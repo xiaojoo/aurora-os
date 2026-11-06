@@ -2471,6 +2471,120 @@ def check_deliver_layer(log: str, src: Path | None = None) -> tuple[list[str], s
                  f" 向量={vec:#04x} BSPid={bsp_id:#x} APid={ap_id:#x}")
 
 
+PIT_MARK_LINE = "pit_ioport_write [0x3] <- 0x0"   # QEMU 打 `0x0` 不补零（实测）
+V32_LINE = re.compile(r"^apic_deliver_irq dest \d+ dest_mode \d+ delivery_mode \d+ vector 32 ")
+TIMER_W1 = re.compile(r"timer: ticks \d+ -> \d+ \(第一段 (?P<t>\d+) ticks cycles=(?P<c>\d+) "
+                      r"轮数=\d+ 游标=\S+\.\.\S+\)")
+TIMER_REC = re.compile(r"recurring=(\w+)")
+TIMER_MARKS = re.compile(r"timer 游标: 段1=(?P<a>\S+)\.\.(?P<b>\S+) 段2=(?P<c>\S+)\.\.(?P<d>\S+)")
+TIMER_W2 = re.compile(r"second_window=\d+ \(第二段 (?P<t>\d+) ticks cycles=(?P<c>\d+) 轮数=\d+\)")
+INTERVAL_MEAN = re.compile(r"clock 判据: .*interval_mean=(?P<v>\d+)")
+
+
+def window_deliveries(src: Path, cap: int = 12_000_000) -> tuple[int, int, int]:
+    """拿 PIT latch 游标把 trace 切成窗口段，数里面投了几发 vector 32。
+
+    返回 `(第一段窗口内投递, 第二段窗口内投递, 全跑投递)`。游标不够就返回 `-1`：
+    调用方**必须**把"证人不在场"与"窗口内一发都没投"分开——后者是事实，前者是盲区。
+    （`-trace` 清单写坏时 QEMU 只 warning 就带零事件启动，这条就是那一族的兜底。）
+
+    段与段之间靠**游标的先后**分，不靠时间戳：simple trace 后端不打时间戳（实测），
+    而Latch 命令在 trace 里的形状唯一（`[0x3] <- 0x0`，QEMU 打 `0x0` 不补零），
+    所以第 1、2 个游标之间就是第一段，第 3、4 个之间就是第二段。
+    """
+    marks: list[int] = []
+    hits: list[int] = []
+    n = 0
+    with src.open(encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            n += 1
+            if n > cap:
+                break
+            s = line.strip()
+            if s == PIT_MARK_LINE:
+                marks.append(n)
+            elif V32_LINE.match(s):
+                hits.append(n)
+    d1 = sum(1 for h in hits if marks[0] < h < marks[1]) if len(marks) >= 2 else -1
+    d2 = sum(1 for h in hits if marks[2] < h < marks[3]) if len(marks) >= 4 else -1
+    return d1, d2, len(hits)
+
+
+def aurora_pit_divisor() -> int:
+    """PIT 分频只有一份来源：内核 `clock.rs` 的 `PIT_DIVISOR`。
+    宿主机不自己写死 11932——写死就是凭记忆改硬件常数，那一族错的源头。"""
+    m = re.search(r"pub const PIT_DIVISOR: u64 = ([0-9_]+);",
+                  (ROOT / "kernel" / "src" / "clock.rs").read_text(encoding="utf-8"))
+    if not m:
+        raise SystemExit("clock.rs 里找不到 PIT_DIVISOR ⇒ 设备侧超速的上界没有依据，拒绝判定")
+    return int(m.group(1).replace("_", ""))
+
+
+def check_timer_window(log: str, src: Path) -> tuple[list[str], str]:
+    """两段窗口各记两本账：窗口内**取到**几发（内核）与窗口内**投出**几发（控制器）。
+
+    这四格是 ADR-036 那条"窗口长度必须是时间单位"的续集。`recurring` 原来要求
+    "两个 tick 周期的墙上时间里取到 2 发"，而这台 QEMU 的 PIT 是**短脉冲 + 电平线**：
+    vCPU 被宿主按住时投递照样发生，但 IRR 只有一个位，攒下的会被合并。
+    ⇒ "取到 ≥ 2"在可抢占的宿主上不是"紧"，是**形状错了**。换成两条能判的：
+
+    * `T ≤ D`：每一发处理都必须先有一次投递；合并只让 D 多，不会让 T 多。
+    * `D ≤ ⌈窗口 cycles ÷ 周期⌉ + 1`：设备不可能比 PIT 自己的 100 Hz 还快。
+      周期取标定读出的相邻间隔均值（`clock 判据` 那行的 `interval_mean=`），
+      分频常数从内核 `clock.rs` 读回来（不写死）。
+
+    再加两条管仪器自己在不在场：游标读不到 ⇒ **不许豁免也不许读成"没投"**；
+    latch 回来的计数出格 ⇒ 通道 0 不是那个 100 Hz 速率发生器，相位与上界都失去依据。
+    """
+    bad: list[str] = []
+    mw1 = TIMER_W1.search(log)
+    if not mw1:
+        return ["串口里没有带游标的 `timer: ticks … (第一段 … 游标=… 收尾=…)` ⇒ "
+                "内核侧的窗口取数或游标读数没打出来"], "内核侧读数缺失"
+    mi = INTERVAL_MEAN.search(log)
+    if not mi:
+        return ["没有 `clock 判据: … interval_mean=` ⇒ 窗口时长没有可比的时间单位"], "标定侧读数缺失"
+    mrec = TIMER_REC.search(log)
+    m_w2 = TIMER_W2.search(log)
+    taken, wcycles = int(mw1.group("t")), int(mw1.group("c"))
+    taken2, cyc2 = (int(m_w2.group("t")), int(m_w2.group("c"))) if m_w2 else (-1, -1)
+    period = int(mi.group("v"))
+    d1, d2, d_all = window_deliveries(src)
+    if not m_w2:
+        bad.append("串口里没有第二段窗口那半行（`second_window=… (第二段 … 轮数=…)`）⇒ 少一段可比的两本账")
+    for name, tk, cyc, d in (("第一段", taken, wcycles, d1), ("第二段", taken2, cyc2, d2)):
+        if tk < 0:
+            continue
+        if d < 0:
+            bad.append(f"{name}窗口的游标读不到（全跑投递 {d_all} 条在）⇒ 证人不在场，"
+                       f"这一格不许豁免，也不许读成「窗口里没投」")
+            continue
+        if d == 0:
+            bad.append(f"{name}窗口里控制器一发都没投（取到 {tk}）⇒ 这一格在量它没有的东西")
+        if tk > d:
+            bad.append(f"{name}窗口层间方向破了：取到 {tk} > 投出 {d}（每一发处理都必须先有一次投递）")
+        ceiling = -(-cyc // max(period, 1)) + 1
+        if d > ceiling:
+            bad.append(f"{name}窗口设备侧超速：{cyc} cycles 内投了 {d} 发，"
+                       f"按周期 {period} cycles/发推出来的上界是 {ceiling}")
+    mmarks = TIMER_MARKS.search(log)
+    if not mmarks:
+        bad.append("串口里没有 `timer 游标: 段1=… 段2=…` 那行 ⇒ 段边界没有依据，两本账切不出来")
+    else:
+        for grp in ("a", "b", "c", "d"):
+            if mmarks.group(grp) == "None":
+                bad.append(f"游标 {grp} 读数出格（latch 回来的计数不在 [1, {aurora_pit_divisor()}]）"
+                           f"⇒ 通道 0 不是那个 100 Hz 速率发生器，段边界与上界都失去依据")
+                break
+    if mrec and mrec.group(1) == "false" and (d1 < 0 or d2 < 0):
+        bad.append("recurring=false 而证人读不到 ⇒ 这条红既不能定罪也不能豁免，先修仪器")
+    return bad, (f"第一段 取到={taken} 投出={d1} ／ 第二段 取到={taken2} 投出={d2} "
+                 f"(窗口 cycles={wcycles}/{cyc2}，周期={period}，上限="
+                 f"{-(-wcycles // max(period, 1)) + 1}/{-(-cyc2 // max(period, 1)) + 1}) "
+                 f"游标={mmarks.group('a')}..{mmarks.group('b')}|{mmarks.group('c')}..{mmarks.group('d')} "
+                 f"全跑投出={d_all} recurring={mrec.group(1) if mrec else '?'}")
+
+
 def do_check(elf: Path | None) -> int:
     gates = {
         "check-lints-wired": lambda: check_lints_wired(),
@@ -2793,11 +2907,15 @@ def do_test(timeout: int) -> int:
     dlv, dlrc, dllog = do_run(["irq-affinity-probe"], timeout,
                               extra=f"-trace events={EVENTS_TXT} -trace file={DELIVER_LOG}")
     dl_bad, dl_why = check_deliver_layer(dllog)
+    # 同一跑、同一份 trace 再切两段窗口，把"窗口内取到 ≤ 窗口内投出"与设备侧超速一起判掉
+    tw_bad, tw_why = check_timer_window(dllog, DELIVER_LOG)
+    dl_bad = dl_bad + tw_bad
     if dlv == "PASS":
         dl_verdict = "PASS" if not dl_bad else "CONTENT-MISMATCH"
     else:
         dl_verdict = dlv
     print(f"    判定={dlv} 分层对账={not dl_bad}（{dl_why}）")
+    print(f"    窗口两本账={not tw_bad}（{tw_why}）")
     for x in dl_bad:
         print("    对账:", x)
     DELIVER_LOG.unlink(missing_ok=True)

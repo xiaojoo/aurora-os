@@ -1113,13 +1113,19 @@ fn t_timer_ticks_recur() -> bool {
     // 第三段从**排空之后**起算，数的必须是新到的两个 tick。不排空就会被攒下的 backlog
     // 当场填满（实测：那一段 2 个 tick 只花 10,363,532 cycles，而第一段同样 2 个花
     // 68,040,996——同一个量两次读数差 6.6 倍，说明其中一次没在测它声称的东西）。
+    let mk2 = apic::pit_mark();
     let w2 = apic::wait_ticks(t_drained, 2, clock::window_cycles(2));
+    let mk3 = apic::pit_mark();
     let t2 = apic::ticks();
+    // 四格游标单独打一行：宿主机按游标的**先后**把 trace 切成段（simple trace 不带时间戳），
+    // 所以这四个数是段边界本身，读数出格（None）就等于证人不在场。
+    crate::log_info!("timer 游标: 段1={:?}..{:?} 段2={:?}..{:?}（PIT latch 计数，None=出格）",
+        mk0, mk1, mk2, mk3);
     let _ = st;
     apic::timer_stop().ok();
     let after = apic::counts();
     crate::log_info!(
-        "timer: ticks {} -> {} (第一段 {} ticks cycles={} 轮数={} 游标={:?}..{:?} ; after_cli={} (关IF 空转 {} ticks cycles={} 轮数={}) ; 排空={} (+{} cycles={}) ; second_window={} (第二段 {} ticks cycles={} 轮数={})",
+        "timer: ticks {} -> {} (第一段 {} ticks cycles={} 轮数={} 游标={:?}..{:?}) ; after_cli={} (关IF 空转 {} ticks cycles={} 轮数={}) ; 排空={} (+{} cycles={}) ; second_window={} (第二段 {} ticks cycles={} 轮数={})",
         c0, t1, w1.ticks, w1.cycles, w1.rounds, mk0, mk1, t_after_cli, w_idle.ticks, w_idle.cycles, w_idle.rounds,
         t_drained, w_drain.ticks, w_drain.cycles, t2, w2.ticks, w2.cycles, w2.rounds
     );
