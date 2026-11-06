@@ -43,7 +43,7 @@ pub fn finish(code: Code) -> ! {
     }
     serial::line("exit", format_args!("qemu-exit={}", code.qemu_exit()));
     serial::out8(DEBUGEXIT_PORT, code as u8);
-    crate::trap::halt_forever()
+    crate::arch::x86_64::trap::halt_forever()
 }
 
 /// 启动阶段就无法继续：先尽量把原因打到串口，再给独立退出码

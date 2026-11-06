@@ -18,7 +18,7 @@
 //! 一起长——先把没人调的签名摆在这里，就是把手册的目录当成实现（BACKLOG 记着）。
 //! `request_irq` 已在 M5-g② 兑现（调用者是 AHCI），所以它出现在下面而不是这里。
 
-use crate::apic;
+use crate::arch::x86_64::apic;
 use crate::hw::{self, HwError, MmioRegion};
 use crate::irq;
 use crate::mm::{self, Mapping, ModuleId, PageFlags, PAGE};

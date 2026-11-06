@@ -10,8 +10,8 @@
 //! 另外两格不做也不写"已交付"：硬锁死要平台真给 NMI，硬件看门狗要平台真有那个器件，
 //! 这台 QEMU 量不出来（§9.6 自己写了"平台提供时才启用"）。
 
-use crate::apic;
-use crate::cpu;
+use crate::arch::x86_64::apic;
+use crate::arch::x86_64::cpu;
 use crate::tsc;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 

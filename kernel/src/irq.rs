@@ -20,9 +20,9 @@
 //! "写进设备 → 设备读回来同数 → 设备真发一发 → 内核数到那个向量"。
 //! 位数算错不会报错，只会一个中断都不来，所以判据必须是"计数在涨"，而不是"没报错"。
 
-use crate::apic;
+use crate::arch::x86_64::apic;
 use crate::mm::ModuleId;
-use crate::trap;
+use crate::arch::x86_64::trap;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -116,13 +116,13 @@ static DISPATCHED: AtomicUsize = AtomicUsize::new(0);
 /// 目的地写错（投到别的核上）时它照样涨，所以"投给了谁"这件事今天没有任何一台仪器能答。
 /// M5-g③ 把它与宿主机 `qemu -d int` 数到的投递总数交叉：两个数必须相等，
 /// 而非 BSP 那几格必须是 0。
-static PER_CPU: [AtomicUsize; crate::cpu::MAX_CPUS] = [const { AtomicUsize::new(0) }; crate::cpu::MAX_CPUS];
+static PER_CPU: [AtomicUsize; crate::arch::x86_64::cpu::MAX_CPUS] = [const { AtomicUsize::new(0) }; crate::arch::x86_64::cpu::MAX_CPUS];
 /// L3-B：目的地被移动过几次（与"落到哪颗核"分开数，见 `moves()`）。
 static MOVES: AtomicUsize = AtomicUsize::new(0);
 
 /// 按 CPU 的投递分布（索引是槽号，不是 LAPIC id）。
-pub fn by_cpu() -> [usize; crate::cpu::MAX_CPUS] {
-    let mut out = [0usize; crate::cpu::MAX_CPUS];
+pub fn by_cpu() -> [usize; crate::arch::x86_64::cpu::MAX_CPUS] {
+    let mut out = [0usize; crate::arch::x86_64::cpu::MAX_CPUS];
     for (i, slot) in PER_CPU.iter().enumerate() {
         out[i] = slot.load(Ordering::Relaxed);
     }
@@ -202,10 +202,10 @@ pub fn set_affinity(h: Handle, owner: ModuleId, lapic_id: u8) -> Result<Msg, Irq
         return Err(IrqError::WrongContext);
     }
     let vector = checked(h, owner)?;
-    let Some(slot) = crate::cpu::slot_of_lapic(u64::from(lapic_id)) else {
+    let Some(slot) = crate::arch::x86_64::cpu::slot_of_lapic(u64::from(lapic_id)) else {
         return Err(IrqError::NoSuchCpu(lapic_id));
     };
-    if !crate::cpu::is_online(slot) {
+    if !crate::arch::x86_64::cpu::is_online(slot) {
         return Err(IrqError::Offline(slot));
     }
     // SAFETY: 见 TableCell；写者只有 BSP 的任务上下文
@@ -283,7 +283,7 @@ pub fn dispatch(vector: usize) -> bool {
     }
     // 先记"到过哪台 CPU"再决定归属：目的地写错的那一发也是真到过，
     // 把它按"没到"数就正好丢掉了 M5-g③ 要抓的那个形状。
-    PER_CPU[crate::cpu::self_slot()].fetch_add(1, Ordering::Relaxed);
+    PER_CPU[crate::arch::x86_64::cpu::self_slot()].fetch_add(1, Ordering::Relaxed);
     // SAFETY: 见 TableCell。这里只读函数指针并做原子自增：不分配、不睡、不碰句柄表以外的写
     let ran = unsafe {
         let t = &*TABLE.0.get();

@@ -13,7 +13,8 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-use crate::{mm, trap};
+use crate::{mm};
+use crate::arch::x86_64::{trap};
 use crate::mm::{ModuleId, PageFlags, VirtAddr};
 
 pub const MOD_STACK_TASK: ModuleId = ModuleId(12);
@@ -26,7 +27,7 @@ pub const MOD_STACK_KUSER: ModuleId = ModuleId(15);
 /// 不是把回收问题解掉：过程与现在的状态见 BACKLOG 的 M4 一节。
 pub const MAX_TASKS: usize = 8;
 /// 全系统可登记的任务数（跨所有 CPU）。用例读 `WORK[i]` / `state_of(i)` 时用的是这个空间里的全局下标。
-pub const MAX_TASKS_TOTAL: usize = MAX_TASKS * crate::cpu::MAX_CPUS;
+pub const MAX_TASKS_TOTAL: usize = MAX_TASKS * crate::arch::x86_64::cpu::MAX_CPUS;
 const STACK_PAGES: usize = 4;
 /// +1 = 栈底 guard 页（永不映射）
 const STACK_VA_PAGES: usize = STACK_PAGES + 1;
@@ -139,8 +140,8 @@ impl OwnedSet {
 /// 为什么需要它：`preempt_point` 在**每次**出中断时都会路过回收检查，
 /// 而绝大多数时候没有任何东西要收。先读这一格（自己的缓存行里，几十周期以内），
 /// 为 0 就直接走——把 8 格的扫描放进 P3/P5 的被测区间是不诚实的代价。
-static REAP_PENDING: [core::sync::atomic::AtomicUsize; crate::cpu::MAX_CPUS] =
-    [const { core::sync::atomic::AtomicUsize::new(0) }; crate::cpu::MAX_CPUS];
+static REAP_PENDING: [core::sync::atomic::AtomicUsize; crate::arch::x86_64::cpu::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; crate::arch::x86_64::cpu::MAX_CPUS];
 
 /// 本次运行里"任务结束后释放掉的映射数"（判据要看见回收真的发生过，而不是只看见状态变 Free）。
 static REAP_RELEASED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -240,7 +241,7 @@ fn release_owned(cpu: usize, slot: usize) {
 /// 它的映射（如果有）在这一刻**不能**解映射。所以退出时先标 Free、把资源留在槽里，
 /// 等这个 CPU 换别人上来之后再收。
 pub fn reap(cpu: usize) -> usize {
-    if cpu >= crate::cpu::MAX_CPUS || REAP_PENDING[cpu].load(Ordering::Acquire) == 0 {
+    if cpu >= crate::arch::x86_64::cpu::MAX_CPUS || REAP_PENDING[cpu].load(Ordering::Acquire) == 0 {
         return 0;
     }
     let cur = current_of(cpu);
@@ -329,8 +330,8 @@ struct QueueCell(core::cell::UnsafeCell<RunQueue>);
 // 将来加迁移时，这段 SAFETY 必须重写成"迁移窗口内两边都关中断并持有队列所有权"，
 // 不能沿用"没人会碰"这种靠人守的论证。
 unsafe impl Sync for QueueCell {}
-static RQ: [QueueCell; crate::cpu::MAX_CPUS] =
-    [const { QueueCell(core::cell::UnsafeCell::new(EMPTY_QUEUE)) }; crate::cpu::MAX_CPUS];
+static RQ: [QueueCell; crate::arch::x86_64::cpu::MAX_CPUS] =
+    [const { QueueCell(core::cell::UnsafeCell::new(EMPTY_QUEUE)) }; crate::arch::x86_64::cpu::MAX_CPUS];
 
 /// 每条 CPU 的调度标志，**一行一条缓存行**：三个原子数组按 CPU 铺开时，
 /// 八个原子量正好挤在同一条 64 字节行里，而它就在被测路径正中间（读 `NEED_RESCHED`、写 `TICKS`）
@@ -347,14 +348,14 @@ struct FlagRow {
     _pad: [usize; 6],
 }
 
-static FLAGS: [FlagRow; crate::cpu::MAX_CPUS] = [const {
+static FLAGS: [FlagRow; crate::arch::x86_64::cpu::MAX_CPUS] = [const {
     FlagRow {
         need: AtomicBool::new(false),
         ticks: AtomicUsize::new(0),
         switches: AtomicUsize::new(0),
         _pad: [0; 6],
     }
-}; crate::cpu::MAX_CPUS];
+}; crate::arch::x86_64::cpu::MAX_CPUS];
 
 /// 抢占标志**按 CPU 放**。
 ///
@@ -367,10 +368,10 @@ static FLAGS: [FlagRow; crate::cpu::MAX_CPUS] = [const {
 /// M3b-2b 起按 CPU 分行，并且切换路径一次都不读 LAPIC id（槽位由异常入口传进来）。
 /// 读数变化的归因是四轮排除法做下来的（结论：被测区间里多读了三次 UC- 寄存器，
 /// 拆掉之后 2536 → 735；顺带量到一次 `self_slot()` ≈600 周期），过程与数据在 ADR-024。
-static P1_LAST: [AtomicU64; crate::cpu::MAX_CPUS] = [const { AtomicU64::new(0) }; crate::cpu::MAX_CPUS];
-static P1_SUM: [AtomicU64; crate::cpu::MAX_CPUS] = [const { AtomicU64::new(0) }; crate::cpu::MAX_CPUS];
-static P1_MIN: [AtomicU64; crate::cpu::MAX_CPUS] = [const { AtomicU64::new(u64::MAX) }; crate::cpu::MAX_CPUS];
-static P1_MAX: [AtomicU64; crate::cpu::MAX_CPUS] = [const { AtomicU64::new(0) }; crate::cpu::MAX_CPUS];
+static P1_LAST: [AtomicU64; crate::arch::x86_64::cpu::MAX_CPUS] = [const { AtomicU64::new(0) }; crate::arch::x86_64::cpu::MAX_CPUS];
+static P1_SUM: [AtomicU64; crate::arch::x86_64::cpu::MAX_CPUS] = [const { AtomicU64::new(0) }; crate::arch::x86_64::cpu::MAX_CPUS];
+static P1_MIN: [AtomicU64; crate::arch::x86_64::cpu::MAX_CPUS] = [const { AtomicU64::new(u64::MAX) }; crate::arch::x86_64::cpu::MAX_CPUS];
+static P1_MAX: [AtomicU64; crate::arch::x86_64::cpu::MAX_CPUS] = [const { AtomicU64::new(0) }; crate::arch::x86_64::cpu::MAX_CPUS];
 /// 每个任务往自己的格子里加的计数：测试据此判断"确实轮转过"，而不是只切了一次。
 /// 下标是**全局任务下标**（`gidx(cpu, slot)`），所以 BSP 的任务仍然落在 0..MAX_TASKS。
 pub static WORK: [AtomicUsize; MAX_TASKS_TOTAL] = [const { AtomicUsize::new(0) }; MAX_TASKS_TOTAL];
@@ -391,7 +392,7 @@ fn rq(cpu: usize) -> &'static mut RunQueue {
 /// 本 CPU 的队列。
 #[inline]
 fn my_rq() -> &'static mut RunQueue {
-    rq(crate::cpu::self_slot())
+    rq(crate::arch::x86_64::cpu::self_slot())
 }
 
 core::arch::global_asm!(
@@ -473,7 +474,7 @@ pub fn current_id() -> usize {
 
 /// 某个 CPU 当前跑的任务（全局下标）。跨核用例用它证明"两个核各自跑各自队列里的任务"。
 pub fn current_of(cpu: usize) -> usize {
-    if cpu >= crate::cpu::MAX_CPUS {
+    if cpu >= crate::arch::x86_64::cpu::MAX_CPUS {
         return 0;
     }
     // SAFETY: 只读，且读的是**别的 CPU 独占**的那条队列——这是一个无同步的快照读，
@@ -486,18 +487,18 @@ pub fn current_of(cpu: usize) -> usize {
 /// 前两个数**按 CPU 取**：把它们混成一个全局数，"BSP 换过 27 次人"和
 /// "两个 CPU 各换过 13 次"就再也分不出来了。
 pub fn stats() -> (usize, usize, usize) {
-    let slot = crate::cpu::self_slot();
+    let slot = crate::arch::x86_64::cpu::self_slot();
     (FLAGS[slot].switches.load(Ordering::Relaxed), FLAGS[slot].ticks.load(Ordering::Relaxed), tasks_active())
 }
 
 pub fn stats_of(slot: usize) -> (usize, usize) {
-    if slot >= crate::cpu::MAX_CPUS {
+    if slot >= crate::arch::x86_64::cpu::MAX_CPUS {
         return (0, 0);
     }
     (FLAGS[slot].switches.load(Ordering::Relaxed), FLAGS[slot].ticks.load(Ordering::Relaxed))
 }
 
-static SWITCHES_FOR: [AtomicUsize; crate::cpu::MAX_CPUS] = [const { AtomicUsize::new(0) }; crate::cpu::MAX_CPUS];
+static SWITCHES_FOR: [AtomicUsize; crate::arch::x86_64::cpu::MAX_CPUS] = [const { AtomicUsize::new(0) }; crate::arch::x86_64::cpu::MAX_CPUS];
 
 /// 所有 CPU 上"还能被调度"的任务数之和（跨核快照，只用于日志与判据）。
 pub fn tasks_active() -> usize {
@@ -511,11 +512,11 @@ pub fn tasks_active() -> usize {
 /// 手册 §12.4.1 与 `tools/aurora.py bench` 的解析格式从这个形状来，所以不改成跨 CPU 汇总；
 /// 各核分别走 `p1_stats_all()`，日志里单独打一行。
 pub fn p1_stats() -> (u64, u64, u64, u64) {
-    p1_stats_of(crate::cpu::BSP_SLOT)
+    p1_stats_of(crate::arch::x86_64::cpu::BSP_SLOT)
 }
 
 pub fn p1_stats_of(slot: usize) -> (u64, u64, u64, u64) {
-    if slot >= crate::cpu::MAX_CPUS {
+    if slot >= crate::arch::x86_64::cpu::MAX_CPUS {
         return (0, 0, 0, 0);
     }
     let n = FLAGS[slot].switches.load(Ordering::Relaxed) as u64;
@@ -530,7 +531,7 @@ pub fn p1_stats_of(slot: usize) -> (u64, u64, u64, u64) {
 /// 每个 CPU 的 P1 读数（只列真有样本的那些）。
 pub fn p1_with_samples() -> alloc::vec::Vec<(usize, u64, u64, u64, u64)> {
     let mut out = alloc::vec::Vec::new();
-    for s in 0..crate::cpu::MAX_CPUS {
+    for s in 0..crate::arch::x86_64::cpu::MAX_CPUS {
         let (n, mean, min, max) = p1_stats_of(s);
         if n > 0 {
             out.push((s, n, mean, min, max));
@@ -542,7 +543,7 @@ pub fn p1_with_samples() -> alloc::vec::Vec<(usize, u64, u64, u64, u64)> {
 
 /// 定时器中断里只做两件事：计数 + 给自己那个 CPU 置标志。真正的换栈在异常出口做。
 pub fn mark_tick() {
-    let slot = crate::cpu::self_slot();
+    let slot = crate::arch::x86_64::cpu::self_slot();
     FLAGS[slot].ticks.fetch_add(1, Ordering::Relaxed);
     FLAGS[slot].need.store(true, Ordering::Release);
 }
@@ -552,14 +553,14 @@ pub fn mark_tick() {
 /// 与真实 tick 数对不上，而那条"两台仪器数到同一个数"的判据就废了）。
 /// 现在唯一的另一个用户是 `user::park_current`：任务被判死刑，必须当场换下去。
 pub fn mark_need(slot: usize) {
-    if slot < crate::cpu::MAX_CPUS {
+    if slot < crate::arch::x86_64::cpu::MAX_CPUS {
         FLAGS[slot].need.store(true, Ordering::Release);
     }
 }
 
 /// 本 CPU 的 tick 数（AP 也数得出来，供跨核用例读）。
 pub fn ticks_of(slot: usize) -> usize {
-    if slot >= crate::cpu::MAX_CPUS {
+    if slot >= crate::arch::x86_64::cpu::MAX_CPUS {
         return 0;
     }
     FLAGS[slot].ticks.load(Ordering::Relaxed)
@@ -616,7 +617,7 @@ pub fn task_frame(task: usize) -> Option<u64> {
 /// 把当前上下文登记为任务 0（启动上下文）。
 pub fn init_boot_task() {
     let (lo, hi) = mm::boot_stack_range();
-    let cpu = crate::cpu::self_slot();
+    let cpu = crate::arch::x86_64::cpu::self_slot();
     let s = rq(cpu);
     s.tasks[0] = Task {
         id: 0,
@@ -646,7 +647,7 @@ pub fn init_boot_task() {
 /// 边界不同。栈边界搞错的后果不是崩溃而是**永远不换人**：
 /// `preempt_point` 的"帧在不在这条栈上"那道检查会一直判否，然后白倒一次标志。
 pub fn init_idle_task(stack_lo: u64, stack_hi: u64, guarded: bool) {
-    let cpu = crate::cpu::self_slot();
+    let cpu = crate::arch::x86_64::cpu::self_slot();
     let s = rq(cpu);
     s.tasks[0] = Task {
         id: 0,
@@ -672,7 +673,7 @@ pub fn init_idle_task(stack_lo: u64, stack_hi: u64, guarded: bool) {
 /// 建一个任务：保留 `STACK_VA_PAGES` 页，最低那一页永不映射当 guard。
 /// 新任务挂在**调用者所在 CPU** 的队列上（`Task::on_cpu`），返回值是全局任务下标。
 pub fn spawn(entry: fn() -> !) -> Result<usize, mm::MmError> {
-    let cpu = crate::cpu::self_slot();
+    let cpu = crate::arch::x86_64::cpu::self_slot();
     // 分配走 mm 的锁，**不能**在已经拿着自己队列的时候做：
     // 队列的 SAFETY 前提是"只由本 CPU 碰"，而 mm 的等待时间完全可能跨过别的 CPU 的观察点。
     let win = mm::alloc_va_range(STACK_VA_PAGES).ok_or(mm::MmError::OutOfMemory)?;
@@ -736,7 +737,7 @@ pub fn spawn(entry: fn() -> !) -> Result<usize, mm::MmError> {
 /// ②首次运行的帧同样是 `TrapFrame`（`cs/ss` 是 RPL3、`rsp` 指向用户栈），
 /// 与内核任务共用 `context_load`；③`rflags` 里不写 IF——IF 由 CPU 供（ADR-021）。
 pub fn spawn_user(entry_rip: u64, user_stack_top: u64, mut res: OwnedSet) -> Result<usize, mm::MmError> {
-    let cpu = crate::cpu::self_slot();
+    let cpu = crate::arch::x86_64::cpu::self_slot();
     let win = mm::alloc_va_range(STACK_VA_PAGES).ok_or(mm::MmError::OutOfMemory)?;
     let map_lo = win.0 + mm::PAGE as u64;
     let frames = mm::phys_alloc(STACK_PAGES.trailing_zeros() as u8, MOD_STACK_KUSER)?;
@@ -941,7 +942,7 @@ pub unsafe fn preempt_point(frame: u64, cpu: usize) {
     if REAP_PENDING[cpu].load(Ordering::Acquire) != 0 {
         reap(cpu);
     }
-    if !crate::cpu::runs_sched(cpu) {
+    if !crate::arch::x86_64::cpu::runs_sched(cpu) {
         FLAGS[cpu].need.store(false, Ordering::Relaxed);
         return;
     }
@@ -1033,7 +1034,7 @@ pub unsafe fn preempt_point(frame: u64, cpu: usize) {
     // `fault-if-carriage` 是这条决定的负样本：它改回"任务自己带 IF"（硬件的默认行为），
     // 用来证明这条规则不是修辞——去掉它，M3a 记录过的故障形状必须回来。
     #[cfg(not(feature = "fault-if-carriage"))]
-    let if_open = crate::apic::interrupts_enabled(cpu);
+    let if_open = crate::arch::x86_64::apic::interrupts_enabled(cpu);
     #[cfg(feature = "fault-if-carriage")]
     let if_open = frame_if_bit(next).unwrap_or(false);
     IF_LOADS[usize::from(if_open)].fetch_add(1, Ordering::Relaxed);

@@ -43,7 +43,7 @@ pub const CR4_SMAP: u64 = 1 << 21;
 /// **每台 CPU 都要设一次**：CR4 是每 CPU 的寄存器，只在 BSP 上调一次的话，
 /// ring3 跑到 AP 上那两位就是 0，"内核不许执行用户页"只在一条核上成立。
 pub fn enable_user_protections() -> (bool, bool, u64) {
-    let f = crate::cpuid::detect();
+    let f = crate::arch::x86_64::cpuid::detect();
     let want = CR4_SMEP | CR4_SMAP;
     let mut cr4: u64;
     // SAFETY: 只读写 CR4，不碰内存；`ldmxcsr` 一类不涉及。cr4 的读写对是特权指令，
@@ -191,10 +191,10 @@ pub fn slot_of_lapic(id: u64) -> Option<usize> {
 /// 系统里确实只有一个运行中的 CPU，返回 0 是构造出来的事实而不是猜测。
 /// 反过来，APIC 已就绪却查不到登记，才是要报的异常——那说明有人在没分槽位的情况下跑了别的 id。
 pub fn self_slot() -> usize {
-    if !crate::apic::is_lapic_mapped() {
+    if !crate::arch::x86_64::apic::is_lapic_mapped() {
         return BSP_SLOT;
     }
-    let id = crate::apic::self_id();
+    let id = crate::arch::x86_64::apic::self_id();
     match slot_of_lapic(id) {
         Some(s) => s,
         None => {

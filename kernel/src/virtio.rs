@@ -1434,7 +1434,7 @@ pub fn msix_probe() -> Result<MsixProbe, VirtioError> {
         MSIX_FLAG.store(false, Ordering::Release);
         let (c0, k0) = ctx.irq_counts(h).map_err(VirtioError::Ctx)?;
         let mut buf = [0u8; 512];
-        let r = crate::apic::with_interrupts(|| read_block(0, &mut buf));
+        let r = crate::arch::x86_64::apic::with_interrupts(|| read_block(0, &mut buf));
         let mut waited = 0u32;
         while !MSIX_FLAG.load(Ordering::Acquire) && waited < 200_000 {
             core::hint::spin_loop();

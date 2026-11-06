@@ -234,18 +234,18 @@ pub fn wait_tick_count(cycles: u64) -> TickWait {
 /// 每个 CPU 的**本地**定时器 tick 数（向量 `trap::VEC_CPU_TIMER`）。
 /// 它与 `ticks()`（BSP 经 I/O APIC 收到的 PIT tick）是两条独立来源，不能混着数：
 /// 混了之后 `t_timer_ticks_recur` 那台"两台仪器必须数到同一个数"的仪器就会当场对不上。
-static CPU_TICKS: [AtomicUsize; crate::cpu::MAX_CPUS] = [const { AtomicUsize::new(0) }; crate::cpu::MAX_CPUS];
+static CPU_TICKS: [AtomicUsize; crate::arch::x86_64::cpu::MAX_CPUS] = [const { AtomicUsize::new(0) }; crate::arch::x86_64::cpu::MAX_CPUS];
 
 pub fn cpu_ticks(slot: usize) -> usize {
-    if slot >= crate::cpu::MAX_CPUS {
+    if slot >= crate::arch::x86_64::cpu::MAX_CPUS {
         return 0;
     }
     CPU_TICKS[slot].load(Ordering::Relaxed)
 }
 
 /// 所有 CPU 的本地 tick 快照，供日志一行打完。
-pub fn cpu_ticks_all() -> [usize; crate::cpu::MAX_CPUS] {
-    let mut out = [0usize; crate::cpu::MAX_CPUS];
+pub fn cpu_ticks_all() -> [usize; crate::arch::x86_64::cpu::MAX_CPUS] {
+    let mut out = [0usize; crate::arch::x86_64::cpu::MAX_CPUS];
     for (i, v) in out.iter_mut().enumerate() {
         *v = cpu_ticks(i);
     }
@@ -332,7 +332,7 @@ pub fn init(m: &Madt) -> Result<State, ApicError> {
     let id = mmio_read32(lapic_va, LAPIC_ID) >> 24;
     // 把 BSP 的槽位登记在**硬件读回的 id** 上，而不是 MP 响应里的 bsp_lapic_id：
     // 两者应当一致，而那正是 `t_cpu_ids_agree` 要证的（用其中一个去填另一个就是循环论证）。
-    crate::cpu::init_bsp(id);
+    crate::arch::x86_64::cpu::init_bsp(id);
 
     // 定时器走哪条线：ISA IRQ0 -> GSI -> (哪个 IOAPIC, 第几条 RTE)
     let gsi = crate::acpi::gsi_for(m, TIMER_ISA_IRQ);
@@ -354,7 +354,7 @@ pub fn init(m: &Madt) -> Result<State, ApicError> {
         crate::log_fatal!("apic: GSI {} -> RTE {} 超出 I/O APIC {} 的 {} 条表项", gsi, rte, io.id, irt_entries);
         return Err(ApicError::NoIoApicForGsi);
     }
-    let vector = crate::trap::VEC_IRQ_BASE + TIMER_ISA_IRQ as usize;
+    let vector = crate::arch::x86_64::trap::VEC_IRQ_BASE + TIMER_ISA_IRQ as usize;
 
     // 两段式写：先带屏蔽位写低半（向量/模式），再写高半（目标），最后清屏蔽
     let low_masked: u32 = (vector as u32 & 0xff) | (1 << 16);
@@ -450,7 +450,7 @@ pub fn rte_raw(rte: u8) -> Option<(u32, u32)> {
     Some((ioapic_read(base, reg), ioapic_read(base, reg + 1)))
 }
 
-static ISR_DEPTH: [AtomicUsize; crate::cpu::MAX_CPUS] = [const { AtomicUsize::new(0) }; crate::cpu::MAX_CPUS];
+static ISR_DEPTH: [AtomicUsize; crate::arch::x86_64::cpu::MAX_CPUS] = [const { AtomicUsize::new(0) }; crate::arch::x86_64::cpu::MAX_CPUS];
 /// 中断上下文里发生过的"分配尝试"次数。§6.5/§7.1 一直只有约定（"中断里禁止堆分配"），
 /// 没有机制就等于没有：这里把它变成可数的违规，正常构建必须是 0，
 /// 而 `fault-alloc-in-irq` 构建专门用来证明这个检测器**不是摆设**。
@@ -470,12 +470,12 @@ pub fn self_id() -> u64 {
 }
 
 pub fn in_isr() -> bool {
-    ISR_DEPTH[crate::cpu::self_slot()].load(Ordering::Relaxed) > 0
+    ISR_DEPTH[crate::arch::x86_64::cpu::self_slot()].load(Ordering::Relaxed) > 0
 }
 
 /// 本 CPU 的 ISR 嵌套深度（用例用它验证"每个 CPU 各数各的"）。
 pub fn isr_depth(slot: usize) -> usize {
-    if slot >= crate::cpu::MAX_CPUS {
+    if slot >= crate::arch::x86_64::cpu::MAX_CPUS {
         return 0;
     }
     ISR_DEPTH[slot].load(Ordering::Relaxed)
@@ -505,17 +505,17 @@ pub fn pic_imr() -> (u8, u8) {
 /// 纪律：这里**不许**堆分配、不许打印（串口按字节忙等，会把中断窗口拖长几十微秒），
 /// 只做计数和一次 EOI。日志留给被中断的线程自己读 `counts()`。
 pub fn on_interrupt(vector: usize) {
-    if vector == crate::trap::VEC_SPURIOUS {
+    if vector == crate::arch::x86_64::trap::VEC_SPURIOUS {
         SPURIOUS.fetch_add(1, Ordering::Relaxed);
         return; // spurious 没有 ISR 位，按规范不发 EOI
     }
     // 深度自增：此刻起 in_isr() 为真，任何分配尝试都会被记成违规。
     // **按 CPU 分开数**：全局一份深度会让 AP 正在服务中断时把 BSP 也标成"在中断里"，
     // 于是 BSP 的正常分配被拒（L3），现场是一个说不清来源的失败。
-    let slot = crate::cpu::self_slot();
+    let slot = crate::arch::x86_64::cpu::self_slot();
     ISR_DEPTH[slot].fetch_add(1, Ordering::Relaxed);
-    if (crate::trap::VEC_IRQ_BASE..=crate::trap::VEC_IRQ_LAST).contains(&vector) {
-        let i = vector - crate::trap::VEC_IRQ_BASE;
+    if (crate::arch::x86_64::trap::VEC_IRQ_BASE..=crate::arch::x86_64::trap::VEC_IRQ_LAST).contains(&vector) {
+        let i = vector - crate::arch::x86_64::trap::VEC_IRQ_BASE;
         IRQ_COUNTS[i].fetch_add(1, Ordering::Relaxed);
         // 时钟标定用的两次相邻 tick 的间隔。读 TSC 在 EOI **之前**做：
         // 我们要的是"中断到达的节奏"，不是"处理完的节奏"。
@@ -547,7 +547,7 @@ pub fn on_interrupt(vector: usize) {
         if crate::irq::in_range(vector) {
             crate::irq::dispatch(vector);
         }
-    } else if vector == crate::trap::VEC_CPU_TIMER {
+    } else if vector == crate::arch::x86_64::trap::VEC_CPU_TIMER {
         // 每个 CPU 的本地定时器（M3b-2b 起它走异常帧，所以会进到这儿来）。
         // 三件事要注意：
         // * **不占** `IRQ_COUNTS` 那 16 格——那 16 格是 I/O APIC 的 16 条线，
@@ -576,11 +576,11 @@ pub fn on_interrupt(vector: usize) {
 /// 任务"执行，而下一个任务又自带 IF=1。要么规定任务永不携带 IF，要么规定 rflags 归任务、
 /// 窗口只等不关；这里选前者，并且把它做成**可测的**：换入时按这张表改写异常帧的 IF 位
 /// （见 `sched::preempt_point` 与 `context_load` 的第二个参数）。
-static CPU_IF: [AtomicBool; crate::cpu::MAX_CPUS] = [const { AtomicBool::new(false) }; crate::cpu::MAX_CPUS];
+static CPU_IF: [AtomicBool; crate::arch::x86_64::cpu::MAX_CPUS] = [const { AtomicBool::new(false) }; crate::arch::x86_64::cpu::MAX_CPUS];
 
 /// 本 CPU 的中断窗口是否开着。调度器换入任务时要按它改写异常帧的 IF 位。
 pub fn interrupts_enabled(slot: usize) -> bool {
-    slot < crate::cpu::MAX_CPUS && CPU_IF[slot].load(Ordering::Acquire)
+    slot < crate::arch::x86_64::cpu::MAX_CPUS && CPU_IF[slot].load(Ordering::Acquire)
 }
 
 /// AP 进门时开自己那条中断窗口用的：**立牌 + `sti` 一起做**。
@@ -591,7 +591,7 @@ pub fn interrupts_enabled(slot: usize) -> bool {
 /// 这正是 M3a 记录过的"接手的人带着关中断的状态跑"的形状，只是换到了 AP 上。
 /// （M3b-1 时 AP 不跑调度器，这个缺口不会显形；跑调度器之后它就是死锁，见任务 #11。）
 pub fn open_cpu_window(slot: usize) {
-    if slot < crate::cpu::MAX_CPUS {
+    if slot < crate::arch::x86_64::cpu::MAX_CPUS {
         CPU_IF[slot].store(true, Ordering::Release);
     }
     // SAFETY: sti 只置 EFLAGS.IF，不访问内存、不动栈
@@ -602,7 +602,7 @@ pub fn open_cpu_window(slot: usize) {
 pub fn close_cpu_window(slot: usize) {
     // SAFETY: cli 只清 EFLAGS.IF
     unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
-    if slot < crate::cpu::MAX_CPUS {
+    if slot < crate::arch::x86_64::cpu::MAX_CPUS {
         CPU_IF[slot].store(false, Ordering::Release);
     }
 }
@@ -619,7 +619,7 @@ pub fn close_cpu_window(slot: usize) {
 /// "窗口开着但牌上写着关"的窗口，被抢占的那个任务换回来时会被强行关掉 IF。
 #[inline]
 pub fn with_interrupts<T>(f: impl FnOnce() -> T) -> T {
-    let slot = crate::cpu::self_slot();
+    let slot = crate::arch::x86_64::cpu::self_slot();
     CPU_IF[slot].store(true, Ordering::Release);
     // SAFETY: sti 只置 EFLAGS.IF，不访问内存、不动栈
     unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
@@ -731,7 +731,7 @@ pub fn ap_timer_start(period_us: u64, tsc_hz: u64) -> Result<u32, TimerError> {
     }
     // 1) 分频器 + LVT 先按"屏蔽"状态配好，再放开：与 BSP 配 I/O APIC 同一条纪律
     mmio_write32(lapic, LAPIC_TDCR, TIMER_DIVIDE);
-    mmio_write32(lapic, LAPIC_LVT_TIMER, LVT_MASKED | LVT_PERIODIC | (crate::trap::VEC_CPU_TIMER as u32 & 0xff));
+    mmio_write32(lapic, LAPIC_LVT_TIMER, LVT_MASKED | LVT_PERIODIC | (crate::arch::x86_64::trap::VEC_CPU_TIMER as u32 & 0xff));
     // 2) 标定窗口：先把计数器灌满量程再跑一段已知 TSC 时长。
     // 这里**不用** `tsc::spin(n)`：那个函数的 n 是循环次数不是周期数，每轮代价随
     // 优化等级变；标定窗口必须用"读到 TSC 差够数为止"的绝对界限，否则量出来的
@@ -769,7 +769,7 @@ pub fn ap_timer_start(period_us: u64, tsc_hz: u64) -> Result<u32, TimerError> {
     }
     // 3) 装入初值并**最后**放开屏蔽：与 BSP 那条 RTE 的两段式写同一条顺序纪律
     mmio_write32(lapic, LAPIC_TMICT, initial as u32);
-    mmio_write32(lapic, LAPIC_LVT_TIMER, LVT_PERIODIC | (crate::trap::VEC_CPU_TIMER as u32 & 0xff));
+    mmio_write32(lapic, LAPIC_LVT_TIMER, LVT_PERIODIC | (crate::arch::x86_64::trap::VEC_CPU_TIMER as u32 & 0xff));
     note_cal_dbg([raw as u64, spent, dt_cycles, counts_per_sec, initial]);
     Ok(initial as u32)
 }
@@ -781,7 +781,7 @@ pub fn ap_timer_stop() {
     if lapic == 0 {
         return;
     }
-    mmio_write32(lapic, LAPIC_LVT_TIMER, LVT_MASKED | LVT_PERIODIC | (crate::trap::VEC_CPU_TIMER as u32 & 0xff));
+    mmio_write32(lapic, LAPIC_LVT_TIMER, LVT_MASKED | LVT_PERIODIC | (crate::arch::x86_64::trap::VEC_CPU_TIMER as u32 & 0xff));
     // 屏蔽之后计数器还在跑；把它停在初值上，避免下一次启动的第一拍是个剩余值
     let cur = mmio_read32(lapic, LAPIC_TMCCT);
     mmio_write32(lapic, LAPIC_TMICT, cur);

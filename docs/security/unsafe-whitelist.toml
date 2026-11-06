@@ -10,7 +10,9 @@
 
 [crate.aurora-kernel]
 reason = "垂直切片阶段整个内核就是一个二进制 crate，异常桩/描述符表/端口 I/O 都在里面"
-scope = "trap.rs(asm+描述符+CR2) · serial.rs(端口) · limine.rs(启动信息指针转引用) · cpuid.rs · main.rs(read_volatile)"
+scope = "arch/x86_64/trap.rs(asm+描述符+CR2) · serial.rs(端口) · limine.rs(启动信息指针转引用) · arch/x86_64/cpuid.rs · main.rs(read_volatile)"
+# 2026-11-06 那一刀：`trap/apic/smp/cpu/cpuid` 已从 kernel/src/ 平铺移进 kernel/src/arch/x86_64/（BACKLOG 77）。
+# 下面两行里的裸名字（trap/cpu/apic/smp…）指的是**模块名**，不是文件路径；门禁按包计数，路径变化不影响它，但引用这些文件时请用新路径。
 # M4-2 之后这条 scope 已经**不再完整**（sched/sync/apic/mm/cpu/smp/user/tsc 也都有 unsafe），
 # 而门禁是按包计数的，所以这行写漏不会让检查失败——那正是它该被写全的理由。
 # 逐包拆分之前，先把"这个包里 unsafe 集中在哪几类"说明白，而不是留一份 M1 时代的清单。

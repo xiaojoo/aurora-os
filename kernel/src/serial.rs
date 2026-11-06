@@ -204,7 +204,7 @@ fn acquire_line() -> LineGuard {
     if HALTING.load(Ordering::Relaxed) {
         return LineGuard { held: false };
     }
-    let me = crate::cpu::self_slot() + 1;
+    let me = crate::arch::x86_64::cpu::self_slot() + 1;
     if OWNER.compare_exchange(0, me, Ordering::Acquire, Ordering::Relaxed).is_ok() {
         HOLDS.fetch_add(1, Ordering::Relaxed);
         return LineGuard { held: true };

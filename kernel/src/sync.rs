@@ -126,7 +126,7 @@ fn restore_flags(f: u64) {
 /// APIC 还没初始化时退到 0（启动早期所有锁都在 BSP 上，这是正确的）。
 #[inline]
 fn cpu_token() -> u64 {
-    crate::apic::self_id()
+    crate::arch::x86_64::apic::self_id()
 }
 
 // ----------------------------------------------------------------- lockdep
@@ -138,7 +138,7 @@ fn cpu_token() -> u64 {
 /// 读到的"外层等级"可能是 A 核留下的残值，于是 `10 <= 20` 这种根本不存在嵌套的
 /// 组合会被报成锁序违规（M3b 放 AP 之后就是随机红）。
 /// 释放守卫时还原的是**本 CPU** 的那一份，见 `IrqGuard::drop`。
-static INNERMOST: [AtomicU8; crate::cpu::MAX_CPUS] = [const { AtomicU8::new(0) }; crate::cpu::MAX_CPUS];
+static INNERMOST: [AtomicU8; crate::arch::x86_64::cpu::MAX_CPUS] = [const { AtomicU8::new(0) }; crate::arch::x86_64::cpu::MAX_CPUS];
 static ORDER_VIOLATIONS: AtomicUsize = AtomicUsize::new(0);
 static REENTRANT_HITS: AtomicUsize = AtomicUsize::new(0);
 static ACQUIRES: AtomicUsize = AtomicUsize::new(0);
@@ -210,7 +210,7 @@ impl<T: Send> IrqSpinLock<T> {
         ACQUIRES.fetch_add(1, Ordering::Relaxed);
         let flags = save_and_cli();
         let token = cpu_token();
-        let slot = crate::cpu::self_slot();
+        let slot = crate::arch::x86_64::cpu::self_slot();
         let mut spins = 0u64;
         let t0 = crate::tsc::now();
         loop {
@@ -266,7 +266,7 @@ impl<T: Send> IrqSpinLock<T> {
             restore_flags(flags);
             return None;
         }
-        let slot = crate::cpu::self_slot();
+        let slot = crate::arch::x86_64::cpu::self_slot();
         let prev_rank = INNERMOST[slot].swap(self.rank.0, Ordering::Relaxed);
         if self.rank.0 <= prev_rank && prev_rank != 0 {
             ORDER_VIOLATIONS.fetch_add(1, Ordering::Relaxed);

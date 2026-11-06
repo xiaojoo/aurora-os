@@ -47,9 +47,9 @@ pub const F_SAFE_MODE: u64 = 8;
 
 /// `(major << 32) | (minor << 16) | features`。位一律**读回真实状态**，不读"我打算开"。
 pub fn abi_word() -> u64 {
-    let (smep, smap) = crate::cpu::user_protections_active();
+    let (smep, smap) = crate::arch::x86_64::cpu::user_protections_active();
     let mut f = 0u64;
-    if crate::trap::fastpath_on() {
+    if crate::arch::x86_64::trap::fastpath_on() {
         f |= F_FASTPATH;
     }
     if smap {
@@ -289,7 +289,7 @@ pub fn ensure_trampoline() -> Option<u64> {
     // 快路径与落脚页同批装：两条都是"让 ring3 进得来"的设施，装不装不该看调用顺序。
     // 不在 `init_cpu_tables` 里装，是因为那一刻 MM 还没接管，GS 基址指向的内核 VA
     // 与换页表之后的含义还没对上。快路径是**可选**的：CPUID 不支持就返回 false 照常跑。
-    crate::trap::install_fastpath(crate::cpu::self_slot());
+    crate::arch::x86_64::trap::install_fastpath(crate::arch::x86_64::cpu::self_slot());
     Some(TRAMPOLINE_VA)
 }
 
@@ -461,7 +461,7 @@ pub fn write_at(va: u64, v: u64) {
 /// 返回"故不故障"由用例判：没故障 = 隔离根本没生效（§5.1 R17 的必需项就是靠这条撑着）。
 pub fn probe_slot_without_window(off: u64) -> Option<u64> {
     let p = prog()?;
-    crate::trap::probe_page_fault(p.data_va + off)
+    crate::arch::x86_64::trap::probe_page_fault(p.data_va + off)
 }
 
 pub fn prog() -> Option<&'static UserProg> {
@@ -480,7 +480,7 @@ pub fn prog() -> Option<&'static UserProg> {
 /// 这里**只立请求，不释放任何东西**：此刻的上下文就是要求结束的那个任务，
 /// 它正站在自己要交出去的内核栈上。真正的解映射与归还由 `sched::reap` 在
 /// 本 CPU 换别人上来之后做（§6.3 R13 的主人负责 + §9.2 的"别在故障点上自杀")。
-pub fn syscall_dispatch(frame: &mut crate::trap::TrapFrame) -> bool {
+pub fn syscall_dispatch(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> bool {
     let n = SYSCALLS_SERVED.fetch_add(1, Ordering::Relaxed) + 1;
     // `exit` 是一个显式的控制流状态，**不是**"看返回值像不像 0"。
     // 后者是拿值的巧合当控制流：将来任何一个回 0 的调用（`sys_nop`、成功的
@@ -557,10 +557,10 @@ pub fn syscall_dispatch(frame: &mut crate::trap::TrapFrame) -> bool {
 /// ③把出口 `iretq` 要回去的 rip 换成内核的落脚页——不改 rip 回内核，是替用户造一个
 /// 新的未验证状态；跳进一条内核拥有的 `jmp .` 什么都做不了，只等下一次抢占换下去。
 /// `rsp/cs/ss` 保持故障帧原样：那是这个任务自己的用户栈与选择子。论证与现场见 ADR-028。
-pub fn park_current(frame: &mut crate::trap::TrapFrame) {
+pub fn park_current(frame: &mut crate::arch::x86_64::trap::TrapFrame) {
     KILLS.fetch_add(1, Ordering::Relaxed);
     crate::sched::kill_current();
-    crate::sched::mark_need(crate::cpu::self_slot());
+    crate::sched::mark_need(crate::arch::x86_64::cpu::self_slot());
     let tramp = match TRAMP.load(Ordering::Acquire) {
         0 => {
             // 走到这里说明有用户任务在跑却没有落脚页——`init()` / `load()` 两条入口
@@ -579,7 +579,7 @@ pub fn park_current(frame: &mut crate::trap::TrapFrame) {
     // 异常桩的 `iretq`，**不经过 `if_patch`**——所以这里必须自己按 `CPU_IF` 写对。
     // 写错的下场是实测过的：留给用户态 IF=0，那个被标结束的任务就在 `jmp .` 里关着中断
     // 死转，本 CPU 再也没有 tick，启动上下文永远回不来（整机判成"挂死"，一条读数都拿不到）。
-    frame.rflags = if crate::apic::interrupts_enabled(crate::cpu::self_slot()) {
+    frame.rflags = if crate::arch::x86_64::apic::interrupts_enabled(crate::arch::x86_64::cpu::self_slot()) {
         0x2 | RFLAGS_IF
     } else {
         0x2

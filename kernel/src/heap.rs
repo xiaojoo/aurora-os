@@ -73,10 +73,10 @@ fn class_of(size: usize) -> Option<usize> {
 /// 不可能让出）——那时表现不是"分配失败"而是整个内核卡在关中断的自旋里。
 #[inline]
 fn refuse_if_isr(op: &str) -> bool {
-    if !crate::apic::in_isr() {
+    if !crate::arch::x86_64::apic::in_isr() {
         return false;
     }
-    crate::apic::note_alloc_in_isr();
+    crate::arch::x86_64::apic::note_alloc_in_isr();
     let n = ISR_REFUSED.fetch_add(1, Ordering::Relaxed);
     if n < 4 {
         // 只打前四条：这是错误路径，但不能让它变成"把中断窗口拖长"的第二个故障源

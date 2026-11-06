@@ -23,7 +23,7 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use crate::acpi::Madt;
-use crate::apic;
+use crate::arch::x86_64::apic;
 use crate::driver::{DmaHandle, DriverCtx, DriverError, IrqHandle, MmioHandle};
 use crate::irq::Msg;
 use crate::mm::{self, ModuleId};
@@ -537,13 +537,13 @@ static ISR_ENTRY: AtomicUsize = AtomicUsize::new(0);
 /// L3-B（BACKLOG 73f）：**谁在服务**。总账与分账同时记，两边必须同数（那条不变量由用例判）。
 /// 只有总账的时候，"目的地搬到 AP 之后到底是谁在执行顶半"这件事只能从投递分布反推；
 /// MSI-X 一上来就是一向量一目的地，反推就不够用了。
-static ISR_ENTRY_CPU: [AtomicUsize; crate::cpu::MAX_CPUS] =
-    [const { AtomicUsize::new(0) }; crate::cpu::MAX_CPUS];
+static ISR_ENTRY_CPU: [AtomicUsize; crate::arch::x86_64::cpu::MAX_CPUS] =
+    [const { AtomicUsize::new(0) }; crate::arch::x86_64::cpu::MAX_CPUS];
 /// 同理，宽限窗那两笔按"等的那一侧是谁"分开数：`RACE_HITS` 是总数，这里是分账与每核最大间隔。
-static RACE_HITS_CPU: [AtomicUsize; crate::cpu::MAX_CPUS] =
-    [const { AtomicUsize::new(0) }; crate::cpu::MAX_CPUS];
-static RACE_MAX_CPU: [AtomicU64; crate::cpu::MAX_CPUS] =
-    [const { AtomicU64::new(0) }; crate::cpu::MAX_CPUS];
+static RACE_HITS_CPU: [AtomicUsize; crate::arch::x86_64::cpu::MAX_CPUS] =
+    [const { AtomicUsize::new(0) }; crate::arch::x86_64::cpu::MAX_CPUS];
+static RACE_MAX_CPU: [AtomicU64; crate::arch::x86_64::cpu::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; crate::arch::x86_64::cpu::MAX_CPUS];
 
 /// 顶半。规矩：不分配、不打印、不碰命令表、不发命令——只读 `PxIS`、按 W1C 原样写回、
 /// 清全局 `IS` 里本端口那一位、把旗子立起来。
@@ -566,7 +566,7 @@ fn clear_pxis(num: u8, bits: u32) -> Result<(), AhciError> {
 
 fn ahci_isr() -> bool {
     ISR_ENTRY.fetch_add(1, Ordering::Relaxed);
-    ISR_ENTRY_CPU[crate::cpu::self_slot()].fetch_add(1, Ordering::Relaxed);
+    ISR_ENTRY_CPU[crate::arch::x86_64::cpu::self_slot()].fetch_add(1, Ordering::Relaxed);
     // 引导口还没定下来 ⇒ 不认领这一发。宁可让轮询那条路把命令收掉，
     // 也不在中断上下文里走 `boot_port()`：它会 `enumerate()` 并**发射命令**（递归进自己）。
     let cached = BOOT_PORT.load(Ordering::Relaxed);
@@ -628,8 +628,8 @@ pub fn race_stats() -> (usize, u64) {
 
 /// 顶半按 CPU 的分账（索引是槽号）。与 `irq::by_cpu()` 不同源：那本数"投递到过哪颗核"，
 /// 这本数"顶半在哪颗核上跑过"——两者不等就说明派发与执行之间还有别的东西。
-pub fn isr_entry_by_cpu() -> [usize; crate::cpu::MAX_CPUS] {
-    let mut out = [0usize; crate::cpu::MAX_CPUS];
+pub fn isr_entry_by_cpu() -> [usize; crate::arch::x86_64::cpu::MAX_CPUS] {
+    let mut out = [0usize; crate::arch::x86_64::cpu::MAX_CPUS];
     for (i, c) in ISR_ENTRY_CPU.iter().enumerate() {
         out[i] = c.load(Ordering::Relaxed);
     }
@@ -637,10 +637,10 @@ pub fn isr_entry_by_cpu() -> [usize; crate::cpu::MAX_CPUS] {
 }
 
 /// 宽限窗那笔的分账：`(每核命中数, 每核最大间隔)`。
-pub fn race_by_cpu() -> ([usize; crate::cpu::MAX_CPUS], [u64; crate::cpu::MAX_CPUS]) {
-    let mut hits = [0usize; crate::cpu::MAX_CPUS];
-    let mut maxs = [0u64; crate::cpu::MAX_CPUS];
-    for i in 0..crate::cpu::MAX_CPUS {
+pub fn race_by_cpu() -> ([usize; crate::arch::x86_64::cpu::MAX_CPUS], [u64; crate::arch::x86_64::cpu::MAX_CPUS]) {
+    let mut hits = [0usize; crate::arch::x86_64::cpu::MAX_CPUS];
+    let mut maxs = [0u64; crate::arch::x86_64::cpu::MAX_CPUS];
+    for i in 0..crate::arch::x86_64::cpu::MAX_CPUS {
         hits[i] = RACE_HITS_CPU[i].load(Ordering::Relaxed);
         maxs[i] = RACE_MAX_CPU[i].load(Ordering::Relaxed);
     }
@@ -766,7 +766,7 @@ pub fn set_affinity(lapic_id: u8) -> Result<(bool, usize, Msg), AhciError> {
     let Some(msi) = caps.msi else { return Err(AhciError::NoMsi) };
     let h = irq_handle().ok_or(AhciError::NotClaimed)?;
     let m = ctx.irq_set_affinity(h, lapic_id).map_err(AhciError::Ctx)?;
-    let slot = crate::cpu::slot_of_lapic(u64::from(lapic_id)).ok_or(AhciError::NotClaimed)?;
+    let slot = crate::arch::x86_64::cpu::slot_of_lapic(u64::from(lapic_id)).ok_or(AhciError::NotClaimed)?;
     let (same, bl, bh, bd, bc) = program_msi(&msi, &m)?;
     crate::log_info!(
         "ahci: 亲和性 目的地={:#04x} 槽={} 向量={:#04x} 写=({:#010x},{:#010x},{:#010x})          读回=({:#010x},{:#010x},{:#010x}) ctrl={:#06x} 逐字一致={}",
@@ -900,7 +900,7 @@ fn wait_settled(ci: usize, d2h: u64, tfd_off: usize) -> bool {
                     let gap = tsc::now().wrapping_sub(g0);
                     RACE_HITS.fetch_add(1, Ordering::Relaxed);
                     RACE_MAX.fetch_max(gap, Ordering::Relaxed);
-                    let w = crate::cpu::self_slot();
+                    let w = crate::arch::x86_64::cpu::self_slot();
                     RACE_HITS_CPU[w].fetch_add(1, Ordering::Relaxed);
                     RACE_MAX_CPU[w].fetch_max(gap, Ordering::Relaxed);
                     return true;

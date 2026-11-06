@@ -22,7 +22,8 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use crate::{apic, clock, cpu, limine, mm, sched, sync, trap, tsc};
+use crate::{clock, limine, mm, sched, sync, tsc};
+use crate::arch::x86_64::{apic, cpu, trap};
 
 /// AP 的入口栈：4 页 + 1 页 guard（与任务栈同一条 §6.4 规则）
 const AP_STACK_PAGES: usize = 4;
@@ -568,7 +569,7 @@ fn run_race_round() {
     let phase = PHASE.load(Ordering::Acquire);
     #[cfg(feature = "serial-atomic-probe")]
     if phase == PHASE_PRINT_LINES {
-        let slot = crate::cpu::self_slot();
+        let slot = crate::arch::x86_64::cpu::self_slot();
         // 等 BSP 的那块牌，四个 CPU 才真的同时在开口
         let mut spins = 0u64;
         while PRINT_GO.load(Ordering::Acquire) != phase && spins < PRINT_GO_MAX {

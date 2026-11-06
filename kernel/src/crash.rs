@@ -161,7 +161,7 @@ fn is_code(va: u64) -> bool {
 /// 已有现场（真异常那条路给了向量号与真 RIP）就不覆盖 —— 一次崩溃只该有一条记录。
 pub fn ensure_dumped() {
     if !DUMPED.swap(true, Ordering::Relaxed) {
-        dump(NO_VECTOR, crate::cpu::self_slot(), 0).ok();
+        dump(NO_VECTOR, crate::arch::x86_64::cpu::self_slot(), 0).ok();
     }
 }
 

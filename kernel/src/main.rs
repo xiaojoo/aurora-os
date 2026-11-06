@@ -18,13 +18,12 @@ use alloc::vec::Vec;
 static GLOBAL: heap::AuroraGlobal = heap::AuroraGlobal;
 
 mod acpi;
+mod arch;
+use crate::arch::x86_64::{apic, cpu, cpuid, smp, trap};
 mod ahci;
-mod apic;
 mod boot_guard;
 mod clock;
 mod crash;
-mod cpuid;
-mod cpu;
 mod driver;
 mod elf;
 mod heap;
@@ -41,9 +40,7 @@ mod sync;
 mod resource;
 mod user;
 mod pci;
-mod smp;
 mod state_store;
-mod trap;
 mod watchdog;
 mod tsc;
 mod virtio;
@@ -449,10 +446,10 @@ extern "C" fn after_switch(_: usize) -> ! {
     // 所以这三行与 M3a/M3b-1 存档里的数字**不可直接比**；能比的只有同一构建内部的比值
     // （那正是 §12.4.1 规则 3 的判别方式，bench 就是这么判的）。
     for ps in trap::p_stats_all().iter() {
-        if ps.cpu >= crate::cpu::registered() && ps.cpu != crate::cpu::BSP_SLOT {
+        if ps.cpu >= crate::arch::x86_64::cpu::registered() && ps.cpu != crate::arch::x86_64::cpu::BSP_SLOT {
             continue;
         }
-        if ps.cpu != crate::cpu::BSP_SLOT && ps.irq.faults == 0 && ps.resume.faults == 0 {
+        if ps.cpu != crate::arch::x86_64::cpu::BSP_SLOT && ps.irq.faults == 0 && ps.resume.faults == 0 {
             continue; // 没登记或没样本的槽位不占一行
         }
         crate::log_info!(
@@ -1155,7 +1152,7 @@ fn t_timer_ticks_recur() -> bool {
     // **逐向量比对**，不是只比总数：总数相等可以藏住"IRQ0 多一个、IRQ1 少一个"，
     // 而这一轮要查的正是一个样本的来路（`asm=47 / rust=46`、非 ISA 桶 = 0 ⇒
     // 差的那一个落在 32..47 里面，总数判据到此已经给不出更多信息了）。
-    let hist = trap::p5_hist_of(crate::cpu::BSP_SLOT);
+    let hist = trap::p5_hist_of(crate::arch::x86_64::cpu::BSP_SLOT);
     let mut hist_bad = 0usize;
     let mut first_diff = "";
     for i in 0..hist.len() {
@@ -2025,7 +2022,7 @@ fn t_user_roundtrip() -> bool {
     // 里 STAR 隐式加 0x20/0x10 的前提，也必须钉住）。
     let (ui, ci) = (trap::udata_sel() >> 3, trap::ucode_sel() >> 3);
     let mut segs_ok = ui == 3 && ci == 4 && trap::udata_sel() & 3 == 3 && trap::ucode_sel() & 3 == 3;
-    for slot in 0..crate::cpu::registered() {
+    for slot in 0..crate::arch::x86_64::cpu::registered() {
         let (Some(d), Some(c)) = (trap::gdt_entry(slot, ui as usize), trap::gdt_entry(slot, ci as usize)) else {
             crate::log_fatal!("user: cpu{slot} 读不到 GDT 条目");
             segs_ok = false;
@@ -2185,8 +2182,8 @@ fn t_user_roundtrip() -> bool {
     // 而 CPU 从偏移 4 取 8 个字节，于是换栈换到一个被截断的地址（M4-1 的三重故障）。
     // ist1 与 iomap_base 此刻就装好了；rsp0 只有在换入过用户任务之后才非 0，
     // 所以三种合法读数都接受：还没装(0)、两条用户任务各自的内核栈顶。
-    let ex_top = trap::ex_stack_info(crate::cpu::BSP_SLOT).map_or(0, |i| i.top);
-    let (rsp0_now, ist1_now, iomap_now) = trap::tss_offsets(crate::cpu::BSP_SLOT).unwrap_or((0, 0, 0));
+    let ex_top = trap::ex_stack_info(crate::arch::x86_64::cpu::BSP_SLOT).map_or(0, |i| i.top);
+    let (rsp0_now, ist1_now, iomap_now) = trap::tss_offsets(crate::arch::x86_64::cpu::BSP_SLOT).unwrap_or((0, 0, 0));
     let tops = [good_top, bad_top];
     let tss_ok = ist1_now == ex_top
         && iomap_now == 104
@@ -2694,7 +2691,7 @@ fn t_elf_load_run() -> bool {
     // 另一张按"分发器被调到"计数，两者不等就说明有一类向量绕过了记账（或记了两次）。
     // 这条同时是 P5 干净的反证：把系统调用错并进 P5 的那版实现里，
     // `timer 判据` 的两台仪器差 3（= 这 3 次调用），现在它们各自对得上。
-    let sc = trap::stats_syscall_of(crate::cpu::BSP_SLOT);
+    let sc = trap::stats_syscall_of(crate::arch::x86_64::cpu::BSP_SLOT);
     crate::log_info!(
         "elfload: magic={:?} ping={:?} add={:?} unk={:?} rodata={:?} served={} unknown_nr={} rounds={} runs={} state={:?} guard_unmapped={}",
         magic,
@@ -3518,11 +3515,11 @@ fn t_syscall_fastpath() -> bool {
     let kills = user::kills();
     let served = user::served();
     let (efer, star, lstar) = trap::fast_readback();
-    let (fc, fmin, fcold, flead) = trap::p7_fast_of(crate::cpu::BSP_SLOT);
-    let ints = trap::stats_syscall_of(crate::cpu::BSP_SLOT);
-    let (area_kstack, area_slot) = trap::fast_area_of(crate::cpu::BSP_SLOT).unwrap_or((0, 0));
-    let rsp0 = trap::rsp0_of(crate::cpu::BSP_SLOT);
-    let (smep, smap) = crate::cpu::user_protections_active();
+    let (fc, fmin, fcold, flead) = trap::p7_fast_of(crate::arch::x86_64::cpu::BSP_SLOT);
+    let ints = trap::stats_syscall_of(crate::arch::x86_64::cpu::BSP_SLOT);
+    let (area_kstack, area_slot) = trap::fast_area_of(crate::arch::x86_64::cpu::BSP_SLOT).unwrap_or((0, 0));
+    let rsp0 = trap::rsp0_of(crate::arch::x86_64::cpu::BSP_SLOT);
+    let (smep, smap) = crate::arch::x86_64::cpu::user_protections_active();
     let bits = abi.unwrap_or(0) & 0xFFFF;
     crate::log_info!(
         "fast: abi={:#x} major={} minor={} 位=[fast={} smap={} smep={}] ping={:?} cs={:?} ss={:?}",

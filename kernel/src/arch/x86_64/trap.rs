@@ -118,7 +118,7 @@ impl Tss {
 /// 与 `set_rsp0`/`install_exception_stack` 写进去的数就对不上，而且对不上是**可判定的**，
 /// 不需要等到 ring3 换栈去用一次三重故障当证明。
 pub fn tss_offsets(slot: usize) -> Option<(u64, u64, u16)> {
-    if slot >= crate::cpu::MAX_CPUS {
+    if slot >= crate::arch::x86_64::cpu::MAX_CPUS {
         return None;
     }
     // SAFETY: 只读本槽位自己的 TSS；用 `read_unaligned` 而不是引用，
@@ -206,23 +206,23 @@ struct TablesSlot(UnsafeCell<Tables>);
 // 这条 SAFETY 依赖 `cpu::reserve_ap_slot` 先把槽位分好且 id 不重复——那一步由 BSP 单线程完成。
 unsafe impl Sync for TablesSlot {}
 
-static TABLES: [TablesSlot; crate::cpu::MAX_CPUS] = [const {
+static TABLES: [TablesSlot; crate::arch::x86_64::cpu::MAX_CPUS] = [const {
     TablesSlot(UnsafeCell::new(Tables {
         gdt: [0; GDT_QWORDS],
         idt: [[0; 2]; IDT_ENTRIES],
         tss: Tss::new(),
         df_stack: [0u8; PAGE],
     }))
-}; crate::cpu::MAX_CPUS];
+}; crate::arch::x86_64::cpu::MAX_CPUS];
 
 /// 每个 CPU 的 #DF 栈区间。四张表都用原子量存：BSP 要在 `cpu::is_ready(slot)` 之后
 /// 读 AP 自己写进去的数，用非原子的字段就得再造一把锁，而这里没有任何需要一起看的字段。
 /// guard==0 表示这个槽位还没换上带 guard page 的栈（仍在用 .bss 那一页）。
-static EX_GUARD: [AtomicU64; crate::cpu::MAX_CPUS] = [const { AtomicU64::new(0) }; crate::cpu::MAX_CPUS];
-static EX_LO: [AtomicU64; crate::cpu::MAX_CPUS] = [const { AtomicU64::new(0) }; crate::cpu::MAX_CPUS];
-static EX_HI: [AtomicU64; crate::cpu::MAX_CPUS] = [const { AtomicU64::new(0) }; crate::cpu::MAX_CPUS];
+static EX_GUARD: [AtomicU64; crate::arch::x86_64::cpu::MAX_CPUS] = [const { AtomicU64::new(0) }; crate::arch::x86_64::cpu::MAX_CPUS];
+static EX_LO: [AtomicU64; crate::arch::x86_64::cpu::MAX_CPUS] = [const { AtomicU64::new(0) }; crate::arch::x86_64::cpu::MAX_CPUS];
+static EX_HI: [AtomicU64; crate::arch::x86_64::cpu::MAX_CPUS] = [const { AtomicU64::new(0) }; crate::arch::x86_64::cpu::MAX_CPUS];
 /// 每个 CPU 的 #DF 栈顶（IST1 的值）。0 = 还在用 bss 里那页，没有 guard page。
-static EX_STACK_TOP: [AtomicU64; crate::cpu::MAX_CPUS] = [const { AtomicU64::new(0) }; crate::cpu::MAX_CPUS];
+static EX_STACK_TOP: [AtomicU64; crate::arch::x86_64::cpu::MAX_CPUS] = [const { AtomicU64::new(0) }; crate::arch::x86_64::cpu::MAX_CPUS];
 /// 本 CPU 的异常栈区间与栈顶，供用例逐项验证。
 #[derive(Clone, Copy, Debug)]
 pub struct ExStackInfo {
@@ -303,7 +303,7 @@ pub fn init_cpu_tables(slot: usize) {
     // MM 就绪后由 install_exception_stack 换成带 guard page 的栈。
     let bss_df_top = ((t.df_stack.as_ptr() as u64) + PAGE as u64) & !0xf;
     // packed 字段不能取引用，一律 addr_of_mut! + write_unaligned（见 `Tss` 的注释）
-    let ist1 = if slot < crate::cpu::MAX_CPUS {
+    let ist1 = if slot < crate::arch::x86_64::cpu::MAX_CPUS {
         let v = EX_STACK_TOP[slot].load(Ordering::Relaxed);
         if v == 0 { bss_df_top } else { v }
     } else {
@@ -386,7 +386,7 @@ pub fn install_exception_stack(slot: usize) -> Result<ExStackInfo, crate::mm::Mm
 
 /// 某个 CPU 的异常栈读数；None = 还没换上带 guard page 的栈。
 pub fn ex_stack_info(slot: usize) -> Option<ExStackInfo> {
-    if slot >= crate::cpu::MAX_CPUS {
+    if slot >= crate::arch::x86_64::cpu::MAX_CPUS {
         return None;
     }
     let guard = EX_GUARD[slot].load(Ordering::Acquire);
@@ -582,11 +582,11 @@ const fn new_row() -> StatsRow {
 }
 
 #[repr(C, align(64))]
-struct StatsTable(core::cell::UnsafeCell<[StatsRow; crate::cpu::MAX_CPUS]>);
+struct StatsTable(core::cell::UnsafeCell<[StatsRow; crate::arch::x86_64::cpu::MAX_CPUS]>);
 // SAFETY: 每个 CPU 只写自己那一行（写的时候本 CPU IF=0，不会与本 CPU 的第二个异常交错），
 // 跨 CPU 只有读，而且读的是 AtomicU64。行大小 64 字节对齐，所以两核不会落在同一行里互相拖慢。
 unsafe impl Sync for StatsTable {}
-static STATS: StatsTable = StatsTable(core::cell::UnsafeCell::new([const { new_row() }; crate::cpu::MAX_CPUS]));
+static STATS: StatsTable = StatsTable(core::cell::UnsafeCell::new([const { new_row() }; crate::arch::x86_64::cpu::MAX_CPUS]));
 
 /// 本 CPU 的槽位由调用方传进来，**不在这里读 LAPIC**。
 ///
@@ -644,7 +644,7 @@ fn p7_record(r: &StatsRow, vector: u64, cost: u64) {
 
 /// 快路径那套格子的读数（用例并排打印两条入口用）。
 pub fn p7_fast_of(slot: usize) -> (u64, u64, u64, [u64; 4]) {
-    if slot >= crate::cpu::MAX_CPUS {
+    if slot >= crate::arch::x86_64::cpu::MAX_CPUS {
         return (0, 0, 0, [0; 4]);
     }
     let r = row(slot);
@@ -781,7 +781,7 @@ fn stats_of_row(count: &AtomicU64, sum: &AtomicU64, min: &AtomicU64, max: &Atomi
 /// P7 专用：带"第一个样本"的读法（别的表不配这一格，所以单独一个函数）。
 pub fn stats_syscall_of(slot: usize) -> P3Stats {
     let mut s = stats_of_cpu(slot).syscall;
-    if slot < crate::cpu::MAX_CPUS {
+    if slot < crate::arch::x86_64::cpu::MAX_CPUS {
         s.first_cycles = row(slot).sc_lead[0].load(Ordering::Relaxed);
         s.cold_samples = row(slot).sc_cold.load(Ordering::Relaxed);
     }
@@ -802,7 +802,7 @@ pub fn stats_of_cpu(slot: usize) -> CpuPStats {
 }
 
 /// 已登记 CPU 的读数快照（含还没样本的 CPU，供日志一行打完）。
-pub fn p_stats_all() -> [CpuPStats; crate::cpu::MAX_CPUS] {
+pub fn p_stats_all() -> [CpuPStats; crate::arch::x86_64::cpu::MAX_CPUS] {
     let mut out = [CpuPStats {
         cpu: 0,
         resume: P3Stats { faults: 0, mean_cycles: 0, min_cycles: 0, max_cycles: 0, last_cycles: 0, first_cycles: 0, cold_samples: 0 },
@@ -811,7 +811,7 @@ pub fn p_stats_all() -> [CpuPStats; crate::cpu::MAX_CPUS] {
         syscall: P3Stats { faults: 0, mean_cycles: 0, min_cycles: 0, max_cycles: 0, last_cycles: 0, first_cycles: 0, cold_samples: 0 },
         p5_non_irq: 0,
         last_vec: 0,
-    }; crate::cpu::MAX_CPUS];
+    }; crate::arch::x86_64::cpu::MAX_CPUS];
     for (i, o) in out.iter_mut().enumerate() {
         *o = stats_of_cpu(i);
     }
@@ -822,7 +822,7 @@ pub fn p_stats_all() -> [CpuPStats; crate::cpu::MAX_CPUS] {
 /// 某个 CPU 的 P5 逐向量样本数（下标 = vector - 32）。
 pub fn p5_hist_of(slot: usize) -> [u64; VEC_IRQ_LAST - VEC_IRQ_BASE + 1] {
     let mut out = [0u64; VEC_IRQ_LAST - VEC_IRQ_BASE + 1];
-    if slot >= crate::cpu::MAX_CPUS {
+    if slot >= crate::arch::x86_64::cpu::MAX_CPUS {
         return out;
     }
     let r = row(slot);
@@ -834,34 +834,34 @@ pub fn p5_hist_of(slot: usize) -> [u64; VEC_IRQ_LAST - VEC_IRQ_BASE + 1] {
 
 /// P5 中非 ISA-IRQ 的样本数（逐 CPU 可读，BSP 用 `p5_non_irq()`）。
 pub fn p5_non_irq_of(slot: usize) -> u64 {
-    if slot >= crate::cpu::MAX_CPUS {
+    if slot >= crate::arch::x86_64::cpu::MAX_CPUS {
         return 0;
     }
     row(slot).p5_non_irq.load(Ordering::Relaxed)
 }
 
 pub fn p5_non_irq() -> u64 {
-    p5_non_irq_of(crate::cpu::BSP_SLOT)
+    p5_non_irq_of(crate::arch::x86_64::cpu::BSP_SLOT)
 }
 
 pub fn p5_samples_total() -> u64 {
-    (0..crate::cpu::MAX_CPUS).map(|s| stats_of_cpu(s).irq.faults).sum()
+    (0..crate::arch::x86_64::cpu::MAX_CPUS).map(|s| stats_of_cpu(s).irq.faults).sum()
 }
 
 /// 合法补页/恢复路径的样本总数（跨 CPU）。
 pub fn p3_faults_total() -> u64 {
-    (0..crate::cpu::MAX_CPUS).map(|s| stats_of_cpu(s).resume.faults).sum()
+    (0..crate::arch::x86_64::cpu::MAX_CPUS).map(|s| stats_of_cpu(s).resume.faults).sum()
 }
 
 /// 下面三个 `*_stats()` 是 **BSP 那一份**的读数：手册 §12.4.1 与 `tools/aurora.py bench`
 /// 的解析格式从这个形状来（`p3 resume: faults= mean= min= max=`），改成跨 CPU 汇总
 /// 会让历史基线不可比，也看不出是哪个核。跨 CPU 的数走 `p_stats_all()` 单独打一行。
 pub fn p3_resume_stats() -> P3Stats {
-    stats_of_cpu(crate::cpu::BSP_SLOT).resume
+    stats_of_cpu(crate::arch::x86_64::cpu::BSP_SLOT).resume
 }
 
 pub fn p5_irq_stats() -> P3Stats {
-    stats_of_cpu(crate::cpu::BSP_SLOT).irq
+    stats_of_cpu(crate::arch::x86_64::cpu::BSP_SLOT).irq
 }
 
 /// 本 CPU 最后一次进异常路径的向量号。
@@ -878,16 +878,16 @@ pub fn note_last_vec(cpu: usize, v: u64) {
 /// （不能拿 0 当"没记过"的哨兵，所以真实读数下压到 1，代价是 0 与 1 分不开——
 /// 而 0 周期的系统调用本来就不存在）。
 pub fn p7_first() -> u64 {
-    stats_syscall_of(crate::cpu::BSP_SLOT).first_cycles
+    stats_syscall_of(crate::arch::x86_64::cpu::BSP_SLOT).first_cycles
 }
 
 /// P7 前四次样本的代价（不足四次的位置保持 0）。
 pub fn p7_lead() -> [u64; 4] {
     let mut out = [0u64; 4];
-    if crate::cpu::BSP_SLOT >= crate::cpu::MAX_CPUS {
+    if crate::arch::x86_64::cpu::BSP_SLOT >= crate::arch::x86_64::cpu::MAX_CPUS {
         return out;
     }
-    let r = row(crate::cpu::BSP_SLOT);
+    let r = row(crate::arch::x86_64::cpu::BSP_SLOT);
     for (o, v) in out.iter_mut().zip(r.sc_lead.iter()) {
         *o = v.load(Ordering::Relaxed);
     }
@@ -895,14 +895,14 @@ pub fn p7_lead() -> [u64; 4] {
 }
 
 pub fn p5_last_vec() -> u64 {
-    stats_of_cpu(crate::cpu::BSP_SLOT).last_vec
+    stats_of_cpu(crate::arch::x86_64::cpu::BSP_SLOT).last_vec
 }
 
 /// 非法访问终止路径：从进桩到「判定致命、打完现场、准备停机」的周期数。
 /// 与上面那张表**分开**是手册 §12.4.1 的要求（两条路径分别计），合在一张表里
 /// 就等于把 200 周期的恢复和 20 周期的停机混成一个均值，谁都不能用。
 pub fn p3_fatal_stats() -> P3Stats {
-    stats_of_cpu(crate::cpu::BSP_SLOT).fatal
+    stats_of_cpu(crate::arch::x86_64::cpu::BSP_SLOT).fatal
 }
 
 pub enum Action {
@@ -930,7 +930,7 @@ pub fn dispatch(frame: &mut TrapFrame) -> Action {
     }
     if frame.vector >= VEC_IRQ_BASE as u64 {
         // 外部中断。计数与 EOI 的规则都在 apic 里，这里只负责"它不是异常"。
-        crate::apic::on_interrupt(frame.vector as usize);
+        crate::arch::x86_64::apic::on_interrupt(frame.vector as usize);
         return Action::Resume;
     }
     if frame.vector == 14 {
@@ -1020,7 +1020,7 @@ pub fn from_user(frame: &TrapFrame) -> bool {
 /// 判据仍交叉核对（`fast_area_of` vs `tss_offsets`）。
 /// **写之前本 CPU 的 IF 必须是 0**，否则一次中断可能读到改了一半的 rsp0。
 pub fn set_rsp0(slot: usize, va: u64) {
-    if slot >= crate::cpu::MAX_CPUS {
+    if slot >= crate::arch::x86_64::cpu::MAX_CPUS {
         return;
     }
     // SAFETY: 见 TablesSlot——本 CPU 写自己那一槽的 TSS
@@ -1031,7 +1031,7 @@ pub fn set_rsp0(slot: usize, va: u64) {
     // 同一个值发布给快路径：`SYSCALL` 不查 TSS，硬件不给它换栈。
     // **一个写入点喂两个消费者**，所以"rsp0 与快路径不同源"这种错法在结构上不会出现；
     // 判据仍然交叉核对（`fast_area_of` vs `tss_offsets`），因为"同一个函数写"不等于"同一个值"。
-    if slot < crate::cpu::MAX_CPUS {
+    if slot < crate::arch::x86_64::cpu::MAX_CPUS {
         // SAFETY: 本 CPU 写自己那一格
         unsafe {
             (*FAST_AREAS[slot].0.get()).kstack_top = va;
@@ -1041,7 +1041,7 @@ pub fn set_rsp0(slot: usize, va: u64) {
 
 /// 本 CPU 当前的 rsp0（0 = 还没装，那时任何 ring3 陷入都会 #DF）。
 pub fn rsp0_of(slot: usize) -> u64 {
-    if slot >= crate::cpu::MAX_CPUS {
+    if slot >= crate::arch::x86_64::cpu::MAX_CPUS {
         return 0;
     }
     // 走 `tss_offsets`：读的是**架构位置**上那 8 个字节，不是"我以为的字段"
@@ -1055,7 +1055,7 @@ pub fn rsp0_of(slot: usize) -> u64 {
 /// 那种故障只有不触发异常的一条路能提前抓到，而触发异常的那条把它报成
 /// 一个抹掉 RPL 的选择子号码（0x1b → 0x18），指不到真正错的那一位。
 pub fn gdt_entry(slot: usize, i: usize) -> Option<u64> {
-    if slot >= crate::cpu::MAX_CPUS || i >= GDT_QWORDS {
+    if slot >= crate::arch::x86_64::cpu::MAX_CPUS || i >= GDT_QWORDS {
         return None;
     }
     // SAFETY: 只读，且读的是自己那一槽
@@ -1078,7 +1078,7 @@ pub const PF_LOAD_ITERATIONS: usize = 200_000;
 pub unsafe extern "C" fn aurora_trap_entry(frame: &mut TrapFrame) {
     // P3/P5 的下界读数（新边界见 `isr_common` 出口那段的注释：不含异常桩的寄存器保存）。
     // 取完就存进本 CPU 的行，致命出口那条路径要从这里回看。
-    let cpu = crate::cpu::self_slot();
+    let cpu = crate::arch::x86_64::cpu::self_slot();
     let t0 = crate::tsc::now();
     mark_entry(cpu, t0);
     // 向量号在读数的同一时刻记下来，两条出口路径才都有读数（见 `note_last_vec`）。
@@ -1146,8 +1146,8 @@ pub fn dump_frame(f: &TrapFrame) {
     // 当成"TSS.rsp0"，而 M4-1 的排查正好被它带过一次（rsp 与 rsp0 相等的假象让我
     // 以为故障发生在 ring3→ring0 的换栈瞬间）。这里把两者分开、各自给真值。
     serial::line("cpu", format_args!("cr2={:#x} rax={:#x} rbx={:#x} rbp={:#x} pf_stale_hits={}", f.cr2, f.rax, f.rbx, f.rbp, PF_STALE_HITS.load(Ordering::Relaxed)));
-    let (smep, smap) = crate::cpu::user_protections_active();
-    serial::line("cpu", format_args!("rsp0={:#x} from_user={} smep={} smap={} cr4={:#x}", rsp0_of(crate::cpu::self_slot()), from_user(f), smep, smap, crate::cpu::cr4()));
+    let (smep, smap) = crate::arch::x86_64::cpu::user_protections_active();
+    serial::line("cpu", format_args!("rsp0={:#x} from_user={} smep={} smap={} cr4={:#x}", rsp0_of(crate::arch::x86_64::cpu::self_slot()), from_user(f), smep, smap, crate::arch::x86_64::cpu::cr4()));
 }
 
 pub fn halt_forever() -> ! {
@@ -1198,7 +1198,7 @@ struct FastSlotCell(core::cell::UnsafeCell<FastArea>);
 // SAFETY: 每个 CPU 只写自己那一格（`slot` 由 BSP 分配且互不重复，见 cpu.rs 那条），
 // 写发生在装机或换入用户任务时，本 CPU IF=0。
 unsafe impl Sync for FastSlotCell {}
-static FAST_AREAS: [FastSlotCell; crate::cpu::MAX_CPUS] = [const {
+static FAST_AREAS: [FastSlotCell; crate::arch::x86_64::cpu::MAX_CPUS] = [const {
     FastSlotCell(core::cell::UnsafeCell::new(FastArea {
         kstack_top: 0,
         slot: 0,
@@ -1208,7 +1208,7 @@ static FAST_AREAS: [FastSlotCell; crate::cpu::MAX_CPUS] = [const {
         frame_base: 0,
         _pad: [0; 2],
     }))
-}; crate::cpu::MAX_CPUS];
+}; crate::arch::x86_64::cpu::MAX_CPUS];
 
 static FAST_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// 装机时读回的 EFER/STAR/LSTAR 值，供用例核对"写了并且生效了"。
@@ -1220,7 +1220,7 @@ pub fn fastpath_on() -> bool {
 
 /// (kstack_top, slot)：判据用它交叉核对"rsp0 与快路径用的是不是同一个值"。
 pub fn fast_area_of(slot: usize) -> Option<(u64, u64)> {
-    if slot >= crate::cpu::MAX_CPUS {
+    if slot >= crate::arch::x86_64::cpu::MAX_CPUS {
         return None;
     }
     // SAFETY: 只读本 CPU 那一格的快照；跨槽读只是观测（同 `rsp0_of`）
@@ -1240,7 +1240,7 @@ pub fn fast_readback() -> (u64, u64, u64) {
 /// `int 0x80` 那条路还在，快路径是可选特性，不是启动前提。
 /// 返回值是"装了并且读回确认了"。
 pub fn install_fastpath(slot: usize) -> bool {
-    if slot >= crate::cpu::MAX_CPUS || !crate::cpuid::detect().syscall {
+    if slot >= crate::arch::x86_64::cpu::MAX_CPUS || !crate::arch::x86_64::cpuid::detect().syscall {
         return false;
     }
     extern "C" {
@@ -1253,20 +1253,20 @@ pub fn install_fastpath(slot: usize) -> bool {
     // SFMASK：TF|IF|DF|RF|AC。关 IF 由这一位给出（这条入口没有中断门替我们关）
     let sfmask: u64 = 0x100 | 0x200 | 0x400 | 0x10000 | 0x40000;
     // EFER.SCE（bit0）不打开的话 `syscall` 就是 #UD；NXE 之类保持原样
-    let efer_before = crate::cpu::rdmsr(0xC000_0080);
-    let efer = crate::cpu::wrmsr(0xC000_0080, efer_before | 1);
-    crate::cpu::wrmsr(crate::cpu::MSR_STAR, star);
-    crate::cpu::wrmsr(crate::cpu::MSR_LSTAR, addr);
-    crate::cpu::wrmsr(crate::cpu::MSR_SFMASK, sfmask);
+    let efer_before = crate::arch::x86_64::cpu::rdmsr(0xC000_0080);
+    let efer = crate::arch::x86_64::cpu::wrmsr(0xC000_0080, efer_before | 1);
+    crate::arch::x86_64::cpu::wrmsr(crate::arch::x86_64::cpu::MSR_STAR, star);
+    crate::arch::x86_64::cpu::wrmsr(crate::arch::x86_64::cpu::MSR_LSTAR, addr);
+    crate::arch::x86_64::cpu::wrmsr(crate::arch::x86_64::cpu::MSR_SFMASK, sfmask);
     // GS 的两边：用户侧清零，内核侧指向本 CPU 的那格
-    crate::cpu::wrmsr(crate::cpu::MSR_GS_BASE, 0);
+    crate::arch::x86_64::cpu::wrmsr(crate::arch::x86_64::cpu::MSR_GS_BASE, 0);
     let area = FAST_AREAS[slot].0.get() as u64;
-    let gs_seen = crate::cpu::wrmsr(crate::cpu::MSR_KERNEL_GS_BASE, area);
+    let gs_seen = crate::arch::x86_64::cpu::wrmsr(crate::arch::x86_64::cpu::MSR_KERNEL_GS_BASE, area);
     // SAFETY: 本 CPU 写自己那一格
     unsafe {
         (*FAST_AREAS[slot].0.get()).slot = slot as u64;
     }
-    let (s_seen, l_seen) = (crate::cpu::rdmsr(crate::cpu::MSR_STAR), crate::cpu::rdmsr(crate::cpu::MSR_LSTAR));
+    let (s_seen, l_seen) = (crate::arch::x86_64::cpu::rdmsr(crate::arch::x86_64::cpu::MSR_STAR), crate::arch::x86_64::cpu::rdmsr(crate::arch::x86_64::cpu::MSR_LSTAR));
     FAST_READBACK[0].store(efer, Ordering::Relaxed);
     FAST_READBACK[1].store(s_seen, Ordering::Relaxed);
     FAST_READBACK[2].store(l_seen, Ordering::Relaxed);
@@ -1284,7 +1284,7 @@ pub fn install_fastpath(slot: usize) -> bool {
 /// 快路径出口的 IF：`sysretq` 从 r11 装 rflags，而它不经过 `if_patch`（那条只打在换入上）。
 /// ADR-021"IF 属于 CPU"在这条路径上的实现点，写成一句可核对的话放在 ADR-025。
 pub fn fast_fix_if(frame: &mut TrapFrame, cpu: usize) {
-    let on = crate::apic::interrupts_enabled(cpu);
+    let on = crate::arch::x86_64::apic::interrupts_enabled(cpu);
     frame.rflags = if on { frame.rflags | 0x200 } else { frame.rflags & !0x200 };
 }
 

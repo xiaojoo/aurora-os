@@ -56,7 +56,7 @@ const MAX_REGIONS: usize = 96;
 /// 24 那个数是 M2 时代拍的，M4 一开用户态就撞上：现场是
 /// `L4: VA 保留登记表已满` 而不是任何页表错误，所以容量也得跟着里程碑复算。
 /// 登记不下时**明确失败**而不是发一条没登记的 VA（见 alloc_va_range 的注释）。
-const MAX_VA_RESERVATIONS: usize = crate::cpu::MAX_CPUS * crate::sched::MAX_TASKS + 16;
+const MAX_VA_RESERVATIONS: usize = crate::arch::x86_64::cpu::MAX_CPUS * crate::sched::MAX_TASKS + 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PhysAddr(pub u64);
@@ -1129,8 +1129,8 @@ fn unmap_pages(va: VirtAddr, count: usize) {
 static SD_VA: AtomicU64 = AtomicU64::new(0);
 static SD_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 static SD_TIMEOUTS: AtomicUsize = AtomicUsize::new(0);
-static SD_ACKS: [AtomicUsize; crate::cpu::MAX_CPUS] = [const { AtomicUsize::new(0) }; crate::cpu::MAX_CPUS];
-static SD_INVLPG: [AtomicUsize; crate::cpu::MAX_CPUS] = [const { AtomicUsize::new(0) }; crate::cpu::MAX_CPUS];
+static SD_ACKS: [AtomicUsize; crate::arch::x86_64::cpu::MAX_CPUS] = [const { AtomicUsize::new(0) }; crate::arch::x86_64::cpu::MAX_CPUS];
+static SD_INVLPG: [AtomicUsize; crate::arch::x86_64::cpu::MAX_CPUS] = [const { AtomicUsize::new(0) }; crate::arch::x86_64::cpu::MAX_CPUS];
 
 /// 等回执的上界（周期）。本机 ≈6 ms；一次 shootdown 的真实代价见用例读数。
 /// 定这么宽不是为了宽容，而是**目标 CPU 可能正关着中断在一个持锁的临界区里**
@@ -1146,7 +1146,7 @@ const SHOOTDOWN_DEADLINE_CYCLES: u64 = 20_000_000;
 /// 一个细节不能省：**即使 `SD_VA` 读出来是 0 也要回执**。请求方是按名单数回执的，
 /// 少一个就是它一直等到超时然后把整件事升成 L4——把"我没活儿"当成"我没到账"是错的。
 pub fn shootdown_self() {
-    let slot = crate::cpu::self_slot();
+    let slot = crate::arch::x86_64::cpu::self_slot();
     let va = SD_VA.load(Ordering::Acquire);
     if va != 0 {
         tlb_invalidate(va);
@@ -1156,17 +1156,17 @@ pub fn shootdown_self() {
     // 否则"等不齐也照样归还物理帧"这条路就是两个主人同一块页。
     #[cfg(not(feature = "fault-shootdown-noack"))]
     SD_ACKS[slot].fetch_add(1, Ordering::Release);
-    crate::apic::eoi_self();
+    crate::arch::x86_64::apic::eoi_self();
 }
 
 /// 请求方：让所有**其它在线** CPU 各回一次执，收不齐就升 L4。
 /// 调用前提：持有 VMM 锁（`unmap_pages` 内部）。
 fn shootdown_others(va: u64) {
-    let me = crate::cpu::self_slot();
+    let me = crate::arch::x86_64::cpu::self_slot();
     let mut want = 0usize;
-    let mut base = [0usize; crate::cpu::MAX_CPUS];
-    for s2 in 0..crate::cpu::MAX_CPUS {
-        if s2 != me && crate::cpu::is_online(s2) {
+    let mut base = [0usize; crate::arch::x86_64::cpu::MAX_CPUS];
+    for s2 in 0..crate::arch::x86_64::cpu::MAX_CPUS {
+        if s2 != me && crate::arch::x86_64::cpu::is_online(s2) {
             base[s2] = SD_ACKS[s2].load(Ordering::Acquire);
             want += 1;
         }
@@ -1178,12 +1178,12 @@ fn shootdown_others(va: u64) {
     SD_VA.store(va, Ordering::Release);
     // 逐点名（不用"除本 CPU 外全体"的缩写：本机实测收不到，理由写在 apic::send_ipi_to 上）。
     // 顺序是"先发布 VA，再发 IPI"：处理方读的就是 SD_VA，反过来它可能读到上一条请求的 VA。
-    for s2 in 0..crate::cpu::MAX_CPUS {
-        if s2 == me || !crate::cpu::is_online(s2) {
+    for s2 in 0..crate::arch::x86_64::cpu::MAX_CPUS {
+        if s2 == me || !crate::arch::x86_64::cpu::is_online(s2) {
             continue;
         }
-        let Some(dest) = crate::cpu::lapic_id_of(s2) else { continue };
-        if crate::apic::send_ipi_to(dest, crate::trap::VEC_SHOOTDOWN as u32).is_err() {
+        let Some(dest) = crate::arch::x86_64::cpu::lapic_id_of(s2) else { continue };
+        if crate::arch::x86_64::apic::send_ipi_to(dest, crate::arch::x86_64::trap::VEC_SHOOTDOWN as u32).is_err() {
             SD_VA.store(0, Ordering::Release);
             crate::log_fatal!("L4 mm: shootdown 的 IPI 发不出去（ICR 卡在投递中）va={:#x} 目标={:#x}", va, dest);
             crate::exit::finish(crate::exit::Code::ExceptionFatal);
@@ -1191,8 +1191,8 @@ fn shootdown_others(va: u64) {
     }
     let t0 = crate::tsc::now();
     loop {
-        let missing = (0..crate::cpu::MAX_CPUS).filter(|&s2| {
-            s2 != me && crate::cpu::is_online(s2) && SD_ACKS[s2].load(Ordering::Acquire) == base[s2]
+        let missing = (0..crate::arch::x86_64::cpu::MAX_CPUS).filter(|&s2| {
+            s2 != me && crate::arch::x86_64::cpu::is_online(s2) && SD_ACKS[s2].load(Ordering::Acquire) == base[s2]
         }).count();
         if missing == 0 {
             break;
@@ -1216,13 +1216,13 @@ fn shootdown_others(va: u64) {
 pub struct ShootdownStats {
     pub requests: usize,
     pub timeouts: usize,
-    pub acks: [usize; crate::cpu::MAX_CPUS],
-    pub invlpg: [usize; crate::cpu::MAX_CPUS],
+    pub acks: [usize; crate::arch::x86_64::cpu::MAX_CPUS],
+    pub invlpg: [usize; crate::arch::x86_64::cpu::MAX_CPUS],
 }
 
 pub fn shootdown_stats() -> ShootdownStats {
-    let mut acks = [0usize; crate::cpu::MAX_CPUS];
-    let mut invlpg = [0usize; crate::cpu::MAX_CPUS];
+    let mut acks = [0usize; crate::arch::x86_64::cpu::MAX_CPUS];
+    let mut invlpg = [0usize; crate::arch::x86_64::cpu::MAX_CPUS];
     for (i, (a, v)) in acks.iter_mut().zip(invlpg.iter_mut()).enumerate() {
         *a = SD_ACKS[i].load(Ordering::Relaxed);
         *v = SD_INVLPG[i].load(Ordering::Relaxed);
