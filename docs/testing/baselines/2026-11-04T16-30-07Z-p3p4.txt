@@ -1,0 +1,6 @@
+# P3/P4 原始输出（2026-11-04T16-30-07Z）。可比性依据 §12.4.1 规则 2，跨机只看比值。
+host_cpu=Intel64 Family 6 Model 183 Stepping 1, GenuineIntel qemu_cpu=max smp=4 mem=512M rust=见 tools/versions.toml
+discriminate=yes p4_repeat_spread_pct=3
+no-load#1 verdict=PASS rc=33 p3_faults,mean,min,max=(2, 103350, 1383, 205318) p4_stages,total,bytes=(7, 68070873, 5968)
+no-load#2 verdict=PASS rc=33 p3_faults,mean,min,max=(2, 102549, 1421, 203678) p4_stages,total,bytes=(7, 70811248, 5968)
+bench-pf-load verdict=PASS rc=33 p3_faults,mean,min,max=(2, 412092, 230562, 593622) p4_stages,total,bytes=(7, 69567960, 5970)

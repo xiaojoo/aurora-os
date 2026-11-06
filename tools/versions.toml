@@ -1,0 +1,38 @@
+# Aurora OS 工具链与第三方产物版本固定（手册 §3.1 要求）
+# 本机实测情况：github.com 的 release 资产主机 objects.githubusercontent.com
+# 连接被重置，但 git-over-HTTPS 到 github.com 可用 —— 因此 Limine 走 git clone
+# 取 -binary 标签内的预编译产物，而不是 release 资产下载。
+# 升级任何一项都要走评审（手册 §3.1）。
+
+[rust]
+channel = "1.99.1"                      # rustc 1.99.1 (58cf8f9c3 2026-10-13)
+host = "x86_64-pc-windows-msvc"
+target_bare = "x86_64-unknown-none"     # Tier 2，stable 可用，默认 kernel code model、无红区、不发 SSE
+components = ["llvm-tools"]
+install_root = ".tools/rustup"
+source = "https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe"
+
+[qemu]
+version = "2026-08-11 Windows 构建（QEMU 11.1.0）"
+install_root = ".tools/qemu"
+source = "https://qemu.weilnetz.de/w64/2026/qemu-w64-setup-20260811.exe"
+sha512 = "5bcf9eed634e8575a37b74f445af41a2fe4106da512d0c30c368301d4c105037fdfab40a5287367a28a957624cddebbc8c07e16c88ab6634f554cdf3d16bf543"
+# 该 sha512 取自 scoop 官方 main bucket 的 qemu.json（与安装器同版本），不是自算的参考值
+ovmf = ".tools/qemu/share/qemu/edk2-x86_64-code.fd"
+
+[limine]
+# 预编译产物标签（含 BOOTX64.EFI 与 Windows 宿主工具 limine.exe）
+binary_tag = "v11.4.1-binary"
+protocol_repo = "https://github.com/limine-bootloader/limine-protocol"
+protocol_ref = "trunk"
+# 本手册内核一侧请求的 base revision；bootloader 若不支持会在 tag 第 2 分量回写实际值，
+# 由内核在启动日志里打印，不硬信文档。
+requested_base_revision = 5
+pinned_reason = "release 资产主机在本机不可达；-binary 标签走 git 可取，且 11.4.1 已提供 HHDM/内存映射/帧缓冲请求"
+known_limitation = "11.4.1 早于 12.9.6；协议 rev5 的 IOMMU/LAPIC 交接保证是否全部落实，以内核启动日志打印的实际协商 revision 为准"
+
+[host]
+# 手册 A.5 登记的 M0 阻塞项“host 平台声明”，在此定下：
+primary = "Windows 11 x64 + Git Bash（MSYS2 层）"
+python = "3.12.10"
+note = "§3.5 的 sh 脚本路线已放弃；统一入口改为 tools/aurora.py（Python，跨 Windows/Linux 通用），CI 镜像后续与之一致"

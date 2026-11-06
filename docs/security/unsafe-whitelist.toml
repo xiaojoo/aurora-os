@@ -1,0 +1,24 @@
+# unsafe 登记表（手册 §1.3 的唯一来源）
+#
+# 规则：
+#   * 只有这里列出的 crate 可以含 unsafe；其余 crate 必须 #![forbid(unsafe_code)]
+#   * CI 双向对账：登记了但实际 unsafe 统计为 0 -> 报“白名单虚报”；
+#     实际有 unsafe 但未登记 -> 报“越权 unsafe”（§1.3 第 6 条）
+#   * 每条都要写 reason 与 expires；到期未处理就得改成正式条目或删除该 unsafe
+#
+# 检查脚本：python tools/aurora.py check
+
+[crate.aurora-kernel]
+reason = "垂直切片阶段整个内核就是一个二进制 crate，异常桩/描述符表/端口 I/O 都在里面"
+scope = "trap.rs(asm+描述符+CR2) · serial.rs(端口) · limine.rs(启动信息指针转引用) · cpuid.rs · main.rs(read_volatile)"
+# M4-2 之后这条 scope 已经**不再完整**（sched/sync/apic/mm/cpu/smp/user/tsc 也都有 unsafe），
+# 而门禁是按包计数的，所以这行写漏不会让检查失败——那正是它该被写全的理由。
+# 逐包拆分之前，先把"这个包里 unsafe 集中在哪几类"说明白，而不是留一份 M1 时代的清单。
+scope_actual = "asm 全局符号与异常桩(trap/sched/cpu) · 描述符表与 CR4/CR3(trap/cpu/mm) · 端口与 MMIO(serial/apic) · 页表遍历(mm) · per-CPU 静态区的裸指针读写(sched/sync/resource/smp/user/cpu) · 内联 asm 的取指/STAC-CLAC(user) · ktest 里的现场读回(main) · 句柄表里那一段连续物理内存的 volatile 字节/双字访问与 `UnsafeCell` 表(driver) · 驱动静态区取句柄(ahci，只剩 5 处，全部是拿句柄不是拿指针) · 崩溃现场的有界栈走(crash：两处 read_volatile，每处都先过"8 字节对齐 + 内核半区 + 已映射"三关，读回来的值只进记录、不解引用、不参与控制流)"
+expires = "M2：按 §2.5 拆出 aurora-arch / aurora-hw / aurora-mm-core 后，本条改为逐 crate 登记"
+
+# M4-2：第一个用户程序（测试夹具）。它的 unsafe 只有两类，都写在源码注释里。
+[crate.aurora-user-hello]
+reason = "它是产物而不是库：唯一的 unsafe 需求是 `int 0x80` 与一个自跳转，没有任何指针算术、没有内存操作、不碰任何内核对象"
+scope = "main.rs：3 次 int 0x80（inlateout rax + in rdi/rsi）、panic 与收尾各一个 `jmp .` 自跳转"
+expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe；多了就得回这条账"

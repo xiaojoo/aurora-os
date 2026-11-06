@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = ["kernel", "user/hello"]
+
+# 垂直切片阶段只有 kernel 一个 crate。§2.5 的 api/impl 拆分等第一个真实
+# 实现出现后再展开，避免"先造空壳再填肉"（Sandi Metz：错误的抽象比重复更贵）。
+#
+# `user/hello` 是 M4-2 加进来的**第一个非内核成员**，它是产物而不是库：
+# 它没有依赖、不该被宿主构建、也不参与 `cargo test`——构建它只有一条路，
+# 就是 tools/aurora.py 给它单独传 RUSTFLAGS（链接脚本与内核那个不同）。
+# 留在 members 里是为了让 `cargo metadata`/`check-crates` 数得到它（§2.5 R10）。
+# 新增 crate 必须同时登记进 docs/…/crates.toml 与本文件（§2.5 R10 的机器可读版）。
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "warn"
+dbg_macro = "deny"
+
+[profile.release]
+panic = "abort"
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
+
+[profile.dev]
+panic = "abort"

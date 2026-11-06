@@ -1,0 +1,31 @@
+# crate 清单（手册 §2.5 R10 的机器可读版）
+#
+# 这是唯一来源：正文引用的每个 crate 都必须同时出现在这里与根 Cargo.toml 的 members，
+# CI 用 cargo metadata 与实际包集合双向比对（python tools/aurora.py check-crates）。
+#
+# 垂直切片阶段只有 aurora-kernel 一个包。§2.5 的 api/impl 拆分等第一个真实实现
+# 出现后再展开——先造空壳只会得到一堆没人实现的 trait。
+
+crate.aurora-kernel = "aurora-kernel"
+
+# M4-2：第一个用户程序的**产物**包。它不是库、没有 api/impl 之分，
+# 登记它是为了让 §2.5 R10 的双向比对覆盖到"仓库里存在的包都必须有说明"这条。
+crate.aurora-user-hello = "aurora-user-hello"
+
+# ---------------------------------------------------------------- 许可证策略（§11.2 R10 / ADR-009b）
+#
+# 白名单与"登记过的留空"的唯一来源就在这里，`check-sbom` 直接读这两段。
+# ADR-009b（发布许可证）还没定 ⇒ 两个成员**故意没有** license 字段：
+# 留空必须是登记过的留空（带理由与到期条件），不是没人注意的空白，
+# 也不是随手填一个 MIT 把它糊过去。
+
+license.allow[] = "MIT"
+license.allow[] = "Apache-2.0"
+license.allow[] = "BSD-3-Clause"
+license.allow[] = "BSD-2-Clause"
+license.allow[] = "ISC"
+license.allow[] = "Zlib"
+license.allow[] = "MPL-2.0"
+
+license.pending.aurora-kernel = "ADR-009b 未定（发布许可证由安全委员会在 M9 前确定，手册 §11.2/§15.4）"
+license.pending.aurora-user-hello = "同上：它是内核的产物夹具，许可证随内核一起定"

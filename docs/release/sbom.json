@@ -1,0 +1,33 @@
+{
+  "format": "aurora-sbom-v1",
+  "generator": "tools/aurora.py release",
+  "note": "外部 crate 数为 0 是实测而不是省略；依赖出现的第一天 check-sbom 就要管到它",
+  "workspace_packages": 2,
+  "external_packages": 0,
+  "packages": [
+    {
+      "name": "aurora-kernel",
+      "version": "0.0.0",
+      "license": "",
+      "source": "workspace",
+      "description": ""
+    },
+    {
+      "name": "aurora-user-hello",
+      "version": "0.0.0",
+      "license": "",
+      "source": "workspace",
+      "description": ""
+    }
+  ],
+  "kernel_elf_sha256": "84c27191f859876231e440198c5e282c6227dc8b1321a5210f1e36cd9b1f170e",
+  "image_sha256": "75c6d9939f7a3a1985df74a1dd6434036aad3124e6382b83b2536c256a32df0b",
+  "image_file_digests": {
+    "/EFI/": "e3b0c44298fc1c14",
+    "/EFI/BOOT/": "e3b0c44298fc1c14",
+    "/EFI/BOOT/BOOTX64.EFI": "333f7a69379b1f47",
+    "/boot/": "e3b0c44298fc1c14",
+    "/boot/aurora.bin": "84c27191f8598762",
+    "/limine.conf": "ceb9d14a0d1eea51"
+  }
+}

@@ -1,0 +1,10 @@
+# 工具链固定（手册 §3.1）
+#
+# 这里写 "stable" 而不是 "1.99.1"：本机 rustup 安装的是 stable 频道
+# （当前解析为 rustc 1.99.1 / cargo 1.99.1，见 tools/versions.toml）。
+# 若写具体版本号，rustup 会尝试另下载一个同名工具链，而版本号的真实锁定
+# 由 tools/versions.toml + CI 容器镜像负责，rust-toolchain.toml 只做频道声明。
+[toolchain]
+channel = "stable"
+components = ["rust-src", "clippy", "rustfmt", "llvm-tools"]
+targets = ["x86_64-unknown-none"]

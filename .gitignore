@@ -1,0 +1,36 @@
+# 构建产物与便携工具链（按用户要求全部留在项目内，不写系统）
+/tools/.build/
+/build/
+target/
+**/*.rs.bk
+*.img
+serial.log
+.qemu.pid
+
+# 便携工具链本体（体积大且由 tools/versions.toml 固定来源与校验值）
+/.tools/rustup/
+/.tools/cargo/
+/.tools/qemu/
+/.tools/*.exe
+/.tools/*.zip
+/.tools/*.json
+/.tools/limine-bin/
+/.tools/limine-src/
+/.tools/limine-protocol/
+/.tools/limine-1141/
+
+# 临时量具与探针
+/.scratch/
+
+# 取证用的 QEMU 源码拷贝与安装包分片：体积 200 MB、且是 GPLv2 上游源码的副本，
+# 不进仓库（要重取用 .tools/fetch_qemu.sh；文档里引用的是版本号+文件路径，不是这些副本）
+/.tools/qemu-src/
+/.tools/*.parts/
+/.tools/qemu-merged.exe
+
+# 编辑器本机状态
+/.idea/
+
+# Python 编译产物
+__pycache__/
+*.pyc

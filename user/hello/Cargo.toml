@@ -1,0 +1,16 @@
+[package]
+name = "aurora-user-hello"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# 第一个用户程序。它**不是内核 workspace 的普通成员**：它要用另一个链接脚本、
+# 另一个入口，且永远不该被宿主 `cargo test` 编译。构建入口只有 `python tools/aurora.py`
+# （ADR-016：一条命令做完全套），它给这个包单独传 RUSTFLAGS，覆盖
+# `.cargo/config.toml` 里 `[target.x86_64-unknown-none]` 那组**为内核写死**的链接参数。
+[[bin]]
+name = "hello"
+path = "src/main.rs"
+
+[lints]
+workspace = true

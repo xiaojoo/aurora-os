@@ -1,0 +1,13 @@
+# 说明（手册 V1.2 R15）：**这里故意不写 [build] target**。
+# 写了之后 `cargo test` 会用 bare-metal 目标编译测试二进制再回宿主执行，直接失败。
+# 目标由 tools/aurora.py 在命令行上显式传 --target。
+#
+# 注意 rustc 的工作目录是**被构建的包目录**（kernel/），所以链接脚本用相对包根的路径。
+[target.x86_64-unknown-none]
+rustflags = [
+  "-C", "link-arg=-Tkernel/linker.ld",   # 相对**仓库根**：lld 的 CWD 是调用 cargo 的目录
+  "-C", "relocation-model=static",     # 非 PIE：Limine 的不可重定位内核直接用 higher-half 虚拟地址
+  "-C", "force-frame-pointers=yes",    # 便于栈回溯（§9.7 CrashRecord.backtrace）
+  "-C", "panic=abort",                 # ADR-005
+  "-C", "opt-level=1",
+]
