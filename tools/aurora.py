@@ -262,8 +262,11 @@ STORM_LOG = BUILD / "ahci-storm.log"
 # 而 `-machine kernel_irqchip=off` 被 KVM 直接拒绝（`KVM does not support userspace APIC`）
 # ⇒ "投给了谁/CPU 收到了几发"这两维在 KVM 档结构上读不到，只有设备事件读得到（BACKLOG 76a/76b）。
 DELIVER_LOG = BUILD / "apic-deliver.log"
+# 事件清单里为什么带 `pit_ioport_write`：它是 `apic::pit_mark()` 留下的窗口游标
+# （`[0x3] <- 0x0`，实测 QEMU 打 `0x0` 不补零）。为什么不带 RTC：`0x70/0x71` 在这台
+# OVMF/QEMU 上写进去读不回来，且 `mc146818rzy_*` 一条都不产出（已实测，别再挂回去）。
 DELIVER_EVENTS = ["apic_deliver_irq", "apic_local_deliver", "ahci_irq_raise", "ahci_check_irq",
-                  "mc146818rzy_write"]
+                  "pit_ioport_write"]
 NET_MAC = "52:54:00:12:34:56"      # 只用于 `mac=`：内核读的是设备配置空间里那份，不拿它当判据
 
 # 这一帧的形状与内核 `virtio.rs` 里那几行是同一张表，由 `check-net-pattern` 逐字对账
