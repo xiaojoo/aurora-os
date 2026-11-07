@@ -35,6 +35,14 @@ pub struct LockRank(pub u8);
 /// `堆(10) -> VMM(20) -> PMM(30) -> 台账(40)`；ACPI(50) 目前只在启动期单独用。
 /// 新增一把锁必须先改 `docs/architecture/lock-order.md`（§7.1 的原文要求）。
 pub const RANK_HEAP: LockRank = LockRank(10);
+/// 每 CPU 运行队列的所有权（ADR-047 决策 2，`sched::RQ`）。
+///
+/// 为什么是 8 而不是 9 或 12：`INNERMOST` 用 0 表示"没持锁"（`prev_rank != 0` 那道判据），
+/// 所以比堆更外层的锁只有 1..9 这九格可取；`spawn` 在队列锁内要任务栈 ⇒ 必须能向下嵌套
+/// `HEAP(10)`，因此 8 < 10；留 9 是给"将来仍在堆之下、但在队列之外"的锁。
+/// 允许的内部嵌套见 `docs/architecture/lock-order.md`：**不许**跨 `context_load` 持有，
+/// 也不许在锁内 drop `Mapping`（那会等 shootdown 回执 = 等别的 CPU 开中断）。
+pub const RANK_RUNQ: LockRank = LockRank(8);
 pub const RANK_VMM: LockRank = LockRank(20);
 pub const RANK_PMM: LockRank = LockRank(30);
 /// 用户句柄表（P7）。只读文件对象**不持有页框** ⇒ 表锁内只许调台账(40)、不许调 mm(20)；

@@ -181,19 +181,25 @@ pub fn terminate_task(task: usize) -> bool {
         return false;
     }
     let cpu = cpu_of(task);
-    let s = rq(cpu);
-    let slot = slot_of(task);
-    if s.tasks[slot].state == TaskState::Free {
-        return false;
-    }
-    s.tasks[slot].state = TaskState::Free;
-    s.tasks[slot].frame = 0;
-    s.entries[slot] = None;
-    if s.current == task {
+    let (slot, on_cpu_now, has_bag) = {
+        let mut s = rq(cpu);
+        let slot = slot_of(task);
+        if s.tasks[slot].state == TaskState::Free {
+            return false;
+        }
+        s.tasks[slot].state = TaskState::Free;
+        s.tasks[slot].frame = 0;
+        s.entries[slot] = None;
+        (slot, s.current == task, s.tasks[slot].owned.n > 0)
+    };
+    // 放掉队列锁之后再回收：`release_owned` 自己分段取锁，而它中间要 drop `Mapping`
+    // （拿 VMM 锁、可能等 shootdown 回执）。拿着队列锁去等一把跨 CPU 的锁，等于把两条
+    // 不变量绑成一条——这正是 ADR-047 决策 2 禁止的形状。
+    if on_cpu_now {
         // 正在 CPU 上：等下一次抢占点换下去（`mark_need` 由调用方负责，
         // SYS_EXIT 的路径会立刻立牌；旁观者路径靠本 CPU 的下一次 tick）。
         REAP_PENDING[cpu].fetch_add(1, Ordering::AcqRel);
-    } else if s.tasks[slot].owned.n > 0 {
+    } else if has_bag {
         // 已经不在 CPU 上了，就地回收安全
         release_owned(cpu, slot);
     }
@@ -203,7 +209,7 @@ pub fn terminate_task(task: usize) -> bool {
 /// 释放某个槽位名下的映射。**调用前必须确认这个槽位不在本 CPU 上运行**。
 fn release_owned(cpu: usize, slot: usize) {
     let n = {
-        let s = rq(cpu);
+        let mut s = rq(cpu);
         core::mem::take(&mut s.tasks[slot].owned.n)
     };
     // 把映射从槽位里搬出来再 drop：不能在持有 `&mut RunQueue` 的时候逐个 drop，
@@ -212,7 +218,7 @@ fn release_owned(cpu: usize, slot: usize) {
     let mut bag = OwnedSet::new();
     let mut released = 0usize;
     {
-        let s = rq(cpu);
+        let mut s = rq(cpu);
         for i in 0..n.min(MAX_OWNED) {
             if let Some(m) = s.tasks[slot].owned.items[i].take() {
                 bag.items[i] = Some(m);
@@ -228,7 +234,7 @@ fn release_owned(cpu: usize, slot: usize) {
     if released > 0 {
         REAP_RELEASED.fetch_add(released as u64, Ordering::Relaxed);
     }
-    let s = rq(cpu);
+    let mut s = rq(cpu);
     s.tasks[slot].kstack_lo = 0;
     s.tasks[slot].kstack_hi = 0;
     s.tasks[slot].kstack_top = 0;
@@ -279,13 +285,13 @@ pub fn reap(cpu: usize) -> usize {
         #[cfg(feature = "handles")]
         {
             let id = {
-                let s = rq(cpu);
+                let mut s = rq(cpu);
                 s.tasks[slot].id
             };
             crate::handle::revoke_task(gi, id);
         }
         release_owned(cpu, slot);
-        let s = rq(cpu);
+        let mut s = rq(cpu);
         s.tasks[slot].state = TaskState::Free;
         s.tasks[slot].frame = 0;
         s.tasks[slot].runs = 0;
@@ -333,17 +339,48 @@ const EMPTY_QUEUE: RunQueue = RunQueue {
 };
 
 #[repr(C, align(64))]
-struct QueueCell(core::cell::UnsafeCell<RunQueue>);
-// SAFETY: 每条队列**只由它自己的 CPU 读写**——BSP 槽位 0，AP 在 `cpu::reserve_ap_slot`
-// 里拿到自己的槽位之后只碰 `RQ[自己的槽位]`。这条前提下面还有两条必须一起成立，
-// 少一条这里就是数据竞争：
-//   * `spawn` 只往**调用者所在 CPU** 的队列里放任务（`Task::on_cpu` 由它写入）；
-//   * 任务不迁移——`pick_next` 的过滤条件包含 `on_cpu == 本 CPU`，所以别的核选不到它。
-// 将来加迁移时，这段 SAFETY 必须重写成"迁移窗口内两边都关中断并持有队列所有权"，
-// 不能沿用"没人会碰"这种靠人守的论证。
+struct QueueCell {
+    lock: crate::sync::IrqSpinLock<()>,
+    data: core::cell::UnsafeCell<RunQueue>,
+}
+// SAFETY: 队列的**写**只发生在持有 `lock`（`RANK_RUNQ`，取锁即关 IF）的时候，
+// 由 `RqLock` 这个句柄保证——拿不到句柄就改不了 `data`。
+// 剩下的一类访问是**跨核只读快照**（`state_of`/`current_of`/`runs_of` 等），
+// 它们刻意不取锁：那是观测用的弱读，判据只用它做"归属对不对"这类断言，
+// 不参与任何调度决定（要按它决定就得先有迁移协议，ADR-047 的 P9）。
+// ADR-047 之前这段论证是"每条队列只由它自己的 CPU 读写"，那是靠人守的事实；
+// 现在写权归锁，所以这条 unsafe 的凭据换成了锁本身。
 unsafe impl Sync for QueueCell {}
-static RQ: [QueueCell; crate::arch::x86_64::cpu::MAX_CPUS] =
-    [const { QueueCell(core::cell::UnsafeCell::new(EMPTY_QUEUE)) }; crate::arch::x86_64::cpu::MAX_CPUS];
+static RQ: [QueueCell; crate::arch::x86_64::cpu::MAX_CPUS] = [const {
+    QueueCell { lock: crate::sync::IrqSpinLock::new(crate::sync::RANK_RUNQ, ()), data: core::cell::UnsafeCell::new(EMPTY_QUEUE) }
+}; crate::arch::x86_64::cpu::MAX_CPUS];
+
+/// 一条队列的所有权句柄：持有它 = 本 CPU 关着中断独占这条队列。
+///
+/// 两条规矩（ADR-047）：
+/// * **不许跨过 `context_load`**——换栈时本句柄的 `Drop` 不会在预期位置执行，
+///   per-CPU 的等级栈与 IF 归属会一起错位（`lock-order.md` 的 M3b-1 那一节）；
+/// * **不许在句柄活着的时候 `drop Mapping` / 等 shootdown 回执**——那是拿队列锁去等一把
+///   跨 CPU 的锁，两条不变量会绑成一条（`release_owned` 因此自己分段取锁）。
+struct RqLock {
+    cell: &'static QueueCell,
+    _g: crate::sync::IrqGuard<'static, ()>,
+}
+
+impl core::ops::Deref for RqLock {
+    type Target = RunQueue;
+    fn deref(&self) -> &RunQueue {
+        // SAFETY: 见 QueueCell——`_g` 证明本 CPU 持有这条队列的 RANK_RUNQ 锁。
+        unsafe { &*self.cell.data.get() }
+    }
+}
+
+impl core::ops::DerefMut for RqLock {
+    fn deref_mut(&mut self) -> &mut RunQueue {
+        // SAFETY: 同上；`&mut self` 保证同一时刻只有一个可变句柄。
+        unsafe { &mut *self.cell.data.get() }
+    }
+}
 
 /// 每条 CPU 的调度标志，**一行一条缓存行**：三个原子数组按 CPU 铺开时，
 /// 八个原子量正好挤在同一条 64 字节行里，而它就在被测路径正中间（读 `NEED_RESCHED`、写 `TICKS`）
@@ -396,14 +433,15 @@ pub fn rsp0_writes() -> u64 {
 }
 
 #[inline]
-fn rq(cpu: usize) -> &'static mut RunQueue {
-    // SAFETY: 见 QueueCell——调用方必须就是 `cpu` 那个 CPU（或由它独占的那段启动期）
-    unsafe { &mut *RQ[cpu].0.get() }
+fn rq(cpu: usize) -> RqLock {
+    // SAFETY: `RQ` 是定长静态数组，调用方保证 cpu < MAX_CPUS（各入口都有检查）。
+    let cell = &RQ[cpu];
+    RqLock { cell, _g: cell.lock.lock() }
 }
 
 /// 本 CPU 的队列。
 #[inline]
-fn my_rq() -> &'static mut RunQueue {
+fn my_rq() -> RqLock {
     rq(crate::arch::x86_64::cpu::self_slot())
 }
 
@@ -491,7 +529,7 @@ pub fn current_identity() -> Option<(usize, u32)> {
     let cpu = crate::arch::x86_64::cpu::self_slot();
     let gi = current_of(cpu);
     let slot = slot_of(gi);
-    let s = rq(cpu);
+    let mut s = rq(cpu);
     let t = &s.tasks[slot];
     if t.state == TaskState::Free {
         None
@@ -509,7 +547,7 @@ pub fn identity_of(gidx: usize) -> Option<(usize, u32)> {
     }
     let cpu = cpu_of(gidx);
     let slot = slot_of(gidx);
-    let s = rq(cpu);
+    let mut s = rq(cpu);
     let t = &s.tasks[slot];
     if t.state == TaskState::Free {
         None
@@ -526,7 +564,7 @@ pub fn current_of(cpu: usize) -> usize {
     // SAFETY: 只读，且读的是**别的 CPU 独占**的那条队列——这是一个无同步的快照读，
     // 用途仅限观测（判据只用它做"不等于"这种弱断言），不参与任何决策。
     // 这条不是可重用的接口：真要按它做调度决定，必须先有迁移锁。
-    unsafe { (*RQ[cpu].0.get()).current }
+    unsafe { (*RQ[cpu].data.get()).current }
 }
 
 /// (本 CPU 的切换次数, 本 CPU 的 tick 数, 可调度任务数)。
@@ -646,7 +684,7 @@ pub fn owned_of(i: usize) -> usize {
         return 0;
     }
     // SAFETY: 只读快照，理由同 `current_of`
-    unsafe { (*RQ[cpu_of(i)].0.get()).tasks[slot_of(i)].owned.count() }
+    unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].owned.count() }
 }
 
 /// 某个任务当前的续跑点（全局下标）。None = 这个槽位没登记过任务。
@@ -657,14 +695,14 @@ pub fn task_frame(task: usize) -> Option<u64> {
         return None;
     }
     // SAFETY: 只读快照，理由同 `current_of`
-    Some(unsafe { (*RQ[cpu_of(task)].0.get()).tasks[slot_of(task)].frame })
+    Some(unsafe { (*RQ[cpu_of(task)].data.get()).tasks[slot_of(task)].frame })
 }
 
 /// 把当前上下文登记为任务 0（启动上下文）。
 pub fn init_boot_task() {
     let (lo, hi) = mm::boot_stack_range();
     let cpu = crate::arch::x86_64::cpu::self_slot();
-    let s = rq(cpu);
+    let mut s = rq(cpu);
     s.tasks[0] = Task {
         id: 0,
         frame: 0,
@@ -694,7 +732,7 @@ pub fn init_boot_task() {
 /// `preempt_point` 的"帧在不在这条栈上"那道检查会一直判否，然后白倒一次标志。
 pub fn init_idle_task(stack_lo: u64, stack_hi: u64, guarded: bool) {
     let cpu = crate::arch::x86_64::cpu::self_slot();
-    let s = rq(cpu);
+    let mut s = rq(cpu);
     s.tasks[0] = Task {
         id: 0,
         frame: 0,
@@ -733,7 +771,7 @@ pub fn spawn(entry: fn() -> !) -> Result<usize, mm::MmError> {
     owned.push(m)?;
     let stack_hi = win.0 + (STACK_VA_PAGES as u64) * mm::PAGE as u64;
 
-    let s = rq(cpu);
+    let mut s = rq(cpu);
     let slot = (0..MAX_TASKS).find(|&i| s.tasks[i].state == TaskState::Free).ok_or(mm::MmError::Unsupported)?;
     // 合成首次运行的异常帧：放在栈顶往下，字段顺序必须与 trap::TrapFrame 逐格一致。
     let f = (stack_hi - trap::TRAP_FRAME_BYTES as u64) as usize;
@@ -791,7 +829,7 @@ pub fn spawn_user(entry_rip: u64, user_stack_top: u64, mut res: OwnedSet) -> Res
     res.push(m)?;
     let kstack_hi = win.0 + (STACK_VA_PAGES as u64) * mm::PAGE as u64;
 
-    let s = rq(cpu);
+    let mut s = rq(cpu);
     let slot = (0..MAX_TASKS).find(|&i| s.tasks[i].state == TaskState::Free).ok_or(mm::MmError::Unsupported)?;
     let f = (kstack_hi - trap::TRAP_FRAME_BYTES as u64) as usize;
     let mut frame = [0u64; 23];
@@ -832,12 +870,19 @@ pub fn spawn_user(entry_rip: u64, user_stack_top: u64, mut res: OwnedSet) -> Res
 /// 所有任务入口的统一跳板。
 extern "C" fn trampoline() -> ! {
     let me = current_id();
-    let s = my_rq();
-    let entry = s.entries[slot_of(me)];
+    // 入口指针要在**放掉队列锁之后**再调：工人函数体里会 spawn、会结束任务，那都要取队列锁，
+    // 拿着锁调它 = 同 CPU 重入 = 当场 L4（ADR-047 决策 2：持锁不许跨未知回调）。
+    let entry = {
+        let s = my_rq();
+        s.entries[slot_of(me)]
+    };
     if let Some(f) = entry {
         f();
     }
-    s.tasks[slot_of(me)].state = TaskState::Done;
+    {
+        let mut s = my_rq();
+        s.tasks[slot_of(me)].state = TaskState::Done;
+    }
     loop {
         crate::tsc::spin(1000);
     }
@@ -909,7 +954,7 @@ pub fn on_cpu_of(i: usize) -> Option<usize> {
         return None;
     }
     // SAFETY: 只读快照，理由同 `current_of`
-    Some(unsafe { (*RQ[cpu_of(i)].0.get()).tasks[slot_of(i)].on_cpu as usize })
+    Some(unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].on_cpu as usize })
 }
 
 /// 第 i 个任务的栈区间与"有没有 guard page"。用例要靠它验证 §6.4 那条不变量。
@@ -918,7 +963,7 @@ pub fn stack_bounds(i: usize) -> Option<(u64, u64, bool)> {
         return None;
     }
     // SAFETY: 只读快照，理由同 `current_of`
-    let t = unsafe { &(*RQ[cpu_of(i)].0.get()).tasks[slot_of(i)] };
+    let t = unsafe { &(*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)] };
     if t.stack_lo == 0 {
         return None;
     }
@@ -935,7 +980,7 @@ pub fn kstack_top_of(i: usize) -> Option<u64> {
         return None;
     }
     // SAFETY: 只读快照，理由同 `current_of`
-    let t = unsafe { &(*RQ[cpu_of(i)].0.get()).tasks[slot_of(i)] };
+    let t = unsafe { &(*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)] };
     if t.kstack_hi == 0 {
         return None;
     }
@@ -947,7 +992,7 @@ pub fn state_of(i: usize) -> TaskState {
         return TaskState::Free;
     }
     // SAFETY: 只读快照，理由同 `current_of`
-    unsafe { (*RQ[cpu_of(i)].0.get()).tasks[slot_of(i)].state }
+    unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].state }
 }
 
 pub fn runs_of(i: usize) -> u64 {
@@ -955,7 +1000,7 @@ pub fn runs_of(i: usize) -> u64 {
         return 0;
     }
     // SAFETY: 只读快照，理由同 `current_of`
-    unsafe { (*RQ[cpu_of(i)].0.get()).tasks[slot_of(i)].runs }
+    unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].runs }
 }
 
 /// 在本 CPU 的队列里选下一个。参数与返回值都是**全局任务下标**。
@@ -1022,7 +1067,7 @@ pub unsafe fn preempt_point(frame: u64, cpu: usize) {
     }
     let nslot = slot_of(next);
     {
-        let s = rq(cpu);
+        let mut s = rq(cpu);
         // 只有 Running 才降级成 Runnable。**不能**把 Done 又改回 Runnable：
         // 收工后的任务还在自己最后那段 spin 循环里，而它是带 IF=1 跑上来的，
         // 于是"标记完成 → 被时钟抢占 → 又被复活"会永远循环，
@@ -1050,7 +1095,7 @@ pub unsafe fn preempt_point(frame: u64, cpu: usize) {
     FLAGS[cpu].switches.fetch_add(1, Ordering::Relaxed);
     #[cfg(feature = "trace-switch")]
     {
-        let s = rq(cpu);
+        let mut s = rq(cpu);
         crate::log_info!(
             "sw#{} cpu{} {}->{} me_frame={:#x} next_frame={:#x} st=[{:?},{:?},{:?}] need_rs={} ticks={}",
             cpu, me, next, frame, s.tasks[nslot].frame,

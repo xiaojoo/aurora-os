@@ -265,6 +265,7 @@ source_modules = ["sync"]
 public_api = [
   "sync::IrqSpinLock",
   "sync::RANK_HEAP",
+  "sync::RANK_RUNQ",
   "sync::RANK_LEDGER",
   "sync::RANK_PMM",
   "sync::RANK_TEST",

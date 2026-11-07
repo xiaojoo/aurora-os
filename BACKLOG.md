@@ -3703,6 +3703,39 @@ P5 的完成判据加一条"**换证人，不许放宽判据**"。这条撤回�
 **P2 的完成判据（沿用 ADR-047 的 V1/V2）**：默认 `run` 53/53 + 串口日志**多重集**不变；
 新增同 CPU 连取两次 `RANK_RUNQ` 的重入负样本 ⇒ 39，还原 ⇒ 33。
 
+## 102. ADR-048（P2）：运行队列写权归锁，零行为变化取证（2026-11-08）
+
+**改动（实测）**：`QueueCell { lock: IrqSpinLock<()> @RANK_RUNQ(8), data: UnsafeCell<RunQueue> }`，
+写只能经 `RqLock`（Deref/DerefMut）；快照读族语义不动（决策 2，理由见 ADR）。
+真嵌套只有 2 处：`trampoline` 拿引用调 `f()`、`terminate_task` 引用活着时调 `release_owned`
+（后者中间 drop `Mapping` = 可能等 shootdown 回执）。其余 8 条链是顺序获取，句柄在前一句就析构。
+`sched.rs` +101/−48、`sync.rs` +8。
+
+**读数（取证跑 variant=normal）**：
+- 改前：把树回到 HEAD 重跑一份——`ktests 53/53`、`判定=PASS(33)`、二进制 4413584 字节。
+  注意仓库里原有的 `build/serial.log`（00:54，61 条 1 红 FAIL）**不是**可用基线，已排除。
+- 改后：`ktests 53/53`、`判定=PASS(33)`、二进制 4426336 字节，
+  `sync: acquires=348877 order_violations=0 reentrant_hits=0 wait_events=2556 wait_spins=4132
+  wait_max=673845 wait_timeouts=0`。
+- **V1 判据（零行为变化）**：去数字后的串口行种多重集 **789 vs 789，双向差 0 种**。
+- `wait_max` 232076 → 673845 周期（≈0.2 ms）：**不归因**——本轮同时引入了队列锁与它的新临界区，
+  没有单独量具拆开两者，要拆等 P4 之后再读一次。
+
+**负样本（实测，先红后绿）**：`spawn` 持锁区间里插 `let _nested = rq(cpu);`
+⇒ 串口 `L4 sync: 重入获取 rank=8 token=0x3`、宿主 `判定=EXCEPTION qemu_rc=39`；
+按字节还原后重跑 ⇒ `PASS(33)`。反向嵌套（持 RUNQ 取 WAITQ）需要等待队列存在，属 ADR-047 的 V3，留 P4。
+
+**登记面（被门禁当场要求，不是自觉）**：`public_api` 补 `sync::RANK_RUNQ`（ADR-045 反向规则点名报红后补）；
+`sched` 的 U4 10→11、普查 total 281→282、U4 106→107、`### sched` 小节 18 条重算；
+`lock-order.md` 的 RUNQ 行转"已落地"并写上证人数字。`RANK_WAITQ` 按硬约束 2 **不加**（无人调用）。
+
+**仍未做（欠账）**：
+- `reap` 每槽仍取放锁 3 次（一轮最多 24 次），合并留到 P4 与等待队列一起判，免得稀释本轮证据。
+- ISR 上下文里取队列锁的路径没有被测过（今天 tick 顶半不碰队列）；P5 的 resched 一定碰到，
+  那时必须配一条"ISR 内取队列锁"的样本。
+- 快照读要不要升级成一致读；41 行矩阵本轮未重跑（内核变了，但判据是 `run` 的多重集与 53 条用例；
+  矩阵 41 行的完整重跑留到 P4 之后一起做，避免每片都跑一次长链）。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

@@ -1,6 +1,6 @@
 # unsafe 逐处审计表（U1–U6）
 
-总计 281 处。U1 53 · U2 60 · U3 13 · U4 106 · U5 28 · U6 21
+总计 282 处。U1 53 · U2 60 · U3 13 · U4 107 · U5 28 · U6 21
 
 本表由 `tools/aurora.py` 的 `unsafe_sites()` 从源码逐处生成，**不是手写的**。
 机器可读的权威来源是 `docs/security/unsafe-whitelist.toml` 的 `[modules.*]` 段（模块×类别→处数），
@@ -490,42 +490,42 @@
   > unsafe { core::ptr::read_volatile((va + o) as *const u32) } } None => 0, 
 
 ### sched
-
-- `kernel/src/sched.rs:342` [impl] **U4** fn=`reap`
-  > unsafe impl Sync for QueueCell {} static RQ: [QueueCell; crate::arch::x86_64::cpu::MAX_CPUS] = [const { QueueCell(core::cell::UnsafeCell::new(EMPTY_QUEUE)) }; crate::arch::x86_64::cpu::MAX_CPUS]; 
-- `kernel/src/sched.rs:399` [{] **U4** fn=`rq`
-  > unsafe { &mut *RQ[cpu].0.get() } }  
-- `kernel/src/sched.rs:527` [{] **U4** fn=`current_of`
-  > unsafe { (*RQ[cpu].0.get()).current } }  
-- `kernel/src/sched.rs:637` [{] **U2** fn=`frame_rflags_of`
-  > Some(unsafe { core::ptr::read_volatile((f as usize + RFLAGS_OFF) as *const u64) }) }  
-- `kernel/src/sched.rs:647` [{] **U4** fn=`owned_of`
-  > unsafe { (*RQ[cpu_of(i)].0.get()).tasks[slot_of(i)].owned.count() } }  
-- `kernel/src/sched.rs:658` [{] **U4** fn=`task_frame`
-  > Some(unsafe { (*RQ[cpu_of(task)].0.get()).tasks[slot_of(task)].frame }) }  
-- `kernel/src/sched.rs:754` [{] **U2** fn=`spawn`
-  > unsafe { core::ptr::write_volatile((f + i * 8) as *mut u64, *v) }; } s.entries[slot] = Some(entry); 
-- `kernel/src/sched.rs:808` [{] **U2** fn=`spawn_user`
-  > unsafe { core::ptr::write_volatile((f + i * 8) as *mut u64, *v) }; } s.entries[slot] = None; // 用户任务没有内核入口函数 
-- `kernel/src/sched.rs:910` [{] **U4** fn=`on_cpu_of`
-  > Some(unsafe { (*RQ[cpu_of(i)].0.get()).tasks[slot_of(i)].on_cpu as usize }) }  
-- `kernel/src/sched.rs:919` [{] **U4** fn=`stack_bounds`
-  > let t = unsafe { &(*RQ[cpu_of(i)].0.get()).tasks[slot_of(i)] }; if t.stack_lo == 0 { return None; 
-- `kernel/src/sched.rs:936` [{] **U4** fn=`kstack_top_of`
-  > let t = unsafe { &(*RQ[cpu_of(i)].0.get()).tasks[slot_of(i)] }; if t.kstack_hi == 0 { return None; 
-- `kernel/src/sched.rs:948` [{] **U4** fn=`state_of`
-  > unsafe { (*RQ[cpu_of(i)].0.get()).tasks[slot_of(i)].state } }  
-- `kernel/src/sched.rs:956` [{] **U4** fn=`runs_of`
-  > unsafe { (*RQ[cpu_of(i)].0.get()).tasks[slot_of(i)].runs } }  
-- `kernel/src/sched.rs:978` [fn] **U2** fn=`preempt_point`
-  > pub unsafe fn preempt_point(frame: u64, cpu: usize) { // 不跑调度器的 CPU 直接把标志倒掉再返回。今天 AP 的中断根本不经过这里 // （`isr_stub_cpu_timer` 是独立快路径），这条判断是给"把 AP 接进调度"留的 
-- `kernel/src/sched.rs:1066` [{] **U1** fn=`preempt_point`
-  > unsafe { p1_extra_flush(frame) }; crate::tsc::spin(20_000); } 
-- `kernel/src/sched.rs:1090` [{] **U1** fn=`preempt_point`
-  > unsafe { context_load(resume, if_open as u64) } }  
-- `kernel/src/sched.rs:1115` [{] **U2** fn=`preempt_hook`
-  > unsafe { preempt_point(frame, cpu) } } 
-
+- `kernel/src/sched.rs:353` [impl] **U4** fn=`reap`
+  > unsafe impl Sync for QueueCell {} static RQ: [QueueCell; crate::arch::x86_64::cpu::MAX_CPUS] = [const { QueueCell { lock: crate::sync::IrqSpinLock::new(crate::sync::RANK_RUNQ, ()), data: core::cell::UnsafeCell::new(EMPTY_QUEUE) }
+- `kernel/src/sched.rs:374` [{] **U4** fn=`reap`
+  > unsafe { &*self.cell.data.get() } } }
+- `kernel/src/sched.rs:381` [{] **U4** fn=`reap`
+  > unsafe { &mut *self.cell.data.get() } } }
+- `kernel/src/sched.rs:567` [{] **U4** fn=`current_of`
+  > unsafe { (*RQ[cpu].data.get()).current } } 
+- `kernel/src/sched.rs:677` [{] **U2** fn=`frame_rflags_of`
+  > Some(unsafe { core::ptr::read_volatile((f as usize + RFLAGS_OFF) as *const u64) }) } 
+- `kernel/src/sched.rs:687` [{] **U4** fn=`owned_of`
+  > unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].owned.count() } } 
+- `kernel/src/sched.rs:698` [{] **U4** fn=`task_frame`
+  > Some(unsafe { (*RQ[cpu_of(task)].data.get()).tasks[slot_of(task)].frame }) } 
+- `kernel/src/sched.rs:794` [{] **U2** fn=`spawn`
+  > unsafe { core::ptr::write_volatile((f + i * 8) as *mut u64, *v) }; } s.entries[slot] = Some(entry);
+- `kernel/src/sched.rs:848` [{] **U2** fn=`spawn_user`
+  > unsafe { core::ptr::write_volatile((f + i * 8) as *mut u64, *v) }; } s.entries[slot] = None; // 用户任务没有内核入口函数
+- `kernel/src/sched.rs:957` [{] **U4** fn=`on_cpu_of`
+  > Some(unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].on_cpu as usize }) } 
+- `kernel/src/sched.rs:966` [{] **U4** fn=`stack_bounds`
+  > let t = unsafe { &(*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)] }; if t.stack_lo == 0 { return None;
+- `kernel/src/sched.rs:983` [{] **U4** fn=`kstack_top_of`
+  > let t = unsafe { &(*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)] }; if t.kstack_hi == 0 { return None;
+- `kernel/src/sched.rs:995` [{] **U4** fn=`state_of`
+  > unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].state } } 
+- `kernel/src/sched.rs:1003` [{] **U4** fn=`runs_of`
+  > unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].runs } } 
+- `kernel/src/sched.rs:1025` [fn] **U2** fn=`preempt_point`
+  > pub unsafe fn preempt_point(frame: u64, cpu: usize) { // 不跑调度器的 CPU 直接把标志倒掉再返回。今天 AP 的中断根本不经过这里 // （`isr_stub_cpu_timer` 是独立快路径），这条判断是给"把 AP 接进调度"留的
+- `kernel/src/sched.rs:1113` [{] **U1** fn=`preempt_point`
+  > unsafe { p1_extra_flush(frame) }; crate::tsc::spin(20_000); }
+- `kernel/src/sched.rs:1137` [{] **U1** fn=`preempt_point`
+  > unsafe { context_load(resume, if_open as u64) } } 
+- `kernel/src/sched.rs:1165` [{] **U2** fn=`preempt_hook`
+  > unsafe { preempt_point(frame, cpu) } }
 ### serial
 
 - `kernel/src/serial.rs:23` [{] **U1** fn=`out8`
