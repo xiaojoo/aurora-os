@@ -2353,6 +2353,199 @@ def check_unsafe_registry() -> list[str]:
     return bad
 
 
+def check_module_interfaces() -> list[str]:
+    """Task A：`docs/architecture/module-interfaces.toml` 与源码事实双向对账。
+
+    核四件事（任何一条断了，登记表就会慢慢变成一篇好看的散文）：
+    1. main.rs 的每个 `mod` 都被**恰好一个**逻辑模块的 source_modules 覆盖；
+    2. public_api 里的每个符号在它声称的源模块里真的是 pub/pub(crate)；
+    3. dependencies / allowed_callers 与源码实际引用边（剥注释、排除 ktests/*）**相等**；
+       实际命中 forbidden_dependencies 的边必须列在 known_violations（冻结当前基线，
+       新增违规当场红）；
+    4. unsafe_scope 里的模块×类别在 `unsafe_sites()` 重算里确实存在。
+    """
+    import tomllib
+
+    reg = ROOT / "docs" / "architecture" / "module-interfaces.toml"
+    if not reg.exists():
+        return ["缺 docs/architecture/module-interfaces.toml（Task A 的登记表）"]
+    try:
+        doc = tomllib.loads(reg.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as e:
+        return [f"module-interfaces.toml 不是合法 TOML：{e}"]
+    mods = doc.get("modules")
+    if not isinstance(mods, dict) or not mods:
+        return ["module-interfaces.toml 缺 [modules.*] 段或为空：整层对账会空转"]
+    for key in ("status_values", "context_values", "error_classes"):
+        if not isinstance(doc.get(key), list) or not doc[key]:
+            return [f"module-interfaces.toml 缺 {key}（没有取值域，下面的枚举校验会空转）"]
+
+    src = ROOT / "kernel" / "src"
+    files = sorted(src.rglob("*.rs"))
+    texts = {f.relative_to(src).with_suffix("").as_posix(): f.read_text(encoding="utf-8") for f in files}
+    pub_re = re.compile(
+        r'^(pub(?:\(crate\))?)\s+(?:unsafe\s+)?(?:extern\s+"C"\s+)?'
+        r'(fn|struct|enum|const|static|type|trait|mod)\s+([A-Za-z_][A-Za-z0-9_]*)'
+    )
+    pubs = {path: {m.group(3) for ln in text.splitlines() if (m := pub_re.match(ln))}
+            for path, text in texts.items()}
+
+    def resolve(s: str) -> str | None:
+        if s in pubs:
+            return s
+        if s + "/mod" in pubs:
+            return s + "/mod"
+        return None
+
+    bad: list[str] = []
+    req = ["module_id", "owner", "layer", "source_modules", "public_api", "allowed_callers",
+           "dependencies", "forbidden_dependencies", "known_violations", "context",
+           "error_classes", "resource_ownership", "error_policy", "unsafe_scope",
+           "test_targets", "status"]
+    for mid, m in mods.items():
+        for f in req:
+            if f not in m:
+                bad.append(f"{mid}: 缺字段 {f}")
+        if m.get("module_id") != mid:
+            bad.append(f"{mid}: module_id={m.get('module_id')!r} 与键不符")
+        if m.get("status") not in doc["status_values"]:
+            bad.append(f"{mid}: status={m.get('status')!r} 不在 {doc['status_values']}")
+        for c in m.get("context", []):
+            if c not in doc["context_values"]:
+                bad.append(f"{mid}: context {c!r} 不在 {doc['context_values']}")
+        for c in m.get("error_classes", []):
+            if c not in doc["error_classes"]:
+                bad.append(f"{mid}: error_class {c!r} 不在 {doc['error_classes']}")
+        for s in m.get("source_modules", []):
+            if resolve(s) is None:
+                bad.append(f"{mid}: source_module {s!r} 没有对应源文件")
+
+    # 覆盖：main.rs 的每个顶层 mod 恰好属于一个逻辑模块；main.rs 本体也必须登记。
+    main_src = (src / "main.rs").read_text(encoding="utf-8")
+    top = sorted(set(re.findall(r'^(?:pub(?:\(crate\))?\s+)?mod ([a-z_][a-z0-9_]*);', main_src, re.M)))
+    for t in top:
+        hits = [k for k, v in mods.items()
+                if any(s == t or s.startswith(t + "/") for s in v.get("source_modules", []))]
+        if len(hits) != 1:
+            bad.append(f"main.rs 的 mod {t} 被 {len(hits)} 个逻辑模块覆盖（{hits}）")
+    hits = [k for k, v in mods.items() if "main" in v.get("source_modules", [])]
+    if len(hits) != 1:
+        bad.append(f"main.rs 本体被 {len(hits)} 个逻辑模块登记（{hits}）")
+
+    # 短名 -> 源路径；同一个短名只能指向一个文件。
+    short2path: dict[str, str] = {}
+    path2log: dict[str, str] = {}
+    for mid, m in mods.items():
+        for s in m.get("source_modules", []):
+            rp = resolve(s)
+            if rp is None:
+                continue
+            short = s.split("/")[-1]
+            if short in short2path and short2path[short] != rp:
+                bad.append(f"短名冲突 {short}: {short2path[short]} vs {rp}")
+            short2path[short] = rp
+            path2log[rp] = mid
+            path2log[s] = mid
+
+    valid = set(mods) | {"alloc", "core"}
+    for mid, m in mods.items():
+        for field in ("allowed_callers", "dependencies", "forbidden_dependencies"):
+            for n in m.get(field, []):
+                if n not in valid:
+                    bad.append(f"{mid}.{field}: 未知模块 {n!r}")
+                if n == mid:
+                    bad.append(f"{mid}.{field}: 自依赖")
+        for kv in m.get("known_violations", []):
+            if "->" not in kv:
+                bad.append(f"{mid}.known_violations: {kv!r} 不是 a->b")
+                continue
+            a, b = kv.split("->", 1)
+            if a != mid or b not in mods:
+                bad.append(f"{mid}.known_violations: {kv!r} 端点不合法")
+
+    for mid, m in mods.items():
+        for entry in m.get("public_api", []):
+            if "::" not in entry:
+                bad.append(f"{mid}.public_api: {entry!r} 缺 ::")
+                continue
+            spec, sym = entry.rsplit("::", 1)
+            path = resolve(spec) if resolve(spec) is not None else short2path.get(spec)
+            if path is None:
+                bad.append(f"{mid}.public_api: {entry!r} 的模块无法解析")
+                continue
+            if path2log.get(path) != mid:
+                bad.append(f"{mid}.public_api: {entry!r} 指向别的逻辑模块 {path}")
+                continue
+            if sym not in pubs.get(path, set()):
+                bad.append(f"{mid}.public_api: {path} 没有 pub 符号 {sym}")
+
+    # 实际依赖边：剥 // 注释，排除 ktests/*，按短名引用统计。
+    def strip_comments(text: str) -> str:
+        return "\n".join(re.sub(r"//.*$", "", ln) for ln in text.splitlines())
+
+    actual: dict[str, set[str]] = {}
+    callers: dict[str, set[str]] = {}
+    for path, text in texts.items():
+        if path.startswith("ktests/"):
+            continue
+        a = path2log.get(path) or path2log.get(path.split("/")[0])
+        if a is None:
+            continue
+        code = strip_comments(text)
+        for short, p in short2path.items():
+            b = path2log.get(p)
+            if b is None or a == b:
+                continue
+            if re.search(r"\b" + re.escape(short) + r"::|\bcrate::" + re.escape(short) + r"\b", code):
+                actual.setdefault(a, set()).add(b)
+                callers.setdefault(b, set()).add(a)
+    for a in set(actual) | set(mods):
+        got = actual.get(a, set())
+        want = set(mods[a].get("dependencies", []))
+        if got != want:
+            only_src = sorted(got - want)
+            only_reg = sorted(want - got)
+            bad.append(f"{a}.dependencies 不符：源码多 {only_src}，登记多 {only_reg}")
+    for b in set(callers) | set(mods):
+        got = callers.get(b, set())
+        want = set(mods[b].get("allowed_callers", []))
+        if got != want:
+            bad.append(f"{b}.allowed_callers 不符：源码多 {sorted(got - want)}，登记多 {sorted(want - got)}")
+    for a, bs in actual.items():
+        for b in bs:
+            if b in mods[a].get("forbidden_dependencies", []) \
+                    and f"{a}->{b}" not in mods[a].get("known_violations", []):
+                bad.append(f"{a}->{b} 命中 forbidden_dependencies 但没有登记 known_violations")
+    for a in mods:
+        for kv in mods[a].get("known_violations", []):
+            b = kv.split("->", 1)[1] if "->" in kv else ""
+            if b not in actual.get(a, set()) or b not in mods[a].get("forbidden_dependencies", []):
+                bad.append(f"{a}.known_violations 的 {kv} 已不是实际的 forbidden 边（基线过期）")
+
+    census = unsafe_census()
+    for mid, m in mods.items():
+        for entry in m.get("unsafe_scope", []):
+            if ":" not in entry:
+                bad.append(f"{mid}.unsafe_scope: {entry!r} 缺 :")
+                continue
+            path, cls = entry.split(":", 1)
+            if path2log.get(resolve(path) or "") != mid:
+                bad.append(f"{mid}.unsafe_scope: {path} 不在本逻辑模块")
+            for c in cls.split(","):
+                if c not in UNSAFE_CLASSES:
+                    bad.append(f"{mid}.unsafe_scope: 类别 {c!r} 不合法")
+                elif census.get((path, c), 0) <= 0:
+                    bad.append(f"{mid}.unsafe_scope: {path} 的重算里没有 {c}（登记虚报）")
+
+    all_text = "\n".join(texts.values())
+    fns = set(re.findall(r"\bfn (t_[a-z0-9_]+)\s*\(", all_text))
+    for mid, m in mods.items():
+        for t in m.get("test_targets", []):
+            if t not in fns:
+                bad.append(f"{mid}.test_targets: 找不到 fn {t}")
+    return bad
+
+
 def check_nofloat(elf: Path) -> list[str]:
     """镜像里不允许出现 SSE/x87 指令：本目标默认不发浮点，但这个保证可被单个
     #[target_feature] 或 C 侧选项悄悄拆掉，而 §5.3 的入口桩不保存浮点状态。"""
@@ -3902,6 +4095,7 @@ def do_check(elf: Path | None) -> int:
         "check-lints-wired": lambda: check_lints_wired(),
         "check-unsafe": lambda: check_unsafe_registry(),
         "check-crates": lambda: check_crates_listed(),
+        "check-module-interfaces": lambda: check_module_interfaces(),
         "check-driver-ctx": lambda: check_driver_no_raw(),
         "check-state-window": lambda: check_state_window(),
         "check-virtio-pattern": lambda: check_virtio_pattern(),

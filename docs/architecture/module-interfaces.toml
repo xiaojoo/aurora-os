@@ -1,0 +1,627 @@
+# 模块接口登记表（架构规范 V1.0 Task A；由 .scratch/t01/gen_registry.py 生成）
+#
+# public_api = 产品路径上**实际跨模块引用**到的 pub/pub(crate) 符号；
+# 仅在 ktests/* 里使用的测试钩子不算稳定接口，登记在 test_targets。
+# dependencies/allowed_callers = 源码实际引用边（// 注释已剥离，ktests/* 除外）。
+# forbidden_dependencies = 规范 §2.2 明确禁止的方向；实际命中的边必须同时列在
+# known_violations 里（当前基线），否则 check-module-interfaces 变红。
+schema = 1
+status_values = ["已落地", "部分落地", "目标设计", "未决"]
+context_values = ["BOOT", "KERNEL", "IRQ_OFF", "ISR_TOP", "DEFERRED", "USER_ENTRY", "PANIC"]
+error_classes = ["A", "B", "C", "D"]
+
+[modules."boot"]
+module_id = "boot"
+owner = "boot"
+layer = "boot"
+source_modules = ["limine", "boot_guard"]
+public_api = [
+  "boot_guard::BootMode",
+  "boot_guard::decide",
+  "boot_guard::mark_healthy",
+  "boot_guard::mode",
+  "boot_guard::optional_devices_allowed",
+  "limine::BASE_REVISION",
+  "limine::BootInfo",
+  "limine::MemmapType",
+  "limine::Mp",
+  "limine::MpInfo",
+  "limine::collect",
+  "limine::release_mp_cpu",
+]
+allowed_callers = ["arch", "integration", "memory", "sched", "storage"]
+dependencies = ["diagnostics", "sync"]
+forbidden_dependencies = []
+known_violations = []
+context = ["BOOT", "KERNEL"]
+error_classes = ["A", "D"]
+resource_ownership = "Limine 交接信息的规范化副本、启动阶段状态与启动健康计数；不拥有物理帧分配策略。"
+error_policy = "启动信息缺失/基线版本不支持 → BootInvalid(37)；不把缺失能力降级成默认值。"
+unsafe_scope = ["limine:U2,U3"]
+test_targets = ["t_revision_tag_rewritten", "t_memmap_usable_ge_32mib", "t_hhdm_is_canonical_and_below_kernel", "t_pf_probe_recovers", "t_all_32_vectors_distinct", "t_boot_guard", "t_negative_probe_must_fail"]
+status = "部分落地"
+
+[modules."arch"]
+module_id = "arch"
+owner = "arch"
+layer = "arch"
+source_modules = ["arch", "arch/x86_64", "arch/x86_64/apic", "arch/x86_64/cpu", "arch/x86_64/cpuid", "arch/x86_64/smp", "arch/x86_64/trap"]
+public_api = [
+  "apic::TimerError",
+  "apic::ap_enable_lapic",
+  "apic::ap_timer_start",
+  "apic::ap_timer_stop",
+  "apic::close_cpu_window",
+  "apic::counts",
+  "apic::cpu_ticks",
+  "apic::cpu_ticks_all",
+  "apic::eoi_self",
+  "apic::get_or_init",
+  "apic::in_isr",
+  "apic::interrupts_enabled",
+  "apic::is_lapic_mapped",
+  "apic::note_alloc_in_isr",
+  "apic::on_interrupt",
+  "apic::open_cpu_window",
+  "apic::reset_tick_stats",
+  "apic::self_id",
+  "apic::send_ipi_to",
+  "apic::state",
+  "apic::tick_delta_max_cycles",
+  "apic::tick_delta_sum",
+  "apic::ticks",
+  "apic::timer_start",
+  "apic::timer_stop",
+  "apic::wait_ticks",
+  "apic::with_interrupts",
+  "arch::x86_64",
+  "cpu::BSP_SLOT",
+  "cpu::MAX_CPUS",
+  "cpu::MSR_GS_BASE",
+  "cpu::MSR_KERNEL_GS_BASE",
+  "cpu::MSR_LSTAR",
+  "cpu::MSR_SFMASK",
+  "cpu::MSR_STAR",
+  "cpu::clear_smap_for_test",
+  "cpu::cr4",
+  "cpu::enable_user_protections",
+  "cpu::init_bsp",
+  "cpu::is_online",
+  "cpu::is_ready",
+  "cpu::is_registered",
+  "cpu::lapic_id_of",
+  "cpu::mark_offline",
+  "cpu::mark_online",
+  "cpu::mark_ready",
+  "cpu::mark_sched",
+  "cpu::note_hw_id",
+  "cpu::online_count",
+  "cpu::rdmsr",
+  "cpu::registered",
+  "cpu::reserve_ap_slot",
+  "cpu::runs_sched",
+  "cpu::self_slot",
+  "cpu::slot_of_lapic",
+  "cpu::unmatched_self_lookups",
+  "cpu::user_protections_active",
+  "cpu::wrmsr",
+  "cpuid::detect",
+  "smp::released_count",
+  "smp::stop_aps",
+  "smp::stuck_online_count",
+  "trap::PF_TAKEN",
+  "trap::TRAP_FRAME_BYTES",
+  "trap::TrapFrame",
+  "trap::VEC_CPU_TIMER",
+  "trap::VEC_IRQ_BASE",
+  "trap::VEC_IRQ_LAST",
+  "trap::VEC_SHOOTDOWN",
+  "trap::VEC_SPURIOUS",
+  "trap::dump_frame",
+  "trap::entry_tsc_of",
+  "trap::fastpath_on",
+  "trap::halt_forever",
+  "trap::init_cpu_tables",
+  "trap::install_exception_stack",
+  "trap::install_fastpath",
+  "trap::kcode_sel",
+  "trap::kdata_sel",
+  "trap::p3_fatal_stats",
+  "trap::p3_faults_total",
+  "trap::p3_record_fatal",
+  "trap::p3_record_irq",
+  "trap::p3_resume_stats",
+  "trap::p5_irq_stats",
+  "trap::p5_last_vec",
+  "trap::p5_samples_total",
+  "trap::p_stats_all",
+  "trap::probe_page_fault",
+  "trap::set_rsp0",
+  "trap::ucode_sel",
+  "trap::udata_sel",
+  "x86_64::apic",
+  "x86_64::cpu",
+  "x86_64::cpuid",
+  "x86_64::trap",
+]
+allowed_callers = ["capability", "diagnostics", "driver", "integration", "irq", "memory", "pci", "sched", "storage", "sync", "time"]
+dependencies = ["boot", "diagnostics", "irq", "memory", "pci", "sched", "sync", "time"]
+forbidden_dependencies = ["sched"]
+known_violations = ["arch->sched"]
+context = ["BOOT", "KERNEL", "IRQ_OFF", "ISR_TOP", "USER_ENTRY", "PANIC"]
+error_classes = ["A", "C", "D"]
+resource_ownership = "CPU 特性快照、GDT/IDT/TSS、LAPIC/IOAPIC、每 CPU 槽位与上线状态、TrapFrame 与上下文布局。"
+error_policy = "非法向量/未映射 → 明确错误；必需 CPU 特性缺失 → BootInvalid(37)；致命异常 → L4(39)。"
+unsafe_scope = ["arch/x86_64/apic:U1,U2,U4", "arch/x86_64/cpu:U1", "arch/x86_64/smp:U1,U4", "arch/x86_64/trap:U1,U2,U4"]
+test_targets = ["t_cpu_ids_agree", "t_ap_released_and_ticking", "t_ap_boot_abi", "t_exception_stack_guard", "t_tlb_shootdown", "t_percpu_queues", "t_if_belongs_to_cpu", "t_if_patch_both_branches", "t_cross_cpu_lock_contention", "t_pic_still_masked"]
+status = "部分落地"
+
+[modules."memory"]
+module_id = "memory"
+owner = "memory"
+layer = "core"
+source_modules = ["mm", "heap"]
+public_api = [
+  "heap::AuroraGlobal",
+  "heap::LARGE_MAX",
+  "heap::init",
+  "mm::MOD_TEST",
+  "mm::Mapping",
+  "mm::MmError",
+  "mm::MmioMapping",
+  "mm::ModuleId",
+  "mm::PAGE",
+  "mm::PageFlags",
+  "mm::USER_MMAP_BASE",
+  "mm::USER_VA_BASE",
+  "mm::USER_VA_TOP",
+  "mm::VirtAddr",
+  "mm::alloc_user_va_range",
+  "mm::alloc_va_page",
+  "mm::alloc_va_range",
+  "mm::boot_reclaimable_bytes",
+  "mm::boot_stack_range",
+  "mm::counters",
+  "mm::effective_flags",
+  "mm::free_frames",
+  "mm::hhdm",
+  "mm::init_allocator",
+  "mm::is_mapped",
+  "mm::is_ready",
+  "mm::map",
+  "mm::map_device",
+  "mm::map_mmio",
+  "mm::mark_switched",
+  "mm::max_phys",
+  "mm::our_cr3",
+  "mm::phys_alloc",
+  "mm::reclaim_bootloader_regions",
+  "mm::region_count",
+  "mm::release_va",
+  "mm::reservation_count",
+  "mm::reserve_va_at",
+  "mm::shootdown_self",
+  "mm::take_over",
+  "mm::total_frames",
+  "mm::usable_bytes",
+  "mm::with_vmm_lock",
+]
+allowed_callers = ["arch", "capability", "diagnostics", "driver", "integration", "irq", "pci", "resource", "sched", "storage"]
+dependencies = ["arch", "boot", "diagnostics", "resource", "sched", "sync", "time"]
+forbidden_dependencies = ["storage"]
+known_violations = []
+context = ["KERNEL", "IRQ_OFF", "PANIC"]
+error_classes = ["A", "B", "C", "D"]
+resource_ownership = "物理帧分配状态、VA 保留表、页表、Mapping 所有权对象、内核堆、TLB shootdown 请求与回执。"
+error_policy = "非法参数/未映射 → Err；耗尽 → OutOfMemory/ResourceExhausted；DoubleFree/所有权破坏/shootdown 超时 → L4。"
+unsafe_scope = ["mm:U1,U2,U4", "heap:U2"]
+test_targets = ["t_alloc_free_returns_frames", "t_map_write_unmap", "t_guard_page_blocks_access", "t_wx_construction_rejected", "t_map_refused_inside_huge_page", "t_double_free_must_escalate", "t_global_allocator_backs_vec", "t_heap_reuses_freed_slot", "t_heap_rejects_oversize", "t_heap_slots_are_mapped"]
+status = "部分落地"
+
+[modules."sched"]
+module_id = "sched"
+owner = "sched"
+layer = "service"
+source_modules = ["sched", "user", "elf"]
+public_api = [
+  "elf::ElfError",
+  "elf::Program",
+  "elf::USER_VA_TOP",
+  "elf::describe",
+  "elf::parse",
+  "sched::MAX_TASKS",
+  "sched::OwnedSet",
+  "sched::TaskState",
+  "sched::WORK",
+  "sched::current_id",
+  "sched::current_identity",
+  "sched::exit_current",
+  "sched::identity_of",
+  "sched::init_boot_task",
+  "sched::init_idle_task",
+  "sched::kill_current",
+  "sched::mark_need",
+  "sched::mark_tick",
+  "sched::p1_stats",
+  "sched::p1_with_samples",
+  "sched::preempt_point",
+  "sched::reap_released",
+  "sched::spawn",
+  "sched::spawn_user",
+  "sched::start_workers",
+  "sched::state_of",
+  "sched::ticks_of",
+  "sched::wait_for_boot_task",
+  "user::ABI_SLOT_FLAG",
+  "user::COPY_MAX",
+  "user::E_BAD_HANDLE",
+  "user::E_DENIED",
+  "user::E_FAULT",
+  "user::E_INVALID",
+  "user::E_TOO_LONG",
+  "user::FLAG_EXIT",
+  "user::F_HANDLES",
+  "user::abi_word",
+  "user::copy_from_user",
+  "user::describe_load",
+  "user::load",
+  "user::park_current",
+  "user::served",
+  "user::syscall_dispatch",
+  "user::write_at",
+]
+allowed_callers = ["arch", "capability", "diagnostics", "integration", "memory"]
+dependencies = ["arch", "boot", "capability", "diagnostics", "memory", "storage", "sync", "time"]
+forbidden_dependencies = []
+known_violations = []
+context = ["KERNEL", "IRQ_OFF", "ISR_TOP"]
+error_classes = ["A", "B", "D"]
+resource_ownership = "任务槽位、每 CPU 运行队列、当前任务与 CPU 归属、任务状态、任务拥有的映射集合、退出与待回收状态。"
+error_policy = "创建失败 → MmError；非法槽位 → false/None；退出与延迟回收不返回业务错误，账目不平 → FAIL/L4。"
+unsafe_scope = ["sched:U1,U2,U4", "user:U1,U2,U4,U5"]
+test_targets = ["t_preempt_round_robin", "t_task_stack_guard", "t_task_exit", "t_user_roundtrip", "t_elf_container", "t_elf_load_run", "t_user_pointer_checks", "t_copy_user", "t_syscall_fastpath"]
+status = "部分落地"
+
+[modules."sync"]
+module_id = "sync"
+owner = "sync"
+layer = "core"
+source_modules = ["sync"]
+public_api = [
+  "sync::IrqSpinLock",
+  "sync::RANK_HEAP",
+  "sync::RANK_LEDGER",
+  "sync::RANK_PMM",
+  "sync::RANK_TEST",
+  "sync::RANK_VMM",
+  "sync::stats",
+]
+allowed_callers = ["arch", "boot", "capability", "diagnostics", "integration", "irq", "memory", "pci", "resource", "sched", "storage", "time"]
+dependencies = ["arch", "diagnostics", "time"]
+forbidden_dependencies = []
+known_violations = []
+context = ["KERNEL", "IRQ_OFF", "ISR_TOP"]
+error_classes = ["A", "D"]
+resource_ownership = "锁状态、持有者信息、每 CPU 锁序状态、竞争与等待超时统计。"
+error_policy = "rank 违例/重入 → L4；等待超时只记账，由调用方决定是否失败。"
+unsafe_scope = ["sync:U1,U4"]
+test_targets = ["t_lock_reentry_must_escalate"]
+status = "部分落地"
+
+[modules."driver"]
+module_id = "driver"
+owner = "driver"
+layer = "hal"
+source_modules = ["driver"]
+public_api = [
+  "driver::DriverCtx",
+]
+allowed_callers = ["integration", "storage"]
+dependencies = ["arch", "irq", "memory", "pci"]
+forbidden_dependencies = ["storage"]
+known_violations = []
+context = ["KERNEL"]
+error_classes = ["A", "B", "C"]
+resource_ownership = "驱动模块身份、MMIO/DMA 能力句柄表、槽位与 generation、授权与撤销状态、驱动资源统计。"
+error_policy = "Denied/WrongContext/ResourceExhausted/MappingError；越权/世代不匹配 → 拒绝并记事件。"
+unsafe_scope = ["driver:U3,U4"]
+test_targets = ["t_driver_ctx"]
+status = "部分落地"
+
+[modules."pci"]
+module_id = "pci"
+owner = "pci"
+layer = "hal"
+source_modules = ["pci", "acpi", "hw"]
+public_api = [
+  "acpi::Madt",
+  "acpi::gsi_for",
+  "acpi::init",
+  "acpi::ioapic_for",
+  "acpi::summary",
+  "hw::HwError",
+  "hw::inl",
+  "hw::outl",
+  "pci::Backend",
+  "pci::Dev",
+  "pci::Msi",
+  "pci::count_of_class",
+  "pci::dev",
+  "pci::first_of_class",
+  "pci::first_of_triple",
+  "pci::info",
+  "pci::init",
+]
+allowed_callers = ["arch", "capability", "driver", "integration", "storage"]
+dependencies = ["arch", "memory", "sync"]
+forbidden_dependencies = ["storage"]
+known_violations = []
+context = ["BOOT", "KERNEL"]
+error_classes = ["A", "B"]
+resource_ownership = "PCI 枚举快照、BDF、BAR 描述、能力结构解析结果、总线访问后端；ACPI 固定表快照。"
+error_policy = "非法 BDF/越界 → None/Err；枚举只描述设备，不猜设备类型。"
+unsafe_scope = ["pci:U2,U4", "acpi:U2,U4", "hw:U1,U2"]
+test_targets = ["t_pci_config", "t_irq_probe", "t_acpi_tables_and_checksums", "t_acpi_madt_shape", "t_acpi_fadt_and_mcfg", "t_mp_agrees_with_madt", "t_madt_offsets_synthetic", "t_apic_handoff_state", "t_rsdp_signature_at_virtual_addr"]
+status = "部分落地"
+
+[modules."irq"]
+module_id = "irq"
+owner = "irq"
+layer = "hal"
+source_modules = ["irq"]
+public_api = [
+  "irq::Handle",
+  "irq::IrqError",
+  "irq::Msg",
+  "irq::by_cpu",
+  "irq::counts",
+  "irq::dest",
+  "irq::dispatch",
+  "irq::in_range",
+  "irq::message",
+  "irq::release",
+  "irq::request",
+  "irq::set_affinity",
+]
+allowed_callers = ["arch", "driver", "integration", "storage"]
+dependencies = ["arch", "memory", "sync"]
+forbidden_dependencies = []
+known_violations = []
+context = ["KERNEL", "IRQ_OFF", "ISR_TOP"]
+error_classes = ["A", "C"]
+resource_ownership = "向量认领表、所有者、目的 CPU、消息编程与完成计数；顶半只记账不越权。"
+error_policy = "NoSuchHandle/StaleHandle/Denied；未认领中断 → 计数后 EOI。"
+unsafe_scope = ["irq:U4"]
+test_targets = ["t_irq_ahci", "t_irq_probe", "t_irq_affinity"]
+status = "部分落地"
+
+[modules."storage"]
+module_id = "storage"
+owner = "storage"
+layer = "service"
+source_modules = ["ahci", "virtio", "filesystem", "filesystem/fat32", "filesystem/vfs"]
+public_api = [
+  "ahci::FNV_OFFSET",
+  "ahci::REG_CAP",
+  "ahci::REG_GHC",
+  "ahci::SECTOR",
+  "ahci::boot_port",
+  "ahci::fnv1a64",
+  "ahci::init",
+  "ahci::read_bytes",
+  "ahci::write_bytes",
+  "fat32::Volume",
+  "filesystem::fat32",
+  "filesystem::vfs",
+  "vfs::AhciDisk",
+  "vfs::MemDisk",
+  "vfs::SECTOR_BYTES",
+]
+allowed_callers = ["capability", "diagnostics", "integration", "sched"]
+dependencies = ["arch", "boot", "driver", "irq", "memory", "pci", "sync", "testing", "time"]
+forbidden_dependencies = []
+known_violations = []
+context = ["KERNEL", "IRQ_OFF", "ISR_TOP"]
+error_classes = ["A", "B", "D"]
+resource_ownership = "AHCI/virtio-blk 设备路径、块读写请求、FAT32 只读解析与薄 VFS。"
+error_policy = "BlockError/FsError 分层；设备超时/离线 → 错误 + 重试/隔离；读失败不许读成 0。"
+unsafe_scope = ["ahci:U4", "virtio:U4"]
+test_targets = ["t_ahci_claim", "t_ahci_disk", "t_ahci_high_lba", "t_ahci_write", "t_ahci_recovery", "t_fat32", "t_fat32_mem", "t_fat32_exec", "t_virtio_probe", "t_virtio_io", "t_net_tx", "t_net_rx"]
+status = "部分落地"
+
+[modules."diagnostics"]
+module_id = "diagnostics"
+owner = "diagnostics"
+layer = "core"
+source_modules = ["serial", "crash", "state_store", "watchdog", "exit"]
+public_api = [
+  "crash::Site",
+  "crash::dump_site",
+  "crash::ensure_dumped",
+  "crash::report_previous",
+  "exit::Code",
+  "exit::boot_invalid",
+  "exit::finish",
+  "serial::bytes_out",
+  "serial::in8",
+  "serial::init",
+  "serial::is_ready",
+  "serial::line",
+  "serial::line_stats",
+  "serial::out8",
+  "serial::recent_tail",
+  "serial::ring_total",
+  "serial::unlock_for_halt",
+  "state_store::KIND_BOOT",
+  "state_store::LOG_TEXT_MAX",
+  "state_store::SLOT_BYTES",
+  "state_store::STATE_START_LBA",
+  "state_store::StoreError",
+  "state_store::read",
+  "state_store::read_crash",
+  "state_store::read_log",
+  "state_store::write",
+  "state_store::write_crash",
+  "state_store::write_log",
+  "watchdog::poll",
+  "watchdog::stats",
+]
+allowed_callers = ["arch", "boot", "integration", "memory", "sched", "sync", "testing", "time"]
+dependencies = ["arch", "memory", "sched", "storage", "sync", "time"]
+forbidden_dependencies = []
+known_violations = []
+context = ["BOOT", "KERNEL", "IRQ_OFF", "ISR_TOP", "PANIC"]
+error_classes = ["B", "D"]
+resource_ownership = "日志环、崩溃摘要、持久状态记录、启动健康状态、看门狗状态、最终停机出口。"
+error_policy = "故障路径不分配、不等可能损坏的锁；持久状态写失败不得再触发不可恢复故障。"
+unsafe_scope = ["serial:U1", "crash:U6"]
+test_targets = ["t_state_store", "t_crash", "t_crash_oops", "t_watchdog", "t_serial_atomic"]
+status = "部分落地"
+
+[modules."security"]
+module_id = "security"
+owner = "security"
+layer = "service"
+source_modules = ["sign"]
+public_api = [
+  "sign::PKG_BYTES",
+  "sign::PKG_PAYLOAD_BYTES",
+  "sign::check_package",
+  "sign::digest",
+]
+allowed_callers = []
+dependencies = []
+forbidden_dependencies = []
+known_violations = []
+context = ["BOOT", "KERNEL"]
+error_classes = ["A", "C"]
+resource_ownership = "SHA-256 摘要、Lamport 验签原语、信任锚、更新包元数据与安全启动决策状态。"
+error_policy = "验签失败 → 明确拒绝；验签通过不等于安全启动，接入启动决策前不得宣称强制验签。"
+unsafe_scope = []
+test_targets = ["t_sha256", "t_sig_package"]
+status = "部分落地"
+
+[modules."time"]
+module_id = "time"
+owner = "time"
+layer = "core"
+source_modules = ["clock", "tsc"]
+public_api = [
+  "clock::Calibration",
+  "clock::MIN_SAMPLES",
+  "clock::PIT_DIVISOR",
+  "clock::PIT_HZ",
+  "clock::current",
+  "clock::from_pit_window",
+  "clock::hz",
+  "clock::micros",
+  "tsc::elapsed",
+  "tsc::now",
+  "tsc::rdtscp_available",
+  "tsc::spin",
+  "tsc::stage",
+  "tsc::total_stages",
+]
+allowed_callers = ["arch", "capability", "diagnostics", "integration", "memory", "sched", "storage", "sync"]
+dependencies = ["arch", "diagnostics", "sync"]
+forbidden_dependencies = []
+known_violations = []
+context = ["BOOT", "KERNEL", "IRQ_OFF", "ISR_TOP"]
+error_classes = ["A"]
+resource_ownership = "PIT/LAPIC 定时器、TSC 标定与阶段计时；无墙钟。"
+error_policy = "未标定 → None，不回退成假设频率。"
+unsafe_scope = ["tsc:U1"]
+test_targets = ["t_timer_ticks_recur", "t_no_alloc_in_isr", "t_clock_calibrated_by_pit"]
+status = "部分落地"
+
+[modules."capability"]
+module_id = "capability"
+owner = "capability"
+layer = "core"
+source_modules = ["handle"]
+public_api = [
+  "handle::HErr",
+  "handle::Handle",
+  "handle::abort",
+  "handle::begin_read",
+  "handle::close",
+  "handle::dup",
+  "handle::finish",
+  "handle::revoke_task",
+]
+allowed_callers = ["sched"]
+dependencies = ["arch", "memory", "pci", "sched", "storage", "sync", "testing", "time"]
+forbidden_dependencies = []
+known_violations = []
+context = ["KERNEL", "USER_ENTRY"]
+error_classes = ["A", "C"]
+resource_ownership = "16 格句柄表、Rights、owner 两格、slot:u16+gen:u48；当前只有 File 一种对象。"
+error_policy = "NoSuchHandle/StaleHandle/NotOwner/Denied/BadRights；越权拒绝并记安全事件。"
+unsafe_scope = []
+test_targets = ["t_handle_table", "t_handle_syscalls", "t_handle_reap"]
+status = "部分落地"
+
+[modules."resource"]
+module_id = "resource"
+owner = "resource"
+layer = "core"
+source_modules = ["resource"]
+public_api = [
+  "resource::account_alloc",
+  "resource::account_free",
+]
+allowed_callers = ["memory"]
+dependencies = ["memory", "sync"]
+forbidden_dependencies = ["sched"]
+known_violations = []
+context = ["KERNEL", "IRQ_OFF"]
+error_classes = ["D"]
+resource_ownership = "按模块聚合的存活分配台账（帧/映射/句柄计数）。"
+error_policy = "账目不自洽 → L4/FAIL；关键路径不吞错。"
+unsafe_scope = []
+test_targets = ["t_resource_ledger_balanced"]
+status = "部分落地"
+
+[modules."testing"]
+module_id = "testing"
+owner = "testing"
+layer = "integration"
+source_modules = ["ktest", "ktests", "ktests/common"]
+public_api = [
+  "ktest::KTest",
+  "ktest::run_all",
+]
+allowed_callers = ["capability", "integration", "storage"]
+dependencies = ["diagnostics"]
+forbidden_dependencies = []
+known_violations = []
+context = ["KERNEL", "BOOT"]
+error_classes = ["A"]
+resource_ownership = ".ktests 注册表、运行器、报告与判定契约。"
+error_policy = "表空/长度不整除 → 失败；用例返回 false → FAIL(35)。"
+unsafe_scope = ["ktest:U6"]
+test_targets = ["t_negative_probe_must_fail"]
+status = "已落地"
+
+[modules."integration"]
+module_id = "integration"
+owner = "integration"
+layer = "integration"
+source_modules = ["main"]
+public_api = [
+  "main::calibrate_clock_once",
+  "main::exit_fatal_from_exception",
+  "main::kmain",
+  "main::mp_snapshot",
+]
+allowed_callers = []
+dependencies = ["arch", "boot", "diagnostics", "driver", "irq", "memory", "pci", "sched", "storage", "sync", "testing", "time"]
+forbidden_dependencies = []
+known_violations = []
+context = ["BOOT", "KERNEL"]
+error_classes = ["A", "D"]
+resource_ownership = "内核入口、启动编排、阶段日志、最终判定与退出码。"
+error_policy = "必需项失败 → BootInvalid(37)；异常 → L4(39)；用例失败 → FAIL(35)。"
+unsafe_scope = ["main:U4"]
+test_targets = []
+status = "部分落地"

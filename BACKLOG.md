@@ -3222,6 +3222,39 @@ dup/越权/旧句柄改由核内用例见证（`t_handle_syscalls` 11 格）。�
 - `kernel/src/acpi.rs` 与 `kernel/src/sched.rs` 各有一条注释仍指向 main.rs（纯搬移不改注释）。
 - 未验证：真机、KVM；本轮不动任何被测实现语义（除用例自足代码）。
 
+## 88. Task A：模块接口登记表与 check-module-interfaces（2026-11-07）
+
+**做法（实测）**：新增 `docs/architecture/module-interfaces.toml`（16 个逻辑模块，覆盖
+main.rs 的 29 个顶层 `mod` + main 本体）。`public_api` 只收**产品路径实际跨模块引用**到的
+`pub`/`pub(crate)` 符号（// 注释剥离、`ktests/*` 排除；测试钩子只登记在 `test_targets`）。
+`dependencies` / `allowed_callers` 由同一套源码引用扫描算出，与实际边**双向相等**。
+
+**门禁 `check-module-interfaces`（实测）**：
+1. main.rs 每个顶层 `mod` 恰好被一个逻辑模块覆盖；
+2. `public_api` 每个符号在声称的源模块里真的是 pub/pub(crate)；
+3. `dependencies`/`allowed_callers` 与源码实际边相等；实际命中 `forbidden_dependencies`
+   的边必须列在 `known_violations`（冻结基线，新增违规当场红）；
+4. `unsafe_scope` 的模块×类别在 `unsafe_sites()` 重算里确实存在；
+5. `test_targets` 的 `t_*` 函数确实存在。
+
+**负样本（实测，均先红后绿）**：
+- 删 `[modules."sync"]` ⇒ `main.rs 的 mod sync 被 0 个逻辑模块覆盖`；
+- `public_api` 加 `mm::no_such_symbol` ⇒ `mm 没有 pub 符号 no_such_symbol`；
+- 删 memory 的 `arch` 依赖 ⇒ `源码多 ['arch']，登记多 []`；
+- 删 arch 的 `known_violations` ⇒ `arch->sched 命中 forbidden 但没登记`；
+- memory 的 `unsafe_scope` 改成 `mm:U6` ⇒ `mm 的重算里没有 U6（登记虚报）`。
+
+**基线（实测）**：`check` 现在 **15/15**；默认构建 53 条、默认跑 PASS 不变。
+登记表里冻结了一条已知反向依赖：`arch -> sched`（apic/smp/trap 调 `sched::mark_tick` /
+`init_idle_task` / `exit_current`）。`driver -> storage` 是注释里的名字，剥注释后不算实际边。
+
+**仍未做（推断/欠账）**：
+- Task B 的 `docs/architecture/module-dependencies.md` 与完整分层矩阵（本门禁只覆盖
+  §2.2 明示的 forbidden 方向 + 实际边对账）；
+- Task E 的 ADR 模板与接口变更检查；
+- Task C 的启动阶段函数化与性能基线对比。
+- `known_violations` 是**基线冻结**，不是“允许”：拆 crate/分层时要把它们逐条消掉。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。
