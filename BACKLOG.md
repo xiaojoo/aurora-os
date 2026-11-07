@@ -3303,6 +3303,29 @@ main.rs 的 29 个顶层 `mod` + main 本体）。`public_api` 只收**产品路
 - Task C 剩余（`kmain`/`after_switch` 阶段函数化、性能基线前后对比）未做；
 - §9.2 第二到第五步的 crate 提取未开始；14 模块环仍是冻结债务。
 
+## 91. Task C：启动编排按阶段函数组织（2026-11-07）
+
+**做法（实测）**：`after_switch` 从 317 行收成 13 行，按原顺序调用 7 个私有阶段函数：
+`stage_memory` / `stage_cpu_protections` / `stage_probe_addr` / `stage_acpi_and_pci` /
+`stage_fault_injections` / `stage_storage_guard_crash` / `run_ktests_and_finish`。
+main.rs 677 → 709 行（多出来的是函数签名/文档注释/空行）。只搬职责，不改任何函数体内容、
+日志文本、cfg 注入点或调用顺序；无公开接口变化（module-interfaces 门禁仍绿）。
+
+**读数（实测）**：
+- 日志契约：改前/改后各一遍默认启动，抹掉数字后 **789 行逐行同序、多重集差异 0**。
+- `test`：41/41 符合（exit=0）；`check`：16/16；默认注册 53 条、默认跑 53/53。
+- `bench`（改前/改后各四跑）：P4 `serial_bytes` 149224/149226 → 149223/149226；
+  P2/P3 在噪声内；P1 的 min 第一次改后是 1826/1810（改前 1043/1105），但同窗口配对复跑
+  改后为 1545/1028、改前 1571，**不复现** ⇒ 不归因于本次搬运（本轮不动切换路径）。
+  配对时改前那一跑的第二行撞上 BACKLOG §87 记录的瞬时 HANG，改后两行均 PASS。
+- 原始 bench 输出在 `.scratch/t01/taskC-bench-{before,after,before2,after2}.txt`；
+  自动入库的三份本轮 baseline 已删（05-48 那份是会话开始前就存在的未跟踪文件，未动）。
+
+**未做/欠账（推断）**：
+- §9.2 第二到第五步的 crate 提取仍未开始；14 模块强连通分量仍是冻结债务（ADR-039）。
+- §13 的 P1/P2 项（块设备抽象、MSI-X/INTx、驱动隔离域、生命周期/错误契约）仍开。
+- 本轮没有真机/KVM 验证。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

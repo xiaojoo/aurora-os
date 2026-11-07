@@ -192,6 +192,18 @@ pub extern "C" fn kmain() -> ! {
 
 /// 页表切换完成后运行在自己的栈上。`_` 是续体参数，留着以便将来传启动句柄。
 extern "C" fn after_switch(_: usize) -> ! {
+    // Task C（V1.0 §14）：启动编排按阶段函数组织；顺序与日志契约不变。
+    stage_memory();
+    stage_cpu_protections();
+    stage_probe_addr();
+    stage_acpi_and_pci();
+    stage_fault_injections();
+    stage_storage_guard_crash();
+    run_ktests_and_finish()
+}
+
+/// Stage2a/2b：页表接管后的内存统计与内核堆。
+fn stage_memory() {
     mm::mark_switched();
     mm::init_allocator();
     if !mm::is_ready() {
@@ -213,7 +225,10 @@ extern "C" fn after_switch(_: usize) -> ! {
         }
     }
     tsc::stage("heap");
+}
 
+/// Stage2c：SMEP/SMAP 必需项与 BSP 的 #DF guard 栈。
+fn stage_cpu_protections() {
     // ---- Stage2c：把 BSP 的 #DF 栈从 .bss 那一页换成**带 guard page** 的栈（§6.4）。
     // 顺序要求：MM 就绪之后（要走分配器和页表）、任何 AP 释放之前（IST1 是 per-CPU 的）。
     // 换的只是 TSS 里的一个字段，IDT/GDT 不用重装——硬件每次取 IST 都读 TSS。
@@ -250,7 +265,10 @@ extern "C" fn after_switch(_: usize) -> ! {
         ),
         Err(e) => crate::log_fatal!("exstack bsp: 装不上（继续用 .bss 那一页，没有 guard page）: {:?}", e),
     }
+}
 
+/// Stage3：用真实页表挑一个确定未映射的探针地址。
+fn stage_probe_addr() {
     // ---- Stage3：探针地址现在按**真实页表**判定，不再靠算术推算
     match pick_probe_addr() {
         Some(a) => {
@@ -262,7 +280,10 @@ extern "C" fn after_switch(_: usize) -> ! {
     // 把登记表条数打出来：堆窗口和探针地址必须各占一条，少一条就说明有人在绕过登记发放 VA
     crate::log_info!("mm: VA reservations in force = {}", mm::reservation_count());
     tsc::stage("probe");
+}
 
+/// Stage3b/M5-a：ACPI 固定表与 PCI 枚举的只读快照。
+fn stage_acpi_and_pci() {
     // ---- Stage3b：ACPI 固定布局表（M2-c / ADR-012a）。放在堆建好之后：解析要用的
     // 缓冲区都是栈上的，但日志格式化会走全局分配器，顺序反了就是"堆未就绪 -> 空指针"。
     match acpi::init(RSDP_VA.load(Ordering::Relaxed)) {
@@ -326,7 +347,10 @@ extern "C" fn after_switch(_: usize) -> ! {
             }
         }
     }
+}
 
+/// 构建级故障注入（heap OOM / 资源泄漏）；正常构建为空。
+fn stage_fault_injections() {
     // ---- 故障注入（ADR-018）：向全局分配器要一个超过大小类上限的分配。
     // `GlobalAlloc::alloc` 返回 null 之后，稳定版唯一的去向是 handle_alloc_error
     // → panic → panic=abort → 我们的 handler → 39。这条只能靠注入证明，
@@ -358,7 +382,10 @@ extern "C" fn after_switch(_: usize) -> ! {
             exit::finish(exit::Code::BootInvalid);
         }
     }
+}
 
+/// 存储认领、启动循环保护与上一次崩溃的读回。
+fn stage_storage_guard_crash() {
     // ---- §9.4 的启动循环保护：必须先有存储，才谈得上"跨重启的那个计数"。
     // 认领提到启动路径里不是顺手多调一次（`ahci::init` 本来就幂等）：`decide()` 要在
     // 任何可能崩的路径**之前**把 `n+1` 写回盘，而驱动与用例都在后面。
@@ -372,7 +399,10 @@ extern "C" fn after_switch(_: usize) -> ! {
     boot_guard::decide();
     // §9.7 的另一半：上一条崩溃在存储就绪之后才读得回来，所以它一定在串口现场之后。
     crash::report_previous();
+}
 
+/// Stage4：跑 .ktests、报 P1–P5/P4 读数并交付退出码。
+fn run_ktests_and_finish() -> ! {
     // ---- Stage4：跑用例并交付判定
     let s = ktest::run_all();
     crate::log_info!("ktests: total={} passed={} failed={} table_invalid={}", s.total, s.passed, s.failed, s.table_invalid);
@@ -509,6 +539,7 @@ extern "C" fn after_switch(_: usize) -> ! {
     crate::log_warn!("verdict: FAIL");
     exit::finish(exit::Code::Failed)
 }
+
 
 /// 用页表本身找一个确定未映射的页：先问 `mm::is_mapped`，不再靠区间算术推断。
 /// 取到即登记，堆窗口之后不可能再拿到同一页。
