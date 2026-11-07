@@ -625,3 +625,9 @@ error_policy = "必需项失败 → BootInvalid(37)；异常 → L4(39)；用例
 unsafe_scope = ["main:U4"]
 test_targets = []
 status = "部分落地"
+
+[baseline]
+# 当前产品代码的强连通分量（Task B 冻结基线）：新增环成员或改环 ⇒ check 红。
+known_scc = [
+  ["arch", "boot", "capability", "diagnostics", "driver", "irq", "memory", "pci", "resource", "sched", "storage", "sync", "testing", "time"],
+]

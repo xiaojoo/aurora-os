@@ -3255,6 +3255,31 @@ main.rs 的 29 个顶层 `mod` + main 本体）。`public_api` 只收**产品路
 - Task C 的启动阶段函数化与性能基线对比。
 - `known_violations` 是**基线冻结**，不是“允许”：拆 crate/分层时要把它们逐条消掉。
 
+## 89. Task B：依赖矩阵与循环依赖冻结（2026-11-07）
+
+**做法（实测）**：新增 `docs/architecture/module-dependencies.md`；`module-interfaces.toml`
+加 `[baseline].known_scc`，`check-module-interfaces` 增加第 6 条：实际强连通分量必须等于基线。
+
+**实测事实**：
+- 当前产品依赖图是**一个 14 模块的强连通分量**：arch/boot/capability/diagnostics/driver/
+  irq/memory/pci/resource/sched/storage/sync/testing/time；security 与 integration 在环外。
+  也就是说目标分层**尚未成立**，`known_scc` 冻结这一现状，新增环成员或改环即红。
+- §2.2 明示禁止项里，当前唯一的实际违例是 `arch -> sched`（apic/smp/trap 调
+  `sched::mark_tick` / `init_idle_task` / `exit_current`），登记在 `arch.known_violations`。
+- `driver -> storage` 的唯一命中是注释里的 `ahci::RING`；扫描剥注释后不算实际边。
+- `mm -> ahci/virtio`、`pci -> ahci`、`resource -> sched` 当前都干净。
+
+**负样本（实测）**：从 `known_scc` 删掉 `arch` ⇒ 门禁点名
+“强连通分量与 baseline.known_scc 不符”；还原后 `[ ok ]`。此前的 5 个负样本（删模块/
+伪造 API/删依赖/删 known_violation/伪造 unsafe 类别）见 §88。
+
+**仍未做（推断/欠账）**：
+- `serial` 专属禁止项（不得依赖业务私有状态）与“低层不得引用 main 测试函数”尚未机器化；
+- 没有 Cargo 依赖图（单 crate），也没有 `check-deps` 这个独立门禁——当前用
+  `check-module-interfaces` 覆盖源码级矩阵；
+- `known_scc` 是冻结基线，不是许可；拆 crate/分层时要逐条缩小并在本文件记录；
+- Task E（ADR 模板与接口变更检查）与 Task C 的启动阶段函数化/性能基线仍开。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

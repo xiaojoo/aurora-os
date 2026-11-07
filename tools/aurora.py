@@ -2522,6 +2522,59 @@ def check_module_interfaces() -> list[str]:
             if b not in actual.get(a, set()) or b not in mods[a].get("forbidden_dependencies", []):
                 bad.append(f"{a}.known_violations 的 {kv} 已不是实际的 forbidden 边（基线过期）")
 
+    base = doc.get("baseline")
+    if not isinstance(base, dict) or not isinstance(base.get("known_scc"), list):
+        bad.append("缺 [baseline].known_scc（循环依赖的冻结基线；没有它，新增环无人发现）")
+    else:
+        expected = []
+        for comp in base["known_scc"]:
+            if not isinstance(comp, list) or len(comp) < 2:
+                bad.append(f"baseline.known_scc 的 {comp!r} 不是至少两项的列表")
+                continue
+            for n in comp:
+                if n not in mods:
+                    bad.append(f"baseline.known_scc 含未知模块 {n!r}")
+            expected.append(sorted(comp))
+
+        def sccs_of(g: dict[str, set[str]]) -> list[list[str]]:
+            index: dict[str, int] = {}
+            low: dict[str, int] = {}
+            on: set[str] = set()
+            stack: list[str] = []
+            out: list[list[str]] = []
+            counter = [0]
+
+            def strong(v: str) -> None:
+                index[v] = low[v] = counter[0]
+                counter[0] += 1
+                stack.append(v)
+                on.add(v)
+                for w in g.get(v, ()):
+                    if w not in index:
+                        strong(w)
+                        low[v] = min(low[v], low[w])
+                    elif w in on:
+                        low[v] = min(low[v], index[w])
+                if low[v] == index[v]:
+                    comp: list[str] = []
+                    while True:
+                        w = stack.pop()
+                        on.discard(w)
+                        comp.append(w)
+                        if w == v:
+                            break
+                    out.append(sorted(comp))
+
+            for v in g:
+                if v not in index:
+                    strong(v)
+            return out
+
+        got = sorted([sorted(c) for c in sccs_of(actual) if len(c) > 1])
+        if got != sorted(expected):
+            bad.append(f"强连通分量与 baseline.known_scc 不符：源码 {got}，基线 {sorted(expected)}"
+                       "（新增/消除环都要同步 baseline；拆环是好事，但必须显式更新）")
+
     census = unsafe_census()
     for mid, m in mods.items():
         for entry in m.get("unsafe_scope", []):
