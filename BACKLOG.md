@@ -3482,6 +3482,102 @@ exit_current / preempt_point）。`sched::install_arch_hooks()` 在 `after_switc
 - 文本扫描的字符串字面量与跨行宏边界；`serial` 专属禁止项与"低层不得引用 main 测试函数"
   两条尚未机器化；ADR-042 的 `thread_id` 仍无判据。
 
+## 97. W1 依赖梳理 + ADR-045（public_api 反向登记）（2026-11-08）
+
+**为什么先做这个（实测）**：用户裁决"转向功能侧 S1，按 P0–P9 执行"。P0 是 W1 的三件前置，
+其中 P0-1 是接口登记口径——不修，W1 新增的 `WaitQueue/RANK_WAITQ/RANK_RUNQ/sleep_until`
+会像 `RANK_HANDLE` 一样静默逃逸。
+
+### 97a W1 依赖图（四路取证 + 逐条复核）
+
+**三条"设计文档的前提在代码里不成立"（实测）**：
+
+1. **运行队列锁不存在**。T1.2 写"等待队列锁 rank 低于运行队列锁"，但 `kernel/src/sched.rs` 里
+   `IrqSpinLock|RANK_` 命中 **0**：`RQ` 是 per-CPU `UnsafeCell`，SAFETY（`sched.rs:337-344`）
+   把前提写成"每条队列只由它自己的 CPU 读写 + 任务不迁移"，并预告加迁移时要重写成
+   "迁移窗口内两边都关中断并持有队列所有权"。W1 的跨 CPU 唤醒定义就是"向目标 CPU 队列投递"
+   ⇒ **正面撞现行单写者不变式**。W1 真正的第一步是建 RQ 所有权协议，不是 WaitQueue。
+2. **T1.1 不能排在 T1.2 前面**：`yield_now` 需要 Blocked 态与 wake token（属 T1.2）；且
+   `loads_closed` 今天结构恒 0——唯一入口是异常出口 `trap.rs:1099`，用例注释自己写着
+   "必然 0：没有触发源"（`ktests/sched.rs:356`）。补那一格 = 新增一个内核态调度入口。
+3. **T1.4 的判据"`-d int` 见 hlt"没有仪器**：`check_irq_trace` 只对账 `0x21..0x2F` 的外部投递
+   （`tools/aurora.py:3728`），今天没有任何代码数过 hlt，也没数过 0xF1/0xF2 的 IPI；
+   且 `-d int` 在 kvm 档零产出、在 tcg 档有 `instrument_caused_red` 的自扰动前科
+   （手册 :2156/:2168）。判据要换成内核自计数进串口，或走 `-trace` 通道（ADR-037 形状）。
+
+**数值与接口层面的硬约束（实测）**：
+
+- rank 空间只剩 **1..9**：0 是"没持锁"哨兵（`sync.rs:254` 判据带 `prev_rank != 0`，
+  `INNERMOST` 初值 0），现有 10/20/30/35/40/50/60 占高段。要满足"等待队列锁 < 运行队列锁"
+  且 RQ 内部还允许调堆（`spawn` 要栈 ⇒ HEAP=10），可行解只有 `RANK_WAITQ∈1..4`、`RANK_RUNQ∈5..9`。
+  `lock-order.md:3` 规定先改表再改代码。
+- 向量：现有具名只有 32/47/0x80/0xf1/0xf2/0xff（`trap.rs:157-185`），resched 无。新向量必须
+  ①建帧走 `isr_common→抢占点`（像 0xF1，**不能**学 0xF2 那道故意不建帧的门），②在
+  `apic::on_interrupt` 显式归类，否则 `unexpected` 涨红破 `ktests/time.rs:88`；③在 P5 两台
+  仪器对照式（`time.rs:130-132`）里表态；④**ADR-020 向量表从未登记过非 ISA 向量**，
+  先例格式要新造（P0-2）。
+- `arch.forbidden_dependencies=["sched"]` 且 `known_violations=[]` ⇒ ISR/定时器要叫到 sched
+  只能扩 `hooks` 表；每加一个函数字段 = 1 处 U4，要同轮进白名单与 census。
+- `reap` 只认 `Free/Done`（`sched.rs:265`），Blocked 槽会被跳过；BACKLOG 144 那条**没写下来的
+  前提**"释放时机依赖本 CPU 再出现一次抢占"在阻塞场景失效（`pick_next` 可能返回自身）。
+- `MAX_TASKS` 8→64 必须同时抬 `mm::MAX_TASKS_SUPPORTED`（ADR-041 的编译期断言 + VA 保留公式）。
+- **"定长不进堆"的理由要写对**：不是被 ISR 禁令逼的（ISR 内分配是 **L3 拒绝、可观察**，
+  `heap.rs:75 refuse_if_isr`），是被 `LARGE_MAX=2048` 与台账粒度逼的。
+- sleep 判据要先定源：BSP tick 走 PIT→IOAPIC 0x20，AP 走 LAPIC 周期 10ms÷16，两本账
+  `watchdog.rs:5,34-43` 明文不许混数；`tsc::spin` 是**循环次数**不是周期（`apic.rs:736` 自己
+  警告过）；标定是瞬时估计、样本量卡在 ±0.8%（BACKLOG 66/67）。
+- 全仓 **0 处 `debug_assertions`** ⇒"持自旋锁不得睡"只能做成 `fault-*` 注入 + 判定表新行，
+  三处登记（Cargo features / `do_test` 的 `do_run` / `rows`+`logs`），否则过不了
+  `check-matrix-wiring` 与手册 R19。
+- 一上 idle/阻塞就会红的现有断言清单：`ktests/time.rs:84-89`（`w_idle.ticks == 0`）、
+  `:130-132`（P5 样本等式）、`ktests/sched.rs:79/124/335/638-649`（切换次数与 current 必须
+  Running）、`ktests/watchdog.rs:91`（依赖 AP 工人自旋心跳）。P1/P4 绝对值本来就不可与历史比
+  （M3b-2b 分行后 bench 只看 BSP 三行）⇒ 只能同构建内比。**这批改造排在功能之前（P0-3）**。
+- 拟用 ADR 编号 039–047 全部被真实 ADR 039–045 撞车 ⇒ W1 的"阻塞/等待/定时"ADR 是
+  **ADR-046**，后续依次 047…053。
+
+**关键路径（用户已确认三件事：可以新增两把锁并改锁序表；RQ 所有权与回收时机由 ADR 开路；
+idle 开 IF 造成的串口行数变化不算违约）**：
+P0-1 登记口径 → P0-2 向量表先例 → P0-3 断言 delta 化 → P1 ADR-046 → P2 RQ 所有权
+（判据：默认 53/53 且串口日志多重集不变，这是唯一"零行为变化"证明）→ P3 Blocked+yield_now
+→ P4 WaitQueue+丢唤醒计数（变异 A）→ P5 resched 向量+hooks+idle hlt → P6 定时器轮+sleep_until
+→ P7 Mutex/Event+持锁睡注入 → P8 wait()+容量抬升 → P9 迁移。
+
+### 97b ADR-045：public_api 反向登记（实测）
+
+**发现（实测）**：`check-module-interfaces` 只验 registered → source，不验反方向。
+`handle.rs:25` 用 `use crate::sync::{IrqSpinLock, RANK_HANDLE};` 导入、`:165` 裸用，
+所以 `RANK_HANDLE` 至今不在登记表。两口径重算：口径 A（现行全限定文本）**需新增 0 条**
+——这解释了为什么门禁一直绿而盲区一直存在；口径 B（加 `use` 树导入名）**需新增 18 条**
+（arch 1 / storage 6 / driver 4 / pci 1 / diagnostics 4 / sync 2）；另有 **9 条**登记了但两口径
+都查不到引用（`main::*` 由 asm/ktests 引、`sign::*` 由 ktests 引、`ktest::KTest` 由 `ktest!`
+宏展开引）——**它们不是死条目**，所以规则只能单向。顺带确证登记表粒度是**源文件级**
+（arch 逻辑模块 99 条里大半是同模块跨文件引用），ADR-039 没写清，已由 ADR-045 补。
+
+**做法（实测）**：`check_module_interfaces` 加 `imported_names()` 与反向规则（+58 行）；
+登记表补 18 条（283 → 301）。内核源码零改动。
+
+**负样本（实测，先红后绿）**：
+1. 删 `"sync::RANK_HANDLE"` 登记 ⇒ `public_api 漏登记：sync::RANK_HANDLE（被 handle 在产品
+   路径上引用）`；还原 ⇒ 绿。口径 A 下删它**不会**红（实测"需新增 0 条"），这条对比就是盲区证明。
+2. `driver.rs` 末尾加 `use crate::sync::LOCK_WATCHDOG_CYCLES; const _: u64 = LOCK_WATCHDOG_CYCLES;`
+   ⇒ 一次撞出**四条**规则：`driver.dependencies 多 ['sync']`、`sync.allowed_callers 多 ['driver']`、
+   **`环内新边 driver->sync（站点 1）未登记棘轮`**、`public_api 漏登记：sync::LOCK_WATCHDOG_CYCLES`；
+   还原 ⇒ 绿。第三条是 ADR-044 棘轮"环内新边"分支的**首次**被证——上一轮只验过"已有边 +1"
+   与"非环边 +1 不响"。
+3. 两处变异都按字节还原（sha256 一致），`git diff` 里 `kernel/` 为空。
+
+**读数（实测）**：`check` **16/16**；`public_api` 283 → 301；内核二进制未变 ⇒ 不重跑矩阵，
+默认 53/53 沿用 ADR-044 那一跑。
+
+**顺手修（实测）**：`AGENTS.md:9` 的"目前 014–038 共 24 份"已过期，改为"014–045 共 31 份"，
+并写明完整化方案 §3 拟用的 039–047 全部撞车、新决定从 046 起编。
+
+**仍未做（推断/欠账）**：
+- 宏展开与 asm 引用仍是盲区（那 9 条靠单向规则保住了，但"入口符号"没有显式登记面）。
+- `use` 嵌套花括号 `use a::{b::{c,d}}` 未解析；当前仓库无此写法。
+- P0-2（ADR-020 非 ISA 向量先例）、P0-3（绝对断言 delta 化）尚未开始。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

@@ -2637,6 +2637,64 @@ def check_module_interfaces() -> list[str]:
                     bad.append(f"环内边 {k} 站点数已降到 {measured[k]}（登记 {ratchet[k]}）："
                                "请把登记一起收紧，否则余量会被下一个人悄悄用掉")
 
+    # P0-1（ADR-045）：**反向**登记规则——产品路径里被别的源文件引用到的 pub 符号，
+    # 必须出现在它所属模块的 public_api 里。此前的规则只验"登记的符号真存在"，
+    # 于是 `use crate::sync::{IrqSpinLock, RANK_HANDLE}` 导入后裸用的符号一直逃逸
+    # （handle.rs:25 导入、:165 用的 RANK_HANDLE 至今不在登记表——实测）。
+    # 只做单向：反向相等会把 `ktest::KTest`（由 ktest! 宏展开引用）与 `main::kmain`
+    # （由 asm/extern 引用）这类"只被测试/汇编用到的入口"误判成死条目，实测 9 条。
+    def imported_names(body: str) -> list[str]:
+        names: list[str] = []
+        br = re.search(r"\{([^{}]*)\}", body)
+        if br:
+            for part in br.group(1).split(","):
+                p = part.strip()
+                if " as " in p:
+                    p = p.split(" as ")[0].strip()
+                if p and p != "self":
+                    names.append(p)
+        else:
+            tail = body.rstrip().split("::")[-1].strip()
+            if tail and tail != "self":
+                names.append(tail)
+        return names
+
+    registered_api: dict[str, set[str]] = {}
+    for mid, m in mods.items():
+        for e in m.get("public_api", []):
+            if "::" not in e:
+                continue
+            spec, sym = e.rsplit("::", 1)
+            pp = resolve(spec) or short2path.get(spec)
+            if pp:
+                registered_api.setdefault(pp, set()).add(sym)
+
+    referenced: dict[tuple[str, str], str] = {}
+    for path, text in texts.items():
+        if path.startswith("ktests/"):
+            continue
+        code = strip_product(text)
+        for p2, tsyms in pubs.items():
+            if p2 == path or p2.startswith("ktests/") or not tsyms:
+                continue
+            short = p2.split("/")[-1]
+            for sym in tsyms:
+                if re.search(r"\b(?:crate::)?(?:\w+::)*" + re.escape(short) + r"::" + re.escape(sym) + r"\b", code):
+                    referenced.setdefault((p2, sym), path)
+            for ln in code.splitlines():
+                mu = re.match(r"^(?:pub\s+)?use\s+(.+)$", ln.strip())
+                if mu is None or f"{short}::" not in mu.group(1):
+                    continue
+                for nm in imported_names(mu.group(1)):
+                    if nm in tsyms:
+                        referenced.setdefault((p2, nm), path)
+    missing_api = sorted(k for k in referenced if k[1] not in registered_api.get(k[0], set()))
+    for (p2, sym) in missing_api[:20]:
+        bad.append(f"public_api 漏登记：{p2.split('/')[-1]}::{sym}"
+                   f"（被 {referenced[(p2, sym)]} 在产品路径上引用）")
+    if len(missing_api) > 20:
+        bad.append(f"public_api 漏登记共 {len(missing_api)} 条，上面只列前 20")
+
     census = unsafe_census()
     for mid, m in mods.items():
         for entry in m.get("unsafe_scope", []):

@@ -146,6 +146,7 @@ public_api = [
   "x86_64::cpu",
   "x86_64::cpuid",
   "x86_64::trap",
+  "x86_64::smp",
 ]
 allowed_callers = ["diagnostics", "driver", "integration", "irq", "memory", "pci", "sched", "storage", "sync", "time"]
 dependencies = ["boot", "diagnostics", "irq", "memory", "pci", "sync", "time"]
@@ -269,6 +270,8 @@ public_api = [
   "sync::RANK_TEST",
   "sync::RANK_VMM",
   "sync::stats",
+  "sync::IrqGuard",
+  "sync::RANK_HANDLE",
 ]
 allowed_callers = ["arch", "boot", "capability", "diagnostics", "integration", "irq", "memory", "pci", "resource", "sched", "storage", "time"]
 dependencies = ["arch", "diagnostics", "time"]
@@ -289,6 +292,10 @@ layer = "hal"
 source_modules = ["driver"]
 public_api = [
   "driver::DriverCtx",
+  "driver::DmaHandle",
+  "driver::DriverError",
+  "driver::IrqHandle",
+  "driver::MmioHandle",
 ]
 allowed_callers = ["integration", "storage"]
 dependencies = ["arch", "irq", "memory", "pci"]
@@ -325,6 +332,7 @@ public_api = [
   "pci::first_of_triple",
   "pci::info",
   "pci::init",
+  "hw::MmioRegion",
 ]
 allowed_callers = ["arch", "driver", "integration", "storage"]
 dependencies = ["arch", "memory", "sync"]
@@ -387,6 +395,12 @@ public_api = [
   "filesystem::vfs",
   "vfs::AhciDisk",
   "vfs::SECTOR_BYTES",
+  "ahci::AhciError",
+  "fat32::FileCursor",
+  "fat32::FsError",
+  "vfs::Block",
+  "vfs::BlockError",
+  "vfs::FileStat",
 ]
 allowed_callers = ["capability", "diagnostics", "integration", "sched"]
 dependencies = ["arch", "boot", "driver", "irq", "memory", "pci", "sync", "time"]
@@ -436,6 +450,10 @@ public_api = [
   "state_store::write_log",
   "watchdog::poll",
   "watchdog::stats",
+  "state_store::BootState",
+  "state_store::CrashRecord",
+  "state_store::KIND_CRASH",
+  "state_store::MAX_FRAMES",
 ]
 allowed_callers = ["arch", "boot", "integration", "memory", "sched", "sync", "testing", "time"]
 dependencies = ["arch", "memory", "storage", "sync", "time"]
