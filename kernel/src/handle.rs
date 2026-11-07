@@ -116,7 +116,6 @@ struct Entry {
     owner_gidx: u16,
     owner_id: u32,
     rights: u32,
-    revoked: bool,
     obj: Option<FileObj>,
 }
 
@@ -126,7 +125,6 @@ const EMPTY: Entry = Entry {
     owner_gidx: 0,
     owner_id: 0,
     rights: 0,
-    revoked: false,
     obj: None,
 };
 
@@ -181,10 +179,6 @@ fn check(t: &mut Table, h: Handle, owner: (usize, u32), need: u32) -> Result<usi
         t.c.stale += 1;
         return Err(HErr::Stale);
     }
-    if e.revoked {
-        t.c.denied += 1;
-        return Err(HErr::Denied);
-    }
     if e.owner_gidx as usize != owner.0 || e.owner_id != owner.1 {
         t.c.not_owner += 1;
         return Err(HErr::NotOwner);
@@ -212,8 +206,7 @@ pub fn grant_file(owner: (usize, u32), port: u8, cursor: FileCursor, rights: u32
         owner_gidx: owner.0 as u16,
         owner_id: owner.1,
         rights,
-        revoked: false,
-        obj: Some(FileObj { port, cursor }),
+            obj: Some(FileObj { port, cursor }),
     };
     t.c.grants += 1;
     let live = t.live();
@@ -241,7 +234,6 @@ pub fn close(h: Handle, owner: (usize, u32)) -> Result<(), HErr> {
     e.used = false;
     e.obj = None;
     e.rights = 0;
-    e.revoked = false;
     // gen 保留：这一格下一回 grant 在它上面 +1（旧句柄因此变成 Stale）。
     t.c.closes += 1;
     Ok(())
@@ -269,8 +261,7 @@ pub fn dup(h: Handle, owner: (usize, u32), new_rights: u32) -> Result<Handle, HE
         owner_gidx: owner.0 as u16,
         owner_id: owner.1,
         rights: new_rights,
-        revoked: false,
-        // 对象本体与游标随表项复制：第一版没有对象表，两个句柄**不共享读取位置**。
+            // 对象本体与游标随表项复制：第一版没有对象表，两个句柄**不共享读取位置**。
         // 共享偏移要一张带引用计数的对象表，那是接缓冲区对象时一起做的事（设计 §3.3）。
         obj: old.obj,
     };
@@ -370,8 +361,7 @@ pub fn revoke_task(gidx: usize, id: u32) -> usize {
             e.used = false;
             e.obj = None;
             e.rights = 0;
-            e.revoked = false;
-            n += 1;
+                    n += 1;
         }
     }
     t.c.revoked += n;
@@ -773,4 +763,100 @@ mod tests {
 
     #[cfg(feature = "fat32-exec")]
     crate::ktest!(KT_HANDLE_SYSCALLS, t_handle_syscalls);
+    /// 设计 §8 第 5 条：任务退出 → reap 的**端到端**撤销。
+    /// 前面 `t_handle_table` 只直调了 `revoke_task`；这一格证明 `sched::reap` 真的会走到它，
+    /// 且只清死者（启动任务手里的句柄必须活着）。
+    #[cfg(feature = "fat32-exec")]
+    pub fn t_handle_reap() -> bool {
+        let Some(s) = crate::acpi::summary() else { return false };
+        let Some(m) = s.madt else { return false };
+        if crate::apic::get_or_init(&m).is_err() {
+            return false;
+        }
+        crate::sched::init_boot_task();
+        crate::sched::start_workers();
+        reset_for_test();
+        reset_counters_for_test();
+        let Some(keep_owner) = crate::sched::current_identity() else {
+            crate::log_fatal!("handle-reap: 拿不到启动任务身份");
+            return false;
+        };
+        let Some(cur) = fixture() else { return false };
+        // 启动任务自己的句柄：reap 只清"死者"的表项，这一格必须活着
+        let keep = match grant_file(keep_owner, 3, cur, RIGHT_READ) {
+            Ok(h) => h,
+            Err(_) => return false,
+        };
+        // 带 `SYS_EXIT` 的容器（与 `t_task_exit` 第二轮同形状）
+        let l = match crate::user::load(crate::HELLO_ELF) {
+            Ok(l) => l,
+            Err(e) => {
+                crate::log_fatal!("handle-reap: 装载失败 —— {}", crate::user::describe_load(e));
+                return false;
+            }
+        };
+        crate::user::write_at(l.data_va + crate::user::ABI_SLOT_FLAG, crate::user::FLAG_EXIT);
+        let t = match crate::sched::spawn_user(l.entry, l.stack_top, l.owned) {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
+        let Some(dead_owner) = crate::sched::identity_of(t) else {
+            return false;
+        };
+        let (h1, h2) = (
+            grant_file(dead_owner, 3, cur, RIGHT_READ),
+            grant_file(dead_owner, 3, cur, RIGHT_READ),
+        );
+        let (Ok(h1), Ok(h2)) = (h1, h2) else {
+            return false;
+        };
+        // 开时钟让它自己退出；`drain_reap` 要靠 tick 把 reap 叫起来，所以时钟到 drain 之后再停。
+        crate::apic::timer_start().ok();
+        crate::apic::with_interrupts(|| {
+            let t0 = crate::tsc::now();
+            while crate::user::served() < crate::P7_CALLS
+                && crate::tsc::now().wrapping_sub(t0) < 200_000_000
+            {
+                crate::tsc::spin(20_000);
+            }
+            if !crate::sched::wait_for_boot_task(300_000_000) {
+                crate::log_fatal!("handle-reap: 窗口收不了场");
+            }
+        });
+        let drained = crate::drain_reap();
+        crate::apic::timer_stop().ok();
+        let state = crate::sched::state_of(t);
+        let c = counters();
+        let live_after = live();
+        let dead_gone = begin_read(h1, dead_owner).is_err() && begin_read(h2, dead_owner).is_err();
+        let keep_ok = begin_read(keep, keep_owner).is_ok();
+        let mut buf = [0u8; 4];
+        let keep_read = read_with(keep, keep_owner, &MemDisk { img: IMAGE }, &mut buf) == Ok(4)
+            && pattern(&buf, 0);
+        let ok = drained
+            && state == crate::sched::TaskState::Free
+            && c.revoked >= 2
+            && live_after == 1
+            && dead_gone
+            && keep_ok
+            && keep_read;
+        crate::log_info!(
+            "handle-reap: drained={} state={:?} live={} revoked={} 死者句柄都没了={} 启动任务句柄还在={} keep读={} ⇒ {}",
+            drained,
+            state,
+            live_after,
+            c.revoked,
+            dead_gone,
+            keep_ok,
+            keep_read,
+            ok
+        );
+        close(keep, keep_owner).ok();
+        reset_for_test();
+        ok
+    }
+
+    #[cfg(feature = "fat32-exec")]
+    crate::ktest!(KT_HANDLE_REAP, t_handle_reap);
+
 }

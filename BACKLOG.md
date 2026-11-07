@@ -3078,11 +3078,12 @@ ADR-007 补记 5 与负样本 6、手册 §10.4 的落地状态注。
 
 ### 86b. 读数（取证跑）
 
-* `run --features fat32-exec`（ELF `183716fa3066`，rc=33）：`ktests: total=60 passed=60`；
+* `run --features fat32-exec`（ELF `feb4e741ed86`，rc=33）：`ktests: total=61 passed=61`；
   `handle: checks=[17×true] grants=26 closes=8 reads=3 bytes=2016 stale=2 not_owner=2 denied=3
   exhausted=1 invalid=3 no_such=2 revoked=2 live_peak=16`；
   `handle-sys: checks=[11×true] size=32672 bytes=32672 calls=8 grants=4 denied=1 no_such=1 reads=11`；
-  `elfdisk: 句柄 slot=0 gen=0x1 字节=32672 同走链=true EOF=true 关闭=true`。
+  `elfdisk: 句柄 slot=0 gen=0x1 字节=32672 同走链=true EOF=true 关闭=true`；
+  `handle-reap: drained=true state=Free live=1 revoked=2 死者句柄都没了=true 启动任务句柄还在=true keep读=true ⇒ true`。
 * **ring3（P7 ⑤）**：`elfdisk: 授予容器 句柄=0x20000 主人=(1,10)`（槽 0、gen 2；主人是**容器**
   的两格，不是启动上下文），`elfdisk: ring3 句柄 魔数=Some(1179403647) done=Some(310383693381)
   句柄值=0x20000 表清空=true ⇒ true`（魔数 = hello.elf 前四字节的 LE u32）。
@@ -3110,8 +3111,9 @@ M1 之前的真实误红与"必须含 fat32-probe"的结构共同兜住。
 2. ~~ring3 没有调用者~~ **已有**：容器在 `t_fat32_exec` 里读自己的镜像并 close；**产品启动路径
    仍然不装载用户容器**，所以手册 §10.2 仍不收这三个号。ring3 侧只做 read+close 两次调用——
    dup/越权/旧句柄三格仍是核内用例（签名包 32 KiB 上限压着 hello 的大小，见 86e）。
-3. **第 5 条（退出 → reap 的端到端）未造**：只直调了 `revoke_task`（清掉 2 格并回账）；
-   `reap` 里的调用点存在但没有用例证明它真的被走到。
+3. ~~第 5 条（退出 → reap 的端到端）未造~~ **已造**：`t_handle_reap`（spawn → 授两格 → `SYS_EXIT` →
+   `drain_reap`）⇒ `drained=true state=Free live=1 revoked=2`；变异「拿掉 reap 里的 `revoke_task`」
+   ⇒ `live=3 revoked=0` 红。**第 5 条关闭。**
 4. **块设备失败没有自己的码**：设计只批了 `-4/-5/-6`，当前打一行点名后按 `-2` 带出；
    新增 `-7=EIO` 要 ADR 级批准。
 5. `dup` **不共享读取位置**（表项各存一份游标）；共享要一张带引用计数的对象表。
