@@ -3669,6 +3669,40 @@ P5 的完成判据加一条"**换证人，不许放宽判据**"。这条撤回�
 **下一步（P2，尚未开始）**：`RQ` 换成 `IrqSpinLock<RunQueue>(RANK_RUNQ)`，SAFETY 注释重写，
 **不引入迁移**；完成判据是默认 53/53 + 串口日志多重集不变（V1），外加同核重入负样本（V2）。
 
+## 101. P2 前置取证：运行队列的嵌套取锁链（2026-11-08，实测）
+
+**为什么要先做这件事（推断→实测）**：ADR-047 决策 2 要把 `RQ` 从"单写者论证"换成
+`RANK_RUNQ(8)` 锁。但 `sync.rs:227-231` 的重入判据是**同 CPU 连取两次当场 L4**，
+所以只要存在"自己持锁又调用别的取锁函数"的链，加锁的下一步就是开机 39。先把链列全再定改法。
+
+**读数（实测，一次性脚本留在 `.scratch/w1/` 不入库）**：
+- 直接取队列（调用 `rq(` / `my_rq(`）的函数 **14 个**：`current_id`、`current_identity`、
+  `finish_current`、`identity_of`、`init_boot_task`、`init_idle_task`、`kill_current`、`my_rq`、
+  `pick_next`、`reap`、`release_owned`、`spawn`、`spawn_user`、`terminate_task`。
+- 同文件内的嵌套取锁链 **10 条**：`finish_current -> {current_id, my_rq}`、
+  `kill_current -> {current_id, my_rq}`、`spawn_user -> {current_id, my_rq}`、
+  `pick_next -> reap -> release_owned`（三层）、`reap -> release_owned`、
+  `terminate_task -> release_owned`、`current_id -> my_rq`。
+- 外部入口 5 个，调用者本身不持队列锁，安全：`current_identity` / `identity_of` /
+  `init_boot_task` / `spawn_user`（handle.rs）、`kill_current`（user.rs）。
+- 只读快照族（`state_of:950`、`runs_of:953`、`current_of:529`、`on_cpu_of:912`、
+  `owned_count_of:649`、`frame_of:660`、`identity_of:921/938`）今天**绕过任何锁**直接
+  `UnsafeCell::get()`，而 `ktests/sched.rs:633-636` 的注释明确利用了这个语义
+  （"跨核只能断言归属，状态可能读到换人做到一半"）。
+
+**因此 P2 的改法定为（下一轮落地）**：
+1. **持锁下传**：入口函数取一次 guard，内部函数改成收 `&mut RunQueue`——把 10 条嵌套链消掉，
+   而不是把锁做成可重入的。可重入会把"嵌套方向"从判据里抹掉，ADR-047 的 V3 负样本就没着力点。
+2. **快照读语义不变**：`state_of` 那族继续不加锁。把它们改成一致读会**加强**判据并牵动
+   `t_percpu_queues` 的既有论证，那不属于 P2 的"零行为变化"范围。
+3. 队列锁与数据同 cell：`QueueCell { lock: IrqSpinLock<()>, data: UnsafeCell<RunQueue> }`，
+   writer 持 `RANK_RUNQ(8)` 之后才 `data.get()`，reader 维持原 SAFETY 注记。
+4. `RANK_WAITQ(5)` **本轮不加**：没有等待队列就加一个没人用的 rank，违反 AGENTS 硬约束 2。
+   锁序表里已写它，状态标注是"裁决已定、代码未落地"。
+
+**P2 的完成判据（沿用 ADR-047 的 V1/V2）**：默认 `run` 53/53 + 串口日志**多重集**不变；
+新增同 CPU 连取两次 `RANK_RUNQ` 的重入负样本 ⇒ 39，还原 ⇒ 33。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。
