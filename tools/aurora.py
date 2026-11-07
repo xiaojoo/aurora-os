@@ -2599,6 +2599,64 @@ def check_module_interfaces() -> list[str]:
     return bad
 
 
+def check_interface_change() -> list[str]:
+    """Task E：ADR 最小格式 + 模块接口变更必须有 ADR。
+
+    1) `docs/adr/ADR-<3位>-*.md`：标题编号与文件名一致、编号唯一、有 `状态：` 行且取值合法；
+    2) 工作树里 `module-interfaces.toml` / `module-dependencies.md` 有改动时，
+       必须同时有 `docs/adr/ADR-*.md` 的改动。
+
+    第 2 条是**提交前**的工作树门禁：干净树不推断历史（见 ADR-039「未决」）。
+    """
+    adr_dir = ROOT / "docs" / "adr"
+    files = sorted(adr_dir.glob("ADR-[0-9][0-9][0-9]-*.md"))
+    if not files:
+        return ["docs/adr/ 下一份 ADR-<3位>-*.md 都没有：接口变更检查会空转"]
+    tokens = ("已采纳", "采纳", "已核实", "部分采纳", "已取代", "提议", "拒绝", "已起草")
+    bad: list[str] = []
+    seen: dict[str, str] = {}
+    for f in files:
+        text = f.read_text(encoding="utf-8")
+        lines = text.splitlines()
+        first = lines[0] if lines else ""
+        fm = re.match(r"ADR-(\d{3})-", f.name)
+        tm = re.match(r"#\s*ADR-(\d{3})\s*[:：]", first)
+        if fm is None:
+            bad.append(f"{f.name}: 文件名不是 ADR-<3位>-<标题>.md")
+            continue
+        num = fm.group(1)
+        if tm is None:
+            bad.append(f"{f.name}: 首行不是 `# ADR-{num}: <决定>`")
+        elif tm.group(1) != num:
+            bad.append(f"{f.name}: 标题编号 ADR-{tm.group(1)} 与文件名 ADR-{num} 不一致")
+        if num in seen:
+            bad.append(f"ADR-{num} 重复：{seen[num]} 与 {f.name}")
+        seen[num] = f.name
+        m = re.search(r"(?m)^状态\s*[:：]\s*(.+)$", text)
+        if m is None:
+            bad.append(f"{f.name}: 缺 `状态：` 行（模板见 ADR-template.md）")
+        elif not any(tok in m.group(1) for tok in tokens):
+            bad.append(f"{f.name}: 状态取值 {m.group(1)[:40]!r} 不在 {tokens}")
+
+    # 接口变更必须带 ADR（工作树门禁）。
+    out = subprocess.run(["git", "status", "--porcelain", "-z"], cwd=ROOT,
+                         capture_output=True, text=True, env=env())
+    if out.returncode != 0:
+        bad.append("git status 失败：接口变更检查无法执行")
+        return bad
+    paths = []
+    for entry in out.stdout.split("\0"):
+        if len(entry) >= 4 and entry[2] == " ":
+            paths.append(entry[3:])
+    iface = {"docs/architecture/module-interfaces.toml", "docs/architecture/module-dependencies.md"}
+    iface_changed = sorted(p for p in paths if p in iface)
+    adr_changed = [p for p in paths if re.fullmatch(r"docs/adr/ADR-\d{3}-.*\.md", p)]
+    if iface_changed and not adr_changed:
+        bad.append(f"{iface_changed} 有未提交改动，但工作树里没有 ADR 改动；"
+                   "先按 docs/adr/ADR-template.md 写一份 ADR（接口变更先有决策、后有实现）")
+    return bad
+
+
 def check_nofloat(elf: Path) -> list[str]:
     """镜像里不允许出现 SSE/x87 指令：本目标默认不发浮点，但这个保证可被单个
     #[target_feature] 或 C 侧选项悄悄拆掉，而 §5.3 的入口桩不保存浮点状态。"""
@@ -4149,6 +4207,7 @@ def do_check(elf: Path | None) -> int:
         "check-unsafe": lambda: check_unsafe_registry(),
         "check-crates": lambda: check_crates_listed(),
         "check-module-interfaces": lambda: check_module_interfaces(),
+        "check-interface-change": lambda: check_interface_change(),
         "check-driver-ctx": lambda: check_driver_no_raw(),
         "check-state-window": lambda: check_state_window(),
         "check-virtio-pattern": lambda: check_virtio_pattern(),

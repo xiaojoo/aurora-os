@@ -3280,6 +3280,29 @@ main.rs 的 29 个顶层 `mod` + main 本体）。`public_api` 只收**产品路
 - `known_scc` 是冻结基线，不是许可；拆 crate/分层时要逐条缩小并在本文件记录；
 - Task E（ADR 模板与接口变更检查）与 Task C 的启动阶段函数化/性能基线仍开。
 
+## 90. Task E：ADR 模板与接口变更检查（2026-11-07）
+
+**做法（实测）**：新增 `docs/adr/ADR-template.md` 与 `docs/adr/ADR-039-模块接口登记与依赖矩阵基线.md`
+（按新模板写，记录 Task A/B 的决策）。新增第 16 道门禁 `check-interface-change`：
+1. `docs/adr/ADR-<3位>-*.md` 首行编号与文件名一致、编号唯一、有 `状态：` 行且取值合法；
+2. 工作树里 `module-interfaces.toml` / `module-dependencies.md` 有改动时，必须同时有
+   `docs/adr/ADR-*.md` 的改动；否则红（接口变更先有决策、后有实现）。
+既有 24 份 ADR 不回改，只做最小机器校验。
+
+**负样本（实测，先红后绿）**：
+- 临时移走 ADR-039 后改 `module-interfaces.toml` ⇒
+  “有未提交改动，但工作树里没有 ADR 改动”；
+- 改 `module-interfaces.toml` 且 ADR-039 在场 ⇒ `[ ok ]`（证明“带 ADR”方向不是常量红）；
+- 删 ADR-039 的 `状态：` 行 ⇒ “缺 `状态：` 行”；还原后 `[ ok ]`。
+
+**基线（实测）**：`check` 现在 **16/16**；默认构建 53 条、默认跑 PASS 不变（本轮只改文档与工具）。
+
+**边界（推断/未做）**：
+- `check-interface-change` 是**提交前工作树门禁**：干净树（CI 已提交之后）不推断历史；
+  若要在 CI 事后审计，需要另设基于提交历史的检查。
+- Task C 剩余（`kmain`/`after_switch` 阶段函数化、性能基线前后对比）未做；
+- §9.2 第二到第五步的 crate 提取未开始；14 模块环仍是冻结债务。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。
