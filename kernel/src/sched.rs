@@ -208,17 +208,13 @@ pub fn terminate_task(task: usize) -> bool {
 
 /// 释放某个槽位名下的映射。**调用前必须确认这个槽位不在本 CPU 上运行**。
 fn release_owned(cpu: usize, slot: usize) {
-    let n = {
-        let mut s = rq(cpu);
-        core::mem::take(&mut s.tasks[slot].owned.n)
-    };
-    // 把映射从槽位里搬出来再 drop：不能在持有 `&mut RunQueue` 的时候逐个 drop，
-    // 因为 `Mapping::drop` 要拿 VMM 锁，而队列的 SAFETY 前提是"本 CPU 独占"——
-    // 拿着队列的可变引用去等一把跨 CPU 的锁，等于把两条不变量绑在一起。
+    // 一次持锁把"取走计数 + 把映射搬出槽位"做完（原来分两次，每次都要重取队列锁）。
+    // `drop(bag)` 仍旧留在锁外——那才是真正可能阻塞的一步，合并取锁不能把它带进来。
     let mut bag = OwnedSet::new();
     let mut released = 0usize;
     {
         let mut s = rq(cpu);
+        let n = core::mem::take(&mut s.tasks[slot].owned.n);
         for i in 0..n.min(MAX_OWNED) {
             if let Some(m) = s.tasks[slot].owned.items[i].take() {
                 bag.items[i] = Some(m);
@@ -230,6 +226,9 @@ fn release_owned(cpu: usize, slot: usize) {
         // 于是 `reap_released()` 恒为 0（现场：页确实被解映射了，计数却说什么都没发生）。
         bag.n = released;
     }
+    // 把映射从槽位里搬出来再 drop：不能在持有队列句柄的时候逐个 drop，
+    // 因为 `Mapping::drop` 要拿 VMM 锁、可能等 shootdown 回执——
+    // 拿着队列去等一把跨 CPU 的锁，等于把两条不变量绑在一起（ADR-048 决策 3）。
     drop(bag);
     if released > 0 {
         REAP_RELEASED.fetch_add(released as u64, Ordering::Relaxed);
@@ -258,15 +257,15 @@ pub fn reap(cpu: usize) -> usize {
     let mut waiting = 0usize;
     for slot in 0..MAX_TASKS {
         let gi = gidx(cpu, slot);
-        let st = {
+        // 一轮里这一格只取放一次队列锁（原来是 3~4 次：state、has_bag、id 各一次）。
+        // 这不是微优化——A/B 之后必须把抢占点上的锁流量降下来（ADR-048 未决 1）。
+        // `continue` 从这个块里离开时句柄先析构，不会带着锁跳出循环体。
+        let (st, has_bag, _id) = {
             let s = rq(cpu);
-            s.tasks[slot].state
-        };
-        let has_bag = {
-            let s = rq(cpu);
+            let st = s.tasks[slot].state;
             // Done 的判定带 `|| st == Done` 是因为"被杀但映射为空"也要归化成 Free，
             // 否则槽位永远停在 Done —— 那正是 M4-1 撞过的"队列被占满"的形状。
-            s.tasks[slot].owned.n > 0 || st == TaskState::Done
+            (st, s.tasks[slot].owned.n > 0 || st == TaskState::Done, s.tasks[slot].id)
         };
         if st != TaskState::Free && st != TaskState::Done {
             continue;
@@ -283,13 +282,7 @@ pub fn reap(cpu: usize) -> usize {
         // 任务退出撤销：句柄表里 owner 两格都对的表项在这里清掉。**这是唯一安全的时刻**——
         // 它的内核栈与用户页都已经不会再被踩（设计 §7）。只读文件对象不持有页框，账只记在手柄表里。
         #[cfg(feature = "handles")]
-        {
-            let id = {
-                let mut s = rq(cpu);
-                s.tasks[slot].id
-            };
-            crate::handle::revoke_task(gi, id);
-        }
+        crate::handle::revoke_task(gi, _id);
         release_owned(cpu, slot);
         let mut s = rq(cpu);
         s.tasks[slot].state = TaskState::Free;
