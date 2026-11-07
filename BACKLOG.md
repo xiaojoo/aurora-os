@@ -3358,6 +3358,31 @@ exit_current / preempt_point）。`sched::install_arch_hooks()` 在 `after_switc
 - §9.2 第二到第五步的 crate 提取；§13 P1/P2 项仍开。
 - `serial` 专属禁止项与“低层不得引用 main 测试函数”仍未机器化。
 
+## 93. ADR-041：VA 保留容量归 memory，调度器用编译期断言适配（2026-11-08）
+
+**做法（实测）**：`mm` 新增 `pub const MAX_TASKS_SUPPORTED: usize = 8`，并用自己的常量定义
+`MAX_VA_RESERVATIONS`；`sched` 保留 `MAX_TASKS`，加
+`const _: () = assert!(MAX_TASKS <= crate::mm::MAX_TASKS_SUPPORTED);`。
+`memory.dependencies` 去掉 `sched`。经核查 `boot -> sched` **不存在**（环经过 boot 的路径是
+`sched -> boot -> diagnostics -> sched`）；本轮实际消掉的只有 `memory -> sched` 这一条。
+
+**读数（实测）**：
+- 默认构建/运行：注册 53 条、`53/53/0` PASS；`check` 16/16。
+- 日志契约：默认启动 2/3 次与 ADR-040 记录**789 行逐行同序、多重集差异 0**；
+  另一次多出 6 行 AHCI“发射被吞/起口”可选恢复日志（设备/时序相关，**不归因**于本轮编译期改动）。
+- `test` 三次：第一次 `fault-ahci-write-dir` 瞬时 HANG、第二次 `fat32-exec+fault-fat32-tail`
+  瞬时 HANG（均为 BACKLOG §87 记录的已知抖动）、第三次 **41/41 符合**（exit=0）。
+  本轮只改编译期常量与断言，运行路径未变；抖动按既有记录处理，不写成已修。
+- SCC 仍是 14（`memory -> diagnostics -> sched -> memory` 等仍闭合），`known_scc` 不变。
+- 负样本：把 `MAX_TASKS_SUPPORTED` 改成 7 ⇒ 编译期
+  `E0080: assertion failed: MAX_TASKS <= crate::mm::MAX_TASKS_SUPPORTED`；还原后构建通过。
+  这证明容量契约由编译器强制，不是注释。
+
+**仍未做（推断/欠账）**：
+- 14 模块环的其余边（`memory -> diagnostics -> sched`、`sched -> boot -> diagnostics` 等）。
+- §9.2 第二到第五步的 crate 提取；§13 P1/P2 项仍开。
+- `MAX_TASKS_SUPPORTED = 8` 与 `MAX_CPUS = 8` 仍是固定值；动态容量需要新的容量模型。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

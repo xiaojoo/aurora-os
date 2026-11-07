@@ -36,7 +36,7 @@ Boot / Platform     (boot)
 | --- | --- |
 | boot | diagnostics, sync |
 | arch | boot, diagnostics, irq, memory, pci, sync, time |
-| memory | arch, boot, diagnostics, resource, sched, sync, time |
+| memory | arch, boot, diagnostics, resource, sync, time |
 | sched | arch, boot, capability, diagnostics, memory, storage, sync, time |
 | sync | arch, diagnostics, time |
 | driver | arch, irq, memory, pci |
@@ -66,8 +66,10 @@ arch · boot · capability · diagnostics · driver · irq · memory · pci
 显式更新 baseline，并在 BACKLOG 记一条“环缩小了”。
 
 ADR-040 已消掉 `arch -> sched` 这条 §2.2 明示的 forbidden 边（经 `hooks` 表反转），
-`arch.known_violations` 现在为空；但强连通分量仍是 14——`arch -> memory -> sched -> arch`
-等其它路径仍闭合。本文件不把“环没变小”写成“拆环完成”。
+`arch.known_violations` 现在为空。ADR-041 又把唯一一条 `memory -> sched`（VA 保留表的
+编译期容量依赖）改成“memory 拥有容量 + sched 编译期断言适配”。
+但强连通分量仍是 14——`memory -> diagnostics -> sched -> memory` 等其它路径仍闭合。
+本文件不把“环没变小”写成“拆环完成”。
 
 ## 4. 门禁规则（`check-module-interfaces`）
 
@@ -103,3 +105,5 @@ ADR-040 已消掉 `arch -> sched` 这条 §2.2 明示的 forbidden 边（经 `ho
 - `serial` 专属禁止项与“低层不得引用 main 测试函数”两条尚未机器化，列在 §1 的欠账里。
 - `known_violations` 是**冻结基线，不是许可**；ADR-040 后 `arch` 这一条已消掉，其余按同样流程处理。
 - `hooks` 归入 `arch` 逻辑模块；`arch` 源码不再直接引用 `sched` / `user`（注释除外，扫描已剥注释）。
+- `memory` 不再引用 `sched`；VA 保留容量由 `mm::MAX_TASKS_SUPPORTED` 拥有，sched 的
+  `MAX_TASKS` 用 `const _: () = assert!(...)` 适配。

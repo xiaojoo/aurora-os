@@ -51,12 +51,16 @@ const MAX_PHYS_COVER: u64 = 4 * 1024 * 1024 * 1024;
 const BITMAP_WORDS: usize = (MAX_PHYS_COVER as usize / PAGE) / 64;
 const MAX_REGIONS: usize = 96;
 /// VA 保留登记表容量。**按能数清楚的用量算，不按"当时跑起来够用"拍**：
-/// 每个任务栈一条（最坏 `MAX_CPUS * MAX_TASKS` = 48 条）+ 固定用途 16 条
+/// 每个任务栈一条（最坏 `MAX_CPUS * MAX_TASKS` = 64 条）+ 固定用途 16 条
 /// （内核堆窗口、每个 CPU 的 #DF 栈、AP 栈、LAPIC/串口设备窗口、M4 的用户三页）。
 /// 24 那个数是 M2 时代拍的，M4 一开用户态就撞上：现场是
 /// `L4: VA 保留登记表已满` 而不是任何页表错误，所以容量也得跟着里程碑复算。
 /// 登记不下时**明确失败**而不是发一条没登记的 VA（见 alloc_va_range 的注释）。
-const MAX_VA_RESERVATIONS: usize = crate::arch::x86_64::cpu::MAX_CPUS * crate::sched::MAX_TASKS + 16;
+/// VA 保留表按每 CPU 这么多个任务槽留余量；
+/// sched 的 `MAX_TASKS` 必须 <= 它（sched 里有 const 断言）。
+pub const MAX_TASKS_SUPPORTED: usize = 8;
+const MAX_VA_RESERVATIONS: usize =
+    crate::arch::x86_64::cpu::MAX_CPUS * MAX_TASKS_SUPPORTED + 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PhysAddr(pub u64);

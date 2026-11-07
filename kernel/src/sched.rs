@@ -26,6 +26,8 @@ pub const MOD_STACK_KUSER: ModuleId = ModuleId(15);
 /// 6 → 8 是 M4-1 撞出来的（Done 的任务以前从不回收槽位）。加两格只是容量，
 /// 不是把回收问题解掉：过程与现在的状态见 BACKLOG 的 M4 一节。
 pub const MAX_TASKS: usize = 8;
+// ADR-041：VA 保留表的容量归 memory 拥有；扩槽要把 memory 的容量一起抬。
+const _: () = assert!(MAX_TASKS <= crate::mm::MAX_TASKS_SUPPORTED);
 /// 全系统可登记的任务数（跨所有 CPU）。用例读 `WORK[i]` / `state_of(i)` 时用的是这个空间里的全局下标。
 pub const MAX_TASKS_TOTAL: usize = MAX_TASKS * crate::arch::x86_64::cpu::MAX_CPUS;
 const STACK_PAGES: usize = 4;
