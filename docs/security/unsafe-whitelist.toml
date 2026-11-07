@@ -16,7 +16,7 @@ scope = "arch/x86_64/trap.rs(asm+描述符+CR2) · serial.rs(端口) · limine.r
 # M4-2 之后这条 scope 已经**不再完整**（sched/sync/apic/mm/cpu/smp/user/tsc 也都有 unsafe），
 # 而门禁是按包计数的，所以这行写漏不会让检查失败——那正是它该被写全的理由。
 # 逐包拆分之前，先把"这个包里 unsafe 集中在哪几类"说明白，而不是留一份 M1 时代的清单。
-scope_actual = "asm 全局符号与异常桩(trap/sched/cpu) · 描述符表与 CR4/CR3(trap/cpu/mm) · 端口与 MMIO(serial/apic) · 页表遍历(mm) · per-CPU 静态区的裸指针读写(sched/sync/resource/smp/user/cpu) · 内联 asm 的取指/STAC-CLAC(user) · ktest 里的现场读回(main) · 句柄表里那一段连续物理内存的 volatile 字节/双字访问与 `UnsafeCell` 表(driver) · 驱动静态区取句柄(ahci，只剩 5 处，全部是拿句柄不是拿指针) · 崩溃现场的有界栈走(crash：两处 read_volatile，每处都先过"8 字节对齐 + 内核半区 + 已映射"三关，读回来的值只进记录、不解引用、不参与控制流)"
+scope_actual = "asm 全局符号与异常桩(trap/sched/cpu) · 描述符表与 CR4/CR3(trap/cpu/mm) · 端口与 MMIO(serial/apic) · 页表遍历(mm) · per-CPU 静态区的裸指针读写(sched/sync/resource/smp/user/cpu) · 内联 asm 的取指/STAC-CLAC(user) · ktest 里的现场读回(main) · 句柄表里那一段连续物理内存的 volatile 字节/双字访问与 `UnsafeCell` 表(driver) · 驱动静态区取句柄(ahci，只剩 5 处，全部是拿句柄不是拿指针) · 崩溃现场的有界栈走(crash：两处 read_volatile，每处都先过「8 字节对齐 + 内核半区 + 已映射」三关，读回来的值只进记录、不解引用、不参与控制流)"
 expires = "M2：按 §2.5 拆出 aurora-arch / aurora-hw / aurora-mm-core 后，本条改为逐 crate 登记"
 
 # M4-2：第一个用户程序（测试夹具）。它的 unsafe 只有两类，都写在源码注释里。
@@ -24,3 +24,121 @@ expires = "M2：按 §2.5 拆出 aurora-arch / aurora-hw / aurora-mm-core 后，
 reason = "它是产物而不是库：唯一的 unsafe 需求是 `int 0x80` 与一个自跳转，没有任何指针算术、没有内存操作、不碰任何内核对象"
 scope = "main.rs：3 次 int 0x80（inlateout rax + in rdi/rsi）、panic 与收尾各一个 `jmp .` 自跳转"
 expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe；多了就得回这条账"
+
+# ---------------------------------------------------------------- P3 细分登记（模块 × 类别）
+#
+# 上面两条 [crate.*] 是**按包**的准入闸（哪个包允许含 unsafe），一字未动。
+# 下面这一段是**按现场**的普查快照：每个模块每类各多少处。类别 U1..U6 的含义：
+#   U1 架构入口与特殊寄存器
+#   U2 页表、物理内存与 MMIO
+#   U3 DMA 与设备共享内存
+#   U4 并发共享状态与 UnsafeCell
+#   U5 用户指针与地址空间访问
+#   U6 诊断路径的有限现场读取
+#
+# 这份数不是手写的，是 `tools/aurora.py` 的 `unsafe_sites()` 从源码逐处算出来的；
+# 门禁 `check-unsafe` 每次重算一遍再与本段逐格双向对账：源码有而这里没登记 ⇒ 红，
+# 这里登记了而源码算不出来 ⇒ 红。**类别判错了改分类规则，不改这里的数去凑。**
+# 逐处判定（含行号、所属函数、判定依据原文）见 docs/security/unsafe-census.md。
+#
+# 本轮普查：278 处 = U1 53 + U2 60 + U3 13 + U4 103 + U5 28 + U6 21
+# 2026-11-07 P7：hello 加了 syscall3（U1 两处）与 ring3 句柄读/close（U5 三处）。
+
+[unsafe-census]
+total = 278
+U1 = 53
+U2 = 60
+U3 = 13
+U4 = 103
+U5 = 28
+U6 = 21
+
+[modules."acpi"]
+U2 = 1
+U4 = 6
+
+[modules."ahci"]
+U4 = 9
+
+[modules."arch/x86_64/apic"]
+U1 = 4
+U2 = 2
+U4 = 3
+
+[modules."arch/x86_64/cpu"]
+U1 = 5
+
+[modules."arch/x86_64/smp"]
+U1 = 4
+U4 = 8
+
+[modules."arch/x86_64/trap"]
+U1 = 13
+U2 = 1
+U4 = 9
+
+[modules."crash"]
+U6 = 2
+
+[modules."driver"]
+U3 = 9
+U4 = 9
+
+[modules."heap"]
+U2 = 7
+
+[modules."hw"]
+U1 = 2
+U2 = 6
+
+[modules."irq"]
+U4 = 9
+
+[modules."ktest"]
+U6 = 1
+
+[modules."limine"]
+U2 = 10
+U3 = 4
+
+[modules."main"]
+U1 = 3
+U4 = 8
+U6 = 18
+
+[modules."mm"]
+U1 = 2
+U2 = 21
+U4 = 4
+
+[modules."pci"]
+U2 = 3
+U4 = 7
+
+[modules."sched"]
+U1 = 2
+U2 = 4
+U4 = 10
+
+[modules."serial"]
+U1 = 2
+
+[modules."sync"]
+U1 = 2
+U4 = 3
+
+[modules."tsc"]
+U1 = 1
+
+[modules."user"]
+U1 = 1
+U2 = 5
+U4 = 8
+U5 = 6
+
+[modules."user/hello"]
+U1 = 12
+U5 = 22
+
+[modules."virtio"]
+U4 = 10

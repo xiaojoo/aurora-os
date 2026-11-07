@@ -33,10 +33,16 @@ pub const SYS_POKE_BUF: u64 = 6;
 /// LSTAR 没装就打 `syscall` 会跳到 rip=0，那是 ring0 的取指故障 ——
 /// 一个用户程序不该有能力把整机打死（§9.2）。
 pub const SYS_ABI_INFO: u64 = 7;
+/// P7（ADR-007 决定 5）：关闭一个句柄。`rdi`=句柄；成功 `0`。
+pub const SYS_HANDLE_CLOSE: u64 = 8;
+/// P7：`dup` 到新权限（只能收窄）。`rdi`=句柄、`rsi`=新权限；成功返回新句柄。
+pub const SYS_HANDLE_DUP: u64 = 9;
+/// P7：从游标继续读。`rdi`=句柄、`rsi`=用户缓冲、`rdx`=长度；成功返回字节数，`0`=EOF。
+pub const SYS_FILE_READ: u64 = 10;
 
-/// ABI 版本。minor=4 对应用户态闭环这一段（M4）。
+/// ABI 版本。minor=4 对应用户态闭环这一段（M4）；minor=5 追加 capability 句柄族（P7）。
 pub const ABI_MAJOR: u64 = 0;
-pub const ABI_MINOR: u64 = 4;
+pub const ABI_MINOR: u64 = 5;
 pub const F_FASTPATH: u64 = 1;
 pub const F_SMAP: u64 = 2;
 pub const F_SMEP: u64 = 4;
@@ -44,6 +50,9 @@ pub const F_SMEP: u64 = 4;
 /// 进安全模式不是"悄悄少起几台设备"，而是让调用方能从这一位读出"现在就是少起的状态"。
 /// 位的值直接读 `boot_guard` 的真实状态，不读"我打算开"
 pub const F_SAFE_MODE: u64 = 8;
+/// P7：capability 句柄表在这份构建里存在（设计 §4.3）。**读回真实状态**：
+/// 表只在 `handles` 特性里编译，正常构建这一位必须是 0，8/9/10 也必须走默认分支回 `-1`。
+pub const F_HANDLES: u64 = 16;
 
 /// `(major << 32) | (minor << 16) | features`。位一律**读回真实状态**，不读"我打算开"。
 pub fn abi_word() -> u64 {
@@ -60,6 +69,10 @@ pub fn abi_word() -> u64 {
     }
     if crate::boot_guard::mode() == crate::boot_guard::BootMode::Safe {
         f |= F_SAFE_MODE;
+    }
+    #[cfg(feature = "handles")]
+    {
+        f |= F_HANDLES;
     }
     (ABI_MAJOR << 32) | (ABI_MINOR << 16) | f
 }
@@ -96,6 +109,12 @@ pub enum AbiError {
     /// 混成一种（而 M4-3 第二段刚因为"被截短"与"拷贝坏了"读不出来改过一次）。
     /// 证人：`KT_COPY_USER` 的 `buf_err` 槽（程序故意拿 `COPY_MAX + 1` 打一次）
     TooLong = 3,
+    /// -4：句柄权限不够 / 不是主人 / 表项已撤销（P7，设计 §5.1）。
+    Denied = 4,
+    /// -5：槽不存在或世代号不对（核内 `NoSuch`/`Stale` 分开计数、对用户合成一个）。
+    BadHandle = 5,
+    /// -6：16 格全满（第一版无配额）。
+    Exhausted = 6,
 }
 
 /// `ErrorCode` → `rax` 里那个补码。写成 `const fn` 是为了让下面三个公开常量在编译期就算出来，
@@ -110,6 +129,9 @@ impl AbiError {
             AbiError::Invalid => "-EINVAL（未知调用号或参数形状不对）",
             AbiError::Fault => "-EFAULT（指针是坏的）",
             AbiError::TooLong => "-ETOOLONG（长度超过上限）",
+            AbiError::Denied => "-EDENIED（权限不够 / 不是主人 / 已撤销）",
+            AbiError::BadHandle => "-EBADHANDLE（槽不存在或世代不符）",
+            AbiError::Exhausted => "-EEXHAUSTED（句柄表满）",
         }
     }
 }
@@ -119,6 +141,74 @@ impl AbiError {
 pub const E_INVALID: u64 = err_ret(AbiError::Invalid);
 pub const E_FAULT: u64 = err_ret(AbiError::Fault);
 pub const E_TOO_LONG: u64 = err_ret(AbiError::TooLong);
+pub const E_DENIED: u64 = err_ret(AbiError::Denied);
+pub const E_BAD_HANDLE: u64 = err_ret(AbiError::BadHandle);
+pub const E_EXHAUSTED: u64 = err_ret(AbiError::Exhausted);
+
+#[cfg(feature = "handles")]
+fn handle_err(e: crate::handle::HErr) -> u64 {
+    use crate::handle::HErr;
+    match e {
+        HErr::Invalid => E_INVALID,
+        HErr::NoSuch | HErr::Stale => E_BAD_HANDLE,
+        HErr::NotOwner | HErr::Denied => E_DENIED,
+        HErr::Exhausted => E_EXHAUSTED,
+        // ABI 表里还没有 EIO 码（设计 §5.1 只批了 -4/-5/-6）。块设备失败**不许被抹成别的成因**：
+        // 打一行点名，再按 -2 带出去；新增 EIO 需要 ADR 级批准（BACKLOG 登记）。
+        HErr::Io(_) => {
+            crate::log_info!("abi: file_read 块设备失败（{}）⇒ 暂按 -2 带出", e.tag());
+            E_FAULT
+        }
+    }
+}
+
+/// `SYS_FILE_READ`：rdi=句柄，rsi=用户缓冲，rdx=长度。长度是用户给的数：先判形状再碰盘。
+/// 读是**分块**的（一块一个扇区）：表锁不在盘 I/O 内，复制失败时票作废、游标一格不动。
+#[cfg(feature = "handles")]
+fn sys_file_read(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let want = frame.rdx as usize;
+    if want == 0 {
+        return E_INVALID;
+    }
+    if want > COPY_MAX {
+        return E_TOO_LONG;
+    }
+    let Some(owner) = crate::sched::current_identity() else {
+        return E_BAD_HANDLE;
+    };
+    let mut ticket = match crate::handle::begin_read(crate::handle::Handle(frame.rdi), owner) {
+        Ok(t) => t,
+        Err(e) => return handle_err(e),
+    };
+    let disk = crate::filesystem::vfs::AhciDisk { port: ticket.port() };
+    let mut chunk = [0u8; crate::filesystem::vfs::SECTOR_BYTES];
+    let mut done = 0usize;
+    while done < want {
+        let ask = core::cmp::min(chunk.len(), want - done);
+        match ticket.read_chunk(&disk, &mut chunk[..ask]) {
+            Ok(0) => break, // EOF
+            Ok(n) => match copy_to_user(&chunk[..n], frame.rsi + done as u64) {
+                Ok(m) if m == n => done += n,
+                _ => {
+                    // 中途写用户内存失败：**不提交游标**（重试会重新交付这几字节）。
+                    BAD_PTRS.fetch_add(1, Ordering::Relaxed);
+                    crate::handle::abort(ticket);
+                    crate::log_info!("abi: file_read 写用户缓冲失败，游标未提交");
+                    return E_FAULT;
+                }
+            },
+            Err(e) => {
+                // 盘读失败：票作废，游标一格不动
+                crate::handle::abort(ticket);
+                return handle_err(e);
+            }
+        }
+    }
+    match crate::handle::finish(ticket, done) {
+        Ok(()) => done as u64,
+        Err(e) => handle_err(e),
+    }
+}
 
 /// 容器镜像里 `.slots` 的布局（§10.7）。这一份与 `user/hello/src/main.rs` 里那一份是
 /// **两次独立声明**：程序侧用 `offset_of!` 在编译期核对字段顺序，内核侧靠装载之后
@@ -159,6 +249,11 @@ pub const ABI_SLOT_ABI_WORD: u64 = 120;
 pub const ABI_SLOT_FAST_CS: u64 = 128;
 pub const ABI_SLOT_FAST_SS: u64 = 136;
 pub const ABI_SLOT_FAST_PING: u64 = 144;
+/// P7：装载器授予容器的文件句柄（指向容器自己的镜像），以及 ring3 那六格的读数。
+/// 偏移与程序侧 `OFF_H*` 是**两次独立声明**（同 `.slots` 的既有纪律）。
+pub const ABI_SLOT_HANDLE: u64 = 152;
+pub const ABI_SLOT_H_MAGIC: u64 = 160;
+pub const ABI_SLOT_H_DONE: u64 = 168;
 /// `flag` 的位（与程序侧 `FLAG_*` 同一套编号）
 pub const FLAG_EXIT: u64 = 1;
 pub const FLAG_GUARD_STORE: u64 = 2;
@@ -167,6 +262,8 @@ pub const FLAG_PEEK: u64 = 4;
 pub const FLAG_BUF: u64 = 8;
 /// 快路径那一档（`sys_abi_info` + 八次 `syscall`）。
 pub const FLAG_FASTPATH: u64 = 16;
+/// P7：ring3 句柄实验（读自己镜像 / dup 收窄 / 越权 / close / 旧句柄）。
+pub const FLAG_HANDLE: u64 = 32;
 /// 跨页实验用的缓冲区：从可写段第一页的 `0xF00` 开始、长 `0x200` 字节 ⇒ **最后 0x100 字节在第 2 页**。
 pub const BUF_OFF: u64 = 0xF00;
 pub const BUF_LEN: usize = 0x200;
@@ -530,6 +627,28 @@ pub fn syscall_dispatch(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> boo
             }
         }
         SYS_ABI_INFO => abi_word(),
+        #[cfg(feature = "handles")]
+        SYS_HANDLE_CLOSE => match crate::sched::current_identity() {
+            Some(owner) => match crate::handle::close(crate::handle::Handle(frame.rdi), owner) {
+                Ok(()) => 0,
+                Err(e) => handle_err(e),
+            },
+            None => E_BAD_HANDLE,
+        },
+        #[cfg(feature = "handles")]
+        SYS_HANDLE_DUP => match crate::sched::current_identity() {
+            Some(owner) => match crate::handle::dup(
+                crate::handle::Handle(frame.rdi),
+                owner,
+                frame.rsi as u32,
+            ) {
+                Ok(h) => h.0,
+                Err(e) => handle_err(e),
+            },
+            None => E_BAD_HANDLE,
+        },
+        #[cfg(feature = "handles")]
+        SYS_FILE_READ => sys_file_read(frame),
         SYS_POKE_BUF => {
             // 内核 → 用户。写成 `Ok(n)` 而不是布尔：`n != want` 就是"中途被接住的故障"，
             // 程序核对字节时看得见的差异与内核报回的数必须一致（两台仪器不能各说各话）。

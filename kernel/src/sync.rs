@@ -37,6 +37,9 @@ pub struct LockRank(pub u8);
 pub const RANK_HEAP: LockRank = LockRank(10);
 pub const RANK_VMM: LockRank = LockRank(20);
 pub const RANK_PMM: LockRank = LockRank(30);
+/// 用户句柄表（P7）。只读文件对象**不持有页框** ⇒ 表锁内只许调台账(40)、不许调 mm(20)；
+/// 盘 I/O 也不在锁内（AHCI 在关中断下只能走轮询宽限窗）。见 `docs/architecture/lock-order.md`。
+pub const RANK_HANDLE: LockRank = LockRank(35);
 pub const RANK_LEDGER: LockRank = LockRank(40);
 pub const RANK_ACPI: LockRank = LockRank(50);
 /// 跨核竞争用例专用（`smp::CONTENTION_LOCK`）。排在最内层是因为它**不嵌套任何东西**：

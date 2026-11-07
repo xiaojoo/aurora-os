@@ -295,8 +295,8 @@ FAT_IMG = {name: BUILD / f"{name}.img" for name in FAT_PORTS.values()}
 # 存成 `.img.zz` 的理由很实际：`.gitignore` 里 `*.img` 挡的是构建产物，裸卷 32/64 MiB 不该进仓库，
 # 而它们**是**源（配方与 mtools 数值记在 BACKLOG 78）。压缩后 40 KB 与 262 KB，几乎全是零与重复图案。
 FAT_EXPECT = {
-    "fat32-small": (33_554_432, "c06014238a8667357cea68d5131561cccbcd8e78631c9b93aef3d37713548ceb"),
-    "fat32-wide": (67_108_864, "adef0e1c8fcb415b4079ccde01612dbf5707921b4cab7d6f53745bc7ede863c8"),
+    "fat32-small": (33_554_432, "3eb1d518923ae4e3692aafec7d545c1bfa92ef75366ea3ab82fbc5256f97c976"),
+    "fat32-wide": (67_108_864, "da3aa3a2e2e7d600d45fa47ad142b635c072269a9bba25d7df2f51e08c8d34e9"),
 }
 # L3-C② 的内存夹具卷：11,264 字节，由 `tools/make_fat32_mem.py` 现算（这块卷**不在仓库里**——
 # `.gitignore` 的 `*.img` 把它挡了，而能被配方重新算出来的东西本来就该不进仓库）。
@@ -664,6 +664,12 @@ FAT_MEM_GEO_RE = re.compile(
     r"结构判型=(?P<struct>\w+) 名字串=(?P<name>true|false) 备份逐字节同=(?P<bsame>true|false) "
     r"自由簇=(?P<free>\d+)")
 FAT_MEM_DIR_RE = re.compile(r"fat32-mem: 目录 (?P<body>.*)")
+# P7 ⑤：装载器授予容器的那一行，与 ring3 自己写的结论行。
+HANDLE_GRANT_RE = re.compile(
+    r"elfdisk: 授予容器 句柄=(?P<h>0x[0-9a-f]+) 主人=\((?P<g>\d+),(?P<id>\d+)\)")
+HANDLE_RING3_RE = re.compile(
+    r"elfdisk: ring3 句柄 魔数=Some\((?P<magic>\d+)\) done=Some\((?P<done>\d+)\) "
+    r"句柄值=(?P<h>0x[0-9a-f]+) 表清空=(?P<clean>true|false) ⇒ (?P<ok>true|false)")
 FAT_MEM_CURSOR_RE = re.compile(
     r"fat32-cursor: memory checks=\[(?P<checks>[a-z, ]+)\] sum=(?P<sum>0x[0-9a-f]+) "
     r"bound_reads=(?P<bound>\d+) position=(?P<pos>\d+)")
@@ -1099,7 +1105,7 @@ def check_fat32_exec_byte(log: str) -> list[str]:
 def check_fat32_cluster_hi(log: str) -> list[str]:
     """第 39 行的证人：高半抹零之后内核读到的是**另一个文件的字节**，而不是"读不出来"。
 
-    宿主机先自己把改过的那块卷解析一遍：首簇掉到低半、走满 62 簇喂够 31,320 字节、
+    宿主机先自己把改过的那块卷解析一遍：首簇掉到低半、走满 64 簇喂够 32,672 字节、
     末簇后继还不是 EOC、头四字节不再是 ELF 魔数。然后要求串口那条拒因里的四个数
     与宿主机算的逐格相同——这才叫"少一半就读到别的东西"，而不是"期望对上了"。
     """
@@ -1142,6 +1148,43 @@ def check_fat32_cluster_hi(log: str) -> list[str]:
     for tag in ("dir", "walk", "cross"):
         if v.group(tag) != "false":
             bad.append(f"判据 {tag}={v.group(tag)}，期望 false（高半抹零该把目录/链/两卷同哈希三格都推翻）")
+    return bad
+
+
+def check_handle_ring3(log: str) -> list[str]:
+    """第 40 行的证人：ring3 读到的 4 字节、收到的句柄值、以及"表清空"都由宿主机独立对。
+
+    魔数的期望**不来自内核**：它由宿主机读 `kernel/fixtures/hello.elf` 的前 4 字节算出来；
+    句柄值的槽/世代也由宿主机按 ABI 拆开检查。内核那行 `⇒ true` 是它自己判自己，这里补第二台。
+    """
+    bad: list[str] = []
+    m = HANDLE_RING3_RE.search(log)
+    if not m:
+        return ["串口没有 `elfdisk: ring3 句柄 …` 那一行（P7 ⑤ 没跑到结论）"]
+    want_magic = int.from_bytes((ROOT / "kernel" / "fixtures" / "hello.elf").read_bytes()[:4], "little")
+    if int(m.group("magic")) != want_magic:
+        bad.append(f"ring3 读到的魔数={m.group('magic')}，宿主机读 hello.elf 前四字节={want_magic}")
+    if int(m.group("done")) != 0x4844_4F4E_45:
+        bad.append(f"ring3 的 done 哨兵={m.group('done')}，期望 0x48444f4e45")
+    if m.group("clean") != "true":
+        bad.append("ring3 跑完句柄表没清空（close 没走到或授错了对象）")
+    if m.group("ok") != "true":
+        bad.append("ring3 那一行自己的判据是 false（上面几格应有具体成因）")
+    g = HANDLE_GRANT_RE.search(log)
+    if not g:
+        bad.append("串口没有 `elfdisk: 授予容器 句柄=… 主人=(…)` 那一行")
+    else:
+        hv = int(g.group("h"), 16)
+        slot, gen = hv & 0xFFFF, hv >> 16
+        if slot >= 16 or gen == 0:
+            bad.append(f"授予的句柄值形状不对：slot={slot} gen={gen}")
+        if hv != int(m.group("h"), 16):
+            bad.append(f"ring3 拿到的句柄={m.group('h')} 不是授予的那个 {g.group('h')}")
+        if int(g.group("g")) == 0:
+            bad.append("主人是 gidx=0（启动上下文）——句柄授给了错的任务")
+    kt = KT_TOTAL_RE.search(log)
+    if not kt or kt.group("passed") != kt.group("total"):
+        bad.append("这一跑的 ktests 不是全过（ring3 的结论靠它一起成立）")
     return bad
 
 
@@ -1252,10 +1295,15 @@ def check_fat32_exec(log: str) -> list[str]:
                           ("add", runm.group("add"), emb.group("add")),
                           ("unk", runm.group("unk"), emb.group("unk")),
                           ("rodata", runm.group("rod"), emb.group("rodata")),
-                          ("served", runm.group("served"), emb.group("served")),
                           ("guard", runm.group("guard"), emb.group("guard"))]:
             if a != b:
                 bad.append(f"两条来源跑出的数不同（{tag}）: 盘上={a} 内嵌={b}")
+        # 盘上那一跑还带 `FLAG_HANDLE`：ring3 句柄段多打两次调用（file_read + close）。
+        # 只有**同一跑里真有 `授予容器` 那一行**才允许这个 +2；没有授予行就仍要逐字相等。
+        want_served = int(emb.group("served")) + (2 if HANDLE_GRANT_RE.search(log) else 0)
+        if int(runm.group("served")) != want_served:
+            bad.append(f"两条来源跑出的数不同（served）: 盘上={runm.group('served')} "
+                       f"内嵌={emb.group('served')} 期望={want_served}（有授予行时 +2）")
 
     clean = FAT_EXE_CLEAN_RE.search(log)
     if not clean:
@@ -1305,11 +1353,13 @@ def check_fat32_ports() -> list[str]:
             bad.append(f"Cargo.toml 的 [features] 里没有 {f}，本脚本却按它挂盘")
     # 注入变体必须依赖探针：否则 `--features fault-fat32-tail` 会编出一个不带 t_fat32 的内核，
     # 那条负样本永远"没有红"——不是判据不成立，而是被测的东西根本没进镜像。
-    # ③（`fat32-exec`）同理：它复用 ① 的挂载与解析，依赖断了就是一条独立实现的孤儿用例。
+    # ③（`fat32-exec`）同理：它复用 ① 的挂载与解析，依赖断了就是一条独立实现的孤儿用例；
+    # P7 之后它还依赖 `handles`（句柄表）——**判据是"列表里必须含 fat32-probe"**，不是"只有它"。
     for f in sorted(FAT_FEATURES - {"fat32-probe"}):
-        m = re.search(rf'^{f} = \[["]([^"]+)["]\]', feats, re.M)
-        if not m or m.group(1) != "fat32-probe":
-            bad.append(f"{f} 应写成 {f} = [\"fat32-probe\"]，实际={m.group(0) if m else '没这条依赖'}")
+        m = re.search(rf'^{f} = \[(.*?)\]', feats, re.M)
+        deps = re.findall(r'"([^"]+)"', m.group(1)) if m else []
+        if "fat32-probe" not in deps:
+            bad.append(f"{f} 必须依赖 fat32-probe（否则它是没有探针的孤儿用例），实际={deps}")
     # 探针与 ③ 的代码在 `main.rs`（用例本体），注入的落点在 `fat32.rs`（被测代码里那一行）。
     # 两条查法不能互换：注入特性不新写用例，只把解析器里那个 `cfg!` 翻开。
     for f in sorted(FAT_DISK_FEATURES):
@@ -4251,12 +4301,35 @@ def do_test(timeout: int) -> int:
     print("=== 第 39 行：给第 34 行 ⑦ 那格证红——宿主机把卷B 目录项的簇号高半抹成 0 ===")
     # ⑦ 今天是内核自己构造一个"只取低半"的 FileStat 再走链——那证明的是 walk 的拒因，
     # 不是 open 真的把两半拼起来了。这一跑改的是**盘上的目录项**：首簇从 67,587 掉到 2,051，
-    # 落在 FILLER.BIN 中间，走满 62 簇喂够字节而链还没到 EOC ⇒ ChainEndsLate，
+    # 落在 FILLER.BIN 中间，走满 64 簇喂够字节而链还没到 EOC ⇒ ChainEndsLate，
     # 且读出来的头四字节不再是 ELF 魔数。拒因里那四个数由宿主机按改过的盘独立算一遍。
     IMAGE.unlink(missing_ok=True)
     hiv, hirc, hilog = do_run(["fat32-probe"], timeout, host_fault="fault-fat32-cluster-hi")
     hi_bad = fat_host_witness("fault-fat32-cluster-hi", hilog)
     hi_verdict = hiv if not hi_bad else "CONTENT-MISMATCH"
+    IMAGE.unlink(missing_ok=True)
+
+    print("=== 第 40 行：P7 ⑤ ring3 句柄——容器读自己的镜像，宿主机按下发的句柄值复核 ===")
+    # 设计 §9 F：正向行复用 `fat32-exec` 档**再跑一遍**，不新增构建档。
+    # 这一行的期望值（魔数）来自宿主机自己读 hello.elf，不是内核打印的 true。
+    IMAGE.unlink(missing_ok=True)
+    h3v, h3rc, h3log = do_run(["fat32-exec"], timeout)
+    h3_bad = check_handle_ring3(h3log)
+    h3_verdict = h3v if h3v != "PASS" else ("PASS" if not h3_bad else "CONTENT-MISMATCH")
+    for x in h3_bad:
+        print("    对账:", x)
+    IMAGE.unlink(missing_ok=True)
+
+    print("=== 第 41 行：授错主人必须红（--features fault-handle-owner）===")
+    # 内核侧注入（§80a 允许做成特性）：授予时把 Task::id 改错一格。容器拿自己的句柄读
+    # 必须 `-4`，ring3 的魔数变成错误标记、表也清不空 ⇒ 这一跑必须 FAIL。
+    ihv, ihrc, ihlog = do_run(["fat32-exec", "fault-handle-owner"], timeout)
+    im = HANDLE_RING3_RE.search(ihlog)
+    want_magic = int.from_bytes((ROOT / "kernel" / "fixtures" / "hello.elf").read_bytes()[:4], "little")
+    inj_ok = ihv == "FAIL" and im is not None and im.group("ok") == "false"         and int(im.group("magic")) != want_magic
+    ih_verdict = "FAIL" if inj_ok else "CONTENT-MISMATCH"
+    if not inj_ok:
+        print("    对账: 授错主人这一跑没有红在 ring3 那格（判定/魔数/布尔至少一项不符）")
     IMAGE.unlink(missing_ok=True)
 
     rows = [
@@ -4350,6 +4423,11 @@ def do_test(timeout: int) -> int:
         # 第 34 行 ⑦ 那格的证红：目录项高半抹零 ⇒ open 拼出的首簇掉进 FILLER.BIN 中间，
         # 读到的是别的文件的字节。拒因里四个数由宿主机按改过的盘独立重算
         ("FAT32簇号高半抹零必须红", hi_verdict, hirc, "FAIL", 35),
+        # P7 ⑤：装载器把 READ|DUP 句柄授给**容器**（owner 两格），ring3 读自己的镜像。
+        # 期望值与句柄形状由宿主机独立算；内核那行 true 只是它的自述。
+        ("P7 句柄ring3读自己镜像", h3_verdict, h3rc, "PASS", 33),
+        # P7 第 40 行的证红：owner 改错一格 ⇒ 容器读不到 ⇒ 必须红在 ring3 那格
+        ("P7 句柄授错主人必须红", ih_verdict, ihrc, "FAIL", 35),
     ]
     # 每一行对应那一跑的串口：不符时把红的那几格打出来。
     # 单独一张表而不是把日志塞进 `rows` 的元组里：元组要保持成"名字/期望/实际"这种
@@ -4385,6 +4463,8 @@ def do_test(timeout: int) -> int:
         "FAT32③多喂一字节红在溢出": evlog,
         "FAT32④段内字节改了必须红": eblog,
         "FAT32簇号高半抹零必须红": hilog,
+        "P7 句柄ring3读自己镜像": h3log,
+        "P7 句柄授错主人必须红": ihlog,
     }
     all_ok = True
     print()

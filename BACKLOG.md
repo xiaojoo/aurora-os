@@ -3030,26 +3030,127 @@ C2「每次读重新 mount」被否——那要每次付 3 个扇区 + 逐字节
 
   M1 与 M3 的"只红一格"是这两格存在的理由：它们各自钉住一类旧判据看不见的失败。
 
-### 85c. 登记：ADR-007 的「代数回绕后旧句柄仍必失效」不成立（不擅自改已采纳语义）
+### 85c. ADR-007 的「代数回绕后旧句柄仍必失效」不成立：已裁决改法（2026-11-07 同日）
 
 `driver.rs:108-111` 的 `fresh_gen` 从 1 起、`g+1 == 0` 时跳回 1（永不发 0）。ADR-007 补记 5 与
 设计文档 §8 第 6 行据此写的是「回绕之后旧句柄仍须 `StaleHandle`」「gen 跳回 1，旧句柄仍 `-5`」。
 **这句话机制上保不了**：句柄是 `(槽, 世代)`，`next_gen` 是表级 u32，走完一圈回到 1 之后，
-同一槽上一圈发出的旧句柄与新句柄**逐位相同**，会被当成有效句柄。要保住承诺，至少得三选一
-（**都是 ADR 级改动，本轮一个都没做**）：世代加宽到 u64、槽位退休不复用、或把承诺改弱成
-"在一个世代周期内有效"。另外那格的探针（预置计数器）自己也要先被证一次会咬（§80d-3）。
-本轮零影响：`FileCursor` 还没有世代号，capability 句柄表也还没实现。
+同一槽上一圈发出的旧句柄与新句柄**逐位相同**，会被当成有效句柄。
+
+**裁决（同日）**：用户句柄改成 `slot:u16 + gen:u48`（16+48 正好填满一个 u64），**每槽独立计数**，
+从 1 起、跳过 0；承诺改写成**可数的上界**——同一槽连续复用 `2⁴⁸−2` 次内旧句柄必拒，
+到上界后同 gen 会重新匹配（负样本 6 负责当场把界的形状打出来，不许写成"仍然会拒"）。
+**不做槽位退休**（16 格表里退休即容量泄漏）。理由是两个数：u32 热槽按 1 万次/秒 **≈5 天**跑完一圈，
+u48 同速率 **≈891 年**（1 千次/秒 ≈8,900 年）。落到文档：设计 §2.1/§2.2/§2.3/§5/§8/§9 G、
+ADR-007 补记 5 与负样本 6、手册 §10.4 的落地状态注。
+**实现仍未开始**：capability 句柄表没有一行代码，`FileCursor` 也没有世代号。
+（同日 §86 已落地第一刀；这一句在写下的时刻是真的。）
+`driver.rs` 的核内表**不动**（表级 u32、不进用户 ABI）——设计文档已明写"用户侧不许照抄它"。
 
 ### 85d. 没做/仍开
 
-1. **capability 句柄表**（手册 §10.4 / ADR-007）仍未实现：`FileCursor` 是核内对象，
-   没有 Rights、没有 owner、没有用户态入口；"谁在调用"`syscall_dispatch` 仍然不问。
+1. **capability 句柄表**（手册 §10.4 / ADR-007）~~仍未实现~~ **同日 §86 已落地第一刀**：
+   表、Rights、owner、`8/9/10` 都有代码与用例；仍开的是 ring3 调用者与判定表两行（见 §86d）。
 2. 续读入口今天**只被 ktest 调用**（`fat32-exec` 档），产品启动路径没有用户容器。
 3. 第一版没有 seek（游标只前进）；`open_cursor` 每次都要重新解析目录项——表项要缓存的是
    游标本身（设计 §3.1 的 C1），不是这个入口。
 4. `walk` 与旧接口原样保留；判定表第 34–39 行仍是旧路。要迁移，等句柄路径真接上。
 5. 宿主机新增的续读对账只在 `fat32-probe` 那一行跑（`check_fat32`）；它的证咬是离线做的，
    没有单独占一行判定表——要不要升成正式行，等下一轮定。
+
+## 86. P7 第二刀：capability 句柄表与 8/9/10（2026-11-07，与 §85 同日）
+
+### 86a. 动了什么
+
+* `kernel/src/handle.rs`（新，`handles` 特性）：`Handle(u64)` = `slot:u16 + gen:u48`；16 格表；
+  owner 两格（`gidx + Task::id`）；`Rights`（READ/DUP 发放）；`close` / `dup`（只能收窄）/
+  `read`（**取票 → 锁外读 → 锁内提交**，失败不提交游标）；`revoke_task`；六个拒绝计数器；
+  每槽 u48 计数器与预置探针。
+* `user.rs`：`8/9/10`、`-4/-5/-6`、`ABI_MINOR 4 → 5`、`F_HANDLES = 16`（**只在特性开启时置位**）；
+  `file_read` 分块读 + `copy_to_user`，写失败/盘失败都不提交游标（`abort`）。
+* `sync.rs`：`RANK_HANDLE = 35`；`lock-order.md` 去掉"预登记、代码里没有"的注记并写明盘 I/O 在锁外。
+* `sched.rs`：`current_identity()`（两格）与 `reap` 里的 `revoke_task`（任务退出的唯一安全时刻）。
+* `t_fat32_exec`：新增**经表读取**的第二条证据（授权 → 512 字节一块读满 31,320 → 与走链逐字节相同 → EOF → close）。
+* `Cargo.toml`：`handles = []`，`fat32-exec = ["fat32-probe", "handles"]`；
+  `check-fat32-ports` 的依赖判据从"只能写 fat32-probe"改成"**必须包含** fat32-probe"（否则新变体是孤儿用例）。
+* 12 条负样本里 **10 条可跑**（1/2/3/4/6/7/8/9/10/11），分在 `t_handle_table`（17 格）与
+  `t_handle_syscalls`（11 格）；第 5 条（退出 → reap 端到端）与第 12 条（上游注入重跑）未跑。
+
+### 86b. 读数（取证跑）
+
+* `run --features fat32-exec`（ELF `183716fa3066`，rc=33）：`ktests: total=60 passed=60`；
+  `handle: checks=[17×true] grants=26 closes=8 reads=3 bytes=2016 stale=2 not_owner=2 denied=3
+  exhausted=1 invalid=3 no_such=2 revoked=2 live_peak=16`；
+  `handle-sys: checks=[11×true] size=32672 bytes=32672 calls=8 grants=4 denied=1 no_such=1 reads=11`；
+  `elfdisk: 句柄 slot=0 gen=0x1 字节=32672 同走链=true EOF=true 关闭=true`。
+* **ring3（P7 ⑤）**：`elfdisk: 授予容器 句柄=0x20000 主人=(1,10)`（槽 0、gen 2；主人是**容器**
+  的两格，不是启动上下文），`elfdisk: ring3 句柄 魔数=Some(1179403647) done=Some(310383693381)
+  句柄值=0x20000 表清空=true ⇒ true`（魔数 = hello.elf 前四字节的 LE u32）。
+* 正常构建：`ktests` 仍 **53**，`8/9/10` 走默认分支回 `-1`，`F_HANDLES` 为 0。
+* `check`：14/14；`test`：**41 行全部符合**（新增第 40/41 行）。
+
+### 86c. 变异证红（六格，每次造错后还原都回 60/60）
+
+| 变异 | 造了什么错 | 红在哪 |
+|---|---|---|
+| M1 | 删掉世代比较 | `stale_ok`、`stale_boundary`；`stale` 计数归 0 |
+| M2 | 删掉 owner 两格比较 | `owner_ok`；`not_owner` 归 0 |
+| M3 | 删掉权限位比较 | 表 `denied_ok`/`nocap_ok` 与 syscall `denied_ok`；`denied` 归 0 |
+| M4 | 世代永不推进（恒为 1） | `stale_ok`、`gen1_ok`、`stale_boundary` |
+| M5 | 复制失败也提交游标 | `rollback_ok`（坏指针那次的 8 字节被吞掉） |
+| M6 | 同一把锁再取一次 | L4 `重入获取 rank=35`，判定 `EXCEPTION(39)` |
+
+M6 同时是 rank 35 的**重入负样本**（硬约束 4 的第四件事）；`check-fat32-ports` 的新判据由
+M1 之前的真实误红与"必须含 fat32-probe"的结构共同兜住。
+
+### 86d. 没做/仍开
+
+1. ~~判定表 F 的两行没加~~ **已加**（第 40 行 ring3 正向、第 41 行授错主人注入，见 86e）；
+   第 40 行的期望魔数由宿主机读 `hello.elf` 算，不是内核自报。
+2. ~~ring3 没有调用者~~ **已有**：容器在 `t_fat32_exec` 里读自己的镜像并 close；**产品启动路径
+   仍然不装载用户容器**，所以手册 §10.2 仍不收这三个号。ring3 侧只做 read+close 两次调用——
+   dup/越权/旧句柄三格仍是核内用例（签名包 32 KiB 上限压着 hello 的大小，见 86e）。
+3. **第 5 条（退出 → reap 的端到端）未造**：只直调了 `revoke_task`（清掉 2 格并回账）；
+   `reap` 里的调用点存在但没有用例证明它真的被走到。
+4. **块设备失败没有自己的码**：设计只批了 `-4/-5/-6`，当前打一行点名后按 `-2` 带出；
+   新增 `-7=EIO` 要 ADR 级批准。
+5. `dup` **不共享读取位置**（表项各存一份游标）；共享要一张带引用计数的对象表。
+6. `t_handle_syscalls` 依赖 AHCI，只在 `fat32-exec` 档有意义；纯 `handles` 构建目前不存在调用者。
+
+### 86e. 同日晚些：ring3 调用者、真卷补写与判定表 +2 行
+
+**装载器授予（设计 §6.5 / P7 ⑤）**：`spawn_user` 返回容器 gidx 之后，用
+`sched::identity_of(gidx)` 查 `(gidx, Task::id)` 两格作为 owner，授 `READ|DUP`，把句柄值写进
+容器的 `.slots`（新偏移 152），同时置 `FLAG_HANDLE=32`；定时器之后才开，所以写入先于容器运行。
+容器读 4 字节（`SYS_FILE_READ`）→ 存魔数 → `SYS_HANDLE_CLOSE` → 写 done 哨兵。内核等 done
+（不是只等 `P7_CALLS`，否则"程序还在跑、内核已去读槽"会读成判据红），再核：
+魔数等于宿主机自己读出的 `hello.elf` 前四字节、done 哨兵、`handle::live()==0`。
+
+**为什么 ring3 只做两次调用**：`sign` 的载荷上限 `PKG_PAYLOAD_BYTES = 32768` 是签名包格式的界
+（ADR-033），而 hello 原来已 31,320。完整六格版本把 ELF 推到 33,856 ⇒ 镜像生成当场断言失败。
+**不擅自改包上限**（ADR 级），把 ring3 段压到 read+close（32,672 字节，离上限 96 字节）；
+dup/越权/旧句柄改由核内用例见证（`t_handle_syscalls` 11 格）。要加回 ring3 的这三格，
+先要一个"包上限或用户程序来源"的裁决。
+
+**真卷补写**：hello 改了大小，卷上的 `HELLO.ELF` 必须跟着换。本机没有 mtools（78h-6/80f-1），
+新增 `tools/patch_fat32_file.py`：就地替换一个 8.3 文件（必要时追加簇、两份 FAT 与 FSInfo 一起改），
+**写后由宿主机独立解析器复验**（字节/大小/簇链/FNV 全对）。两块卷的 HELLO 由 31,320/62 簇
+变为 **32,672/64 簇**；新指纹 `fat32-small 3eb1d518…`、`fat32-wide da3aa3a2…`；
+`t_fat32` 的 want 表与 `t_fat32_exec` 的簇数判据跟着改（后者改成**由大小推出**，不再写死）。
+第 39 行的高半抹零注入在新卷上仍是 `ChainEndsLate`（宿主机离线复算过：64 簇、末簇后继 0x843）。
+
+**判定表 +2 行（设计 §9 F）**：
+* 第 40 行：复用 `fat32-exec` 再跑一遍；宿主机核 `授予容器`/`ring3 句柄` 两行，魔数期望来自
+  `hello.elf` 前四字节，句柄值按 `slot/gen` 拆开检查，且要求这一跑 ktests 全过。
+* 第 41 行：新特性 `fault-handle-owner` 把授予的 `Task::id` 改一格 ⇒ 容器读 `-4`、
+  魔数变成 `0xdead_fffc`、表清不空、ring3 `⇒ false`，期望 FAIL(35)。
+* 注入跑**顺带抓到一个顺序依赖**：加特性改变了 `.ktests` 的链接顺序，`t_handle_syscalls`
+  跑到 `init_boot_task` 之前 ⇒ "拿不到当前任务身份"。已按"用例必须自足"在用例开头补
+  `sched::init_boot_task()`（AGENTS 那条老规矩的又一次现场）。
+
+**其它账**：unsafe 普查 +5（`user/hello` U1 10→12、U5 19→22；总计 273→278），
+`unsafe-whitelist.toml` 与 `unsafe-census.md` 的汇总行已同步；
+`check-fat32-ports` 的依赖判据改成"列表必须含 fat32-probe"（`fat32-exec` 现在多依赖 `handles`）。
 
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。

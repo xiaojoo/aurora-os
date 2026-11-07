@@ -27,6 +27,8 @@ mod driver;
 mod elf;
 mod filesystem;
 mod heap;
+#[cfg(feature = "handles")]
+mod handle;
 mod hw;
 mod irq;
 mod exit;
@@ -5256,12 +5258,12 @@ fn t_fat32() -> bool {
         lo: u16,
     }
     let want_a = [
-        Want { name: "HELLO.ELF", size: 31_320, cluster: 3, seen: 1, hi: 0, lo: 3 },
+        Want { name: "HELLO.ELF", size: 32_672, cluster: 3, seen: 1, hi: 0, lo: 3 },
         Want { name: "NOTES", size: 1_000, cluster: 65, seen: 2, hi: 0, lo: 65 },
         Want { name: "SMALL.BIN", size: 100, cluster: 67, seen: 3, hi: 0, lo: 67 },
     ];
     let want_b = [
-        Want { name: "HELLO.ELF", size: 31_320, cluster: 67_587, seen: 2, hi: 1, lo: 2_051 },
+        Want { name: "HELLO.ELF", size: 32_672, cluster: 67_587, seen: 2, hi: 1, lo: 2_051 },
         Want { name: "NOTES", size: 1_000, cluster: 67_649, seen: 3, hi: 1, lo: 2_113 },
         Want { name: "SMALL.BIN", size: 100, cluster: 67_651, seen: 4, hi: 1, lo: 2_115 },
     ];
@@ -5771,11 +5773,76 @@ fn t_fat32_exec() -> bool {
         return false;
     }
     let walk_ok = w.bytes == size
-        && w.clusters == 62
+        // 簇数由大小推出来，不写死 62：容器一改（P7 加了句柄实验段，31,320 → 33,856），
+        // 写死的数会把"夹具换了"读成"走链坏了"。
+        && w.clusters as usize == (size + vol.bpb.cluster_bytes - 1) / vol.bpb.cluster_bytes
         && w.tail_bytes == size - (w.clusters as usize - 1) * vol.bpb.cluster_bytes
         && w.after_last >= EOC_MARKER
         && fed == size;
     let bytes_same = disk == &HELLO_ELF[..];
+
+    // ②b 句柄路径（P7 设计 §6.4）：同一份字节经 16 格表 + 每槽 u48 世代读回来，必须与走链
+    //     那份逐个相同。表里存的是值（port + Bpb + FileStat + 游标），不借 `Volume` 的生命周期。
+    //     这条把「取文件路径改走表的核内入口」变成有真实调用者的一件事；它仍是 ktest，不是产品路径。
+    sched::init_boot_task();
+    let ident = match crate::sched::current_identity() {
+        Some(v) => v,
+        None => {
+            crate::log_fatal!("elfdisk: 句柄路径拿不到当前任务身份");
+            return false;
+        }
+    };
+    let hcur = match vol.open_cursor("HELLO.ELF") {
+        Ok(c) => c,
+        Err(e) => {
+            crate::log_fatal!("elfdisk: 句柄路径打开失败 {:?}", e);
+            return false;
+        }
+    };
+    let h = match crate::handle::grant_file(
+        ident,
+        FAT_PORT_A,
+        hcur,
+        crate::handle::RIGHT_READ | crate::handle::RIGHT_DUP,
+    ) {
+        Ok(h) => h,
+        Err(e) => {
+            crate::log_fatal!("elfdisk: 授予句柄失败 {}", e.tag());
+            return false;
+        }
+    };
+    let mut hoff = 0usize;
+    let mut hsame = true;
+    let mut hchunk = [0u8; crate::filesystem::vfs::SECTOR_BYTES];
+    while hoff < size {
+        let ask = core::cmp::min(hchunk.len(), size - hoff);
+        match crate::handle::read(h, ident, &mut hchunk[..ask]) {
+            Ok(0) => break,
+            Ok(n) => {
+                hsame &= disk[hoff..hoff + n] == hchunk[..n];
+                hoff += n;
+                if n < ask {
+                    break;
+                }
+            }
+            Err(e) => {
+                crate::log_fatal!("elfdisk: 句柄路径读失败 {}", e.tag());
+                return false;
+            }
+        }
+    }
+    let heof = crate::handle::read(h, ident, &mut hchunk) == Ok(0);
+    let hclose = crate::handle::close(h, ident).is_ok();
+    let handle_ok = hoff == size && hsame && heof && hclose;
+    crate::log_info!(
+        "elfdisk: 句柄 slot={} gen={:#x} 字节={} 同走链={} EOF={} 关闭={}",
+        h.slot(),
+        h.gen(),
+        hoff,
+        hsame,
+        heof,
+        hclose
+    );
 
     // ③ 段表两处对比（这份容器是 `ET_EXEC`，地址搬不动，所以两处必须逐格相同）
     let prog_d = elf::parse(disk);
@@ -5840,11 +5907,57 @@ fn t_fat32_exec() -> bool {
             return false;
         }
     };
+    // P7 ⑤：装载器给**这个容器**授予 READ|DUP 句柄，指向它自己那份镜像。
+    // 身份按 spawn 返回的 gidx 查两格（gidx + Task::id）——不是启动上下文自己的身份；
+    // 把句柄写进容器的 `.slots`，与 `flag` 一起在它被换上来之前写好（定时器还没开）。
+    let ring3_h = match crate::sched::identity_of(t) {
+        Some(ident) => {
+            let hc = match vol.open_cursor("HELLO.ELF") {
+                Ok(c) => c,
+                Err(e) => {
+                    crate::log_fatal!("elfdisk: 授予前打开失败 {:?}", e);
+                    return false;
+                }
+            };
+            // 负样本：owner 的 Task::id 改错一格。容器读自己的句柄必须 `-4`。
+            let owner = {
+                #[cfg(feature = "fault-handle-owner")]
+                { (ident.0, ident.1 ^ 1) }
+                #[cfg(not(feature = "fault-handle-owner"))]
+                { ident }
+            };
+            let h = match crate::handle::grant_file(
+                owner,
+                FAT_PORT_A,
+                hc,
+                crate::handle::RIGHT_READ | crate::handle::RIGHT_DUP,
+            ) {
+                Ok(h) => h,
+                Err(e) => {
+                    crate::log_fatal!("elfdisk: 授予容器失败 {}", e.tag());
+                    return false;
+                }
+            };
+            user::write_at(loaded.data_va + user::ABI_SLOT_HANDLE, h.0);
+            user::write_at(loaded.data_va + user::ABI_SLOT_FLAG, user::FLAG_HANDLE);
+            crate::log_info!("elfdisk: 授予容器 句柄={:#x} 主人=({},{})", h.0, owner.0, owner.1);
+            h
+        }
+        None => {
+            crate::log_fatal!("elfdisk: 容器身份查不到（gidx={}）", t);
+            return false;
+        }
+    };
     apic::timer_start().ok();
     let mut rounds = 0u64;
     apic::with_interrupts(|| {
         let t0 = tsc::now();
-        while user::served() < P7_CALLS && tsc::now().wrapping_sub(t0) < 200_000_000 {
+        // 句柄实验的最后一步写 `h_done`；等它，而不是只等基础序列的调用数——
+        // 否则"程序还在跑句柄段、内核已经去读槽"这种赛跑会被读成判据红。
+        while (user::served() < P7_CALLS
+            || user::read_at(loaded.data_va + user::ABI_SLOT_H_DONE).unwrap_or(0) == 0)
+            && tsc::now().wrapping_sub(t0) < 200_000_000
+        {
             rounds += 1;
             tsc::spin(20_000);
         }
@@ -5860,6 +5973,21 @@ fn t_fat32_exec() -> bool {
     let unk = user::read_at(loaded.data_va + 24);
     let rod = user::read_at(loaded.data_va + 32);
     let loops = user::read_at(loaded.data_va + 40);
+    // ring3 那两格：由**用户侧**写，内核只读。close 的成功不单占一格——`live()==0` 就是见证。
+    let h_magic = user::read_at(loaded.data_va + user::ABI_SLOT_H_MAGIC);
+    let h_done = user::read_at(loaded.data_va + user::ABI_SLOT_H_DONE);
+    let table_clean = crate::handle::live() == 0;
+    let ring3_ok = h_magic == Some(0x464c_457f)
+        && h_done == Some(0x4844_4f4e_45)
+        && table_clean;
+    crate::log_info!(
+        "elfdisk: ring3 句柄 魔数={:?} done={:?} 句柄值={:#x} 表清空={} ⇒ {}",
+        h_magic,
+        h_done,
+        ring3_h.0,
+        table_clean,
+        ring3_ok
+    );
     let served = user::served();
     let guard_ok = !mm::is_mapped(loaded.stack_top - mm::PAGE as u64 - 8);
     crate::log_info!(
@@ -5891,7 +6019,8 @@ fn t_fat32_exec() -> bool {
         && served >= P7_CALLS
         && eff_ok
         && guard_ok
-        && same_image;
+        && same_image
+        && ring3_ok;
 
     // ⑤ 目录项把大小说大 4096：链在喂完之前就到 EOC ⇒ 必须红在走链那一步，装载无从发生。
     //    这一格是"来源换成盘"之后新增的那一类：内嵌夹具的 size 是我编的，改不动它。
@@ -5935,9 +6064,9 @@ fn t_fat32_exec() -> bool {
         after
     );
 
-    let ok = bound_ok && walk_ok && bytes_same && segs_same && run_ok && early_ok && short_ok && clean_up;
+    let ok = bound_ok && walk_ok && bytes_same && handle_ok && segs_same && run_ok && early_ok && short_ok && clean_up;
     crate::log_info!(
-        "elfdisk: 判据 同长={} 走链={} 字节同={} 段表同={} 跑通={} 元数据说大被拒={} 截短被拒={} 收尾干净={} ⇒ {}",
+        "elfdisk: 判据 同长={} 走链={} 字节同={} 段表同={} 跑通={} 元数据说大被拒={} 截短被拒={} 收尾干净={} 句柄路径={} ring3句柄={} ⇒ {}",
         bound_ok,
         walk_ok,
         bytes_same,
@@ -5946,6 +6075,8 @@ fn t_fat32_exec() -> bool {
         early_ok,
         short_ok,
         clean_up,
+        handle_ok,
+        ring3_ok,
         ok
     );
     if !ok {

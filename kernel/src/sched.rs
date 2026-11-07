@@ -272,6 +272,16 @@ pub fn reap(cpu: usize) -> usize {
             waiting += 1;
             continue;
         }
+        // 任务退出撤销：句柄表里 owner 两格都对的表项在这里清掉。**这是唯一安全的时刻**——
+        // 它的内核栈与用户页都已经不会再被踩（设计 §7）。只读文件对象不持有页框，账只记在手柄表里。
+        #[cfg(feature = "handles")]
+        {
+            let id = {
+                let s = rq(cpu);
+                s.tasks[slot].id
+            };
+            crate::handle::revoke_task(gi, id);
+        }
         release_owned(cpu, slot);
         let s = rq(cpu);
         s.tasks[slot].state = TaskState::Free;
@@ -470,6 +480,40 @@ const RFLAGS_IF: u64 = 1 << 9;
 
 pub fn current_id() -> usize {
     my_rq().current
+}
+
+/// 当前任务的 `(全局下标, Task::id)` 两格（P7 句柄的 owner）。
+/// 只认槽号会让新任务继承死者的句柄：`spawn` 找 `Free` 槽而退出当场就标 Free（设计 §2.2）。
+#[cfg(feature = "handles")]
+pub fn current_identity() -> Option<(usize, u32)> {
+    let cpu = crate::arch::x86_64::cpu::self_slot();
+    let gi = current_of(cpu);
+    let slot = slot_of(gi);
+    let s = rq(cpu);
+    let t = &s.tasks[slot];
+    if t.state == TaskState::Free {
+        None
+    } else {
+        Some((gi, t.id))
+    }
+}
+
+/// 按**全局下标**查 `(gidx, Task::id)`。装载器用它把句柄授给"这个容器"，
+/// 而不是授给正在跑验收的启动上下文——两者是不同任务，混了就等于没有归属。
+#[cfg(feature = "handles")]
+pub fn identity_of(gidx: usize) -> Option<(usize, u32)> {
+    if gidx >= MAX_TASKS_TOTAL {
+        return None;
+    }
+    let cpu = cpu_of(gidx);
+    let slot = slot_of(gidx);
+    let s = rq(cpu);
+    let t = &s.tasks[slot];
+    if t.state == TaskState::Free {
+        None
+    } else {
+        Some((gidx, t.id))
+    }
 }
 
 /// 某个 CPU 当前跑的任务（全局下标）。跨核用例用它证明"两个核各自跑各自队列里的任务"。

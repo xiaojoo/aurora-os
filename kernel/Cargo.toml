@@ -107,7 +107,13 @@ fat32-probe = []
 # 变体（L3-C③，BACKLOG 78h-1）：把用户镜像的来源从 `include_bytes!` 换成卷A 上的 `HELLO.ELF`，
 # 装进用户窗口并真跑一遍。依赖探针——没有那两条用例就没有"同一份容器的另一条路"可比。
 # 同样不进正常构建也不进四把尺子：一次走链 401 条块命令，加上一次真跑用户任务。
-fat32-exec = ["fat32-probe"]
+fat32-exec = ["fat32-probe", "handles"]
+# P7：用户 capability 句柄表（16 格、slot:u16+gen:u48）。只在特性档里编译/置位 ABI 位：
+# 正常构建没有表 ⇒ 8/9/10 走默认分支回 -1，F_HANDLES 读回 false（与手册 §10.2 的纪律一致）。
+handles = []
+# 负样本（P7 §9 F）：把装载器授予的 owner 改错一格（Task::id ^ 1）。
+# 容器读自己的句柄必须 NotOwner ⇒ 判定链这一行期望 FAIL；证明"授予给谁"不是修辞。
+fault-handle-owner = []
 
 
 # 负样本（M5-c③）：写命令不置 DW0 的 W 位（真驱动最容易犯的方向错）。

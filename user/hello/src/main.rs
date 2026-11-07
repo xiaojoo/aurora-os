@@ -126,6 +126,8 @@ const SYS_EXIT: u64 = 3;
 const SYS_PEEK: u64 = 4;
 /// 返回 ABI 版本与特性位
 const SYS_ABI_INFO: u64 = 7;
+const SYS_HANDLE_CLOSE: u64 = 8;
+const SYS_FILE_READ: u64 = 10;
 /// 让内核把一段缓冲区读走并算校验和（跨页形状）
 const SYS_PEEK_BUF: u64 = 5;
 /// 让内核把一段模式写进这块缓冲区（跨页形状，方向反过来）
@@ -178,6 +180,9 @@ struct Slots {
     fast_cs: AtomicU64,
     fast_ss: AtomicU64,
     fast_ping: AtomicU64,
+    handle: AtomicU64,
+    h_magic: AtomicU64,
+    h_done: AtomicU64,
 }
 
 // 初始值全是 0：用例在外面先把它们填成 `0xdeadbeef` 之类的哨兵是不可能的
@@ -205,6 +210,9 @@ static SLOTS: Slots = Slots {
     fast_cs: AtomicU64::new(0),
     fast_ss: AtomicU64::new(0),
     fast_ping: AtomicU64::new(0),
+    handle: AtomicU64::new(0),
+    h_magic: AtomicU64::new(0),
+    h_done: AtomicU64::new(0),
 };
 
 // **偏移是编译期核对的，不是注释里的约定**。内核侧按 `OFF_*` 这组数字读写，
@@ -228,6 +236,9 @@ const _: () = assert!(core::mem::offset_of!(Slots, abi_word) as u64 == OFF_ABI_W
 const _: () = assert!(core::mem::offset_of!(Slots, fast_cs) as u64 == OFF_FAST_CS);
 const _: () = assert!(core::mem::offset_of!(Slots, fast_ss) as u64 == OFF_FAST_SS);
 const _: () = assert!(core::mem::offset_of!(Slots, fast_ping) as u64 == OFF_FAST_PING);
+const _: () = assert!(core::mem::offset_of!(Slots, handle) as u64 == OFF_HANDLE);
+const _: () = assert!(core::mem::offset_of!(Slots, h_magic) as u64 == OFF_H_MAGIC);
+const _: () = assert!(core::mem::offset_of!(Slots, h_done) as u64 == OFF_H_DONE);
 // `BUF_OFF + BUF_LEN` 必须**真的跨过一条页边界**，否则整个跨页实验就退化成同页实验，
 // 而"第一页满、第二页没动"那种错法正好只有跨页才抓得到。
 const _: () = assert!(BUF_OFF / 4096 != (BUF_OFF + BUF_LEN - 1) / 4096);
@@ -305,6 +316,34 @@ unsafe fn syscall(nr: u64, a1: u64, a2: u64) -> u64 {
             inlateout("rax") nr => ret,
             in("rdi") a1,
             in("rsi") a2,
+            options(preserves_flags)
+        );
+    }
+    ret
+}
+
+/// P7：capability 句柄实验（ring3 调用 10/8；越权与旧句柄两格由内核用例覆盖）。
+pub const FLAG_HANDLE: u64 = 32;
+/// 内核授予的文件句柄（指向卷上的 HELLO.ELF）。
+pub const OFF_HANDLE: u64 = 152;
+/// 读到的前 4 字节（成功时是 ELF 魔数的 LE u32）。
+pub const OFF_H_MAGIC: u64 = 160;
+/// 收尾哨兵；内核等它非 0 才读上面两格。
+pub const OFF_H_DONE: u64 = 168;
+const HANDLE_DONE: u64 = 0x4844_4f4e_45; // "HDONE"
+
+/// 三参数版本（`file_read` 要 `rdx`=长度）。与两参数版本同一条 ABI，只多一个寄存器。
+#[inline]
+unsafe fn syscall3(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    let ret: u64;
+    // SAFETY: 同 `syscall`；rdx 只是第三个参数。
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") nr => ret,
+            in("rdi") a1,
+            in("rsi") a2,
+            in("rdx") a3,
             options(preserves_flags)
         );
     }
@@ -434,6 +473,27 @@ pub extern "C" fn _start() -> ! {
                 k += 1;
             }
         }
+    }
+    if flag & FLAG_HANDLE != 0 {
+        // P7 ring3 句柄：内核按"这个容器"的身份授了 READ|DUP 句柄，指向卷上的 HELLO.ELF。
+        // ① 读 4 字节必须是 ELF 魔数；② close 必须回 0（越权/旧句柄两格由内核用例覆盖）。
+        // 缓冲用栈上的局部量：`relocation-model=static` 下取 `.rodata` 地址会退化成 32 位
+        // 绝对重定位（见上面 peek 那段注释）。
+        let mut buf = [0u8; 4];
+        let ptr = core::ptr::addr_of!(buf) as u64;
+        let h = SLOTS.handle.load(Ordering::Relaxed);
+        let n = unsafe { syscall3(SYS_FILE_READ, h, ptr, 4) };
+        let magic = if n == 4 {
+            // SAFETY: `ptr` 指向本任务栈上这 4 个字节，内核刚写满
+            (unsafe { core::ptr::read_volatile(ptr as *const u32) }) as u64
+        } else {
+            0xdead_0000 | (n & 0xffff)
+        };
+        SLOTS.h_magic.store(magic, Ordering::Relaxed);
+        // close 的返回值不单占一格：它成功与否由内核的 `live()==0` 判（表清空就是见证）
+        let _ = unsafe { syscall(SYS_HANDLE_CLOSE, h, 0) };
+        // 最后一个写：内核等这一格非 0 才读上面三格
+        SLOTS.h_done.store(HANDLE_DONE, Ordering::Relaxed);
     }
     if flag & FLAG_GUARD_STORE != 0 {
         // 从 ring3 直接写 guard 页：这**不经过**任何指针校验（校验管的是"内核替谁读"），
