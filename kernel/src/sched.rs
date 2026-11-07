@@ -1089,3 +1089,30 @@ pub unsafe fn preempt_point(frame: u64, cpu: usize) {
     // SAFETY: resume 由 spawn 合成或上一次抢占时保存，落在该任务自己的栈上
     unsafe { context_load(resume, if_open as u64) }
 }
+
+
+/// ADR-040：把调度器实现装进 arch 的回调表。只在 after_switch 开头调用一次。
+pub fn install_arch_hooks() {
+    crate::hooks::install(crate::hooks::SchedHooks {
+        mark_tick,
+        init_idle_task,
+        spawn,
+        bump_current_work,
+        syscall_dispatch: crate::user::syscall_dispatch,
+        park_current: crate::user::park_current,
+        exit_current,
+        preempt_point: preempt_hook,
+    });
+}
+
+/// AP 工人经 hook 调用：只数自己的圈，不再直接碰 WORK。
+pub fn bump_current_work() {
+    WORK[current_id()].fetch_add(1, Ordering::Relaxed);
+}
+
+/// hook 的安全垫片：把“必须持有当前异常帧”的契约收在这里，表里只放安全 fn。
+fn preempt_hook(frame: u64, cpu: usize) {
+    // SAFETY: 调用点是异常出口，frame 指向本 CPU 刚保存的 TrapFrame；
+    // 契约与 sched::preempt_point 的 SAFETY 注释相同。
+    unsafe { preempt_point(frame, cpu) }
+}

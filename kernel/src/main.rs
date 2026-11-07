@@ -27,6 +27,7 @@ mod driver;
 mod elf;
 mod filesystem;
 mod heap;
+mod hooks;
 #[cfg(feature = "handles")]
 mod handle;
 mod hw;
@@ -192,6 +193,8 @@ pub extern "C" fn kmain() -> ! {
 
 /// 页表切换完成后运行在自己的栈上。`_` 是续体参数，留着以便将来传启动句柄。
 extern "C" fn after_switch(_: usize) -> ! {
+    // ADR-040：先把调度器实现装进 arch 的回调表，早于 AP 释放与任何定时器窗口。
+    sched::install_arch_hooks();
     // Task C（V1.0 §14）：启动编排按阶段函数组织；顺序与日志契约不变。
     stage_memory();
     stage_cpu_protections();

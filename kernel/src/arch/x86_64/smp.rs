@@ -22,7 +22,7 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use crate::{clock, limine, mm, sched, sync, tsc};
+use crate::{clock, limine, mm, sync, tsc};
 use crate::arch::x86_64::{apic, cpu, trap};
 
 /// AP 的入口栈：4 页 + 1 页 guard（与任务栈同一条 §6.4 规则）
@@ -417,10 +417,10 @@ pub extern "C" fn aurora_ap_main(slot: u64, expect_lapic: u64) -> ! {
         cpu::mark_ready(slot);
         halt_forever(); // 没建过栈就不要开调度：队列的边界校验会一直失败，那是更难的现场
     }
-    sched::init_idle_task(stack_lo, stack_lo + (AP_STACK_PAGES as u64) * mm::PAGE as u64, true);
+    (crate::hooks::sched().init_idle_task)(stack_lo, stack_lo + (AP_STACK_PAGES as u64) * mm::PAGE as u64, true);
     // 6) 在这条 CPU 自己的队列里放一个工人。它和上面的空闲上下文轮流跑，
     //    这就是"AP 在跑调度器"的唯一可数证据（BSP 那边读 `stats_of(ap).0`）。
-    match sched::spawn(ap_worker) {
+    match (crate::hooks::sched().spawn)(ap_worker) {
         Ok(t) => AP_TASK[slot].store(t + 1, Ordering::Release), // +1：0 留给"没建成"
         Err(e) => {
             AP_SPAWN_FAILED.fetch_add(1, Ordering::Relaxed);
@@ -507,9 +507,8 @@ pub fn ap_spawn_failures() -> usize {
 /// 而那条用例的判据根本没打算管 AP。不收工也没关系：
 /// `stop_aps()` 会让空闲上下文跳出主循环，这条 CPU 之后不再取任务。
 fn ap_worker() -> ! {
-    let me = sched::current_id();
     loop {
-        sched::WORK[me].fetch_add(1, Ordering::Relaxed);
+        (crate::hooks::sched().bump_current_work)();
         tsc::spin(3_000);
     }
 }

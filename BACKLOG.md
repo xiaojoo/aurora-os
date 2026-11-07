@@ -3326,6 +3326,34 @@ main.rs 677 → 709 行（多出来的是函数签名/文档注释/空行）。�
 - §13 的 P1/P2 项（块设备抽象、MSI-X/INTx、驱动隔离域、生命周期/错误契约）仍开。
 - 本轮没有真机/KVM 验证。
 
+## 92. ADR-040：arch 与 sched 之间用回调表反转依赖（2026-11-08）
+
+**做法（实测）**：新增中性 `kernel/src/hooks.rs`（`SchedHooks` 函数表，8 个字段：
+mark_tick / init_idle_task / spawn / bump_current_work / syscall_dispatch / park_current /
+exit_current / preempt_point）。`sched::install_arch_hooks()` 在 `after_switch` 开头安装；
+`apic` / `smp` / `trap` 不再直接引用 `sched` 或 `user`（注释除外）。
+`preempt_point` 用 sched 内的安全垫片 `preempt_hook`，表里只放安全 fn。
+
+**读数（实测）**：
+- 默认启动日志：改前/改后各一遍，抹数字后 **789 行逐行同序、多重集差异 0**。
+- `test`：41/41 符合（exit=0）；`check`：16/16；默认注册 53、默认跑 53/53。
+- 依赖登记：`arch.dependencies` 去掉 `sched`；`arch.known_violations` 清空；
+  SCC 仍是 14（`arch -> memory -> sched -> arch` 等其它路径仍闭合），`known_scc` 不变。
+- unsafe：278 → 281（`hooks` U4=3；`sched` U2 4→5；`arch/x86_64/trap` U2 1→0）。
+  顺带修了 Task A 生成 census 时丢失 `###` 标题的问题，逐处表已全量重生成。
+- bench：P1 min 本次 1164/1087（Task C 改后配对 1545/1028、改前 1571），在噪声内；
+  P5 min 配对 改前 6324/6055/4719、改后 6257/6033/4687/6136/5741，分布重叠；
+  P7 min/mean 305–326 / 12.9–14.8k vs 改前 310 / 12.9k，样本数 235 相同；
+  P4 离散度 0.76%。**不把间接调用写成无代价**：本轮只给同窗口对照，长期容忍度未定。
+- 负样本：删掉 `sched::install_arch_hooks()` 调用（默认桩生效）⇒ 判定 FAIL(35)、
+  `ktests total=53 passed=44 failed=9`，`t_percpu_queues` / `t_if_belongs_to_cpu` 失败；
+  还原后 PASS 53/53。证明 hook 表不是没有调用者的空接口。
+
+**仍未做（推断/欠账）**：
+- 14 模块环只消了这一条 §2.2 forbidden 边；`memory -> sched`、`boot -> sched` 等仍在。
+- §9.2 第二到第五步的 crate 提取；§13 P1/P2 项仍开。
+- `serial` 专属禁止项与“低层不得引用 main 测试函数”仍未机器化。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

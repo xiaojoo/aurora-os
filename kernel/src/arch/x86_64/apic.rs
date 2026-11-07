@@ -521,7 +521,7 @@ pub fn on_interrupt(vector: usize) {
         // 我们要的是"中断到达的节奏"，不是"处理完的节奏"。
         if i == TIMER_ISA_IRQ as usize {
             // 抢占的唯一触发源（BSP 这一侧）。这里只置标志 + 两次原子加，不拿锁、不打印、不分配。
-            crate::sched::mark_tick();
+            (crate::hooks::sched().mark_tick)();
             let now = crate::tsc::now();
             let prev = TICK_TSC_LAST.swap(now, Ordering::Relaxed);
             if prev != 0 {
@@ -556,7 +556,7 @@ pub fn on_interrupt(vector: usize) {
         // * 也不算 `unexpected`：它是设计内的中断。
         // * `mark_tick()` 置的是**本 CPU** 的重调度标志，各条队列各排各的人。
         CPU_TICKS[slot].fetch_add(1, Ordering::Relaxed);
-        crate::sched::mark_tick();
+        (crate::hooks::sched().mark_tick)();
     } else {
         UNEXPECTED.fetch_add(1, Ordering::Relaxed);
     }

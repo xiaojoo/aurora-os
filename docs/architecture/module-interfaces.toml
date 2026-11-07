@@ -45,7 +45,7 @@ status = "部分落地"
 module_id = "arch"
 owner = "arch"
 layer = "arch"
-source_modules = ["arch", "arch/x86_64", "arch/x86_64/apic", "arch/x86_64/cpu", "arch/x86_64/cpuid", "arch/x86_64/smp", "arch/x86_64/trap"]
+source_modules = ["arch", "arch/x86_64", "arch/x86_64/apic", "arch/x86_64/cpu", "hooks", "arch/x86_64/cpuid", "arch/x86_64/smp", "arch/x86_64/trap"]
 public_api = [
   "apic::TimerError",
   "apic::ap_enable_lapic",
@@ -106,6 +106,9 @@ public_api = [
   "cpu::user_protections_active",
   "cpu::wrmsr",
   "cpuid::detect",
+  "hooks::SchedHooks",
+  "hooks::install",
+  "hooks::sched",
   "smp::released_count",
   "smp::stop_aps",
   "smp::stuck_online_count",
@@ -145,14 +148,14 @@ public_api = [
   "x86_64::trap",
 ]
 allowed_callers = ["capability", "diagnostics", "driver", "integration", "irq", "memory", "pci", "sched", "storage", "sync", "time"]
-dependencies = ["boot", "diagnostics", "irq", "memory", "pci", "sched", "sync", "time"]
+dependencies = ["boot", "diagnostics", "irq", "memory", "pci", "sync", "time"]
 forbidden_dependencies = ["sched"]
-known_violations = ["arch->sched"]
+known_violations = []
 context = ["BOOT", "KERNEL", "IRQ_OFF", "ISR_TOP", "USER_ENTRY", "PANIC"]
 error_classes = ["A", "C", "D"]
 resource_ownership = "CPU 特性快照、GDT/IDT/TSS、LAPIC/IOAPIC、每 CPU 槽位与上线状态、TrapFrame 与上下文布局。"
 error_policy = "非法向量/未映射 → 明确错误；必需 CPU 特性缺失 → BootInvalid(37)；致命异常 → L4(39)。"
-unsafe_scope = ["arch/x86_64/apic:U1,U2,U4", "arch/x86_64/cpu:U1", "arch/x86_64/smp:U1,U4", "arch/x86_64/trap:U1,U2,U4"]
+unsafe_scope = ["arch/x86_64/apic:U1,U2,U4", "arch/x86_64/cpu:U1", "hooks:U4", "arch/x86_64/smp:U1,U4", "arch/x86_64/trap:U1,U4"]
 test_targets = ["t_cpu_ids_agree", "t_ap_released_and_ticking", "t_ap_boot_abi", "t_exception_stack_guard", "t_tlb_shootdown", "t_percpu_queues", "t_if_belongs_to_cpu", "t_if_patch_both_branches", "t_cross_cpu_lock_contention", "t_pic_still_masked"]
 status = "部分落地"
 
@@ -232,21 +235,16 @@ public_api = [
   "sched::MAX_TASKS",
   "sched::OwnedSet",
   "sched::TaskState",
-  "sched::WORK",
   "sched::current_id",
   "sched::current_identity",
-  "sched::exit_current",
   "sched::identity_of",
   "sched::init_boot_task",
-  "sched::init_idle_task",
+  "sched::install_arch_hooks",
   "sched::kill_current",
   "sched::mark_need",
-  "sched::mark_tick",
   "sched::p1_stats",
   "sched::p1_with_samples",
-  "sched::preempt_point",
   "sched::reap_released",
-  "sched::spawn",
   "sched::spawn_user",
   "sched::start_workers",
   "sched::state_of",
@@ -270,7 +268,7 @@ public_api = [
   "user::syscall_dispatch",
   "user::write_at",
 ]
-allowed_callers = ["arch", "capability", "diagnostics", "integration", "memory"]
+allowed_callers = ["capability", "diagnostics", "integration", "memory"]
 dependencies = ["arch", "boot", "capability", "diagnostics", "memory", "storage", "sync", "time"]
 forbidden_dependencies = []
 known_violations = []

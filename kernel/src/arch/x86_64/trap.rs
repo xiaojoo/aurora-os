@@ -922,7 +922,7 @@ pub enum Action {
 /// 没有这条的话，一个用户程序的野指针就是整台机器（§1.1 的立项理由）。
 pub fn dispatch(frame: &mut TrapFrame) -> Action {
     if is_syscall_vector(frame.vector) {
-        return if crate::user::syscall_dispatch(frame) {
+        return if (crate::hooks::sched().syscall_dispatch)(frame) {
             Action::Exit
         } else {
             Action::Resume
@@ -1087,16 +1087,16 @@ pub unsafe extern "C" fn aurora_trap_entry(frame: &mut TrapFrame) {
         Action::Fatal => crate::exit_fatal_from_exception(frame),
         // 用户任务的故障：标 Done + 把它停在自己的死循环里。
         // **不停机**——这条分支存在的全部意义就是"一个用户程序的错不变成整台机器的错"。
-        Action::Kill => crate::user::park_current(frame),
+        Action::Kill => (crate::hooks::sched().park_current)(frame),
         // `SYS_EXIT`：只把"结束"这个动作登记下来，**不在这个上下文里释放任何东西**
-        Action::Exit => crate::sched::exit_current(cpu),
+        Action::Exit => (crate::hooks::sched().exit_current)(cpu),
         Action::Resume => {}
     }
     // 抢占点：此刻 frame 就压在**被中断任务自己的栈**上，所以它就是续跑点。
     // 若发生切换，下面这行不会返回（见 sched::preempt_point）。
     // SAFETY: 见 preempt_point 的契约——frame 必须是本任务栈上真实的异常帧，
     // 而它正是上面 `mov rdi, rsp` 交给我们的那个地址。
-    unsafe { crate::sched::preempt_point(core::ptr::addr_of_mut!(*frame) as u64, cpu) };
+    (crate::hooks::sched().preempt_point)(core::ptr::addr_of_mut!(*frame) as u64, cpu);
     // 换出过就不会走到这里。快路径的 rflags 要被 `sysretq` 从 r11 装回去，而那条出口
     // 不经过 `if_patch` —— IF 属于 CPU（ADR-021），在这里按本 CPU 的窗口写。
     if frame.vector == VEC_SYSCALL_FAST {

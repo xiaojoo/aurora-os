@@ -16,7 +16,7 @@ scope = "arch/x86_64/trap.rs(asm+描述符+CR2) · serial.rs(端口) · limine.r
 # M4-2 之后这条 scope 已经**不再完整**（sched/sync/apic/mm/cpu/smp/user/tsc 也都有 unsafe），
 # 而门禁是按包计数的，所以这行写漏不会让检查失败——那正是它该被写全的理由。
 # 逐包拆分之前，先把"这个包里 unsafe 集中在哪几类"说明白，而不是留一份 M1 时代的清单。
-scope_actual = "asm 全局符号与异常桩(trap/sched/cpu) · 描述符表与 CR4/CR3(trap/cpu/mm) · 端口与 MMIO(serial/apic) · 页表遍历(mm) · per-CPU 静态区的裸指针读写(sched/sync/resource/smp/user/cpu) · 内联 asm 的取指/STAC-CLAC(user) · ktest 里的现场读回(main 与 ktests/*) · 句柄表里那一段连续物理内存的 volatile 字节/双字访问与 `UnsafeCell` 表(driver) · 驱动静态区取句柄(ahci，只剩 5 处，全部是拿句柄不是拿指针) · 崩溃现场的有界栈走(crash：两处 read_volatile，每处都先过「8 字节对齐 + 内核半区 + 已映射」三关，读回来的值只进记录、不解引用、不参与控制流)"
+scope_actual = "asm 全局符号与异常桩(trap/sched/cpu) · 描述符表与 CR4/CR3(trap/cpu/mm) · 端口与 MMIO(serial/apic) · 页表遍历(mm) · per-CPU 静态区的裸指针读写(sched/sync/resource/smp/user/cpu) · 内联 asm 的取指/STAC-CLAC(user) · ktest 里的现场读回(main 与 ktests/*) · arch↔sched 回调表(hooks) · 句柄表里那一段连续物理内存的 volatile 字节/双字访问与 `UnsafeCell` 表(driver) · 驱动静态区取句柄(ahci，只剩 5 处，全部是拿句柄不是拿指针) · 崩溃现场的有界栈走(crash：两处 read_volatile，每处都先过「8 字节对齐 + 内核半区 + 已映射」三关，读回来的值只进记录、不解引用、不参与控制流)"
 expires = "M2：按 §2.5 拆出 aurora-arch / aurora-hw / aurora-mm-core 后，本条改为逐 crate 登记"
 
 # M4-2：第一个用户程序（测试夹具）。它的 unsafe 只有两类，都写在源码注释里。
@@ -45,11 +45,11 @@ expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe
 # 2026-11-07 P7：hello 加了 syscall3（U1 两处）与 ring3 句柄读/close（U5 三处）。
 
 [unsafe-census]
-total = 278
+total = 281
 U1 = 53
 U2 = 60
 U3 = 13
-U4 = 103
+U4 = 106
 U5 = 28
 U6 = 21
 
@@ -74,7 +74,6 @@ U4 = 8
 
 [modules."arch/x86_64/trap"]
 U1 = 13
-U2 = 1
 U4 = 9
 
 [modules."crash"]
@@ -86,6 +85,9 @@ U4 = 9
 
 [modules."heap"]
 U2 = 7
+
+[modules."hooks"]
+U4 = 3
 
 [modules."hw"]
 U1 = 2
@@ -146,7 +148,7 @@ U4 = 7
 
 [modules."sched"]
 U1 = 2
-U2 = 4
+U2 = 5
 U4 = 10
 
 [modules."serial"]

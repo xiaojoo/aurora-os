@@ -23,7 +23,7 @@ Boot / Platform     (boot)
 | 禁止 | 当前源码 | 状态 |
 | --- | --- | --- |
 | `mm` → `ahci` / `virtio` | 无 | 干净 |
-| `trap` → `user` 业务实现 | `arch -> sched`（apic/smp/trap 调 `sched::mark_tick` / `init_idle_task` / `exit_current`） | **已知违例**，冻结在 `arch.known_violations` |
+| `trap` → `user` 业务实现 | 无（ADR-040：trap 经 `hooks` 调 `user::syscall_dispatch` / `park_current`） | 干净 |
 | `pci` → 具体 AHCI | 无 | 干净 |
 | `driver` → `ahci.rs` / `virtio.rs` | 无（唯一命中的 `ahci::RING` 在注释里，扫描已剥注释） | 干净 |
 | `resource` → 调度器内部任务结构 | 无 | 干净 |
@@ -35,7 +35,7 @@ Boot / Platform     (boot)
 | 逻辑模块 | 实际依赖（`dependencies`） |
 | --- | --- |
 | boot | diagnostics, sync |
-| arch | boot, diagnostics, irq, memory, pci, sched, sync, time |
+| arch | boot, diagnostics, irq, memory, pci, sync, time |
 | memory | arch, boot, diagnostics, resource, sched, sync, time |
 | sched | arch, boot, capability, diagnostics, memory, storage, sync, time |
 | sync | arch, diagnostics, time |
@@ -64,6 +64,10 @@ arch · boot · capability · diagnostics · driver · irq · memory · pci
 反向依赖高层”的说法，在这 14 个模块之间都还不成立。`[baseline].known_scc` 把这一现状
 冻结：**新增环成员或改变环的划分 ⇒ `check-module-interfaces` 红**。拆环是好事，但必须
 显式更新 baseline，并在 BACKLOG 记一条“环缩小了”。
+
+ADR-040 已消掉 `arch -> sched` 这条 §2.2 明示的 forbidden 边（经 `hooks` 表反转），
+`arch.known_violations` 现在为空；但强连通分量仍是 14——`arch -> memory -> sched -> arch`
+等其它路径仍闭合。本文件不把“环没变小”写成“拆环完成”。
 
 ## 4. 门禁规则（`check-module-interfaces`）
 
@@ -97,4 +101,5 @@ arch · boot · capability · diagnostics · driver · irq · memory · pci
 - 产品文件内的 `#[cfg]` 测试代码也计入依赖（例如 `ahci.rs` 里注册 ktest 产生
   `storage -> testing`）；这是真实编译期依赖，保留。
 - `serial` 专属禁止项与“低层不得引用 main 测试函数”两条尚未机器化，列在 §1 的欠账里。
-- `known_violations` 是**冻结基线，不是许可**；拆 crate/分层时要逐条消掉。
+- `known_violations` 是**冻结基线，不是许可**；ADR-040 后 `arch` 这一条已消掉，其余按同样流程处理。
+- `hooks` 归入 `arch` 逻辑模块；`arch` 源码不再直接引用 `sched` / `user`（注释除外，扫描已剥注释）。
