@@ -3529,10 +3529,17 @@ exit_current / preempt_point）。`sched::install_arch_hooks()` 在 `after_switc
 - 全仓 **0 处 `debug_assertions`** ⇒"持自旋锁不得睡"只能做成 `fault-*` 注入 + 判定表新行，
   三处登记（Cargo features / `do_test` 的 `do_run` / `rows`+`logs`），否则过不了
   `check-matrix-wiring` 与手册 R19。
-- 一上 idle/阻塞就会红的现有断言清单：`ktests/time.rs:84-89`（`w_idle.ticks == 0`）、
-  `:130-132`（P5 样本等式）、`ktests/sched.rs:79/124/335/638-649`（切换次数与 current 必须
-  Running）、`ktests/watchdog.rs:91`（依赖 AP 工人自旋心跳）。P1/P4 绝对值本来就不可与历史比
-  （M3b-2b 分行后 bench 只看 BSP 三行）⇒ 只能同构建内比。**这批改造排在功能之前（P0-3）**。
+- 判据脆性清单：上面初稿列的六处，**逐条复核后只剩一处真的会红**（P0-3 的实测结论，原判记为标错）。
+  `ktests/time.rs:85` 的 `t_after_cli == t1 && w_idle.ticks == 0` 测的是"本 CPU 关 IF 的空转
+  窗口收不到 tick"（`:74` 注释原文就是"关IF 空转"），与 idle **任务**无关；`ktests/sched.rs:79`
+  与 `:124` 是 `while sched::stats().0 < sw0 + 24` 这类**采样循环的上界**，不是判据；
+  `:638-649` 跨核只断言归属、只有 BSP 自读才要求 Running，多一个任务不多一次切换；
+  `ktests/watchdog.rs:44` 要的是"这一窗里有 tick"，属存在性。**真正会红的只有**
+  `ktests/sched.rs:679` 的 `worked_aps == checked_aps`——它的证人是 `smp::ap_task_of(ap)`
+  那个内置工人任务的 `WORK` 计数（`:629`），而 T1.4 恰恰要**用 idle 取代这个工人**：
+  证人不是变脆，是**消失**。因此它归 P5，且必须换成用例自己 spawn 的任务来当证人，
+  不许把等式放宽成 `>= 0` 了事。另记 `ktests/user.rs:228` 的 `runs_of(bad) <= 1` 是全仓唯一
+  一处上界型断言，P9（迁移）那天要复核。P1/P4 绝对值仍不可与历史比（M3b-2b 分行）。
 - 拟用 ADR 编号 039–047 全部被真实 ADR 039–045 撞车 ⇒ W1 的"阻塞/等待/定时"ADR 是
   **ADR-046**，后续依次 047…053。
 
@@ -3622,6 +3629,19 @@ P0-1 登记口径 → P0-2 向量表先例 → P0-3 断言 delta 化 → P1 ADR-
   "今天没有仪器数过 hlt，也没数过 IPI"。
 - W1 的"阻塞/等待/定时"ADR 因 046 被占用而**顺延为 ADR-047**。
 
+## 99. P0-3 的结果：原判撤回，判据改造归入 P5（2026-11-08）
+
+**做法（实测）**：P0-3 原写"把会在 idle/阻塞落地时必红的六处绝对断言改成基线增量"。
+逐条读原文之后**这条不成立**：六处里四处是采样循环的上界或 IF 门控判据（与 idle 任务无关），
+一处是存在性判据；只有 `ktests/sched.rs:679` 的 `worked_aps == checked_aps` 真会红，
+而且红的原因是**证人消失**（内置 AP 工人被 idle 取代），不是取数方式不对。
+
+**读数（实测）**：零代码改动（本轮 `git diff` 只有 BACKLOG.md）；`check` 17/17。
+复核用的筛选脚本是一次性量具，留在 `.scratch/w1/` 不入库。
+
+**结论**：P0 只剩两件已完成（登记口径 ADR-045、向量表 ADR-046）；判据改造并入 P5 的卡，
+P5 的完成判据加一条"**换证人，不许放宽判据**"。这条撤回按 AGENTS 的取证纪律记在这里，
+不在 §97a 原文里留一个错的清单。
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。
