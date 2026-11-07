@@ -5489,25 +5489,28 @@ fn t_fat32_mem() -> bool {
     let mut h = ahci::FNV_OFFSET;
     let mut head = [0u8; 4];
     let m_walk = match &long {
-        Ok(st) => match vol.walk(st, |chunk| {
-            for (i, b) in chunk.iter().enumerate() {
-                h = ahci::fnv1a_step(h, *b);
-                if head.len() > 0 {
-                    let n = core::cmp::min(head.len(), chunk.len());
-                    if i < n {
-                        head[i] = *b;
+        Ok(st) => {
+            let mut off = 0usize;
+            match vol.walk(st, |chunk| {
+                for (i, b) in chunk.iter().enumerate() {
+                    h = ahci::fnv1a_step(h, *b);
+                    // 只抓文件最前四字节。旧写法每段都覆写 head，等于抓"最后一段的前四字节的
+                    // 残留"——旧夹具内容按偏移 4 周期重复，那个错法恰好绿；逐扇区不同内容后当场红。
+                    if off + i < head.len() {
+                        head[off + i] = *b;
                     }
                 }
+                off += chunk.len();
+            }) {
+                Ok(w) => {
+                    w.bytes == 2000
+                        && w.clusters == 4
+                        && w.tail_bytes == 464
+                        && w.after_last >= filesystem::fat32::EOC_MARKER
+                }
+                Err(_) => false,
             }
-        }) {
-            Ok(w) => {
-                w.bytes == 2000
-                    && w.clusters == 4
-                    && w.tail_bytes == 464
-                    && w.after_last >= filesystem::fat32::EOC_MARKER
-            }
-            Err(_) => false,
-        },
+        }
         Err(_) => false,
     };
     let m_head = head == [0x11, 0x14, 0x17, 0x1a];

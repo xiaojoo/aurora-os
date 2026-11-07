@@ -571,3 +571,408 @@ fn name_matches(e: &[u8], want: &str) -> bool {
     let w = want.as_bytes();
     got.len() == w.len() && got.as_bytes()[..w.len()].eq_ignore_ascii_case(&w[..got.len()])
 }
+
+#[derive(Debug, Clone, Copy)]
+pub struct FileCursor {
+    bpb: Bpb,
+    stat: FileStat,
+    cluster: u32,
+    position: u32,
+    clusters: u32,
+}
+
+impl Volume<'_> {
+    pub fn open_cursor(&self, name: &str) -> Result<FileCursor, FsError> {
+        let stat = self.open(name)?;
+        Ok(FileCursor { bpb: self.bpb, stat, cluster: stat.first_cluster, position: 0, clusters: 0 })
+    }
+}
+
+impl FileCursor {
+    pub fn stat(&self) -> FileStat {
+        self.stat
+    }
+
+    pub fn position(&self) -> u32 {
+        self.position
+    }
+
+    fn data_lba(&self, cluster: u32) -> Result<u64, FsError> {
+        if cluster < MIN_CLUSTER || cluster >= 0x0FFF_FFF0
+            || u64::from(cluster - MIN_CLUSTER) >= self.bpb.clusters
+        {
+            return Err(FsError::BadCluster(cluster));
+        }
+        Ok(self.bpb.data_start + u64::from(cluster - MIN_CLUSTER) * u64::from(self.bpb.sectors_per_cluster))
+    }
+
+    fn next_cluster(&self, disk: &dyn Block, sector: &mut [u8; SECTOR_BYTES]) -> Result<u32, FsError> {
+        let byte_off = u64::from(self.cluster) * 4;
+        let fat_sector = byte_off / SECTOR_BYTES as u64;
+        if fat_sector >= u64::from(self.bpb.sectors_per_fat) {
+            return Err(FsError::BadCluster(self.cluster));
+        }
+        disk.read_sectors(u64::from(self.bpb.reserved_sectors) + fat_sector, sector).map_err(FsError::Io)?;
+        Ok(u32_at(sector, (byte_off % SECTOR_BYTES as u64) as usize) & FAT32_CLUSTER_MASK)
+    }
+
+    /// disk 必须仍是打开时的只读卷；Err 时游标不变，dst 中可能已写入的前缀必须丢弃。
+    pub fn read(&mut self, disk: &dyn Block, dst: &mut [u8]) -> Result<usize, FsError> {
+        let want = dst.len().min((self.stat.size - self.position) as usize);
+        let mut pending = *self;
+        let mut done = 0;
+        let mut sector = [0u8; SECTOR_BYTES];
+        while done < want {
+            if pending.clusters >= MAX_CLUSTERS_WALKED {
+                return Err(FsError::ChainTooLong);
+            }
+            let cluster_off = pending.position as usize % pending.bpb.cluster_bytes;
+            let lba = pending.data_lba(pending.cluster)? + (cluster_off / SECTOR_BYTES) as u64;
+            disk.read_sectors(lba, &mut sector).map_err(FsError::Io)?;
+            let sector_off = cluster_off % SECTOR_BYTES;
+            let take = (want - done).min(SECTOR_BYTES - sector_off);
+            dst[done..done + take].copy_from_slice(&sector[sector_off..sector_off + take]);
+            pending.position += take as u32;
+            done += take;
+            if cluster_off + take == pending.bpb.cluster_bytes || pending.position == pending.stat.size {
+                let next = pending.next_cluster(disk, &mut sector)?;
+                let at_end = pending.position == pending.stat.size;
+                if next >= EOC_MARKER {
+                    if !at_end {
+                        return Err(FsError::ChainEndsEarly {
+                            bytes: pending.position as usize, size: pending.stat.size, cluster: pending.cluster, next,
+                        });
+                    }
+                } else {
+                    if at_end {
+                        return Err(FsError::ChainEndsLate {
+                            bytes: pending.position as usize, size: pending.stat.size, cluster: pending.cluster, next,
+                        });
+                    }
+                    pending.data_lba(next)?;
+                    pending.cluster = next;
+                }
+                pending.clusters += 1;
+            }
+        }
+        *self = pending;
+        Ok(done)
+    }
+}
+
+#[cfg(feature = "fat32-probe")]
+mod cursor_tests {
+    use super::*;
+    use super::super::vfs::{AhciDisk, MemDisk};
+    use core::cell::Cell;
+
+    const IMAGE: &[u8] = include_bytes!("../../fixtures/fat32-mem.img");
+
+    struct TestDisk {
+        reads: Cell<u32>,
+        mount_reads: Cell<u32>,
+        fat_reads: Cell<u32>,
+        fail_lba: Cell<Option<u64>>,
+        fat_patch: Option<(usize, u32)>,
+        size: Option<u32>,
+        wide: bool,
+        /// Some(簇号)：BPB 自述 200 个数据簇而 FAT 只有 1 扇区（128 项），LONG~1.TXT 的目录项
+        /// 指到那个簇号。数据区第 135/136 扇区由本适配器供字节——卷的 FAT 盖不住自己的数据区
+        /// 正是 next_cluster 那道 sectors_per_fat 闸要拦的形状。
+        short_fat: Option<u16>,
+    }
+
+    impl TestDisk {
+        fn new() -> Self {
+            Self {
+                reads: Cell::new(0), mount_reads: Cell::new(0), fat_reads: Cell::new(0),
+                fail_lba: Cell::new(None), fat_patch: None, size: None, wide: false, short_fat: None,
+            }
+        }
+    }
+
+    impl Block for TestDisk {
+        fn read_sectors(&self, lba: u64, dst: &mut [u8]) -> Result<(), BlockError> {
+            self.reads.set(self.reads.get() + 1);
+            if self.fail_lba.get() == Some(lba) {
+                return Err(BlockError::NotSettled);
+            }
+            if self.short_fat.is_some() && matches!(lba, 135 | 136) {
+                for (i, b) in dst.iter_mut().enumerate() {
+                    *b = (i * 3 + 0x11) as u8;
+                }
+            } else {
+                MemDisk { img: IMAGE }.read_sectors(lba, dst)?;
+            }
+            if let Some(cluster) = self.short_fat {
+                if matches!(lba, 0 | 6) {
+                    dst[32..36].copy_from_slice(&210u32.to_le_bytes());
+                }
+                if lba == 10 {
+                    // LONG~1.TXT 是根目录第 4 项（偏移 96）：簇号高半 116、低半 122
+                    dst[116..118].copy_from_slice(&0u16.to_le_bytes());
+                    dst[122..124].copy_from_slice(&cluster.to_le_bytes());
+                }
+            }
+            if matches!(lba, 0 | 1 | 6) {
+                self.mount_reads.set(self.mount_reads.get() + 1);
+            }
+            if lba == 8 {
+                self.fat_reads.set(self.fat_reads.get() + 1);
+                if let Some((cluster, value)) = self.fat_patch {
+                    dst[cluster * 4..cluster * 4 + 4].copy_from_slice(&value.to_le_bytes());
+                }
+                if self.short_fat.is_some() {
+                    // 夹具把未用簇填成 0x0FFF_FFF7（坏簇标记，掩码后 < EOC）——对照组簇 127
+                    // 要的是"最后一项且是合法链尾"，不改这一格它会红在 BadCluster 而不是量具想量的闸。
+                    dst[508..512].copy_from_slice(&0x0FFF_FFFFu32.to_le_bytes());
+                }
+            }
+            if lba == 10 {
+                if let Some(size) = self.size {
+                    dst[124..128].copy_from_slice(&size.to_le_bytes());
+                }
+            }
+            if self.wide {
+                if matches!(lba, 0 | 6) {
+                    dst[13] = 2;
+                }
+                if lba == 8 {
+                    dst[16..20].copy_from_slice(&EOC_MARKER.to_le_bytes());
+                }
+                if (12..=15).contains(&lba) {
+                    for (i, b) in dst.iter_mut().enumerate() {
+                        *b = (i * 3 + 0x11 + (lba - 12) as usize * 29) as u8;
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn pattern(bytes: &[u8], start: usize) -> bool {
+        // 与配方同一式子：扇区序号*29 那一项让相邻扇区逐字节不同——只按文件偏移算的话
+        // 512*3 ≡ 0 (mod 256)，多扇区簇读错扇区也会绿（P7 审查抓到的盲点）。
+        bytes.iter().enumerate().all(|(i, b)| {
+            let n = start + i;
+            *b == ((n / SECTOR_BYTES) * 29 + (n % SECTOR_BYTES) * 3 + 0x11) as u8
+        })
+    }
+
+    fn t_fat32_cursor_memory() -> bool {
+        let result = memory_cases();
+        match result {
+            Ok(ok) => ok,
+            Err(e) => {
+                crate::log_info!("fat32-cursor: memory unexpected={:?}", e);
+                false
+            }
+        }
+    }
+
+    fn memory_cases() -> Result<bool, FsError> {
+        let mut buf = [0u8; 1024];
+        let mut chunks_ok = true;
+        let mut eof_ok = true;
+        let mut io_count_ok = true;
+        let mut content_sum = 0u64;
+        for chunk in [1, 511, 512, 513, 777, 1024] {
+            let disk = TestDisk::new();
+            let mut cursor = Volume::mount(&disk)?.open_cursor("LONG~1.TXT")?;
+            let mut sum = crate::ahci::FNV_OFFSET;
+            let mut n = 0;
+            for _ in 0..2001 {
+                buf.fill(0xA5);
+                let got = cursor.read(&disk, &mut buf[..chunk])?;
+                chunks_ok &= pattern(&buf[..got], n) && buf[got..].iter().all(|b| *b == 0xA5);
+                for b in &buf[..got] {
+                    sum = crate::ahci::fnv1a_step(sum, *b);
+                }
+                n += got;
+                if got == 0 { break; }
+            }
+            chunks_ok &= n == 2000 && cursor.position() == 2000 && cursor.stat().size == 2000
+                && sum == 0xf73f_3e28_ec8b_b345;
+            content_sum = sum;
+            let before = disk.reads.get();
+            eof_ok &= cursor.read(&disk, &mut buf)? == 0 && cursor.read(&disk, &mut [])? == 0
+                && disk.reads.get() == before;
+            io_count_ok &= disk.mount_reads.get() == 3 && disk.fat_reads.get() == 4;
+        }
+
+        let disk = TestDisk::new();
+        let mut detached = {
+            let temporary = MemDisk { img: IMAGE };
+            Volume::mount(&temporary)?.open_cursor("LONG~1.TXT")?
+        };
+        fn owned<T: Copy + 'static>(value: T) -> T { value }
+        detached = owned(detached);
+        let detached_ok = detached.read(&disk, &mut buf[..17])? == 17
+            && pattern(&buf[..17], 0) && disk.mount_reads.get() == 0;
+        let before = disk.reads.get();
+        let empty_ok = detached.read(&disk, &mut [])? == 0 && detached.position() == 17
+            && disk.reads.get() == before;
+
+        let disk = TestDisk { size: Some(0), ..TestDisk::new() };
+        let mut empty = Volume::mount(&disk)?.open_cursor("LONG~1.TXT")?;
+        let before = disk.reads.get();
+        let zero_ok = empty.read(&disk, &mut buf)? == 0 && empty.position() == 0 && disk.reads.get() == before;
+
+        let disk = TestDisk::new();
+        let mut cursor = Volume::mount(&disk)?.open_cursor("LONG~1.TXT")?;
+        disk.fail_lba.set(Some(12));
+        let data_error = cursor.read(&disk, &mut buf[..777]);
+        let data_rollback = data_error == Err(FsError::Io(BlockError::NotSettled)) && cursor.position() == 0;
+        disk.fail_lba.set(None);
+        let retry_ok = cursor.read(&disk, &mut buf[..777])? == 777 && pattern(&buf[..777], 0)
+            && cursor.position() == 777;
+
+        let disk = TestDisk::new();
+        let mut cursor = Volume::mount(&disk)?.open_cursor("LONG~1.TXT")?;
+        let prefix = cursor.read(&disk, &mut buf[..511])?;
+        disk.fail_lba.set(Some(8));
+        let fat_error = cursor.read(&disk, &mut buf[..1]);
+        let fat_rollback = prefix == 511 && fat_error == Err(FsError::Io(BlockError::NotSettled))
+            && cursor.position() == 511;
+        disk.fail_lba.set(None);
+        let boundary_retry = cursor.read(&disk, &mut buf[..513])? == 513
+            && pattern(&buf[..513], 511) && cursor.position() == 1024;
+
+        let disk = TestDisk::new();
+        let mut short = Volume::mount(&disk)?.open_cursor("SHORTCHN.BIN")?;
+        let early_ok = short.read(&disk, &mut buf) == Err(FsError::ChainEndsEarly {
+            bytes: 512, size: 4096, cluster: 12, next: EOC_MARKER,
+        }) && short.position() == 0;
+        let disk = TestDisk { size: Some(10), ..TestDisk::new() };
+        let mut long = Volume::mount(&disk)?.open_cursor("LONG~1.TXT")?;
+        let late_ok = long.read(&disk, &mut buf) == Err(FsError::ChainEndsLate {
+            bytes: 10, size: 10, cluster: 3, next: 4,
+        }) && long.position() == 0;
+
+        let mut bad_cluster_ok = true;
+        for value in [0, 1, 14, 0x0FFF_FFF0, 0x0FFF_FFF7] {
+            let disk = TestDisk { fat_patch: Some((3, value)), ..TestDisk::new() };
+            let mut cursor = Volume::mount(&disk)?.open_cursor("LONG~1.TXT")?;
+            let before = disk.reads.get();
+            bad_cluster_ok &= cursor.read(&disk, &mut buf) == Err(FsError::BadCluster(value))
+                && cursor.position() == 0 && disk.reads.get() == before + 2;
+        }
+
+        let disk = TestDisk { wide: true, ..TestDisk::new() };
+        let mut cursor = Volume::mount(&disk)?.open_cursor("LONG~1.TXT")?;
+        let first = cursor.read(&disk, &mut buf[..1023])?;
+        let wide_first = first == 1023 && pattern(&buf[..first], 0) && disk.fat_reads.get() == 0;
+        let last = cursor.read(&disk, &mut buf)?;
+        let wide_ok = wide_first && last == 977 && pattern(&buf[..last], 1023)
+            && cursor.position() == 2000 && disk.fat_reads.get() == 2 && disk.mount_reads.get() == 3;
+
+        let disk = TestDisk::new();
+        let mut cyclic = Volume::mount(&disk)?.open_cursor("CYCLIC.BIN")?;
+        let mut successes = 0;
+        let mut bounded = false;
+        for _ in 0..=MAX_CLUSTERS_WALKED {
+            match cyclic.read(&disk, &mut buf[..512]) {
+                Ok(512) => successes += 1,
+                Err(FsError::ChainTooLong) => { bounded = true; break; }
+                _ => break,
+            }
+        }
+        let limit_ok = bounded && successes == MAX_CLUSTERS_WALKED
+            && cyclic.position() == MAX_CLUSTERS_WALKED * 512;
+
+        // FAT 表越界：BPB 自述 200 簇而 FAT 只有 128 项。簇 128 的数据读得动（适配器供字节），
+        // 它的 FAT 项却在表外——必须在发 FAT 读之前拒，而不是读回数据区的字节当后继。
+        let disk = TestDisk { short_fat: Some(128), size: Some(512), ..TestDisk::new() };
+        let mut oob = Volume::mount(&disk)?.open_cursor("LONG~1.TXT")?;
+        let fat_oob_ok = oob.read(&disk, &mut buf[..512]) == Err(FsError::BadCluster(128))
+            && oob.position() == 0 && disk.fat_reads.get() == 0;
+        // 对照组：簇 127 是 1 扇区 FAT 的最后一项（byte_off 508），必须读得动——
+        // 没有这一格，"全拒"也能混出上面那格的绿。
+        let disk = TestDisk { short_fat: Some(127), size: Some(512), ..TestDisk::new() };
+        let mut edge = Volume::mount(&disk)?.open_cursor("LONG~1.TXT")?;
+        let fat_edge_ok = edge.read(&disk, &mut buf[..512]) == Ok(512) && pattern(&buf[..512], 0)
+            && edge.position() == 512 && disk.fat_reads.get() == 1;
+
+        // 跨簇失败重试：第一跳已提交（簇 3→4），第二跳的数据读完、FAT 读失败——
+        // 回滚必须落在**已提交的簇边界**（position 512、当前簇 4），不是 0 也不是 1024。
+        // 重试若从簇 3 重读，逐扇区不同的内容会当场红（旧夹具在这里是盲的）。
+        let disk = TestDisk::new();
+        let mut cursor = Volume::mount(&disk)?.open_cursor("LONG~1.TXT")?;
+        let hop1 = cursor.read(&disk, &mut buf[..512])?;
+        disk.fail_lba.set(Some(8));
+        let hop2_err = cursor.read(&disk, &mut buf[..512]);
+        let cross_rollback = hop1 == 512 && hop2_err == Err(FsError::Io(BlockError::NotSettled))
+            && cursor.position() == 512;
+        disk.fail_lba.set(None);
+        let cross_cluster_ok = cross_rollback
+            && cursor.read(&disk, &mut buf[..512])? == 512
+            && pattern(&buf[..512], 512) && cursor.position() == 1024;
+
+        // 累计预算回滚：环链走到只剩最后一格预算时 FAT 读失败——失败的那一跳不许吃掉预算，
+        // 否则重试会提前撞 ChainTooLong，而盘本身已经恢复。
+        let disk = TestDisk::new();
+        let mut budget_cursor = Volume::mount(&disk)?.open_cursor("CYCLIC.BIN")?;
+        let mut budget_ok = true;
+        for _ in 0..MAX_CLUSTERS_WALKED - 1 {
+            budget_ok &= budget_cursor.read(&disk, &mut buf[..512]) == Ok(512);
+        }
+        let spent = (MAX_CLUSTERS_WALKED - 1) * 512;
+        budget_ok &= budget_cursor.position() == spent;
+        disk.fail_lba.set(Some(8));
+        budget_ok &= budget_cursor.read(&disk, &mut buf[..512]) == Err(FsError::Io(BlockError::NotSettled))
+            && budget_cursor.position() == spent;
+        disk.fail_lba.set(None);
+        budget_ok &= budget_cursor.read(&disk, &mut buf[..512]) == Ok(512) && budget_cursor.position() == spent + 512;
+        budget_ok &= budget_cursor.read(&disk, &mut buf[..512]) == Err(FsError::ChainTooLong);
+
+        let checks = [chunks_ok, eof_ok, io_count_ok, detached_ok, empty_ok, zero_ok,
+            data_rollback, retry_ok, fat_rollback, boundary_retry, early_ok, late_ok, bad_cluster_ok, wide_ok, limit_ok,
+            fat_oob_ok, fat_edge_ok, cross_cluster_ok, budget_ok];
+        crate::log_info!("fat32-cursor: memory checks={:?} sum={:#018x} bound_reads={} position={}",
+            checks, content_sum, successes, cyclic.position());
+        Ok(checks.iter().all(|v| *v))
+    }
+
+    fn t_fat32_cursor_disks() -> bool {
+        if crate::ahci::init().is_err() { return false; }
+        let mut ok = true;
+        for port in [crate::FAT_PORT_A, crate::FAT_PORT_B] {
+            match disk_file(port) {
+                Ok(good) => ok &= good,
+                Err(e) => {
+                    crate::log_info!("fat32-cursor: port={} error={:?}", port, e);
+                    ok = false;
+                }
+            }
+        }
+        ok
+    }
+
+    fn disk_file(port: u8) -> Result<bool, FsError> {
+        let disk = AhciDisk { port };
+        let volume = Volume::mount(&disk)?;
+        let mut cursor = volume.open_cursor("HELLO.ELF")?;
+        let stat = cursor.stat();
+        let mut old_hash = crate::ahci::FNV_OFFSET;
+        let walk = volume.walk(&stat, |chunk| {
+            for b in chunk { old_hash = crate::ahci::fnv1a_step(old_hash, *b); }
+        })?;
+        let mut hash = crate::ahci::FNV_OFFSET;
+        let mut bytes = 0;
+        let mut buf = [0u8; 777];
+        for _ in 0..=stat.size as usize / buf.len() + 1 {
+            let n = cursor.read(&disk, &mut buf)?;
+            if n == 0 { break; }
+            bytes += n;
+            for b in &buf[..n] { hash = crate::ahci::fnv1a_step(hash, *b); }
+        }
+        let ok = bytes == stat.size as usize && bytes == walk.bytes && hash == old_hash
+            && cursor.position() == stat.size;
+        crate::log_info!("fat32-cursor: port={} size={} bytes={} first_cluster={} hash={:#018x} agree={}",
+            port, stat.size, bytes, stat.first_cluster, hash, ok);
+        Ok(ok)
+    }
+
+    crate::ktest!(KT_FAT32_CURSOR_MEMORY, t_fat32_cursor_memory);
+    crate::ktest!(KT_FAT32_CURSOR_DISKS, t_fat32_cursor_disks);
+}

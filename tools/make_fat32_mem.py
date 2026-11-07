@@ -19,7 +19,7 @@
 | 簇 | 用来判哪一格 |
 |---|---|
 | 2 | 根目录（下面那张表）|
-| 3-6 | FILE.BIN：4 簇、2000 字节 ⇒ 尾格 464，`tail_bytes` 有非平凡值 |
+| 3-6 | LONG~1.TXT：4 簇、2000 字节 ⇒ 尾格 464，`tail_bytes` 有非平凡值 |
 | 7 | NOSHORT：没有扩展名的名字（`name_matches` 不补那个点）|
 | 8,9,10 | CYCLIC.BIN：8→9→10→**9** 成环，size=0xFFFF_FFFF ⇒ 走链必须撞到 `ChainTooLong` |
 | 12 | SHORTCHAIN.BIN：size=4096 而链只有 1 簇 ⇒ `ChainEndsEarly` |
@@ -177,9 +177,11 @@ assert len(root_bytes) == 12 * 32, len(root_bytes)
 img[ent(2) * SEC:ent(2) * SEC + len(root_bytes)] = root_bytes
 
 # ---------------------------------------------------------------- 文件内容
-# LONG~1.TXT 的 2000 字节：值 = (偏移*3 + 0x11) & 0xFF，宿主机与内核各自重算一遍
+# LONG~1.TXT 的 2000 字节：值 = (扇区序号*29 + 扇区内偏移*3 + 0x11) & 0xFF，宿主机与内核各自重算。
+# 逐扇区项 扇区序号*29 不可省：只按文件偏移算的话，512*3 ≡ 0 (mod 256)，相邻扇区内容逐字节
+# 相同——多扇区簇读错扇区也判绿（P7 审查抓到的夹具盲点）。29 是奇数，保证每扇区第 0 字节就不同。
 for off in range(2000):
-    img[ent(3) * SEC + off] = (off * 3 + 0x11) & 0xFF
+    img[ent(3) * SEC + off] = ((off // SEC) * 29 + (off % SEC) * 3 + 0x11) & 0xFF
 for off in range(10):
     img[ent(7) * SEC + off] = (off * 5 + 0x77) & 0xFF
 

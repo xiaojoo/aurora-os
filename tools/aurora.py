@@ -257,6 +257,18 @@ VBLK_FEATURES = {"virtio-blk", "virtio-msix-probe"}
 # 会把一个正确的设计读成断线（本轮实测踩过一次，见 BACKLOG 78e 最后一条）。
 FAT_DISK_FEATURES = {"fat32-probe", "fat32-exec"}
 FAT_FAULT_FEATURES = {"fault-fat32-tail"}
+# L3-C④（BACKLOG 80）：**宿主机侧**注入。它们不是 cargo 特性，走 `do_run(..., host_fault=…)`。
+# 为什么不做成特性（第一版做成了，实测之后改回来）：特性名会进 cargo 的 `-C metadata`，
+# crate disambiguator 跟着变 ⇒ 符号哈希变 ⇒ 链接器排序与绝对地址变。实测同一份源码
+# `fat32-exec` 与 `fat32-exec,fault-fat32-exec-byte` 的 ELF 是 4,540,048 / 4,536,960 字节、
+# sha256 54af93493ef9e44c / a112bc67b329c373，`.text` 有 312,950 格不同；归一化掉地址与符号名
+# 之后指令多重集逐条相同（77,768 条，两边独有 0）——差异是布局不是代码，但那要靠在宿主机上
+# 反汇编两遍才论证得动。不做成特性就没有这个论证负担：负样本用的**就是正向那一跑的同一个 ELF**，
+# "只有盘不同"由构造保证。门禁反过来要求这两个名字既不在 Cargo.toml 里、也不在内核源码里。
+FAT_HOST_FAULTS = {
+    "fault-fat32-exec-byte": "fat32-small",
+    "fault-fat32-cluster-hi": "fat32-wide",
+}
 FAT_FEATURES = FAT_DISK_FEATURES | FAT_FAULT_FEATURES
 # 卷A 是**阈值判型的反例**（64,496 簇按微软那条经验阈值算 FAT16、按结构算 FAT32）；
 # 卷B 用一个 34,603,008 字节的 FILLER.BIN 把后面三个文件推到 65,536 簇之上，于是目录项的
@@ -292,7 +304,7 @@ FAT_EXPECT = {
 # 而不是红在解析器身上（新克隆没有这块卷时同一条路径负责把它造出来）。
 FAT_MEM_OUT = ROOT / "kernel" / "fixtures" / "fat32-mem.img"
 FAT_MEM_SCRIPT = ROOT / "tools" / "make_fat32_mem.py"
-FAT_MEM_EXPECT = (11_264, "3fc538ef44a11f148e42d19ce8432ba9a37ab92b018a6060f4efc6db088d5368")
+FAT_MEM_EXPECT = (11_264, "28f6f1d9cf135d4ab44de4e015a5b9a271cd087f2165139987088cd0eeff89ae")
 
 # M8-a：第一张网卡走 virtio-net（手册 §8.6 里它与 virtio-blk 同列 P1，而且 M5-f② 之后
 # split queue 这条路已经跑通，第二张网卡不该再引入一套新的环布局）。
@@ -602,6 +614,10 @@ def fat32_host_volume(img: bytes, read_names: tuple[str, ...] = ()) -> dict:
                         break
             files[name] = dict(
                 size=size, first=first, hi=hi, lo=lo, seen=seen, lfn=lfn,
+                # 这一条目录项自己在镜像里的字节偏移。宿主机侧注入（L3-C④）要靠它改盘，
+                # 而"改哪一格"必须由解析算出来，不能写死一个偏移：夹具重建之后写死的那个数
+                # 会静默改到别处，负样本照样红，红的却不是要证的那一格。
+                ent_off=cluster_off(c) + o,
                 bytes=len(got), clusters=walked, last=last, after=after,
                 tail=len(got) - (walked - 1) * spc * FAT_SEC if walked else 0,
                 head=bytes(got[:4]), fnv=fnv1a64(bytes(got)) if want_walk else 0,
@@ -648,6 +664,9 @@ FAT_MEM_GEO_RE = re.compile(
     r"结构判型=(?P<struct>\w+) 名字串=(?P<name>true|false) 备份逐字节同=(?P<bsame>true|false) "
     r"自由簇=(?P<free>\d+)")
 FAT_MEM_DIR_RE = re.compile(r"fat32-mem: 目录 (?P<body>.*)")
+FAT_MEM_CURSOR_RE = re.compile(
+    r"fat32-cursor: memory checks=\[(?P<checks>[a-z, ]+)\] sum=(?P<sum>0x[0-9a-f]+) "
+    r"bound_reads=(?P<bound>\d+) position=(?P<pos>\d+)")
 FAT_MEM_STAT_RE = re.compile(
     r"(?P<name>[A-Za-z0-9~_.?]+)=Ok\(FileStat \{ size: (?P<size>\d+), first_cluster: (?P<cluster>\d+), "
     r"entries_seen: (?P<seen>\d+), lfn_entries: (?P<lfn>\d+) \}\)")
@@ -712,6 +731,22 @@ def check_fat32_mem(log: str) -> list[str]:
                                ("LFN", int(m.group("lfn")), hf["lfn"])]:
             if got != want:
                 bad.append(f"内存卷 {want_name} {tag}: 内核={got} 宿主机={want}")
+    # 续读游标的内容账：内核逐块读出来的 FNV，与这台仪器自己走链算的 FNV 必须是同一个数。
+    # 内核那 19 项判据是它自己判自己；这一格让"读出来的字节"有第二台仪器作证。
+    cm = FAT_MEM_CURSOR_RE.search(log)
+    if not cm:
+        bad.append("串口没有 `fat32-cursor: memory checks=… sum=…` 那一行（续读内存账没跑或契约变了）")
+    else:
+        if cm.group("checks") != ", ".join(["true"] * 19):
+            bad.append(f"内存卷 续读判据有不成立的格: [{cm.group('checks')}]")
+        hf = h["files"].get("LONG~1.TXT")
+        if hf is None:
+            bad.append("内存卷：宿主机没走出 LONG~1.TXT 的链，续读内容账没有对账对象")
+        elif int(cm.group("sum"), 16) != hf["fnv"]:
+            bad.append(f"内存卷 LONG~1.TXT 内容FNV: 内核续读={cm.group('sum')} 宿主机走链={hf['fnv']:#018x}")
+        if int(cm.group("bound")) != FAT_MAX_WALKED or int(cm.group("pos")) != FAT_MAX_WALKED * 512:
+            bad.append(f"内存卷 环链撞界: 内核={cm.group('bound')}/{cm.group('pos')} "
+                       f"宿主机期望={FAT_MAX_WALKED}/{FAT_MAX_WALKED * 512}")
     return bad
 
 
@@ -826,6 +861,27 @@ def check_fat32(log: str) -> list[str]:
     # ② 那本账（合成卷）在同一跑里，一并核：两块真卷证明偏移表，合成卷证明分支覆盖，
     # 两边都从宿主机自己的字节算一遍才算这一行覆盖了这个变体里的两条用例
     bad += check_fat32_mem(log)
+    cursor_rows = re.findall(
+        r"fat32-cursor: port=(\d+) size=(\d+) bytes=(\d+) first_cluster=(\d+) "
+        r"hash=(0x[0-9a-f]+) agree=(true|false)", log)
+    if sorted(int(row[0]) for row in cursor_rows) != sorted(FAT_PORTS):
+        bad.append("fat32-cursor: 两块卷的续读记录缺失、重复或口号不符")
+    if log.count("fat32-cursor: port=") != len(cursor_rows):
+        bad.append("fat32-cursor: 有无法解析的续读记录")
+    for port, size, count, first, digest, agree in cursor_rows:
+        letter = {3: "A", 4: "B"}.get(int(port))
+        if letter is None:
+            continue
+        hf = vols[letter]["files"].get("HELLO.ELF")
+        if hf is None:
+            bad.append(f"fat32-cursor: 卷{letter} 没有 HELLO.ELF")
+            continue
+        for field, got, want in [("size", int(size), hf["size"]), ("bytes", int(count), hf["bytes"]),
+                                 ("first_cluster", int(first), hf["first"]), ("hash", int(digest, 16), hf["fnv"])]:
+            if got != want:
+                bad.append(f"fat32-cursor: 卷{letter} {field} 内核={got} 宿主机={want}")
+        if agree != "true":
+            bad.append(f"fat32-cursor: 卷{letter} 续读与旧 walk 不一致")
     return bad
 
 
@@ -855,6 +911,21 @@ ELFLOAD_RUN_RE = re.compile(
     r"rodata=(?P<rodata>Some\([^)]*\)|None) served=(?P<served>\d+) "
     r"unknown_nr=(?P<unknr>\d+) rounds=(?P<rounds>\d+) runs=(?P<runs>\d+) "
     r"state=(?P<state>\S+) guard_unmapped=(?P<guard>true|false)")
+# L3-C④ 那两行负样本的锚点：判据整行与那条拒因的四个数。锚点写全（与上面同一条规矩）——
+# 少一格就报"缺行"而不是"不符"，那看着像用例没跑，其实是正则找错了地方。
+FAT_VERDICT_RE = re.compile(
+    r"fat32: 判据 引导盘被拒=(?P<mbr>true|false) 卷A阈值反例=(?P<ac>true|false) "
+    r"卷B结构=(?P<bs>true|false) 几何=(?P<geo>true|false) 目录=(?P<dir>true|false) "
+    r"链=(?P<walk>true|false) ELF头=(?P<magic>true|false) 无长名=(?P<lfn>true|false) "
+    r"两卷同哈希=(?P<cross>true|false) 大小写=(?P<case>true|false) "
+    r"缺项被拒=(?P<absent>true|false) 低半单独被拒=(?P<lo>true|false)")
+FAT_LATE_RE = re.compile(
+    r"fat32: 卷2 HELLO\.ELF 读不成 ChainEndsLate \{ bytes: (?P<bytes>\d+), size: (?P<size>\d+), "
+    r"cluster: (?P<cluster>\d+), next: (?P<next>\d+) \}")
+FAT_EXE_VERDICT_RE = re.compile(
+    r"elfdisk: 判据 同长=(?P<bound>true|false) 走链=(?P<walk>true|false) 字节同=(?P<bytes>true|false) "
+    r"段表同=(?P<segs>true|false) 跑通=(?P<run>true|false) 元数据说大被拒=(?P<early>true|false) "
+    r"截短被拒=(?P<short>true|false) 收尾干净=(?P<clean>true|false)")
 
 
 def elf64_host_parse(b: bytes) -> dict:
@@ -883,6 +954,215 @@ def elf64_host_parse(b: bytes) -> dict:
             r=bool(flags & 4), w=bool(flags & 2), x=bool(flags & 1),  # PF_R/X/W
         ))
     return dict(entry=entry, phnum=phnum, n=len(loads), loads=loads)
+
+
+# ------------------------------------------------- L3-C④ 宿主机侧注入（改盘，不改内核）
+#
+# 这两条负样本证的是两件不同的事，但共用一条纪律：**要改的那一格由解析算出来，不写死偏移**。
+# 写死一个镜像偏移的注入在夹具重建之后会静默改到别处，而负样本照样"以红收场"——
+# 红的却不是要证的那一格，这种绿（对着红看的绿）比红更贵。
+#
+# 为什么第一条盯的是代码段里那条 immediate 而不是 `.rodata` 的第一个字节：
+# 实测（llvm-objdump -d kernel/fixtures/hello.elf）`BANNER[0]` 被编译器折成了
+# `movq $0xa7, 0x1fb9(%rip)`，而整份容器里**没有一条指令引用 0x100001xxx**（rodata 页）。
+# 所以改 .rodata 那一字节只会让"字节同/sha"红，④ 的槽读数一动不动——半空转。
+# 这件事本身也是一条缺陷（user/hello 声称第四个槽证明 r-- 段 ring3 读得到），记在 BACKLOG 80。
+FAT_EXEC_BYTE_NEW = 0x5A
+FAT_EXEC_INSN = re.compile(rb"\x48\xc7\x05....\xa7\x00\x00\x00", re.S)
+FAT_EXEC_IMM_AT = 7          # REX.W + C7 + ModRM(05) + disp32 之后才是 imm32
+FAT_DIR_HI_AT = 20           # 目录项里簇号高半的偏移，与内核 `OFF_CLUSTER_HI` 同一个数
+
+
+def _fat_image_off(img: bytes, first: int, blob_off: int) -> int:
+    """文件内偏移 → 镜像字节偏移：跟着簇链走到第 `blob_off // cluster_bytes` 个簇。"""
+    bs = img[:FAT_SEC]
+    spc, res, fats = bs[13], _fat_u16(bs, 14), bs[16]
+    data_start = res + fats * _fat_u32(bs, 36)
+    cb = spc * FAT_SEC
+    c, skip = first, blob_off // cb
+    if skip > FAT_MAX_WALKED:
+        raise ValueError(f"要跳过 {skip} 个簇，超过本机走链上界 {FAT_MAX_WALKED}")
+    for _ in range(skip):
+        c = _fat_u32(img, res * FAT_SEC + c * 4) & 0x0FFF_FFFF
+        if c < 2 or c >= FAT_EOC:
+            raise ValueError(f"链在第 {_ + 1} 步就断了（簇号 {c:#x}）")
+    return (data_start + (c - 2) * spc) * FAT_SEC + blob_off % cb
+
+
+def fat_host_fault_plan(kind: str) -> tuple[str, int, bytes, bytes]:
+    """定位一条宿主机侧注入：返回 (卷名, 镜像偏移, 现值, 新值)。
+
+    读的是仓库里那份 `.img.zz`（配方），不是 `build/` 里那份可能已经被改过的镜像——
+    所以这个函数既能用来改盘，也能用来核"盘真被改成了这个样子"，两次算的是同一个数。
+    定位不到、命中不唯一、或改了等于没改，一律抛 ValueError：红在跑之前，而不是跑完之后
+    对着一行 FAIL 猜"它红在哪"。
+    """
+    import zlib
+    name = FAT_HOST_FAULTS[kind]
+    raw = zlib.decompress(FAT_ZZ[name].read_bytes())
+    f = fat32_host_volume(raw, ("HELLO.ELF",))["files"].get("HELLO.ELF")
+    if f is None or not f["walked_it"]:
+        raise ValueError(f"{name} 上读不到 HELLO.ELF 的字节（注入没有对象）")
+    if kind == "fault-fat32-cluster-hi":
+        at = f["ent_off"] + FAT_DIR_HI_AT
+        old = raw[at:at + 2]
+        if old == b"\x00\x00":
+            raise ValueError(f"{name} 的簇号高半本来就是 0 ⇒ 抹零是空转"
+                             "（这块卷的角色是「高半非零」，夹具换了？）")
+        return name, at, old, b"\x00\x00"
+    prog = elf64_host_parse(f["blob"])
+    exe = [s for s in prog["loads"] if s["x"]]
+    if len(exe) != 1:
+        raise ValueError(f"容器里有 {len(exe)} 条可执行段，要恰好 1 条才谈得上「改那一条里的字节」")
+    seg = exe[0]
+    body = f["blob"][seg["offset"]:seg["offset"] + seg["filesz"]]
+    hits = [m.start() for m in FAT_EXEC_INSN.finditer(body)]
+    if len(hits) != 1:
+        raise ValueError(f"代码段里 `movq $0xa7, disp32(%rip)` 命中 {len(hits)} 处，要恰好 1 处"
+                         "（容器重建了？那就要重新量这条指令，而不是随便挑一处改）")
+    at = seg["offset"] + hits[0] + FAT_EXEC_IMM_AT
+    old, new = f["blob"][at], FAT_EXEC_BYTE_NEW
+    if old == new:
+        raise ValueError(f"现值与新值都是 {new:#x} ⇒ 这条注入是空转")
+    return name, _fat_image_off(raw, f["first"], at), bytes([old]), bytes([new])
+
+
+def apply_fat_host_fault(kind: str) -> list[str]:
+    """把一条宿主机侧注入写到 `build/` 那块卷上（在 `make_fat_volumes` 之后调）。
+
+    改的是解压出来的那份，仓库里的 `.img.zz` 一个字节不动；而 `make_fat_volumes` 每次
+    都比「build 里的字节 == 配方解压出来的字节」，所以下一跑自动回到 pristine——
+    注入的寿命就是一跑。跑完由 `fat_host_witness` 还原（它是两条路上最后一个读改过的盘的人），
+    不让一块被改过的盘留在 build/ 里冒充下一跑的证据。
+    """
+    try:
+        name, off, old, new = fat_host_fault_plan(kind)
+    except ValueError as e:
+        return [f"{kind} 定位不成：{e}"]
+    img = FAT_IMG[name]
+    data = bytearray(img.read_bytes())
+    if bytes(data[off:off + len(old)]) != old:
+        return [f"{kind}: {name} 偏移 {off} 现值 {bytes(data[off:off + len(old)]).hex()} "
+                f"不是配方里的 {old.hex()}"]
+    data[off:off + len(old)] = new
+    img.write_bytes(data)
+    print(f"    宿主机侧注入 {kind}: {name} 镜像偏移 {off} {old.hex()} → {new.hex()}"
+          "（内核用的是正向那一跑的同一个 ELF，只有盘不同）")
+    return []
+
+
+def check_fat32_exec_byte(log: str) -> list[str]:
+    """第 38 行的证人：盘上真被改了一格，而 ④ 的槽读数跟着变、"字节同"那格红。
+
+    只要求"这一跑以红收场"是不够的（第 37 行同一条纪律）：别的用例红了这一行也照样符合。
+    所以这里要三件互相独立的事同时成立——
+    1 build/ 里那块卷与配方只差**计划中的那一字节**（宿主机自己比，不信串口）；
+    2 串口那格判据说 `字节同=false 跑通=false`，而 `同长/走链/段表同` 还是 true
+    ⇒ 改的是段内字节，不是元数据，红不是"读不出来"而是"读出来的不一样"；
+    3 同一跑里两条来源的 rodata 槽**不再同数**，且盘上那条正好等于注入的新值、
+    内嵌那条还是 0xa7 ⇒ ④ 的配对判据真的被这一字节推翻了。
+    """
+    bad: list[str] = []
+    import zlib
+    try:
+        name, off, old, new = fat_host_fault_plan("fault-fat32-exec-byte")
+    except ValueError as e:
+        return [f"注入点定位不成，这一行的证人无从算起：{e}"]
+    pristine = zlib.decompress(FAT_ZZ[name].read_bytes())
+    got = FAT_IMG[name].read_bytes()
+    if len(got) != len(pristine):
+        return [f"{name} 镜像长度变了：{len(got)} 对配方 {len(pristine)}"]
+    diff = [i for i in range(len(got)) if got[i] != pristine[i]]
+    if diff != [off] or bytes(got[off:off + 1]) != new:
+        return [f"盘上不是「只差计划中那一格」：差异偏移 {diff[:8]}（共 {len(diff)} 处），"
+                f"计划是 {off} 改成 {new.hex()}"]
+    v = FAT_EXE_VERDICT_RE.search(log)
+    if not v:
+        return bad + ["串口没有 `elfdisk: 判据 …` 那一行（③ 没跑到结论）"]
+    for tag, want in (("bound", "true"), ("walk", "true"), ("segs", "true"),
+                      ("bytes", "false"), ("run", "false")):
+        if v.group(tag) != want:
+            bad.append(f"③ 判据 {tag}={v.group(tag)}，期望 {want}"
+                       "（改的是段内字节：长度/走链/段表都该还对，只有内容与跑后读数该红）")
+    runm, emb = FAT_EXE_RUN_RE.search(log), ELFLOAD_RUN_RE.search(log)
+    if not runm or not emb:
+        return bad + ["串口缺 `elfdisk: 跑后 …` 或 `elfload: magic=…`（④ 的配对没有对象）"]
+    want_new, want_old = f"Some({new[0]})", f"Some({old[0]})"
+    if runm.group("rod") != want_new:
+        bad.append(f"盘上那条的 rodata 槽={runm.group('rod')}，期望 {want_new}"
+                   "（改的那一格就是这条槽的来源，它没变说明注入没走到用户态）")
+    if emb.group("rodata") != want_old:
+        bad.append(f"内嵌那条的 rodata 槽={emb.group('rodata')}，期望 {want_old}（对照物自己被改了？）")
+    return bad
+
+
+def check_fat32_cluster_hi(log: str) -> list[str]:
+    """第 39 行的证人：高半抹零之后内核读到的是**另一个文件的字节**，而不是"读不出来"。
+
+    宿主机先自己把改过的那块卷解析一遍：首簇掉到低半、走满 62 簇喂够 31,320 字节、
+    末簇后继还不是 EOC、头四字节不再是 ELF 魔数。然后要求串口那条拒因里的四个数
+    与宿主机算的逐格相同——这才叫"少一半就读到别的东西"，而不是"期望对上了"。
+    """
+    bad: list[str] = []
+    import zlib
+    try:
+        name, off, old, new = fat_host_fault_plan("fault-fat32-cluster-hi")
+    except ValueError as e:
+        return [f"注入点定位不成，这一行的证人无从算起：{e}"]
+    pristine = zlib.decompress(FAT_ZZ[name].read_bytes())
+    got = FAT_IMG[name].read_bytes()
+    if len(got) != len(pristine):
+        return [f"{name} 镜像长度变了：{len(got)} 对配方 {len(pristine)}"]
+    diff = [i for i in range(len(got)) if got[i] != pristine[i]]
+    # 高半是 1 ⇒ 盘上是 `01 00`，抹成 `00 00` **只真变一格**。第一版这里写死 `[off, off+1]`，
+    # 于是注入完全成立的那一跑被自己的证人报成红（实测：差异偏移 [1049652]，共 1 处）。
+    # 该期望的是"计划里 old 与 new 不同的那些格"，不是"计划覆盖的那些格"。
+    want_diff = [off + i for i in range(len(old)) if old[i] != new[i]]
+    if diff != want_diff or bytes(got[off:off + len(new)]) != new:
+        return [f"盘上不是「只抹了高半那两格」：差异偏移 {diff[:8]}（共 {len(diff)} 处），"
+                f"计划是 {want_diff} 处改成 {new.hex()}"]
+    f = fat32_host_volume(got, ("HELLO.ELF",))["files"]["HELLO.ELF"]
+    if f["hi"] != 0 or f["first"] != f["lo"]:
+        bad.append(f"宿主机读改过的盘：高半={f['hi']} 首簇={f['first']}，期望 0 与 {f['lo']}")
+    if f["bytes"] != f["size"] or f["after"] >= FAT_EOC:
+        bad.append(f"宿主机走链：字节={f['bytes']} 大小={f['size']} 末簇后继={f['after']:#x}"
+                   " ⇒ 这不是 ChainEndsLate 的形状（注入没落到长链中间）")
+    if f["head"] == bytes([0x7F, 0x45, 0x4C, 0x46]):
+        bad.append("抹零之后读出来的还是 ELF 魔数 ⇒ 没读到别的文件，这一格证不了「两半拼」")
+    m = FAT_LATE_RE.search(log)
+    if not m:
+        return bad + ["串口没有 `fat32: 卷2 HELLO.ELF 读不成 ChainEndsLate { … }` 那一行"]
+    for tag, want in (("bytes", f["bytes"]), ("size", f["size"]),
+                      ("cluster", f["last"]), ("next", f["after"])):
+        if int(m.group(tag)) != want:
+            bad.append(f"拒因里的 {tag}={m.group(tag)}，宿主机按改过的盘算得 {want}")
+    v = FAT_VERDICT_RE.search(log)
+    if not v:
+        return bad + ["串口没有 `fat32: 判据 …` 那一行"]
+    for tag in ("dir", "walk", "cross"):
+        if v.group(tag) != "false":
+            bad.append(f"判据 {tag}={v.group(tag)}，期望 false（高半抹零该把目录/链/两卷同哈希三格都推翻）")
+    return bad
+
+
+FAT_HOST_WITNESS = {
+    "fault-fat32-exec-byte": check_fat32_exec_byte,
+    "fault-fat32-cluster-hi": check_fat32_cluster_hi,
+}
+
+
+def fat_host_witness(kind: str, log: str) -> list[str]:
+    """跑完之后叫证人。判定链里那两行与手工 `run --host-fault` 走的是同一个入口——
+    两处各写一遍调用，就会出现"链里核了、单跑没核"那种只在一条路上成立的绿。
+
+    还原放在这里而不是调用方：两个证人都要**读改过的那块盘**（自己比差异偏移），
+    所以这里是两条路上最后一个读它的人，再往后就必须回到 pristine。
+    """
+    bad = FAT_HOST_WITNESS[kind](log)
+    for x in bad:
+        print("    对账:", x)
+    bad += make_fat_volumes()
+    return bad
 
 
 def check_fat32_exec(log: str) -> list[str]:
@@ -1039,6 +1319,31 @@ def check_fat32_ports() -> list[str]:
     for f in sorted(FAT_FAULT_FEATURES):
         if f'feature = "{f}"' not in fat_src:
             bad.append(f"fat32.rs 里没有 `feature = \"{f}\"`：注入点被删了，那条负样本是空转")
+    # 宿主机侧注入查的是**反面**：这两个名字既不许是 cargo 特性，也不许在内核源码里有落点。
+    # 它们的全部意义在于"负样本用的就是正向那一跑的同一个 ELF，只有盘不同"；做成特性会让
+    # crate disambiguator 跟着变（实测 .text 有 31 万格不同，虽然归一化后指令多重集相同），
+    # 而在内核里加 cfg 开关更是直接把负样本换成了另一类东西——两种退化的判定表都照样绿。
+    for f in sorted(FAT_HOST_FAULTS):
+        if re.search(rf"^{f} = ", feats, re.M):
+            bad.append(f"Cargo.toml 里有 {f}：宿主机侧注入不该是构建变量（改了它 ELF 就变了，"
+                       "「只有盘不同」这句话就不再成立）")
+        for rel, text in (("kernel/src/main.rs", src), ("kernel/src/filesystem/fat32.rs", fat_src)):
+            if f'feature = "{f}"' in text:
+                bad.append(f"{rel} 里出现了 `feature = \"{f}\"`：这是宿主机侧注入，内核不该有落点")
+        if FAT_HOST_FAULTS[f] not in set(FAT_PORTS.values()):
+            bad.append(f"{f} 要改的卷 {FAT_HOST_FAULTS[f]} 没挂在任何口上 ⇒ 改了也没人读")
+            continue        # 卷名不在 FAT_ZZ 里，再往下走是 KeyError 而不是红
+        # 注入点必须**现在**就定位得出来：门禁里跑一遍 planner，与跑那一跑用的是同一个函数。
+        # 夹具重建之后图案没了、或高半本来就是 0，红要落在这里，而不是落在一行看不出成因的 FAIL 上。
+        try:
+            name, off, old, new = fat_host_fault_plan(f)
+        except ValueError as e:
+            bad.append(f"{f} 注入点定位不成：{e}")
+            continue
+        if old == new:
+            bad.append(f"{f}: 现值与新值都是 {old.hex()} ⇒ 这条注入是空转")
+        if not 0 <= off < FAT_EXPECT[name][0]:
+            bad.append(f"{f}: 算出的镜像偏移 {off} 不在 {name} 的 {FAT_EXPECT[name][0]} 字节之内")
 
     # 内核读哪几个文件 = 这台仪器核哪几个文件。两处各写一遍就会分家，而分家的表现是
     # "对账核的是另一个对象"——那种绿比红更贵。名字表按 want_a 再 want_b 的顺序比。
@@ -1055,10 +1360,16 @@ def check_fat32_ports() -> list[str]:
         bad.append('③ 没有 `vol.open("HELLO.ELF")`：它读的名字与 FAT_READ_NAMES 不是同一个对象')
     for anchor in ("elfdisk: 目录 大小=", "elfdisk: 段", "elfdisk: 跑后 entry=",
                    "elfdisk: 负格 元数据说大=", "| 收尾 终止=", "elfload: magic=",
-                   "elfdisk: 尾格溢出 已喂="):
+                   "elfdisk: 尾格溢出 已喂=", "elfdisk: 判据 同长=",
+                   "fat32: 判据 引导盘被拒=", "读不成 {:?}"):
         if anchor not in src:
             bad.append(f"串口锚点 `{anchor}` 不在 main.rs 里了：`check_fat32_exec` 的那条正则读成空，"
                        "第 36 行会报缺行而不是报不符（改日志格式要两处一起改）")
+    # 第 39 行的证人读的是 `ChainEndsLate` 的 **Debug 字段序**（bytes/size/cluster/next）。
+    # 那个序在 fat32.rs 的枚举声明里，改它等于改串口原文 ⇒ 正则读成空、报"缺行"而不是"不符"。
+    if "ChainEndsLate { bytes: usize, size: u32, cluster: u32, next: u32 }" not in fat_src:
+        bad.append("fat32.rs 里 ChainEndsLate 的字段序变了：`FAT_LATE_RE` 按 bytes/size/cluster/next "
+                   "读那四个数，改序要两处一起改（否则第 39 行报缺行，看着像用例没跑）")
     # 走链的上界：内核有界、仪器也必须同样有界，否则"两边都有界"这句话里只有一半成立。
     m = re.search(r"pub const MAX_CLUSTERS_WALKED: u32 = ([\d_]+);", fat_src)
     if m is None:
@@ -1151,9 +1462,15 @@ def force_boot_state(failed: int, seq: int = 200) -> None:
     IMAGE.write_bytes(bytes(img))
 
 
-def do_run(features: list[str], timeout: int, extra: str = "") -> tuple[str, int, str]:
+def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str = "") -> tuple[str, int, str]:
     if not QEMU.exists():
         sys.exit(f"QEMU 未就位：{QEMU}")
+    # 宿主机侧注入不是特性（见 FAT_HOST_FAULTS 那一段）：它改盘，不改构建。
+    # 两道前置闸都在这里，因为"改了盘却没人读它"与"注入名写错了"都表现为一跑看不出成因的红。
+    if host_fault and host_fault not in FAT_HOST_FAULTS:
+        sys.exit(f"不认识的宿主机侧注入：{host_fault}（有的那些：{sorted(FAT_HOST_FAULTS)}）")
+    if host_fault and not (FAT_DISK_FEATURES & set(features)):
+        sys.exit(f"{host_fault} 改的是 FAT32 卷，这一跑却没带任何挂盘的特性 ⇒ 改了也没人读")
     ensure_image(features)
     if SCRATCH_FEATURES & set(features):
         # 第二块盘每次重造：写方向那条判据（写完前后的哈希必须不同）要求目标区
@@ -1175,6 +1492,12 @@ def do_run(features: list[str], timeout: int, extra: str = "") -> tuple[str, int
         bad = make_fat_volumes()
         if bad:
             sys.exit("FAT32 夹具不成立：" + " / ".join(bad))
+        # L3-C④：宿主机侧注入必须在**核完指纹之后**改盘——顺序反了就是拿改过的字节去核
+        # pristine 的指纹，那条闸会把注入本身当成"夹具坏了"，而真正的注入点永远走不到。
+        if host_fault:
+            bad = apply_fat_host_fault(host_fault)
+            if bad:
+                sys.exit("FAT32 宿主机侧注入不成立：" + " / ".join(bad))
     SERIAL_LOG.unlink(missing_ok=True)
     code, tpl = ovmf_files()
     # vars 每次从模板重拷：上一次运行写入的 NVRAM 启动项不该影响本次判定（可复现）
@@ -1764,17 +2087,152 @@ def check_lints_wired() -> list[str]:
     return bad
 
 
-def check_unsafe_registry() -> list[str]:
-    """登记表 <-> 实际 unsafe 双向对账（手册 §1.3 第 6 条）。
+# ------------------------------------------------- P3：unsafe 现场分类（U1..U6）
+#
+# 类别由**规则算**，不是人断言。登记表存的是「模块 × 类别 → 处数」这份普查快照，
+# 门禁每次从源码重算一遍再逐格比 ⇒「新增一个未登记的 unsafe 块」与「登记了一条源码里
+# 没有的记录」都表现为计数不符，而不是靠人记得去改散文（旧登记表的 scope 就是这么写漏的：
+# 它自己承认「门禁按包计数，所以这行写漏不会让检查失败」）。
+#
+# 规则有优先序，先命中先归类。逐处判定由 `unsafe_sites()` 一并返回，审计表落进
+# docs/security/unsafe-census.md。**类别判错了改规则，不改登记数去凑**——后者会让
+# 这份普查变成一份跟着代码走的橡皮图章。
+UNSAFE_CLASSES = ("U1", "U2", "U3", "U4", "U5", "U6")
+UNSAFE_CLASS_NAME = {
+    "U1": "架构入口与特殊寄存器",
+    "U2": "页表、物理内存与 MMIO",
+    "U3": "DMA 与设备共享内存",
+    "U4": "并发共享状态与 UnsafeCell",
+    "U5": "用户指针与地址空间访问",
+    "U6": "诊断路径的有限现场读取",
+}
+# 与旧门禁同口径：非注释行里含 unsafe，且是块/impl/fn/extern 四种之一。
+# 实测 273 处全部落在这四种里（235 块 + 27 impl + 10 fn + 1 extern），没有第五种形状。
+UNSITE = re.compile(r"\bunsafe\s*(\{|impl|fn|extern)")
+# 顶层 fn（列 0）。只认列 0 是有意的：extern "C" {} 里那些缩进的 fn 是**声明**不是定义，
+# 认了它会把后面整个文件的"所属函数"都记成 context_load。
+UNFN = re.compile(r'^(?:pub )?(?:unsafe )?(?:extern "C" )?fn\s+(\w+)')
+UNSAFE_ARCH_TABLE = ("tss.", "gdt", "idt", "gdtr", "write_unaligned")
 
-    按**包名**统计（登记表用包名，目录名可能不同，例如 kernel/ 目录对应 aurora-kernel 包）。
+
+def _unsafe_roots() -> list[Path]:
+    """普查范围 = 两个成员包的源文件。与 check_unsafe_registry 的按包对账同一份来源。"""
+    return [ROOT / "kernel" / "src", ROOT / "user" / "hello" / "src"]
+
+
+def unsafe_extern_syms() -> dict[str, str]:
+    """extern "C" {} 里的符号 → 'fn' 或 'static'。这些是全局 asm 定义的入口与链接器符号。
+
+    分开记是有用的：调用一个 extern **fn**（context_load / if_patch）或索引一个 extern
+    **static**（isr_table[v]）是架构入口 ⇒ U1；而对链接器符号取地址（`&raw const __text_start`）
+    只是在量镜像边界，没有入口语义 ⇒ 落到 U2。
+    """
+    syms: dict[str, str] = {}
+    for root in _unsafe_roots():
+        for f in sorted(root.rglob("*.rs")):
+            t = f.read_text(encoding="utf-8")
+            for m in re.finditer(r'extern\s+"C"\s*\{', t):
+                i, depth = m.end(), 1
+                while i < len(t) and depth:
+                    depth += (t[i] == "{") - (t[i] == "}")
+                    i += 1
+                body = t[m.end():i - 1]
+                for kind, pat in (("fn", r"\bfn\s+(\w+)"), ("static", r"\bstatic\s+(\w+)")):
+                    for n in re.findall(pat, body):
+                        syms[n] = kind
+    return syms
+
+
+def _classify_unsafe(kind: str, text: str, module: str, fn: str,
+                     syms: dict[str, str]) -> str:
+    """一处 unsafe 现场 → U1..U6。text 是现场行与其后两行拼起来的窗口
+    （`unsafe {` 常常单独一行，操作在下一行；只看当行会把它们全归到兜底类）。
+
+    **按这处操作做什么归类，不按它坐在哪个函数里。** 第一版有一条"所属函数是
+    `extern "C" fn` 就归 U1"，实测把 `user/hello` 的 `_start` 与 `mm::take_over`
+    整个函数体都染成了 U1（29 处与 5 处），而它们真正做的是 syscall 跨界与镜像边界测量。
+    入口**声明本身**由 `kind == "extern"` 那条归 U1，够了。
+    """
+    if kind == "impl":
+        return "U2" if "GlobalAlloc" in text else "U4"
+    # 用户指针拷贝先判：ucopy_from/to 也是 extern fn，但它的语义比"架构入口"更具体。
+    if "ucopy_from" in text or "ucopy_to" in text:
+        return "U5"
+    if "asm!" in text or kind == "extern":
+        return "U1"
+    for n, k in syms.items():
+        if (f"{n}(" in text) if k == "fn" else (f"{n}[" in text):
+            return "U1"
+    if any(k in text for k in UNSAFE_ARCH_TABLE):
+        return "U1"
+    if any(k in text for k in (".0.get()", "UnsafeCell", ".data.get()", "locked.store")):
+        return "U4"
+    if module in ("crash", "ktest"):
+        return "U6"
+    if module == "user/hello":
+        return "U1" if kind == "fn" else "U5"
+    if module == "driver" and any(k in text for k in ("read_volatile", "write_volatile", "write_bytes")):
+        return "U3"
+    if module == "limine" and any(k in text for k in ("extra_argument", "goto_address", "release_mp_cpu")):
+        return "U3"
+    if fn.startswith("t_"):
+        return "U6"
+    return "U2"
+
+
+def unsafe_sites() -> list[dict]:
+    """普查每一处 unsafe 现场：模块、行号、形状、所属顶层函数、判定类别与判定依据原文。"""
+    syms = unsafe_extern_syms()
+    out: list[dict] = []
+    for root in _unsafe_roots():
+        for f in sorted(root.rglob("*.rs")):
+            rel = f.relative_to(ROOT)
+            # 模块名 = 包内相对路径去掉 .rs。用户程序那个包今天只有一个文件，
+            # 给它一个稳定的名字而不是 "main"（与内核的 main 撞名，普查表会读成同一个模块）。
+            if rel.as_posix().startswith("user/hello/"):
+                module = "user/hello"
+            else:
+                module = f.relative_to(ROOT / "kernel" / "src").with_suffix("").as_posix()
+            lines = f.read_text(encoding="utf-8").splitlines()
+            fn = ""
+            for i, ln in enumerate(lines):
+                m = UNFN.match(ln)
+                if m:
+                    fn = m.group(1)
+                if ln.strip().startswith("//") or not UNSITE.search(ln):
+                    continue
+                kind = UNSITE.search(ln).group(1)
+                text = " ".join(x.strip() for x in lines[i:i + 3])
+                out.append(dict(module=module, path=rel.as_posix(), line=i + 1, kind=kind,
+                                fn=fn, text=text, cls=_classify_unsafe(kind, text, module, fn, syms)))
+    return out
+
+
+def unsafe_census() -> dict[tuple[str, str], int]:
+    """模块 × 类别 → 处数。登记表存的就是这份快照。"""
+    c: dict[tuple[str, str], int] = {}
+    for s in unsafe_sites():
+        k = (s["module"], s["cls"])
+        c[k] = c.get(k, 0) + 1
+    return c
+
+
+def check_unsafe_registry() -> list[str]:
+    """登记表 <-> 实际 unsafe 双向对账（手册 §1.3 第 6 条），两层粒度。
+
+    第一层按**包名**（哪个包允许含 unsafe）：登记表用包名，目录名可能不同，
+    例如 kernel/ 目录对应 aurora-kernel 包。这一层是原来就有的准入闸。
+    第二层按**模块 × 类别**（P3 细分）：从源码逐处重算普查，与 `[modules.*]` 逐格比。
+    只有第一层时，登记表自己承认的那句「门禁按包计数，所以这行写漏不会让检查失败」
+    就是真的——scope 散文写漏了照样绿。第二层把"漏登记一处"变成计数不符。
     """
     reg = ROOT / "docs" / "security" / "unsafe-whitelist.toml"
     if not reg.exists():
         return ["缺 docs/security/unsafe-whitelist.toml"]
+    raw = reg.read_text(encoding="utf-8")
     listed = {
         ln.strip().strip("[]").removeprefix("crate.")
-        for ln in reg.read_text(encoding="utf-8").splitlines()
+        for ln in raw.splitlines()
         if ln.strip().startswith("[crate.")
     }
     out = subprocess.run([str(CARGO), "metadata", "--format-version", "1", "--no-deps"], capture_output=True, text=True, env=env())
@@ -1794,6 +2252,51 @@ def check_unsafe_registry() -> list[str]:
             bad.append(f"{name}: 登记了 unsafe 但实际统计为 0（白名单虚报）")
         if name not in listed and n > 0:
             bad.append(f"{name}: 有 {n} 处含 unsafe 的行但未登记（越权 unsafe）")
+
+    # 第二层。先真解析一遍 TOML：本轮开工时这份文件**根本不是合法 TOML**
+    # （scope_actual 里有嵌套裸双引号），而旧门禁只按行首扫 `[crate.`，所以那个错一直没人发现。
+    # 解析失败必须是红，否则下面整层对账会静默空转。
+    import tomllib
+    try:
+        doc = tomllib.loads(raw)
+    except tomllib.TOMLDecodeError as e:
+        return bad + [f"unsafe-whitelist.toml 不是合法 TOML：{e}（按包对账看不出这个，"
+                      "而模块×类别那一层整层会空转）"]
+    census = doc.get("unsafe-census")
+    modules = doc.get("modules")
+    if not isinstance(census, dict) or not isinstance(modules, dict):
+        return bad + ["缺 [unsafe-census] 或 [modules] 段：P3 细分登记不在位，第二层对账空转"]
+    got = unsafe_census()
+    want = {(m, c): n for m, v in modules.items() for c, n in v.items()}
+    for m, v in modules.items():
+        for c in v:
+            if c not in UNSAFE_CLASSES:
+                bad.append(f"模块 {m} 登记了不存在的类别 {c}（只有 {'/'.join(UNSAFE_CLASSES)}）")
+    for k in sorted(set(want) - set(got)):
+        bad.append(f"登记了 {k[0]} 的 {k[1]} {want[k]} 处，源码里一处都算不出来（白名单虚报）")
+    for k in sorted(set(got) - set(want)):
+        bad.append(f"{k[0]} 有 {got[k]} 处 {k[1]}（{UNSAFE_CLASS_NAME[k[1]]}）但没登记（越权 unsafe）")
+    for k in sorted(set(got) & set(want)):
+        if got[k] != want[k]:
+            bad.append(f"{k[0]} {k[1]}: 登记 {want[k]} 处，源码算出 {got[k]} 处"
+                       "（新增/删除了 unsafe，或分类规则变了——改规则要连登记一起改，并重新核对审计表）")
+    total = sum(got.values())
+    if census.get("total") != total:
+        bad.append(f"[unsafe-census] total={census.get('total')}，源码算出 {total}")
+    for c in UNSAFE_CLASSES:
+        n = sum(v for (m, k), v in got.items() if k == c)
+        if census.get(c) != n:
+            bad.append(f"[unsafe-census] {c}={census.get(c)}，源码算出 {n}")
+    # 审计表与登记表同源，但它是给人读的那一份：只核它的汇总锚点行，
+    # 不逐处比（逐处的权威来源是上面那次重算，两处各写一份就会分家）。
+    audit = ROOT / "docs" / "security" / "unsafe-census.md"
+    if not audit.exists():
+        bad.append("缺 docs/security/unsafe-census.md（逐处审计表：类别判错了要能翻到具体哪一处）")
+    else:
+        line = "总计 %d 处。%s" % (total, " · ".join(
+            f"{c} {sum(v for (m, k), v in got.items() if k == c)}" for c in UNSAFE_CLASSES))
+        if line not in audit.read_text(encoding="utf-8"):
+            bad.append(f"unsafe-census.md 的汇总行与重算不符，应当是：{line}")
     return bad
 
 
@@ -3734,6 +4237,28 @@ def do_test(timeout: int) -> int:
                 print(f"    溢出现场 已喂={at} 这段={n} 界={esize} 走链自报={wb} ⇒ 正好多出 1 字节")
     IMAGE.unlink(missing_ok=True)
 
+    print("=== 第 38 行：给第 36 行 ④ 那格证红——宿主机改卷A 上容器的一个段内字节（内核二进制不变）===")
+    # ④ 今天是"两条来源跑出同一组数"，那是配对，不是证红。这一跑把盘上那份的
+    # `movq $0xa7,…(%rip)` 的 immediate 改成 0x5a：rodata 槽必须变成 90、"字节同"必须红，
+    # 而长度/走链/段表三格还得是 true（改的是段内字节，不是元数据）。
+    # 为什么改代码段而不是 .rodata：实测 BANNER[0] 被折成 immediate，改 .rodata 槽读数不动（BACKLOG 80）。
+    IMAGE.unlink(missing_ok=True)
+    ebv, ebc, eblog = do_run(["fat32-exec"], timeout, host_fault="fault-fat32-exec-byte")
+    eb_bad = fat_host_witness("fault-fat32-exec-byte", eblog)
+    eb_verdict = ebv if not eb_bad else "CONTENT-MISMATCH"
+    IMAGE.unlink(missing_ok=True)
+
+    print("=== 第 39 行：给第 34 行 ⑦ 那格证红——宿主机把卷B 目录项的簇号高半抹成 0 ===")
+    # ⑦ 今天是内核自己构造一个"只取低半"的 FileStat 再走链——那证明的是 walk 的拒因，
+    # 不是 open 真的把两半拼起来了。这一跑改的是**盘上的目录项**：首簇从 67,587 掉到 2,051，
+    # 落在 FILLER.BIN 中间，走满 62 簇喂够字节而链还没到 EOC ⇒ ChainEndsLate，
+    # 且读出来的头四字节不再是 ELF 魔数。拒因里那四个数由宿主机按改过的盘独立算一遍。
+    IMAGE.unlink(missing_ok=True)
+    hiv, hirc, hilog = do_run(["fat32-probe"], timeout, host_fault="fault-fat32-cluster-hi")
+    hi_bad = fat_host_witness("fault-fat32-cluster-hi", hilog)
+    hi_verdict = hiv if not hi_bad else "CONTENT-MISMATCH"
+    IMAGE.unlink(missing_ok=True)
+
     rows = [
         ("正向", v, rc, "PASS", 33),
         ("负样本", nv, nrc, "FAIL", 35),
@@ -3818,6 +4343,13 @@ def do_test(timeout: int) -> int:
         # 第 36 行的证红：把尾格注入叠加到 ③ 上，红必须点名"多喂出来的那一个字节"。
         # 红了但红在别处 ⇒ 上面已经把实际值改成 CONTENT-MISMATCH，这一行就不会假装符合
         ("FAT32③多喂一字节红在溢出", ev_verdict, evc, "FAIL", 35),
+        # 第 36 行 ④ 那格的证红：盘上那份容器的一个**段内字节**被宿主机改掉（内核二进制不变），
+        # rodata 槽必须跟着变成注入值、"字节同"必须红。红了但槽读数没变 ⇒ 注入没走到用户态，
+        # 上面已把实际值改成 CONTENT-MISMATCH，这一行不会假装符合
+        ("FAT32④段内字节改了必须红", eb_verdict, ebc, "FAIL", 35),
+        # 第 34 行 ⑦ 那格的证红：目录项高半抹零 ⇒ open 拼出的首簇掉进 FILLER.BIN 中间，
+        # 读到的是别的文件的字节。拒因里四个数由宿主机按改过的盘独立重算
+        ("FAT32簇号高半抹零必须红", hi_verdict, hirc, "FAIL", 35),
     ]
     # 每一行对应那一跑的串口：不符时把红的那几格打出来。
     # 单独一张表而不是把日志塞进 `rows` 的元组里：元组要保持成"名字/期望/实际"这种
@@ -3851,6 +4383,8 @@ def do_test(timeout: int) -> int:
         "FAT32尾格多喂必须红": ftlog,
         "FAT32读出的镜像装上并跑通": exlog,
         "FAT32③多喂一字节红在溢出": evlog,
+        "FAT32④段内字节改了必须红": eblog,
+        "FAT32簇号高半抹零必须红": hilog,
     }
     all_ok = True
     print()
@@ -3996,6 +4530,11 @@ def main() -> int:
         p = sub.add_parser(name)
         p.add_argument("--features", default="")
         p.add_argument("--timeout", type=int, default=120)
+        if name == "run":
+            # 第 38/39 行那两条宿主机侧注入要能脱离判定链单独复现：`run --features fat32-exec
+            # --host-fault fault-fat32-exec-byte` 必须与链里那一跑是同一个证人。只给 `run`——
+            # 别的子命令收下这个参数却不读它，就是"看着开了其实没开"那种绿。
+            p.add_argument("--host-fault", default="", choices=["", *sorted(FAT_HOST_FAULTS)])
     a = ap.parse_args()
     feats = [f for f in a.features.split(",") if f]
     if a.cmd == "build":
@@ -4005,7 +4544,9 @@ def main() -> int:
         do_image(feats)
         return 0
     if a.cmd == "run":
-        v, rc, _ = do_run(feats, a.timeout)
+        v, rc, log = do_run(feats, a.timeout, host_fault=a.host_fault)
+        if a.host_fault and fat_host_witness(a.host_fault, log):
+            v = "CONTENT-MISMATCH"
         return 0 if v == "PASS" else 1
     if a.cmd == "release":
         return do_release(a.timeout)
