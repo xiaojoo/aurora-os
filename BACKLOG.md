@@ -3578,6 +3578,50 @@ P0-1 登记口径 → P0-2 向量表先例 → P0-3 断言 delta 化 → P1 ADR-
 - `use` 嵌套花括号 `use a::{b::{c,d}}` 未解析；当前仓库无此写法。
 - P0-2（ADR-020 非 ISA 向量先例）、P0-3（绝对断言 delta 化）尚未开始。
 
+## 98. ADR-046：具名中断向量进登记表（第 17 道门禁）（2026-11-08）
+
+**发现（实测）**：W1 的 T1.4 要"把 resched IPI 登记进 ADR-020 的向量表"，但 ADR-020 §一
+只有**区间**式登记（0..31/32..47/48..254/255），具名向量从来没有登记面。`trap.rs` 实测有 7 个
+`pub const VEC_*`（32、47、0x80、0xf1、0xf2、0xff、0x180），而 16 道门禁里**没有一道**看着它们：
+改号、加号、把"不建帧"的特例挪到别的向量上，都不红。
+
+**做法（实测）**：新建 `docs/architecture/vectors.toml`（`[[vector]]` 一行一个具名向量 +
+`[[range]]` 区间去向 + `[meta]` 三处特例名字），新建第 17 道 `check_vector_table`：
+名字与取值双向相等、`idt` 与取值区间一致、`stub` 必须在 trap.rs 文本里存在、向量号不许重复、
+`[[range]]` 必须无重叠无缺口铺满 0..255，**三处特例按源码判据解析**——
+`dpl3_gate ← idt_gate(..., v == X,)`、`frame_bypass ← let handler = if v == X {`、
+`no_eoi ← on_interrupt 里提前 return 的那条 if vector == X 分支`。
+`check-interface-change` 的接口集合加入 `vectors.toml`（改表必须同轮带 ADR）。
+内核源码零改动；`AGENTS.md` 同步：16 → 17 道，ADR 数量那句"014–038 共 24 份"改为
+"014–045 共 31 份"并注明完整化方案 §3 拟用编号全部撞车。
+
+**负样本（实测，七条先红后绿，进程内直调门禁函数）**：
+1. 加 `pub const VEC_RESCHED: usize = 0xf0;` 不登记 ⇒ `具名向量 VEC_RESCHED=0xf0 … 却没登记`
+2. 表里 `VEC_CPU_TIMER` 写 240 ⇒ `登记值 240 ≠ trap.rs 实测 241（0xf1）`
+3. 表里两条都用 0xf1 ⇒ `向量号 0xf1 被两条登记占用：['VEC_CPU_TIMER', 'VEC_CPU_TIMER_DUP']`
+4. `48..255` 改 `48..254` ⇒ `[[range]] 在 0xff 处有缺口（上一段结束于 0xfe）`
+5. `frame_bypass` 多登记一个名字 ⇒ `「不建帧的快路径门」源码点名 ['VEC_SHOOTDOWN'] ≠ 登记 [...]`
+6. **量具自证**：源码判据改成 `if SHOOTDOWN_VEC {` ⇒ `源码里没解析到…（正则失效 = 量具坏了）`，
+   判据消失时不静默绿
+7. `stub` 写成不存在的 `isr_stub_2xx` ⇒ `在 trap.rs 里找不到（桩改名了？）`
+
+**量具自己错过一次（实测，按 §12.3 的纪律记）**：`no_eoi` 第一版按"提到 VEC_* 名字"匹配，
+把 `on_interrupt` 里那条**照常发 EOI** 的 `VEC_CPU_TIMER` 分支也算成特例，报
+`源码点名 ['VEC_CPU_TIMER','VEC_SPURIOUS'] ≠ 登记 ['VEC_SPURIOUS']`。改成按**分支形状**
+（块内出现 `return`）判定后还原为绿。这条如果当时靠人读表就过去了——是新闸第一次跑
+才把它逼出来的。
+
+**读数（实测）**：`check` **17/17**；trap.rs 与 vectors.toml 均按字节还原（sha256 一致），
+`git diff` 里 `kernel/` 为空。内核二进制未变 ⇒ 不重跑矩阵，默认 53/53 沿用 ADR-044 那一跑。
+
+**仍未做（推断/欠账）**：
+- 0..31 每条异常的桩未逐行登记（宏生成，`STUB_NOERR/STUB_ERR`）；需要的那天再登记。
+- **号段分配政策没有**：0xF0 给不给 resched，本表只能防撞号，选号理由得 ADR 说。
+- 表与运行时无交叉见证：`ktests/driver.rs` 打的"irq: 已用向量…"是内核自报；要成独立见证
+  需宿主机从 `-d int`/`-trace` 数出实际到过的向量与表对账——这正是 §97a 第 3 条说的
+  "今天没有仪器数过 hlt，也没数过 IPI"。
+- W1 的"阻塞/等待/定时"ADR 因 046 被占用而**顺延为 ADR-047**。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

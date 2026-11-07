@@ -2719,6 +2719,102 @@ def check_module_interfaces() -> list[str]:
     return bad
 
 
+def check_vector_table() -> list[str]:
+    """P0-2（ADR-046）：具名中断向量与 `docs/architecture/vectors.toml` 双向对账。
+
+    ADR-020 §一只登记了四段区间（0..31/32..47/48..254/255），具名向量 0x80/0xF1/0xF2
+    从来没进那张表——所以 W1 任务卡里"新向量登记进 ADR-020 向量表"这句话一直没有可循的
+    先例格式。本闸把具名向量变成机器可对账的登记表，并把**三处特例**钉在源码的判据上：
+    DPL3 门（`idt_gate(..., v == X)`）、不建帧的快路径（`if v == X {`）、不发 EOI 的判定
+    （apic.rs `vector == X`）。W1 要加的 resched IPI 恰好落在这三处的射程里：
+    它若走不建帧路径，就必须同时改源码判据与登记，两边不一致当场红。
+    """
+    import tomllib
+
+    trap = ROOT / "kernel" / "src" / "arch" / "x86_64" / "trap.rs"
+    apic = ROOT / "kernel" / "src" / "arch" / "x86_64" / "apic.rs"
+    text, atext = trap.read_text(encoding="utf-8"), apic.read_text(encoding="utf-8")
+    consts = {m.group(1): int(m.group(2), 0) for m in re.finditer(
+        r"pub const (VEC_[A-Z0-9_]+)\s*:\s*(?:usize|u64)\s*=\s*(0x[0-9a-fA-F]+|\d+)", text)}
+    if not consts:
+        return ["trap.rs 里没解析到任何 `pub const VEC_*`——常量写法变了，本闸会静默空转"]
+
+    reg = ROOT / "docs" / "architecture" / "vectors.toml"
+    if not reg.exists():
+        return ["缺 docs/architecture/vectors.toml；trap.rs 实测具名向量："
+                + str({k: hex(v) for k, v in sorted(consts.items(), key=lambda kv: kv[1])})]
+    doc = tomllib.loads(reg.read_text(encoding="utf-8"))
+    rows, ranges, meta = doc.get("vector") or [], doc.get("range") or [], doc.get("meta") or {}
+    if not rows or not ranges:
+        return ["vectors.toml 的 [[vector]] 或 [[range]] 为空：本闸会空转（空表不等于全对）"]
+    bad: list[str] = []
+
+    names = [r.get("name") for r in rows]
+    if len(set(names)) != len(names):
+        bad.append("vectors.toml 有重名条目")
+    for n in sorted(set(consts) - set(names)):
+        bad.append(f"具名向量 {n}={consts[n]:#x} 在 trap.rs 定义了却没登记")
+    for n in sorted(set(names) - set(consts)):
+        bad.append(f"登记的 {n} 在 trap.rs 里已不存在（基线过期）")
+    for r in rows:
+        n, v = r.get("name"), r.get("value")
+        if n in consts and v != consts[n]:
+            bad.append(f"{n} 登记值 {v} ≠ trap.rs 实测 {consts[n]}（{consts[n]:#x}）")
+        if not isinstance(v, int):
+            bad.append(f"{n} 的 value 不是整数")
+            continue
+        idt = r.get("idt")
+        if not isinstance(idt, bool):
+            bad.append(f"{n} 缺 idt 布尔位（它占的是 IDT 门还是 MSR 入口？）")
+        elif idt != (0 <= v < 256):
+            bad.append(f"{n}={v:#x} 的 idt={idt} 与取值区间矛盾（只有 0..255 是 IDT 门）")
+        stub = r.get("stub", "")
+        if not stub:
+            bad.append(f"{n} 缺 stub")
+        elif stub not in text:
+            bad.append(f"{n} 的 stub `{stub}` 在 trap.rs 里找不到（桩改名了？）")
+    vals = [r["value"] for r in rows if isinstance(r.get("value"), int)]
+    for v in sorted(set(vals)):
+        if vals.count(v) > 1:
+            bad.append(f"向量号 {v:#x} 被两条登记占用：={[r['name'] for r in rows if r.get('value') == v]}")
+
+    pos = 0
+    for lo, hi in sorted((r.get("lo", -1), r.get("hi", -1)) for r in ranges):
+        if lo != pos:
+            bad.append(f"[[range]] 在 {lo:#x} 处{'与上一段重叠' if lo < pos else '有缺口'}"
+                       f"（上一段结束于 {pos:#x}）")
+        pos = hi
+    if pos != 256:
+        bad.append(f"[[range]] 只铺到 {pos:#x}，而 IDT 有 256 个门——新段必须把旧段改掉，不许留洞")
+
+    anchors = {
+        "dpl3_gate": (r"v == (VEC_[A-Z0-9_]+)\s*,\s*\n\s*\)", text, "唯一的 DPL3 门", False),
+        "frame_bypass": (r"if v == (VEC_[A-Z0-9_]+) \{", text, "不建帧的快路径门", False),
+        # 「不发 EOI」不看"提没提到"，只看**分支形状**：on_interrupt 里提前 `return` 的那条
+        # 分支才是不发 EOI 的那条。第一版只按名字匹配，结果把 CPU 定时器分支也算了进来
+        # （它提到 VEC_CPU_TIMER 但不 return），等于给特例登记面上凭空多一条——已收紧。
+        "no_eoi": (r"vector == crate::arch::x86_64::trap::(VEC_[A-Z0-9_]+)", atext,
+                   "不发 EOI 的判定（提前 return 的分支）", True),
+    }
+    for key, (pat, src_text, label, need_return) in anchors.items():
+        got = {m.group(1) for m in re.finditer(pat, src_text) if m.group(1) in consts}
+        if need_return:
+            early: set[str] = set()
+            for m in re.finditer(pat, src_text):
+                seg = src_text[m.end(): m.end() + 400].split("\n    }")[0]
+                if re.search(r"\breturn\b", seg):
+                    early.add(m.group(1))
+            got = early
+        base = meta.get(key)
+        base = {base} if isinstance(base, str) else set(base or [])
+        if not got:
+            bad.append(f"源码里没解析到「{label}」的点名（正则失效 = 量具坏了）：{key}")
+        elif got != base:
+            bad.append(f"「{label}」源码点名 {sorted(got)} ≠ vectors.toml 的 {key}={sorted(base)}"
+                       "（加/减一处特例都要两边一起改）")
+    return bad
+
+
 def check_interface_change() -> list[str]:
     """Task E：ADR 最小格式 + 模块接口变更必须有 ADR。
 
@@ -2768,7 +2864,8 @@ def check_interface_change() -> list[str]:
     for entry in out.stdout.split("\0"):
         if len(entry) >= 4 and entry[2] == " ":
             paths.append(entry[3:])
-    iface = {"docs/architecture/module-interfaces.toml", "docs/architecture/module-dependencies.md"}
+    iface = {"docs/architecture/module-interfaces.toml", "docs/architecture/module-dependencies.md",
+             "docs/architecture/vectors.toml"}
     iface_changed = sorted(p for p in paths if p in iface)
     adr_changed = [p for p in paths if re.fullmatch(r"docs/adr/ADR-\d{3}-.*\.md", p)]
     if iface_changed and not adr_changed:
@@ -4327,6 +4424,7 @@ def do_check(elf: Path | None) -> int:
         "check-unsafe": lambda: check_unsafe_registry(),
         "check-crates": lambda: check_crates_listed(),
         "check-module-interfaces": lambda: check_module_interfaces(),
+        "check-vector-table": lambda: check_vector_table(),
         "check-interface-change": lambda: check_interface_change(),
         "check-driver-ctx": lambda: check_driver_no_raw(),
         "check-state-window": lambda: check_state_window(),

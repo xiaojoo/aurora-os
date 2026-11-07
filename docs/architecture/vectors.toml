@@ -1,0 +1,104 @@
+# 具名中断向量登记表（ADR-046）。由 `python tools/aurora.py check` 的 check-vector-table
+# 与 kernel/src/arch/x86_64/trap.rs 的 `pub const VEC_*` 双向对账：
+#   名字与取值必须相等（改了号没改表、或加了向量不登记，都当场红）；
+#   idt=true 只在 0..255，stub 必须是 trap.rs 里真存在的符号，向量号不许两条登记共用；
+#   [[range]] 必须无重叠无缺口地铺满 0..255（要为新向量开一段，就得改掉相邻段，不许留洞）；
+#   meta 的三处特例点名必须与源码判据一致（见下面 anchors 注释）。
+# ADR-020 §一只登记了区间，具名向量从来没有登记面——这张表补的就是那一段，
+# 目的是让 W1 新增 resched IPI 时"登记进向量表"有先例可循、且有闸看着。
+
+[meta]
+source = "kernel/src/arch/x86_64/trap.rs"
+idt_entries = 256
+# anchors：三处特例的"源码点名必须等于登记"。源码判据分别是
+#   dpl3_gate    ← trap.rs `t.idt[v] = idt_gate(..., v == X,)`（最后一个参数）
+#   frame_bypass ← trap.rs `let handler = if v == X {`（绕过 isr_table 的特例）
+#   no_eoi       ← apic.rs `if vector == ...trap::X {`（spurious 不发 EOI）
+# W1 的 resched IPI 若走不建帧路径，frame_bypass 就必须多一个名字——两边一起改才过。
+dpl3_gate = "VEC_SYSCALL"
+frame_bypass = ["VEC_SHOOTDOWN"]
+no_eoi = ["VEC_SPURIOUS"]
+
+# ============ 具名向量（与 trap.rs 的 VEC_* 常量一一对应） ============
+
+[[vector]]
+name = "VEC_IRQ_BASE"
+value = 32
+idt = true
+stub = "isr_stub_32"
+purpose = "I/O APIC ISA 路由第一格（IRQ0/定时器实际走 32+0）"
+adr = "ADR-020"
+
+[[vector]]
+name = "VEC_IRQ_LAST"
+value = 47
+idt = true
+stub = "isr_stub_47"
+purpose = "I/O APIC ISA 路由最后一格（IRQ15）"
+adr = "ADR-020"
+
+[[vector]]
+name = "VEC_SYSCALL"
+value = 128
+idt = true
+stub = "isr_stub_128"
+purpose = "ring3→ring0 的 int 0x80 入口；全表唯一的 DPL3 门"
+adr = "ADR-025"
+
+[[vector]]
+name = "VEC_CPU_TIMER"
+value = 241
+idt = true
+stub = "isr_stub_241"
+purpose = "每 CPU 的 LAPIC 本地定时器；M3b-2b 起走建帧路径（要能在 AP 上换人）"
+adr = "ADR-024"
+
+[[vector]]
+name = "VEC_SHOOTDOWN"
+value = 242
+idt = true
+stub = "isr_stub_shootdown"
+purpose = "TLB shootdown IPI；不建帧快路径（请求方正持 VMM 锁等回执，处理侧取锁就是跨 CPU 死锁）"
+adr = "ADR-023"
+
+[[vector]]
+name = "VEC_SPURIOUS"
+value = 255
+idt = true
+stub = "isr_stub_spurious"
+purpose = "LAPIC spurious（SVR=0x1FF）；单独一条桩且不发 EOI——发了会多确认一个不存在的服务中断"
+adr = "ADR-020"
+
+[[vector]]
+name = "VEC_SYSCALL_FAST"
+value = 384
+idt = false
+stub = "syscall_entry"
+purpose = "SYSCALL/SYSRET 快路径入口：MSR_LSTAR 指向的地址，不占 IDT 门（0x180 是记法不是向量）"
+adr = "ADR-026"
+
+# ============ 区间（必须无重叠无缺口铺满 0..255；hi 不含） ============
+
+[[range]]
+lo = 0
+hi = 32
+disposition = "CPU 异常，每个向量一条独立桩（STUB_NOERR/STUB_ERR）；#DF(8) 用 IST1"
+default_stub = "isr_stub_<n>"
+
+[[range]]
+lo = 32
+hi = 48
+disposition = "IRQ0..15，I/O APIC 路由，每个向量一条独立桩"
+default_stub = "isr_stub_<n>"
+
+[[range]]
+lo = 48
+hi = 255
+disposition = "不该出现的向量共用一条桩：仍压向量号占位、仍计数、仍 EOI，不许变成静默 #GP"
+default_stub = "isr_stub_unexpected"
+
+[[range]]
+lo = 255
+hi = 256
+disposition = "LAPIC spurious：计数但不发 EOI"
+default_stub = "isr_stub_spurious"
