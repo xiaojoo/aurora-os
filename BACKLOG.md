@@ -3154,6 +3154,74 @@ dup/越权/旧句柄改由核内用例见证（`t_handle_syscalls` 11 格）。�
 `unsafe-whitelist.toml` 与 `unsafe-census.md` 的汇总行已同步；
 `check-fat32-ports` 的依赖判据改成"列表必须含 fat32-probe"（`fat32-exec` 现在多依赖 `handles`）。
 
+## 87. T0.1：main.rs 用例纯搬移（2026-11-07）
+
+**做法（实测）**：按锚点切片（脚本 `.scratch/t01/move.py`，CRLF），把 74 个 `t_` 用例与
+32 个用例专用辅助项搬进 `kernel/src/ktests/` 的 18 个模块 + `common.rs`（另有 `mod.rs`）。
+`main.rs` 7,617 → 677 行（净 −6,940 = 搬走 6,946 − 新增 mod/use 6）。
+被搬走的行 6,946；新文件正文 7,131 = 6,946 + 文件头/use 127 + 顺序自足修复 58。
+用例 74 对 73 的差额 = `t_irq_noop_handler`（返回 false，无注册、无引用），原样搬进 `driver.rs`。
+默认构建注册 **53** 条（main.rs 73 条注册 − 20 条 cfg 门；`filesystem/fat32.rs` 的 2 条游标用例
+与 `handle.rs` 的 3 条句柄用例只在对应变体里生效）；`fat32-probe`=57、`fat32-exec`=61。
+
+**读数（实测）**：
+- 改前：`check` 14/14；`test` 41/41；默认 `ktests: total=53 passed=53 failed=0`。
+- 改后：同上（`check` 14/14、`test` 41/41、默认 53/53/0）。取证跑：
+  `.scratch/t01/before/test.txt`、`.scratch/t01/after-test6.txt`。
+- 逐变体（32 个：do_test 的 30 个 + `irq-probe` + `virtio-msix-probe`）：
+  26 个完整跑完的变体，注册名集合、`test:` 行集合、`ktests` 三数**完全一致**；
+  6 个在 ktests 之前按设计停机的变体（fault-alloc-in-irq / fault-crash-oops / fault-double-free /
+  fault-lock-reentrant / fault-shootdown-noack / irq-sticky-pxis）verdict 与注册集合一致，
+  但**执行前缀随顺序变化**（注入落在第 N 条之后，N 随链接顺序变）——这不是行为差异，
+  也不能用"串口逐行相同"当判据（设计 §11 勘误已写明）。
+- 执行顺序：变了（`.ktests` 链接顺序），集合不变；逐变体顺序见
+  `.scratch/t01/compare-report3.txt`。不靠调整顺序掩盖。
+
+**顺序变化暴露并修掉的隐式依赖（实测，单独提交）**：
+1. `t_preempt_round_robin` 写死任务下标 1/2；前面的用例可以占掉两格 ⇒ 改用 `spawn` 交回的下标。
+2. `t_timer_ticks_recur` 的 P5 逐桶账用**绝对数**比；前面的用例可能留下一个"走 context_load
+   出口、没有向量桶"的样本（`p3_record_irq` 对 v<32 也 +1）⇒ 改成只比本窗口增量（与 tick 基线同规矩）。
+3. `t_task_exit` 把"落脚页（trampoline）第一次建立"记进第一轮账里 ⇒ 用例开头先
+   `user::ensure_trampoline()`，基线再取。
+4. `drain_reap` 只认"它自己的窗口里有增量"；释放若在窗口前就完成会被读成"没等到" ⇒
+   `t_task_exit` 第二轮、`run_one`、`t_handle_reap` 改成"窗口内有增量 **或** 自本动作前基线以来已增长"。
+5. `t_watchdog` 假设 APIC 已初始化（`timer_start/stop` 失败被 `.ok()` 吞掉）⇒ 开头
+   `apic::get_or_init`。
+6. `t_irq_affinity` 在改目的地后仍会收到"移动前已在途"的 MSI（落在旧目的地）⇒ 改完目的地先做
+   一次不计数读排空，基线在排空之后取；回移基线取在改回之前，避免收尾非 BSP 比移动窗口多。
+7. 宿主机符号门禁 `OOPS_FRAMES_FNS` 钉的是 mangled 尾段；`t_crash_oops` 搬进
+   `ktests::crash` 后路径变了 ⇒ 门禁同步加上 `ktests/crash` 三段（判据强度不变）。
+
+**门禁改指向（实测）**：
+- `check-fat32-ports` → `kernel/src/ktests/fs.rs`（端口常量/want 表/feature/锚点）；
+  `elfload: magic=` 在 `ktests/elf.rs`，锚点检查同时读两个文件；宿主机注入名"不得出现"的扫描
+  从 main.rs 换成 fs.rs（强度不变）。
+- `check-virtio-pattern` → `kernel/src/ktests/virtio.rs`。
+- `check-net-pattern` **本来就不读 main.rs**（读 `kernel/src/virtio.rs`），未改。
+- 变异证红各一次（终端原文在会话记录）：fs 的 `FAT_PORT_A` 3→2 ⇒ `[FAIL] check-fat32-ports`
+  "内核用口 2"；virtio 的 `EXPECT_PATTERN` 0x5C→0x5A ⇒ `[FAIL] check-virtio-pattern`
+  "内核 0x5A，aurora.py 0x5C"；elf.rs 的 `elfload: magic=` 改名 ⇒ `[FAIL] check-fat32-ports`
+  "串口锚点不在 ktests/fs.rs 或 ktests/elf.rs 里了"。还原后各自 `[ ok ]`。
+
+**unsafe 登记（实测）**：总数与类别合计不变（278 = U1 53 / U2 60 / U3 13 / U4 103 / U5 28 / U6 21）。
+`main` 只剩 U4=3（MpCell/mp_store/mp_snapshot）；拆出：
+`ktests/acpi` U6 1、`ktests/crash` U6 1、`ktests/elf` U4 2、`ktests/fs` U4 1/U6 3、
+`ktests/heap` U6 6、`ktests/mm` U6 3、`ktests/sched` U1 3/U6 3、`ktests/sign` U4 2、`ktests/user` U6 1。
+`unsafe-census.md` 的逐处章节与六条分布行已按 `unsafe_sites()` 重生成；汇总行不变。
+
+**验收变异（实测）**：
+- F1：`t_hhdm_is_canonical_and_below_kernel` 的返回式加 `&& false` ⇒ `[FAIL] t_hhdm…`、
+  `ktests: total=53 passed=52 failed=1`、判定 FAIL(35)（正向行红）；还原后 PASS。
+- F2：删掉 `KT_NEG` 的 cfg+注册（连同 `#[cfg]`，否则属性悬空编不过）⇒ `ktests total=53 passed=53`、
+  判定 PASS(33)（"负样本"行期望 FAIL(35) ⇒ 红）；还原后 `total=54 passed=53 failed=1`、FAIL(35)。
+
+**未归因/欠账（推断）**：
+- 长链取证中偶发整跑 HANG（三次矩阵各一次、改后逐变体一次；落在不同行）。同命令隔离复跑
+  多为正常（`fat32-exec+fault-fat32-tail` 21+ 次 FAIL(35)、Safe 序列 6/6 PASS、`ahci-scratch`
+  复跑 PASS）。**不归因**：宿主负载与既有等待窗口都可能；没有把它写成"已修"。
+- `kernel/src/acpi.rs` 与 `kernel/src/sched.rs` 各有一条注释仍指向 main.rs（纯搬移不改注释）。
+- 未验证：真机、KVM；本轮不动任何被测实现语义（除用例自足代码）。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

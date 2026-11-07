@@ -248,7 +248,7 @@ VBLK_PATTERN = 0x5C
 VBLK_FEATURES = {"virtio-blk", "virtio-msix-probe"}
 
 # L3-C①：两块只读 FAT32 卷，挂在 AHCI 的口 3 与口 4。这两个数不是一串参数而是一张**对账表**：
-# 内核 `main.rs` 里写死 `FAT_PORT_A`/`FAT_PORT_B`，宿主机写死在下面的 `FAT_PORTS`，两边由门禁
+# 内核 `ktests/fs.rs` 里写死 `FAT_PORT_A`/`FAT_PORT_B`，宿主机写死在下面的 `FAT_PORTS`，两边由门禁
 # `check-fat32-ports` 比着（同 `check-driver-ctx` 与 DEBUGEXIT_PORT 那条的形状）。
 # 为什么宿主机也要自己解析一遍这两块卷：内核读回来的每一个数（簇数、首簇的高/低半、走字节、
 # FNV）目前只有解析器自己一张嘴。夹具、内核解析、宿主机解析是三方，任何两方一致才叫数。
@@ -277,7 +277,7 @@ FAT_PORTS = {3: "fat32-small", 4: "fat32-wide"}
 # 内核声明"要读哪几个文件"。这张表有两个用处，缺一不可：
 # 1 宿主机这台仪器只走这几个名字的链——卷B 上那个 34,603,008 字节的 FILLER.BIN 没有任何
 #   一条判据读它，跟着算哈希会让对账先挂死（本轮实测：一次 3,400 万次的逐字节循环）。
-# 2 门禁 `check-fat32-ports` 拿它与 main.rs 里那两个 `want` 表逐名对账 ⇒ 用例读的名字与
+# 2 门禁 `check-fat32-ports` 拿它与 ktests/fs.rs 里那两个 `want` 表逐名对账 ⇒ 用例读的名字与
 #   仪器核的名字不可能各走各的（"对账核的是另一个文件"这种绿是没有意义的绿）。
 FAT_READ_NAMES = {
     "A": ("HELLO.ELF", "NOTES", "SMALL.BIN"),
@@ -718,7 +718,7 @@ def check_fat32_mem(log: str) -> list[str]:
     if not dirm:
         return bad + ["串口没有 `fat32-mem: 目录 …` 那一行"]
     got_stats = {m.group("name"): m for m in FAT_MEM_STAT_RE.finditer(dirm.group("body"))}
-    # 用例查的三个名字（`FAT_READ_NAMES["MEM"]`，与 main.rs 的 `vol.open(...)` 由门禁对账）。
+    # 用例查的三个名字（`FAT_READ_NAMES["MEM"]`，与 ktests/fs.rs 的 `vol.open(...)` 由门禁对账）。
     # `?LD.TXT` 里那个问号不是笔误：配方把首字节写成 0x05（删除标记），于是盘上第一位的那个
     # `O` 已经不在了，两台实现都只能按规范把它读成 '?'——上一轮这里查 `?OLD.TXT`，红在 NoEntry。
     for want_name in FAT_READ_NAMES["MEM"]:
@@ -1324,11 +1324,11 @@ def check_fat32_ports() -> list[str]:
     任何一处断了，红都发生在跑之前，而不是跑完之后没人知道少了什么。
     """
     bad: list[str] = []
-    src = (ROOT / "kernel" / "src" / "main.rs").read_text(encoding="utf-8")
+    src = (ROOT / "kernel" / "src" / "ktests" / "fs.rs").read_text(encoding="utf-8")
     for tag, const in (("卷A", "FAT_PORT_A"), ("卷B", "FAT_PORT_B")):
         m = re.search(rf"const {const}: u8 = (\d+);", src)
         if m is None:
-            bad.append(f"main.rs 里找不到模块层的 `const {const}`（挪回函数体里了？③ 也要读同一块盘，两处各写一份就会分家）")
+            bad.append(f"ktests/fs.rs 里找不到模块层的 `const {const}`（挪回函数体里了？③ 也要读同一块盘，两处各写一份就会分家）")
             continue
         port = int(m.group(1))
         if port not in FAT_PORTS:
@@ -1360,11 +1360,11 @@ def check_fat32_ports() -> list[str]:
         deps = re.findall(r'"([^"]+)"', m.group(1)) if m else []
         if "fat32-probe" not in deps:
             bad.append(f"{f} 必须依赖 fat32-probe（否则它是没有探针的孤儿用例），实际={deps}")
-    # 探针与 ③ 的代码在 `main.rs`（用例本体），注入的落点在 `fat32.rs`（被测代码里那一行）。
+    # 探针与 ③ 的代码在 `ktests/fs.rs`（用例本体），注入的落点在 `fat32.rs`（被测代码里那一行）。
     # 两条查法不能互换：注入特性不新写用例，只把解析器里那个 `cfg!` 翻开。
     for f in sorted(FAT_DISK_FEATURES):
         if f'feature = "{f}"' not in src:
-            bad.append(f'main.rs 里没有 `feature = "{f}"`：这条特性编不出被调用的用例')
+            bad.append(f'ktests/fs.rs 里没有 `feature = "{f}"`：这条特性编不出被调用的用例')
     fat_src = (ROOT / "kernel" / "src" / "filesystem" / "fat32.rs").read_text(encoding="utf-8")
     for f in sorted(FAT_FAULT_FEATURES):
         if f'feature = "{f}"' not in fat_src:
@@ -1377,7 +1377,7 @@ def check_fat32_ports() -> list[str]:
         if re.search(rf"^{f} = ", feats, re.M):
             bad.append(f"Cargo.toml 里有 {f}：宿主机侧注入不该是构建变量（改了它 ELF 就变了，"
                        "「只有盘不同」这句话就不再成立）")
-        for rel, text in (("kernel/src/main.rs", src), ("kernel/src/filesystem/fat32.rs", fat_src)):
+        for rel, text in (("kernel/src/ktests/fs.rs", src), ("kernel/src/filesystem/fat32.rs", fat_src)):
             if f'feature = "{f}"' in text:
                 bad.append(f"{rel} 里出现了 `feature = \"{f}\"`：这是宿主机侧注入，内核不该有落点")
         if FAT_HOST_FAULTS[f] not in set(FAT_PORTS.values()):
@@ -1400,7 +1400,7 @@ def check_fat32_ports() -> list[str]:
     want_names = re.findall(r'Want \{ name: "([^"]+)"', src)
     declared = list(FAT_READ_NAMES["A"] + FAT_READ_NAMES["B"])
     if want_names != declared:
-        bad.append(f"main.rs 的 want 表读的名字是 {want_names}，本脚本 FAT_READ_NAMES 核的是 {declared}")
+        bad.append(f"ktests/fs.rs 的 want 表读的名字是 {want_names}，本脚本 FAT_READ_NAMES 核的是 {declared}")
     for n in FAT_READ_NAMES["MEM"]:
         if f'vol.open("{n}")' not in src:
             bad.append(f'内存卷那一本账里没有 `vol.open("{n}")`：这张表核的名字用例不查它')
@@ -1408,12 +1408,15 @@ def check_fat32_ports() -> list[str]:
     # 锚点写坏了的表现是"这一行没读到"而不是"对账不符"，所以要静态确认锚点还在源码里。
     if 'vol.open("HELLO.ELF")' not in src:
         bad.append('③ 没有 `vol.open("HELLO.ELF")`：它读的名字与 FAT_READ_NAMES 不是同一个对象')
+    # T0.1：`elfload: magic=` 这句在 `t_elf_load_run`（ktests/elf.rs），其余在 ktests/fs.rs。
+    # 锚点必须去它实际所在的那个文件找；只改读的文件、不改判据强度。
+    elf_src = (ROOT / "kernel" / "src" / "ktests" / "elf.rs").read_text(encoding="utf-8")
     for anchor in ("elfdisk: 目录 大小=", "elfdisk: 段", "elfdisk: 跑后 entry=",
                    "elfdisk: 负格 元数据说大=", "| 收尾 终止=", "elfload: magic=",
                    "elfdisk: 尾格溢出 已喂=", "elfdisk: 判据 同长=",
                    "fat32: 判据 引导盘被拒=", "读不成 {:?}"):
-        if anchor not in src:
-            bad.append(f"串口锚点 `{anchor}` 不在 main.rs 里了：`check_fat32_exec` 的那条正则读成空，"
+        if anchor not in src and anchor not in elf_src:
+            bad.append(f"串口锚点 `{anchor}` 不在 ktests/fs.rs 或 ktests/elf.rs 里了：`check_fat32_exec` 的那条正则读成空，"
                        "第 36 行会报缺行而不是报不符（改日志格式要两处一起改）")
     # 第 39 行的证人读的是 `ChainEndsLate` 的 **Debug 字段序**（bytes/size/cluster/next）。
     # 那个序在 fat32.rs 的枚举声明里，改它等于改串口原文 ⇒ 正则读成空、报"缺行"而不是"不符"。
@@ -2617,10 +2620,10 @@ def check_virtio_pattern() -> list[str]:
     没有这道对账，那条判据会**当场红一次**（红是对的方向），但更常见的情节是有人为了让它绿
     去改其中一边，从此这条判据只在"两边一起改"时才红，而那是它唯一不需要证明的事。
     """
-    rs = (ROOT / "kernel" / "src" / "main.rs").read_text(encoding="utf-8")
+    rs = (ROOT / "kernel" / "src" / "ktests" / "virtio.rs").read_text(encoding="utf-8")
     m = re.search(r"const EXPECT_PATTERN: u8 = 0x([0-9A-Fa-f]{2})", rs)
     if m is None:
-        return ["内核侧没找到 EXPECT_PATTERN（改名了？用例在 virtio-blk 变体里，常量必须留在 main.rs）"]
+        return ["内核侧没找到 EXPECT_PATTERN（改名了？用例在 virtio-blk 变体里，常量必须留在 ktests/virtio.rs）"]
     if int(m.group(1), 16) != VBLK_PATTERN:
         return [f"夹具图案字节不一致：内核 0x{int(m.group(1), 16):02X}，aurora.py 0x{VBLK_PATTERN:02X}"]
     return []
@@ -3224,7 +3227,7 @@ def crash_cross(log1: str, log2: str) -> tuple[bool, bool, bool]:
 # 第 21 行的第二台仪器：内核只交出**地址**，"这个地址属于哪个函数"由 ELF 符号表说。
 # 两个期望写成模块路径，尾部由 _mangle_tail 现算 —— 手写 mangled 长度是本机错过的那一类数。
 OOPS_FRAMES_FNS = (
-    ("aurora_kernel", "t_crash_oops"),   # 出事那一帧：必须落在故意越界的那个函数里
+    ("aurora_kernel", "ktests", "crash", "t_crash_oops"),   # T0.1 搬进 ktests/crash 出事那一帧：必须落在故意越界的那个函数里
     ("aurora_kernel", "ktest", "run_all"),  # 它的调用者：用例就是被运行器调进去的
 )
 

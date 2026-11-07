@@ -10,13 +10,13 @@
 
 [crate.aurora-kernel]
 reason = "垂直切片阶段整个内核就是一个二进制 crate，异常桩/描述符表/端口 I/O 都在里面"
-scope = "arch/x86_64/trap.rs(asm+描述符+CR2) · serial.rs(端口) · limine.rs(启动信息指针转引用) · arch/x86_64/cpuid.rs · main.rs(read_volatile)"
+scope = "arch/x86_64/trap.rs(asm+描述符+CR2) · serial.rs(端口) · limine.rs(启动信息指针转引用) · arch/x86_64/cpuid.rs · main.rs(启动期 UnsafeCell)"
 # 2026-11-06 那一刀：`trap/apic/smp/cpu/cpuid` 已从 kernel/src/ 平铺移进 kernel/src/arch/x86_64/（BACKLOG 77）。
 # 下面两行里的裸名字（trap/cpu/apic/smp…）指的是**模块名**，不是文件路径；门禁按包计数，路径变化不影响它，但引用这些文件时请用新路径。
 # M4-2 之后这条 scope 已经**不再完整**（sched/sync/apic/mm/cpu/smp/user/tsc 也都有 unsafe），
 # 而门禁是按包计数的，所以这行写漏不会让检查失败——那正是它该被写全的理由。
 # 逐包拆分之前，先把"这个包里 unsafe 集中在哪几类"说明白，而不是留一份 M1 时代的清单。
-scope_actual = "asm 全局符号与异常桩(trap/sched/cpu) · 描述符表与 CR4/CR3(trap/cpu/mm) · 端口与 MMIO(serial/apic) · 页表遍历(mm) · per-CPU 静态区的裸指针读写(sched/sync/resource/smp/user/cpu) · 内联 asm 的取指/STAC-CLAC(user) · ktest 里的现场读回(main) · 句柄表里那一段连续物理内存的 volatile 字节/双字访问与 `UnsafeCell` 表(driver) · 驱动静态区取句柄(ahci，只剩 5 处，全部是拿句柄不是拿指针) · 崩溃现场的有界栈走(crash：两处 read_volatile，每处都先过「8 字节对齐 + 内核半区 + 已映射」三关，读回来的值只进记录、不解引用、不参与控制流)"
+scope_actual = "asm 全局符号与异常桩(trap/sched/cpu) · 描述符表与 CR4/CR3(trap/cpu/mm) · 端口与 MMIO(serial/apic) · 页表遍历(mm) · per-CPU 静态区的裸指针读写(sched/sync/resource/smp/user/cpu) · 内联 asm 的取指/STAC-CLAC(user) · ktest 里的现场读回(main 与 ktests/*) · 句柄表里那一段连续物理内存的 volatile 字节/双字访问与 `UnsafeCell` 表(driver) · 驱动静态区取句柄(ahci，只剩 5 处，全部是拿句柄不是拿指针) · 崩溃现场的有界栈走(crash：两处 read_volatile，每处都先过「8 字节对齐 + 内核半区 + 已映射」三关，读回来的值只进记录、不解引用、不参与控制流)"
 expires = "M2：按 §2.5 拆出 aurora-arch / aurora-hw / aurora-mm-core 后，本条改为逐 crate 登记"
 
 # M4-2：第一个用户程序（测试夹具）。它的 unsafe 只有两类，都写在源码注释里。
@@ -97,14 +97,43 @@ U4 = 9
 [modules."ktest"]
 U6 = 1
 
+[modules."ktests/acpi"]
+U6 = 1
+
+[modules."ktests/crash"]
+U6 = 1
+
+[modules."ktests/elf"]
+U4 = 2
+
+[modules."ktests/fs"]
+U4 = 1
+U6 = 3
+
+[modules."ktests/heap"]
+U6 = 6
+
+[modules."ktests/mm"]
+U6 = 3
+
+[modules."ktests/sched"]
+U1 = 3
+U6 = 3
+
+[modules."ktests/sign"]
+U4 = 2
+
+[modules."ktests/user"]
+U6 = 1
+
 [modules."limine"]
 U2 = 10
 U3 = 4
 
+# T0.1（2026-11-07）：用例搬进 kernel/src/ktests/*.rs，main 只剩启动路径的 3 处 U4；
+# 原 U1 3 / U6 18 按实际落点拆到 ktests/sched 与各用例模块。总数与类别合计不变。
 [modules."main"]
-U1 = 3
-U4 = 8
-U6 = 18
+U4 = 3
 
 [modules."mm"]
 U1 = 2

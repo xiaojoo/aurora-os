@@ -9,12 +9,12 @@
 
 ## 类别
 
-- **U1 架构入口与特殊寄存器** — 53 处，分布在 13 个模块：arch/x86_64/apic、arch/x86_64/cpu、arch/x86_64/smp、arch/x86_64/trap、hw、main、mm、sched、serial、sync、tsc、user、user/hello
+- **U1 架构入口与特殊寄存器** — 53 处，分布在 13 个模块：arch/x86_64/apic、arch/x86_64/cpu、arch/x86_64/smp、arch/x86_64/trap、hw、ktests/sched、mm、sched、serial、sync、tsc、user、user/hello
 - **U2 页表、物理内存与 MMIO** — 60 处，分布在 10 个模块：acpi、arch/x86_64/apic、arch/x86_64/trap、heap、hw、limine、mm、pci、sched、user
 - **U3 DMA 与设备共享内存** — 13 处，分布在 2 个模块：driver、limine
-- **U4 并发共享状态与 UnsafeCell** — 103 处，分布在 14 个模块：acpi、ahci、arch/x86_64/apic、arch/x86_64/smp、arch/x86_64/trap、driver、irq、main、mm、pci、sched、sync、user、virtio
+- **U4 并发共享状态与 UnsafeCell** — 103 处，分布在 17 个模块：acpi、ahci、arch/x86_64/apic、arch/x86_64/smp、arch/x86_64/trap、driver、irq、ktests/elf、ktests/fs、ktests/sign、main、mm、pci、sched、sync、user、virtio
 - **U5 用户指针与地址空间访问** — 28 处，分布在 2 个模块：user、user/hello
-- **U6 诊断路径的有限现场读取** — 21 处，分布在 3 个模块：crash、ktest、main
+- **U6 诊断路径的有限现场读取** — 21 处，分布在 9 个模块：crash、ktest、ktests/acpi、ktests/crash、ktests/fs、ktests/heap、ktests/mm、ktests/sched、ktests/user
 
 ## 口径
 
@@ -27,7 +27,7 @@
 ## 逐处
 
 
-### acpi
+acpi
 
 - `kernel/src/acpi.rs:188` [impl] **U4** fn=`ioapic_for`
   > unsafe impl Sync for SumCellSync {} static SUM_CELL: SumCellSync = SumCellSync(UnsafeCell::new(SumCell { inner: None })); 
@@ -44,7 +44,8 @@
 - `kernel/src/acpi.rs:630` [{] **U4** fn=`table`
   > unsafe { (*REFS.0.get())[i] } } 
 
-### ahci
+
+ahci
 
 - `kernel/src/ahci.rs:307` [impl] **U4** fn=`—`
   > unsafe impl Sync for RingCell {} static RING: RingCell = RingCell(UnsafeCell::new(None)); 
@@ -65,7 +66,8 @@
 - `kernel/src/ahci.rs:1102` [{] **U4** fn=`init`
   > unsafe { *RING.0.get() = Some(Ring { ctx, mmio, dma, info }) }; fill(0, 0xEE, RING_PAGES * mm::PAGE)?; Ok(info)
 
-### arch/x86_64/apic
+
+arch/x86_64/apic
 
 - `kernel/src/arch/x86_64/apic.rs:262` [{] **U4** fn=`state`
   > unsafe { *STATE_COPY.0.get() } } else { None
@@ -86,7 +88,8 @@
 - `kernel/src/arch/x86_64/apic.rs:628` [{] **U1** fn=`with_interrupts`
   > unsafe { core::arch::asm!("cli", options(nomem, nostack)) }; CPU_IF[slot].store(false, Ordering::Release); r
 
-### arch/x86_64/cpu
+
+arch/x86_64/cpu
 
 - `kernel/src/arch/x86_64/cpu.rs:51` [{] **U1** fn=`enable_user_protections`
   > unsafe { core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, preserves_flags)); // 只加要加的位，绝不整份覆盖：bootloader/QEMU 可能已经放了别的位（PAE 之类）
@@ -99,7 +102,8 @@
 - `kernel/src/arch/x86_64/cpu.rs:114` [{] **U1** fn=`clear_smap_for_test`
   > unsafe { let mut v: u64; core::arch::asm!("mov {}, cr4", out(reg) v, options(nomem, preserves_flags));
 
-### arch/x86_64/smp
+
+arch/x86_64/smp
 
 - `kernel/src/arch/x86_64/smp.rs:47` [impl] **U4** fn=`—`
   > unsafe impl Sync for ApBootCell {} static AP_ARGS: [ApBootCell; cpu::MAX_CPUS] = [const { ApBootCell(UnsafeCell::new(ApBoot { stack_top: 0, slot: 0, expect_lapic: 0 })) }
@@ -126,7 +130,8 @@
 - `kernel/src/arch/x86_64/smp.rs:776` [{] **U4** fn=`run_phase`
   > let observed = unsafe { core::ptr::read_volatile(RACE.0.get()) }; let expected = (aps.len() as u64 + 1) * RACE_ROUNDS; // 少的那一部分就是被并发覆盖掉的更新
 
-### arch/x86_64/trap
+
+arch/x86_64/trap
 
 - `kernel/src/arch/x86_64/trap.rs:126` [{] **U4** fn=`tss_offsets`
   > unsafe { let base = core::ptr::addr_of_mut!((*TABLES[slot].0.get()).tss) as *const u8; Some((
@@ -175,14 +180,16 @@
 - `kernel/src/arch/x86_64/trap.rs:1687` [{] **U1** fn=`handler_count_distinct`
   > seen[i] = unsafe { isr_table[i] }; } let mut n = 0;
 
-### crash
+
+crash
 
 - `kernel/src/crash.rs:132` [{] **U6** fn=`walk_frames`
   > let next = unsafe { (fp as *const u64).read_volatile() }; // SAFETY: 同上，偏移在同一个已映射的帧内（rbp 指向帧头，+8 不会越出这一页的 //        可能性由下面的 `next` 自检兜住：拿回来的"链"必须是内核半区的对齐地址）
 - `kernel/src/crash.rs:135` [{] **U6** fn=`walk_frames`
   > let ret = unsafe { ((fp + 8) as *const u64).read_volatile() }; // 先记这一帧，再决定要不要往上走：这一层帧的返回地址是有效的，即使它的上一帧 // 的链断了。反过来（先验 `next` 再记）会把最后那一帧丢掉 —— 第一版就是这么少的一个帧
 
-### driver
+
+driver
 
 - `kernel/src/driver.rs:126` [impl] **U4** fn=`—`
   > unsafe impl Sync for TableCell {} static TABLE: TableCell = TableCell(UnsafeCell::new(Table::empty())); 
@@ -221,7 +228,8 @@
 - `kernel/src/driver.rs:520` [{] **U4** fn=`mmio_gen_at`
   > unsafe { &*TABLE.0.get() }.mmio[usize::from(slot)].as_ref().map(|e| e.gen) }
 
-### heap
+
+heap
 
 - `kernel/src/heap.rs:228` [{] **U2** fn=`try_alloc`
   > st.free[ci] = unsafe { *(p as *const usize) }; st.live_slots[ci] += 1; drop(g);
@@ -238,7 +246,8 @@
 - `kernel/src/heap.rs:312` [{] **U2** fn=`force_reentrant_lock_for_test`
   > if !unsafe { dealloc_small(ptr, layout.size()) } { crate::log_fatal!("L4: dealloc 参数无法归入任何大小类 size={} ptr={:p}", layout.size(), ptr); crate::exit::finish(crate::exit::Cod
 
-### hw
+
+hw
 
 - `kernel/src/hw.rs:58` [{] **U2** fn=`—`
   > Ok(unsafe { core::ptr::read_volatile((self.base() + off as u64) as *const u8) }) } 
@@ -257,7 +266,8 @@
 - `kernel/src/hw.rs:107` [{] **U1** fn=`inl`
   > unsafe { core::arch::asm!("in eax, dx", in("dx") port, out("eax") v, options(nomem, nostack, preserves_flags)) }
 
-### irq
+
+irq
 
 - `kernel/src/irq.rs:109` [impl] **U4** fn=`—`
   > unsafe impl Sync for TableCell {} static TABLE: TableCell = TableCell(UnsafeCell::new(Table::empty())); /// 落进这张表之外的那几发（向量没有主人）。它是"分配与编程两边不一致"的证人。
@@ -278,12 +288,93 @@
 - `kernel/src/irq.rs:288` [{] **U4** fn=`dispatch`
   > let ran = unsafe { let t = &*TABLE.0.get(); match t.slots[vector - VEC_FIRST].as_ref() {
 
-### ktest
+
+ktest
 
 - `kernel/src/ktest.rs:56` [{] **U6** fn=`run_all`
   > let tests = unsafe { core::slice::from_raw_parts(start as *const KTest, bytes / size) };  let mut passed = 0usize;
 
-### limine
+
+### ktests/acpi
+
+- `kernel/src/ktests/acpi.rs:33` [{] **U6** fn=`t_rsdp_signature_at_virtual_addr`
+  > let got = unsafe { core::ptr::read_volatile((raw as *const u8).add(i)) }; if got != SIG[i] { crate::log_fatal!("rsdp signature mismatch at byte {}: got {:#02x} want {:#02x}", i, got, SIG[i]); 
+
+### ktests/crash
+
+- `kernel/src/ktests/crash.rs:232` [{] **U6** fn=`t_crash_oops`
+  > let v = unsafe { (BAD as *const u64).read_volatile() }; crate::log_fatal!("oops: 没有发生故障，读到 {:#x} ⇒ 这条构建没在量它声称的东西", v); false 
+
+### ktests/elf
+
+- `kernel/src/ktests/elf.rs:21` [impl] **U4** fn=`—`
+  > unsafe impl Sync for ElfScratch {} static ELF_BUF: ElfScratch = ElfScratch(UnsafeCell::new([0u8; ELF_SCRATCH]));  
+- `kernel/src/ktests/elf.rs:34` [{] **U4** fn=`with_elf_copy`
+  > let buf = unsafe { &mut *ELF_BUF.0.get() }; buf[..n].copy_from_slice(HELLO_ELF); Some(f(&mut buf[..n])) 
+
+### ktests/fs
+
+- `kernel/src/ktests/fs.rs:546` [impl] **U4** fn=`t_fat32_mem`
+  > unsafe impl Sync for ElfDiskScratch {} #[cfg(feature = "fat32-exec")] static ELF_DISK: ElfDiskScratch = ElfDiskScratch(UnsafeCell::new([0u8; ELF_DISK_MAX])); 
+- `kernel/src/ktests/fs.rs:633` [{] **U6** fn=`t_fat32_exec`
+  > unsafe { let buf = &mut *dst; buf[fed..fed + chunk.len()].copy_from_slice(chunk); 
+- `kernel/src/ktests/fs.rs:643` [{] **U6** fn=`t_fat32_exec`
+  > let head = unsafe { (*dst).as_ptr() }; (w, unsafe { core::slice::from_raw_parts(head, size) }) } 
+- `kernel/src/ktests/fs.rs:644` [{] **U6** fn=`t_fat32_exec`
+  > (w, unsafe { core::slice::from_raw_parts(head, size) }) } Err(e) => { 
+
+### ktests/heap
+
+- `kernel/src/ktests/heap.rs:43` [{] **U6** fn=`t_heap_reuses_freed_slot`
+  > unsafe { core::ptr::write_bytes(p, 0x5a, 100) }; // SAFETY: 同一槽位归还 unsafe { 
+- `kernel/src/ktests/heap.rs:45` [{] **U6** fn=`t_heap_reuses_freed_slot`
+  > unsafe { if !heap::dealloc_small(p, 100) { return false; 
+- `kernel/src/ktests/heap.rs:102` [{] **U6** fn=`t_heap_slots_are_mapped`
+  > unsafe { core::ptr::write_volatile(p, 0x4c); core::ptr::write_volatile(p.add(cls - 1), 0x7a); 
+- `kernel/src/ktests/heap.rs:107` [{] **U6** fn=`t_heap_slots_are_mapped`
+  > let head_ok = unsafe { core::ptr::read_volatile(p) } == 0x4c; let tail_ok = unsafe { core::ptr::read_volatile(p.add(cls - 1)) } == 0x7a; if !(head_ok && tail_ok) { 
+- `kernel/src/ktests/heap.rs:108` [{] **U6** fn=`t_heap_slots_are_mapped`
+  > let tail_ok = unsafe { core::ptr::read_volatile(p.add(cls - 1)) } == 0x7a; if !(head_ok && tail_ok) { crate::log_fatal!("heap slot {:#x} read-back wrong", p as usize); 
+- `kernel/src/ktests/heap.rs:122` [{] **U6** fn=`t_heap_slots_are_mapped`
+  > unsafe { if !heap::dealloc_small(p, cls) { return false; 
+
+### ktests/mm
+
+- `kernel/src/ktests/mm.rs:26` [{] **U6** fn=`t_alloc_free_returns_frames`
+  > let v = unsafe { core::ptr::read_volatile(p as *const u8) }; v == 0xa5 }; 
+- `kernel/src/ktests/mm.rs:59` [{] **U6** fn=`t_map_write_unmap`
+  > unsafe { core::ptr::write_volatile(m.virt().0 as *mut u64, MAGIC) }; // SAFETY: 同上 let got = unsafe { core::ptr::read_volatile(m.virt().0 as *mut u64) }; 
+- `kernel/src/ktests/mm.rs:61` [{] **U6** fn=`t_map_write_unmap`
+  > let got = unsafe { core::ptr::read_volatile(m.virt().0 as *mut u64) }; let mapped_before = mm::is_mapped(m.virt().0); let after_alloc = mm::free_frames(); 
+
+### ktests/sched
+
+- `kernel/src/ktests/sched.rs:377` [{] **U6** fn=`t_if_patch_both_branches`
+  > unsafe { core::ptr::addr_of!((*f.as_ptr()).rflags) as u64 - base } }; let size_ok = core::mem::size_of::<trap::TrapFrame>() == 23 * 8; 
+- `kernel/src/ktests/sched.rs:387` [{] **U1** fn=`t_if_patch_both_branches`
+  > unsafe { sched::if_patch(words.as_mut_ptr() as u64, 1) }; let opened = words[20]; // SAFETY: 同上 
+- `kernel/src/ktests/sched.rs:390` [{] **U1** fn=`t_if_patch_both_branches`
+  > unsafe { sched::if_patch(words.as_mut_ptr() as u64, 0) }; let closed = words[20]; // 另外还要确认"置位"这条分支幂等，且不会顺手清掉别的位 
+- `kernel/src/ktests/sched.rs:395` [{] **U1** fn=`t_if_patch_both_branches`
+  > unsafe { sched::if_patch(words.as_mut_ptr() as u64, 1) }; let idempotent = words[20]; let untouched = words 
+- `kernel/src/ktests/sched.rs:572` [{] **U6** fn=`t_tlb_shootdown`
+  > unsafe { core::ptr::write_volatile(win.0 as *mut u64, 0x5a5a_5a5a_5a5a_5a5a) }; let written = unsafe { core::ptr::read_volatile(win.0 as *const u64) }; drop(m); 
+- `kernel/src/ktests/sched.rs:573` [{] **U6** fn=`t_tlb_shootdown`
+  > let written = unsafe { core::ptr::read_volatile(win.0 as *const u64) }; drop(m); let after = mm::shootdown_stats(); 
+
+### ktests/sign
+
+- `kernel/src/ktests/sign.rs:84` [impl] **U4** fn=`t_sha256`
+  > unsafe impl Sync for PkgScratch {} #[cfg(feature = "sig-check")] static PKG_BUF: PkgScratch = PkgScratch(UnsafeCell::new([0u8; sign::PKG_BYTES])); 
+- `kernel/src/ktests/sign.rs:109` [{] **U4** fn=`t_sig_package`
+  > let buf = unsafe { &mut *PKG_BUF.0.get() }; let mut off = 0usize; let mut reads = 0usize; 
+
+### ktests/user
+
+- `kernel/src/ktests/user.rs:141` [{] **U6** fn=`t_user_roundtrip`
+  > let w = unsafe { [ core::ptr::read_volatile(f as *const u64), 
+
+limine
 
 - `kernel/src/limine.rs:116` [fn] **U2** fn=`response`
   > unsafe fn response<T>(p: &AtomicPtr<T>) -> Option<&T> { // SAFETY: 由本函数的调用约定保证（见函数文档） unsafe { p.load(Ordering::Relaxed).cast_const().as_ref() }
@@ -314,68 +405,17 @@
 - `kernel/src/limine.rs:391` [{] **U2** fn=`collect`
   > let mmap_entries = unsafe { memmap_slice(memmap) }; Some(BootInfo { hhdm_offset: hhdm.offset, mmap_entries, rsdp, bootloader_name, mp }) }
 
+
 ### main
 
-- `kernel/src/main.rs:62` [impl] **U4** fn=`—`
-  > unsafe impl Sync for MpCell {} static MP_SNAP: MpCell = MpCell(UnsafeCell::new(MpSlot(None))); 
-- `kernel/src/main.rs:68` [{] **U4** fn=`mp_store`
-  > unsafe { (*MP_SNAP.0.get()) = MpSlot(Some(m)) }; } 
-- `kernel/src/main.rs:73` [{] **U4** fn=`mp_snapshot`
-  > unsafe { (*MP_SNAP.0.get()).0 } } 
-- `kernel/src/main.rs:563` [{] **U6** fn=`t_rsdp_signature_at_virtual_addr`
-  > let got = unsafe { core::ptr::read_volatile((raw as *const u8).add(i)) }; if got != SIG[i] { crate::log_fatal!("rsdp signature mismatch at byte {}: got {:#02x} want {:#02
-- `kernel/src/main.rs:619` [{] **U6** fn=`t_alloc_free_returns_frames`
-  > let v = unsafe { core::ptr::read_volatile(p as *const u8) }; v == 0xa5 };
-- `kernel/src/main.rs:652` [{] **U6** fn=`t_map_write_unmap`
-  > unsafe { core::ptr::write_volatile(m.virt().0 as *mut u64, MAGIC) }; // SAFETY: 同上 let got = unsafe { core::ptr::read_volatile(m.virt().0 as *mut u64) };
-- `kernel/src/main.rs:654` [{] **U6** fn=`t_map_write_unmap`
-  > let got = unsafe { core::ptr::read_volatile(m.virt().0 as *mut u64) }; let mapped_before = mm::is_mapped(m.virt().0); let after_alloc = mm::free_frames();
-- `kernel/src/main.rs:795` [{] **U6** fn=`t_heap_reuses_freed_slot`
-  > unsafe { core::ptr::write_bytes(p, 0x5a, 100) }; // SAFETY: 同一槽位归还 unsafe {
-- `kernel/src/main.rs:797` [{] **U6** fn=`t_heap_reuses_freed_slot`
-  > unsafe { if !heap::dealloc_small(p, 100) { return false;
-- `kernel/src/main.rs:854` [{] **U6** fn=`t_heap_slots_are_mapped`
-  > unsafe { core::ptr::write_volatile(p, 0x4c); core::ptr::write_volatile(p.add(cls - 1), 0x7a);
-- `kernel/src/main.rs:859` [{] **U6** fn=`t_heap_slots_are_mapped`
-  > let head_ok = unsafe { core::ptr::read_volatile(p) } == 0x4c; let tail_ok = unsafe { core::ptr::read_volatile(p.add(cls - 1)) } == 0x7a; if !(head_ok && tail_ok) {
-- `kernel/src/main.rs:860` [{] **U6** fn=`t_heap_slots_are_mapped`
-  > let tail_ok = unsafe { core::ptr::read_volatile(p.add(cls - 1)) } == 0x7a; if !(head_ok && tail_ok) { crate::log_fatal!("heap slot {:#x} read-back wrong", p as usize);
-- `kernel/src/main.rs:874` [{] **U6** fn=`t_heap_slots_are_mapped`
-  > unsafe { if !heap::dealloc_small(p, cls) { return false;
-- `kernel/src/main.rs:1686` [{] **U6** fn=`t_if_patch_both_branches`
-  > unsafe { core::ptr::addr_of!((*f.as_ptr()).rflags) as u64 - base } }; let size_ok = core::mem::size_of::<trap::TrapFrame>() == 23 * 8;
-- `kernel/src/main.rs:1696` [{] **U1** fn=`t_if_patch_both_branches`
-  > unsafe { sched::if_patch(words.as_mut_ptr() as u64, 1) }; let opened = words[20]; // SAFETY: 同上
-- `kernel/src/main.rs:1699` [{] **U1** fn=`t_if_patch_both_branches`
-  > unsafe { sched::if_patch(words.as_mut_ptr() as u64, 0) }; let closed = words[20]; // 另外还要确认"置位"这条分支幂等，且不会顺手清掉别的位
-- `kernel/src/main.rs:1704` [{] **U1** fn=`t_if_patch_both_branches`
-  > unsafe { sched::if_patch(words.as_mut_ptr() as u64, 1) }; let idempotent = words[20]; let untouched = words
-- `kernel/src/main.rs:1881` [{] **U6** fn=`t_tlb_shootdown`
-  > unsafe { core::ptr::write_volatile(win.0 as *mut u64, 0x5a5a_5a5a_5a5a_5a5a) }; let written = unsafe { core::ptr::read_volatile(win.0 as *const u64) }; drop(m);
-- `kernel/src/main.rs:1882` [{] **U6** fn=`t_tlb_shootdown`
-  > let written = unsafe { core::ptr::read_volatile(win.0 as *const u64) }; drop(m); let after = mm::shootdown_stats();
-- `kernel/src/main.rs:2127` [{] **U6** fn=`t_user_roundtrip`
-  > let w = unsafe { [ core::ptr::read_volatile(f as *const u64),
-- `kernel/src/main.rs:2252` [impl] **U4** fn=`t_user_roundtrip`
-  > unsafe impl Sync for ElfScratch {} static ELF_BUF: ElfScratch = ElfScratch(UnsafeCell::new([0u8; ELF_SCRATCH])); 
-- `kernel/src/main.rs:2265` [{] **U4** fn=`with_elf_copy`
-  > let buf = unsafe { &mut *ELF_BUF.0.get() }; buf[..n].copy_from_slice(HELLO_ELF); Some(f(&mut buf[..n]))
-- `kernel/src/main.rs:5655` [impl] **U4** fn=`t_fat32_mem`
-  > unsafe impl Sync for ElfDiskScratch {} #[cfg(feature = "fat32-exec")] static ELF_DISK: ElfDiskScratch = ElfDiskScratch(UnsafeCell::new([0u8; ELF_DISK_MAX]));
-- `kernel/src/main.rs:5742` [{] **U6** fn=`t_fat32_exec`
-  > unsafe { let buf = &mut *dst; buf[fed..fed + chunk.len()].copy_from_slice(chunk);
-- `kernel/src/main.rs:5752` [{] **U6** fn=`t_fat32_exec`
-  > let head = unsafe { (*dst).as_ptr() }; (w, unsafe { core::slice::from_raw_parts(head, size) }) }
-- `kernel/src/main.rs:5753` [{] **U6** fn=`t_fat32_exec`
-  > (w, unsafe { core::slice::from_raw_parts(head, size) }) } Err(e) => {
-- `kernel/src/main.rs:6700` [impl] **U4** fn=`t_sha256`
-  > unsafe impl Sync for PkgScratch {} #[cfg(feature = "sig-check")] static PKG_BUF: PkgScratch = PkgScratch(UnsafeCell::new([0u8; sign::PKG_BYTES]));
-- `kernel/src/main.rs:6725` [{] **U4** fn=`t_sig_package`
-  > let buf = unsafe { &mut *PKG_BUF.0.get() }; let mut off = 0usize; let mut reads = 0usize;
-- `kernel/src/main.rs:7321` [{] **U6** fn=`t_crash_oops`
-  > let v = unsafe { (BAD as *const u64).read_volatile() }; crate::log_fatal!("oops: 没有发生故障，读到 {:#x} ⇒ 这条构建没在量它声称的东西", v); false
+- `kernel/src/main.rs:70` [impl] **U4** fn=`—`
+  > unsafe impl Sync for MpCell {} static MP_SNAP: MpCell = MpCell(UnsafeCell::new(MpSlot(None)));  
+- `kernel/src/main.rs:76` [{] **U4** fn=`mp_store`
+  > unsafe { (*MP_SNAP.0.get()) = MpSlot(Some(m)) }; }  
+- `kernel/src/main.rs:81` [{] **U4** fn=`mp_snapshot`
+  > unsafe { (*MP_SNAP.0.get()).0 } }  
 
-### mm
+mm
 
 - `kernel/src/mm.rs:279` [impl] **U4** fn=`—`
   > unsafe impl Sync for StateCell {}  static S: StateCell = StateCell(UnsafeCell::new(State {
@@ -432,7 +472,8 @@
 - `kernel/src/mm.rs:1479` [{] **U2** fn=`phys_free`
   > unsafe { core::ptr::write_volatile((st.hhdm + base.0 + b) as *mut u8, 0xa5) }; } if !crate::resource::account_free(owner, n) {
 
-### pci
+
+pci
 
 - `kernel/src/pci.rs:51` [impl] **U4** fn=`—`
   > unsafe impl Sync for TableCell {} static TABLE: TableCell = TableCell(UnsafeCell::new(None)); 
@@ -455,7 +496,8 @@
 - `kernel/src/pci.rs:214` [{] **U2** fn=`ecam_class`
   > unsafe { core::ptr::read_volatile((va + o) as *const u32) } } None => 0,
 
-### sched
+
+sched
 
 - `kernel/src/sched.rs:332` [impl] **U4** fn=`reap`
   > unsafe impl Sync for QueueCell {} static RQ: [QueueCell; crate::arch::x86_64::cpu::MAX_CPUS] = [const { QueueCell(core::cell::UnsafeCell::new(EMPTY_QUEUE)) }; crate::arch
@@ -490,14 +532,16 @@
 - `kernel/src/sched.rs:1046` [{] **U1** fn=`preempt_point`
   > unsafe { context_load(resume, if_open as u64) } }
 
-### serial
+
+serial
 
 - `kernel/src/serial.rs:23` [{] **U1** fn=`out8`
   > unsafe { core::arch::asm!("out dx, al", in("dx") port, in("al") v, options(nomem, nostack, preserves_flags)) } } 
 - `kernel/src/serial.rs:30` [{] **U1** fn=`in8`
   > unsafe { core::arch::asm!("in al, dx", in("dx") port, out("al") v, options(nomem, nostack, preserves_flags)) }; v }
 
-### sync
+
+sync
 
 - `kernel/src/sync.rs:59` [impl] **U4** fn=`—`
   > unsafe impl<T: Send> Sync for IrqSpinLock<T> {}  #[must_use = "丢弃守卫会立即释放锁，等于什么都没锁（§7.1 R16）"]
@@ -510,12 +554,14 @@
 - `kernel/src/sync.rs:117` [{] **U1** fn=`restore_flags`
   > unsafe { core::arch::asm!("push {r}", "popfq", r = in(reg) f) }; } 
 
-### tsc
+
+tsc
 
 - `kernel/src/tsc.rs:31` [{] **U1** fn=`now`
   > unsafe { core::arch::asm!( "rdtsc",
 
-### user
+
+user
 
 - `kernel/src/user.rs:197` [impl] **U4** fn=`abi_word`
   > unsafe impl Sync for ProgCell {} static PROG_PTR: ProgCell = ProgCell(core::cell::UnsafeCell::new(None)); 
@@ -558,7 +604,8 @@
 - `kernel/src/user.rs:1010` [{] **U2** fn=`load`
   > unsafe { core::ptr::write_volatile(sf.base().via_hhdm().0 as *mut u64, 0) }; let m = mm::map(VirtAddr(stack_va), sf, PageFlags::USER_RW).map_err(LoadError::Mm)?; owned.pu
 
-### virtio
+
+virtio
 
 - `kernel/src/virtio.rs:455` [impl] **U4** fn=`off_in`
   > unsafe impl Sync for DevCell {} static DEV: DevCell = DevCell(core::cell::UnsafeCell::new(None)); 
@@ -581,7 +628,8 @@
 - `kernel/src/virtio.rs:982` [{] **U4** fn=`net_info`
   > unsafe { (*NET_DEV.0.get()).as_ref().map(|d| NetInfo { bdf: d.bdf,
 
-### user/hello
+
+user/hello
 
 - `user/hello/src/main.rs:115` [{] **U1** fn=`stack_base`
   > unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags)) }; rsp & !0xfff }
