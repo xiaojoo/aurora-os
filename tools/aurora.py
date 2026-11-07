@@ -2350,6 +2350,15 @@ def check_unsafe_registry() -> list[str]:
             f"{c} {sum(v for (m, k), v in got.items() if k == c)}" for c in UNSAFE_CLASSES))
         if line not in audit.read_text(encoding="utf-8"):
             bad.append(f"unsafe-census.md 的汇总行与重算不符，应当是：{line}")
+        # 逐处章节标题也要对账。Task A 生成 census 时丢过 `###`，而上面只核汇总行，
+        # 所以那处结构损坏一直没人发现；这里补一条“每个登记模块恰好一个 ### 段”。
+        audit_text = audit.read_text(encoding="utf-8")
+        heads = set(re.findall(r"(?m)^### (.+)$", audit_text))
+        want_heads = set(modules.keys())
+        missing = sorted(want_heads - heads)
+        extra = sorted(heads - want_heads)
+        if missing or extra:
+            bad.append(f"unsafe-census.md 的逐处章节与 [modules] 不符：缺 {missing}，多 {extra}")
     return bad
 
 

@@ -3349,6 +3349,10 @@ exit_current / preempt_point）。`sched::install_arch_hooks()` 在 `after_switc
   `ktests total=53 passed=44 failed=9`，`t_percpu_queues` / `t_if_belongs_to_cpu` 失败；
   还原后 PASS 53/53。证明 hook 表不是没有调用者的空接口。
 
+**顺带补的量具（实测）**：`check-unsafe` 之前只核 census 汇总行；Task A 生成的逐处章节
+丢掉 `###` 标题没被抓住。现已补“每个登记模块恰好一个 `###` 段”的对账；
+负样本删 `### hooks` ⇒ `缺 ['hooks']` 红，还原绿。
+
 **仍未做（推断/欠账）**：
 - 14 模块环只消了这一条 §2.2 forbidden 边；`memory -> sched`、`boot -> sched` 等仍在。
 - §9.2 第二到第五步的 crate 提取；§13 P1/P2 项仍开。
