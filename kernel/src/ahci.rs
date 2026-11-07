@@ -1291,7 +1291,7 @@ pub fn enumerate() -> Result<Enum, AhciError> {
 }
 
 /// FNV-1a 64 位。`tools/aurora.py` 里有一份逐字一样的实现——两台仪器算同一个数。
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+pub const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 /// 逐字节推一步。数据缓冲那条路只能一问一答（缓冲区不交出切片），它必须与

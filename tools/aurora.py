@@ -81,6 +81,12 @@ def kernel_path(features: list[str]) -> Path:
 
 
 def kernel_binary(features: list[str]) -> Path:
+    if FAT_FEATURES & set(features):
+        # 必须在 cargo 之前：`include_bytes!("../fixtures/fat32-mem.img")` 是编译期读的，
+        # 那块文件不在仓库里（配方现算），晚一步就是"构建失败"而不是"夹具不对"。
+        bad = ensure_fat32_mem()
+        if bad:
+            sys.exit("内存夹具卷不成立：" + " / ".join(bad))
     profile = ["--release"] if features == ["release"] else []
     args = [str(CARGO), "build", "--target", TARGET, "-p", "aurora-kernel"]
     if profile:
@@ -241,6 +247,53 @@ VBLK_MIB = 64
 VBLK_PATTERN = 0x5C
 VBLK_FEATURES = {"virtio-blk", "virtio-msix-probe"}
 
+# L3-C①：两块只读 FAT32 卷，挂在 AHCI 的口 3 与口 4。这两个数不是一串参数而是一张**对账表**：
+# 内核 `main.rs` 里写死 `FAT_PORT_A`/`FAT_PORT_B`，宿主机写死在下面的 `FAT_PORTS`，两边由门禁
+# `check-fat32-ports` 比着（同 `check-driver-ctx` 与 DEBUGEXIT_PORT 那条的形状）。
+# 为什么宿主机也要自己解析一遍这两块卷：内核读回来的每一个数（簇数、首簇的高/低半、走字节、
+# FNV）目前只有解析器自己一张嘴。夹具、内核解析、宿主机解析是三方，任何两方一致才叫数。
+# 两个集合分开是有原因的：**带哪条特性都要挂盘**（`FAT_DISK_FEATURES`）与
+# **注入点长在被测代码里**（`FAT_FAULT_FEATURES`）不是同一件事——把两者用一把尺子判，
+# 会把一个正确的设计读成断线（本轮实测踩过一次，见 BACKLOG 78e 最后一条）。
+FAT_DISK_FEATURES = {"fat32-probe", "fat32-exec"}
+FAT_FAULT_FEATURES = {"fault-fat32-tail"}
+FAT_FEATURES = FAT_DISK_FEATURES | FAT_FAULT_FEATURES
+# 卷A 是**阈值判型的反例**（64,496 簇按微软那条经验阈值算 FAT16、按结构算 FAT32）；
+# 卷B 用一个 34,603,008 字节的 FILLER.BIN 把后面三个文件推到 65,536 簇之上，于是目录项的
+# 簇号必须两半拼（只取低半的错法在这里会读到别处，而字节数照样对得上）。角色不能互换。
+FAT_PORTS = {3: "fat32-small", 4: "fat32-wide"}
+# 内核声明"要读哪几个文件"。这张表有两个用处，缺一不可：
+# 1 宿主机这台仪器只走这几个名字的链——卷B 上那个 34,603,008 字节的 FILLER.BIN 没有任何
+#   一条判据读它，跟着算哈希会让对账先挂死（本轮实测：一次 3,400 万次的逐字节循环）。
+# 2 门禁 `check-fat32-ports` 拿它与 main.rs 里那两个 `want` 表逐名对账 ⇒ 用例读的名字与
+#   仪器核的名字不可能各走各的（"对账核的是另一个文件"这种绿是没有意义的绿）。
+FAT_READ_NAMES = {
+    "A": ("HELLO.ELF", "NOTES", "SMALL.BIN"),
+    "B": ("HELLO.ELF", "NOTES", "SMALL.BIN"),
+    # L3-C②：合成卷上内核查的三个名字（LFN 命中项、删除标记项、无扩展名项）
+    "MEM": ("LONG~1.TXT", "?LD.TXT", "NOSHORT"),
+}
+# 与内核 `MAX_CLUSTERS_WALKED` 同一个数：两台实现各自有界，界还必须看得见是同一个界
+FAT_MAX_WALKED = 65_535
+FAT_ZZ = {name: ROOT / "tools" / "fixtures" / f"{name}.img.zz" for name in FAT_PORTS.values()}
+FAT_IMG = {name: BUILD / f"{name}.img" for name in FAT_PORTS.values()}
+# 夹具自己的指纹（字节数 + 解压后的 sha256）。内核那一批写死的期望数全是照着这一对卷量的，
+# 所以哪天卷换了而期望数没跟着换，红会落在解析器身上——可错的是夹具。指纹先于解析判，
+# 就是把"量具换了"和"被测物坏了"分在两道闸上。
+# 存成 `.img.zz` 的理由很实际：`.gitignore` 里 `*.img` 挡的是构建产物，裸卷 32/64 MiB 不该进仓库，
+# 而它们**是**源（配方与 mtools 数值记在 BACKLOG 78）。压缩后 40 KB 与 262 KB，几乎全是零与重复图案。
+FAT_EXPECT = {
+    "fat32-small": (33_554_432, "c06014238a8667357cea68d5131561cccbcd8e78631c9b93aef3d37713548ceb"),
+    "fat32-wide": (67_108_864, "adef0e1c8fcb415b4079ccde01612dbf5707921b4cab7d6f53745bc7ede863c8"),
+}
+# L3-C② 的内存夹具卷：11,264 字节，由 `tools/make_fat32_mem.py` 现算（这块卷**不在仓库里**——
+# `.gitignore` 的 `*.img` 把它挡了，而能被配方重新算出来的东西本来就该不进仓库）。
+# 指纹登记在这里，构建前先跑配方脚本：对不上就是"配方与镜像分家"，红在编译之前，
+# 而不是红在解析器身上（新克隆没有这块卷时同一条路径负责把它造出来）。
+FAT_MEM_OUT = ROOT / "kernel" / "fixtures" / "fat32-mem.img"
+FAT_MEM_SCRIPT = ROOT / "tools" / "make_fat32_mem.py"
+FAT_MEM_EXPECT = (11_264, "3fc538ef44a11f148e42d19ce8432ba9a37ab92b018a6060f4efc6db088d5368")
+
 # M8-a：第一张网卡走 virtio-net（手册 §8.6 里它与 virtio-blk 同列 P1，而且 M5-f② 之后
 # split queue 这条路已经跑通，第二张网卡不该再引入一套新的环布局）。
 # "发出去的字节真的上了线"这句话交给 QEMU 自己的抓包器（`filter-dump` 写 pcap）当第二台仪器：
@@ -369,6 +422,656 @@ def make_scratch() -> list[str]:
     return []
 
 
+def make_fat_volumes() -> list[str]:
+    """把两块夹具卷从仓库里的 zlib 副本解压到 `build/`，并先核自己的指纹。
+
+    与 scratch 那一块的区别：scratch 每次必须重造（写方向的判据要求开局是已知空状态），
+    这两块卷**只读**，所以只需要"字节对得上"。落盘时也只在内容真变了时才写：
+    QEMU 打开的就是这些文件，mtime 每次变动会让"同一份夹具"这件事在取证上打折扣。
+
+    指纹不符时返回的是红而不是警告：带着可疑的夹具跑，内核那一读的每一个数都不可解释，
+    而那时红会落在解析器身上——错其实在量具。
+    """
+    import hashlib
+    import zlib
+    bad: list[str] = []
+    for name, (size, sha) in FAT_EXPECT.items():
+        zz, out = FAT_ZZ[name], FAT_IMG[name]
+        if not zz.exists():
+            bad.append(f"夹具源不在位：{zz.relative_to(ROOT)}（配方见 BACKLOG 78 的 mtools 那一节）")
+            continue
+        raw = zlib.decompress(zz.read_bytes())
+        got = hashlib.sha256(raw).hexdigest()
+        if len(raw) != size or got != sha:
+            bad.append(f"夹具 {name} 指纹不符：{len(raw)} 字节 sha256={got[:16]}，期望 {size} 字节 {sha[:16]}")
+            continue
+        if not out.exists() or out.read_bytes() != raw:
+            out.write_bytes(raw)
+    return bad
+
+
+def ensure_fat32_mem() -> list[str]:
+    """把 L3-C② 的配方脚本跑一遍并核指纹——`include_bytes!` 是**编译时**要的。
+
+    这块 11,264 字节的卷不在仓库里（`.gitignore` 的 `*.img` 挡的），所以两件事必须在这里判：
+    1 新克隆能不能编出这个变体（跑一遍脚本就够了，不需要 mtools 或任何外部工具）；
+    2 配方与用例里那些写死的数是不是还对得上（簇数 12、尾格 464、`entries_seen` 4/6/8、
+      头四字节 0x11 0x14 0x17 0x1a——全是照着这块卷量的，指纹一变就得重算一遍）。
+    红在编译之前，而不是等内核把这块卷读成别的形状之后再回头查解析器。
+    """
+    import hashlib
+    if not FAT_MEM_SCRIPT.exists():
+        return [f"配方脚本缺失：{FAT_MEM_SCRIPT.relative_to(ROOT)}（这块夹具卷不在仓库里，只能现算）"]
+    if sh([sys.executable, str(FAT_MEM_SCRIPT)]) != 0:
+        return ["make_fat32_mem.py 退出非零"]
+    if not FAT_MEM_OUT.exists():
+        return [f"脚本没写出 {FAT_MEM_OUT.relative_to(ROOT)}"]
+    data = FAT_MEM_OUT.read_bytes()
+    size, sha = FAT_MEM_EXPECT
+    got = hashlib.sha256(data).hexdigest()
+    if len(data) != size or got != sha:
+        return [f"内存夹具指纹不符：{len(data)} 字节 sha256={got[:12]}，期望 {size} 字节 {sha[:12]}"
+                "（配方改了，用例里那批写死的数必须跟着重算）"]
+    return []
+
+
+# ------------------------------------------------------------------ L3-C① 宿主机那一侧的 FAT32 仪器
+#
+# 这一族函数是**第二台实现**：只按微软 FAT 规范 1.03 的偏移从镜像字节里读，不读内核打印的
+# 任何一个数，也不参与造夹具。它存在的理由与 `hashlib` 对 SHA-256、`bootp_of` 对 DHCP 那一包
+# 完全相同——"解析器自己说它对"不是一格判据。
+#
+# 偏移表与内核 `filesystem/fat32.rs` 那一份是同一次由 mtools 的 `minfo` 对出来的（两处都记着
+# 那个 49→50 的错），而这里**故意重写一遍**而不是 import 过去：两份独立实现撞上同一个数才有
+# 意义，共用一张表就退化成一台仪器。
+
+FAT_SEC = 512
+FAT_EOC = 0x0FFF_FFF8
+
+
+def _fat_u16(b: bytes, o: int) -> int:
+    return b[o] | (b[o + 1] << 8)
+
+
+def _fat_u32(b: bytes, o: int) -> int:
+    return b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24)
+
+
+def fat32_host_volume(img: bytes, read_names: tuple[str, ...] = ()) -> dict:
+    """独立解析一块 FAT32 卷：几何 + FSInfo 自述 + 根目录每一项的账。
+
+    `read_names` 之外的项只读目录项元数据、不走链也不算哈希（卷B 的 FILLER.BIN 有 34 MB，
+    而没有任何一条判据读它）。哈希只对声明要读的那几项算，因为对账比的就是那几项的内容。
+    """
+    bs = img[:FAT_SEC]
+    spc, res, fats = bs[13], _fat_u16(bs, 14), bs[16]
+    root_ent, spf16 = _fat_u16(bs, 17), _fat_u16(bs, 22)
+    spf32 = _fat_u32(bs, 36)
+    total = _fat_u16(bs, 19) or _fat_u32(bs, 32)
+    # 判型只看结构：固定根目录为 0 且 FAT32 的每份扇区不为 0（卷A 的簇数按阈值算落 FAT16 档）
+    struct32 = root_ent == 0 and spf16 == 0 and spf32 != 0
+    spf = spf32 if struct32 else (spf16 or spf32)
+    data_start = res + fats * spf
+    clusters = (total - data_start) // spc
+    band = "Fat12" if clusters < 4085 else ("Fat16" if clusters < 65525 else "Fat32")
+    fsinfo, backup = _fat_u16(bs, 48), _fat_u16(bs, 50)
+    fsi = img[fsinfo * FAT_SEC:fsinfo * FAT_SEC + FAT_SEC]
+
+    def fat_next(c: int) -> int:
+        return _fat_u32(img, res * FAT_SEC + c * 4) & 0x0FFF_FFFF
+
+    def cluster_off(c: int) -> int:
+        return (data_start + (c - 2) * spc) * FAT_SEC
+
+    # 根目录：跟着簇链走。条目序号与内核 `entries_seen` 用同一个数法（被跳过的卷标/目录/LFN
+    # 也算在内，到命中那一项为止）——两边数法不同时，对账会红在"扫过项"那一格，
+    # 而不是各数各的还都绿。
+    files: dict[str, dict] = {}
+    labels = dirs = 0
+    c, seen, lfn = _fat_u32(bs, 44), 0, 0
+    stop = False
+    root_walked = 0
+    while c < FAT_EOC and not stop:
+        if root_walked > FAT_MAX_WALKED:
+            raise ValueError(f"根目录簇链超过 {FAT_MAX_WALKED} 簇：环链或损坏，这台仪器不跟着转")
+        root_walked += 1
+        blk = img[cluster_off(c):cluster_off(c) + spc * FAT_SEC]
+        for o in range(0, len(blk), 32):
+            e = blk[o:o + 32]
+            if e[0] == 0x00:
+                stop = True
+                break
+            seen += 1
+            if e[11] == 0x0F:
+                lfn += 1
+                continue
+            if e[11] & 0x08:
+                labels += 1
+                continue
+            if e[11] & 0x10:
+                dirs += 1
+                continue
+            if e[0] == 0xE5:
+                # 已删除条目：内核跳过但仍计入扫过的项数，这台仪器必须同数法。
+                # 不跳的话内存夹具里那条 0xE5 GONE.BIN 会被宿主机数成"内核漏读了一项"。
+                continue
+            name = e[0:8].decode("latin1").rstrip()
+            if e[0] == 0x05:
+                # 删除标记占掉第一位，原名字的第一字符在盘上已经不存在了 ⇒ 规范读成 '?'。
+                # 内核 `name_matches` 同一件事，两边同一读法才谈得上对账。
+                name = "?" + name[1:]
+            ext = e[8:11].decode("latin1").rstrip()
+            if ext:
+                name += "." + ext
+            size = _fat_u32(e, 28)
+            hi, lo = _fat_u16(e, 20), _fat_u16(e, 26)
+            first = (hi << 16) | lo
+            cc, n, walked, got = first, size, 0, bytearray()
+            last = after = 0
+            off_image = False
+            cyclic = False
+            # 簇号落在保留/坏簇区，或链指到镜像之外：这台仪器**不跟着造链**。
+            # 内核那一侧对应 `EntryOutsideData`（目录项的闸）与 `BadCluster`（走链的闸）；
+            # 这里跟着走会拿一个不存在的簇号去切片，读出空字节后 `take=0` 就是死循环——
+            # 量具自己先挂，比被测物挂了更难查（内存夹具里 BADCLU.BIN 那一条就是这个形状）。
+            bad_cluster = cc < 2 or cc >= FAT_EOC
+            # 只走"内核声明要读的那几个名字"的链：卷B 的 FILLER.BIN 有 34,603,008 字节，
+            # 而 `t_fat32` 从不读它——跟着读的话这台仪器要先算 3,400 万次逐字节哈希，
+            # 实测会把对账拖成一次挂死（本轮踩过）。范围由 `FAT_READ_NAMES` 定，
+            # 与内核那两个 `want` 表由 `check-fat32-ports` 静态对账。
+            want_walk = first in range(2, FAT_EOC) and name in read_names
+            if want_walk:
+                while n > 0:
+                    if walked > FAT_MAX_WALKED:
+                        # 环链：内核撞 `ChainTooLong`，这台仪器撞自己的界。
+                        # 没有这一格，`CYCLIC.BIN`（size=0xFFFF_FFFF、链 8→9→10→9）会让宿主机先死。
+                        cyclic = True
+                        break
+                    chunk = img[cluster_off(cc):cluster_off(cc) + spc * FAT_SEC]
+                    if len(chunk) < spc * FAT_SEC:
+                        off_image = True
+                        break
+                    take = min(len(chunk), n)
+                    got += chunk[:take]
+                    n -= take
+                    walked += 1
+                    last = cc
+                    after = fat_next(cc)
+                    cc = after
+                    if after >= FAT_EOC and n > 0:
+                        break
+            files[name] = dict(
+                size=size, first=first, hi=hi, lo=lo, seen=seen, lfn=lfn,
+                bytes=len(got), clusters=walked, last=last, after=after,
+                tail=len(got) - (walked - 1) * spc * FAT_SEC if walked else 0,
+                head=bytes(got[:4]), fnv=fnv1a64(bytes(got)) if want_walk else 0,
+                # 走过的项才留字节（其余项只留元数据）：③ 那行要把盘上那份与内嵌那份
+                # 直接比 sha256，而那只有 31,320 字节
+                blob=bytes(got) if want_walk else b"",
+                bad_cluster=bad_cluster, off_image=off_image,
+                walked_it=want_walk, cyclic=cyclic)
+        if not stop:
+            c = fat_next(c)
+    return dict(
+        bytes_per_sector=_fat_u16(bs, 11), sectors_per_cluster=spc, reserved=res, fat_count=fats,
+        root_entries=root_ent, sectors_per_fat=spf, total_sectors=total, data_start=data_start,
+        clusters=clusters, band=band, struct="Fat32" if struct32 else "非Fat32",
+        cluster_bytes=spc * FAT_SEC, root_cluster=_fat_u32(bs, 44),
+        fsinfo_sector=fsinfo, backup_sector=backup, boot_sig=bs[66], drv_num=bs[64],
+        fs_name_str=bs[82:87].decode("latin1"),
+        fsinfo_lead=_fat_u32(fsi, 0), fsinfo_struct=_fat_u32(fsi, 484),
+        fsinfo_free=_fat_u32(fsi, 488), fsinfo_next=_fat_u32(fsi, 492),
+        backup_same=img[backup * FAT_SEC:backup * FAT_SEC + FAT_SEC] == bs,
+        entries_seen=seen, lfn=lfn, volume_label=labels, subdirs=dirs, files=files,
+    )
+
+
+# 内核 `t_fat32` 打的三类行：几何一行、每个文件一行、引导盘被拒一行。锚点写全，少任何一条
+# 都当成"这一跑没读到"报红——静默少一条就是静默少测一条（与 check-matrix-wiring 同规矩）。
+FAT_GEO_RE = re.compile(
+    r"fat32: 几何 卷(?P<vol>[AB]) 簇数=(?P<clusters>\d+) 数据起点=(?P<data>\d+) "
+    r"每簇字节=(?P<clu>\d+) FAT份=(?P<fats>\d+) 每份扇区=(?P<spf>\d+) 根簇=(?P<root>\d+) "
+    r"FSInfo扇区=(?P<fsinfo>\d+) 备份扇区=(?P<backup>\d+) 阈值判型=(?P<band>\w+) "
+    r"结构判型=(?P<struct>\w+) 名字串=(?P<name>true|false) 备份逐字节同=(?P<bsame>true|false) "
+    r"自由簇=(?P<free>\d+)")
+FAT_FILE_RE = re.compile(
+    r"fat32: 卷(?P<vol>\d) (?P<name>\S+)\s+大小=(?P<size>\d+) 簇=(?P<cluster>\d+) "
+    r"高半=(?P<hi>\d+) 低半=(?P<lo>\d+) 扫过项=(?P<seen>\d+) LFN=(?P<lfn>\d+) "
+    r"走字节=(?P<wbytes>\d+) 走簇=(?P<wclusters>\d+) 尾字节=(?P<tail>\d+) "
+    r"末簇后继=(?P<after>0x[0-9a-f]+) 头四字节=\[(?P<head>[0-9a-f, ]+)\] 哈希=(?P<hash>0x[0-9a-f]+)")
+FAT_MBR_RE = re.compile(r"fat32: 引导盘 口(?P<port>\d+) 拒因=Some\((?P<err>\w+)")
+# L3-C② 那两行：几何与目录。`Ok(FileStat { … })` 是 Rust 的 Debug 原文，锚点把它整条写完——
+# 字段名改了这里就红，因为那意味着串口里的数不再可核对（与 check-matrix-wiring 同一规矩）。
+FAT_MEM_GEO_RE = re.compile(
+    r"fat32-mem: 几何 簇数=(?P<clusters>\d+) 数据起点=(?P<data>\d+) 每簇字节=(?P<clu>\d+) "
+    r"FAT份=(?P<fats>\d+) 每份扇区=(?P<spf>\d+) 根簇=(?P<root>\d+) 阈值判型=(?P<band>\w+) "
+    r"结构判型=(?P<struct>\w+) 名字串=(?P<name>true|false) 备份逐字节同=(?P<bsame>true|false) "
+    r"自由簇=(?P<free>\d+)")
+FAT_MEM_DIR_RE = re.compile(r"fat32-mem: 目录 (?P<body>.*)")
+FAT_MEM_STAT_RE = re.compile(
+    r"(?P<name>[A-Za-z0-9~_.?]+)=Ok\(FileStat \{ size: (?P<size>\d+), first_cluster: (?P<cluster>\d+), "
+    r"entries_seen: (?P<seen>\d+), lfn_entries: (?P<lfn>\d+) \}\)")
+
+
+def check_fat32_mem(log: str) -> list[str]:
+    """内存夹具那一本账：配方脚本写的字节，与内核读回来的数，由这台仪器各算一遍。
+
+    为什么这块卷也要对账（它明明是"合成"的）：它的每一个期望数（簇数 12、`entries_seen`
+    4/6/8、尾格 464、头四字节 0x11 0x14 0x17 0x1a）都是照着配方脚本写的字节手工推的。
+    脚本一改（加一条目录项、挪一个簇）而那些数没跟着改，红会出现在**内核的用例**里，
+    看起来像解析器坏了。这里从脚本刚写出的那份字节重算，把"配方与用例分家"这一类
+    在跑完之后立刻点名。
+    """
+    bad: list[str] = []
+    geo = FAT_MEM_GEO_RE.search(log)
+    if not geo:
+        return ["这一跑挂了 fat32 变体，但串口没有 `fat32-mem: 几何 …` 那一行（② 那本账没跑）"]
+    if not FAT_MEM_OUT.exists():
+        return [f"宿主机没有 {FAT_MEM_OUT.relative_to(ROOT)}：配方脚本没写出它，内核却把它编进了 .rodata"]
+    h = fat32_host_volume(FAT_MEM_OUT.read_bytes(), FAT_READ_NAMES["MEM"])
+    for tag, got, want in [
+        ("簇数", geo.group("clusters"), h["clusters"]),
+        ("数据起点", geo.group("data"), h["data_start"]),
+        ("每簇字节", geo.group("clu"), h["cluster_bytes"]),
+        ("FAT份", geo.group("fats"), h["fat_count"]),
+        ("每份扇区", geo.group("spf"), h["sectors_per_fat"]),
+        ("根簇", geo.group("root"), h["root_cluster"]),
+        ("自由簇", geo.group("free"), h["fsinfo_free"]),
+    ]:
+        if int(got) != int(want):
+            bad.append(f"内存卷 几何 {tag}: 内核={got} 宿主机按配方的字节读={want}")
+    for tag, got, want in [("阈值判型", geo.group("band"), h["band"]),
+                           ("结构判型", geo.group("struct"), h["struct"])]:
+        if got != want:
+            bad.append(f"内存卷 {tag}: 内核={got} 宿主机={want}")
+    if geo.group("name") != ("true" if h["fs_name_str"] == "FAT32" else "false"):
+        bad.append(f"内存卷 名字串: 内核={geo.group('name')} 宿主机读偏移 82 = {h['fs_name_str']!r}")
+    if geo.group("bsame") != ("true" if h["backup_same"] else "false"):
+        bad.append(f"内存卷 备份扇区: 内核={geo.group('bsame')} 宿主机={h['backup_same']}")
+
+    dirm = FAT_MEM_DIR_RE.search(log)
+    if not dirm:
+        return bad + ["串口没有 `fat32-mem: 目录 …` 那一行"]
+    got_stats = {m.group("name"): m for m in FAT_MEM_STAT_RE.finditer(dirm.group("body"))}
+    # 用例查的三个名字（`FAT_READ_NAMES["MEM"]`，与 main.rs 的 `vol.open(...)` 由门禁对账）。
+    # `?LD.TXT` 里那个问号不是笔误：配方把首字节写成 0x05（删除标记），于是盘上第一位的那个
+    # `O` 已经不在了，两台实现都只能按规范把它读成 '?'——上一轮这里查 `?OLD.TXT`，红在 NoEntry。
+    for want_name in FAT_READ_NAMES["MEM"]:
+        hf = h["files"].get(want_name)
+        if hf is None:
+            bad.append(f"内存卷：配方写出的根目录里没有 {want_name}（脚本改了？用例查的就是它）")
+            continue
+        m = got_stats.get(want_name)
+        if m is None:
+            bad.append(f"内存卷 {want_name}: 内核那一行不是 Ok(FileStat …)（读不成或被改名，"
+                       "用例红在目录那一格）")
+            continue
+        for tag, got, want in [("大小", int(m.group("size")), hf["size"]),
+                               ("首簇", int(m.group("cluster")), hf["first"]),
+                               ("扫过项", int(m.group("seen")), hf["seen"]),
+                               ("LFN", int(m.group("lfn")), hf["lfn"])]:
+            if got != want:
+                bad.append(f"内存卷 {want_name} {tag}: 内核={got} 宿主机={want}")
+    return bad
+
+
+def check_fat32(log: str) -> list[str]:
+    """内核从两块卷读回来的每一个数，与宿主机解析同一批字节的结果逐字段对账。
+
+    为什么值得单独一行（而不是只信内核 `判据` 那行里的十三个 bool）：那十三条全是**内核自己
+    与写死的期望数**比。期望数与夹具不同步时（换卷、换 mtools），两边会"错得一样"，而任何一台
+    仪器都发现不了那种一致。这台从镜像字节自己算，逐字段与串口那个数比；口位接反也一样露馅——
+    两块卷簇数不同（64,496 与 129,022），口 3 与口 4 挂反了 `卷1` 那一行就对不上小卷。
+    """
+    bad: list[str] = []
+    geo = {m.group("vol"): m for m in FAT_GEO_RE.finditer(log)}
+    if not geo:
+        return ["这一跑挂了 fat32 变体，但串口里没有 `fat32: 几何 卷A|B …` 那两行（用例没跑到，或被改名）"]
+    missing = [name for name in FAT_PORTS.values() if not FAT_IMG[name].exists()]
+    if missing:
+        return [f"宿主机这边没有解压好的夹具：{missing}（`make_fat_volumes` 没跑或失败）"]
+    vols = {"A": fat32_host_volume(FAT_IMG[FAT_PORTS[3]].read_bytes(), FAT_READ_NAMES["A"]),
+            "B": fat32_host_volume(FAT_IMG[FAT_PORTS[4]].read_bytes(), FAT_READ_NAMES["B"])}
+    for letter in ("A", "B"):
+        if letter not in geo:
+            bad.append(f"串口没有 `几何 卷{letter}` 那一行（两卷各一行，缺的那卷没被读到）")
+
+    # 几何：卷A = 口 3 = 小卷，卷B = 口 4 = 宽卷。字段集两边对称是内核那两行的形状决定的，
+    # 接错口位在这里就会红：两块卷的簇数与数据起点不同，串口那行却按口号打卷名。
+    for letter in ("A", "B"):
+        m = geo.get(letter)
+        if m is None:
+            continue
+        h = vols[letter]
+        for tag, got, want in [
+            ("簇数", m.group("clusters"), h["clusters"]),
+            ("数据起点", m.group("data"), h["data_start"]),
+            ("每簇字节", m.group("clu"), h["cluster_bytes"]),
+            ("FAT份", m.group("fats"), h["fat_count"]),
+            ("每份扇区", m.group("spf"), h["sectors_per_fat"]),
+            ("根簇", m.group("root"), h["root_cluster"]),
+            ("FSInfo扇区", m.group("fsinfo"), h["fsinfo_sector"]),
+            ("备份扇区", m.group("backup"), h["backup_sector"]),
+            ("自由簇", m.group("free"), h["fsinfo_free"]),
+        ]:
+            if int(got) != int(want):
+                bad.append(f"卷{letter} 几何 {tag}: 内核={got} 宿主机={want}")
+        for tag, got, want in [("阈值判型", m.group("band"), h["band"]),
+                               ("结构判型", m.group("struct"), h["struct"])]:
+            if got != want:
+                bad.append(f"卷{letter} {tag}: 内核={got} 宿主机={want}")
+        # 名字串与备份扇区：内核那两格各是一条"读错偏移就会 false"的检查（模块头记着
+        # 49→50 与 484/488 那两次对表），所以它们在**两块卷上**都要被第二台仪器读过一遍
+        if m.group("name") != ("true" if h["fs_name_str"] == "FAT32" else "false"):
+            bad.append(f"卷{letter} 名字串: 内核={m.group('name')} 宿主机读偏移 82 = {h['fs_name_str']!r}")
+        if m.group("bsame") != ("true" if h["backup_same"] else "false"):
+            bad.append(f"卷{letter} 备份扇区逐字节同: 内核={m.group('bsame')} 宿主机={h['backup_same']}")
+    # `自由簇` 那一格内核只打印不判，所以只有这台仪器在判它。484 与 488 那 4 个字节的偏移之争
+    # 最后由这个数结案：读错偏移会得到 0x61417272（结构签名）这样一个"非零且看着合理"的数，
+    # 任何"非 0 即通过"的检查都拦不住。
+    for letter in ("A", "B"):
+        h = vols[letter]
+        if h["fsinfo_lead"] != 0x4161_5252 or h["fsinfo_struct"] != 0x6141_7272:
+            bad.append(f"卷{letter} 宿主机自己读的 FSInfo 签名就不是规范值："
+                       f"前导={h['fsinfo_lead']:#010x} 结构={h['fsinfo_struct']:#010x}（夹具坏了，先修夹具）")
+
+    # 逐文件：目录项的四格（大小、首簇两半、扫过项、LFN）、走链的四格（字节/簇/尾格/末簇后继）、
+    # 内容的两格（头四字节、FNV）。卷名 A/B 与记录行的"卷1/卷2"按 FAT_PORTS 的口序对应。
+    vol_letter = {1: "A", 2: "B"}
+    lines = {(int(m.group("vol")), m.group("name")): m for m in FAT_FILE_RE.finditer(log)}
+    for vi, letter in vol_letter.items():
+        h = vols[letter]
+        declared = FAT_READ_NAMES[letter]
+        got_rows = sorted(n for (v, n) in lines if v == vi)
+        if got_rows != sorted(declared):
+            bad.append(f"卷{letter}: 串口读的名字是 {got_rows}，这张表声明的是 {sorted(declared)}"
+                       "——两边读的不是同一组文件，逐字段对账就失去了对象")
+        for name in declared:
+            hf = h["files"].get(name)
+            if hf is None:
+                bad.append(f"卷{letter} {name}: 内核说读了它，宿主机在这块卷的根目录里找不到这一项")
+                continue
+            if hf["bad_cluster"] or hf["off_image"] or hf["cyclic"]:
+                bad.append(f"卷{letter} {name}: 宿主机算下来它的链不可读"
+                           f"（坏簇={hf['bad_cluster']} 越出镜像={hf['off_image']} 环链={hf['cyclic']}），"
+                           "而内核给了它一条记录行")
+                continue
+            m = lines.get((vi, name))
+            if m is None:
+                bad.append(f"卷{letter} {name}: 宿主机读到这一项，串口没有对应记录行")
+                continue
+            head = bytes.fromhex(m.group("head").replace(", ", "").replace(" ", ""))
+            for tag, got, want in [
+                ("大小", int(m.group("size")), hf["size"]),
+                ("首簇", int(m.group("cluster")), hf["first"]),
+                ("高半", int(m.group("hi")), hf["hi"]),
+                ("低半", int(m.group("lo")), hf["lo"]),
+                ("扫过项", int(m.group("seen")), hf["seen"]),
+                ("LFN", int(m.group("lfn")), hf["lfn"]),
+                ("走字节", int(m.group("wbytes")), hf["bytes"]),
+                ("走簇", int(m.group("wclusters")), hf["clusters"]),
+                ("尾字节", int(m.group("tail")), hf["tail"]),
+                ("末簇后继", int(m.group("after"), 16), hf["after"]),
+                ("头四字节", head.hex(), hf["head"].hex()),
+                ("内容FNV", int(m.group("hash"), 16), hf["fnv"]),
+            ]:
+                if got != want:
+                    bad.append(f"卷{letter} {name} {tag}: 内核={got} 宿主机={want}")
+    mbr = FAT_MBR_RE.search(log)
+    if not mbr:
+        bad.append("串口没有 `fat32: 引导盘 口N 拒因=…` 那一行（引导盘那格没跑）")
+    elif mbr.group("err") != "BadBytesPerSector":
+        bad.append(f"引导盘拒因={mbr.group('err')}，宿主机算下来应该崩在每扇区字节数那道闸"
+                   f"（保护性 MBR 的 0x55AA 也在位，签名闸拦不住它）")
+    # ② 那本账（合成卷）在同一跑里，一并核：两块真卷证明偏移表，合成卷证明分支覆盖，
+    # 两边都从宿主机自己的字节算一遍才算这一行覆盖了这个变体里的两条用例
+    bad += check_fat32_mem(log)
+    return bad
+
+
+FAT_EXE_DIR_RE = re.compile(
+    r"elfdisk: 目录 大小=(?P<size>\d+) 首簇=(?P<cluster>\d+) 扫过项=(?P<seen>\d+) "
+    r"缓冲上限=(?P<cap>\d+) 与内嵌夹具同长=(?P<same>true|false)")
+FAT_EXE_SEG_RE = re.compile(
+    r"elfdisk: 段(?P<i>\d+) off=(?P<off>\d+) va=(?P<va>0x[0-9a-f]+) filesz=(?P<filesz>\d+) "
+    r"memsz=(?P<memsz>\d+) r=(?P<r>true|false) w=(?P<w>true|false) x=(?P<x>true|false)")
+FAT_EXE_RUN_RE = re.compile(
+    r"elfdisk: 跑后 entry=(?P<entry>0x[0-9a-f]+) data=(?P<data>0x[0-9a-f]+) "
+    r"stack_top=(?P<stack>0x[0-9a-f]+) segs=(?P<segs>\d+) pages=(?P<pages>\d+) "
+    r"magic=(?P<magic>Some\([^)]*\)|None) ping=(?P<ping>Some\([^)]*\)|None) "
+    r"add=(?P<add>Some\([^)]*\)|None) unk=(?P<unk>Some\([^)]*\)|None) "
+    r"rodata=(?P<rod>Some\([^)]*\)|None) loops=(?P<loops>Some\([^)]*\)|None) "
+    r"served=(?P<served>\d+) rounds=(?P<rounds>\d+) guard_unmapped=(?P<guard>true|false)")
+FAT_EXE_NEG_RE = re.compile(
+    r"elfdisk: 负格 元数据说大=Some\(ChainEndsEarly[^)]*\) 截短=Some\(Elf\(SegmentOutOfBounds\)\)")
+FAT_EXE_CLEAN_RE = re.compile(
+    # ⑦ 与⑤⑥ 打在**同一行**里（`负格 … | 收尾 …`）：锚点要连着那个竖线，
+    # 否则读成"没有那一行"——报的是缺行，看着像用例没跑，其实是正则找错了开头。
+    r"\| 收尾 终止=(?P<term>true|false) 回收=(?P<released>\d+) 保留(?P<before>\d+)→(?P<after>\d+)")
+# `elfload:` 是同一跑里"内嵌那份"的读数行（M4-2 那条用例打的）。③ 的对照物就是它。
+ELFLOAD_RUN_RE = re.compile(
+    r"elfload: magic=(?P<magic>Some\([^)]*\)|None) ping=(?P<ping>Some\([^)]*\)|None) "
+    r"add=(?P<add>Some\([^)]*\)|None) unk=(?P<unk>Some\([^)]*\)|None) "
+    r"rodata=(?P<rodata>Some\([^)]*\)|None) served=(?P<served>\d+) "
+    r"unknown_nr=(?P<unknr>\d+) rounds=(?P<rounds>\d+) runs=(?P<runs>\d+) "
+    r"state=(?P<state>\S+) guard_unmapped=(?P<guard>true|false)")
+
+
+def elf64_host_parse(b: bytes) -> dict:
+    """宿主机这一侧的 ELF64 解析（第三份实现）：头 + PT_LOAD 表。
+
+    偏移按 ELF64 规范：`e_entry` 在 24、`e_phoff` 在 32、`e_phentsize` 在 54、`e_phnum` 在 56；
+    每条程序头里 `p_type` 0、`p_flags` 4、`p_offset` 8、`p_vaddr` 16、`p_filesz` 32、
+    `p_memsz` 40。这套偏移在 `t_elf_load_run` 的分区负样本那段也踩过一次坑
+    （`p_vaddr` 不是 +0x20，那是 `p_filesz`），所以这里把每个数写在行尾而不是靠记忆。
+    """
+    assert len(b) >= 64 and b[:4] == b"\x7fELF", "宿主机这份容器连头都不是 ELF64"
+    phoff = int.from_bytes(b[32:40], "little")          # e_phoff 在 ELF64 里是 8 字节
+    phentsize, phnum = _fat_u16(b, 54), _fat_u16(b, 56)
+    entry = int.from_bytes(b[24:32], "little")          # e_entry
+    loads = []
+    for i in range(phnum):
+        at = phoff + i * phentsize
+        if int.from_bytes(b[at:at + 4], "little") != 1:   # PT_LOAD = 1，其余（GNU_STACK 等）不收
+            continue
+        flags = int.from_bytes(b[at + 4:at + 8], "little")
+        loads.append(dict(
+            offset=int.from_bytes(b[at + 8:at + 16], "little"),     # p_offset
+            vaddr=int.from_bytes(b[at + 16:at + 24], "little"),     # p_vaddr
+            filesz=int.from_bytes(b[at + 32:at + 40], "little"),    # p_filesz
+            memsz=int.from_bytes(b[at + 40:at + 48], "little"),     # p_memsz
+            r=bool(flags & 4), w=bool(flags & 2), x=bool(flags & 1),  # PF_R/X/W
+        ))
+    return dict(entry=entry, phnum=phnum, n=len(loads), loads=loads)
+
+
+def check_fat32_exec(log: str) -> list[str]:
+    """L3-C③ 那一本账：盘上那份容器、内嵌那份容器、与宿主机自己算的第三份，三者必须同数。
+
+    这一行比 34 行多了两台仪器，因为③ 换掉的是**输入的来源**而不是算法：
+    * 宿主机用自己的 FAT 解析从卷A 里取出 `HELLO.ELF` 的字节，与 `kernel/fixtures/hello.elf`
+      （rustc 的产物，构建时嵌进镜像的那份）比 sha256 ⇒ 证明"两条路喂给加载器的确实是同一个容器"
+      这件事不由内核自己说。
+    * 宿主机再自己解析一遍 ELF64 的头与 PT_LOAD 表（第三份实现），与串口那几行段读数逐格比。
+      截短那一格期望的 `SegmentOutOfBounds` 也由这里作证：宿主机算出的 `max(offset+filesz)`
+      必须真的落在文件内部——否则内核报的红是量具的红。
+    * 最后把 ③ 的读数与同一跑里 `elfload:`（内嵌那份）的读数配对：同一个容器经两条来源跑出
+      同一组数，才叫"换来源不换行为"。两行都在同一份串口里，与用例先后无关。
+    """
+    bad: list[str] = []
+    dirm = FAT_EXE_DIR_RE.search(log)
+    if not dirm:
+        return ["这一跑挂了 fat32-exec，但串口没有 `elfdisk: 目录 …` 那一行（③ 没跑到）"]
+    if not FAT_IMG[FAT_PORTS[3]].exists():
+        return [f"宿主机没有解压好的 {FAT_PORTS[3]} 卷，无法独立取那份容器"]
+
+    # 第一台：从卷里按 FAT 结构取出 HELLO.ELF 的字节
+    host_vol = fat32_host_volume(FAT_IMG[FAT_PORTS[3]].read_bytes(), ("HELLO.ELF",))
+    hf = host_vol["files"].get("HELLO.ELF")
+    if hf is None:
+        return ["宿主机从卷A 的根目录里读不到 HELLO.ELF（那 ③ 读的是什么？）"]
+    import hashlib
+    fixture = (ROOT / "kernel" / "fixtures" / "hello.elf").read_bytes()
+    body = hf["blob"]
+    if not fixture:
+        return ["kernel/fixtures/hello.elf 是空的（内嵌那份的来源没了，两处对照都失去对象）"]
+    for tag, got, want in [("大小", hf["size"], len(fixture)),
+                           ("走字节", hf["bytes"], len(fixture)),
+                           ("内容FNV", hf["fnv"], fnv1a64(fixture))]:
+        if int(got) != int(want):
+            bad.append(f"③ 的容器 {tag}: 宿主机从卷里读={got} 内嵌那份文件={want}")
+    # 整份字节直接比。哈希那一格 34 行已经判过；这里要的是"加载器拿到的就是同一份容器"
+    # 这句话本身，而摘要相同、字节不同在原则上不是不可能
+    if body != fixture:
+        bad.append(f"盘上那份与内嵌那份不是同一个容器：{len(body)} 字节 sha256={hashlib.sha256(body).hexdigest()[:16]} "
+                   f"对 {len(fixture)} 字节 sha256={hashlib.sha256(fixture).hexdigest()[:16]}")
+
+    # 第二台：宿主机自己解析 ELF64 的头与 PT_LOAD 表
+    prog = elf64_host_parse(body)
+    if int(dirm.group("size")) != len(fixture):
+        bad.append(f"内核读到的大小={dirm.group('size')}，内嵌那份文件是 {len(fixture)} 字节")
+    if dirm.group("same") != "true":
+        bad.append("内核自己报了 `与内嵌夹具同长=false`")
+    segs = list(FAT_EXE_SEG_RE.finditer(log))
+    if len(segs) != prog["n"]:
+        bad.append(f"串口打了 {len(segs)} 条段记录，宿主机的 ELF 表里有 {prog['n']} 条 PT_LOAD")
+    for m, seg in zip(segs, prog["loads"]):
+        for tag, got, want in [("off", int(m.group("off")), seg["offset"]),
+                               ("va", int(m.group("va"), 16), seg["vaddr"]),
+                               ("filesz", int(m.group("filesz")), seg["filesz"]),
+                               ("memsz", int(m.group("memsz")), seg["memsz"]),
+                               ("r", m.group("r"), "true" if seg["r"] else "false"),
+                               ("w", m.group("w"), "true" if seg["w"] else "false"),
+                               ("x", m.group("x"), "true" if seg["x"] else "false")]:
+            if got != want:
+                bad.append(f"③ 段{m.group('i')} {tag}: 内核={got} 宿主机解析 ELF 得={want}")
+    runm = FAT_EXE_RUN_RE.search(log)
+    if not runm:
+        return bad + ["串口没有 `elfdisk: 跑后 …` 那一行（④ 那格没跑成）"]
+    if int(runm.group("entry"), 16) != prog["entry"]:
+        bad.append(f"入口: 内核={runm.group('entry')} 宿主机 e_entry={prog['entry']:#x}")
+    if int(runm.group("segs")) != prog["n"]:
+        bad.append(f"段数: 内核={runm.group('segs')} 宿主机={prog['n']}")
+
+    # 截短那一格的证人：宿主机算的 `max(offset+filesz)` 必须在文件内，且减 1 之后
+    # 确实少掉了某段的一部分（否则内核的红是量具的红）
+    last_end = max(w["offset"] + w["filesz"] for w in prog["loads"])
+    neg = FAT_EXE_NEG_RE.search(log)
+    if not neg:
+        bad.append("串口没有 `负格 元数据说大=Some(ChainEndsEarly…) … 截短=Some(Elf(SegmentOutOfBounds))` 那一行")
+    if not (0 < last_end <= len(fixture)):
+        bad.append(f"宿主机算的段表文件末尾 last_end={last_end} 不在文件长度 {len(fixture)} 之内 ⇒ ⑥ 那格该判没跑成")
+
+    # 第三台：同一跑里内嵌那条路径的读数，两行必须给同一组数
+    emb = ELFLOAD_RUN_RE.search(log)
+    if not emb:
+        bad.append("同一跑里没有 `elfload: magic=…` 那行（内嵌那份的对照物不在，配对判据失去对象）")
+    else:
+        for tag, a, b in [("magic", runm.group("magic"), emb.group("magic")),
+                          ("ping", runm.group("ping"), emb.group("ping")),
+                          ("add", runm.group("add"), emb.group("add")),
+                          ("unk", runm.group("unk"), emb.group("unk")),
+                          ("rodata", runm.group("rod"), emb.group("rodata")),
+                          ("served", runm.group("served"), emb.group("served")),
+                          ("guard", runm.group("guard"), emb.group("guard"))]:
+            if a != b:
+                bad.append(f"两条来源跑出的数不同（{tag}）: 盘上={a} 内嵌={b}")
+
+    clean = FAT_EXE_CLEAN_RE.search(log)
+    if not clean:
+        bad.append("串口没有 `elfdisk: 收尾 …` 那一行（⑦ 那格没跑）")
+    elif clean.group("before") != clean.group("after") or clean.group("term") != "true":
+        bad.append(f"收尾不干净：终止={clean.group('term')} 保留{clean.group('before')}→{clean.group('after')}"
+                   "（留给后面的用例就是 `VaTaken`）")
+    return bad
+
+
+def check_fat32_ports() -> list[str]:
+    """两处各写死一份口号，就必须有机器对账：内核的 `FAT_PORT_A`/`FAT_PORT_B` 与本脚本的 `FAT_PORTS`。
+
+    这一格防的是一件很具体的事：内核注释写着"由 tools/aurora.py 的 FAT_PORTS 定"，而脚本里
+    根本没有那个名字的时候，注释就成了悬空引用，两侧可以各挂各的盘而没人报错——串口只会说
+    "挂载失败"，看起来像驱动坏了，其实是接线断了（本轮开工时仓库里就是这个状态）。
+    顺带把"夹具在位""特性名在 Cargo 里存在""注入变体依赖探针"三件一起判掉：
+    任何一处断了，红都发生在跑之前，而不是跑完之后没人知道少了什么。
+    """
+    bad: list[str] = []
+    src = (ROOT / "kernel" / "src" / "main.rs").read_text(encoding="utf-8")
+    for tag, const in (("卷A", "FAT_PORT_A"), ("卷B", "FAT_PORT_B")):
+        m = re.search(rf"const {const}: u8 = (\d+);", src)
+        if m is None:
+            bad.append(f"main.rs 里找不到模块层的 `const {const}`（挪回函数体里了？③ 也要读同一块盘，两处各写一份就会分家）")
+            continue
+        port = int(m.group(1))
+        if port not in FAT_PORTS:
+            bad.append(f"{tag}: 内核用口 {port}，本脚本 FAT_PORTS 只有 {sorted(FAT_PORTS)}")
+        elif FAT_PORTS[port] not in FAT_EXPECT:
+            bad.append(f"{tag}: 口 {port} 挂的 `{FAT_PORTS[port]}` 没有指纹登记")
+    if len(set(FAT_PORTS.values())) != len(FAT_PORTS):
+        bad.append("FAT_PORTS 里两块卷重名：同一份夹具不可能同时充当两个判型角色")
+    for name in set(FAT_PORTS.values()):
+        if not FAT_ZZ[name].exists():
+            bad.append(f"夹具源缺失：{FAT_ZZ[name].relative_to(ROOT)}")
+    # 口位不能与已有的盘撞：口 0 是引导 ESP（也是 MBR 那一格的证人），口 2 是 scratch
+    # （`if=ide,index=2` 实测落在 AHCI 口 2）。撞了就是"看着挂上了，其实换了块盘"那种红。
+    taken = {0: "引导 ESP/MBR", 2: "scratch 130 GiB"}
+    for port, name in sorted(FAT_PORTS.items()):
+        if port in taken:
+            bad.append(f"口 {port} 已被 {taken[port]} 占用，却又要挂 {name}")
+
+    feats = (ROOT / "kernel" / "Cargo.toml").read_text(encoding="utf-8")
+    for f in sorted(FAT_FEATURES):
+        if not re.search(rf"^{f} = ", feats, re.M):
+            bad.append(f"Cargo.toml 的 [features] 里没有 {f}，本脚本却按它挂盘")
+    # 注入变体必须依赖探针：否则 `--features fault-fat32-tail` 会编出一个不带 t_fat32 的内核，
+    # 那条负样本永远"没有红"——不是判据不成立，而是被测的东西根本没进镜像。
+    # ③（`fat32-exec`）同理：它复用 ① 的挂载与解析，依赖断了就是一条独立实现的孤儿用例。
+    for f in sorted(FAT_FEATURES - {"fat32-probe"}):
+        m = re.search(rf'^{f} = \[["]([^"]+)["]\]', feats, re.M)
+        if not m or m.group(1) != "fat32-probe":
+            bad.append(f"{f} 应写成 {f} = [\"fat32-probe\"]，实际={m.group(0) if m else '没这条依赖'}")
+    # 探针与 ③ 的代码在 `main.rs`（用例本体），注入的落点在 `fat32.rs`（被测代码里那一行）。
+    # 两条查法不能互换：注入特性不新写用例，只把解析器里那个 `cfg!` 翻开。
+    for f in sorted(FAT_DISK_FEATURES):
+        if f'feature = "{f}"' not in src:
+            bad.append(f'main.rs 里没有 `feature = "{f}"`：这条特性编不出被调用的用例')
+    fat_src = (ROOT / "kernel" / "src" / "filesystem" / "fat32.rs").read_text(encoding="utf-8")
+    for f in sorted(FAT_FAULT_FEATURES):
+        if f'feature = "{f}"' not in fat_src:
+            bad.append(f"fat32.rs 里没有 `feature = \"{f}\"`：注入点被删了，那条负样本是空转")
+
+    # 内核读哪几个文件 = 这台仪器核哪几个文件。两处各写一遍就会分家，而分家的表现是
+    # "对账核的是另一个对象"——那种绿比红更贵。名字表按 want_a 再 want_b 的顺序比。
+    want_names = re.findall(r'Want \{ name: "([^"]+)"', src)
+    declared = list(FAT_READ_NAMES["A"] + FAT_READ_NAMES["B"])
+    if want_names != declared:
+        bad.append(f"main.rs 的 want 表读的名字是 {want_names}，本脚本 FAT_READ_NAMES 核的是 {declared}")
+    for n in FAT_READ_NAMES["MEM"]:
+        if f'vol.open("{n}")' not in src:
+            bad.append(f'内存卷那一本账里没有 `vol.open("{n}")`：这张表核的名字用例不查它')
+    # ③ 读的就是 34 行那张表里的同一个对象；而它打的每一行都是宿主机正则的锚点——
+    # 锚点写坏了的表现是"这一行没读到"而不是"对账不符"，所以要静态确认锚点还在源码里。
+    if 'vol.open("HELLO.ELF")' not in src:
+        bad.append('③ 没有 `vol.open("HELLO.ELF")`：它读的名字与 FAT_READ_NAMES 不是同一个对象')
+    for anchor in ("elfdisk: 目录 大小=", "elfdisk: 段", "elfdisk: 跑后 entry=",
+                   "elfdisk: 负格 元数据说大=", "| 收尾 终止=", "elfload: magic=",
+                   "elfdisk: 尾格溢出 已喂="):
+        if anchor not in src:
+            bad.append(f"串口锚点 `{anchor}` 不在 main.rs 里了：`check_fat32_exec` 的那条正则读成空，"
+                       "第 36 行会报缺行而不是报不符（改日志格式要两处一起改）")
+    # 走链的上界：内核有界、仪器也必须同样有界，否则"两边都有界"这句话里只有一半成立。
+    m = re.search(r"pub const MAX_CLUSTERS_WALKED: u32 = ([\d_]+);", fat_src)
+    if m is None:
+        bad.append("fat32.rs 里找不到 MAX_CLUSTERS_WALKED（本仪器的界与它靠这一行对账）")
+    elif int(m.group(1).replace("_", "")) != FAT_MAX_WALKED:
+        bad.append(f"走链上界不一致：内核={m.group(1)} 本脚本={FAT_MAX_WALKED}")
+    if not FAT_MEM_SCRIPT.exists():
+        bad.append(f"内存卷配方缺失：{FAT_MEM_SCRIPT.relative_to(ROOT)}（那块卷不在仓库里，编不出就等于这个变体不存在）")
+    if len(FAT_MEM_EXPECT[1]) != 64 or len(FAT_EXPECT) != len(FAT_PORTS):
+        bad.append("夹具指纹登记得不完整：每块卷都要有字节数与 64 位十六进制的 sha256")
+    return bad
+
+
 def ovmf_files() -> tuple[Path, Path]:
     """返回 (code 镜像, vars 模板)。
 
@@ -466,6 +1169,12 @@ def do_run(features: list[str], timeout: int, extra: str = "") -> tuple[str, int
         bad = make_vblk()
         if bad:
             sys.exit("virtio 盘造不出来：" + " / ".join(bad))
+    if FAT_FEATURES & set(features):
+        # L3-C①：两块只读 FAT32 卷。夹具跟着"要挂这两块盘"走（与前两块的规矩同一条），
+        # 而且这里**必须**在解压之前先核指纹：内核那一批写死的期望数全是照着这两个字节串量的。
+        bad = make_fat_volumes()
+        if bad:
+            sys.exit("FAT32 夹具不成立：" + " / ".join(bad))
     SERIAL_LOG.unlink(missing_ok=True)
     code, tpl = ovmf_files()
     # vars 每次从模板重拷：上一次运行写入的 NVRAM 启动项不该影响本次判定（可复现）
@@ -486,6 +1195,14 @@ def do_run(features: list[str], timeout: int, extra: str = "") -> tuple[str, int
         # `if=ide,index=2` 实测落在 AHCI 的**口 2**（q35 的内置 ich9-ahci 把 IDE 兼容总线
         # 映射到它的端口上），驱动侧就能在端口表里看到第二块 `sig=0x101 ssts=0x113` 的盘
         cmd += ["-drive", f"if=ide,index=2,format=qcow2,file={SCRATCH}"]
+    if FAT_FEATURES & set(features):
+        # 口号映射沿用 scratch 那一格**实测过**的关系：`if=ide,index=N` 落在 ich9-ahci 的口 N。
+        # 这里不另写一套 `-device ide-hd,bus=ahci0.x`：那条路径没在本机量过，而端口表是内核
+        # 自己扫出来的——接线方式一变，"口 3 挂的是卷A"这件事就得重新找证人。
+        # 证人换成两头的对账：`check-fat32-ports` 比口号，`check_fat32` 比内容（两块卷簇数
+        # 不同，接反了内容对账当场红）。
+        for port, name in sorted(FAT_PORTS.items()):
+            cmd += ["-drive", f"if=ide,index={port},format=raw,file={FAT_IMG[name]}"]
     if VBLK_FEATURES & set(features):
         # `if=none` + 显式 `virtio-blk-pci`：这台设备的寄存器布局由 PCI 能力链说，
         # 不像 ide 那样被 q35 的 AHCI 吃掉槽位。地址不写死，让 QEMU 自己挑空槽——
@@ -1298,6 +2015,45 @@ def check_matrix_wiring() -> list[str]:
     for var, names in by_rc.items():
         if len(names) > 1:
             bad.append(f"共用同一份退出码变量 {var} 的行有 {names} —— 其中至少一行的实际值不是自己那一跑的")
+
+    # 撞车的第三种形状，上面两条都盖不住（本轮实测踩过）：判定值那个名字被**别的语句**重新赋过。
+    # 现场是 `ov = EVF_OV_RE.search(evlog)` 撞上了 `ov, orc, olog = do_run(["fault-heap-oom"])`
+    # ⇒ "L4 堆分配失败"那一行的实际值变成一个 Match 对象，而它的 rc 与日志还是自己那一跑的，
+    # 所以那一行报"不符合"、别的行全绿——看起来像被测物坏了，其实是量具在互相覆盖。
+    # 判定值这一路静态上不好归一（很多行写的是 `"FAIL" if loop_ok else "SEQ-BROKEN"` 这种算式），
+    # 所以只查可判的那一半：被 `do_run` 三元组接过的名字不许再被别的语句赋，反过来也一样。
+    dt = re.search(r"^def do_test\(.*?\n(?=^def [A-Za-z_])", src, re.M | re.S)
+    if not dt:
+        bad.append("没找到 `def do_test` 的函数体（本门禁的变量对账靠它，找不着就是空转）")
+    else:
+        body = dt.group(0)
+        # 判的是**次序**：先接住 `do_run` 的证据、后被别的赋值覆盖，才是那一类事故。
+        # 反过来的那种（先写占位 `strc = -1` 与 `stv, stlog = "HANG", ""`，要带负载时再由
+        # `do_run` 覆盖）是有界窗口被 `STORM_TIMEOUT=0` 跳过时留给那一行打数的，有意设计；
+        # 把它一起报红就是误伤，而误伤的门禁活不过下一次改动。
+        evidence: set[str] = set()
+        seen_any = False
+        clash: set[str] = set()
+        # `^\s*` 不是可有可无的：赋值行全在函数体里带缩进，从行首直接匹配的话两边都会是空的，
+        # 而这条对账就变成**静默绿**——正是它要抓的那种错（本轮第一版写完就是这样，`check` 照样 ok）。
+        # 所以下面还要单独自查"到底解析出东西没有"。
+        for m in re.finditer(r"^\s*(\w+(?:\s*,\s*\w+)*)\s*=\s*(.*)$", body, re.M):
+            targets = {x.strip() for x in m.group(1).split(",") if x.strip()}
+            seen_any = True
+            if "do_run(" in m.group(2):
+                evidence |= targets
+                continue
+            clash |= targets & evidence
+            evidence -= targets      # 覆盖之后它就不再是证据了；再被 `do_run` 赋一次算新的
+        if not seen_any:
+            bad.append("do_test 函数体里一条赋值都没解析出来 ⇒ 下面这两条对账整体空转"
+                       "（缩进或写法变了？改了它就同时改这里）")
+        if not evidence:
+            bad.append("do_test 里一条 `x, y, z = do_run(...)` 都没解析出来 ⇒ 本条对账空转")
+        if clash:
+            bad.append(f"do_test 里这些名字接住 `do_run` 之后又被别的语句覆盖：{sorted(clash)}"
+                       " —— 某一行的实际值因此不再是自己那一跑的（本轮的 `ov` 变成 Match 对象，"
+                       "那一行报不符合而它的退出码与日志都是对的）")
     return bad
 
 
@@ -2593,6 +3349,7 @@ def do_check(elf: Path | None) -> int:
         "check-driver-ctx": lambda: check_driver_no_raw(),
         "check-state-window": lambda: check_state_window(),
         "check-virtio-pattern": lambda: check_virtio_pattern(),
+        "check-fat32-ports": lambda: check_fat32_ports(),
         "check-net-pattern": lambda: check_net_pattern(),
         "check-sha-primitives": lambda: check_sha_primitives(),
         "check-sig-anchor": lambda: check_sig_anchor(),
@@ -2921,6 +3678,62 @@ def do_test(timeout: int) -> int:
     DELIVER_LOG.unlink(missing_ok=True)
     IMAGE.unlink(missing_ok=True)
 
+    print("=== FAT32 只读解析：两块卷挂 AHCI 口 3/4，内核读回的每个数由宿主机再解析一遍 ===")
+    # 内核那十三条判据比的是"自己和写死的期望数"，这一行把它们换成"和另一台实现"：
+    # 几何 14 格、每个文件 12 格、以及引导盘该崩在哪一道闸。两块卷的角色不重叠——
+    # 卷A 是阈值判型的反例，卷B 的簇号高半非零（只取低半会读到 FILLER.BIN 中间去）。
+    IMAGE.unlink(missing_ok=True)
+    fatv, fatrc, fatlog = do_run(["fat32-probe"], timeout)
+    fat_bad = check_fat32(fatlog)
+    fat_verdict = fatv if fatv != "PASS" else ("PASS" if not fat_bad else "CONTENT-MISMATCH")
+    for x in fat_bad:
+        print("    对账:", x)
+
+    print("=== 尾格多喂一个字节（--features fault-fat32-tail）：簇数/EOC/大小全好看，只有哈希对不上 ===")
+    # 这条注入专门盯"尾格只喂真的属于文件的那几个字节"那一句：多喂的那个字节是**文件之后的
+    # 盘上内容**，走字节、走簇、末簇后继每一格都还自洽，红只能红在内容账上。
+    IMAGE.unlink(missing_ok=True)
+    ftv, ftrc, ftlog = do_run(["fault-fat32-tail"], timeout)
+    IMAGE.unlink(missing_ok=True)
+
+    print("=== 用户镜像的来源换成盘：走链喂进缓冲、装进窗口、真跑一遍（--features fat32-exec）===")
+    # 这一行判的不是"读得出来"（34 行判过），而是**换了输入来源之后行为是否不变**：
+    # 段表逐项相同、跑后五格与同一跑里 `elfload:`（内嵌那份）逐字段相同；
+    # 加上"目录项撒谎时不许往下装"那两格（说大 4096 ⇒ 走链先红；截到段末减一 ⇒ 加载器先红）。
+    # 那两格是换成盘之后才存在的一类：内嵌夹具的 size 是我编的，改不动它。
+    IMAGE.unlink(missing_ok=True)
+    exv, exc, exlog = do_run(["fat32-exec"], timeout)
+    ex_bad = check_fat32_exec(exlog)
+    ex_verdict = exv if exv != "PASS" else ("PASS" if not ex_bad else "CONTENT-MISMATCH")
+    for x in ex_bad:
+        print("    对账:", x)
+    IMAGE.unlink(missing_ok=True)
+
+    print("=== 第 36 行的证红：同时带上尾格注入，③ 必须红在「多喂一字节」那一格 ===")
+    # 只要求"这一构建以红收场"的话，任何一条别的用例红了这一行也照样符合 —— 那不是证红，
+    # 那是巧合。所以这一行拿串口那格读数当证人：已喂 + 这一段 = 界 + 1，
+    # 而 `walk` 自报的字节数也是 界 + 1（多喂的那个字节来自文件之后的盘上内容）。
+    # 这一跑还顺带验一件事：③ 的拷贝在被注入推翻"walk 不超过 size"那句承诺时，
+    # 必须**拒绝往下写**而不是越界 —— 后者表现为 panic(39)，量具自己把用例红升级成内核挂。
+    EVF_OV_RE = re.compile(
+        r"elfdisk: 尾格溢出 已喂=(?P<at>\d+) 这段还要喂=(?P<n>\d+) 目录项说=(?P<size>\d+) "
+        r"走链自报字节=(?P<wb>\d+)")
+    evv, evc, evlog = do_run(["fat32-exec", "fault-fat32-tail"], timeout)
+    ovf = EVF_OV_RE.search(evlog)
+    ev_verdict = evv
+    if evv == "FAIL":
+        if ovf is None:
+            ev_verdict = "CONTENT-MISMATCH"
+            print("    对账: 这一跑是 FAIL，但串口没有 `elfdisk: 尾格溢出 …` ⇒ 红不是 ③ 带来的（别的用例红了）")
+        else:
+            at, n, esize, wb = (int(ovf.group(i)) for i in ("at", "n", "size", "wb"))
+            if wb != esize + 1 or at + n != esize + 1:
+                ev_verdict = "CONTENT-MISMATCH"
+                print(f"    对账: 溢出的读数不像「多喂一个字节」：已喂={at} 这段={n} 界={esize} 自报={wb}")
+            else:
+                print(f"    溢出现场 已喂={at} 这段={n} 界={esize} 走链自报={wb} ⇒ 正好多出 1 字节")
+    IMAGE.unlink(missing_ok=True)
+
     rows = [
         ("正向", v, rc, "PASS", 33),
         ("负样本", nv, nrc, "FAIL", 35),
@@ -2993,6 +3806,18 @@ def do_test(timeout: int) -> int:
         # M9-a②：盘上那份签名包，宿主机用自己的实现读一遍、验一遍、再按同一批篡改各验一遍，
         #          两边必须逐条给同一个答案（不是"内核拒了就行"）
         ("签名包两份实现同答案", sig_verdict, sprc, "PASS", 33),
+        # L3-C①：内核从两块卷读回的每一个数（几何 14 格 + 每文件 12 格）由宿主机第二台实现
+        # 逐字段核对；内核绿而对不上 ⇒ CONTENT-MISMATCH，两种成因分得开
+        ("FAT32两卷与宿主机对账", fat_verdict, fatrc, "PASS", 33),
+        # 这一行期望 FAIL：注入让尾格多喂一个字节，走字节/走簇/末簇后继每格还自洽，
+        # 只有内容账不认——没有这条注入，"尾格只喂属于文件的那几个字节"是修辞
+        ("FAT32尾格多喂必须红", ftv, ftrc, "FAIL", 35),
+        # L3-C③：容器来自卷而不是 `.rodata`，段表与跑后的五格都要与内嵌那份同数；
+        # 两台仪器（宿主机的 FAT+ELF 解析、同一跑里的 `elfload:` 读数）都对上才算 PASS
+        ("FAT32读出的镜像装上并跑通", ex_verdict, exc, "PASS", 33),
+        # 第 36 行的证红：把尾格注入叠加到 ③ 上，红必须点名"多喂出来的那一个字节"。
+        # 红了但红在别处 ⇒ 上面已经把实际值改成 CONTENT-MISMATCH，这一行就不会假装符合
+        ("FAT32③多喂一字节红在溢出", ev_verdict, evc, "FAIL", 35),
     ]
     # 每一行对应那一跑的串口：不符时把红的那几格打出来。
     # 单独一张表而不是把日志塞进 `rows` 的元组里：元组要保持成"名字/期望/实际"这种
@@ -3022,6 +3847,10 @@ def do_test(timeout: int) -> int:
         "第一条协议往返与 pcap 对账": rtlog,
         "SHA-256 十三向量与 hashlib 对账": shlog,
         "签名包两份实现同答案": splog,
+        "FAT32两卷与宿主机对账": fatlog,
+        "FAT32尾格多喂必须红": ftlog,
+        "FAT32读出的镜像装上并跑通": exlog,
+        "FAT32③多喂一字节红在溢出": evlog,
     }
     all_ok = True
     print()
