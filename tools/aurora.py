@@ -2517,6 +2517,9 @@ def check_module_interfaces() -> list[str]:
 
     actual: dict[str, set[str]] = {}
     callers: dict[str, set[str]] = {}
+    # site_n：每条实际边的**引用站点数**（按行计）。它是 ADR-044 棘轮的输入——
+    # 环内边只许变瘦不许变胖，否则"消环进度"只能写在文档里靠人自觉。
+    site_n: dict[tuple[str, str], int] = {}
     for path, text in texts.items():
         if path.startswith("ktests/"):
             continue
@@ -2528,9 +2531,12 @@ def check_module_interfaces() -> list[str]:
             b = path2log.get(p)
             if b is None or a == b:
                 continue
-            if re.search(r"\b" + re.escape(short) + r"::|\bcrate::" + re.escape(short) + r"\b", code):
+            n = sum(1 for ln in code.splitlines()
+                    if re.search(r"\b" + re.escape(short) + r"::|\bcrate::" + re.escape(short) + r"\b", ln))
+            if n:
                 actual.setdefault(a, set()).add(b)
                 callers.setdefault(b, set()).add(a)
+                site_n[(a, b)] = site_n.get((a, b), 0) + n
     for a in set(actual) | set(mods):
         got = actual.get(a, set())
         want = set(mods[a].get("dependencies", []))
@@ -2606,6 +2612,30 @@ def check_module_interfaces() -> list[str]:
         if got != sorted(expected):
             bad.append(f"强连通分量与 baseline.known_scc 不符：源码 {got}，基线 {sorted(expected)}"
                        "（新增/消除环都要同步 baseline；拆环是好事，但必须显式更新）")
+
+        # ADR-044 的棘轮：**环内**边的引用站点数只许减不许增。环外的一条向边
+        # （sched->boot 这类）不套棘轮——功能开发本来就会让上层模块的出边变多，
+        # 把它们一起钉住只会逼人放宽判据，那就不是门禁了。
+        ring_nodes = {n for c in got for n in c}
+        measured = {f"{a}->{b}": n for (a, b), n in site_n.items() if a in ring_nodes and b in ring_nodes}
+        ratchet = base.get("ring_edge_sites")
+        if not isinstance(ratchet, dict) or not ratchet:
+            bad.append("缺 [baseline].ring_edge_sites（环内边的站点数棘轮；没有它，消环的进度只体现在散文里）。"
+                       f"当前实测：{dict(sorted(measured.items()))}")
+        else:
+            for k, v in ratchet.items():
+                if "->" not in k or not isinstance(v, int):
+                    bad.append(f"ring_edge_sites 的 {k!r}={v!r} 不是 'a->b'=整数")
+            for k in sorted(set(measured) | set(ratchet)):
+                if k not in ratchet:
+                    bad.append(f"环内新边 {k}（站点 {measured[k]}）未登记棘轮")
+                elif k not in measured:
+                    bad.append(f"ring_edge_sites 的 {k} 已不是环内实际边（基线过期：消掉一条环边要显式删登记）")
+                elif measured[k] > ratchet[k]:
+                    bad.append(f"环内边 {k} 站点数 {measured[k]} > 登记 {ratchet[k]}（ADR-044 棘轮：环内引用只许减不许增）")
+                elif measured[k] < ratchet[k]:
+                    bad.append(f"环内边 {k} 站点数已降到 {measured[k]}（登记 {ratchet[k]}）："
+                               "请把登记一起收紧，否则余量会被下一个人悄悄用掉")
 
     census = unsafe_census()
     for mid, m in mods.items():

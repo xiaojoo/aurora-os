@@ -602,3 +602,54 @@ status = "部分落地"
 known_scc = [
   ["arch", "boot", "diagnostics", "driver", "irq", "memory", "pci", "resource", "storage", "sync", "time"],
 ]
+
+[baseline.ring_edge_sites]
+# ADR-044 的棘轮：环内每条边的引用站点数（check-module-interfaces 按行实测）。
+# 只许减不许增；减了要显式改小，改到 0 就删这一行。环外的单向边不登记。
+# 冻结时点：46 条边、449 个站点、最小割 12 条边。
+"arch->boot" = 2
+"arch->diagnostics" = 19
+"arch->irq" = 2
+"arch->memory" = 21
+"arch->pci" = 4
+"arch->sync" = 8
+"arch->time" = 23
+"boot->diagnostics" = 11
+"boot->sync" = 4
+"diagnostics->arch" = 25
+"diagnostics->memory" = 4
+"diagnostics->storage" = 15
+"diagnostics->sync" = 3
+"diagnostics->time" = 3
+"driver->arch" = 4
+"driver->irq" = 18
+"driver->memory" = 5
+"driver->pci" = 3
+"irq->arch" = 29
+"irq->memory" = 1
+"irq->sync" = 1
+"memory->arch" = 67
+"memory->boot" = 8
+"memory->diagnostics" = 7
+"memory->resource" = 2
+"memory->sync" = 9
+"memory->time" = 2
+"pci->arch" = 2
+"pci->memory" = 9
+"pci->sync" = 1
+"resource->memory" = 1
+"resource->sync" = 3
+"storage->arch" = 51
+"storage->boot" = 1
+"storage->driver" = 2
+"storage->irq" = 1
+"storage->memory" = 12
+"storage->pci" = 13
+"storage->sync" = 12
+"storage->time" = 13
+"sync->arch" = 14
+"sync->diagnostics" = 3
+"sync->time" = 3
+"time->arch" = 3
+"time->diagnostics" = 3
+"time->sync" = 2

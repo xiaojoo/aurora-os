@@ -3434,6 +3434,54 @@ exit_current / preempt_point）。`sched::install_arch_hooks()` 在 `after_switc
 - 文本扫描边界（字符串字面量、跨行宏）未处理；出现误报按“改量具规则 + 负样本”处理。
 - §9.2 crate 提取、§13 P1/P2 仍未开始。
 
+## 96. ADR-044：环的最小割实测，消环改为引用站点数棘轮（2026-11-08）
+
+**问题（实测）**：ADR-043 后剩一个 11 模块环。"下一刀消哪条边"要先回答"是否还存在能拆环的
+单边"。量具 `.scratch/ring_scenarios.py`：与门禁同一套剥注释/排测试规则，DP over subsets 求
+精确最小反馈边集，权重=先最小化边数、再最小化站点数。
+
+**读数（实测）**：
+- 环内 **46 条边 / 449 个引用站点**；互为双向的 **11 组**（`arch` 对 diagnostics/irq/memory/
+  pci/sync/time 六组，diagnostics 对 memory/sync/time 三组，`memory<->resource`、`sync<->time`）
+  ⇒ 最小割下界 11，**精确解 12 条边 / 90 站点**。**没有任何一条边能拆环。**
+- 拆模块不减刀数：`serial` 独立 ⇒ 环 12 / 割 12 / 75 站点；再加 `exit` 独立 ⇒ 环 13 / 割 12 / 69；
+  按关注点拆 `arch`：`smp` 独立 ⇒ 割 12 / 68，加 `trap` ⇒ 割 15 / 63，加 `apic`+`hooks` ⇒
+  割 18 / 51，`irq` 并入 lapic ⇒ 割 17 / 49。
+- 只有合并减刀数：`sync`+`clock`+`tsc`→arch ⇒ 割 8 / 73；+`resource`→memory ⇒ 割 7 / 72；
+  +`irq`→arch ⇒ 割 6 / 71；+`pci`/`hw`/`acpi`→arch ⇒ 割 5 / 76；+`serial`→arch ⇒ 割 5 / 55。
+- 按 `[modules.*].layer` 声明的六层口径统计"低层引用高层"的边：**36 条 / 644 站点**——
+  规范 §2.1 与当前图的距离远大于"再消几条边"。
+
+**做法（实测）**：`check_module_interfaces` 新增第 8 条规则——同一次扫描里按行统计每条实际边
+的站点数，与 `[baseline].ring_edge_sites`（46 行）**逐条相等**：多一处红（只许减不许增），
+少一处也红（要求把登记收紧，否则余量会被下一个人悄悄用掉）。只约束环内边；
+`sched -> boot` 这类单向边不套棘轮。内核源码零改动。
+
+**负样本（实测，先红后绿）**：
+1. 环内 +1：`arch/x86_64/apic.rs` 末尾加 `const _: usize = core::mem::size_of::<mm::ModuleId>();`
+   ⇒ `环内边 arch->memory 站点数 22 > 登记 21（ADR-044 棘轮…）`；还原 ⇒ 绿。
+2. 环内 −1：把 apic.rs 的 `use crate::mm::{self, ModuleId};` 注释掉（纯文本变异，这条闸不编译）
+   ⇒ `站点数已降到 20（登记 21）：请把登记一起收紧…`；还原 ⇒ 绿。
+3. 非环边 +1（范围证明）：`sched.rs` 末尾加 `const _: usize = core::mem::size_of::<crate::limine::MpInfo>();`
+   ⇒ 棘轮不响、本闸零红条（`sched` 不在环内）。
+4. 既有闸咬住本轮：改完登记表而 ADR-044 还没写时 `check-interface-change` 报
+   "有未提交改动，但工作树里没有 ADR 改动"；ADR 落地后转绿。
+   三次变异的源文件按字节还原（sha256 一致），`git diff` 里 `kernel/` 为空。
+
+**读数（实测）**：`check` **16/16**。内核二进制未变 ⇒ 不重跑 41 行矩阵，默认 `run` 53/53
+沿用 ADR-043 那一跑。
+
+**顺手修的过期文本（实测）**：`module-dependencies.md` §5 "确认 15/15" → 16/16；§6 那条
+"产品文件内的 `#[cfg]` 测试代码计入依赖（ahci.rs 产生 `storage -> testing`）"与 ADR-043 冲突，
+已删除并改为写明口径；§6 补"站点按行计"的边界；新增 §7 记录上面三张场景表。
+
+**仍未做（推断/欠账）**：
+- 以"消环"为目标的改造到此为止：环 A 冻结为基线。下一步的结构性价值在功能（W1 阻塞/唤醒、
+  §13 P1 的块设备与中断化驱动），不在第 9 份消环 ADR。
+- `arch` 的"原语 vs SMP/中断入口"关注点分离留给 crate 拆分决策（§9.2，按约定要先问）。
+- 文本扫描的字符串字面量与跨行宏边界；`serial` 专属禁止项与"低层不得引用 main 测试函数"
+  两条尚未机器化；ADR-042 的 `thread_id` 仍无判据。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。
