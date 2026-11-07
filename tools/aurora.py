@@ -1606,6 +1606,10 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
         print("   + QEMU 附加参数:", extra_all)
     t0 = time.time()
     r = None
+    # 接线方式必须留痕：挂死/枚举不到设备的现场，第一件要问的就是"盘真的交给 QEMU 了吗"。
+    # 原来这里只回显附加参数，`-drive` 那几项进不了日志——一次"第二块盘没到 HBA"的
+    # 红因此无法归因（实测：同一条用例经矩阵与 `run` 两条路给出不同读数，日志里看不出差别）。
+    print("   + QEMU 接线:", " ".join(x for x in cmd if x.startswith("-drive") or "qcow2" in x or x == "-M" or "q35" in x))
     try:
         r = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True, timeout=timeout, env=env())
         rc = r.returncode
