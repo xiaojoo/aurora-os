@@ -1515,6 +1515,44 @@ def force_boot_state(failed: int, seq: int = 200) -> None:
     IMAGE.write_bytes(bytes(img))
 
 
+def qmp_snapshot(port: int, cmds: list[str]) -> str:
+    """P2.5 取证通道：向 QMP 发 `human-monitor-command`，把 HMP 原文取回来。
+
+    为什么要有它：挂死那一跑唯一的缺陷是"杀进程之前什么都没看到"——CPU 停在哪个函数
+    只有当场问机器才知道。静态排查已排除无界忙等与锁等待（§107/§108），剩下的候选
+    （故障路径再故障走到 cli+hlt、或机器级停顿）用串口原文分不开。
+    只在 `AURORA_QEMU_QMP=<port>` 时启用：默认跑的命令行一个字符都不变。
+    """
+    import json
+    import socket
+
+    out = []
+    nl = chr(10)
+    try:
+        s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    except OSError as e:
+        return "QMP 连不上（port=" + str(port) + "）：" + repr(e)
+    f = s.makefile("rw", encoding="utf-8")
+    try:
+        out.append("# greeting: " + f.readline().strip())
+        f.write(json.dumps({"execute": "qmp_capabilities"}) + chr(13) + chr(10)); f.flush()
+        out.append("# caps: " + f.readline().strip())
+        for c in cmds:
+            req = {"execute": "human-monitor-command", "arguments": {"command-line": c}}
+            f.write(json.dumps(req) + chr(13) + chr(10)); f.flush()
+            line = f.readline()
+            try:
+                body = json.loads(line).get("return", line)
+                txt = body if isinstance(body, str) else json.dumps(body, ensure_ascii=False)[:4000]
+                out.append("### " + c + nl + txt)
+            except json.JSONDecodeError:
+                out.append("### " + c + nl + line)
+    except OSError as e:
+        out.append("# QMP 读取中断：" + repr(e))
+    finally:
+        s.close()
+    return nl.join(out)
+
 def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str = "") -> tuple[str, int, str]:
     if not QEMU.exists():
         sys.exit(f"QEMU 未就位：{QEMU}")
@@ -1604,17 +1642,36 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
     if extra_all:
         cmd += extra_all.split()
         print("   + QEMU 附加参数:", extra_all)
+    # P2.5：只有设了开关才挂 QMP，且挂上之后超时**先取证再杀**
+    qmp_port = int(os.environ.get("AURORA_QEMU_QMP") or 0)
+    if qmp_port:
+        cmd += ["-qmp", "tcp:127.0.0.1:" + str(qmp_port) + ",server=on,wait=off"]
+        print("   + QMP 取证通道: 127.0.0.1:" + str(qmp_port))
     t0 = time.time()
     r = None
     # 接线方式必须留痕：挂死/枚举不到设备的现场，第一件要问的就是"盘真的交给 QEMU 了吗"。
     # 原来这里只回显附加参数，`-drive` 那几项进不了日志——一次"第二块盘没到 HBA"的
     # 红因此无法归因（实测：同一条用例经矩阵与 `run` 两条路给出不同读数，日志里看不出差别）。
     print("   + QEMU 接线:", " ".join(x for x in cmd if x.startswith("-drive") or "qcow2" in x or x == "-M" or "q35" in x))
-    try:
-        r = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True, timeout=timeout, env=env())
-        rc = r.returncode
-    except subprocess.TimeoutExpired:
-        rc = -1
+    if qmp_port:
+        with subprocess.Popen(cmd, cwd=str(ROOT), stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True, env=env()) as proc:
+            try:
+                proc.communicate(timeout=timeout)
+                rc = proc.returncode
+            except subprocess.TimeoutExpired:
+                dump = qmp_snapshot(qmp_port, ["info registers -a", "info lapic", "info pic"])
+                (BUILD / "qmp-hang.txt").write_text(dump, encoding="utf-8")
+                print("   + 挂死现场已存 build/qmp-hang.txt（" + str(len(dump)) + " 字节）")
+                proc.kill()
+                proc.communicate()
+                rc = -1
+    else:
+        try:
+            r = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True, timeout=timeout, env=env())
+            rc = r.returncode
+        except subprocess.TimeoutExpired:
+            rc = -1
     # 必须显式按 UTF-8 读：内核写的是 UTF-8，而 `read_text()` 不带 encoding 时用本机默认
     # 编码（这台机是 GBK），中文日志全部变乱码——于是任何按中文锚点的判据都会读成"零条记录"。
     # 实测踩过：内容对账第一次跑报"串口里只有 0 条块读记录"，而记录明明在。
