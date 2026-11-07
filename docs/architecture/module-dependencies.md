@@ -43,7 +43,7 @@ Boot / Platform     (boot)
 | pci | arch, memory, sync |
 | irq | arch, memory, sync |
 | storage | arch, boot, driver, irq, memory, pci, sync, testing, time |
-| diagnostics | arch, memory, sched, storage, sync, time |
+| diagnostics | arch, memory, storage, sync, time |
 | security | （无产品路径出边；签名目前只在用例里调用） |
 | time | arch, diagnostics, sync |
 | capability | arch, memory, pci, sched, storage, sync, testing, time |
@@ -53,23 +53,24 @@ Boot / Platform     (boot)
 
 ## 3. 循环依赖基线（实测）
 
-当前实际图有**一个 14 模块的强连通分量**：
+当前实际图有**两个强连通分量**（ADR-042 后实测）：
 
 ```text
-arch · boot · capability · diagnostics · driver · irq · memory · pci
-· resource · sched · storage · sync · testing · time
+环 A（12）：arch · boot · diagnostics · driver · irq · memory · pci
+            · resource · storage · sync · testing · time
+环 B（2）：capability · sched
 ```
 
-`security` 与 `integration` 不在环里。这意味着目标分层目前**没有成立**：任何“低层不得
-反向依赖高层”的说法，在这 14 个模块之间都还不成立。`[baseline].known_scc` 把这一现状
+`security` 与 `integration` 仍是单点。这意味着目标分层目前**没有成立**：任何“低层不得
+反向依赖高层”的说法，在环 A 的 12 个模块之间都还不成立。`[baseline].known_scc` 把现状
 冻结：**新增环成员或改变环的划分 ⇒ `check-module-interfaces` 红**。拆环是好事，但必须
 显式更新 baseline，并在 BACKLOG 记一条“环缩小了”。
 
-ADR-040 已消掉 `arch -> sched` 这条 §2.2 明示的 forbidden 边（经 `hooks` 表反转），
-`arch.known_violations` 现在为空。ADR-041 又把唯一一条 `memory -> sched`（VA 保留表的
-编译期容量依赖）改成“memory 拥有容量 + sched 编译期断言适配”。
-但强连通分量仍是 14——`memory -> diagnostics -> sched -> memory` 等其它路径仍闭合。
-本文件不把“环没变小”写成“拆环完成”。
+消环记录：ADR-040 消 `arch -> sched`（hooks 表反转）；ADR-041 消 `memory -> sched`
+（memory 拥有 VA 容量 + sched 编译期断言）；ADR-042 消 `diagnostics -> sched`
+（crash 的 thread_id 经 hooks 取）。三刀之后 `sched` 从 14 模块大环里分离，
+只剩与 `capability` 的二环（`handle.rs` 读任务身份，`sched` 回收时撤销句柄）。
+`sched -> boot` / `sched -> storage` 仍在，但已不构成环。
 
 ## 4. 门禁规则（`check-module-interfaces`）
 
@@ -107,3 +108,6 @@ ADR-040 已消掉 `arch -> sched` 这条 §2.2 明示的 forbidden 边（经 `ho
 - `hooks` 归入 `arch` 逻辑模块；`arch` 源码不再直接引用 `sched` / `user`（注释除外，扫描已剥注释）。
 - `memory` 不再引用 `sched`；VA 保留容量由 `mm::MAX_TASKS_SUPPORTED` 拥有，sched 的
   `MAX_TASKS` 用 `const _: () = assert!(...)` 适配。
+- `diagnostics` 不再引用 `sched`；崩溃记录的 `thread_id` 经 `hooks::sched().current_id` 取。
+- 环 B 的 `capability ↔ sched` 是下一刀的候选；`sched -> boot` / `sched -> storage`
+  是单向依赖，不在环里但仍是分层欠账。

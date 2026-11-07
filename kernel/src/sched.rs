@@ -1102,6 +1102,7 @@ pub fn install_arch_hooks() {
         bump_current_work,
         syscall_dispatch: crate::user::syscall_dispatch,
         park_current: crate::user::park_current,
+        current_id,
         exit_current,
         preempt_point: preempt_hook,
     });

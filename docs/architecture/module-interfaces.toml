@@ -235,7 +235,6 @@ public_api = [
   "elf::parse",
   "sched::OwnedSet",
   "sched::TaskState",
-  "sched::current_id",
   "sched::current_identity",
   "sched::identity_of",
   "sched::init_boot_task",
@@ -268,7 +267,7 @@ public_api = [
   "user::syscall_dispatch",
   "user::write_at",
 ]
-allowed_callers = ["capability", "diagnostics", "integration"]
+allowed_callers = ["capability", "integration"]
 dependencies = ["arch", "boot", "capability", "diagnostics", "memory", "storage", "sync", "time"]
 forbidden_dependencies = []
 known_violations = []
@@ -465,7 +464,7 @@ public_api = [
   "watchdog::stats",
 ]
 allowed_callers = ["arch", "boot", "integration", "memory", "sched", "sync", "testing", "time"]
-dependencies = ["arch", "memory", "sched", "storage", "sync", "time"]
+dependencies = ["arch", "memory", "storage", "sync", "time"]
 forbidden_dependencies = []
 known_violations = []
 context = ["BOOT", "KERNEL", "IRQ_OFF", "ISR_TOP", "PANIC"]
@@ -627,5 +626,6 @@ status = "部分落地"
 [baseline]
 # 当前产品代码的强连通分量（Task B 冻结基线）：新增环成员或改环 ⇒ check 红。
 known_scc = [
-  ["arch", "boot", "capability", "diagnostics", "driver", "irq", "memory", "pci", "resource", "sched", "storage", "sync", "testing", "time"],
+  ["arch", "boot", "diagnostics", "driver", "irq", "memory", "pci", "resource", "storage", "sync", "testing", "time"],
+  ["capability", "sched"],
 ]

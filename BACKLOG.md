@@ -3383,6 +3383,30 @@ exit_current / preempt_point）。`sched::install_arch_hooks()` 在 `after_switc
 - §9.2 第二到第五步的 crate 提取；§13 P1/P2 项仍开。
 - `MAX_TASKS_SUPPORTED = 8` 与 `MAX_CPUS = 8` 仍是固定值；动态容量需要新的容量模型。
 
+## 94. ADR-042：crash 的 thread_id 经 hooks 取，SCC 首次缩小（2026-11-08）
+
+**做法（实测）**：`SchedHooks` 增加 `current_id: fn() -> usize`；sched 在
+`install_arch_hooks()` 里安装；`crash.rs` 的 `thread_id` 改调
+`(crate::hooks::sched().current_id)()`。不新增 unsafe，不改崩溃记录格式。
+
+**读数（实测）**：
+- `diagnostics.dependencies` 去掉 `sched`；`check` 16/16；默认注册 53、默认跑 53/53。
+- 默认启动日志 2/2 跑与 ADR-041 记录 **789 行逐行同序、多重集差异 0**。
+- `test` 一次通过 **41/41**（exit=0）。
+- **SCC 首次缩小**：从 14 模块一环变为
+  `环 A（12）：arch/boot/diagnostics/driver/irq/memory/pci/resource/storage/sync/testing/time`
+  + `环 B（2）：capability/sched`；`[baseline].known_scc` 已按实测更新。
+- `sched -> boot` / `sched -> storage` 仍在，但已不构成环。
+- 负样本：把 crash.rs 改回 `crate::sched::current_id()` ⇒ 门禁同时点名
+  `diagnostics.dependencies 多 ['sched']`、`sched.allowed_callers 多 ['diagnostics']`、
+  以及 SCC 从 12+2 合回 14；还原后绿。这一条同时证明接口边与 SCC 基线都会咬。
+- `thread_id` 目前**没有独立判据**（只被记录、不被用例比较），不写成已验证语义。
+
+**仍未做（推断/欠账）**：
+- 环 A（12 模块）仍是主要结构债；环 B（capability↔sched）是下一刀候选。
+- `sched -> boot`（Safe 模式检查）与 `sched -> storage`（从盘装载）是单向跨层依赖。
+- §9.2 crate 提取、§13 P1/P2 仍未开始。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

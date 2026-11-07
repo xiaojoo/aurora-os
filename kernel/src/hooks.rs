@@ -14,6 +14,7 @@ pub struct SchedHooks {
     pub bump_current_work: fn(),
     pub syscall_dispatch: fn(&mut TrapFrame) -> bool,
     pub park_current: fn(&mut TrapFrame),
+    pub current_id: fn() -> usize,
     pub exit_current: fn(usize),
     /// 安全契片由 sched 安装；调用点必须在异常出口。
     pub preempt_point: fn(u64, usize),
@@ -34,6 +35,9 @@ fn no_syscall(_: &mut TrapFrame) -> bool {
     false
 }
 fn no_park(_: &mut TrapFrame) {}
+fn no_id() -> usize {
+    0
+}
 fn no_exit(_: usize) {}
 fn no_preempt(_: u64, _: usize) {}
 
@@ -44,6 +48,7 @@ static HOOKS: HooksCell = HooksCell(UnsafeCell::new(SchedHooks {
     bump_current_work: no_bump,
     syscall_dispatch: no_syscall,
     park_current: no_park,
+    current_id: no_id,
     exit_current: no_exit,
     preempt_point: no_preempt,
 }));
