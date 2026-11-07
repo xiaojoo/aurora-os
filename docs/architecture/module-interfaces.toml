@@ -147,7 +147,7 @@ public_api = [
   "x86_64::cpuid",
   "x86_64::trap",
 ]
-allowed_callers = ["capability", "diagnostics", "driver", "integration", "irq", "memory", "pci", "sched", "storage", "sync", "time"]
+allowed_callers = ["diagnostics", "driver", "integration", "irq", "memory", "pci", "sched", "storage", "sync", "time"]
 dependencies = ["boot", "diagnostics", "irq", "memory", "pci", "sync", "time"]
 forbidden_dependencies = ["sched"]
 known_violations = []
@@ -210,7 +210,7 @@ public_api = [
   "mm::usable_bytes",
   "mm::with_vmm_lock",
 ]
-allowed_callers = ["arch", "capability", "diagnostics", "driver", "integration", "irq", "pci", "resource", "sched", "storage"]
+allowed_callers = ["arch", "diagnostics", "driver", "integration", "irq", "pci", "resource", "sched", "storage"]
 dependencies = ["arch", "boot", "diagnostics", "resource", "sync", "time"]
 forbidden_dependencies = ["storage"]
 known_violations = []
@@ -234,40 +234,17 @@ public_api = [
   "elf::describe",
   "elf::parse",
   "sched::OwnedSet",
-  "sched::TaskState",
   "sched::current_identity",
-  "sched::identity_of",
-  "sched::init_boot_task",
   "sched::install_arch_hooks",
   "sched::kill_current",
   "sched::mark_need",
   "sched::p1_stats",
   "sched::p1_with_samples",
-  "sched::reap_released",
-  "sched::spawn_user",
-  "sched::start_workers",
-  "sched::state_of",
   "sched::ticks_of",
-  "sched::wait_for_boot_task",
-  "user::ABI_SLOT_FLAG",
-  "user::COPY_MAX",
-  "user::E_BAD_HANDLE",
-  "user::E_DENIED",
-  "user::E_FAULT",
-  "user::E_INVALID",
-  "user::E_TOO_LONG",
-  "user::FLAG_EXIT",
-  "user::F_HANDLES",
-  "user::abi_word",
-  "user::copy_from_user",
-  "user::describe_load",
-  "user::load",
   "user::park_current",
-  "user::served",
   "user::syscall_dispatch",
-  "user::write_at",
 ]
-allowed_callers = ["capability", "integration"]
+allowed_callers = ["integration"]
 dependencies = ["arch", "boot", "capability", "diagnostics", "memory", "storage", "sync", "time"]
 forbidden_dependencies = []
 known_violations = []
@@ -349,7 +326,7 @@ public_api = [
   "pci::info",
   "pci::init",
 ]
-allowed_callers = ["arch", "capability", "driver", "integration", "storage"]
+allowed_callers = ["arch", "driver", "integration", "storage"]
 dependencies = ["arch", "memory", "sync"]
 forbidden_dependencies = ["storage"]
 known_violations = []
@@ -398,7 +375,6 @@ owner = "storage"
 layer = "service"
 source_modules = ["ahci", "virtio", "filesystem", "filesystem/fat32", "filesystem/vfs"]
 public_api = [
-  "ahci::FNV_OFFSET",
   "ahci::REG_CAP",
   "ahci::REG_GHC",
   "ahci::SECTOR",
@@ -407,15 +383,13 @@ public_api = [
   "ahci::init",
   "ahci::read_bytes",
   "ahci::write_bytes",
-  "fat32::Volume",
   "filesystem::fat32",
   "filesystem::vfs",
   "vfs::AhciDisk",
-  "vfs::MemDisk",
   "vfs::SECTOR_BYTES",
 ]
 allowed_callers = ["capability", "diagnostics", "integration", "sched"]
-dependencies = ["arch", "boot", "driver", "irq", "memory", "pci", "sync", "testing", "time"]
+dependencies = ["arch", "boot", "driver", "irq", "memory", "pci", "sync", "time"]
 forbidden_dependencies = []
 known_violations = []
 context = ["KERNEL", "IRQ_OFF", "ISR_TOP"]
@@ -519,7 +493,7 @@ public_api = [
   "tsc::stage",
   "tsc::total_stages",
 ]
-allowed_callers = ["arch", "capability", "diagnostics", "integration", "memory", "sched", "storage", "sync"]
+allowed_callers = ["arch", "diagnostics", "integration", "memory", "sched", "storage", "sync"]
 dependencies = ["arch", "diagnostics", "sync"]
 forbidden_dependencies = []
 known_violations = []
@@ -547,7 +521,7 @@ public_api = [
   "handle::revoke_task",
 ]
 allowed_callers = ["sched"]
-dependencies = ["arch", "memory", "pci", "sched", "storage", "sync", "testing", "time"]
+dependencies = ["storage", "sync"]
 forbidden_dependencies = []
 known_violations = []
 context = ["KERNEL", "USER_ENTRY"]
@@ -588,7 +562,7 @@ public_api = [
   "ktest::KTest",
   "ktest::run_all",
 ]
-allowed_callers = ["capability", "integration", "storage"]
+allowed_callers = ["integration"]
 dependencies = ["diagnostics"]
 forbidden_dependencies = []
 known_violations = []
@@ -626,6 +600,5 @@ status = "部分落地"
 [baseline]
 # 当前产品代码的强连通分量（Task B 冻结基线）：新增环成员或改环 ⇒ check 红。
 known_scc = [
-  ["arch", "boot", "diagnostics", "driver", "irq", "memory", "pci", "resource", "storage", "sync", "testing", "time"],
-  ["capability", "sched"],
+  ["arch", "boot", "diagnostics", "driver", "irq", "memory", "pci", "resource", "storage", "sync", "time"],
 ]

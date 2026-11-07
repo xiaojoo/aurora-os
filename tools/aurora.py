@@ -2488,9 +2488,32 @@ def check_module_interfaces() -> list[str]:
             if sym not in pubs.get(path, set()):
                 bad.append(f"{mid}.public_api: {path} 没有 pub 符号 {sym}")
 
-    # 实际依赖边：剥 // 注释，排除 ktests/*，按短名引用统计。
-    def strip_comments(text: str) -> str:
-        return "\n".join(re.sub(r"//.*$", "", ln) for ln in text.splitlines())
+    # 实际依赖边：只统计**产品路径**。剥 // 注释、排除 ktests/*，并跳过产品文件里的
+    # `mod tests { ... }` 块——测试代码不是模块接口；把它算进来会造出假的环
+    # （ADR-043：capability↔sched 就是 handle.rs 的 mod tests 造成的）。
+    def strip_product(text: str) -> str:
+        out = []
+        depth = 0
+        skip_at = None
+        for ln in text.splitlines():
+            code = ln.split("//", 1)[0]
+            s = code.strip()
+            if skip_at is None:
+                is_mod = (s.startswith("mod ") or s.startswith("pub mod ")) and "tests" in s.split("{")[0] and "{" in s
+                is_fn = (s.startswith("fn t_") or s.startswith("pub fn t_") or s.startswith("pub(crate) fn t_")) and "{" in s
+                if is_mod or is_fn:
+                    skip_at = depth
+                if "ktest!(" in code:
+                    out.append("")
+                    continue
+            depth += code.count("{") - code.count("}")
+            if skip_at is not None:
+                if depth <= skip_at:
+                    skip_at = None
+                out.append("")
+            else:
+                out.append(code)
+        return "\n".join(out)
 
     actual: dict[str, set[str]] = {}
     callers: dict[str, set[str]] = {}
@@ -2500,7 +2523,7 @@ def check_module_interfaces() -> list[str]:
         a = path2log.get(path) or path2log.get(path.split("/")[0])
         if a is None:
             continue
-        code = strip_comments(text)
+        code = strip_product(text)
         for short, p in short2path.items():
             b = path2log.get(p)
             if b is None or a == b:

@@ -3407,6 +3407,33 @@ exit_current / preempt_point）。`sched::install_arch_hooks()` 在 `after_switc
 - `sched -> boot`（Safe 模式检查）与 `sched -> storage`（从盘装载）是单向跨层依赖。
 - §9.2 crate 提取、§13 P1/P2 仍未开始。
 
+## 95. ADR-043：依赖图只统计产品路径，SCC 缩到 11（2026-11-08）
+
+**发现（实测）**：ADR-042 后剩下的 `capability ↔ sched` 二元环不是产品代码的环——
+`handle.rs` 里所有 `crate::sched::` 都在 `mod tests` 内；`storage -> testing` 同理来自
+`filesystem/fat32.rs` 的 `mod cursor_tests`。量具把测试代码算成了模块依赖。
+
+**做法（实测）**：`check-module-interfaces` 与登记表生成器在统计依赖边/产品接口前剥掉：
+`mod *tests*` 块、顶层 `fn t_*` 块、含 `ktest!(` 的注册行；`ktests/*` 继续整体排除。
+无内核源码改动，只改 `tools/aurora.py`、登记表与文档。
+
+**读数（实测）**：
+- SCC：从 ADR-042 的 `12 + 2` 变为**一个 11 模块环**
+  `arch/boot/diagnostics/driver/irq/memory/pci/resource/storage/sync/time`；
+  `capability`、`sched`、`testing`、`security`、`integration` 是单点。
+- `capability.dependencies` 从 8 项降到 `storage, sync`；`storage` 去掉 `testing`；
+  `sched.allowed_callers` 只剩 `integration`。
+- `check` 16/16；内核二进制未变，默认 53/53 沿用 ADR-042；不重跑 41 行矩阵。
+- 负样本（证明排除有边界）：在产品作用域给 handle.rs 加
+  `const _: fn() -> usize = crate::sched::current_id;` ⇒ 门禁点名
+  `capability.dependencies 多 ['sched']`、`sched.allowed_callers 多 ['capability']`，
+  SCC 合回 `11+2`；同一行移进 `mod tests` ⇒ 绿；删除 ⇒ 绿。
+
+**仍未做（推断/欠账）**：
+- 11 模块环 A 仍是主要结构债；`sched -> boot` / `sched -> storage` 是单向跨层依赖。
+- 文本扫描边界（字符串字面量、跨行宏）未处理；出现误报按“改量具规则 + 负样本”处理。
+- §9.2 crate 提取、§13 P1/P2 仍未开始。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。
