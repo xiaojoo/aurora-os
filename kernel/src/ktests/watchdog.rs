@@ -1,7 +1,7 @@
 //! 看门狗采样用例（T0.1 纯搬移）。
 
 use crate::arch::x86_64::{apic, cpu};
-use crate::{clock, tsc, watchdog};
+use crate::{acpi, clock, tsc, watchdog};
 use crate::ktest;
 
 /// M6-c①：§9.6 的软锁死。七格，每格只挡一类错法：
@@ -16,6 +16,14 @@ use crate::ktest;
 /// 用例每格之间用 TSC 等 30 ms 真实时间（比 10 ms 的定时周期宽三倍）。
 fn t_watchdog() -> bool {
     use watchdog as wd;
+    // 用例自足（T0.1 顺序暴露）：`timer_start`/`timer_stop` 都要 APIC 已初始化；
+    // 否则它们返回 Err 被 `.ok()` 吞掉，下面"停表"那几窗其实没停，报警永远不会来。
+    let Some(s) = acpi::summary() else { return false };
+    let Some(m) = s.madt else { return false };
+    if apic::get_or_init(&m).is_err() {
+        crate::log_fatal!("watchdog: APIC 起不来");
+        return false;
+    }
     let saved = wd::stats();
     let bsp = cpu::BSP_SLOT;
     // 每格之间的真实时间：30 ms 比 10 ms 的定时周期宽三倍，健康核一定前进，停掉的核一定不前进

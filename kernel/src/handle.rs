@@ -811,6 +811,8 @@ mod tests {
             return false;
         };
         // 开时钟让它自己退出；`drain_reap` 要靠 tick 把 reap 叫起来，所以时钟到 drain 之后再停。
+        // 用例自足（T0.1 顺序暴露）：释放可能在本窗口之前就已完成，窗口里自然看不到增量。
+        let released0 = crate::sched::reap_released();
         crate::apic::timer_start().ok();
         crate::apic::with_interrupts(|| {
             let t0 = crate::tsc::now();
@@ -823,7 +825,7 @@ mod tests {
                 crate::log_fatal!("handle-reap: 窗口收不了场");
             }
         });
-        let drained = crate::drain_reap();
+        let drained = crate::drain_reap() || crate::sched::reap_released() > released0;
         crate::apic::timer_stop().ok();
         let state = crate::sched::state_of(t);
         let c = counters();

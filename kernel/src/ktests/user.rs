@@ -259,6 +259,13 @@ fn t_task_exit() -> bool {
         crate::log_fatal!("exit: APIC 起不来");
         return false;
     }
+    // 用例自足（T0.1 顺序暴露）：落脚页是**全局设施**，第一次 `user::load` 才建。
+    // 它名下的 1 条 VA 保留 + 1 个 MOD_USER 页框会记进第一轮的账里，于是"第一轮是否回账"
+    // 取决于本用例是不是第一个装载者。先把它建好，基线才真的是"本用例开始时的账"。
+    if user::ensure_trampoline().is_none() {
+        crate::log_fatal!("exit: 落脚页建立失败");
+        return false;
+    }
     let base_res = mm::reservation_count();
     let base_live = resource::live_of(user::MOD_USER);
     let base_released = sched::reap_released();
@@ -337,6 +344,7 @@ fn t_task_exit() -> bool {
     };
     let mut two_ran = false;
     if l2.segs >= 1 {
+        let r2_base = sched::reap_released();
         user::clear_counters();
         // 通过 SMAP 窗口往它的 flag 格写非 0：程序跑完调用序列之后就自己结束。
         // 这一步同时是 §10.3 的最小预览（内核开窗口**写**用户页），不是测试专用的后门。
@@ -354,7 +362,9 @@ fn t_task_exit() -> bool {
                 });
                 // SYS_EXIT 的释放是**延迟**的（那一刻它还站在自己的内核栈上），
                 // 必须等到本 CPU 出现下一次抢占，所以这一处 `drain` 是真判据。
-                let drained = drain_reap();
+                // 但延迟可能在本窗口结束前就完成了：`drain_reap` 只认"它自己的窗口里有增量"，
+                // 于是"释放已经发生"会被读成"没等到"。以**本轮开始前**为基线，两者取或。
+                let drained = drain_reap() || sched::reap_released() > r2_base;
                 let exits = user::exits();
                 // 回收前后的两个独立读数：槽里还牵着几条映射、代码页还在不在。
                 // 只看"能不能再装载一次"会漏掉"装得上是因为它换了地址"这类假绿。

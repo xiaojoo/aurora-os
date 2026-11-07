@@ -1315,7 +1315,6 @@ fn t_irq_affinity() -> bool {
         crate::log_fatal!("irq-aff: 没有第二颗上线的 CPU ⇒ 这一格在量它没有的东西");
         return false;
     };
-    let before = irq::by_cpu();
     let moves0 = irq::moves();
 
     // ---- 一次"开中断窗口读 LBA 1"，回来报按 CPU 的分布 ----
@@ -1356,8 +1355,15 @@ fn t_irq_affinity() -> bool {
         }
     };
     let dest_a = ahci::affinity_dest() == Some(ap_id);
+    // 用例自足（T0.1 顺序暴露）：改完目的地后先做一次**不计数**的读，把移动前已经在途的
+    // MSI（落在旧目的地）吸收掉；基线在排空之后取，才真的是"这一步开始时的投递分布"。
+    let _ = step("排空到AP前");
+    let before = irq::by_cpu();
     let (mid, mid_served) = step("移到AP后");
     // ② 移回 BSP
+    // 回移的基线取在**搬到 AP 那一步之后、改目的地之前**：这中间不许再产生 AP 投递，
+    // 否则宿主机那台仪器会看到"收尾的非 BSP 比移动窗口里多"，那正是它在防的半程错。
+    let back_base = irq::by_cpu();
     let (same_b, slot_b, msg_b) = match ahci::set_affinity(bsp_id) {
         Ok(v) => v,
         Err(e) => {
@@ -1374,9 +1380,9 @@ fn t_irq_affinity() -> bool {
     let landed = mid[ap_slot] > before[ap_slot];
     let not_bsp = mid[0] == before[0];
     // 移回之后 BSP 继续涨、而非 BSP 一格都不再涨——这条排除"表里改了而设备没改"那种半程错
-    let non_mid: usize = mid[1..].iter().sum();
     let non_after: usize = after[1..].iter().sum();
-    let back_ok = after[0] > mid[0] && non_after == non_mid;
+    let non_back: usize = back_base[1..].iter().sum();
+    let back_ok = after[0] > back_base[0] && non_after == non_back;
     let moves_ok = irq::moves() == moves0 + 2;
     // 73f：服务那一侧也要按 CPU 看得见。`step` 每步开头把账归零，所以读数就是"这一步里谁服务过"：
     // 目的地在 AP 那一步，顶半只能出现在 AP 那格；搬回 BSP 那一步反过来。

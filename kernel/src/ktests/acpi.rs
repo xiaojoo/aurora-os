@@ -1,8 +1,9 @@
 //! ACPI 固定布局表、MADT 与 RSDP 用例（T0.1 纯搬移）。
+use crate::mp_snapshot;
 
 use crate::arch::x86_64::{apic};
 use crate::{acpi, limine, mm};
-use crate::{RSDP_VA, mp_snapshot};
+use crate::{RSDP_VA};
 use crate::ktest;
 use core::sync::atomic::{Ordering};
 

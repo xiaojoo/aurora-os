@@ -24,6 +24,13 @@ fn t_timer_ticks_recur() -> bool {
     }
     let before = apic::counts();
     let c0 = apic::ticks();
+    // 用例自足（T0.1 顺序暴露）：P5 的逐桶账是**全局累计**的，前面的用例可能留下一个
+    // "走 context_load 出口、没有向量桶"的样本（`p3_record_irq` 对 v<32 也 +1）。
+    // 绝对数相等因此依赖顺序；这里只比**本用例窗口内的增量**（与下面 tick 基线同一条规矩）。
+    let p5_0 = trap::p5_irq_stats();
+    let hist0 = trap::p5_hist_of(crate::arch::x86_64::cpu::BSP_SLOT);
+    let non_irq0 = trap::p5_non_irq();
+    let rust0: usize = before.irq.iter().sum::<usize>() + before.unexpected + before.spurious;
     // 基线必须是**相对的**：`apic::ticks()` 是全局累计值，前面跑过的抢占用例
     // 已经把它推到 9，用绝对数 2 判断"等到两次 tick"就永远立刻成立（实测踩过：
     // 窗口一次都没等，t1==c0，用例红）。表的枚举顺序不由源码顺序决定，
@@ -93,38 +100,48 @@ fn t_timer_ticks_recur() -> bool {
     // **逐向量比对**，不是只比总数：总数相等可以藏住"IRQ0 多一个、IRQ1 少一个"，
     // 而这一轮要查的正是一个样本的来路（`asm=47 / rust=46`、非 ISA 桶 = 0 ⇒
     // 差的那一个落在 32..47 里面，总数判据到此已经给不出更多信息了）。
+    // 比的是**增量**：读数与基线同一形状，顺序不再影响绝对数。
     let hist = trap::p5_hist_of(crate::arch::x86_64::cpu::BSP_SLOT);
+    let p5_delta = p5.faults - p5_0.faults;
+    let rust_delta = rust_total - rust0;
+    let non_irq_delta = non_irq - non_irq0;
+    let mut hist_delta = hist;
+    let mut irq_delta = cc.irq;
+    for i in 0..hist_delta.len() {
+        hist_delta[i] -= hist0[i];
+        irq_delta[i] -= before.irq[i];
+    }
     let mut hist_bad = 0usize;
     let mut first_diff = "";
-    for i in 0..hist.len() {
-        if hist[i] != cc.irq[i] as u64 {
+    for i in 0..hist_delta.len() {
+        if hist_delta[i] != irq_delta[i] as u64 {
             hist_bad += 1;
             if first_diff.is_empty() {
                 first_diff = "见下行";
                 crate::log_fatal!(
-                    "p5 逐向量不一致 vec={}：P5样本={} 驱动计数={}",
-                    trap::VEC_IRQ_BASE + i, hist[i], cc.irq[i]
+                    "p5 逐向量不一致 vec={}：P5增量={} 驱动增量={}",
+                    trap::VEC_IRQ_BASE + i, hist_delta[i], irq_delta[i]
                 );
             }
         }
     }
     // 逐桶相等 + "P5 总数 == 各桶之和 + 非 ISA 桶"（后者是**自洽检查**：
     // 它抓的是"有一次进桩没进任何桶"，那种漏法逐桶比对看不出来）。
-    let bucketed: u64 = hist.iter().sum::<u64>() + non_irq;
+    let bucketed: u64 = hist_delta.iter().sum::<u64>() + non_irq_delta;
     let instruments_agree =
-        hist_bad == 0 && p5.faults as usize == rust_total && bucketed == p5.faults;
+        hist_bad == 0 && p5_delta as usize == rust_delta && bucketed == p5_delta;
     crate::log_info!(
         "timer 判据逐项: recurring={} drained={} again={} if_gates={} clean={} eoi_per_irq={} (eoi_delta={} ticks_delta={}) instruments_agree={}",
         recurring, drained, again, if_gates, clean, eoi_per_irq, after.eois - before.eois, t2 - c0, instruments_agree
     );
     crate::log_info!(
         "p5 cross-check: asm_samples={} rust_samples={} 非ISA样本={} 入桶合计={} 不一致桶={}({}) agree={}",
-        p5.faults, rust_total, non_irq, bucketed, hist_bad, first_diff, instruments_agree
+        p5_delta, rust_delta, non_irq_delta, bucketed, hist_bad, first_diff, instruments_agree
     );
     crate::log_info!(
         "p5 hist: P5={:?} 驱动={:?}",
-        hist,
-        &cc.irq[..hist.len()]
+        hist_delta,
+        &irq_delta[..hist_delta.len()]
     );
     // 这个数只能叫**窗口均值**，不能叫周期：窗口里第一个间隔可能不完整，均值必然是周期的
     // 下界（实测 2 ticks / 47,831,965 cycles ⇒ 均值 23.9M，而标定给的真周期是 33.3M）。

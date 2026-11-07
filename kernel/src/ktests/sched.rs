@@ -46,10 +46,23 @@ fn t_preempt_round_robin() -> bool {
     }
     sched::init_boot_task();
     sched::start_workers();
-    if sched::spawn(sched_worker).is_err() || sched::spawn(sched_worker).is_err() {
-        crate::log_fatal!("sched: spawn 失败");
-        return false;
-    }
+    // 用例自足（T0.1 顺序暴露）：任务下标不是常量。前面的用例可能已经占掉 1、2 两格，
+    // 这里必须用 spawn 交回的下标读数，不能写死——否则两条工人跑在别的槽里，
+    // `WORK[1]/WORK[2]` 读到的是别人留下的数。判据本身的语义不变：两条工人都推进过。
+    let w1 = match sched::spawn(sched_worker) {
+        Ok(v) => v,
+        Err(_) => {
+            crate::log_fatal!("sched: spawn 失败");
+            return false;
+        }
+    };
+    let w2 = match sched::spawn(sched_worker) {
+        Ok(v) => v,
+        Err(_) => {
+            crate::log_fatal!("sched: spawn 失败");
+            return false;
+        }
+    };
     let (sw0, tk0, _) = sched::stats();
     let boot0 = sched::WORK[0].load(Ordering::Relaxed);
     apic::timer_start().ok();
@@ -75,7 +88,7 @@ fn t_preempt_round_robin() -> bool {
         sched::stop_workers();
         // 收工标志要真的落到 Done 状态上：工人得再被调度到一次才会去检查它
         let t1 = tsc::now();
-        while (sched::state_of(1) != sched::TaskState::Done || sched::state_of(2) != sched::TaskState::Done)
+        while (sched::state_of(w1) != sched::TaskState::Done || sched::state_of(w2) != sched::TaskState::Done)
             && tsc::now() - t1 < 400_000_000
         {
             sched::WORK[0].fetch_add(1, Ordering::Relaxed);
@@ -103,16 +116,16 @@ fn t_preempt_round_robin() -> bool {
     crate::log_info!(
         "preempt: switches {} -> {} (ticks {} -> {}), work boot={} w1={} w2={}, active_left={}, runs1={} runs2={}, state1={:?} state2={:?}",
         sw0, sw1, tk0, tk1, boot1 - boot0,
-        sched::WORK[1].load(Ordering::Relaxed), sched::WORK[2].load(Ordering::Relaxed),
-        active, sched::runs_of(1), sched::runs_of(2),
-        sched::state_of(1), sched::state_of(2)
+        sched::WORK[w1].load(Ordering::Relaxed), sched::WORK[w2].load(Ordering::Relaxed),
+        active, sched::runs_of(w1), sched::runs_of(w2),
+        sched::state_of(w1), sched::state_of(w2)
     );
     crate::log_info!("p1 switch: samples={} mean={} min={} max={} cycles (excludes iretq and the new task's first instruction)", n, mean, min, max);
     let rotated = sw1 >= sw0 + 24;
     let all_worked = boot1 > boot0
-        && sched::WORK[1].load(Ordering::Relaxed) > 0
-        && sched::WORK[2].load(Ordering::Relaxed) > 0;
-    let resumed = sched::runs_of(1) >= 1 && sched::runs_of(2) >= 1;
+        && sched::WORK[w1].load(Ordering::Relaxed) > 0
+        && sched::WORK[w2].load(Ordering::Relaxed) > 0;
+    let resumed = sched::runs_of(w1) >= 1 && sched::runs_of(w2) >= 1;
     let p1_sane = n > 0 && min <= mean && mean <= max && mean > 0;
     let second_window = tick_b >= tick_a + 2;
     crate::log_info!(

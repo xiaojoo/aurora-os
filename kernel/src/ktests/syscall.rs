@@ -28,6 +28,9 @@ struct Round {
 /// 没有任何槽登记待回收 —— 那时它只会白等一个 120M 周期的窗口再返回 false，
 /// 读数就成了"回收没发生"，而真实原因是"等待条件不成立"。这一课在 `KT_TASK_EXIT` 上付过学费。
 fn run_one(flag: u64, calls: u64, tag: &str, expect_end: bool) -> Option<Round> {
+    // 用例自足（T0.1 顺序暴露）：释放可能在 `drain_reap` 的窗口开始**之前**就完成
+    //（任务不在 CPU 上时 terminate 走就地回收），那时窗口里看不到增量。基线取本动作之前。
+    let released0 = sched::reap_released();
     let l = match user::load(HELLO_ELF) {
         Ok(l) => l,
         Err(e) => {
@@ -59,7 +62,7 @@ fn run_one(flag: u64, calls: u64, tag: &str, expect_end: bool) -> Option<Round> 
     });
     // 先等回收、再读状态：反过来就会读到"Done 但还没归化成 Free"的中间态，
     // 而那个中间态不代表任何事，只代表快门按早了。
-    let drained = if expect_end { Some(drain_reap()) } else { None };
+    let drained = if expect_end { Some(drain_reap() || sched::reap_released() > released0) } else { None };
     let state = sched::state_of(t);
     Some(Round { base, stack_top, t, served: user::served(), state, drained, image_lo, image_hi })
 }
