@@ -52,12 +52,29 @@ fn t_watchdog() -> bool {
     // 而不是前面那些无关窗口的尾巴上（第一版就是这么红的：`限内不报=false(0x0/0x1)`）。
     wd::reset_for_test(false);
     apic::timer_stop().ok();
+    // 整个停表分段关着 IF 跑（修复 ①）。`close_cpu_window` 同时倒牌，所以
+    // `interrupts_enabled` 读到的就是硬件状态，判据可以真的测它，不是读一句注释。
+    let was_open = apic::interrupts_enabled(bsp);
+    apic::close_cpu_window(bsp);
+    let mut closed_ok = true;
     let mut seq = [0u32; 4];
     for item in seq.iter_mut().take(4) {
-        settle();
+        // 停表分段的等待：不开中断窗口，并且**在窗口内部**逐轮采样 IF。
+        // 为什么必须在内部采：`with_interrupts` 退出时会把牌倒回去，在两次窗口之间读
+        // 永远是 false —— 第一版判据就是这么空转的（MUTATION-A 当时没咬）。
+        let budget = clock::hz().map_or(120_000_000, |hz| hz * 30 / 1000);
+        let t0 = tsc::now();
+        while tsc::now().wrapping_sub(t0) < budget {
+            closed_ok &= !apic::interrupts_enabled(bsp);
+            tsc::spin(20_000);
+        }
         *item = wd::sample();
     }
     apic::timer_start().ok();
+    if was_open {
+        apic::open_cpu_window(bsp);
+    }
+    crate::log_info!("watchdog: 停表窗口 全程关中断={} 分段前IF={}", closed_ok, was_open);
     // 阈值那条线断的是"第几个窗口才报"，不是"第几次采样必须报"：`timer_stop()` 之后还有
     // 一个**在途 tick** 会落进计数（实测两种都有 —— 有时报在第 3 个窗口、有时第 4 个），
     // 把等式写成"恰好第 3 个"就变成一条会自己飘红的判据。
@@ -91,7 +108,7 @@ fn t_watchdog() -> bool {
         apic::cpu_ticks(bsp + 1) > 0
     );
     wd::restore(saved);
-    let ok = healthy == 0 && below_limit && alarmed && right_cpu && no_collateral && cleared && counters && actions == 0;
+    let ok = healthy == 0 && below_limit && alarmed && right_cpu && no_collateral && cleared && counters && actions == 0 && closed_ok;
     if !ok {
         crate::log_fatal!(
             "watchdog: 判据不成立 健康={} 前两窗静默={} 第几窗报={}/限={} 报的是本核={} 没连坐={} 消警={} 计数={}",
