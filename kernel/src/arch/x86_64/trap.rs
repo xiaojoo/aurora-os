@@ -191,6 +191,13 @@ pub const VEC_SHOOTDOWN: usize = 0xf2;
 /// 它**不置 LAPIC 的 ISR 位**，所以处理侧不发 EOI（与 spurious 同理，见 ADR-020）。
 pub const VEC_RESCHED: usize = 0xf0;
 
+/// 跨核 resched **IPI**（ADR-055，P4c）。与 `VEC_RESCHED` 分开是**必须的**，不是整洁：
+/// `int 0xF0` 是软件自陷，不置 LAPIC 的 ISR 位，所以不发 EOI；而经 ICR 发来的真实 IPI
+/// **会置目标的 ISR 位**，不发 EOI 就把那个向量留在服务中，目标此后收不到别的中断。
+/// 实测踩过：共用 0xF0 时 AP 全部不再回执 shootdown，`L4 mm: shootdown 超时 还差 3 个回执`，
+/// 随后崩溃路径又撞上 `VMM(20)->RUNQ(8)` 反向嵌套。分开之后 0xF3 走正常 EOI 路径。
+pub const VEC_RESCHED_IPI: usize = 0xf3;
+
 /// 每 CPU 一套描述符表 + TSS + 异常栈：`rsp0`/`IST1` 天生是每 CPU 的，GDT 被 TSS 的地址拖着
 /// 也必须 per-CPU，IDT 本可共享但仍放进同一套——免得"哪张表属于哪个 CPU"变成隐式约定。
 /// 对齐 64 是为了相邻 CPU 不在同一条缓存行上互相拖慢，更为了不让人在不知情时写到别人的 TSS 里。
@@ -1376,6 +1383,7 @@ isr_stub_\n:
     // 用快路径回避的问题，现在用"分表"解决，而不是用"不记账"回避）。
     STUB_NOERR 240
     STUB_NOERR 241
+    STUB_NOERR 243
     // ring3 发起系统调用的门（int 0x80）。走 isr_common：建异常帧、进 Rust 分发。
     // 它与别的向量有一处不同——**门是 DPL3**（见 `idt_gate`），所以 ring3 进得来、
     // ring0 也进得来（自己 int 自己 = 内核内的同一条路径，用例用它测嵌套进入）。
@@ -1601,9 +1609,15 @@ isr_table:
     .quad isr_stub_240
     // 241：每 CPU 本地定时器（M3b-2b 起走异常帧）
     .quad isr_stub_241
-    // 242..254：仍然共用意外桩。242 是 shootdown，但 IDT 里那一格由 Rust 侧
-    // 换成 `isr_stub_shootdown`（见 init_cpu_tables），这张表的这一项不会被用上。
-    .rept 13
+    // 242：shootdown，IDT 里那一格由 Rust 侧换成 `isr_stub_shootdown`（见 init_cpu_tables），
+    // 这张表的这一项不会被用上。
+    .rept 1
+    .quad isr_stub_unexpected
+    .endr
+    // 243：跨核 resched IPI（ADR-055）。建帧，且**走正常 EOI**——真实 IPI 置了 ISR 位。
+    .quad isr_stub_243
+    // 244..254：仍然共用意外桩
+    .rept 11
     .quad isr_stub_unexpected
     .endr
     .quad isr_stub_spurious

@@ -635,6 +635,43 @@ pub fn mark_tick() {
     FLAGS[slot].need.store(true, Ordering::Release);
 }
 
+/// 每个 CPU 收到 resched IPI 并立牌的次数（P4c 的见证读数）。
+static RESCHED_MARKS: [core::sync::atomic::AtomicU64; crate::arch::x86_64::cpu::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; crate::arch::x86_64::cpu::MAX_CPUS];
+static RESCHED_IPI_FAIL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// 收到 resched IPI 时立本 CPU 的 need 牌，并记一次见证读数。
+fn mark_need_self() {
+    let cpu = crate::arch::x86_64::cpu::self_slot();
+    if cpu < crate::arch::x86_64::cpu::MAX_CPUS {
+        RESCHED_MARKS[cpu].fetch_add(1, Ordering::Relaxed);
+    }
+    mark_need(cpu);
+}
+
+/// 该 CPU 收到并立牌的次数（跨核用例用它证明 IPI 真的到了）。
+pub fn resched_marks(cpu: usize) -> u64 {
+    if cpu >= crate::arch::x86_64::cpu::MAX_CPUS { return 0; }
+    RESCHED_MARKS[cpu].load(Ordering::Relaxed)
+}
+
+/// resched IPI 发送失败次数。失败**不丢唤醒**：目标任务的状态已经是 Runnable，
+/// 只是要等它自己的下一次 tick 才被选上，所以这里只计数不升 L4（与 shootdown 不同——
+/// 那边收不齐回执就需要升 L4，因为正确性依赖回执）。
+pub fn resched_ipi_fail() -> u64 { RESCHED_IPI_FAIL.load(Ordering::Relaxed) }
+
+/// 向某个 CPU 发 resched IPI，让它尽快重新调度（ADR-055，P4c）。
+pub fn request_resched(cpu: usize) -> bool {
+    if cpu >= crate::arch::x86_64::cpu::MAX_CPUS || !crate::arch::x86_64::cpu::is_online(cpu) {
+        return false;
+    }
+    let Some(id) = crate::arch::x86_64::cpu::lapic_id_of(cpu) else { return false };
+    match crate::arch::x86_64::apic::send_ipi_to(id, trap::VEC_RESCHED_IPI as u32) {
+        Ok(()) => true,
+        Err(_) => { RESCHED_IPI_FAIL.fetch_add(1, Ordering::Relaxed); false }
+    }
+}
+
 /// 把调度器实现装进 `sync` 的等待回调表（ADR-053 决策 1 的反转）。
 /// `sync` 因此不引用 `sched`，依赖方向不变、环 A 不动。启动期装一次，之后只读。
 pub fn install_wait_ops() {
@@ -688,6 +725,10 @@ pub fn wake_task(gidx: usize, token: crate::sync::WaitToken) -> bool {
     };
     if moved {
         mark_need(cpu);
+        // 跨核：牌已经立了，但目标 CPU 可能正在自旋/hlt，要一发 IPI 让它立刻看牌
+        if cpu != crate::arch::x86_64::cpu::self_slot() {
+            let _ = request_resched(cpu);
+        }
     }
     moved
 }
@@ -1336,6 +1377,7 @@ pub unsafe fn preempt_point(frame: u64, cpu: usize) {
 pub fn install_arch_hooks() {
     crate::hooks::install(crate::hooks::SchedHooks {
         mark_tick,
+        mark_need: mark_need_self,
         init_idle_task,
         spawn,
         bump_current_work,

@@ -85,6 +85,14 @@ stub = "isr_stub_240"
 purpose = "主动让出/重调度：yield_now 自陷 int 0xF0，硬件建帧后走既有 preempt_point；软件中断不置 ISR 位 ⇒ 不发 EOI"
 adr = "ADR-049"
 
+[[vector]]
+name = "VEC_RESCHED_IPI"
+value = 243
+idt = true
+stub = "isr_stub_243"
+purpose = "跨核 resched IPI：真实 IPI 置目标 ISR 位，故走正常 EOI；与自陷的 0xF0 分开（ADR-055）"
+adr = "ADR-055"
+
 # ============ 区间（必须无重叠无缺口铺满 0..255；hi 不含） ============
 
 [[range]]

@@ -516,6 +516,9 @@ pub fn on_interrupt(vector: usize) {
     }
     if vector == crate::arch::x86_64::trap::VEC_RESCHED {
         RESCHED.fetch_add(1, Ordering::Relaxed);
+        // 跨核唤醒：发送方已把目标任务标 Runnable，这里立**本 CPU** 的 need 牌，
+        // 让异常出口的 preempt_point 真的去换人（ADR-055）。不借 mark_tick，理由见 hooks。
+        (crate::hooks::sched().mark_need)();
         // `int 0xF0` 是软件中断，同样不置 ISR 位 ⇒ 不发 EOI（ADR-020 对 spurious 的理由
         // 原样适用：多确认一个不存在的服务中断，后果是别的中断收不到）。
         // 换人发生在异常出口的 `preempt_point`，need 牌由 `yield_now` 在自陷前立好。
@@ -559,6 +562,11 @@ pub fn on_interrupt(vector: usize) {
         if crate::irq::in_range(vector) {
             crate::irq::dispatch(vector);
         }
+    } else if vector == crate::arch::x86_64::trap::VEC_RESCHED_IPI {
+        // 跨核唤醒的 IPI：与自陷的 0xF0 记在同一本账（P5 对照式两边都算它），
+        // 但**不 return**——真实 IPI 置了 ISR 位，必须走下面的 EOI（ADR-055）。
+        RESCHED.fetch_add(1, Ordering::Relaxed);
+        (crate::hooks::sched().mark_need)();
     } else if vector == crate::arch::x86_64::trap::VEC_CPU_TIMER {
         // 每个 CPU 的本地定时器（M3b-2b 起它走异常帧，所以会进到这儿来）。
         // 三件事要注意：

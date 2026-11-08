@@ -9,6 +9,9 @@ use crate::mm::MmError;
 
 pub struct SchedHooks {
     pub mark_tick: fn(),
+    /// 收到 resched IPI 时立**本 CPU** 的 need 牌（ADR-055，P4c）。与 mark_tick 分开：
+    /// 借 mark_tick 会把 tick 数灌进去，破坏"两台仪器数到同一个数"（ADR-049 决策 3）。
+    pub mark_need: fn(),
     pub init_idle_task: fn(u64, u64, bool),
     pub spawn: fn(fn() -> !) -> Result<usize, MmError>,
     pub bump_current_work: fn(),
@@ -26,6 +29,7 @@ struct HooksCell(UnsafeCell<SchedHooks>);
 unsafe impl Sync for HooksCell {}
 
 fn no_mark_tick() {}
+fn no_mark_need() {}
 fn no_init_idle(_: u64, _: u64, _: bool) {}
 fn no_spawn(_: fn() -> !) -> Result<usize, MmError> {
     Err(MmError::Unsupported)
@@ -43,6 +47,7 @@ fn no_preempt(_: u64, _: usize) {}
 
 static HOOKS: HooksCell = HooksCell(UnsafeCell::new(SchedHooks {
     mark_tick: no_mark_tick,
+    mark_need: no_mark_need,
     init_idle_task: no_init_idle,
     spawn: no_spawn,
     bump_current_work: no_bump,

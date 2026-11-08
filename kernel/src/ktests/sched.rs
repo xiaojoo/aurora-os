@@ -666,6 +666,45 @@ fn t_waitqueue() -> bool {
 }
 ktest!(KT_WAITQUEUE, t_waitqueue);
 
+/// P4c-1（ADR-055）：跨核 resched 的**直接见证**——发一发 IPI，目标 CPU 真的立了牌。
+///
+/// 为什么先做这一格再上四核压力：跨核唤醒链条有三环（发送方标 Runnable → IPI 送达 →
+/// 目标立牌后 preempt 换人）。压力用例把三环混在一个读数里，红了分不清哪一环；
+/// 这一格只验后两环，且是确定性的（每个在线 AP 都必须送达）。
+/// 第一环由 `t_block_wake`/`t_waitqueue` 的状态转移判据覆盖。
+fn t_cross_cpu_resched() -> bool {
+    if smp::bringup().is_err() {
+        crate::log_fatal!("resched: AP 起不来");
+        return false;
+    }
+    let mut checked = 0usize;
+    let mut delivered = 0usize;
+    let mut refused = 0usize;
+    for ap in 1..cpu::MAX_CPUS {
+        if !cpu::is_online(ap) {
+            continue;
+        }
+        checked += 1;
+        let m0 = sched::resched_marks(ap);
+        if !sched::request_resched(ap) {
+            refused += 1;
+            continue;
+        }
+        let t0 = tsc::now();
+        while sched::resched_marks(ap) <= m0 && tsc::now().wrapping_sub(t0) < 200_000_000 {
+            tsc::spin(2_000);
+        }
+        if sched::resched_marks(ap) > m0 {
+            delivered += 1;
+        }
+    }
+    crate::log_info!(
+        "resched 跨核(ADR-055): 在线AP={} 送达={} 发送被拒={} IPI失败累计={}",
+        checked, delivered, refused, sched::resched_ipi_fail());
+    checked > 0 && delivered == checked && refused == 0
+}
+ktest!(KT_CROSS_CPU_RESCHED, t_cross_cpu_resched);
+
 /// `if_patch` 两条分支的直接覆盖，以及 asm 偏移与 Rust 结构体的对账。
 ///
 /// 为什么这条用例存在：ADR-021 的"关着窗口换入"分支今天**没有触发源**

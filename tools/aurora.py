@@ -2872,10 +2872,30 @@ def check_vector_table() -> list[str]:
     for key, (pat, src_text, label, need_return) in anchors.items():
         got = {m.group(1) for m in re.finditer(pat, src_text) if m.group(1) in consts}
         if need_return:
+            # 用**花括号配对**取分支体再判 return。旧版是"匹配后 400 字符内找 return"，
+            # 两头都会错：分支里加几行注释就把 return 挤出窗口（漏判 0xF0），
+            # else-if 链上没有同缩进收尾花括号时又一路吞到后面的 return（误判 0xF3）。
+            # 两种都实测发生过（ADR-055），所以换成结构判据。
             early: set[str] = set()
             for m in re.finditer(pat, src_text):
-                seg = src_text[m.end(): m.end() + 400].split("\n    }")[0]
-                if re.search(r"\breturn\b", seg):
+                brace = src_text.find("{", m.end())
+                if brace < 0:
+                    continue
+                depth = 0
+                end = brace
+                for j in range(brace, min(len(src_text), brace + 4000)):
+                    ch = src_text[j]
+                    if ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            end = j
+                            break
+                # 剥掉 // 注释再判：分支注释里写"不 return"也会被正则命中（实测误判 0xF3）
+                body = chr(10).join(x.split("//", 1)[0] for x in src_text[brace:end].split(chr(10)))
+                if re.search(r"\breturn\b", body):
+                    early.add(m.group(1))
                     early.add(m.group(1))
             got = early
         base = meta.get(key)
