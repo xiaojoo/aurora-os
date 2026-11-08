@@ -45,9 +45,9 @@ expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe
 # 2026-11-07 P7：hello 加了 syscall3（U1 两处）与 ring3 句柄读/close（U5 三处）。
 
 [unsafe-census]
-total = 295
+total = 297
 U1 = 56
-U2 = 61
+U2 = 63
 U3 = 13
 U4 = 116
 U5 = 28
@@ -139,7 +139,11 @@ U4 = 3
 
 [modules."mm"]
 U1 = 2
-U2 = 21
+# P1a（ADR-063）+2：FrameInfo 影子数组引导写入（bootstrap_frame_info）与逐帧只读对账
+# （frame_info_shadow_mismatch）。指针来自 phys_alloc_locked 分出的 MOD_BOOT 帧 + HHDM，
+# 范围 [0, frame_info_frames)，4 字节对齐（AtomicU32 首字段），生命周期整个内核（永不归还），
+# 引导期单核 IF=0 无并发、对账持 PMM 锁；不变量由"元数组帧永久持有 + 条目数=limit"保证。
+U2 = 23
 U4 = 4
 
 [modules."pci"]

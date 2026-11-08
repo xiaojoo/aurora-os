@@ -9,7 +9,7 @@
 //!   手册"首期 4 KiB 基础页"指的是**分配粒度**，不约束区域映射。
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::sync::{self, IrqGuard, IrqSpinLock};
 
@@ -50,6 +50,20 @@ const EARLY_POOL_PAGES: usize = 24;
 const MAX_PHYS_COVER: u64 = 4 * 1024 * 1024 * 1024;
 const BITMAP_WORDS: usize = (MAX_PHYS_COVER as usize / PAGE) / 64;
 const MAX_REGIONS: usize = 96;
+
+/// 每帧元数据（ADR-063，W2 P1a）。P1a 阶段它是**影子**：位图仍驱动分配，
+/// 它在 init_allocator 两阶段引导里被填好并与位图逐帧对账；P1b 才让它接管分配/释放。
+/// `refcnt==0` ⇔ 自由（取代位图的 free 位）；`>=1` ⇔ 活着的主人个数。
+#[repr(C)]
+struct FrameInfo {
+    refcnt: AtomicU32,
+    flags: u8,
+    owner: ModuleId,
+}
+const FI_FREE: u8 = 0;
+const FI_USED: u8 = 1;
+const FI_PINNED: u8 = 2;
+const FRAME_INFO_BYTES: usize = core::mem::size_of::<FrameInfo>();
 /// VA 保留登记表容量。**按能数清楚的用量算，不按"当时跑起来够用"拍**：
 /// 每个任务栈一条（最坏 `MAX_CPUS * MAX_TASKS` = 64 条）+ 固定用途 16 条
 /// （内核堆窗口、每个 CPU 的 #DF 栈、AP 栈、LAPIC/串口设备窗口、M4 的用户三页）。
@@ -275,6 +289,9 @@ struct State {
     free_frames: AtomicUsize,
     total_frames: AtomicUsize,
     ready: AtomicBool,
+    /// FrameInfo 影子数组的 HHDM 虚地址（0 = 未引导）；P1a 由 init_allocator 分出并填充。
+    frame_info: AtomicU64,
+    frame_info_frames: usize,
 }
 
 struct StateCell(UnsafeCell<State>);
@@ -297,6 +314,8 @@ static S: StateCell = StateCell(UnsafeCell::new(State {
     free_frames: AtomicUsize::new(0),
     total_frames: AtomicUsize::new(0),
     ready: AtomicBool::new(false),
+    frame_info: AtomicU64::new(0),
+    frame_info_frames: 0,
 }));
 
 /// memmap 副本单独成一个 static。
@@ -1386,7 +1405,7 @@ fn bit_set(frame: u64, used: bool) {
 /// 接管之后再解析内存映射：全标已用 -> 只放开 Usable ->
 /// 再把**已被我们的页表占用的物理页**从空闲里收回（早期池 + PML4 都在 .bss，
 /// 属于内核镜像区间，而内核镜像被 memmap 标成 ExecutableAndModules，天然不放开）。
-pub fn init_allocator() {
+pub fn init_allocator() -> Result<(), MmError> {
     let _g = pmm();
     let st = s();
     for w in &st.bitmap {
@@ -1419,11 +1438,86 @@ pub fn init_allocator() {
     let st = s();
     st.total_frames.store(limit as usize, Ordering::Relaxed);
     st.free_frames.store(free, Ordering::Relaxed);
+    // P1a（ADR-063）：两阶段引导的第二步——分出 FrameInfo 元数组并把位图状态平移进去。
+    // 位图仍是分配的唯一真相（影子模式），元数组只供对账；P1b 才接管。
+    // 引导失败往上传 MmError，由 integration（main）记日志/停机——mm 不新增 diagnostics 引用
+    // （环内 memory->diagnostics 受 ADR-044 棘轮约束，只许减不许增）。
+    bootstrap_frame_info(limit)
+}
+
+/// 引导 FrameInfo 影子数组（ADR-063 决策 2）。**调用方已持 PMM 锁**（init_allocator）。
+/// 阶段 A：用现位图分出元数组自身的连续帧（归 MOD_BOOT、永不归还，与页表页同形）；
+/// 阶段 B：逐帧把位图状态平移进 FrameInfo（已用⇒refcnt 1，自由⇒0）。
+/// 元数组覆盖到它自己的帧是正常的——那些帧在阶段 A 已被位图标 USED，平移后 refcnt=1。
+fn bootstrap_frame_info(limit: u64) -> Result<(), MmError> {
+    let st = s();
+    let bytes = limit as usize * FRAME_INFO_BYTES;
+    let pages = bytes.div_ceil(PAGE);
+    if pages == 0 {
+        return Ok(());
+    }
+    let order = (usize::BITS - 1 - pages.leading_zeros()) as u8;
+    // 阶段 A：分出元数组帧。forget 掉 OwnedFrames——这些帧永久持有，不走 Drop 归还。
+    let frames = phys_alloc_locked(order, MOD_BOOT)?;
+    let base = frames.base().0;
+    core::mem::forget(frames);
+    let hhdm = st.hhdm;
+    let arr = (hhdm + base) as *mut FrameInfo;
+    // 阶段 B：平移位图状态。每个条目都写满（refcnt/flags/owner），不留引导期的脏字节。
+    for f in 0..limit {
+        let used = bit_get(f);
+        // SAFETY: arr 指向刚分出的 2^order 帧（>= limit 个条目），f<limit 在界内；
+        // 此刻单核 IF=0（init），无并发；元数组帧归 MOD_BOOT 永不归还，生命周期是整个内核。
+        unsafe {
+            let e = &mut *arr.add(f as usize);
+            e.refcnt = AtomicU32::new(if used { 1 } else { 0 });
+            e.flags = if used { FI_USED } else { FI_FREE };
+            e.owner = if used { MOD_BOOT } else { ModuleId(0) };
+        }
+    }
+    st.frame_info.store(hhdm + base, Ordering::Release);
+    st.frame_info_frames = limit as usize;
+    Ok(())
+}
+
+/// 影子与位图逐帧对账：返回首个 refcnt 与位图状态不符的帧号（None = 全一致）。
+/// P1a 的引导见证，由 integration（main）在 init_allocator 之后调用并据此停机——
+/// mm 自己不打 fatal（环内 memory->diagnostics 棘轮）。持 PMM 锁取一致快照。
+pub fn frame_info_shadow_mismatch() -> Option<u64> {
+    let _g = pmm();
+    let st = s();
+    let addr = st.frame_info.load(Ordering::Relaxed);
+    let limit = st.frame_info_frames as u64;
+    if addr == 0 {
+        return None;
+    }
+    let arr = addr as *const FrameInfo;
+    for f in 0..limit {
+        let used = bit_get(f);
+        // SAFETY: arr 覆盖 frame_info_frames 个条目，f<limit 在界内；只读 refcnt（原子）。
+        let rc = unsafe { (*arr.add(f as usize)).refcnt.load(Ordering::Relaxed) };
+        if (rc >= 1) != used {
+            return Some(f);
+        }
+    }
+    None
+}
+
+/// FrameInfo 影子数组的规模（帧条目数, 占用字节）。P1a 供启动日志与宿主机对账。
+pub fn frame_info_size() -> (usize, usize) {
+    let st = s();
+    (st.frame_info_frames, st.frame_info_frames * FRAME_INFO_BYTES)
 }
 
 /// 分配 2^order 个连续物理页
 pub fn phys_alloc(order: u8, owner: ModuleId) -> Result<OwnedFrames, MmError> {
     let _g = pmm();
+    phys_alloc_locked(order, owner)
+}
+
+/// `phys_alloc` 的持锁内核：调用方**必须已持 PMM 锁**。init_allocator 的两阶段引导在
+/// 自己那把 pmm() 里分出 FrameInfo 元数组，不能再取一次 PMM（重入会升 L4），故拆出此函数。
+fn phys_alloc_locked(order: u8, owner: ModuleId) -> Result<OwnedFrames, MmError> {
     let st = s();
     if !st.ready.load(Ordering::Relaxed) {
         return Err(MmError::NotInit);

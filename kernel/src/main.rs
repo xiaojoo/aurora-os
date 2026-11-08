@@ -210,12 +210,24 @@ extern "C" fn after_switch(_: usize) -> ! {
 /// Stage2a/2b：页表接管后的内存统计与内核堆。
 fn stage_memory() {
     mm::mark_switched();
-    mm::init_allocator();
+    if let Err(e) = mm::init_allocator() {
+        crate::log_fatal!("mm::init_allocator 引导失败 {:?}（FrameInfo 元数组分不出）", e);
+        exit::boot_invalid("mm init_allocator failed");
+    }
     if !mm::is_ready() {
         crate::log_fatal!("mm not ready after takeover");
         exit::finish(exit::Code::BootInvalid);
     }
+    // P1a 引导自洽见证：FrameInfo 影子必须与位图逐帧一致。判据放 integration（mm 不打 fatal，
+    // 环内 memory->diagnostics 受棘轮约束）；不一致就点名首个差异帧并停机。
+    let shadow_bad = mm::frame_info_shadow_mismatch();
+    if let Some(f) = shadow_bad {
+        crate::log_fatal!("L4 mm: FrameInfo 影子与位图不符，首个差异帧 #{}", f);
+        exit::finish(exit::Code::ExceptionFatal);
+    }
     crate::log_info!("mm: frames total={} free={} max_phys={:#x}", mm::total_frames(), mm::free_frames(), mm::max_phys());
+    let (fi_frames, fi_bytes) = mm::frame_info_size();
+    crate::log_info!("mm: frame_info 影子 帧条目={} 字节={} 引导自洽={}（P1a，位图仍驱动分配）", fi_frames, fi_bytes, shadow_bad.is_none());
     crate::log_info!("mm: usable memory = {} MiB over {} regions", mm::usable_bytes() / (1024 * 1024), mm::region_count());
     crate::log_info!("mm: bootloader regions held back = {} MiB (AP park area; reclaim is explicit, M3b)", mm::boot_reclaimable_bytes() / (1024 * 1024));
     tsc::stage("mm-takeover");

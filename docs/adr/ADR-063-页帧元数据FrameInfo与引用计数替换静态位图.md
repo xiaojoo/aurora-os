@@ -125,6 +125,22 @@ COW/缺页/每-AS（W3）、锁序表数值（PMM/LEDGER 不变）、syscall 号
 - 回滚：恢复位图路径（FrameInfo 留作只读影子或删除）。回滚后 COW/共享地基没了，但独占行为不变。
 - 不可回滚的部分：无（本帖不动盘上格式、不动 syscall）。
 
+## P1a 落地记录（2026-11-08，影子模式实测）
+
+- **引导读数（实测，build/run-001.log）**：`frame_info 影子 帧条目=130780 字节=1046240 引导自洽=true`。
+  8 字节/帧证实（审查记录第 4 条）；元数组占 256 帧（1 MiB / 4 KiB），free_frames 比改前少 256
+  （116787 → 116531），与"元数组从 usable 扣"一致。`ktests total=63 passed=63 failed=0`，判定 PASS。
+- **影子模式**：位图仍驱动分配，FrameInfo 只在引导时被填充并与位图逐帧对账；P1b 才接管。
+- **诊断路由（实现期发现，补决策 4）**：引导失败/影子不符**不在 mm 里打 fatal**——`init_allocator`
+  改返回 `Result<(), MmError>`，`frame_info_shadow_mismatch()` 是 pub 谓词，由 main（integration）
+  记日志/停机。原因：环内 `memory->diagnostics` 受 ADR-044 棘轮约束（登记 7），mm 里新增两处
+  `log_fatal!`+`exit::finish` 会把它涨到 9 ⇒ 红。integration->diagnostics 不套棘轮，故路由出去。
+  这是"新规则配负样本"之外的另一条纪律：**新增致命路径不许喂胖环内诊断边**。
+- **登记**：`memory.public_api` 补 `mm::frame_info_size`、`mm::frame_info_shadow_mismatch`；
+  unsafe 普查 mm U2 21→23（引导写入 + 只读对账两处，白名单已写指针来源/范围/对齐/生命周期/并发）。
+- **负样本（P1a 预注册，P1b/P1c 兑现）**：影子对账本身是引导见证；把平移循环改成"全填 0"
+  ⇒ `frame_info_shadow_mismatch` 返回首个已用帧 ⇒ main 停机（证它对漂移会咬）。
+
 ## 审查记录（2026-11-08，P0 起草后自审，对照源码）
 
 方向不变（refcnt 单一真相、两阶段引导、保留不变量都成立），收紧七处：
