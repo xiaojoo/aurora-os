@@ -113,6 +113,10 @@ ADR-018 决策 2 把"超过 LARGE_MAX=2048 字节的请求"明确失败，**不�
 - **登记**：`memory.public_api` 补 `mm::KBuf`；unsafe 普查 mm U2 28→31（write_bytes/from_raw_parts/
   from_raw_parts_mut），total 302→305。环内棘轮不动（KBuf 在 mm.rs 内，对 resource 仍走 ledger_* 两助手）。
 - **new(0) 拒绝**：验收用例首格断言 `KBuf::new(0).is_ok()==false`（实测通过）。
+- **矩阵复验**：首跑 42/43，唯一不符是"投递三层由控制器事件数到"行的 **timer-window 格**
+  （第一段窗口 取到=2>投出=1，PIT trace 窗口边界竞态），**与 KBuf 无关**；定向复跑该变体 5/5 全过，
+  全矩阵重跑 **43/43 全符合**。KBuf 见证在 50 份留档里 44 份跑到、三格全 true、零失败。
+  偶发备注见 BACKLOG（不松判据，那是 71a 同源错法）。
 
 ## 未决
 

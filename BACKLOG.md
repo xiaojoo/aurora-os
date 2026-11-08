@@ -4923,6 +4923,40 @@ VA 保留表扩成区间表、`split_huge`、缺页处理），或先清上面�
 - "失败不丢唤醒"只在**有本地 tick 的 CPU**（AP）上被证明；BSP idle 靠 IPI 醒、无本地 tick，
   那条路径在注入下被 gate 掉，没有用例（ADR-062 未决 2/3）。
 
+## 139. W2 内存分层 P1+P2：FrameInfo/引用计数地基 + KBuf 大块分配（2026-11-08，实测）
+
+**依赖图先行**：W2 开工前先做了有证据支撑的依赖图（内联交互 DAG），定下切片顺序
+P1 FrameInfo/refcount → P2 KBuf → P3 VA 区间表 → P4 split_huge+map_hole → P5 demand-zero。
+**W2/W3 边界**：完整缺页修复（COW/按进程杀）要 W3 的每-AS VmaTable，W2 只落内核修复接缝+单 AS demand-zero。
+方案"VA 表 24 条"是 M2 旧值，代码已是 80（MAX_CPUS×8+16，mm.rs:62）。
+
+**P1（ADR-063，三子切片各自过门禁、各自证红）**：
+- P1a：FrameInfo 影子数组两阶段引导（位图分出元数组自身的帧→状态平移进 FrameInfo）。
+  逐帧影子对账见证会咬（变异全填 0 ⇒ 首个差异帧 #0 停机）。8 字节/帧（ModuleId=u16），本机 ~1 MiB、占 256 帧。
+- P1b：alloc/free 走 refcnt，位图退引导期。多 order 等价用例 + fault-double-free 仍 L4。
+- P1c：frame_get/frame_put + SharedFrame RAII。N get/N put 最后才归还、多 put → DoubleFree L4；
+  fault-put-double-free 注入升 L4。两条负样本各自证红。
+- **两处实现期修正**：①mm 新增 fatal 会喂胖环内 memory->diagnostics（7→9 红）⇒ 错误传出由 main 记日志；
+  ②共享帧逼台账改**逐帧**记账（推翻 P1b"保 call counts"），集中到 ledger_alloc/ledger_free 两助手
+  保住 memory->resource 棘轮=2。Σlive==Σalloc−Σfree 不变。
+
+**P2（ADR-064）**：KBuf::new(bytes,owner) 经 phys_alloc(order)+HHDM 直接寻址，**不占 VA 表、不建映射、
+不经 GlobalAlloc**（填 ADR-018 留的口子），失败 Result 可传播。分配即清零（防 0xA5 陈旧帧泄漏），
+RAII 靠 OwnedFrames 字段自动归还。验收 9 档 64KiB–16MiB 全回基线/清零/写满读回，new(0) 拒绝。
+两条负样本证红（去清零⇒清零=false；ManuallyDrop 泄漏⇒9 档全不回基线）。
+
+**读数**：用例 63→**66**；矩阵 **43/43**（P1c 起新增"共享帧多put升L4"行）；check 全程 17/17。
+FrameInfo  unsafe 普查 mm U2 累计 21→31（P1 七处 + P2 三处），total 295→305。
+
+**偶发备注（不松判据）**：P2 首跑矩阵 42/43，唯一不符是"投递三层由控制器事件数到"行的 **timer-window 格**
+（第一段窗口 取到=2>投出=1，PIT trace 窗口边界竞态）。**与 KBuf 无关**（KBuf 不碰 PIT/AHCI 中断）：
+定向复跑 irq-affinity-probe 变体 **5/5 全过**，全矩阵重跑 **43/43**。记此一笔供以后归因——
+这是 TCG 下 trace 窗口对齐的偶发抖动，不是回归；**不去松判据**（check_deliver_layer 注释点名的 71a 同源错法）。
+真机/KVM 要重测这一格（ADR-024 口径）。
+
+**仍开**：P3 VA 区间表（supersede ADR-041）、P4 split_huge+map_hole(UC)、P5 demand-zero（单 AS）；
+KBuf 大 order 碎片化长跑成功率、免清零变体、中断上下文禁用门禁（ADR-064 未决）。下一个空 ADR **065**。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。
