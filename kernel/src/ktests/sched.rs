@@ -411,6 +411,83 @@ fn t_if_belongs_to_cpu() -> bool {
 }
 ktest!(KT_IF_BELONGS_TO_CPU, t_if_belongs_to_cpu);
 
+/// ADR-068：嵌套的 `with_interrupts` 不许关掉外层还开着的窗口。三格各管一件事：
+/// 1. **牌**：内层返回后，外层的牌必须还写着开 ⇒ 直接对着 BACKLOG 82 记的那句话
+///    （"返回时把牌一律置 false，不恢复原值"）。
+/// 2. **硬件**：同一段外层窗口里必须真收到 ≥1 发 tick ⇒ 牌只是软件影子，这一格量 EFLAGS.IF。
+///    这里用 `wait_tick_count` 而不是 `wait_ticks`：前者**不碰**中断状态，所以它没再嵌套一层，
+///    量到的就是外层窗口的真实 IF。
+/// 3. **没改坏非嵌套**：最外层返回后牌回关，且整段窗口长度里 0 发 tick ⇒ 用例不是
+///    "改了什么东西就红"：修复前这一格照样绿。
+/// 修复前的期望是 1、2 红、3 绿；`window_cycles(N)` 是按 TSC 区间最坏端点推的上界，
+/// 所以第 2 格不需要碰运气（与 `time.rs` 三段窗口同一口径）。
+fn t_if_window_nested() -> bool {
+    let slot = cpu::self_slot();
+    // 前提归一：从"窗口关着"起步，判据不取决于上一条用例留下什么牌；收尾按进来时放回。
+    let prior = apic::interrupts_enabled(slot);
+    apic::close_cpu_window(slot);
+    // 用例自足：tick 靠表驱动，而 `.ktests` 顺序由链接器定，前面的用例可能把表停了
+    // （与 `t_sleep_until` 同一形状）。这个 probe 自己开窗关窗，落在前提之后，不影响判据。
+    let probe = apic::wait_ticks(apic::ticks(), 1, clock::window_cycles(1));
+    let running_on_entry = probe.ticks >= 1;
+    if !running_on_entry {
+        apic::timer_start().ok();
+    }
+
+    let mut inner_saw_open = false;
+    let mut sign_after_inner = false;
+    let mut outer_ticks = 0u64;
+    let mut outer_cycles = 0u64;
+    apic::with_interrupts(|| {
+        // 内层：进来时外层已经开着，出去时不许把外层关掉
+        apic::with_interrupts(|| {
+            inner_saw_open = apic::interrupts_enabled(slot);
+        });
+        sign_after_inner = apic::interrupts_enabled(slot);
+        let w = apic::wait_tick_count(clock::window_cycles(2));
+        outer_ticks = w.ticks;
+        outer_cycles = w.cycles;
+    });
+    let sign_after_outer = apic::interrupts_enabled(slot);
+    let after = apic::wait_tick_count(clock::window_cycles(1));
+    if !running_on_entry {
+        apic::timer_stop().ok();
+    }
+    if prior {
+        apic::open_cpu_window(slot);
+    }
+    crate::log_info!(
+        "nested(ADR-068): 内层见开={} 内层返回后牌={} 外层窗口内tick={}跨{}cycles 外层返回后牌={} 之后tick={}跨{}cycles 进表时心跳={}",
+        inner_saw_open,
+        sign_after_inner,
+        outer_ticks,
+        outer_cycles,
+        sign_after_outer,
+        after.ticks,
+        after.cycles,
+        running_on_entry
+    );
+    let ok = inner_saw_open
+        && sign_after_inner
+        && outer_ticks >= 1
+        && !sign_after_outer
+        && after.ticks == 0
+        && after.cycles >= clock::window_cycles(1);
+    if !ok {
+        crate::log_fatal!(
+            "nested: 判据不成立 内层见开={} 内层后牌={} 外层内tick={} 外层后牌={} 之后tick={}(应0) 之后跨={}(应>=窗口)",
+            inner_saw_open,
+            sign_after_inner,
+            outer_ticks,
+            sign_after_outer,
+            after.ticks,
+            after.cycles
+        );
+    }
+    ok
+}
+ktest!(KT_IF_WINDOW_NESTED, t_if_window_nested);
+
 /// P3b 的工人：**自己**终止自己，然后让出。
 /// `terminate_task` 对"正在 CPU 上"的任务只登记待回收、不就地释放（它正站在那条栈上），
 /// 所以必须让出去一次，别人才收得到它。

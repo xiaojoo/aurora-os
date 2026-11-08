@@ -15,7 +15,7 @@
 //!    Lowest Priority 的条目已屏蔽（NMI/ExtINT 在 rev≥5 也被屏蔽），其余按固件设置。
 //!    本文件把这些当"可核对的前提"，全部**读回来打进日志**，不当既成事实。
 
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::acpi::Madt;
 use crate::mm::{self, ModuleId};
@@ -605,12 +605,29 @@ pub fn on_interrupt(vector: usize) {
 /// （见 `sched::preempt_point` 与 `context_load` 的第二个参数）。
 static CPU_IF: [AtomicBool; crate::arch::x86_64::cpu::MAX_CPUS] = [const { AtomicBool::new(false) }; crate::arch::x86_64::cpu::MAX_CPUS];
 
+/// 每 CPU 的 `with_interrupts` **嵌套深度**（ADR-068）。
+/// 只有 0↔1 那一次跃迁动硬件与牌，中间层不碰。于是"这张 CPU 的窗口开着"
+/// 变成"这条 CPU 上至少有一个还没返回的 `with_interrupts`"，与 ADR-021 的
+/// "IF 属于 CPU"是同一句话；而 BACKLOG 82 记的那个形状——内层返回时把外层还开着的
+/// 窗口关掉——在这本账下不可能发生。
+///
+/// 用计数而不是"进来时先读一份牌值、退出时写回去"：后者拿的是**进入那一刻的本地快照**，
+/// 跨抢占会失真（外层开着窗口时本上下文被换下，换入者又开又关，快照早就不是现状）。
+/// 计数没有这个问题——每一层只看**自己那一次 `fetch_sub` 的返回值**，那是操作当时的真值。
+static IF_DEPTH: [AtomicU32; crate::arch::x86_64::cpu::MAX_CPUS] = [const { AtomicU32::new(0) }; crate::arch::x86_64::cpu::MAX_CPUS];
+
 /// 本 CPU 的中断窗口是否开着。调度器换入任务时要按它改写异常帧的 IF 位。
 pub fn interrupts_enabled(slot: usize) -> bool {
     slot < crate::arch::x86_64::cpu::MAX_CPUS && CPU_IF[slot].load(Ordering::Acquire)
 }
 
 /// AP 进门时开自己那条中断窗口用的：**立牌 + `sti` 一起做**。
+///
+/// **裸接口，不进 `IF_DEPTH`**（ADR-068 决策 3）：它服务的是"永不返回"的上下文
+/// （AP 进门、AP 停机、`sched::idle_entry` 的常驻窗口）。因此**不要在 `with_interrupts`
+/// 的窗口里套这两个函数**——那会造出"深度 >0 但牌被倒掉"的不一致，计数救不了它。
+/// 既有调用点（`smp.rs` 的进门/停机、`idle_entry` 的每次 hlt 前立牌、`watchdog`/`sched`
+/// 用例里窗口之外的归一动作）实测都在窗口之外。
 ///
 /// 为什么必须两个动作一起：ADR-021 之后 `context_load` 换入任何人时都按 `CPU_IF[slot]`
 /// 改写异常帧的 IF 位。AP 只 `sti` 而不立牌的话，那块牌一直写着"关着"，
@@ -644,16 +661,24 @@ pub fn close_cpu_window(slot: usize) {
 /// 必须看到"窗口是开的"，否则它会带着 IF=0 跑下去，而开窗口的那个上下文还在 `Runnable`
 /// 里等 CPU——那正是 M3a 挂死过的形状。反过来（先 sti 后立牌）会留下一个
 /// "窗口开着但牌上写着关"的窗口，被抢占的那个任务换回来时会被强行关掉 IF。
+///
+/// **嵌套按计数**（ADR-068）：只有最外层（0↔1）做上面那四个动作，中间层既不 `sti`
+/// 也不 `cli`。所以内层返回不会关掉外层还开着的窗口——BACKLOG 82 记的那个形状，
+/// ADR-059 当年只能绕开（让每次 hlt 前自己重新立牌）。判据是 `t_if_window_nested`。
 #[inline]
 pub fn with_interrupts<T>(f: impl FnOnce() -> T) -> T {
     let slot = crate::arch::x86_64::cpu::self_slot();
-    CPU_IF[slot].store(true, Ordering::Release);
-    // SAFETY: sti 只置 EFLAGS.IF，不访问内存、不动栈
-    unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+    if IF_DEPTH[slot].fetch_add(1, Ordering::AcqRel) == 0 {
+        CPU_IF[slot].store(true, Ordering::Release);
+        // SAFETY: sti 只置 EFLAGS.IF，不访问内存、不动栈
+        unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+    }
     let r = f();
-    // SAFETY: cli 只清 EFLAGS.IF，同上
-    unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
-    CPU_IF[slot].store(false, Ordering::Release);
+    if IF_DEPTH[slot].fetch_sub(1, Ordering::AcqRel) == 1 {
+        // SAFETY: cli 只清 EFLAGS.IF，同上
+        unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
+        CPU_IF[slot].store(false, Ordering::Release);
+    }
     r
 }
 

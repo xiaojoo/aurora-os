@@ -992,13 +992,15 @@ pub fn idle_of(cpu: usize) -> usize {
 fn idle_entry() -> ! {
     let cpu = crate::arch::x86_64::cpu::self_slot();
     // 自己开窗口、**永不关**：本任务不退出，与 AP 空闲上下文（smp 步骤 8/9）同一形状。
-    // 不能用 `with_interrupts`：它返回时把牌一律置 false（不恢复原值），在任务里用
-    // 等于关掉别人开的窗口（BACKLOG 82 的嵌套隐患）。牌开着，换入的下个任务按 ADR-021
+    // 不用 `with_interrupts`：它是"这次调用期间开着"的语义，最外层返回时照样倒牌
+    // （ADR-068 只把**嵌套**改成计数，没改非嵌套的收场），而本任务的窗口是常驻的，
+    // 属 ADR-068 决策 3 的裸接口一侧。牌开着，换入的下个任务按 ADR-021
     // 由 `context_load` 供 IF，语义不变。
     loop {
         // **每次 hlt 前都要重新开窗口**，不能只在入口开一次：牌是 per-CPU 的，
-        // 别的代码（`with_interrupts` 返回时一律把牌置 false）会在 idle 不在 CPU 上时关掉它，
-        // 而换回来时 `context_load` 按牌供 IF ⇒ IF=0 的 hlt 永远醒不来。
+        // 别的代码（`with_interrupts` 最外层返回时一律把牌置 false，ADR-068 没改这一侧）
+        // 会在 idle 不在 CPU 上时关掉它，而换回来时 `context_load` 按牌供 IF ⇒ IF=0 的
+        // hlt 永远醒不来。
         // 实测：P6b 的用例调了 `apic::wait_ticks`（内部 with_interrupts）之后，
         // BSP 就停在 idle_entry 里 HLT=1 而 RFL=0x7（IF=0），整机静默。
         crate::arch::x86_64::apic::open_cpu_window(cpu);
