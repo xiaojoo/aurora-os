@@ -4033,6 +4033,30 @@ def l4_exit_cascade(log: str, first_anchor: str) -> tuple[bool, str]:
     return True, "锚点在，锚点之后无级联"
 
 
+# 欠账⑦ / ADR-062：resched IPI 失败注入那一跑的见证行。四个数都要由宿主机独立解出来，
+# 不是读内核那个 bool：失败计数涨（f1>f0）、收到的 IPI 为 0、消费者跑完（done=1）、ack 不超时。
+RIF_RE = re.compile(
+    r"resched IPI失败注入\(ADR-062\): ack超时=(?P<ack>\d+) 完成=(?P<done>\d+) "
+    r"失败计数 (?P<f0>\d+)->(?P<f1>\d+) 收到IPI=(?P<ipi>\d+)")
+
+
+def check_resched_ipi_fail(log: str) -> tuple[bool, str]:
+    m = RIF_RE.search(log)
+    if m is None:
+        return False, "没找到见证行 ⇒ 注入用例没跑到（判据不算数，不许算绿）"
+    ack, done = int(m.group("ack")), int(m.group("done"))
+    f0, f1, ipi = int(m.group("f0")), int(m.group("f1")), int(m.group("ipi"))
+    if ack != 0:
+        return False, f"ack超时={ack} ⇒ 相位没跑完"
+    if done != 1:
+        return False, f"完成={done} ⇒ 消费者没跑完，丢唤醒了"
+    if f1 <= f0:
+        return False, f"失败计数 {f0}->{f1} 没涨 ⇒ 计数没咬（注入没走到 Err 分支）"
+    if ipi != 0:
+        return False, f"收到IPI={ipi} ⇒ 注入没把 IPI 打掉，这条构建没在量它声称的东西"
+    return True, f"失败计数 {f0}->{f1} 收到IPI=0 完成=1 ack=0"
+
+
 def check_irq_trace(log: str, src: Path | None = None) -> tuple[list[str], str]:
     """M5-g③：把 QEMU `-d int` 数到的投递与内核自己报的两本账对起来。
 
@@ -4637,6 +4661,14 @@ def do_test(timeout: int) -> int:
     # 两档各查一次而不只查一档：只看其中一档，另一档的退出路径改坏了也照样绿。
     scasc_ok, scasc_msg = l4_exit_cascade(slog, "L4 mm: shootdown 超时")
     print("    无级联:", scasc_msg)
+    # 欠账⑦ / ADR-062：resched IPI 发送一律失败的注入。期望整体仍 PASS（失败不丢唤醒，
+    # 目标靠自己的 tick 仍被选上），但宿主机要独立核三件事：失败计数真的涨了、收到的 IPI 为 0、
+    # 消费者真的跑完。内核自判之外再加这台仪器，"计数会咬"才不是内核自说自话。
+    print("=== resched IPI 失败注入（--features fault-resched-ipi，计数必须涨且不丢唤醒）===")
+    IMAGE.unlink(missing_ok=True)
+    riv, rirc, rilog = do_run(["fault-resched-ipi"], timeout)
+    rif_ok, rif_msg = check_resched_ipi_fail(rilog)
+    print("    IPI失败注入:", rif_msg)
     print("=== virtio-blk 取证（--features virtio-blk，第三块盘走 virtio）===")
     vv, vrc, vlog = do_run(["virtio-blk"], timeout)
     print("=== 启动循环保护：同一份镜像连跑四遍（--features negative-probe），第四次必须进安全模式 ===")
@@ -5000,6 +5032,9 @@ def do_test(timeout: int) -> int:
         # 挂死不是一种"错误码"，而是判定契约里的独立一级（§12.3）：这里它就是期望结果
         ("IF 归任务就挂死", fv, frc, "HANG", -1),
         ("shootdown 收不齐回执升 L4", sv if scasc_ok else "CONTENT-MISMATCH", src, "EXCEPTION", 39),
+        # 欠账⑦ / ADR-062：IPI 发送失败但**不丢唤醒**，所以整体期望 PASS(33)。
+        # 内核绿而宿主机那三件事（计数涨/收到0/跑完）对不上 ⇒ CONTENT-MISMATCH，两种成因分得开
+        ("resched IPI失败计数会咬", riv if rif_ok else "CONTENT-MISMATCH", rirc, "PASS", 33),
         # 期望的是**新的一级**而不是 FAIL：这一条的故障在内核之外，rc 仍是 33
         ("块内容对账抓得出错标签", cv, crc, "CONTENT-MISMATCH", 33),
         # 这条红在**内核里**，不是对账层。原先我推测的成因是"QEMU 把命令丢掉 ⇒ 有界等待到期"，
@@ -5088,7 +5123,7 @@ def do_test(timeout: int) -> int:
         "正向": log, "负样本": nlog, "L4 重复释放": dlog, "L4 堆分配失败": olog,
         "泄漏注入被检出": llog, "中断内分配被挡下": alog, "锁重入被抓住": rlog,
         "SMAP 没开成不启动": slog2, "IF 归任务就挂死": flog,
-        "shootdown 收不齐回执升 L4": slog, "块内容对账抓得出错标签": clog,
+        "shootdown 收不齐回执升 L4": slog, "resched IPI失败计数会咬": rilog, "块内容对账抓得出错标签": clog,
         "计数放错位置读不出长块": chlog, "高LBA 与写方向判据成立": hlog,
         "高位写错就读不到图案": ghlog, "写方向少编程扇区数必须红": pwlog,
         "丢 W 位本机不可见": wdlog,

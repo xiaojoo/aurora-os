@@ -682,7 +682,15 @@ pub fn request_resched(cpu: usize) -> bool {
         return false;
     }
     let Some(id) = crate::arch::x86_64::cpu::lapic_id_of(cpu) else { return false };
-    match crate::arch::x86_64::apic::send_ipi_to(id, trap::VEC_RESCHED_IPI as u32) {
+    // 注入（欠账⑦ / ADR-062）：健康 QEMU 上 IPI 从不失败，resched_ipi_fail() 恒 0、没人能
+    // 证明它会咬。这条构建在**记账点**强制走 Err 分支（与真失败同一条处置：计数 + 返回 false），
+    // 验证计数真的涨、且失败不丢唤醒。注入放这里而不是 send_ipi_to：那里是 apic.rs，
+    // check-vector-table 会把任何 `vector == VEC_*` 的提前 return 误读成"不发 EOI 的分支"。
+    #[cfg(feature = "fault-resched-ipi")]
+    let sent: Result<(), crate::arch::x86_64::apic::ApicError> = Err(crate::arch::x86_64::apic::ApicError::MapFailed);
+    #[cfg(not(feature = "fault-resched-ipi"))]
+    let sent = crate::arch::x86_64::apic::send_ipi_to(id, trap::VEC_RESCHED_IPI as u32);
+    match sent {
         Ok(()) => true,
         Err(_) => { RESCHED_IPI_FAIL.fetch_add(1, Ordering::Relaxed); false }
     }

@@ -672,6 +672,7 @@ ktest!(KT_WAITQUEUE, t_waitqueue);
 /// 目标立牌后 preempt 换人）。压力用例把三环混在一个读数里，红了分不清哪一环；
 /// 这一格只验后两环，且是确定性的（每个在线 AP 都必须送达）。
 /// 第一环由 `t_block_wake`/`t_waitqueue` 的状态转移判据覆盖。
+#[cfg(not(feature = "fault-resched-ipi"))]
 fn t_cross_cpu_resched() -> bool {
     if smp::bringup().is_err() {
         crate::log_fatal!("resched: AP 起不来");
@@ -698,11 +699,15 @@ fn t_cross_cpu_resched() -> bool {
             delivered += 1;
         }
     }
+    let fails = sched::resched_ipi_fail();
     crate::log_info!(
         "resched 跨核(ADR-055): 在线AP={} 送达={} 发送被拒={} IPI失败累计={}",
-        checked, delivered, refused, sched::resched_ipi_fail());
-    checked > 0 && delivered == checked && refused == 0
+        checked, delivered, refused, fails);
+    // 健康跑里每一发都送达（delivered==checked），失败计数就必须是 0——这是"计数不误报"
+    // 的那一半；"计数会咬"的另一半由 fault-resched-ipi 构建的 t_resched_ipi_fail_fallback 证。
+    checked > 0 && delivered == checked && refused == 0 && fails == 0
 }
+#[cfg(not(feature = "fault-resched-ipi"))]
 ktest!(KT_CROSS_CPU_RESCHED, t_cross_cpu_resched);
 
 // ---- P4c-2：跨核阻塞/唤醒压力。逻辑全部在**测试层** ----
@@ -792,6 +797,7 @@ fn wwc_producer() {
 /// 那部分是 TCG 把四个 vCPU 串在一个宿主线程上轮转的抖动，量的是模拟器不是内核；
 /// 去掉 IPI 则每轮都要等目标自己的 tick ⇒ 慢轮 52~77%（实测）。所以 10% 是两个 regime
 /// 的分界，不是性能 SLA；最大延迟只作观察量报出来。
+#[cfg(not(feature = "fault-resched-ipi"))]
 fn t_cross_cpu_wait() -> bool {
     let (n, aps) = smp::participant_slots();
     for &s in &aps[..n] {
@@ -832,7 +838,78 @@ fn t_cross_cpu_wait() -> bool {
         && blocks == wakes && blocks > 0
         && slow * 10 <= WWC_ROUNDS && ipi > 0 && ack == 0
 }
+#[cfg(not(feature = "fault-resched-ipi"))]
 ktest!(KT_CROSS_CPU_WAIT, t_cross_cpu_wait);
+
+// ---- 欠账⑦（ADR-062）：resched IPI 失败不丢唤醒。只在 fault-resched-ipi 构建里注册 ----
+// 健康 QEMU 上 IPI 从不失败，resched_ipi_fail() 恒 0；这条构建强制它失败，证明计数会咬，
+// 且失败之后目标任务靠自己的 tick 仍被选上（"失败不丢唤醒"那条安全不变量）。
+#[cfg(feature = "fault-resched-ipi")]
+const RIF_QID: u8 = 5;
+#[cfg(feature = "fault-resched-ipi")]
+static RIF_FLAG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "fault-resched-ipi")]
+static RIF_DONE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "fault-resched-ipi")]
+static RIF_TASK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// AP 侧消费者：真的阻塞一次，被唤醒后置 DONE。角色跑在 AP 的空闲上下文里，
+/// 所以**不能** `finish_current`（与 wwc_consumer 同一理由：空闲上下文不退出）。
+#[cfg(feature = "fault-resched-ipi")]
+fn rif_consumer() {
+    let Some(q) = sync::wait_queue(RIF_QID) else { return };
+    RIF_TASK.store(sched::current_id() as u64, Ordering::Release);
+    match q.wait_while(RIF_QID, || RIF_FLAG.load(Ordering::Acquire) != 0) {
+        Ok(_) => { RIF_DONE.store(1, Ordering::Release); }
+        Err(_) => { RIF_DONE.store(u64::MAX, Ordering::Release); }
+    }
+}
+
+/// BSP 侧观察者：等消费者**真的阻塞了**再置位并 wake_all。注入下这次 wake 的 IPI 必失败，
+/// 但消费者已是 Runnable，靠它自己的下一次 tick 仍会跑完。永不阻塞，所以丢唤醒时它能报红。
+#[cfg(feature = "fault-resched-ipi")]
+fn rif_observer() {
+    let t0 = tsc::now();
+    while tsc::now().wrapping_sub(t0) < 100_000_000 {
+        let task = RIF_TASK.load(Ordering::Acquire);
+        if task != u64::MAX && matches!(sched::state_of(task as usize), sched::TaskState::Blocked(_)) {
+            break;
+        }
+        tsc::spin(2_000);
+    }
+    RIF_FLAG.store(1, Ordering::Release);
+    if let Some(q) = sync::wait_queue(RIF_QID) {
+        let _ = q.wake_all();
+    }
+}
+
+/// 四格：ack 不超时、消费者真的跑完（DONE==1，不是错误标记）、失败计数涨了、收到的 IPI 为 0。
+/// `fail > fail0` 是"计数会咬"的直接见证；`received == 0` 证明注入确实把 IPI 打掉了；
+/// `done` 证明**没丢唤醒**。三者缺一，这条判据就退化成"看起来绿"。
+#[cfg(feature = "fault-resched-ipi")]
+fn t_resched_ipi_fail_fallback() -> bool {
+    RIF_FLAG.store(0, Ordering::Relaxed);
+    RIF_DONE.store(0, Ordering::Relaxed);
+    RIF_TASK.store(u64::MAX, Ordering::Relaxed);
+    let fail0 = sched::resched_ipi_fail();
+    let ipi0 = apic::resched_ipi_received() as u64;
+    let ack = match smp::run_ap_role(rif_consumer, rif_observer) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_fatal!("resched IPI 失败注入: 测不成 {:?}", e);
+            return false;
+        }
+    };
+    let fail = sched::resched_ipi_fail();
+    let received = apic::resched_ipi_received() as u64 - ipi0;
+    let done = RIF_DONE.load(Ordering::Acquire);
+    crate::log_info!(
+        "resched IPI失败注入(ADR-062): ack超时={} 完成={} 失败计数 {}->{} 收到IPI={}",
+        ack, done, fail0, fail, received);
+    ack == 0 && done == 1 && fail > fail0 && received == 0
+}
+#[cfg(feature = "fault-resched-ipi")]
+ktest!(KT_RESCHED_IPI_FAIL, t_resched_ipi_fail_fallback);
 
 // ---- P5：把 BSP 的 idle 真的逼出来跑一次 hlt，并证明 IPI 能叫醒它 ----
 const P5_QID: u8 = 2;
@@ -893,6 +970,7 @@ fn p5_bsp_blocker() {
 /// P5：BSP idle 的 hlt 路径**必须被执行到**，否则那段转换等于没验。
 /// 判据：清场后 BSP 只剩 idle 可跑 ⇒ `idle_hlt_count(BSP)` 必须前进；
 /// AP 确实看到了阻塞态（`P5_AP_SAW>0`）；启动上下文被跨核唤醒后回来了（flag 生效）。
+#[cfg(not(feature = "fault-resched-ipi"))]
 fn t_idle_hlt_wakes() -> bool {
     if sched::state_of(0) == sched::TaskState::Free {
         sched::init_boot_task();
@@ -933,6 +1011,7 @@ fn t_idle_hlt_wakes() -> bool {
     // 只判 `h1 > h0` 量的是"idle 跑过"，不是"idle 真的停住了"。
     h1 > h0 && h1 - h0 <= 4 && saw > 0 && woke && ack == 0
 }
+#[cfg(not(feature = "fault-resched-ipi"))]
 ktest!(KT_IDLE_HLT_WAKES, t_idle_hlt_wakes);
 
 // ---- P6：sleep_until 的精度判据，BSP 与 AP 各一档 ----

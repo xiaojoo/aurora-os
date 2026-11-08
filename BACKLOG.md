@@ -4886,6 +4886,43 @@ VA 保留表扩成区间表、`split_huge`、缺页处理），或先清上面�
 - 三处旧用例里手写的 `q.remove_task(...)` 现在是冗余无效操作，**有意不删**：
   它们是"缺陷曾经存在"的证据，删掉就只剩散文。
 
+## 138. 清欠账第 7 条：resched IPI 失败计数由注入证明它会咬，且失败不丢唤醒（2026-11-08，实测）
+
+**要清的是 §135 未决 7**：`resched_ipi_fail()` 只被日志打印、没有断言看着它。
+健康 QEMU 上 IPI 从不失败，计数恒 0，"它真失败时会不会涨"靠健康跑永远测不到。
+
+**落地（ADR-062，用户选了注入这条路）**：
+1. 健康跑那一半：`t_cross_cpu_resched` 判据加 `fails == 0`，配 `delivered == checked` 反空转 ⇒ 计数不误报。
+2. 注入那一半：新特性 `fault-resched-ipi`，在 `request_resched` 的**记账点**强制走 Err 分支
+   （与真失败同一条处置：计数 + 返回 false）。新用例 `t_resched_ipi_fail_fallback` 四格：
+   `ack==0 / done==1（没丢唤醒）/ fail>fail0（计数会咬）/ received==0（注入真把 IPI 打掉了）`。
+3. 宿主机第二台仪器 `check_resched_ipi_fail` 独立解见证行；判定表第 **42** 行期望 PASS(33)，
+   内核绿而宿主机对不上 ⇒ CONTENT-MISMATCH。
+
+**两处量具错（不是被测物错，记下来当提醒）**：
+- 第一版注入放 `send_ipi_to`（apic.rs），被 `check-vector-table` 的 no_eoi 形状判据误读成
+  "不发 EOI 的分支"（`vector == VEC_*` 提前 return）⇒ 红。挪到记账点 `request_resched`（sched.rs，
+  该门禁不扫）解决，**没有**为它放宽门禁或污染 vectors.toml。
+- 第一版没 gate `t_idle_hlt_wakes`：注入下 AP 发的 IPI 失败，BSP idle 靠 IPI 醒、又没有本地 tick 源
+  ⇒ 永远停住（实测 HANG 120 s）。连同 `t_cross_cpu_resched`/`t_cross_cpu_wait` 三条整条不注册
+  （不是改断言能救的），由新用例取代。注入构建 61 条，正常构建仍 63 条。
+
+**读数（实测）**：
+- 注入构建：`失败计数 0->3 收到IPI=0 完成=1 ack超时=0`、`total=61 passed=61 failed=0`、PASS(33)。
+  三个 AP 消费者各占一格，wake_all 三发 IPI 全失败 ⇒ 计数涨 3，三个都靠自己的 tick 跑完。
+- 健康构建：`IPI失败累计=0`、`total=63 passed=63 failed=0`、PASS。
+- 宿主机判据证红：把见证行的计数改 `0->0`、`完成=1` 改 `0`、`收到IPI=0` 改 `2`、删见证行，
+  四种各返回 False（点名成因）；真日志返回 True。
+- `check` **17/17**（`arch.public_api` 补 `apic::ApicError`；环内棘轮不变）。
+- **矩阵整轮复验 42 行全符合、0 不符**；49 份留档里健康跑 `IPI失败累计` 取值集合 = {0}，
+  注入见证仅 1 份且读数 = (0,1,0->3,0)。
+
+**没做 / 新发现的风险**：
+- 注入是**记账点模拟**，`send_ipi_to` 的真硬件 ICR 卡死路径（`ICR_POLL_LIMIT` 超时）本机仍测不到，
+  真机（M7）要重测（ADR-062 未决 1）。
+- "失败不丢唤醒"只在**有本地 tick 的 CPU**（AP）上被证明；BSP idle 靠 IPI 醒、无本地 tick，
+  那条路径在注入下被 gate 掉，没有用例（ADR-062 未决 2/3）。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

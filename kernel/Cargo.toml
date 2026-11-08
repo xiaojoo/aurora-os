@@ -52,6 +52,14 @@ fault-no-smap = []
 # 请求方必须在有界等待到期时升 L4——否则它会以为可以安全归还那块物理页。
 fault-shootdown-noack = []
 
+# 负样本（欠账⑦ / ADR-062）：resched IPI 发送一律失败（在 request_resched 的记账点强制
+# 走 Err 分支，只影响 resched，不动 shootdown）。健康 QEMU 上 IPI 从不失败，所以
+# resched_ipi_fail() 这个计数平时恒 0、没人能证明它会咬。这条构建强制它失败，验证：
+# 计数真的涨、收到的 IPI 为 0、且**失败不丢唤醒**——目标任务已是 Runnable，靠它自己的
+# 下一次 tick 仍被选上。三条依赖跨核 IPI 送达的用例（t_cross_cpu_resched / t_cross_cpu_wait /
+# t_idle_hlt_wakes）在本特性下不注册，由 t_resched_ipi_fail_fallback 取代它们量这条路径。
+fault-resched-ipi = []
+
 # 负样本（§8.7.2 与 §12.3 R19）：把第二次块读的 LBA 标签打成第一次的那个。
 # 内核自判的内容见证（MBR 签名、`EFI PART`、两次哈希不同）在注入下**照样全绿**，
 # 只有 `tools/aurora.py` 的宿主机对账会翻车 —— 这条构建证明的是那把尺子能分辨。

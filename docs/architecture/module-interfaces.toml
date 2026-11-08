@@ -47,6 +47,7 @@ owner = "arch"
 layer = "arch"
 source_modules = ["arch", "arch/x86_64", "arch/x86_64/apic", "arch/x86_64/cpu", "hooks", "arch/x86_64/cpuid", "arch/x86_64/smp", "arch/x86_64/trap"]
 public_api = [
+  "apic::ApicError",
   "apic::TimerError",
   "apic::ap_enable_lapic",
   "apic::ap_timer_start",
