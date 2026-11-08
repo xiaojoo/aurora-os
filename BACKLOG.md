@@ -4105,6 +4105,52 @@ entry=0x100102000`，所以挂死现场的 `RIP=0x100102040` 落在**代码页**
 这个手法与"单 tick 源 + 无 idle 任务"是耦合的。W1 的 idle/阻塞落地之后应当重新审视：
 那时"心跳停止"该由**任务阻塞**而不是**停硬件时钟**来表达，用例手法也要跟着换。
 
+## 113. P2.5 关闭：矩阵 41/41；并把 P3 的依赖链摸清（2026-11-08，实测）
+
+**判定表复验（实测，修复①之后一整轮）**：**41 行全符合、0 不符**。
+- 三行原本会飘红的档现在都是 PASS：`高LBA 与写方向判据成立`、`中断投递由宿主机数到`、
+  `投递三层由控制器事件数到`。
+- 期望 HANG 的两行**仍然是 HANG**：`IF 归任务就挂死`（fault-if-carriage，60 s）、
+  `不清源就风暴（有界窗口）`（irq-sticky-pxis，6 s，风暴对账=True）——
+  这次改动没有把负样本弄绿，这一点单独核过。
+- 全轮**没有意外 HANG**。
+
+**P2.5 至此关闭**：诊断（§111 三条独立证据）+ 修复①（§112）+ 确定性变异证红 +
+合成对抗 5/5 + 默认档 12/12 + 日志多重集只多一行新判据 + `check` 17/17 + 矩阵 41/41。
+`中断投递由宿主机数到` 那一行从此可以当判据用，不再需要"重跑看绿"。
+
+### 113a P3 的依赖链（只读取证，矩阵跑期间未动树）
+
+**关键结论：`yield_now` 不需要新的切换机制，但 resched 向量要从 P5 提前到 P3。**
+`preempt_point` 的契约要求异常帧在当前任务栈上，而普通内核上下文没有帧；
+现成解法是**自陷**：`STUB_NOERR n` 宏生成建帧桩（`push 0; push n; jmp isr_common`，
+241 就是这么来的），所以 `yield_now` = 立 need 牌 + `int 0xF0`，硬件建帧、走既有
+`isr_common → preempt_point`。软件中断不受 IF 影响 ⇒ **IF=0 时也能让出**，
+这正是 ADR-021/`loads_closed` 那一格缺的触发源。
+
+**必须同轮改的七处（少一处就红在别处）**：
+1. `trap.rs`：`VEC_RESCHED=0xF0` + `STUB_NOERR 240` + 把 IDT 表里 240 那格从 `.rept`
+   共用桩拆出来（现状：241 独占、242..254 共用 `.rept 13`）。
+2. `vectors.toml` 加 `VEC_RESCHED` 行（ADR-046 的闸要求名字/取值/stub 对得上、
+   `[[range]]` 仍铺满 0..255）；**不进** `frame_bypass`，因为它建帧。
+3. `apic::on_interrupt` 必须给它单独一支：现分类是"32..47→IRQ 桶；==VEC_CPU_TIMER→
+   mark_tick；**其余→UNEXPECTED**"，不加分支就把 `unexpected` 顶上去，
+   `ktests/time.rs:88` 的 `clean` 当场红。
+4. **不能借 `mark_tick`**（会灌 tick 数、破坏两台仪器对照）。走 hooks 新字段
+   `mark_need_from_isr`；每加一个字段 = 1 处 U4，同轮进白名单与 census。
+5. `apic::Counts` 现在只有 `{irq[16], unexpected, spurious, eois}`，**没有 resched 的位置**；
+   而 `p5_non_irq`（`trap.rs:684`，>47 的向量）会把它收进去 ⇒ `p5_delta == rust_delta`
+   会失衡。必须给 `Counts` 加字段，并同轮改 `main.rs` 的 `rust_irq_total` 与
+   `ktests/time.rs` 的等式。代码里那句注释早预言了："新增一类会进 P5 的向量必须显式表态"。
+6. `TaskState::Blocked(WaitToken)` + **每 CPU 兜底 idle 任务**（否则 `pick_next` 返回自身，
+   阻塞者原地继续跑）+ `reap` 状态集补 Blocked + `tasks_active()` 只数 Runnable/Running
+   的语义变化要写进日志说明。
+7. BACKLOG 144 那条**没写下的前提**（释放依赖本 CPU 再出现一次抢占）从此显式化。
+
+**顺序修正**：P3 = resched 向量 + `yield_now` + Blocked/idle/reap；
+P5 只剩"idle 真 hlt、`worked_aps` 换证人、宿主机 `-trace` 对账"。
+向量是 `yield_now` 的前置，不是 idle 的附属品。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。
