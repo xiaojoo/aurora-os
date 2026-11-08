@@ -14,6 +14,12 @@ pub struct SchedHooks {
     pub mark_need: fn(),
     pub init_idle_task: fn(u64, u64, bool),
     pub spawn: fn(fn() -> !) -> Result<usize, MmError>,
+    /// 同 `spawn`，但把新建的任务登记进**常驻工人名单**（`Task::resident`）。
+    /// 唯一的调用点是 AP 的工人循环：它设计上不退出，所以用例收尾判据要豁免它，
+    /// 而豁免必须显式，不能靠"它是内核任务"这种 blanket 理由（ADR-050 未决 1 的另一半）。
+    /// 在 `spawn` 里一次性写定，不做"先建再标记"——那会让收尾有机会在标记之前看到一个
+    /// 还没进名单的 Runnable 工人。
+    pub spawn_resident: fn(fn() -> !) -> Result<usize, MmError>,
     pub bump_current_work: fn(),
     pub syscall_dispatch: fn(&mut TrapFrame) -> bool,
     pub park_current: fn(&mut TrapFrame),
@@ -60,6 +66,7 @@ static HOOKS: HooksCell = HooksCell(UnsafeCell::new(SchedHooks {
     mark_need: no_mark_need,
     init_idle_task: no_init_idle,
     spawn: no_spawn,
+    spawn_resident: no_spawn,
     bump_current_work: no_bump,
     syscall_dispatch: no_syscall,
     park_current: no_park,

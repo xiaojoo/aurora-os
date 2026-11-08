@@ -80,6 +80,13 @@ pub struct Task {
     pub state: TaskState,
     /// 是不是用户态任务（决定换入时要不要装 rsp0，也决定故障该杀还是该停机）。
     pub user: bool,
+    /// **设计上就不退出的常驻工人**：每 CPU 的启动/空闲上下文（slot 0）、BSP 的兜底 idle、
+    /// AP 队列里的工人。收尾判据只豁免这一份名单里的内核任务，其余还 `Runnable` 的
+    /// 内核工人一律点名（关掉 ADR-050 未决 1 的另一半、ADR-061 未决 3）。
+    ///
+    /// 取值只有五个来源，就是下面五个 `Task` 字面量；`terminate_task` 释放槽位时清掉，
+    /// 所以"槽位被复用"不会把常驻身份带给下一个任务（ADR-061 未决 1 的 ABA 同一条线）。
+    pub resident: bool,
     /// **属于哪个 CPU 的队列**（`cpu` 模块的槽位号）。
     ///
     /// 为什么要把"在哪个 CPU 上"从 `state` 里分出来：M3a 那次挂死就是两者共用一个字段造成的——
@@ -216,6 +223,9 @@ pub fn terminate_task(task: usize) -> bool {
         };
         s.tasks[slot].state = TaskState::Free;
         s.tasks[slot].frame = 0;
+        // 常驻身份跟着槽位走，所以释放时必须清掉：否则下一个复用这条槽的任务
+        // 会白白拿到豁免（ADR-061 未决 1 那条 ABA 的同一家族）。
+        s.tasks[slot].resident = false;
         s.entries[slot] = None;
         (slot, s.current == task, s.tasks[slot].owned.n > 0, was_blocked)
     };
@@ -349,6 +359,7 @@ const EMPTY_TASK: Task = Task {
     guarded: false,
     state: TaskState::Free,
     user: false,
+    resident: false,
     on_cpu: 0,
     runs: 0,
     left_tsc: 0,
@@ -918,6 +929,7 @@ pub fn init_boot_task() {
         guarded: false,
         state: TaskState::Running,
         user: false,
+        resident: true, // 每 CPU 的启动/空闲上下文：设计上不退出（名单见 Task::resident）
         on_cpu: cpu as u8,
         runs: 1,
         left_tsc: 0,
@@ -947,6 +959,7 @@ pub fn init_idle_task(stack_lo: u64, stack_hi: u64, guarded: bool) {
         guarded,
         state: TaskState::Running,
         user: false,
+        resident: true, // 每 CPU 的启动/空闲上下文：设计上不退出（名单见 Task::resident）
         on_cpu: cpu as u8,
         runs: 1,
         left_tsc: 0,
@@ -1178,6 +1191,7 @@ pub fn init_idle() -> bool {
         guarded: false, // .bss 数组，与启动栈同理：上一格属于同一个静态量
         state: TaskState::Runnable,
         user: false,
+        resident: true, // 兜底 idle 永不退出（ADR-051）：它是"没人可换"时的最后一格
         on_cpu: cpu as u8,
         runs: 0,
         left_tsc: 0,
@@ -1189,7 +1203,20 @@ pub fn init_idle() -> bool {
 
 /// 建一个任务：保留 `STACK_VA_PAGES` 页，最低那一页永不映射当 guard。
 /// 新任务挂在**调用者所在 CPU** 的队列上（`Task::on_cpu`），返回值是全局任务下标。
+/// 建一个任务。**默认不是常驻工人**：收尾判据会在用例跑完之后把它点名。
+/// 只有"设计上不退出"的启动路径工人要走 `spawn_resident`（名单见 `Task::resident`）。
 pub fn spawn(entry: fn() -> !) -> Result<usize, mm::MmError> {
+    spawn_inner(entry, false)
+}
+
+/// 与 `spawn` 同一件事，但把这个任务登记进**常驻名单**（ADR-050 未决 1 的另一半）。
+/// 今天唯一的调用点是 AP 的工人循环（`smp.rs`）：它按设计不退出，`stop_aps()` 之后
+/// 才随那条 CPU 一起停机。装进 hooks 表而不是让 arch 直调 sched，与 `spawn` 同一条理由。
+pub fn spawn_resident(entry: fn() -> !) -> Result<usize, mm::MmError> {
+    spawn_inner(entry, true)
+}
+
+fn spawn_inner(entry: fn() -> !, resident: bool) -> Result<usize, mm::MmError> {
     let cpu = crate::arch::x86_64::cpu::self_slot();
     // 分配走 mm 的锁，**不能**在已经拿着自己队列的时候做：
     // 队列的 SAFETY 前提是"只由本 CPU 碰"，而 mm 的等待时间完全可能跨过别的 CPU 的观察点。
@@ -1238,6 +1265,7 @@ pub fn spawn(entry: fn() -> !) -> Result<usize, mm::MmError> {
         guarded: true,
         state: TaskState::Runnable,
         user: false,
+        resident,
         on_cpu: cpu as u8,
         runs: 0,
         left_tsc: 0,
@@ -1292,6 +1320,7 @@ pub fn spawn_user(entry_rip: u64, user_stack_top: u64, mut res: OwnedSet) -> Res
         guarded: true,
         state: TaskState::Runnable,
         user: true,
+        resident: false, // 用户任务永远不进常驻名单：收尾判据对它本来就点名（ADR-050）
         on_cpu: cpu as u8,
         runs: 0,
         left_tsc: 0,
@@ -1436,6 +1465,18 @@ pub fn is_user(i: usize) -> bool {
     }
     // SAFETY: 只读快照，理由同 `current_of`
     unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].user }
+}
+
+/// 这个槽位是不是**显式登记的常驻工人**（启动/空闲上下文、兜底 idle、AP 工人）。
+/// 收尾判据用它把豁免范围从"所有内核任务"收到"名单里这几个"（ADR-050 未决 1 的另一半）。
+/// 与 `is_user` 同样是只读快照，不参与调度决定，也不取队列锁（取锁会引入
+/// "BSP 等 AP 的 RUNQ"这种跨核等待，ADR-047 决策 2 禁止的就是这个形状）。
+pub fn is_resident(i: usize) -> bool {
+    if i >= MAX_TASKS_TOTAL {
+        return false;
+    }
+    // SAFETY: 只读快照，理由同 `current_of`
+    unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].resident }
 }
 
 pub fn runs_of(i: usize) -> u64 {
@@ -1611,6 +1652,7 @@ pub fn install_arch_hooks() {
         current_id_snapshot: current_id_no_lock,
         init_idle_task,
         spawn,
+        spawn_resident,
         bump_current_work,
         syscall_dispatch: crate::user::syscall_dispatch,
         park_current: crate::user::park_current,

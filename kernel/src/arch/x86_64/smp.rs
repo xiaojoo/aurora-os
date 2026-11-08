@@ -423,7 +423,10 @@ pub extern "C" fn aurora_ap_main(slot: u64, expect_lapic: u64) -> ! {
     (crate::hooks::sched().init_idle_task)(stack_lo, stack_lo + (AP_STACK_PAGES as u64) * mm::PAGE as u64, true);
     // 6) 在这条 CPU 自己的队列里放一个工人。它和上面的空闲上下文轮流跑，
     //    这就是"AP 在跑调度器"的唯一可数证据（BSP 那边读 `stats_of(ap).0`）。
-    match (crate::hooks::sched().spawn)(ap_worker) {
+    //    走 `spawn_resident` 而不是 `spawn`：这个工人按设计不退出（`stop_aps()` 才随 CPU 停），
+    //    所以它必须在收尾判据的**显式名单**里；不登记的话，判据扩到全 CPU 之后
+    //    每一格用例收尾都会把它点成"没人收的内核工人"（ADR-050 未决 1 的另一半）。
+    match (crate::hooks::sched().spawn_resident)(ap_worker) {
         Ok(t) => AP_TASK[slot].store(t + 1, Ordering::Release), // +1：0 留给"没建成"
         Err(e) => {
             AP_SPAWN_FAILED.fetch_add(1, Ordering::Relaxed);

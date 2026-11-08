@@ -415,60 +415,100 @@ fn stage_storage_guard_crash() {
 }
 
 /// Stage4：跑 .ktests、报 P1–P5/P4 读数并交付退出码。
+/// 用例收尾的账（ADR-050 / ADR-061 / W1 收尾 B2）。
+/// 两类残留**分开点名**，因为成因与处置不同：
+/// * `stray`：还 `Runnable`/`Running` 而**不在常驻名单**里的任务——原来只数用户任务，
+///   今天把"没人收的内核工人"一起数进来，豁免从 blanket 收到 `sched::is_resident`
+///   那份**显式名单**（名单在启动路径里写定：每 CPU 的启动/空闲上下文、BSP 的兜底 idle、
+///   AP 的工人循环）。新工人忘了登记会当场红，而不是被"它是内核任务"悄悄放过。
+/// * `blocked`：还 `Blocked` 的任务 ⇒ 等待槽/轮项漏了（ADR-061）。
+/// 范围从"本 CPU"扩到**所有在线 CPU**（ADR-050 未决 2 / ADR-061 未决 2）。
+/// 只读快照、不取队列锁：拿着 BSP 的锁去等 AP 的 RUNQ 正是 ADR-047 决策 2 禁止的形状。
+pub(crate) struct Sweep {
+    pub stray: usize,
+    pub first_stray: usize,
+    pub stray_cpu: usize,
+    pub blocked: usize,
+    pub first_blocked: usize,
+    pub blocked_cpu: usize,
+    /// 名单里被豁免掉的任务数。**防空转格**：这一格要是 0，"豁免是显式的"就是修辞。
+    pub residents: usize,
+    /// 扫了几颗在线 CPU（含 BSP）
+    pub cpus: usize,
+}
+
+pub(crate) fn finish_sweep() -> Sweep {
+    let mut s = Sweep {
+        stray: 0,
+        first_stray: usize::MAX,
+        stray_cpu: usize::MAX,
+        blocked: 0,
+        first_blocked: usize::MAX,
+        blocked_cpu: usize::MAX,
+        residents: 0,
+        cpus: 0,
+    };
+    for c in 0..cpu::MAX_CPUS {
+        if cpu::is_online(c) {
+            s.cpus += 1;
+        }
+    }
+    for i in 0..sched::MAX_TASKS_TOTAL {
+        let c = sched::cpu_of(i);
+        if !cpu::is_online(c) {
+            continue;
+        }
+        match sched::state_of(i) {
+            sched::TaskState::Blocked(_) => {
+                s.blocked += 1;
+                if s.first_blocked == usize::MAX {
+                    s.first_blocked = i;
+                    s.blocked_cpu = c;
+                }
+            }
+            sched::TaskState::Runnable | sched::TaskState::Running => {
+                if sched::is_resident(i) {
+                    s.residents += 1;
+                } else {
+                    s.stray += 1;
+                    if s.first_stray == usize::MAX {
+                        s.first_stray = i;
+                        s.stray_cpu = c;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    s
+}
+
 fn run_ktests_and_finish() -> ! {
     // ---- Stage4：跑用例并交付判定
     // P3b-2：先给 BSP 登记兜底 idle，再跑用例。有了它，"没有别人可换"不再是
     // "返回 prev 让 Done 任务永远占着 CPU"，而是切到 idle ⇒ reap 收得到那个槽（ADR-051）。
     let idle_ok = sched::init_idle();
     crate::log_info!("sched idle: 登记={} 下标={}", idle_ok, sched::idle_of(cpu::BSP_SLOT));
-    // P3a-2 的收尾不变量：**用例跑完时，本 CPU 不许留下可运行的用户任务**。
+    // P3a-2 的收尾不变量：**用例跑完时，任何在线 CPU 都不许留下"没登记的"可运行任务，
+    // 也不许留下阻塞任务**。豁免只给启动路径显式登记的常驻工人（`finish_sweep` 的注释）。
     // 为什么这条值得当判据：残留的 ring3 自旋任务会让任何"关窗口让出"或"停掉唯一
-    // tick 源"的动作变成整机静默（§111/§114a 两次挂死同一地址 RIP=0x100102040）。
-    // 它不是调度器的缺陷，是用例没把自己造的容器收干净——所以判据放在用例边界上，
-    // 由这里点名是哪一条用例留下的，而不是让每个用例各自扫一遍。
+    // tick 源"的动作变成整机静默（§111/§114a 两次挂死同一地址 RIP=0x100102040），
+    // 而残留的 Blocked 内核工人占着等待槽与轮项（ADR-061）。
+    // 它不是调度器的缺陷，是用例没把自己造的东西收干净——所以判据放在用例边界上，
+    // 由这里点名是哪一条用例留下的、在哪个 CPU、首个槽号，而不是让每个用例各自扫一遍。
     let s = ktest::run_all(|name| {
-        let bsp = cpu::BSP_SLOT;
-        let mut left = 0usize;
-        let mut first = usize::MAX;
-        // P7b（欠账⑥）：**内核工人也算**。Blocked 的任务占着等待槽、可能还占着一个轮项，
-        // 用例收尾还留着它就是漏注册——与"可运行的用户任务"是两种不同的漏，所以分开点名。
-        // ADR-050 未决 1 当时豁免了内核工人（tick 在跑时会被轮转），那条豁免只对 Runnable 成立；
-        // Blocked 不会被任何 tick 轮转，只能等一个也许永远不会来的唤醒。
-        let mut blocked = 0usize;
-        let mut first_blocked = usize::MAX;
-        for i in 0..sched::MAX_TASKS_TOTAL {
-            if sched::cpu_of(i) != bsp {
-                continue;
-            }
-            let st = sched::state_of(i);
-            if matches!(st, sched::TaskState::Blocked(_)) {
-                blocked += 1;
-                if first_blocked == usize::MAX {
-                    first_blocked = i;
-                }
-                continue;
-            }
-            if !sched::is_user(i) {
-                continue;
-            }
-            if matches!(st, sched::TaskState::Runnable | sched::TaskState::Running) {
-                left += 1;
-                if first == usize::MAX {
-                    first = i;
-                }
-            }
-        }
-        if blocked != 0 {
+        let sw = finish_sweep();
+        if sw.blocked != 0 {
             crate::log_fatal!(
-                "用例收尾不变量破坏：test={} 之后本 CPU 仍有 {} 个阻塞任务（首个 #{}）⇒ 等待槽/轮项漏了",
-                name, blocked, first_blocked);
+                "用例收尾不变量破坏：test={} 之后 cpu{} 仍有 {} 个阻塞任务（首个 #{}）⇒ 等待槽/轮项漏了",
+                name, sw.blocked_cpu, sw.blocked, sw.first_blocked);
         }
-        if left != 0 {
+        if sw.stray != 0 {
             crate::log_fatal!(
-                "用例收尾不变量破坏：test={} 之后本 CPU 仍有 {} 个可运行用户任务（首个 #{}）",
-                name, left, first);
+                "用例收尾不变量破坏：test={} 之后 cpu{} 仍有 {} 个未登记的可运行任务（首个 #{}，用户或内核工人在 `Task::resident` 名单之外）",
+                name, sw.stray_cpu, sw.stray, sw.first_stray);
         }
-        left == 0 && blocked == 0
+        sw.stray == 0 && sw.blocked == 0
     });
     crate::log_info!("ktests: total={} passed={} failed={} table_invalid={}", s.total, s.passed, s.failed, s.table_invalid);
     // §9.6 的账本：开机到现在看过几次心跳、报过几次、处置过几次。处置次数今天必须是 0，

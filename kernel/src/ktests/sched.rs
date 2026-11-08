@@ -168,11 +168,15 @@ fn t_task_stack_guard() -> bool {
     let first_mapped = mm::is_mapped(lo);
     let guard_faults = trap::probe_page_fault(guard_va).is_some();
     let first_faults = trap::probe_page_fault(lo).is_some();
+    // 收尾自己收干净（W1 收尾 B2 查出来的第二个泄漏）：这个工人只是借它的栈量边界，
+    // 用例不需要它活着。以前"内核任务一律豁免"藏住了它——它要等别的用例调
+    // `stop_workers()` 才收工，而那条用例可能排在本用例之前也可能排在之后。
+    let swept = sched::terminate_task(slot);
     crate::log_info!(
-        "task stack guard: lo={:#x} guarded={} guard_unmapped={} guard_faults={} first_mapped={} first_faults={}",
-        lo, guarded, guard_unmapped, guard_faults, first_mapped, first_faults
+        "task stack guard: lo={:#x} guarded={} guard_unmapped={} guard_faults={} first_mapped={} first_faults={} 工人收掉={}",
+        lo, guarded, guard_unmapped, guard_faults, first_mapped, first_faults, swept
     );
-    guarded && guard_unmapped && guard_faults && first_mapped && !first_faults
+    guarded && guard_unmapped && guard_faults && first_mapped && !first_faults && swept
 }
 ktest!(KT_TASK_STACK_GUARD, t_task_stack_guard);
 
@@ -394,20 +398,24 @@ fn t_if_belongs_to_cpu() -> bool {
     let closed_after = sched::if_loads().0;
     let partner_runs = sched::runs_of(partner);
     let (loads_closed, loads_open) = sched::if_loads();
+    // 读数取完之后把搭档收掉（W1 收尾 B2 查出来的第三个泄漏）：它要**第二次**被换上
+    // 才走得到自己的 `finish_current()`，而这一段表已经停了、没有任何抢占来源，
+    // 于是它永远停在 `Runnable`。以前"内核任务一律豁免"看不见这一格。
+    let partner_swept = sched::terminate_task(partner);
     crate::log_info!(
         "if-rule(ADR-021): slot={} runs={} frame_before={:?}(IF={}) frame_after={:?}(IF={}) loads_open={} loads_closed={}",
         slot, runs, before, if_before, after, if_after, loads_open, loads_closed
     );
     crate::log_info!(
-        "yield(ADR-049): 关窗口让出 closed {} -> {} 搭档runs={} 自陷计数={} 清残留={} 窗口还原={}",
+        "yield(ADR-049): 关窗口让出 closed {} -> {} 搭档runs={} 自陷计数={} 清残留={} 窗口还原={} 搭档收掉={}",
         closed_before, closed_after, partner_runs, apic::counts().resched, swept,
-        apic::interrupts_enabled(cpu::BSP_SLOT));
+        apic::interrupts_enabled(cpu::BSP_SLOT), partner_swept);
     // 判据：换入前 IF=0（帧里带的）→ 换入后跑过 ≥2 次且它的现场里 IF=1（CPU 给的）。
     // `loads_closed` 这一格从 P3a 起**有触发源了**：`yield_now` 自陷 0xF0，软件中断不受
     // IF 影响，所以关着窗口也能换人（ADR-049）。原来那句"必然 0、等主动让出时补"
     // 就是在这里补上的：现在要求它真的前进过，且搭档确实被换入过。
     !if_before && runs >= 2 && if_after && loads_open > 0
-        && closed_after > closed_before && partner_runs >= 1
+        && closed_after > closed_before && partner_runs >= 1 && partner_swept
 }
 ktest!(KT_IF_BELONGS_TO_CPU, t_if_belongs_to_cpu);
 
@@ -487,6 +495,140 @@ fn t_if_window_nested() -> bool {
     ok
 }
 ktest!(KT_IF_WINDOW_NESTED, t_if_window_nested);
+
+// ---- W1 收尾 B2：收尾判据的豁免改成**显式名单**，扫描范围扩到所有在线 CPU ----
+//
+// 这条用例就是那份"同轮的负样本"（ADR-050 未决 2 要求扩范围必须同轮换判据与负样本）。
+// 它注入的是**不登记**的常驻形状工人（自己不退出不收工），分两格：
+// BSP 一格、AP 一格。AP 那一格只有在扫描范围真的扩到全 CPU 时才看得见——
+// 把 `finish_sweep` 改回"只扫 BSP"，第 2 格当场红（MUTATION-F1）。
+// 把豁免改回"所有内核任务都豁免"（blanket），第 1、2 格同时红（MUTATION-F2）。
+
+/// 被注入的工人：只数自己的圈，**永不退出**。它走 `spawn`，所以 `Task::resident=false`。
+static FSN_WORK: [core::sync::atomic::AtomicU64; cpu::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; cpu::MAX_CPUS];
+/// 每颗 CPU 上那个注入工人的全局槽号（`usize::MAX` = 没建成/已收掉）。
+static FSN_GIDX: [core::sync::atomic::AtomicUsize; cpu::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicUsize::new(usize::MAX) }; cpu::MAX_CPUS];
+
+fn fsn_stray_worker() -> ! {
+    let c = cpu::self_slot();
+    loop {
+        FSN_WORK[c].fetch_add(1, Ordering::Relaxed);
+        tsc::spin(3_000);
+    }
+}
+
+/// AP 侧的角色：在**自己这条 CPU** 的队列里建一个不登记的工人。
+/// `spawn` 挂在 `cpu::self_slot()` 上，所以这个任务生来就归那颗 AP——这正是
+/// "只扫 BSP 的判据看不见 AP 残留"的那个形状，拿它当证人而不是靠推断。
+fn fsn_ap_spawn_role() {
+    let c = cpu::self_slot();
+    FSN_WORK[c].store(0, Ordering::Relaxed);
+    if let Ok(g) = sched::spawn(fsn_stray_worker) {
+        FSN_GIDX[c].store(g, Ordering::Release);
+    }
+}
+
+fn fsn_noop() {}
+
+fn fsn_clear() {
+    for c in 0..cpu::MAX_CPUS {
+        let g = FSN_GIDX[c].swap(usize::MAX, Ordering::AcqRel);
+        if g != usize::MAX {
+            let _ = sched::terminate_task(g);
+        }
+    }
+}
+
+/// 收尾判据自己的判据：注入必须被点名、点名范围必须覆盖 AP、收干净必须回 0。
+fn t_finish_sweep_names_worker() -> bool {
+    // 前提：进来时账是干净的。不干净就别测——残留是谁留的由链接顺序决定，
+    // 那种红离本用例的成因太远（§86e 的教训）。
+    let sw0 = crate::finish_sweep();
+    if sw0.stray != 0 || sw0.blocked != 0 {
+        crate::log_fatal!("finish-sweep: 前提失效，进用例时已有 未登记={} 阻塞={}", sw0.stray, sw0.blocked);
+        return false;
+    }
+    // 名单非空是"豁免是显式的"这句话的反空转格：BSP 至少占两格（启动上下文 + 兜底 idle）。
+    if sw0.residents < 2 {
+        crate::log_fatal!("finish-sweep: 常驻名单是空的（residents={}）⇒ 豁免这一侧没被测过", sw0.residents);
+        return false;
+    }
+
+    // ① BSP 注入
+    let g_bsp = match sched::spawn(fsn_stray_worker) {
+        Ok(g) => g,
+        Err(e) => {
+            crate::log_fatal!("finish-sweep: BSP 侧 spawn 失败 {:?}", e);
+            return false;
+        }
+    };
+    FSN_GIDX[cpu::BSP_SLOT].store(g_bsp, Ordering::Release);
+    let sw1 = crate::finish_sweep();
+
+    // ② 收掉 BSP 那一格，只剩 AP 上的注入——此刻点名范围必须落在非 BSP 的 CPU 上
+    let _ = sched::terminate_task(g_bsp);
+    FSN_GIDX[cpu::BSP_SLOT].store(usize::MAX, Ordering::Release);
+    if smp::run_ap_role(fsn_ap_spawn_role, fsn_noop).is_err() {
+        crate::log_fatal!("finish-sweep: AP 角色没跑起来 ⇒ 第 2 格的证人不存在，不静默跳过");
+        fsn_clear();
+        return false;
+    }
+    let sw2 = crate::finish_sweep();
+    let ap_strays = (1..cpu::MAX_CPUS).filter(|&c| FSN_GIDX[c].load(Ordering::Acquire) != usize::MAX).count();
+
+    // ③ 全部收干净
+    fsn_clear();
+    let sw3 = crate::finish_sweep();
+
+    crate::log_info!(
+        "收尾名单(ADR-050/061): 在线CPU={} 进用例豁免={} BSP注入后点名={}/{}(cpu{} 首个#{}) 只剩AP注入时={}/{}(cpu{} 首个#{}) 收干净后={}/{} AP侧建成={}",
+        sw0.cpus,
+        sw0.residents,
+        sw1.stray,
+        sw1.blocked,
+        sw1.stray_cpu,
+        sw1.first_stray,
+        sw2.stray,
+        sw2.blocked,
+        sw2.stray_cpu,
+        sw2.first_stray,
+        sw3.stray,
+        sw3.blocked,
+        ap_strays
+    );
+    let ok = sw1.stray == 1
+        && sw1.first_stray == g_bsp
+        && sw1.stray_cpu == cpu::BSP_SLOT
+        && ap_strays >= 1
+        && sw2.stray == ap_strays
+        && sw2.stray_cpu != cpu::BSP_SLOT
+        && sw3.stray == 0
+        && sw3.blocked == 0
+        && sw3.residents == sw0.residents;
+    if !ok {
+        crate::log_fatal!(
+            "finish-sweep: 判据不成立 注入后={}/{}(cpu{} 首个#{}, 期望 1/#{}#{}) AP-only={}/{}(cpu{}, 期望 AP 且={}) 收干净={}/{} 豁免{}->{}",
+            sw1.stray,
+            sw1.blocked,
+            sw1.stray_cpu,
+            sw1.first_stray,
+            g_bsp,
+            cpu::BSP_SLOT,
+            sw2.stray,
+            sw2.blocked,
+            sw2.stray_cpu,
+            ap_strays,
+            sw3.stray,
+            sw3.blocked,
+            sw0.residents,
+            sw3.residents
+        );
+    }
+    ok
+}
+ktest!(KT_FINISH_SWEEP, t_finish_sweep_names_worker);
 
 /// P3b 的工人：**自己**终止自己，然后让出。
 /// `terminate_task` 对"正在 CPU 上"的任务只登记待回收、不就地释放（它正站在那条栈上），
@@ -585,11 +727,16 @@ fn t_idle_fallback() -> bool {
     sched::yield_now();
     let runs1 = sched::runs_of(idle);
     let partner_runs = sched::runs_of(partner);
+    // 收尾自己收干净（W1 收尾 B2 查出来的）：这个搭档让出一次就回到 `Runnable`，
+    // 永远走不到它自己的 `finish_current()`。以前"内核任务一律豁免"把它藏住了，
+    // 改成显式名单之后收尾判据当场点名——它不是 idle，不在名单里，就该被收掉。
+    // 读数已经在上面取完，所以收掉它不影响本用例的判据。
+    let swept = sched::terminate_task(partner);
     crate::log_info!(
-        "idle(ADR-051): 下标={} 状态={:?} 名下={} active={} 独立重算={} idle_runs {} -> {} 搭档runs={}",
-        idle, st, owned, active, recount, runs0, runs1, partner_runs);
+        "idle(ADR-051): 下标={} 状态={:?} 名下={} active={} 独立重算={} idle_runs {} -> {} 搭档runs={} 搭档收掉={}",
+        idle, st, owned, active, recount, runs0, runs1, partner_runs, swept);
     st == sched::TaskState::Runnable && owned == 0 && active == recount
-        && runs1 == runs0 && partner_runs >= 1
+        && runs1 == runs0 && partner_runs >= 1 && swept
 }
 ktest!(KT_IDLE_FALLBACK, t_idle_fallback);
 

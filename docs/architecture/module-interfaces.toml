@@ -265,6 +265,7 @@ public_api = [
   "sched::MAX_TASKS_TOTAL",
   "sched::TaskState",
   "sched::is_user",
+  "sched::is_resident",
   "sched::install_wait_ops",
   "sched::idle_of",
   "sched::idle_hlt_count",
