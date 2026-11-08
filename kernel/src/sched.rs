@@ -625,6 +625,23 @@ pub fn mark_tick() {
     FLAGS[slot].need.store(true, Ordering::Release);
 }
 
+/// 主动让出：立牌 + 自陷 resched 向量（ADR-049，P3a）。
+///
+/// 为什么用自陷而不是直接调 `preempt_point`：那个函数的契约要求**异常帧就在当前任务
+/// 栈上**，而普通内核上下文没有帧。`int 0xF0` 让硬件压帧，于是既有的
+/// `isr_common → preempt_point` 原样可用，不需要第二套切换机制。
+/// `int` 不受 IF 影响 ⇒ **关着窗口也能让出**，这正是 `loads_closed` 缺的触发源。
+/// 门是中断门（不是陷阱门），所以硬件进来时清 IF、`iretq` 时按保存的 rflags 还原，
+/// 窗口状态不会被这次让出改掉（ADR-021：IF 属于 CPU）。
+pub fn yield_now() {
+    mark_need(crate::arch::x86_64::cpu::self_slot());
+    // SAFETY: `int` 会压栈并进入本 CPU 的同步入口，所以**不能**声明 nostack/nomem；
+    // 向量 0xF0 的门是 DPL0、已装建帧桩（`STUB_NOERR 240`），处理侧只计数不发 EOI，
+    // `iretq` 回到这里继续执行。前提：调用者是一个已登记的任务（帧要落在它的内核栈上），
+    // 由 `preempt_point` 的"帧在不在这条栈上"那道检查兜住——不满足时它只是不换人。
+    unsafe { core::arch::asm!("int {}", const crate::arch::x86_64::trap::VEC_RESCHED) };
+}
+
 /// 让本 CPU 在**下一次出中断时**换人。`mark_tick` 也立这块牌，但它同时把 tick 数加一——
 /// 那是"发生过一次时钟"的记录，不该被别的理由借用（借用的后果是 P5/`ticks` 的数
 /// 与真实 tick 数对不上，而那条"两台仪器数到同一个数"的判据就废了）。

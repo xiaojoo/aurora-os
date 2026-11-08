@@ -184,6 +184,13 @@ pub const VEC_SYSCALL: usize = 0x80;
 /// 而它也不需要抢占点（回执之后要继续做原来的活，不是换人）。
 pub const VEC_SHOOTDOWN: usize = 0xf2;
 
+/// 主动让出 / 重调度（ADR-049，P3a）。**软件中断**：`yield_now` 用 `int 0xF0` 自陷，
+/// 硬件替我们压出异常帧，于是既有的 `isr_common → preempt_point` 原样可用，
+/// 不需要第二套切换机制；而且 `int` 不受 IF 影响，**关着窗口也能让出**——
+/// 这正是 `loads_closed` 一直缺的触发源。
+/// 它**不置 LAPIC 的 ISR 位**，所以处理侧不发 EOI（与 spurious 同理，见 ADR-020）。
+pub const VEC_RESCHED: usize = 0xf0;
+
 /// 每 CPU 一套描述符表 + TSS + 异常栈：`rsp0`/`IST1` 天生是每 CPU 的，GDT 被 TSS 的地址拖着
 /// 也必须 per-CPU，IDT 本可共享但仍放进同一套——免得"哪张表属于哪个 CPU"变成隐式约定。
 /// 对齐 64 是为了相邻 CPU 不在同一条缓存行上互相拖慢，更为了不让人在不知情时写到别人的 TSS 里。
@@ -1367,6 +1374,7 @@ isr_stub_\n:
     // 队列，所以这条中断必须和其他中断一样建帧、进 `isr_common`、出到抢占点。
     // P5 表也已经按 CPU 分行，所以 AP 的样本不会再污染 BSP 的那把尺子（这正是当初
     // 用快路径回避的问题，现在用"分表"解决，而不是用"不记账"回避）。
+    STUB_NOERR 240
     STUB_NOERR 241
     // ring3 发起系统调用的门（int 0x80）。走 isr_common：建异常帧、进 Rust 分发。
     // 它与别的向量有一处不同——**门是 DPL3**（见 `idt_gate`），所以 ring3 进得来、
@@ -1585,10 +1593,12 @@ isr_table:
     .endr
     // 128：ring3 的系统调用门（M4-1）
     .quad isr_stub_128
-    // 129..240：又回到共用桩
-    .rept 112
+    // 129..239：又回到共用桩
+    .rept 111
     .quad isr_stub_unexpected
     .endr
+    // 240：主动让出/重调度（ADR-049）。建帧，理由与 241 同：不建帧就换不了人。
+    .quad isr_stub_240
     // 241：每 CPU 本地定时器（M3b-2b 起走异常帧）
     .quad isr_stub_241
     // 242..254：仍然共用意外桩。242 是 shootdown，但 IDT 里那一格由 Rust 侧

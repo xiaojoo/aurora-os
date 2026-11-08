@@ -34,6 +34,18 @@ fn sched_worker_forever() -> ! {
     }
 }
 
+/// P3a 的搭档：让出一次就把 CPU 还给启动上下文，然后收工。
+///
+/// 为什么必须"让回来"：关着窗口又没有 tick，让出去之后**没有任何抢占来源**能把 CPU
+/// 拿回来（§111 那条挂死机制）。所以这个搭档自己再让一次——它是那条机制的反面用法。
+fn yield_partner() -> ! {
+    sched::yield_now();
+    sched::finish_current();
+    loop {
+        tsc::spin(3_000);
+    }
+}
+
 /// 时钟抢占的轮转：两个任务 + 启动上下文必须**都**推进过，且切换次数、
 /// 每个任务的 runs 都要非零。只证明"能进中断"不够——必须证明
 /// "被换下去的任务后来又被换回来并继续跑"，否则轮转是假的。
@@ -347,16 +359,55 @@ fn t_if_belongs_to_cpu() -> bool {
     let after = sched::frame_rflags_of(slot);
     let if_after = sched::frame_if_bit(slot).unwrap_or(false);
     let runs = sched::runs_of(slot);
+    // ---- P3a：关着窗口主动让出，给 `loads_closed` 一个真正的触发源（ADR-049）----
+    // 先把那个"不收工"的工人请出队列：它不会让回来，而关窗口 + 停表之后没有任何
+    // 抢占来源，让出去就再也回不来（§111 的机制，这里刻意避开它）。
+    let _ = sched::terminate_task(slot);
+    // 用例自足：关窗口 + 停表之后**没有任何抢占来源**，所以此刻本 CPU 上除启动上下文
+    // 以外不许留下任何可选中的任务——否则 `pick_next` 会把它选上来，而它若是个只会
+    // 自旋的 ring3 任务，整机就再也回不来（实测 RIP=0x100102040 CPL=3，与 §111 同一地址）。
+    // 残留是谁不由本用例决定（`.ktests` 顺序由链接器定），所以逐个清掉并留一行证据。
+    let boot = sched::current_id();
+    let mut swept = 0usize;
+    for i in 0..sched::MAX_TASKS_TOTAL {
+        if i == boot || sched::cpu_of(i) != cpu::BSP_SLOT {
+            continue;
+        }
+        if sched::state_of(i) != sched::TaskState::Free && sched::terminate_task(i) {
+            swept += 1;
+            crate::log_info!("yield: 清掉残留任务 #{}", i);
+        }
+    }
+    let closed_before = sched::if_loads().0;
+    let partner = match sched::spawn(yield_partner) {
+        Ok(i) => i,
+        Err(e) => {
+            crate::log_fatal!("yield: 搭档 spawn 失败 {:?}", e);
+            return false;
+        }
+    };
+    apic::close_cpu_window(cpu::BSP_SLOT);
+    sched::yield_now(); // 关着窗口让出：硬件建帧 → preempt_point 换入搭档
+    // 搭档会让回来。能回到这一行，就说明"关窗口换入"这条路真的走通了。
+    apic::open_cpu_window(cpu::BSP_SLOT);
+    apic::open_cpu_window(cpu::BSP_SLOT);
+    let closed_after = sched::if_loads().0;
+    let partner_runs = sched::runs_of(partner);
     let (loads_closed, loads_open) = sched::if_loads();
     crate::log_info!(
         "if-rule(ADR-021): slot={} runs={} frame_before={:?}(IF={}) frame_after={:?}(IF={}) loads_open={} loads_closed={}",
         slot, runs, before, if_before, after, if_after, loads_open, loads_closed
     );
+    crate::log_info!(
+        "yield(ADR-049): 关窗口让出 closed {} -> {} 搭档runs={} 自陷计数={} 清残留={} 窗口还原={}",
+        closed_before, closed_after, partner_runs, apic::counts().resched, swept,
+        apic::interrupts_enabled(cpu::BSP_SLOT));
     // 判据：换入前 IF=0（帧里带的）→ 换入后跑过 ≥2 次且它的现场里 IF=1（CPU 给的）。
-    // `loads_closed` 今天**必然**是 0：所有换入都发生在开窗口的窗口之内，关着窗口换入
-    // 这条分支没有触发源（既不能造 tick，又不能造没有 tick 的抢占）。这不是"测过了"，
-    // 已在 BACKLOG 挂账，等 AP 接入调度器或加入主动让出时补。
+    // `loads_closed` 这一格从 P3a 起**有触发源了**：`yield_now` 自陷 0xF0，软件中断不受
+    // IF 影响，所以关着窗口也能换人（ADR-049）。原来那句"必然 0、等主动让出时补"
+    // 就是在这里补上的：现在要求它真的前进过，且搭档确实被换入过。
     !if_before && runs >= 2 && if_after && loads_open > 0
+        && closed_after > closed_before && partner_runs >= 1
 }
 ktest!(KT_IF_BELONGS_TO_CPU, t_if_belongs_to_cpu);
 

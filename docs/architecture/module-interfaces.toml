@@ -119,6 +119,7 @@ public_api = [
   "trap::VEC_IRQ_BASE",
   "trap::VEC_IRQ_LAST",
   "trap::VEC_SHOOTDOWN",
+  "trap::VEC_RESCHED",
   "trap::VEC_SPURIOUS",
   "trap::dump_frame",
   "trap::entry_tsc_of",

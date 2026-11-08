@@ -30,7 +30,7 @@ fn t_timer_ticks_recur() -> bool {
     let p5_0 = trap::p5_irq_stats();
     let hist0 = trap::p5_hist_of(crate::arch::x86_64::cpu::BSP_SLOT);
     let non_irq0 = trap::p5_non_irq();
-    let rust0: usize = before.irq.iter().sum::<usize>() + before.unexpected + before.spurious;
+    let rust0: usize = before.irq.iter().sum::<usize>() + before.unexpected + before.spurious + before.resched;
     // 基线必须是**相对的**：`apic::ticks()` 是全局累计值，前面跑过的抢占用例
     // 已经把它推到 9，用绝对数 2 判断"等到两次 tick"就永远立刻成立（实测踩过：
     // 窗口一次都没等，t1==c0，用例红）。表的枚举顺序不由源码顺序决定，
@@ -91,7 +91,7 @@ fn t_timer_ticks_recur() -> bool {
     // 不相等就是有一类向量绕过了记账（或者被记了两次），那 P5 的每个数字都不可信。
     let p5 = trap::p5_irq_stats();
     let cc = apic::counts();
-    let rust_total: usize = cc.irq.iter().sum::<usize>() + cc.unexpected + cc.spurious;
+    let rust_total: usize = cc.irq.iter().sum::<usize>() + cc.unexpected + cc.spurious + cc.resched;
     // 对齐式子现在写全了：P5 的样本 == 驱动数到的外部中断 + 那些**驱动刻意不数**的
     // 非 ISA 向量（本地 APIC 定时器 0xF1 是第一条）。只写"两边相等"的话，多出一个
     // 非 IRQ 样本只会让它变红且不告诉你差哪一类；写全之后它红得明白，

@@ -17,7 +17,7 @@ idt_entries = 256
 # W1 的 resched IPI 若走不建帧路径，frame_bypass 就必须多一个名字——两边一起改才过。
 dpl3_gate = "VEC_SYSCALL"
 frame_bypass = ["VEC_SHOOTDOWN"]
-no_eoi = ["VEC_SPURIOUS"]
+no_eoi = ["VEC_RESCHED", "VEC_SPURIOUS"]
 
 # ============ 具名向量（与 trap.rs 的 VEC_* 常量一一对应） ============
 
@@ -76,6 +76,14 @@ idt = false
 stub = "syscall_entry"
 purpose = "SYSCALL/SYSRET 快路径入口：MSR_LSTAR 指向的地址，不占 IDT 门（0x180 是记法不是向量）"
 adr = "ADR-026"
+
+[[vector]]
+name = "VEC_RESCHED"
+value = 240
+idt = true
+stub = "isr_stub_240"
+purpose = "主动让出/重调度：yield_now 自陷 int 0xF0，硬件建帧后走既有 preempt_point；软件中断不置 ISR 位 ⇒ 不发 EOI"
+adr = "ADR-049"
 
 # ============ 区间（必须无重叠无缺口铺满 0..255；hi 不含） ============
 

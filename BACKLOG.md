@@ -4151,6 +4151,47 @@ entry=0x100102000`，所以挂死现场的 `RIP=0x100102040` 落在**代码页**
 P5 只剩"idle 真 hlt、`worked_aps` 换证人、宿主机 `-trace` 对账"。
 向量是 `yield_now` 的前置，不是 idle 的附属品。
 
+## 114. P3a 落地：resched 自陷让出，loads_closed 那一格关闭；并更正 P2.5 的根因（2026-11-08，实测）
+
+**交付（ADR-049）**：`VEC_RESCHED=0xF0` + `STUB_NOERR 240` + IDT 表拆格；
+`on_interrupt` 提前 return 一支（只计数、**不发 EOI**、不借 `mark_tick`）；
+`Counts.resched` 新字段 + 三处求和同轮改（`main.rs`、`ktests/time.rs` 的 rust0/rust_total）；
+`sched::yield_now()` = 立牌 + `int 0xF0`（软件中断不受 IF 影响 ⇒ 关窗口也能让出）。
+
+**读数（实测）**：
+- `if-rule(ADR-021): … loads_open=207 loads_closed=2` —— **`loads_closed` 从"结构上恒 0"变成 2**，
+  M3b 遗留那一格关闭（用例里那句"没有触发源，等主动让出时补"就是在这里补上的）。
+- `yield(ADR-049): 关窗口让出 closed 0 -> 2 搭档runs=1 自陷计数=2 清残留=4 窗口还原=true`。
+- 默认档 **5/5 PASS**、53/53；`check` 17/17（登记补齐后）。
+- **MUTATION-Y（确定性证红）**：去掉 `yield_now` 的立牌 ⇒ `closed 0 -> 0 搭档runs=0 自陷计数=1`
+  → `t_if_belongs_to_cpu -> failed` → FAIL(35)。`自陷计数=1` 说明陷进去了但没换人，
+  所以这条判据量的是**换人**而不是"有没有自陷"。还原 ⇒ PASS。
+
+**门禁自证（四处都是被点名后才补的，不是自觉）**：`check-vector-table` 报
+"VEC_RESCHED 定义了却没登记" + "不发 EOI 的源码点名 ['VEC_RESCHED','VEC_SPURIOUS'] ≠ 登记"；
+`check-module-interfaces` 报 `public_api 漏登记：trap::VEC_RESCHED`；
+`check-unsafe` 报 `sched U1 登记 2、源码 3`。补齐后：向量表 `no_eoi` 两处特例、
+`arch.public_api` +1、`sched` U1 2→3、普查 total 282→283 / U1 53→54。
+
+### 114a 对 P2.5 的根因更正（重要）
+
+新用例第一次跑就**确定性挂死**，QMP 现场是 `RIP=0x100102040 CPL=3 RFL=0x2`——
+**与 §111 那次自然挂死同一个地址**。探针逐步定位到：`yield_now` 自陷之后没回来，
+而搭档根本没跑（P1 探针未出）⇒ `pick_next` 选中的不是我的搭档，而是**前面某条用例残留的、
+仍 Runnable 的 ring3 自旋任务**；窗口关着、表停着，此后没有任何抢占来源。
+
+清残留时打出来的证据：本 CPU 上除启动上下文外还有 **4 个**可被选中的任务（#1..#4）。
+
+**所以 §112 的修复①只拆掉了一个触发路径，根因仍在**：
+"某条用例留下一个 Runnable 的 ring3 自旋任务"才是公共前提，
+任何"关窗口让出"或"停掉唯一 tick 源"的动作都会把它变成整机静默。
+矩阵 41/41 之所以绿，是因为触发路径被堵住了，不是因为根因被修掉了。
+本用例靠"让出前清残留"做到自足（并留一行证据），但**残留本身必须单独定位并在那条用例收尾修掉**，
+不能靠每个用例各自扫一遍。这条已列为 P3a 之后的独立待办。
+
+**方法论一条**：这次能定死，靠的是"确定性复现 + QMP 取 RIP + 逐步探针"三件一起，
+而不是继续加跑次数。前面 §107 那种 1/14 的自然复现率下，加跑次数是最贵的方法。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

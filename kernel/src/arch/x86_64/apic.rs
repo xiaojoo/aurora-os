@@ -105,6 +105,9 @@ static IOAPIC_VA: AtomicU64 = AtomicU64::new(0);
 static IRQ_COUNTS: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
 static UNEXPECTED: AtomicUsize = AtomicUsize::new(0);
 static SPURIOUS: AtomicUsize = AtomicUsize::new(0);
+/// 主动让出/重调度（向量 0xF0，软件中断）。单独一格：它既不是 IRQ 也不是 tick，
+/// 混进任何一边都会把"两台仪器数到同一个数"那条判据弄假（ADR-049）。
+static RESCHED: AtomicUsize = AtomicUsize::new(0);
 static EOIS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Copy)]
@@ -113,6 +116,8 @@ pub struct Counts {
     pub unexpected: usize,
     pub spurious: usize,
     pub eois: usize,
+    /// 向量 0xF0 的自陷次数（`sched::yield_now`）。不占 IRQ 那 16 格、不算 tick。
+    pub resched: usize,
 }
 
 pub fn counts() -> Counts {
@@ -120,7 +125,7 @@ pub fn counts() -> Counts {
     for (i, c) in IRQ_COUNTS.iter().enumerate() {
         irq[i] = c.load(Ordering::Relaxed);
     }
-    Counts { irq, unexpected: UNEXPECTED.load(Ordering::Relaxed), spurious: SPURIOUS.load(Ordering::Relaxed), eois: EOIS.load(Ordering::Relaxed) }
+    Counts { irq, unexpected: UNEXPECTED.load(Ordering::Relaxed), spurious: SPURIOUS.load(Ordering::Relaxed), eois: EOIS.load(Ordering::Relaxed), resched: RESCHED.load(Ordering::Relaxed) }
 }
 
 /// 相邻两次 tick 之间的 TSC 差（采样用）。0 表示还不够样本。
@@ -508,6 +513,13 @@ pub fn on_interrupt(vector: usize) {
     if vector == crate::arch::x86_64::trap::VEC_SPURIOUS {
         SPURIOUS.fetch_add(1, Ordering::Relaxed);
         return; // spurious 没有 ISR 位，按规范不发 EOI
+    }
+    if vector == crate::arch::x86_64::trap::VEC_RESCHED {
+        RESCHED.fetch_add(1, Ordering::Relaxed);
+        // `int 0xF0` 是软件中断，同样不置 ISR 位 ⇒ 不发 EOI（ADR-020 对 spurious 的理由
+        // 原样适用：多确认一个不存在的服务中断，后果是别的中断收不到）。
+        // 换人发生在异常出口的 `preempt_point`，need 牌由 `yield_now` 在自陷前立好。
+        return;
     }
     // 深度自增：此刻起 in_isr() 为真，任何分配尝试都会被记成违规。
     // **按 CPU 分开数**：全局一份深度会让 AP 正在服务中断时把 BSP 也标成"在中断里"，
