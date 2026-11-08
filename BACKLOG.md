@@ -4213,6 +4213,23 @@ P5 只剩"idle 真 hlt、`worked_aps` 换证人、宿主机 `-trace` 对账"。
 **下一步**：带着留档重跑整轮矩阵；若该行再红，直接读 `run-NNN.log` 里的 `[FAIL]` 用例名，
 不再重跑碰运气。P3a-2（残留 ring3 自旋任务的根因）与 P3b（Blocked/idle/reap）排在其后。
 
+## 116. P3a 复验全绿：矩阵 41/41，留档机制生效（2026-11-08，实测）
+
+**读数（实测）**：带着"每跑落盘"重跑整轮 ⇒ **41 行全符合、0 不符**；
+两处 HANG 仍是期望行（`fault-if-carriage`、`irq-sticky-pxis`），无意外挂死。
+上一轮那一红（`边沿与消息由设备事件数到`）**没有再现**；现在若再红，
+可直接读 `build/run-NNN.log` 里的 `[FAIL]` 用例名，不再靠重跑碰运气。
+
+**留档（实测）**：本轮共 48 份 `build/run-NNN.log`。其中 10 份含 `[FAIL]` 行，
+全部落在**期望 FAIL 的负样本档**（`t_negative_probe_must_fail`、`fault-ahci-*` 的
+high_lba/write/disk、`fault-fat32-*` 的 cursor/mem/exec）——矩阵逐行对上期望，
+所以这些红是该红的，不是缺陷。**读留档时不要只 grep `[FAIL]` 就下结论**，
+要与该行的期望值一起看。
+
+**状态**：P3a 完成（ADR-049、`loads_closed` 由恒 0 变 2、确定性变异证红、
+默认档 5/5、矩阵 41/41、`check` 17/17）。
+**下一步按顺序**：P3a-2（残留 Runnable ring3 自旋任务的根因，§114a）→ P3b（Blocked/idle/reap）。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。
