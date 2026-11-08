@@ -1515,6 +1515,10 @@ def force_boot_state(failed: int, seq: int = 200) -> None:
     IMAGE.write_bytes(bytes(img))
 
 
+# 每一跑的留档序号（见 do_run 里的 run-NNN.log）
+RUN_SEQ = 0
+
+
 def qmp_snapshot(port: int, cmds: list[str]) -> str:
     """P2.5 取证通道：向 QMP 发 `human-monitor-command`，把 HMP 原文取回来。
 
@@ -1676,6 +1680,14 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
     # 编码（这台机是 GBK），中文日志全部变乱码——于是任何按中文锚点的判据都会读成"零条记录"。
     # 实测踩过：内容对账第一次跑报"串口里只有 0 条块读记录"，而记录明明在。
     log = SERIAL_LOG.read_text(encoding="utf-8", errors="replace") if SERIAL_LOG.exists() else ""
+    # 每一跑都留档（P3a 之后补的量具缺口）：矩阵原来只在内存里留着各行的串口原文，
+    # 于是"某一行红了"事后无法归因——只能重跑，而重跑往往就绿了（实测两次）。
+    # 留档之后，红那一跑的用例名与 fatal 原文都在，不需要靠复现率去猜。
+    global RUN_SEQ
+    RUN_SEQ += 1
+    keep = BUILD / f"run-{RUN_SEQ:03d}.log"
+    keep.write_text(log, encoding="utf-8")
+    print(f"   串口留档: {keep.name}")
     if rc == 33:
         verdict = "PASS"
     elif rc in (35, 37, 39):
