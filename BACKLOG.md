@@ -4359,6 +4359,28 @@ MUTATION-I2 ⇒ HANG(120 s)（见上）。两条还原后都回到 PASS、哈希
 
 **下一步**：整轮矩阵复验（idle 对所有变体生效），然后 P4（`WaitQueue` 与 `Blocked` 同轮）。
 
+## 122. P3b-2 复验全绿：矩阵 41/41，idle 判据跨变体读数一致（2026-11-08，实测）
+
+**读数（实测）**：整轮矩阵 **41 行全符合、0 不符**；两处 HANG 仍是期望行
+（`fault-if-carriage` 60 s、`irq-sticky-pxis` 6 s 且风暴对账=True），无意外挂死。
+- `t_idle_fallback` 在 **39 份留档里读数完全一致**：
+  `下标=1 状态=Runnable 名下=0 active=7 独立重算=7 idle_runs 0 -> 0 搭档runs=1`，零失败。
+  跨变体一致这件事本身是证据：两遍扫描的第一遍确实把 idle 排除在正常轮转之外，
+  所以它不随特性门控的用例数量变化而漂移。
+- ADR-050 的收尾不变量在全部变体**零点名**。
+
+**P3b-2 关闭**。BACKLOG 144 那条前提现在是**构造保证**：
+BSP 有专属 idle（静态 .bss 栈、`owned` 为空），`pick_next` 在 prev 不再可运行时回落到它，
+所以标了 Done/Free 的任务一定会被换下、`reap` 一定收得到。
+`t_reap_premise` 与 `t_idle_fallback` 两条判据看着它，各自的负样本都真实跑过。
+
+**仍写明的缺口**：回落分支本身未被用例直接触发（要求 runner 自己不再可运行）；
+AP 侧仍用 slot 0 的空闲上下文当兜底，没有专属 idle。两者都留到 P4/P5。
+
+**下一步**：P4 —— `sync::WaitQueue` 与 `TaskState::Blocked(WaitToken)` **同轮**落地
+（ADR-047 决策 3/4：定长不进堆、检查条件→入队→切走同锁内、`RANK_WAITQ(5)` 已在锁序表里
+等着），配防丢唤醒计数与变异 A（把入队移出锁）/变异 B（去掉 resched IPI）。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。
