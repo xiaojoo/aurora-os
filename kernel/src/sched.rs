@@ -1005,6 +1005,16 @@ pub fn state_of(i: usize) -> TaskState {
     unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].state }
 }
 
+/// 这个槽位是不是用户态任务（P3a-2 的收尾不变量要用它区分"内核工人"与"容器任务"）。
+/// 与 `state_of` 同样是只读快照，不参与调度决定。
+pub fn is_user(i: usize) -> bool {
+    if i >= MAX_TASKS_TOTAL {
+        return false;
+    }
+    // SAFETY: 只读快照，理由同 `current_of`
+    unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].user }
+}
+
 pub fn runs_of(i: usize) -> u64 {
     if i >= MAX_TASKS_TOTAL {
         return 0;

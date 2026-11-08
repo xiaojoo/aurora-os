@@ -1,6 +1,6 @@
 # unsafe 逐处审计表（U1–U6）
 
-总计 283 处。U1 54 · U2 60 · U3 13 · U4 107 · U5 28 · U6 21
+总计 284 处。U1 54 · U2 60 · U3 13 · U4 108 · U5 28 · U6 21
 
 本表由 `tools/aurora.py` 的 `unsafe_sites()` 从源码逐处生成，**不是手写的**。
 机器可读的权威来源是 `docs/security/unsafe-whitelist.toml` 的 `[modules.*]` 段（模块×类别→处数），
@@ -518,15 +518,17 @@
   > let t = unsafe { &(*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)] }; if t.kstack_hi == 0 { return None;
 - `kernel/src/sched.rs:1005` [{] **U4** fn=`state_of`
   > unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].state } } 
-- `kernel/src/sched.rs:1013` [{] **U4** fn=`runs_of`
+- `kernel/src/sched.rs:1015` [{] **U4** fn=`is_user`
+  > unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].user } } 
+- `kernel/src/sched.rs:1023` [{] **U4** fn=`runs_of`
   > unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].runs } } 
-- `kernel/src/sched.rs:1035` [fn] **U2** fn=`preempt_point`
+- `kernel/src/sched.rs:1045` [fn] **U2** fn=`preempt_point`
   > pub unsafe fn preempt_point(frame: u64, cpu: usize) { // 不跑调度器的 CPU 直接把标志倒掉再返回。今天 AP 的中断根本不经过这里 // （`isr_stub_cpu_timer` 是独立快路径），这条判断是给"把 AP 接进调度"留的
-- `kernel/src/sched.rs:1123` [{] **U1** fn=`preempt_point`
+- `kernel/src/sched.rs:1133` [{] **U1** fn=`preempt_point`
   > unsafe { p1_extra_flush(frame) }; crate::tsc::spin(20_000); }
-- `kernel/src/sched.rs:1147` [{] **U1** fn=`preempt_point`
+- `kernel/src/sched.rs:1157` [{] **U1** fn=`preempt_point`
   > unsafe { context_load(resume, if_open as u64) } } 
-- `kernel/src/sched.rs:1175` [{] **U2** fn=`preempt_hook`
+- `kernel/src/sched.rs:1185` [{] **U2** fn=`preempt_hook`
   > unsafe { preempt_point(frame, cpu) } }
 ### serial
 

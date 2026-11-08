@@ -238,6 +238,11 @@ fn t_user_roundtrip() -> bool {
         sched::runs_of(bad),
         mm::effective_flags(user::TRAMPOLINE_VA).is_some_and(|e| e.user)
     );
+    // P3a-2：把自己造的容器收干净。`utask` 跑完三次调用之后就在 ring3 里自旋，
+    // 不收掉它就一直 Runnable —— 后续任何"关窗口让出"或"停掉唯一 tick 源"的动作
+    // 都会被它变成整机静默（§111/§114a：两次挂死同一地址 RIP=0x100102040）。
+    // 放在所有读数之后：上面那些判据还要读它的状态与 runs。
+    let _ = sched::terminate_task(utask);
     ping_ok && add_ok && unk_ok && smap_blocks && killed && user::unknown_nr() >= 1
         && stale_hits == 0 && probes_clean && tss_ok
 }

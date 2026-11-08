@@ -243,6 +243,10 @@ public_api = [
   "sched::p1_stats",
   "sched::p1_with_samples",
   "sched::ticks_of",
+  "sched::MAX_TASKS_TOTAL",
+  "sched::TaskState",
+  "sched::is_user",
+  "sched::state_of",
   "user::park_current",
   "user::syscall_dispatch",
 ]

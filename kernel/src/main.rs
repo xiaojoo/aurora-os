@@ -407,7 +407,34 @@ fn stage_storage_guard_crash() {
 /// Stage4：跑 .ktests、报 P1–P5/P4 读数并交付退出码。
 fn run_ktests_and_finish() -> ! {
     // ---- Stage4：跑用例并交付判定
-    let s = ktest::run_all();
+    // P3a-2 的收尾不变量：**用例跑完时，本 CPU 不许留下可运行的用户任务**。
+    // 为什么这条值得当判据：残留的 ring3 自旋任务会让任何"关窗口让出"或"停掉唯一
+    // tick 源"的动作变成整机静默（§111/§114a 两次挂死同一地址 RIP=0x100102040）。
+    // 它不是调度器的缺陷，是用例没把自己造的容器收干净——所以判据放在用例边界上，
+    // 由这里点名是哪一条用例留下的，而不是让每个用例各自扫一遍。
+    let s = ktest::run_all(|name| {
+        let bsp = cpu::BSP_SLOT;
+        let mut left = 0usize;
+        let mut first = usize::MAX;
+        for i in 0..sched::MAX_TASKS_TOTAL {
+            if sched::cpu_of(i) != bsp || !sched::is_user(i) {
+                continue;
+            }
+            if matches!(sched::state_of(i), sched::TaskState::Runnable | sched::TaskState::Running) {
+                left += 1;
+                if first == usize::MAX {
+                    first = i;
+                }
+            }
+        }
+        if left == 0 {
+            return true;
+        }
+        crate::log_fatal!(
+            "用例收尾不变量破坏：test={} 之后本 CPU 仍有 {} 个可运行用户任务（首个 #{}）",
+            name, left, first);
+        false
+    });
     crate::log_info!("ktests: total={} passed={} failed={} table_invalid={}", s.total, s.passed, s.failed, s.table_invalid);
     // §9.6 的账本：开机到现在看过几次心跳、报过几次、处置过几次。处置次数今天必须是 0，
     // 它变成非 0 的那一天就是"把核摘线"真的实现了的那一天（在那之前它只是个计数器）。

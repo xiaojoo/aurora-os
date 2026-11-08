@@ -40,7 +40,12 @@ pub struct Summary {
     pub table_invalid: bool,
 }
 
-pub fn run_all() -> Summary {
+/// `checkpoint` 由 integration 传入：每跑完一条用例问一次"收尾不变量还成立吗"。
+/// 返回 false 时记一条失败但**继续跑**——上一版在这里 `break`，结果判定变成
+/// `QEMU-EXIT-0`（后半程收尾路径从没被这样跑过），比原来的形状更难读（§108）。
+/// 用回调而不是让框架直接查调度器：`ktest` 不该为了查不变量去引用 `sched`，
+/// 那等于给 `testing` 加一条产品依赖边（ADR-045 的口径）。
+pub fn run_all(checkpoint: fn(&'static str) -> bool) -> Summary {
     let start = &raw const __ktests_start as usize;
     let end = &raw const __ktests_end as usize;
     let bytes = end.saturating_sub(start);
@@ -65,6 +70,9 @@ pub fn run_all() -> Summary {
             failed += 1;
         }
         serial::line(if ok { "test" } else { "FAIL" }, format_args!("{} -> {}", t.name, if ok { "ok" } else { "failed" }));
+        if !checkpoint(t.name) {
+            failed += 1;
+        }
     }
     Summary { total: tests.len(), passed, failed, table_invalid: false }
 }
