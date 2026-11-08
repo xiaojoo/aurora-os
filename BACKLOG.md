@@ -4275,6 +4275,36 @@ high_lba/write/disk、`fault-fat32-*` 的 cursor/mem/exec）——矩阵逐行�
 `reap` 状态集补 Blocked、`tasks_active()` 的语义说明、
 以及把 BACKLOG 144 那条"释放依赖本 CPU 再出现一次抢占"的未写下前提显式化。
 
+## 119. P3b 第一刀：BACKLOG 144 的前提变成判据；Blocked 推迟到 P4（2026-11-08，实测）
+
+**顺序裁决（ADR-051）**：原计划 P3b 含 `TaskState::Blocked(WaitToken)`，但**今天没有任何
+生产者会产生 Blocked**（`WaitQueue`/`wait_until` 在 P4）。先加没人用的状态违反硬约束 2，
+而且 `Blocked` 一进枚举，`reap`/`pick_next`/`tasks_active`/`state_of` 的消费者要同轮全改。
+所以：**Blocked 与它的生产者同轮（P4）**；P3b 先交付"前提变判据"，兜底 idle 定为 **P3b-2**
+（设计已在 ADR-051 定死，落地单独一轮，因为它会动很多既有读数）。
+
+**交付（实测）**：新增 `t_reap_premise` —— 工人**自己**终止自己（`terminate_task(me)`，
+它是 current 所以只登记待回收）再 `yield_now()` 让出；启动上下文再让一次，
+给 `reap` 一个"它已不是 current"的机会；然后判 `状态=Free && 名下=0 && released 前进`。
+读数：`worker=#3 状态=Free 名下=0 released 44 -> 47`，`PASS(33)`、**54/54**、`check` 17/17。
+用例只从 `ktests` 引用 `sched`，按 ADR-043/045 不算产品边 ⇒ **本轮零登记改动**。
+
+**MUTATION-R（确定性证红，实测）**：去掉第二次 `yield_now()` ⇒
+`worker=#3 状态=Free 名下=1 released 44 -> 46` → `[FAIL] t_reap_premise -> failed` → FAIL(35)。
+**`名下=1` 正是前提失效的形状**：槽位标了 Free，资源却还挂在它名下没人收。还原 ⇒ PASS。
+
+**顺带写成纪律的一条（实测）**：`init_boot_task`/`init_idle_task` 都会**无条件重写 slot 0**
+（`frame=0`、`runs=1`），所以用例要登记启动上下文必须先确认 0 号槽是 Free，
+否则会把别的用例的 `runs`/`frame` 读数打掉。本用例就是这么做的；不改接口幂等性
+（那是调度语义变更，要另开 ADR）。
+
+**P3b-2 落地时要预期的读数变化（先记下，免得届时被当回归）**：切换次数上升、
+`tasks_active` 必须排除 idle、`t_preempt_round_robin` 一类期望切换次数要重取基线、
+`t_percpu_queues` 的 `nonempty` 会多一个。都属判据基线更新，必须与代码同轮改并各配负样本。
+
+**仍未保证的事**：idle 没落地，所以"总有别人可换"**今天仍依赖启动上下文恰好在册**；
+本轮只是把这条依赖变成会被测出来的东西，没有把它变成保证。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

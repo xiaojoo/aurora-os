@@ -411,6 +411,54 @@ fn t_if_belongs_to_cpu() -> bool {
 }
 ktest!(KT_IF_BELONGS_TO_CPU, t_if_belongs_to_cpu);
 
+/// P3b 的工人：**自己**终止自己，然后让出。
+/// `terminate_task` 对"正在 CPU 上"的任务只登记待回收、不就地释放（它正站在那条栈上），
+/// 所以必须让出去一次，别人才收得到它。
+fn self_terminating_worker() -> ! {
+    let me = sched::current_id();
+    let _ = sched::terminate_task(me);
+    sched::yield_now();
+    loop {
+        tsc::spin(3_000);
+    }
+}
+
+/// P3b：把 BACKLOG 144 那条**没写下来的前提**变成被测的不变量。
+///
+/// 前提原文：资源释放推迟到"本 CPU 上跑的已经不是它"的那一刻（`reap` 的 `skip = current`）。
+/// 它今天成立，是因为总有别人可换（启动上下文）——但那是**假设**，不是保证：
+/// 一旦没有别人，标了 Done/Free 的任务就永远占着 CPU，`reap` 永远跳过它，资源永不回账。
+/// 这条用例用 `yield_now`（ADR-049）把"换别人"做成确定性动作，然后验证前提的结论：
+/// 自己终止的任务在 CPU 换过别人之后，槽位归 Free、名下资源回账。
+///
+/// 它同时是 P3b 后半（兜底 idle）的**判据基线**：idle 落地之后这条必须仍然绿，
+/// 而且那时"总有别人可换"才第一次由构造保证，而不是靠启动上下文恰好在册。
+fn t_reap_premise() -> bool {
+    // 只在 0 号槽确实空着时登记启动上下文：`init_boot_task` 会无条件重写 slot 0
+    // （frame=0、runs=1），在已有 boot 任务时调它会把别的用例的读数打掉。
+    if sched::state_of(0) == sched::TaskState::Free {
+        sched::init_boot_task();
+    }
+    let released0 = sched::reap_released();
+    let w = match sched::spawn(self_terminating_worker) {
+        Ok(i) => i,
+        Err(e) => {
+            crate::log_fatal!("reap 前提: 工人 spawn 失败 {:?}", e);
+            return false;
+        }
+    };
+    sched::yield_now(); // 换工人上来：它自己 terminate + 让出
+    sched::yield_now(); // 再让一次：给 reap 一个"它已不是 current"的机会
+    let st = sched::state_of(w);
+    let owned = sched::owned_of(w);
+    let released = sched::reap_released();
+    crate::log_info!(
+        "reap 前提(BACKLOG144): worker=#{} 状态={:?} 名下={} released {} -> {}",
+        w, st, owned, released0, released);
+    st == sched::TaskState::Free && owned == 0 && released > released0
+}
+ktest!(KT_REAP_PREMISE, t_reap_premise);
+
 /// `if_patch` 两条分支的直接覆盖，以及 asm 偏移与 Rust 结构体的对账。
 ///
 /// 为什么这条用例存在：ADR-021 的"关着窗口换入"分支今天**没有触发源**
