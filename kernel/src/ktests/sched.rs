@@ -1009,6 +1009,91 @@ fn t_sleep_until() -> bool {
 }
 ktest!(KT_SLEEP_UNTIL, t_sleep_until);
 
+// ---- P6b：带时限的条件等待 ----
+const P6B_QID: u8 = 3;
+static P6B_FLAG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static P6B_BOOT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// 场景2 的唤醒者：等启动上下文**真的阻塞了**再置位并 wake_all（赶在它让出之前唤醒的话，
+/// 它查条件就成立、根本不阻塞，那测不到"条件唤醒后取消轮项"这条）。
+fn p6b_waker() -> ! {
+    let b = P6B_BOOT.load(Ordering::Acquire);
+    if b != u64::MAX {
+        let bg = b as usize;
+        let t0 = tsc::now();
+        while !matches!(sched::state_of(bg), sched::TaskState::Blocked(_))
+            && tsc::now().wrapping_sub(t0) < 100_000_000
+        {
+            tsc::spin(2_000);
+        }
+        P6B_FLAG.store(1, Ordering::Release);
+        if let Some(q) = sync::wait_queue(P6B_QID) {
+            let _ = q.wake_all();
+        }
+    }
+    sched::finish_current();
+    loop {
+        tsc::spin(3_000);
+    }
+}
+
+/// P6b（ADR-058 决策 5/6）：带时限等待的两种结局都必须对。
+///
+/// 场景1：条件永不成立 ⇒ 必须 `TimedOut`，且 elapsed 落在 `[d, d+2 tick]`（与 sleep 同一口径）。
+/// 场景2：条件先成立 ⇒ 必须 `Condition`，且**轮项被取消**（残留=0）——不取消的话它会占着槽
+/// 一直到 deadline，槽满时后来者就睡不了。另判 `fired` 前进（场景1 真的由定时器叫醒）。
+fn t_wait_timeout() -> bool {
+    if sched::state_of(0) == sched::TaskState::Free {
+        sched::init_boot_task();
+    }
+    let tick = clock::current().map_or_else(clock::max_tick_period_cycles, |c| c.tick_period_cycles);
+    let d = tick * 2;
+    // 用例自足于时钟状态（与 t_sleep_until 同一理由：链接顺序可能让前面的用例停过表）
+    let tick_in = apic::ticks();
+    let probe = apic::wait_ticks(tick_in, 1, clock::window_cycles(1));
+    let was_running = probe.ticks >= 1;
+    if !was_running {
+        apic::timer_start().ok();
+    }
+    let Some(q) = sync::wait_queue(P6B_QID) else {
+        crate::log_fatal!("wait 时限: 队列取不到");
+        return false;
+    };
+    let (_, f0, _) = sched::timer_stats(cpu::BSP_SLOT);
+    // 场景1：条件永不成立
+    P6B_FLAG.store(0, Ordering::Relaxed);
+    P6B_BOOT.store(u64::MAX, Ordering::Relaxed);
+    let t0 = tsc::now();
+    let r1 = q.wait_while_until(P6B_QID, || P6B_FLAG.load(Ordering::Acquire) != 0, t0.wrapping_add(d));
+    let e1 = tsc::now().wrapping_sub(t0);
+    // 场景2：条件先成立
+    P6B_FLAG.store(0, Ordering::Relaxed);
+    P6B_BOOT.store(sched::current_id() as u64, Ordering::Release);
+    let w = match sched::spawn(p6b_waker) {
+        Ok(i) => i,
+        Err(e) => {
+            crate::log_fatal!("wait 时限: 唤醒者 spawn 失败 {:?}", e);
+            return false;
+        }
+    };
+    let t1 = tsc::now();
+    let r2 = q.wait_while_until(P6B_QID, || P6B_FLAG.load(Ordering::Acquire) != 0, t1.wrapping_add(d * 4));
+    let e2 = tsc::now().wrapping_sub(t1);
+    let (_, f1, pend) = sched::timer_stats(cpu::BSP_SLOT);
+    let _ = q.remove_task(w);
+    let _ = sched::terminate_task(w);
+    if !was_running {
+        apic::timer_stop().ok();
+    }
+    crate::log_info!(
+        "wait 时限(P6b): d={} 场景1={:?} elapsed={} 场景2={:?} elapsed={} fired {}->{} 残留={}",
+        d, r1, e1, r2, e2, f0, f1, pend);
+    matches!(r1, Ok(sync::WaitOutcome::TimedOut)) && e1 >= d && e1 <= d + 2 * tick
+        && matches!(r2, Ok(sync::WaitOutcome::Condition)) && e2 < d * 4
+        && f1 > f0 && pend == 0
+}
+ktest!(KT_WAIT_TIMEOUT, t_wait_timeout);
+
 /// `if_patch` 两条分支的直接覆盖，以及 asm 偏移与 Rust 结构体的对账。
 ///
 /// 为什么这条用例存在：ADR-021 的"关着窗口换入"分支今天**没有触发源**

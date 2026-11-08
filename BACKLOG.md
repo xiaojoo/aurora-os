@@ -4711,6 +4711,43 @@ Send ⇒ 锁自动 Sync，不需要再包 UnsafeCell（比 RoleCell/OpsCell 少�
 （`sync` 需暴露只读 innermost 查询），与 §128 的 L4 退出路径级联反向嵌套是同一处欠账；
 真机/KVM 的精度余量未测。
 
+## 134. P6b：wait_while 的时限落地，并抓到 P5 的一个潜在缺陷（2026-11-08，实测）
+
+**交付（ADR-059，形状由 ADR-058 决策 5/6 预登记）**：`WaitOps` 加 `timer_add`/`timer_del`
+两个回调（`sync` 仍不引用 `sched`）；`wait_while_until(qid, cond, deadline) -> WaitOutcome`；
+等待槽与轮项**共用同一 token**（两种唤醒谁先都认，后到者 `wake_task` 返回 false）；
+持 WAITQ(5) 调 timer_add 取 TIMER(6)、**放锁后**才切走；醒来先摘两处注册再按 `cond()` 分
+`Condition`/`TimedOut`；`timer_add` 失败要把已标的 Blocked 自己改回去。无时限的 `wait_while` 不动。
+用例数 61 → **62**。**登记面零变化**（新类型只被 ktest 引用、锁与嵌套 P6a 已登记、无新增 unsafe）。
+
+**抓到 P5 的潜在缺陷（本轮最重要的发现）**：新用例**确定性 HANG 3/3**，而 `t_sleep_until` 同时是过的。
+QMP 现场钉死原因：BSP 停在 `idle_entry`，**`HLT=1` 而 `RFL=0x7`（IF=0）**——halt 时中断关着，
+永远醒不来 ⇒ 轮永远没人扫 ⇒ 阻塞者等不到到期。
+根因是 **ADR-057 决策 1 的"入口开一次窗口、永不关"有缺陷**：牌是 per-CPU 的，而
+`with_interrupts` 返回时**一律置 false**（BACKLOG 82 早记过它不检测嵌套）。idle 不在 CPU 上时
+任何调用 `with_interrupts` 的代码都会把牌关掉；换回来时 `context_load` 按牌供 IF ⇒ IF=0 的 hlt ⇒ 死停。
+新用例正好调了 `apic::wait_ticks`（内部就是 with_interrupts），于是确定性触发。
+**修法（ADR-059 决策 1）**：`idle_entry` 与 `ap_worker` 都改成**每次 hlt 前重新开窗口**。
+不改 `with_interrupts` 的语义（那属 ADR-021 范围、面太大）。
+**如实记**：P5 当时"过了自己的判据但带着潜在缺陷"——它的用例没有在 idle off-CPU 期间关牌的动作，
+所以没暴露；不能因为 P5 矩阵全绿就当它没问题。
+
+**读数（实测）**：默认档 **3/3 PASS、62/62**，
+`d≈63M 场景1=Ok(TimedOut) elapsed=66~99M（落在 [d,d+2tick]）场景2=Ok(Condition) elapsed≈33M
+fired 1->2 残留=0`；P5 的 `t_idle_hlt_wakes` 仍绿（增量 1 ≤ 4）。
+
+**负样本（实测）**：
+- MUTATION-T2 条件唤醒后不取消轮项 ⇒ `残留=1` → FAIL(35)，确定性。
+- MUTATION-T3 结局分类永远返回 Condition ⇒ `场景1=Ok(Condition)` → FAIL(35)，确定性。
+- **MUTATION-T1（deadline 改 0 立刻到期）⇒ HANG，不是预期的红 ⇒ 不作为证据**。
+  精度格的证人是 P6a 的 MUTATION-T（同一条轮路径，`elapsed=1.1M ≪ d` → FAIL 35）。
+  与 ADR-054 的"裸变异 A 未触发"同一口径：**没按预期咬的变异不算证据**。
+- 三条还原后回到 PASS(33)。
+
+**未决**：`with_interrupts` 不恢复原牌值仍是隐患（本轮绕开而非修复）；轮槽 64 与等待槽 16×16
+仍无 workload 依据；异常出口取锁前应先查被中断上下文是否持锁（ADR-058 未决 3、§128 的 L4 级联）；
+真机/KVM 上 `[d,d+2tick]` 余量与 P5 两个 hlt 上界都要重测。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

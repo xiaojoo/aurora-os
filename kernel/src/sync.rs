@@ -95,6 +95,15 @@ pub enum WaitError {
     NotInstalled,
 }
 
+/// 带时限等待的两种结局（P6b/ADR-058 决策 5）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitOutcome {
+    /// 条件成立（可能是入队前就成立，也可能是被条件唤醒）
+    Condition,
+    /// 到期被定时器叫醒，而条件仍不成立
+    TimedOut,
+}
+
 /// 依赖反转表（ADR-053 决策 1）：`sync` 不引用 `sched`，否则会把 `sched` 拉进环 A。
 /// 由 `sched::install_wait_ops()` 在启动期装一次，之后只读；默认桩让装表前的调用安全失败。
 pub struct WaitOps {
@@ -106,6 +115,11 @@ pub struct WaitOps {
     pub wake: fn(usize, WaitToken) -> bool,
     /// 让出（自陷 resched，ADR-049）。**必须在放掉 WAITQ 锁之后调用**
     pub yield_now: fn(),
+    /// 给该任务注册一个到期项（P6b）。**在持 WAITQ 时被调用** ⇒ 内部取 TIMER(6)，
+    /// 方向 5→6 合法（lock-order.md）。槽满回 false，调用方不得阻塞。
+    pub timer_add: fn(usize, WaitToken, u64) -> bool,
+    /// 取消该任务的到期项；返回 true 表示它当时还挂着（即不是定时器叫醒的）。
+    pub timer_del: fn(usize, WaitToken) -> bool,
 }
 
 struct OpsCell(core::cell::UnsafeCell<WaitOps>);
@@ -116,8 +130,11 @@ fn no_current() -> usize { usize::MAX }
 fn no_block(_: usize, _: WaitToken) -> bool { false }
 fn no_wake(_: usize, _: WaitToken) -> bool { false }
 fn no_yield() {}
+fn no_timer_add(_: usize, _: WaitToken, _: u64) -> bool { false }
+fn no_timer_del(_: usize, _: WaitToken) -> bool { false }
 static WAIT_OPS: OpsCell = OpsCell(core::cell::UnsafeCell::new(WaitOps {
     current: no_current, block: no_block, wake: no_wake, yield_now: no_yield,
+    timer_add: no_timer_add, timer_del: no_timer_del,
 }));
 
 /// 启动期安装一次（由 sched 调）。
@@ -207,6 +224,55 @@ impl WaitQueue {
             let _ = self.remove_task(me);
         }
         Ok(cond())
+    }
+
+    /// 带时限的条件等待（P6b，形状由 ADR-058 决策 5/6 定死）。
+    ///
+    /// 与 `wait_while` 同一套防丢唤醒协议（查条件与入队同锁、**放锁后**才切走），
+    /// 另加一个到期项：**等待槽与轮项共用同一个 token**，所以条件唤醒与到期唤醒谁先都能被
+    /// `wake_task` 认；后到者看到状态已不是 `Blocked`，返回 false，无副作用。
+    /// 持 WAITQ(5) 调 `timer_add` 取 TIMER(6)，方向合法。
+    /// 醒来后先摘两处注册，再按 `cond()` 分结局：真 ⇒ Condition，假 ⇒ TimedOut。
+    pub fn wait_while_until(
+        &self,
+        qid: u8,
+        cond: impl Fn() -> bool,
+        deadline: u64,
+    ) -> Result<WaitOutcome, WaitError> {
+        let o = wait_ops();
+        let me = (o.current)();
+        if me == usize::MAX {
+            return Err(WaitError::NotInstalled);
+        }
+        let tok = {
+            let mut g = self.0.lock();
+            let inner = g.get();
+            if cond() {
+                return Ok(WaitOutcome::Condition);
+            }
+            let Some(slot) = inner.slots.iter().position(|w| !w.used) else {
+                return Err(WaitError::NoCapacity);
+            };
+            inner.seq = inner.seq.wrapping_add(1);
+            let tok = WaitToken { queue: qid, seq: inner.seq };
+            if !(o.block)(me, tok) {
+                return Err(WaitError::NotInstalled);
+            }
+            if !(o.timer_add)(me, tok, deadline) {
+                // 注册不成：状态已经标了 Blocked，必须自己改回去，否则永久阻塞
+                let _ = (o.wake)(me, tok);
+                return Err(WaitError::NoCapacity);
+            }
+            inner.slots[slot] = Waiter { used: true, task: me, token: tok, next: inner.head };
+            inner.head = slot as u16;
+            inner.blocks += 1;
+            tok
+        }; // ← 两把锁都放掉，然后才切走
+        (o.yield_now)();
+        let _ = self.remove_task(me);
+        // 条件先叫醒时必须取消轮项，否则它占着槽一直到 deadline（判据会数残留）
+        let _ = (o.timer_del)(me, tok);
+        Ok(if cond() { WaitOutcome::Condition } else { WaitOutcome::TimedOut })
     }
 
     /// 叫醒队首一个。返回实际转移的状态数（0 或 1）。

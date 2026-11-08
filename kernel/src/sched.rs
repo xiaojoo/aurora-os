@@ -684,7 +684,43 @@ pub fn install_wait_ops() {
         block: block_for_wait,
         wake: wake_task,
         yield_now: yield_now,
+        timer_add: timer_add_for_wait,
+        timer_del: timer_del_for_wait,
     });
+}
+
+/// 给等待者注册到期项（P6b）。**由 `sync` 在持 WAITQ(5) 时调用**，这里取 TIMER(6)：
+/// 方向 5→6 合法（lock-order.md）。token 与等待槽共用，所以两种唤醒谁先都认。
+fn timer_add_for_wait(task: usize, token: crate::sync::WaitToken, deadline: u64) -> bool {
+    let cpu = cpu_of(task);
+    if cpu >= crate::arch::x86_64::cpu::MAX_CPUS {
+        return false;
+    }
+    let mut g = WHEELS[cpu].lock();
+    let w = g.get();
+    let Some(slot) = w.slots.iter().position(|e| !e.used) else {
+        return false;
+    };
+    w.slots[slot] = TimerEntry { used: true, deadline, task, token };
+    w.registered += 1;
+    true
+}
+
+/// 取消到期项；返回 true 表示它当时还挂着（即不是定时器叫醒的）。
+fn timer_del_for_wait(task: usize, token: crate::sync::WaitToken) -> bool {
+    let cpu = cpu_of(task);
+    if cpu >= crate::arch::x86_64::cpu::MAX_CPUS {
+        return false;
+    }
+    let mut g = WHEELS[cpu].lock();
+    let w = g.get();
+    for e in w.slots.iter_mut() {
+        if e.used && e.task == task && e.token == token {
+            e.used = false;
+            return true;
+        }
+    }
+    false
 }
 
 /// 把**当前任务**标成阻塞（ADR-053 P4a）。只改状态、**不让出**——
@@ -910,8 +946,13 @@ fn idle_entry() -> ! {
     // 不能用 `with_interrupts`：它返回时把牌一律置 false（不恢复原值），在任务里用
     // 等于关掉别人开的窗口（BACKLOG 82 的嵌套隐患）。牌开着，换入的下个任务按 ADR-021
     // 由 `context_load` 供 IF，语义不变。
-    crate::arch::x86_64::apic::open_cpu_window(cpu);
     loop {
+        // **每次 hlt 前都要重新开窗口**，不能只在入口开一次：牌是 per-CPU 的，
+        // 别的代码（`with_interrupts` 返回时一律把牌置 false）会在 idle 不在 CPU 上时关掉它，
+        // 而换回来时 `context_load` 按牌供 IF ⇒ IF=0 的 hlt 永远醒不来。
+        // 实测：P6b 的用例调了 `apic::wait_ticks`（内部 with_interrupts）之后，
+        // BSP 就停在 idle_entry 里 HLT=1 而 RFL=0x7（IF=0），整机静默。
+        crate::arch::x86_64::apic::open_cpu_window(cpu);
         if cpu < crate::arch::x86_64::cpu::MAX_CPUS {
             IDLE_HLT[cpu].fetch_add(1, Ordering::Relaxed);
         }

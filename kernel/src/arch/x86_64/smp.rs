@@ -515,8 +515,10 @@ fn ap_worker() -> ! {
     // 与 AP 空闲上下文同一形状；不用 `with_interrupts`，理由见 sched::idle_entry。
     // **没有退掉这个任务**：它的 WORK 计数仍是 t_percpu_queues 的 `worked_aps` 证人，
     // 退掉它就得先换证人（ADR-047/§113a）。改成 hlt 既不再烧 CPU，又保住证人。
-    apic::open_cpu_window(slot);
     loop {
+        // 与 sched::idle_entry 同一条理由：每次 hlt 前重新开窗口。只在入口开一次的话，
+        // 别人把牌关掉之后本任务被换回来就是 IF=0 的 hlt，永远醒不来（实测过）。
+        apic::open_cpu_window(slot);
         (crate::hooks::sched().bump_current_work)();
         if slot < cpu::MAX_CPUS {
             AP_WORKER_HLT[slot].fetch_add(1, Ordering::Relaxed);
