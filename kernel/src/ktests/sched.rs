@@ -588,6 +588,84 @@ fn t_block_wake() -> bool {
 }
 ktest!(KT_BLOCK_WAKE, t_block_wake);
 
+/// P4b 的生产者/消费者：消费者在条件不成立时阻塞，生产者置位后 wake_one。
+static WQ_FLAG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static WQ_DONE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+const WQ_ROUNDS: u64 = 24;
+
+fn wq_consumer() -> ! {
+    let q = sync::wait_queue(0);
+    for _ in 0..WQ_ROUNDS {
+        if let Some(q) = q {
+            // 条件谓词在 WAITQ 锁内被调用，所以它必须是廉价读，不能睡、不能取更外层的锁
+            let _ = q.wait_while(0, || WQ_FLAG.load(Ordering::Relaxed) != 0);
+        }
+        WQ_FLAG.store(0, Ordering::Relaxed);
+        WQ_DONE.fetch_add(1, Ordering::Relaxed);
+        sched::yield_now(); // 把 CPU 还给生产者，让它推进下一轮
+    }
+    sched::finish_current();
+    loop {
+        tsc::spin(3_000);
+    }
+}
+
+/// P4b（ADR-053）：条件等待协议的可观测保证。
+///
+/// 四格：①每一轮都推进到 `WQ_ROUNDS`（没有丢唤醒——丢一次就会卡在某轮，有界让出后判红）；
+/// ②链上无残留槽；③`blocks == wakes`（每次阻塞都被一次有效唤醒配对）；
+/// ④`empty_wakes` 与 `blocks` 一起读才有意义：生产者跑在消费者阻塞之前是**合法**的，
+/// 那一次 wake 落在空队列上，消费者随后查条件直接成立、不阻塞。
+/// 全部用 `yield_now` 驱动，停表状态下也确定性成立。
+fn t_waitqueue() -> bool {
+    if sched::state_of(0) == sched::TaskState::Free {
+        sched::init_boot_task();
+    }
+    let Some(q) = sync::wait_queue(0) else {
+        crate::log_fatal!("waitqueue: 0 号队列取不到");
+        return false;
+    };
+    WQ_FLAG.store(0, Ordering::Relaxed);
+    WQ_DONE.store(0, Ordering::Relaxed);
+    let c = match sched::spawn(wq_consumer) {
+        Ok(i) => i,
+        Err(e) => {
+            crate::log_fatal!("waitqueue: 消费者 spawn 失败 {:?}", e);
+            return false;
+        }
+    };
+    let mut stalled = 0usize;
+    for round in 0..WQ_ROUNDS {
+        // **先让消费者去阻塞**：不先让一次，生产者总是跑在前面，消费者查条件时 flag 已置位，
+        // 于是一次都不阻塞（实测第一版 blocks=0 wakes=0 empty_wakes=24，判据全绿却什么都没测）。
+        sched::yield_now();
+        WQ_FLAG.store(1, Ordering::Relaxed);
+        let _ = q.wake_one();
+        let target = round + 1;
+        let mut n = 0usize;
+        while WQ_DONE.load(Ordering::Relaxed) < target && n < 200 {
+            sched::yield_now();
+            n += 1;
+        }
+        if WQ_DONE.load(Ordering::Relaxed) < target {
+            stalled += 1;
+            crate::log_fatal!("waitqueue: 第 {} 轮没推进（done={}）", round, WQ_DONE.load(Ordering::Relaxed));
+            break;
+        }
+    }
+    let done = WQ_DONE.load(Ordering::Relaxed);
+    let (blocks, wakes, empty, used) = q.stats();
+    // 收干净（ADR-050 的纪律）：消费者若还阻塞着，先摘链再终止，避免留一个陈旧 waiter
+    let _ = q.remove_task(c);
+    let _ = sched::terminate_task(c);
+    crate::log_info!(
+        "waitqueue(ADR-053): rounds={} done={} blocks={} wakes={} empty_wakes={} 仍在链上={} 卡住={}",
+        WQ_ROUNDS, done, blocks, wakes, empty, used, stalled);
+    // `blocks > 0` 是**防空转**的一格：没有它，"生产者永远跑在前面"也能让其余各格全绿
+    done == WQ_ROUNDS && stalled == 0 && used == 0 && blocks == wakes && blocks > 0
+}
+ktest!(KT_WAITQUEUE, t_waitqueue);
+
 /// `if_patch` 两条分支的直接覆盖，以及 asm 偏移与 Rust 结构体的对账。
 ///
 /// 为什么这条用例存在：ADR-021 的"关着窗口换入"分支今天**没有触发源**

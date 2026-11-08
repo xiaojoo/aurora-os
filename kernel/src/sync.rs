@@ -69,6 +69,219 @@ pub struct WaitToken {
     pub seq: u64,
 }
 
+/// 等待队列锁（ADR-047 决策 3 / ADR-053，P4b 落地）。
+/// 等级 5：必须**低于**运行队列锁 `RANK_RUNQ(8)`，因为持等待队列锁时要叫醒别人（取 RUNQ）；
+/// 又必须低于 `HEAP(10)`，方向才与"从外到内递增"一致。0 是"没持锁"的哨兵，不能当等级用。
+/// 嵌套方向唯一：`WAITQ -> RUNQ`；反向在同 CPU 上由 `lock()` 的等级判据当场升 L4。
+pub const RANK_WAITQ: LockRank = LockRank(5);
+
+/// 队列数与每队列 waiter 槽数（ADR-047 决策 3）。**定长、不进堆**：
+/// 理由不是 ISR 禁令（ISR 内分配是 L3 拒绝、可观察），而是 `LARGE_MAX = 2048`
+/// 与"故障路径不分配"。这两个数目前是**上限**，不是由 workload 钉出来的（ADR-053 未决 1）：
+/// 槽满回 `NoCapacity`，调用方必须处理，不许在等待路径上顺手分配。
+pub const MAX_WAIT_QUEUES: usize = 16;
+pub const MAX_WAITERS: usize = 16;
+
+/// 等待的失败分类（B 类资源 / C 类契约）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitError {
+    /// 槽满：调用方**不得**阻塞，应改用轮询或退避
+    NoCapacity,
+    /// 回调表还没装（启动早期）或当前上下文不是任务：调用方不得阻塞
+    NotInstalled,
+}
+
+/// 依赖反转表（ADR-053 决策 1）：`sync` 不引用 `sched`，否则会把 `sched` 拉进环 A。
+/// 由 `sched::install_wait_ops()` 在启动期装一次，之后只读；默认桩让装表前的调用安全失败。
+pub struct WaitOps {
+    /// 当前任务的全局下标；`usize::MAX` = 当前上下文不是任务
+    pub current: fn() -> usize,
+    /// 把该任务标成 `Blocked(token)`（内部自己取 RUNQ 锁）
+    pub block: fn(usize, WaitToken) -> bool,
+    /// 世代号匹配时把 `Blocked` 转回 `Runnable` 并立目标 CPU 的 need 牌
+    pub wake: fn(usize, WaitToken) -> bool,
+    /// 让出（自陷 resched，ADR-049）。**必须在放掉 WAITQ 锁之后调用**
+    pub yield_now: fn(),
+}
+
+struct OpsCell(core::cell::UnsafeCell<WaitOps>);
+// SAFETY: 表在启动期单核、关中断安装一次，之后只读；默认桩保证安装前调用也安全。
+// 与 `hooks::HooksCell` 同一论证形状（ADR-040）。
+unsafe impl Sync for OpsCell {}
+fn no_current() -> usize { usize::MAX }
+fn no_block(_: usize, _: WaitToken) -> bool { false }
+fn no_wake(_: usize, _: WaitToken) -> bool { false }
+fn no_yield() {}
+static WAIT_OPS: OpsCell = OpsCell(core::cell::UnsafeCell::new(WaitOps {
+    current: no_current, block: no_block, wake: no_wake, yield_now: no_yield,
+}));
+
+/// 启动期安装一次（由 sched 调）。
+pub fn install_wait_ops(o: WaitOps) {
+    // SAFETY: 见 OpsCell；调用点固定在 after_switch 开头，早于 AP 与定时器。
+    unsafe { *WAIT_OPS.0.get() = o; }
+}
+
+fn wait_ops() -> &'static WaitOps {
+    // SAFETY: 见 OpsCell；装表后只读。
+    unsafe { &*WAIT_OPS.0.get() }
+}
+
+const NO_NEXT: u16 = u16::MAX;
+
+#[derive(Clone, Copy)]
+struct Waiter {
+    used: bool,
+    task: usize,
+    token: WaitToken,
+    next: u16,
+}
+
+struct WaitInner {
+    slots: [Waiter; MAX_WAITERS],
+    head: u16,
+    seq: u64,
+    blocks: u64,
+    wakes: u64,
+    /// 队列空时还来叫的次数：它是"生产者跑在消费者阻塞之前"的合法情形，
+    /// 也是丢唤醒变异要盯的数之一（配合 blocks/wakes 一起看才有意义）。
+    empty_wakes: u64,
+}
+
+/// 一把等待队列。锁与数据同体，`RANK_WAITQ`。
+pub struct WaitQueue(IrqSpinLock<WaitInner>);
+
+impl WaitQueue {
+    pub const fn new() -> Self {
+        WaitQueue(IrqSpinLock::new(RANK_WAITQ, WaitInner {
+            slots: [Waiter { used: false, task: 0, token: WaitToken { queue: 0, seq: 0 }, next: NO_NEXT }; MAX_WAITERS],
+            head: NO_NEXT,
+            seq: 0,
+            blocks: 0,
+            wakes: 0,
+            empty_wakes: 0,
+        }))
+    }
+
+    /// 条件等待（ADR-053 决策 2）：**查条件与入队在同一把锁内**，放锁后才切走。
+    ///
+    /// 为什么这样就不丢唤醒：致命窗口是"查完条件到入队之间插进一次 wake"，
+    /// 而这两步同锁，插不进来。放锁之后即使立刻被 wake，本任务已是 `Runnable`，
+    /// 让出后仍会被选回来。反过来，**持锁切走**会让守卫在阻塞期间一直不释放
+    /// （`IrqGuard` 的 Drop 在函数返回时执行，而阻塞者不返回），唤醒方全死。
+    ///
+    /// `cond` 必须是**廉价谓词**：它在锁内被调用，不得睡眠、不得取比 WAITQ 更外层的锁。
+    /// 返回 `Ok(true)` = 条件成立（可能没阻塞，也可能被唤醒后成立）。
+    pub fn wait_while(&self, qid: u8, cond: impl Fn() -> bool) -> Result<bool, WaitError> {
+        let o = wait_ops();
+        let me = (o.current)();
+        if me == usize::MAX {
+            return Err(WaitError::NotInstalled);
+        }
+        let enqueued = {
+            let mut g = self.0.lock();
+            let inner = g.get();
+            if cond() {
+                return Ok(true); // 条件已成立：不入队，也不阻塞
+            }
+            let Some(slot) = inner.slots.iter().position(|w| !w.used) else {
+                return Err(WaitError::NoCapacity);
+            };
+            inner.seq = inner.seq.wrapping_add(1);
+            let tok = WaitToken { queue: qid, seq: inner.seq };
+            if !(o.block)(me, tok) {
+                return Err(WaitError::NotInstalled);
+            }
+            inner.slots[slot] = Waiter { used: true, task: me, token: tok, next: inner.head };
+            inner.head = slot as u16;
+            inner.blocks += 1;
+            true
+        }; // ← 锁在这里放掉，**然后**才切走
+        if enqueued {
+            (o.yield_now)();
+            // 回来就摘链：正常路径下 wake 已经摘过，这里兜住"被直接 wake_task 叫醒"的情形
+            let _ = self.remove_task(me);
+        }
+        Ok(cond())
+    }
+
+    /// 叫醒队首一个。返回实际转移的状态数（0 或 1）。
+    pub fn wake_one(&self) -> usize {
+        let o = wait_ops();
+        let mut g = self.0.lock();
+        let inner = g.get();
+        if inner.head == NO_NEXT {
+            inner.empty_wakes += 1;
+            return 0;
+        }
+        let h = inner.head as usize;
+        let w = inner.slots[h];
+        inner.head = w.next;
+        inner.slots[h].used = false;
+        inner.slots[h].next = NO_NEXT;
+        inner.wakes += 1;
+        // 持 WAITQ 取 RUNQ：方向合法（5 -> 8），见 lock-order.md
+        if (o.wake)(w.task, w.token) { 1 } else { 0 }
+    }
+
+    /// 叫醒全部，返回实际转移数。
+    pub fn wake_all(&self) -> usize {
+        let o = wait_ops();
+        let mut n = 0usize;
+        let mut g = self.0.lock();
+        let inner = g.get();
+        let mut cur = inner.head;
+        inner.head = NO_NEXT;
+        while cur != NO_NEXT {
+            let i = cur as usize;
+            let w = inner.slots[i];
+            cur = w.next;
+            inner.slots[i].used = false;
+            inner.slots[i].next = NO_NEXT;
+            inner.wakes += 1;
+            if (o.wake)(w.task, w.token) {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// 把某个任务从链上摘掉（杀死阻塞任务时用，ADR-053 决策 4）。
+    pub fn remove_task(&self, task: usize) -> bool {
+        let mut g = self.0.lock();
+        let inner = g.get();
+        let mut cur = inner.head;
+        let mut prev = NO_NEXT;
+        while cur != NO_NEXT {
+            let i = cur as usize;
+            if inner.slots[i].task == task {
+                let nxt = inner.slots[i].next;
+                if prev == NO_NEXT { inner.head = nxt; } else { inner.slots[prev as usize].next = nxt; }
+                inner.slots[i].used = false;
+                inner.slots[i].next = NO_NEXT;
+                return true;
+            }
+            prev = cur;
+            cur = inner.slots[i].next;
+        }
+        false
+    }
+
+    /// `(blocks, wakes, empty_wakes, 仍在链上的槽数)`。判据用它对账，不靠串口猜。
+    pub fn stats(&self) -> (u64, u64, u64, usize) {
+        let mut g = self.0.lock();
+        let inner = g.get();
+        (inner.blocks, inner.wakes, inner.empty_wakes, inner.slots.iter().filter(|w| w.used).count())
+    }
+}
+
+static WAIT_QUEUES: [WaitQueue; MAX_WAIT_QUEUES] = [const { WaitQueue::new() }; MAX_WAIT_QUEUES];
+
+/// 按编号取队列；越界返回 None（调用方必须处理，不许 unwrap）。
+pub fn wait_queue(id: u8) -> Option<&'static WaitQueue> {
+    WAIT_QUEUES.get(id as usize)
+}
+
 const UNHELD: u64 = u64::MAX;
 
 pub struct IrqSpinLock<T> {

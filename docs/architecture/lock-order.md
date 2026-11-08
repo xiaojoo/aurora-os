@@ -5,7 +5,7 @@
 
 | 锁 | 等级 | 保护的量 | 允许在它内部获取 | 依据（实测的调用关系） |
 | --- | --- | --- | --- | --- |
-| `RANK_WAITQ` | 5 | 等待队列的链表头尾与 waiter 槽（ADR-047 的 `sync::WaitQueue`） | RUNQ(8)、HEAP(10)、VMM(20)、PMM(30)、台账(40) | **裁决已定、代码未落地（P2/P4）**：持等待队列锁时要叫醒别人，即取运行队列锁 |
+| `RANK_WAITQ` | 5 | `sync::WaitQueue` 的链表头尾、waiter 槽与计数 | RUNQ(8)、HEAP(10)、VMM(20)、PMM(30)、台账(40) | **已落地（ADR-053/P4b，2026-11-08）**：持等待队列锁时叫醒别人即取运行队列锁；实测负样本 `重入获取 rank=5` ⇒ 39、`锁序违规，外层 rank=8 本次 rank=5` ⇒ 39 |
 | `RANK_RUNQ` | 8 | 每 CPU 运行队列的所有权（`sched::RQ` 的 `QueueCell.lock`） | HEAP(10)、VMM(20)、PMM(30)、台账(40) | **已落地（ADR-048，2026-11-08）**：`spawn` 在队列锁内要任务栈 ⇒ 向下要页；实测取证跑 `acquires=348877 order_violations=0 reentrant_hits=0 wait_events=2556 wait_timeouts=0`，重入负样本 `L4 sync: 重入获取 rank=8` ⇒ 39 |
 | `RANK_HEAP` | 10 | `heap::Heap` 的光标/自由链表 | VMM(20)、PMM(30)、台账(40) | `try_alloc` → `map_more_through` → `mm::map` → `new_table_frame` → `phys_alloc` → 台账 |
 | `RANK_VMM` | 20 | 页表结构与 VA 保留登记表 | PMM(30)、台账(40) | `map`/`alloc_va_range` 内部要新页表页，走 `phys_alloc` |
@@ -25,7 +25,7 @@
 接内存缓冲区对象（要归还页框、要调 VMM(20)/PMM(30)）那天，要么把这一级降到 20 以下，
 要么把释放移到锁外——两条路都要先改这张表再改代码，并各自配锁序/重入负样本。
 
-## ADR-047 新增的两级：等级空间与单向嵌套（RUNQ 已落地 ADR-048；WAITQ 待 P4）
+## ADR-047 新增的两级：等级空间与单向嵌套（RUNQ 已落地 ADR-048；WAITQ 已落地 ADR-053）
 
 **为什么只能落在 1..9。** `sync::INNERMOST` 是 `[AtomicU8; MAX_CPUS]`，初值 0，
 而违规判据是 `rank <= prev_rank && prev_rank != 0`（`sync.rs:254`）——**0 是"当前没持锁"的哨兵，

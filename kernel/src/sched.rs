@@ -635,6 +635,21 @@ pub fn mark_tick() {
     FLAGS[slot].need.store(true, Ordering::Release);
 }
 
+/// 把调度器实现装进 `sync` 的等待回调表（ADR-053 决策 1 的反转）。
+/// `sync` 因此不引用 `sched`，依赖方向不变、环 A 不动。启动期装一次，之后只读。
+pub fn install_wait_ops() {
+    // 阻塞者总是当前任务，所以 ops 传来的下标只作校验用，实际改的是 current
+    fn block_for_wait(_task: usize, token: crate::sync::WaitToken) -> bool {
+        block_current(token)
+    }
+    crate::sync::install_wait_ops(crate::sync::WaitOps {
+        current: current_id,
+        block: block_for_wait,
+        wake: wake_task,
+        yield_now: yield_now,
+    });
+}
+
 /// 把**当前任务**标成阻塞（ADR-053 P4a）。只改状态、**不让出**——
 /// 调用方要在放掉队列锁之后自己 `yield_now()`，因为持锁切走会让 guard 在阻塞期间
 /// 一直不释放（ADR-053 决策 2 修正了 ADR-047 的措辞）。

@@ -1,6 +1,6 @@
 # unsafe 逐处审计表（U1–U6）
 
-总计 286 处。U1 54 · U2 61 · U3 13 · U4 109 · U5 28 · U6 21
+总计 289 处。U1 54 · U2 61 · U3 13 · U4 112 · U5 28 · U6 21
 
 本表由 `tools/aurora.py` 的 `unsafe_sites()` 从源码逐处生成，**不是手写的**。
 机器可读的权威来源是 `docs/security/unsafe-whitelist.toml` 的 `[modules.*]` 段（模块×类别→处数），
@@ -542,18 +542,22 @@
   > unsafe { core::arch::asm!("in al, dx", in("dx") port, out("al") v, options(nomem, nostack, preserves_flags)) }; v } 
 
 ### sync
-
-- `kernel/src/sync.rs:62` [impl] **U4** fn=`—`
-  > unsafe impl<T: Send> Sync for IrqSpinLock<T> {}  #[must_use = "丢弃守卫会立即释放锁，等于什么都没锁（§7.1 R16）"] 
-- `kernel/src/sync.rs:84` [{] **U4** fn=`—`
-  > unsafe { &mut *self.lock.data.get() } } } 
-- `kernel/src/sync.rs:95` [{] **U4** fn=`—`
-  > unsafe { self.lock.locked.store(0, Ordering::Release) }; restore_flags(self.flags); } 
-- `kernel/src/sync.rs:106` [{] **U1** fn=`save_and_cli`
-  > unsafe { core::arch::asm!( "pushfq", 
-- `kernel/src/sync.rs:120` [{] **U1** fn=`restore_flags`
-  > unsafe { core::arch::asm!("push {r}", "popfq", r = in(reg) f) }; }  
-
+- `kernel/src/sync.rs:110` [impl] **U4** fn=``
+  > unsafe impl Sync for OpsCell {} fn no_current() -> usize { usize::MAX } fn no_block(_: usize, _: WaitToken) -> bool { false }
+- `kernel/src/sync.rs:122` [{] **U4** fn=`install_wait_ops`
+  > unsafe { *WAIT_OPS.0.get() = o; } } 
+- `kernel/src/sync.rs:127` [{] **U4** fn=`wait_ops`
+  > unsafe { &*WAIT_OPS.0.get() } } 
+- `kernel/src/sync.rs:296` [impl] **U4** fn=`wait_queue`
+  > unsafe impl<T: Send> Sync for IrqSpinLock<T> {}  #[must_use = "丢弃守卫会立即释放锁，等于什么都没锁（§7.1 R16）"]
+- `kernel/src/sync.rs:318` [{] **U4** fn=`wait_queue`
+  > unsafe { &mut *self.lock.data.get() } } }
+- `kernel/src/sync.rs:329` [{] **U4** fn=`wait_queue`
+  > unsafe { self.lock.locked.store(0, Ordering::Release) }; restore_flags(self.flags); }
+- `kernel/src/sync.rs:340` [{] **U1** fn=`save_and_cli`
+  > unsafe { core::arch::asm!( "pushfq",
+- `kernel/src/sync.rs:354` [{] **U1** fn=`restore_flags`
+  > unsafe { core::arch::asm!("push {r}", "popfq", r = in(reg) f) }; } 
 ### tsc
 
 - `kernel/src/tsc.rs:31` [{] **U1** fn=`now`

@@ -4434,6 +4434,43 @@ AP 侧仍用 slot 0 的空闲上下文当兜底，没有专属 idle。两者都�
 （把入队移出 `WAITQ` 锁 ⇒ 丢唤醒计数 > 0）。`RANK_WAITQ(5)` 落地后锁序表那行转"已落地"，
 并按硬约束 4 配重入与反向嵌套负样本。
 
+## 125. P4b：等待队列落地，并抓到一次"绿而无效"（2026-11-08，实测）
+
+**交付（ADR-054，落地 ADR-053）**：`sync` 侧 `RANK_WAITQ(5)`、`WaitError{NoCapacity,NotInstalled}`、
+`WaitOps` 回调表（反转，`sync` 不引用 `sched`）、`WaitQueue`（定长 16×16、不进堆）与
+`wait_while/wake_one/wake_all/remove_task/stats`；`sched::install_wait_ops()` 由 `main.rs`
+在启动期与 arch hooks 同一时机装好。协议按 ADR-053：**查条件与入队同锁、放锁后才自陷切走**。
+
+**抓到一次"绿而无效"（实测，值得记）**：第一版用例全绿，但读数
+`blocks=0 wakes=0 empty_wakes=24` —— **消费者一次都没阻塞**，生产者总跑在前面。
+其余各格（轮数推进、链上无残留、blocks==wakes）在根本没走阻塞路径时全部成立。
+修法：每轮**先让出一次**让消费者去阻塞，并给判据加一格 **`blocks > 0`** 防空转。
+改后 `rounds=24 done=24 blocks=24 wakes=24 empty_wakes=0 仍在链上=0 卡住=0`，默认档 **3/3 PASS、57/57**。
+
+**变异 A 的诚实账（实测）**：
+- 裸变异 A（查条件移到锁外）单核连跑 **4 发全 PASS**，**未触发** ⇒ 不作为证红证据。
+  原因：锁外查条件到取锁之间的天然窗口太窄。
+- **MUTATION-A2**（再在窗口里让出一次，放大竞争）⇒ **2/2 确定性 FAIL(35)**，
+  签名是教科书式丢唤醒：`blocks=1 wakes=0 empty_wakes=1 仍在链上=1 卡住=1`。
+  判据读成红而不是挂死，靠用例里"有界让出 200 次"那一段。
+- 所以"防丢唤醒已证"目前只对**放大窗口的单核**成立；**并发证明留 P4c**（4 核压力）。
+
+**锁负样本（实测，硬约束 4）**：
+- MUTATION-L1 持 WAITQ 再取 WAITQ ⇒ `L4 sync: 重入获取 rank=5` ⇒ 39。
+- MUTATION-L3 在只持 RUNQ 的 `reap` 里取 WAITQ ⇒ `L4 sync: 锁序违规，外层 rank=8 本次 rank=5` ⇒ 39。
+- **挑错路径的一次**：MUTATION-L2 放在 `wake_task` 里，打到的是**重入**而不是锁序违规，
+  因为 `wake_task` 本来就在 WAITQ 锁内被调用。负样本必须挑对路径，这条记进 ADR-054。
+- 三条还原后回到 PASS(33)。`lock-order.md` 的 WAITQ 行转"已落地"并带上这两条证人原文。
+
+**登记面（门禁点名后补）**：`public_api` +3（`sched::install_wait_ops`、`sync::WaitOps`、
+`sync::install_wait_ops`）；`sync` U4 3→6（OpsCell 的 Sync/装/读），普查 286→289、U4 109→112。
+`WaitQueue`/`wait_queue`/`WaitError`/`RANK_WAITQ` 目前只被 ktest 引用，按口径不进 `public_api`。
+依赖图不变（回调表反转），环 A 与棘轮不动。
+
+**未决（写明）**：容量 16×16 无 workload 依据；`wait_while` 没有时限参数（阻塞期间没有
+定时器轮能叫醒它，P6 才有），所以"卡住"只能由调用方的有界让出发现；
+`terminate_task` 与 `remove_task` 的**自动**挂接未做（用例 presently 自己先摘链再终止）。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

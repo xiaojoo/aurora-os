@@ -195,6 +195,8 @@ pub extern "C" fn kmain() -> ! {
 extern "C" fn after_switch(_: usize) -> ! {
     // ADR-040：先把调度器实现装进 arch 的回调表，早于 AP 释放与任何定时器窗口。
     sched::install_arch_hooks();
+    // P4b：等待队列的回调表（ADR-053 的反转），与 arch hooks 同一时机装好
+    sched::install_wait_ops();
     // Task C（V1.0 §14）：启动编排按阶段函数组织；顺序与日志契约不变。
     stage_memory();
     stage_cpu_protections();
