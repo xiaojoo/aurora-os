@@ -580,7 +580,11 @@ static SWITCHES_FOR: [AtomicUsize; crate::arch::x86_64::cpu::MAX_CPUS] = [const 
 /// 所有 CPU 上"还能被调度"的任务数之和（跨核快照，只用于日志与判据）。
 pub fn tasks_active() -> usize {
     (0..MAX_TASKS_TOTAL)
-        .filter(|&i| matches!(state_of(i), TaskState::Runnable | TaskState::Running))
+        .filter(|&i| {
+            // idle 不是"工作"：把它算进去会让 active_left 一类读数凭空 +1（ADR-051 决策 4）
+            i != idle_of(cpu_of(i))
+                && matches!(state_of(i), TaskState::Runnable | TaskState::Running)
+        })
         .count()
 }
 
@@ -762,6 +766,96 @@ pub fn init_idle_task(stack_lo: u64, stack_hi: u64, guarded: bool) {
         owned: OwnedSet::new(),
     };
     s.current = gidx(cpu, 0);
+}
+
+/// P3b-2：每 CPU 的兜底 idle 栈。**静态**持有，不挂到任务名下（`owned` 为空）——
+/// 否则它被换下时 `reap` 会把一条还在用的 CPU 栈解映射（`init_idle_task` 的注释已写明这条）。
+/// 放 .bss 而不是走分配器：idle 必须在堆/VA 保留表耗尽时仍然存在，它是最后的兜底。
+const IDLE_STACK_BYTES: usize = 8192;
+#[repr(C, align(16))]
+struct IdleStack([u8; IDLE_STACK_BYTES]);
+// 必须用 `UnsafeCell` 包起来：裸的 `[const { IdleStack([0; N]) }; N]` 被 LLVM 当成
+// 编译期常量放进了 **.rodata**（实测 `llvm-objdump -t` 显示段名 .rodata），
+// 于是往里写帧当场 #PF(err=0x3，写只读页)。UnsafeCell 表达内部可变性，落到可写段。
+#[repr(C, align(16))]
+struct IdleStackCell(core::cell::UnsafeCell<IdleStack>);
+// SAFETY: 每个 CPU 只碰 `IDLE_STACKS[自己那格]`（索引取自 `cpu::self_slot()`），
+// 而写帧只发生在 `init_idle` 持本 CPU 队列锁、IF=0 的那一次；此后这块内存只由
+// 该 CPU 上的 idle 任务自己当栈用。与 `QueueCell` 同一条论证形状。
+unsafe impl Sync for IdleStackCell {}
+static IDLE_STACKS: [IdleStackCell; crate::arch::x86_64::cpu::MAX_CPUS] =
+    [const { IdleStackCell(core::cell::UnsafeCell::new(IdleStack([0; IDLE_STACK_BYTES]))) };
+        crate::arch::x86_64::cpu::MAX_CPUS];
+/// 每个 CPU 的 idle 全局下标；`usize::MAX` = 还没登记。
+static IDLE_GIDX: [core::sync::atomic::AtomicUsize; crate::arch::x86_64::cpu::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicUsize::new(usize::MAX) }; crate::arch::x86_64::cpu::MAX_CPUS];
+
+/// 本 CPU 的兜底 idle 下标；`usize::MAX` 表示没有（那时 `pick_next` 仍退回旧行为）。
+pub fn idle_of(cpu: usize) -> usize {
+    if cpu >= crate::arch::x86_64::cpu::MAX_CPUS {
+        return usize::MAX;
+    }
+    IDLE_GIDX[cpu].load(Ordering::Relaxed)
+}
+
+/// idle 的入口：只自旋。**第一版不 `hlt`**——那要动 IF 语义（ADR-021），属 P5。
+/// 它只在"没有别的可运行任务"时才会被选中（见 `pick_next` 的两遍扫描）。
+fn idle_entry() -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// 给**本 CPU**登记一个专属 idle 任务（ADR-051 决策 3，P3b-2）。
+/// 幂等：已登记就直接返回 true。栈是静态的，`owned` 为空，所以 `reap` 永远不会碰它。
+pub fn init_idle() -> bool {
+    let cpu = crate::arch::x86_64::cpu::self_slot();
+    if cpu >= crate::arch::x86_64::cpu::MAX_CPUS {
+        return false;
+    }
+    if idle_of(cpu) != usize::MAX {
+        return true;
+    }
+    let base = IDLE_STACKS[cpu].0.get() as u64;
+    let (lo, hi) = (base, base + IDLE_STACK_BYTES as u64);
+    let mut s = rq(cpu);
+    // 不用 slot 0：那是启动/空闲上下文的位置，`init_boot_task`/`init_idle_task` 会重写它。
+    let Some(slot) = (1..MAX_TASKS).find(|&i| s.tasks[i].state == TaskState::Free) else {
+        return false;
+    };
+    let f = (hi - trap::TRAP_FRAME_BYTES as u64) as usize;
+    let mut frame = [0u64; 23];
+    frame[16] = 0;
+    frame[17] = 0;
+    frame[18] = idle_entry as *const () as u64;
+    frame[19] = trap::kcode_sel();
+    frame[20] = 0x2; // IF 由 CPU 供（ADR-021），与 spawn 同一条规矩
+    frame[21] = hi - 16;
+    frame[22] = trap::kdata_sel();
+    for (i, v) in frame.iter().enumerate() {
+        // SAFETY: f..f+23*8 落在 IDLE_STACKS[cpu] 这个静态数组内（hi 是它的上界），
+        // 16 字节对齐满足 u64 写入；此刻本 CPU 持队列锁且 IF=0，没有并发读者。
+        unsafe { core::ptr::write_volatile((f + i * 8) as *mut u64, *v) };
+    }
+    let gi = gidx(cpu, slot);
+    s.tasks[slot] = Task {
+        id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+        frame: f as u64,
+        kstack_lo: lo,
+        kstack_hi: hi,
+        kstack_top: hi - 16,
+        stack_lo: lo,
+        stack_hi: hi,
+        guarded: false, // .bss 数组，与启动栈同理：上一格属于同一个静态量
+        state: TaskState::Runnable,
+        user: false,
+        on_cpu: cpu as u8,
+        runs: 0,
+        left_tsc: 0,
+        owned: OwnedSet::new(),
+    };
+    IDLE_GIDX[cpu].store(gi, Ordering::Release);
+    true
 }
 
 /// 建一个任务：保留 `STACK_VA_PAGES` 页，最低那一页永不映射当 guard。
@@ -1029,11 +1123,28 @@ pub fn runs_of(i: usize) -> u64 {
 /// 变成一条可检查的不变量（`t_percpu_queues` 就是数这个）。
 fn pick_next(prev: usize, cpu: usize) -> usize {
     let s = rq(cpu);
+    let idle = idle_of(cpu);
     let start = (slot_of(prev) + 1) % MAX_TASKS;
+    // 第一遍：**排除 idle** 的轮转。这样只要还有真任务可跑，行为与 P3b-2 之前逐字相同，
+    // 既有轮转判据与 P1 的样本形状都不受扰动（ADR-051 影响一节要求的"最小扰动"）。
     for k in 0..MAX_TASKS {
         let slot = (start + k) % MAX_TASKS;
-        if s.tasks[slot].state == TaskState::Runnable && s.tasks[slot].on_cpu as usize == cpu {
-            return gidx(cpu, slot);
+        let gi = gidx(cpu, slot);
+        if gi != idle && s.tasks[slot].state == TaskState::Runnable && s.tasks[slot].on_cpu as usize == cpu {
+            return gi;
+        }
+    }
+    // 第二遍：**只有 prev 自己已经不再可运行时**才回落 idle。
+    // 要治的形状是"已标 Done/Free 却仍占着 CPU"：返回 prev 会让它永远不被换下，
+    // 于是 `reap` 的 `skip = current` 永远跳过它、资源永不回账（BACKLOG 144）。
+    // 反过来，prev 还活着（Runnable/Running）时返回 prev 是**正确且安全**的：
+    // 它继续跑，不依赖 tick 才能回来。若无条件回落 idle，一个活任务在关窗口/停表时
+    // 让出就会被切到 idle 而再也回不来——那正是 §111 那一类挂死，等于自己造一个新的。
+    let prev_live = matches!(s.tasks[slot_of(prev)].state, TaskState::Runnable | TaskState::Running);
+    if !prev_live && idle != usize::MAX && idle != prev && slot_of(idle) < MAX_TASKS {
+        let sl = slot_of(idle);
+        if s.tasks[sl].state == TaskState::Runnable && s.tasks[sl].frame != 0 {
+            return idle;
         }
     }
     prev

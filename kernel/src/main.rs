@@ -407,6 +407,10 @@ fn stage_storage_guard_crash() {
 /// Stage4：跑 .ktests、报 P1–P5/P4 读数并交付退出码。
 fn run_ktests_and_finish() -> ! {
     // ---- Stage4：跑用例并交付判定
+    // P3b-2：先给 BSP 登记兜底 idle，再跑用例。有了它，"没有别人可换"不再是
+    // "返回 prev 让 Done 任务永远占着 CPU"，而是切到 idle ⇒ reap 收得到那个槽（ADR-051）。
+    let idle_ok = sched::init_idle();
+    crate::log_info!("sched idle: 登记={} 下标={}", idle_ok, sched::idle_of(cpu::BSP_SLOT));
     // P3a-2 的收尾不变量：**用例跑完时，本 CPU 不许留下可运行的用户任务**。
     // 为什么这条值得当判据：残留的 ring3 自旋任务会让任何"关窗口让出"或"停掉唯一
     // tick 源"的动作变成整机静默（§111/§114a 两次挂死同一地址 RIP=0x100102040）。

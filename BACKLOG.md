@@ -4321,6 +4321,44 @@ ADR-051 已把设计与预期读数变化写死。
 **下一步**：P3b-2（每 CPU 专属 idle + `pick_next` 回落），随后 P4（`WaitQueue` 与 `Blocked`
 同轮，含防丢唤醒协议与两条变异）。
 
+## 121. P3b-2：兜底 idle 落地，BACKLOG 144 的前提由构造保证（2026-11-08，实测）
+
+**交付（ADR-052，落地并收窄 ADR-051 决策 3）**：每 CPU 专属 idle（静态栈、`owned` 为空、
+栈终身持有）；`pick_next` **两遍扫描**——第一遍排除 idle 保持既有轮转逐字不变，
+第二遍**只在 prev 自己已不再可运行时**回落 idle；`tasks_active()` 排除 idle；
+BSP 由 `main.rs` 在跑用例前 `init_idle()`（AP 侧本轮不动，仍用 slot 0 的空闲上下文）。
+
+**为什么回落要收窄（实测支撑）**：若"没有别的 Runnable"就无条件回落 idle，
+一个**活着的**任务在关窗口/停表时让出就会被切到 idle 而再也回不来——那是 §111 那一类挂死。
+MUTATION-I2（第一遍不排除 idle）实测直接 **HANG(120 s)**，机器在到达断言前就死了，
+证明"排除 idle"是**活性**所必需，不只是读数好看。
+
+**落地时真实抓到的一次错（实测，方法记下来）**：第一版静态栈写成
+`[const { IdleStack([0; N]) }; N]`，LLVM 把它当编译期常量放进 **`.rodata`**，
+写首帧当场 `#PF err=0x3`（写只读页），随后持队列锁进故障路径又重入 rank=8 升 L4。
+定位靠 `llvm-nm` + `llvm-objdump -t`：`init_idle+0x1a7` 写 `IDLE_STACKS+0x1f48`，段名 `.rodata`。
+改成 `UnsafeCell` 包装 + 显式 `Sync`（与 `QueueCell` 同形）后段名变 **`.bss`**，故障消失。
+**教训：静态可写缓冲不要只用"全零初始化"表达，要用 `UnsafeCell` 表明内部可变性，
+并且用段名核对，而不是假设它一定在 .bss。**
+
+**读数（实测）**：`sched idle: 登记=true 下标=1`；
+`idle(ADR-051): 下标=1 状态=Runnable 名下=0 active=7 独立重算=7 idle_runs 0 -> 0 搭档runs=1`；
+`reap 前提: worker=#4 Free 名下=0 released 44 -> 47`；`PASS(33)`、**55/55**；
+二进制 4436168 → 4459336（静态栈进 .bss，不占镜像体积）。
+
+**负样本（实测）**：MUTATION-I1（`tasks_active` 不排除 idle）⇒ `active=8 独立重算=7`
+→ `t_idle_fallback -> failed` → FAIL(35)，**独立重算这条对账被证明有用**；
+MUTATION-I2 ⇒ HANG(120 s)（见上）。两条还原后都回到 PASS、哈希 `5aa87c0a2f9b`。
+
+**登记面（门禁点名后补）**：`sched.public_api` +2（`idle_of`/`init_idle`）；
+`sched` U2 5→6、U4 12→13；普查 total 284→286、U2 60→61、U4 108→109。
+
+**覆盖缺口（写明不藏）**：回落分支本身无法由用例直接触发（那要求测试 runner 自己
+不再可运行）。`t_idle_fallback` 验的是使该分支安全的三个前提 + active 排除对账；
+分支本身留待 P4 的阻塞用例间接覆盖。
+
+**下一步**：整轮矩阵复验（idle 对所有变体生效），然后 P4（`WaitQueue` 与 `Blocked` 同轮）。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

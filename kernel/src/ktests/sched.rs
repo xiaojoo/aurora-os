@@ -370,8 +370,8 @@ fn t_if_belongs_to_cpu() -> bool {
     let boot = sched::current_id();
     let mut swept = 0usize;
     for i in 0..sched::MAX_TASKS_TOTAL {
-        if i == boot || sched::cpu_of(i) != cpu::BSP_SLOT {
-            continue;
+        if i == boot || sched::cpu_of(i) != cpu::BSP_SLOT || i == sched::idle_of(cpu::BSP_SLOT) {
+            continue; // idle 是兜底，不能扫掉（ADR-051）：扫掉它就回到"没人可换"的老形状
         }
         if sched::state_of(i) != sched::TaskState::Free && sched::terminate_task(i) {
             swept += 1;
@@ -458,6 +458,63 @@ fn t_reap_premise() -> bool {
     st == sched::TaskState::Free && owned == 0 && released > released0
 }
 ktest!(KT_REAP_PREMISE, t_reap_premise);
+
+/// P3b-2 的搭档：让出一次就收工，用来证明"有真任务时 idle 不许被选中"。
+fn idle_probe_partner() -> ! {
+    sched::yield_now();
+    sched::finish_current();
+    loop {
+        tsc::spin(3_000);
+    }
+}
+
+/// P3b-2：兜底 idle 的三条可观测保证（ADR-051 决策 3/4）。
+///
+/// ①它登记在册、可运行、**名下无资源**（`owned` 为空 ⇒ `reap` 永远不会解映射它的栈）；
+/// ②`tasks_active()` 把它排除——用**独立重算**对账，不是读一遍同一个函数自证；
+/// ③有真任务可跑时**不许**选它：让出一次，看 idle 的 `runs` 有没有动。
+///
+/// 覆盖缺口要说清：**回落分支本身**（prev 已 Done/Free 且没有别的真任务）无法由用例直接
+/// 触发——那要求跑用例的上下文自己不再可运行，等于把测试 runner 结束掉。所以这里验的是
+/// 使那条分支安全的三个前提，分支本身留待 P4 的阻塞用例间接覆盖（见 BACKLOG）。
+fn t_idle_fallback() -> bool {
+    let idle = sched::idle_of(cpu::BSP_SLOT);
+    if idle == usize::MAX {
+        crate::log_fatal!("idle: BSP 没有登记兜底 idle");
+        return false;
+    }
+    let st = sched::state_of(idle);
+    let owned = sched::owned_of(idle);
+    // ② 独立重算：自己数一遍"非 idle 且可运行"，与 tasks_active() 对账
+    let mut recount = 0usize;
+    for i in 0..sched::MAX_TASKS_TOTAL {
+        if i == sched::idle_of(sched::cpu_of(i)) {
+            continue;
+        }
+        if matches!(sched::state_of(i), sched::TaskState::Runnable | sched::TaskState::Running) {
+            recount += 1;
+        }
+    }
+    let active = sched::tasks_active();
+    // ③ 有真任务时不许选 idle
+    let runs0 = sched::runs_of(idle);
+    let partner = match sched::spawn(idle_probe_partner) {
+        Ok(i) => i,
+        Err(e) => {
+            crate::log_fatal!("idle: 搭档 spawn 失败 {:?}", e);
+            return false;
+        }
+    };
+    sched::yield_now();
+    let runs1 = sched::runs_of(idle);
+    let partner_runs = sched::runs_of(partner);
+    crate::log_info!(
+        "idle(ADR-051): 下标={} 状态={:?} 名下={} active={} 独立重算={} idle_runs {} -> {} 搭档runs={}",
+        idle, st, owned, active, recount, runs0, runs1, partner_runs);
+    st == sched::TaskState::Runnable && owned == 0 && active == recount
+        && runs1 == runs0 && partner_runs >= 1
+}
+ktest!(KT_IDLE_FALLBACK, t_idle_fallback);
 
 /// `if_patch` 两条分支的直接覆盖，以及 asm 偏移与 Rust 结构体的对账。
 ///

@@ -1,6 +1,6 @@
 # unsafe 逐处审计表（U1–U6）
 
-总计 284 处。U1 54 · U2 60 · U3 13 · U4 108 · U5 28 · U6 21
+总计 286 处。U1 54 · U2 61 · U3 13 · U4 109 · U5 28 · U6 21
 
 本表由 `tools/aurora.py` 的 `unsafe_sites()` 从源码逐处生成，**不是手写的**。
 机器可读的权威来源是 `docs/security/unsafe-whitelist.toml` 的 `[modules.*]` 段（模块×类别→处数），
@@ -498,37 +498,41 @@
   > unsafe { &mut *self.cell.data.get() } } }
 - `kernel/src/sched.rs:560` [{] **U4** fn=`current_of`
   > unsafe { (*RQ[cpu].data.get()).current } } 
-- `kernel/src/sched.rs:642` [{] **U1** fn=`yield_now`
+- `kernel/src/sched.rs:646` [{] **U1** fn=`yield_now`
   > unsafe { core::arch::asm!("int {}", const crate::arch::x86_64::trap::VEC_RESCHED) }; } 
-- `kernel/src/sched.rs:687` [{] **U2** fn=`frame_rflags_of`
+- `kernel/src/sched.rs:691` [{] **U2** fn=`frame_rflags_of`
   > Some(unsafe { core::ptr::read_volatile((f as usize + RFLAGS_OFF) as *const u64) }) } 
-- `kernel/src/sched.rs:697` [{] **U4** fn=`owned_of`
+- `kernel/src/sched.rs:701` [{] **U4** fn=`owned_of`
   > unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].owned.count() } } 
-- `kernel/src/sched.rs:708` [{] **U4** fn=`task_frame`
+- `kernel/src/sched.rs:712` [{] **U4** fn=`task_frame`
   > Some(unsafe { (*RQ[cpu_of(task)].data.get()).tasks[slot_of(task)].frame }) } 
-- `kernel/src/sched.rs:804` [{] **U2** fn=`spawn`
+- `kernel/src/sched.rs:785` [impl] **U4** fn=`init_idle_task`
+  > unsafe impl Sync for IdleStackCell {} static IDLE_STACKS: [IdleStackCell; crate::arch::x86_64::cpu::MAX_CPUS] = [const { IdleStackCell(core::cell::UnsafeCell::new(IdleStack([0; IDLE_STACK_BYTES]))) };
+- `kernel/src/sched.rs:838` [{] **U2** fn=`init_idle`
+  > unsafe { core::ptr::write_volatile((f + i * 8) as *mut u64, *v) }; } let gi = gidx(cpu, slot);
+- `kernel/src/sched.rs:898` [{] **U2** fn=`spawn`
   > unsafe { core::ptr::write_volatile((f + i * 8) as *mut u64, *v) }; } s.entries[slot] = Some(entry);
-- `kernel/src/sched.rs:858` [{] **U2** fn=`spawn_user`
+- `kernel/src/sched.rs:952` [{] **U2** fn=`spawn_user`
   > unsafe { core::ptr::write_volatile((f + i * 8) as *mut u64, *v) }; } s.entries[slot] = None; // 用户任务没有内核入口函数
-- `kernel/src/sched.rs:967` [{] **U4** fn=`on_cpu_of`
+- `kernel/src/sched.rs:1061` [{] **U4** fn=`on_cpu_of`
   > Some(unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].on_cpu as usize }) } 
-- `kernel/src/sched.rs:976` [{] **U4** fn=`stack_bounds`
+- `kernel/src/sched.rs:1070` [{] **U4** fn=`stack_bounds`
   > let t = unsafe { &(*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)] }; if t.stack_lo == 0 { return None;
-- `kernel/src/sched.rs:993` [{] **U4** fn=`kstack_top_of`
+- `kernel/src/sched.rs:1087` [{] **U4** fn=`kstack_top_of`
   > let t = unsafe { &(*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)] }; if t.kstack_hi == 0 { return None;
-- `kernel/src/sched.rs:1005` [{] **U4** fn=`state_of`
+- `kernel/src/sched.rs:1099` [{] **U4** fn=`state_of`
   > unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].state } } 
-- `kernel/src/sched.rs:1015` [{] **U4** fn=`is_user`
+- `kernel/src/sched.rs:1109` [{] **U4** fn=`is_user`
   > unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].user } } 
-- `kernel/src/sched.rs:1023` [{] **U4** fn=`runs_of`
+- `kernel/src/sched.rs:1117` [{] **U4** fn=`runs_of`
   > unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].runs } } 
-- `kernel/src/sched.rs:1045` [fn] **U2** fn=`preempt_point`
+- `kernel/src/sched.rs:1156` [fn] **U2** fn=`preempt_point`
   > pub unsafe fn preempt_point(frame: u64, cpu: usize) { // 不跑调度器的 CPU 直接把标志倒掉再返回。今天 AP 的中断根本不经过这里 // （`isr_stub_cpu_timer` 是独立快路径），这条判断是给"把 AP 接进调度"留的
-- `kernel/src/sched.rs:1133` [{] **U1** fn=`preempt_point`
+- `kernel/src/sched.rs:1244` [{] **U1** fn=`preempt_point`
   > unsafe { p1_extra_flush(frame) }; crate::tsc::spin(20_000); }
-- `kernel/src/sched.rs:1157` [{] **U1** fn=`preempt_point`
+- `kernel/src/sched.rs:1268` [{] **U1** fn=`preempt_point`
   > unsafe { context_load(resume, if_open as u64) } } 
-- `kernel/src/sched.rs:1185` [{] **U2** fn=`preempt_hook`
+- `kernel/src/sched.rs:1296` [{] **U2** fn=`preempt_hook`
   > unsafe { preempt_point(frame, cpu) } }
 ### serial
 

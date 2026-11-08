@@ -45,11 +45,11 @@ expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe
 # 2026-11-07 P7：hello 加了 syscall3（U1 两处）与 ring3 句柄读/close（U5 三处）。
 
 [unsafe-census]
-total = 284
+total = 286
 U1 = 54
-U2 = 60
+U2 = 61
 U3 = 13
-U4 = 108
+U4 = 109
 U5 = 28
 U6 = 21
 
@@ -148,8 +148,8 @@ U4 = 7
 
 [modules."sched"]
 U1 = 3
-U2 = 5
-U4 = 12
+U2 = 6
+U4 = 13
 
 [modules."serial"]
 U1 = 2
