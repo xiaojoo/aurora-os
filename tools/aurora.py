@@ -4608,6 +4608,12 @@ def do_test(timeout: int) -> int:
     IMAGE.unlink(missing_ok=True)
     dv, drc, dlog = do_run(["fault-double-free"], timeout)
     l4_ok = dv == "EXCEPTION"
+    # P1c / ADR-063：共享帧 frame_put 到 0 后再 put 一次，走 frame_put 的 DoubleFree 判定升 L4。
+    # 与 fault-double-free（走 phys_free）成对：两条释放路径的 DoubleFree 都要能咬。
+    print("=== L4 注入（--features fault-put-double-free，共享帧多 put 必须停机）===")
+    IMAGE.unlink(missing_ok=True)
+    pdv, pdrc, pdlog = do_run(["fault-put-double-free"], timeout)
+    pd_ok = pdv == "EXCEPTION" and "L4 integrity: DoubleFree" in pdlog
     print("=== L4 注入（--features fault-heap-oom，堆分配失败必须升到 39）===")
     IMAGE.unlink(missing_ok=True)
     ov, orc, olog = do_run(["fault-heap-oom"], timeout)
@@ -5018,6 +5024,8 @@ def do_test(timeout: int) -> int:
         ("正向", v, rc, "PASS", 33),
         ("负样本", nv, nrc, "FAIL", 35),
         ("L4 重复释放", dv, drc, "EXCEPTION", 39),
+        # P1c / ADR-063：共享帧多 put 的 DoubleFree 升 L4（走 frame_put，与上一行的 phys_free 成对）
+        ("共享帧多put升L4", pdv if pd_ok else "CONTENT-MISMATCH", pdrc, "EXCEPTION", 39),
         ("L4 堆分配失败", ov, orc, "EXCEPTION", 39),
         ("泄漏注入被检出", lv, lrc, "FAIL", 35),
         # 守卫拒绝之后容器路径必然走 handle_alloc_error（ADR-018 的稳定版唯一去向），
@@ -5120,7 +5128,7 @@ def do_test(timeout: int) -> int:
     # 单独一张表而不是把日志塞进 `rows` 的元组里：元组要保持成"名字/期望/实际"这种
     # 一眼能核对的形状，串口文本只是它的证据附件
     logs = {
-        "正向": log, "负样本": nlog, "L4 重复释放": dlog, "L4 堆分配失败": olog,
+        "正向": log, "负样本": nlog, "L4 重复释放": dlog, "共享帧多put升L4": pdlog, "L4 堆分配失败": olog,
         "泄漏注入被检出": llog, "中断内分配被挡下": alog, "锁重入被抓住": rlog,
         "SMAP 没开成不启动": slog2, "IF 归任务就挂死": flog,
         "shootdown 收不齐回执升 L4": slog, "resched IPI失败计数会咬": rilog, "块内容对账抓得出错标签": clog,

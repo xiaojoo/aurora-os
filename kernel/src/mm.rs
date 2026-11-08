@@ -1506,6 +1506,14 @@ fn fi_refcnt(f: u64) -> u32 {
     unsafe { (*arr.add(f as usize)).refcnt.load(Ordering::Relaxed) }
 }
 
+/// 读一个帧的 owner（台账归账用）。SAFETY: 调用方持 PMM 锁、f<frame_info_frames。
+fn fi_owner(f: u64) -> ModuleId {
+    let st = s();
+    let arr = st.frame_info.load(Ordering::Relaxed) as *const FrameInfo;
+    // SAFETY: arr 覆盖 frame_info_frames 个条目，f 在界内；只读 owner（PMM 锁下不变）。
+    unsafe { (*arr.add(f as usize)).owner }
+}
+
 /// 把一个帧标为已用/自由（独占：refcnt 1/0）。SAFETY: 调用方持 PMM 锁、f<frame_info_frames。
 fn fi_set_used(f: u64, used: bool, owner: ModuleId) {
     let st = s();
@@ -1516,6 +1524,70 @@ fn fi_set_used(f: u64, used: bool, owner: ModuleId) {
         e.refcnt.store(if used { 1 } else { 0 }, Ordering::Relaxed);
         e.flags = if used { FI_USED } else { FI_FREE };
         e.owner = if used { owner } else { ModuleId(0) };
+    }
+}
+
+/// refcnt 加一（共享）。SAFETY: 调用方持 PMM 锁、f<frame_info_frames、该帧活着（调用方已持参考）。
+fn fi_inc_refcnt(f: u64) {
+    let st = s();
+    let arr = st.frame_info.load(Ordering::Relaxed) as *mut FrameInfo;
+    // SAFETY: 同上；PMM 锁互斥，fetch_add 原子。
+    unsafe { (*arr.add(f as usize)).refcnt.fetch_add(1, Ordering::Relaxed); }
+}
+
+/// refcnt 减一（不归还）。SAFETY: 调用方持 PMM 锁、f<frame_info_frames、refcnt>=1。
+fn fi_dec_refcnt(f: u64) {
+    let st = s();
+    let arr = st.frame_info.load(Ordering::Relaxed) as *mut FrameInfo;
+    // SAFETY: 同上；PMM 锁互斥，fetch_sub 原子。
+    unsafe { (*arr.add(f as usize)).refcnt.fetch_sub(1, Ordering::Relaxed); }
+}
+
+/// 共享一个已持有的帧（ADR-063 决策 3，P1c）：refcnt++，返回共享凭证。
+/// **前置**：调用方必须已持有一个参考（OwnedFrames 或 SharedFrame）——这保证 get 不会与
+/// "1→0 归还"竞争（只要还有人能 get，refcnt 就不会到 0）。弱引用 get（不持参考按帧号查表）
+/// 本帖不提供，留到页缓存真有查表调用者那天另起草。frame 是帧号（phys_alloc 的 base/PAGE）。
+pub fn frame_get(frame: u64) -> SharedFrame {
+    let _g = pmm();
+    fi_inc_refcnt(frame);
+    SharedFrame { frame }
+}
+
+/// 归还一个参考（ADR-063 决策 3，P1c）：refcnt--，**减到 0 才归还**（毒化 + 台账 + free_frames）。
+/// refcnt 已 0 再 put ⇒ DoubleFree（沿用 free_violation 升 L4 的语义，这里返回 Err 由调用方处置）。
+pub fn frame_put(frame: u64) -> Result<(), MmError> {
+    let _g = pmm();
+    let rc = fi_refcnt(frame);
+    if rc == 0 {
+        return Err(MmError::DoubleFree);
+    }
+    let owner = fi_owner(frame);
+    if rc == 1 {
+        fi_set_used(frame, false, ModuleId(0));
+        fi_final_free(frame, owner)?;
+    } else {
+        fi_dec_refcnt(frame);
+    }
+    Ok(())
+}
+
+/// 共享帧的 RAII 凭证（P1c）：丢弃即 frame_put。与 OwnedFrames 的区别——OwnedFrames 是
+/// 分配器交出的**独占**主人（一段连续帧），SharedFrame 是 frame_get 出来的**共享**参考（单帧）。
+pub struct SharedFrame {
+    frame: u64,
+}
+
+impl SharedFrame {
+    pub fn frame(&self) -> u64 {
+        self.frame
+    }
+}
+
+impl Drop for SharedFrame {
+    fn drop(&mut self) {
+        if let Err(e) = frame_put(self.frame) {
+            free_violation(e, PhysAddr(self.frame * PAGE as u64), ModuleId(0));
+        }
     }
 }
 
@@ -1550,10 +1622,12 @@ fn phys_alloc_locked(order: u8, owner: ModuleId) -> Result<OwnedFrames, MmError>
             }
             let st = s();
             st.free_frames.fetch_sub(n, Ordering::Relaxed);
-            // 台账按模块聚合"活着多少"。页表页也是从这里取的（owner=MOD_BOOT）且
-            // 永不归还，所以它们在账上一直挂着——这是对的，不是泄漏。
-            // 早期池不记：那部分来自 .bss，没经过分配器。记账按段（一次 n 帧），保住 call counts。
-            crate::resource::account_alloc(owner, n);
+            // 台账按模块聚合"活着多少"。页表页（owner=MOD_BOOT）永不归还，账上一直挂着——对，不是泄漏。
+            // 早期池不记（来自 .bss，没经过分配器）。P1c：记账改**逐帧**，因为共享帧按单帧归还
+            // （frame_put 到 0 才记 free），段级记账会在部分归还时把账写坏。Σlive==Σalloc−Σfree 不变；
+            // call counts 随帧数变（修订 P1b 的"按段保 call counts"）。记账集中在 ledger_* 两个助手，
+            // 全模块对 resource 的引用只此两处（环内 memory->resource 棘轮，ADR-044）。
+            ledger_alloc(owner, n);
             return Ok(OwnedFrames { base: PhysAddr(f * PAGE as u64), order, owner });
         }
         f += n as u64;
@@ -1561,7 +1635,41 @@ fn phys_alloc_locked(order: u8, owner: ModuleId) -> Result<OwnedFrames, MmError>
     Err(MmError::OutOfMemory)
 }
 
-/// 释放：FrameInfo 接管后 refcnt==0 即重复释放（位图期靠位图）。
+/// 台账分配记账（逐帧）。全模块对 resource::account_alloc 的引用**只此一处**（memory->resource 棘轮）。
+fn ledger_alloc(owner: ModuleId, n: usize) {
+    for _ in 0..n {
+        crate::resource::account_alloc(owner, 1);
+    }
+}
+
+/// 台账归还记账（逐帧）。全模块对 resource::account_free 的引用**只此一处**（memory->resource 棘轮）。
+fn ledger_free(owner: ModuleId, n: usize) -> bool {
+    for _ in 0..n {
+        if !crate::resource::account_free(owner, 1) {
+            return false;
+        }
+    }
+    true
+}
+
+/// 一个帧最终归还（refcnt 已到 0）：毒化 + 台账单帧归还 + free_frames++。
+/// 调用方已持 PMM 锁、已把该帧标自由。phys_free 与 frame_put 共用，保证毒化/记账口径一致。
+fn fi_final_free(frame: u64, owner: ModuleId) -> Result<(), MmError> {
+    let st = s();
+    let base = frame * PAGE as u64;
+    // 释放后毒化，让 use-after-free 变成可观察的错误值（§6.7）
+    for b in 0..PAGE as u64 {
+        // SAFETY: base+off 在 max_phys 内，HHDM 覆盖全部物理内存
+        unsafe { core::ptr::write_volatile((st.hhdm + base + b) as *mut u8, 0xa5) };
+    }
+    if !ledger_free(owner, 1) {
+        return Err(MmError::UnbalancedFree);
+    }
+    s().free_frames.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
+/// 释放：FrameInfo 接管后逐帧减 refcnt，**减到 0 才归还**（共享帧需要，P1c）；位图期整段释放。
 /// `owner` 只用于台账——所有权判定靠 refcnt/位图，不靠调用方自报。
 fn phys_free(base: PhysAddr, order: u8, owner: ModuleId) -> Result<(), MmError> {
     let _g = pmm();
@@ -1581,22 +1689,32 @@ fn phys_free(base: PhysAddr, order: u8, owner: ModuleId) -> Result<(), MmError> 
             return Err(MmError::DoubleFree);
         }
     }
-    for k in 0..n as u64 {
-        if active {
-            fi_set_used(first + k, false, ModuleId(0));
-        } else {
+    if active {
+        // 逐帧减 refcnt：独占帧 1→0 当场归还；被 frame_get 共享过的帧 >1，只减不归还，
+        // 留给最后一个 frame_put 收。这样丢弃 OwnedFrames 不会把别人还持有的共享帧毒化掉。
+        for k in 0..n as u64 {
+            let f = first + k;
+            let rc = fi_refcnt(f);
+            if rc == 1 {
+                fi_set_used(f, false, ModuleId(0));
+                fi_final_free(f, owner)?;
+            } else {
+                fi_dec_refcnt(f);
+            }
+        }
+    } else {
+        for k in 0..n as u64 {
             bit_set(first + k, false);
         }
+        for b in 0..(n * PAGE) as u64 {
+            // SAFETY: base+off 在 max_phys 内，HHDM 覆盖全部物理内存
+            unsafe { core::ptr::write_volatile((st.hhdm + base.0 + b) as *mut u8, 0xa5) };
+        }
+        if !ledger_free(owner, n) {
+            return Err(MmError::UnbalancedFree);
+        }
+        s().free_frames.fetch_add(n, Ordering::Relaxed);
     }
-    // 释放后毒化，让 use-after-free 变成可观察的错误值（§6.7）
-    for b in 0..(n * PAGE) as u64 {
-        // SAFETY: base+off 在 max_phys 内，HHDM 覆盖全部物理内存
-        unsafe { core::ptr::write_volatile((st.hhdm + base.0 + b) as *mut u8, 0xa5) };
-    }
-    if !crate::resource::account_free(owner, n) {
-        return Err(MmError::UnbalancedFree);
-    }
-    s().free_frames.fetch_add(n, Ordering::Relaxed);
     Ok(())
 }
 
@@ -1618,6 +1736,22 @@ pub fn force_double_free_for_test() -> bool {
     drop(again);
     // 走到这里说明 L4 升级没生效
     false
+}
+
+/// 故障注入（P1c / ADR-063）：共享帧归还到 0 之后**再 put 一次**，必须升 L4。
+/// 只在 `fault-put-double-free` 构建里被调用。走 frame_put → Err(DoubleFree) → free_violation → L4。
+#[cfg(feature = "fault-put-double-free")]
+pub fn force_put_double_free_for_test() -> bool {
+    let f = match phys_alloc(0, MOD_TEST) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let frame = f.base().0 / PAGE as u64;
+    core::mem::forget(f); // 独占主人不自动 drop，手动 put 到 0
+    let _ = frame_put(frame); // refcnt 1 -> 0，归还
+    let again = SharedFrame { frame }; // 再构造一个凭证并丢弃 -> frame_put -> DoubleFree -> L4
+    drop(again);
+    false // 走到这里说明 L4 升级没生效
 }
 
 fn free_violation(e: MmError, base: PhysAddr, owner: ModuleId) -> ! {

@@ -1,6 +1,6 @@
 # unsafe 逐处审计表（U1–U6）
 
-总计 298 处。U1 56 · U2 64 · U3 13 · U4 116 · U5 28 · U6 21
+总计 302 处。U1 56 · U2 68 · U3 13 · U4 116 · U5 28 · U6 21
 
 本表由 `tools/aurora.py` 的 `unsafe_sites()` 从源码逐处生成，**不是手写的**。
 机器可读的权威来源是 `docs/security/unsafe-whitelist.toml` 的 `[modules.*]` 段（模块×类别→处数），
@@ -477,8 +477,16 @@
   > P1a（ADR-063）：写 FrameInfo 影子条目。指针 = phys_alloc_locked 分出的 MOD_BOOT 帧 + HHDM；范围 [0,limit)，AtomicU32 首字段 4 对齐；元数组帧永不归还（生命周期=内核）；引导期单核 IF=0 无并发。不变量由"2^order 帧 >= limit 条目"保证。
 - `kernel/src/mm.rs:1506` [{] **U2** fn=`fi_refcnt`
   > P1b：只读一个帧的 refcnt。同一指针来源/范围/对齐；调用方持 PMM 锁且保证 f<frame_info_frames；只读原子量。
-- `kernel/src/mm.rs:1515` [{] **U2** fn=`fi_set_used`
+- `kernel/src/mm.rs:1514` [{] **U2** fn=`fi_owner`
+  > P1c：只读一个帧的 owner（台账归账）。同一指针来源/范围/对齐；PMM 锁下 owner 不变；只读。
+- `kernel/src/mm.rs:1523` [{] **U2** fn=`fi_set_used`
   > P1b：写一个帧的 refcnt/flags/owner（独占 1/0）。同一指针来源/范围/对齐；PMM 锁互斥；元数组帧永不归还。
+- `kernel/src/mm.rs:1535` [{] **U2** fn=`fi_inc_refcnt`
+  > P1c：refcnt 原子加一（frame_get 共享）。同一指针来源/范围/对齐；PMM 锁互斥；前置"调用方已持参考"保证不与归还竞争。
+- `kernel/src/mm.rs:1543` [{] **U2** fn=`fi_dec_refcnt`
+  > P1c：refcnt 原子减一（不归还）。同一指针来源/范围/对齐；PMM 锁互斥；调用方保证 refcnt>=1。
+- `kernel/src/mm.rs:1663` [{] **U2** fn=`fi_final_free`
+  > P1c：refcnt 到 0 最终归还时毒化 0xA5。base=frame*PAGE 在 max_phys 内，HHDM 覆盖；PMM 锁下该帧已标自由。
 
 ### pci
 

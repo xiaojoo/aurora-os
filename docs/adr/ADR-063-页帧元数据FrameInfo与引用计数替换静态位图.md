@@ -171,6 +171,30 @@ COW/缺页/每-AS（W3）、锁序表数值（PMM/LEDGER 不变）、syscall 号
   （40 份，其余是提前停机的故障注入构建）`不变量=true`、零失败。base 随变体不同（114975~116445），
   但各跑各的基线、释放都回自己的基线。
 
+## P1c 落地记录（2026-11-08，get/put 引用计数与共享帧）
+
+- **读数（实测，build/run-001.log）**：`refcount(P1c): N=3 base=116400 alloc后=116399 主人放手后=116399
+  最后put回基线=true 多put=Err(DoubleFree) live回基线=true`。即：独占主人（OwnedFrames）放手时
+  refcnt>1 不归还；N 个共享凭证逐个 put，**最后一个才归还**（free_frames 此刻才回基线）；再 put 一次
+  返回 DoubleFree。`ktests total=65 passed=65 failed=0`，判定 PASS。
+- **注入（实测）**：`fault-put-double-free` ⇒ `EXCEPTION(39)`、`L4 integrity: DoubleFree base=0x30000`。
+  走 frame_put → Err(DoubleFree) → free_violation → L4，与 fault-double-free（走 phys_free）成对。
+  判定表新增第 43 行"共享帧多put升L4"，期望 EXCEPTION(39)，宿主机核 `L4 integrity: DoubleFree` 锚点。
+- **台账修订（推翻 P1b 的"按段保 call counts"）**：共享帧按单帧归还，段级记账会在部分归还时把账写坏
+  （alloc 记 n、free 只回部分 ⇒ live 虚高）。故 P1c 改**逐帧**记账：alloc 每帧 account_alloc(owner,1)，
+  free 在 refcnt 到 0 时每帧 account_free(owner,1)。Σlive==Σalloc−Σfree 不变量保持（实测 live回基线=true）；
+  call counts 随帧数变——P1b 那句"保住 call counts"作废，以本帖为准。
+- **memory->resource 棘轮（实现期发现）**：逐帧记账若散落多处会把环内 memory->resource 站点数涨过登记 2。
+  解法：全模块记账集中到 `ledger_alloc`/`ledger_free` 两个助手，对 resource 的引用各只一处（共 2，棘轮不动）。
+- **登记**：public_api 补 `mm::frame_get`/`mm::frame_put`/`mm::SharedFrame`；unsafe 普查 mm U2 24→28
+  （fi_owner/fi_inc_refcnt/fi_dec_refcnt/fi_final_free 毒化），total 298→302。
+- **负样本（P1c 实测，两条都咬）**：①MUT-P1C-1：frame_put 改成"每次都归还"（不等 refcnt 到 0）
+  ⇒ 正例第 0 个 put 就提前回基线，`refcount: 第 0 个 put 后 free=116400 期望 116399` fatal、停机（实测 rc=39）；
+  ②MUT-P1C-2：去掉 frame_put 的 `rc==0 ⇒ DoubleFree` 判定 ⇒ 注入不再升 L4，`判定=FAIL(35)`、
+  `L4 integrity` 命中 0（实测；矩阵第 43 行会因此报 CONTENT-MISMATCH）。两条还原后均回 PASS。
+- **局限**：frame_get 的"调用方已持参考"前置是**协议约定**，无运行时强制（弱引用 get 会与归还竞争）；
+  本帖不提供弱引用 get，留到页缓存查表调用者出现时另起草（决策 3 已写明）。
+
 ## 审查记录（2026-11-08，P0 起草后自审，对照源码）
 
 方向不变（refcnt 单一真相、两阶段引导、保留不变量都成立），收紧七处：

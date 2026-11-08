@@ -25,6 +25,9 @@ irq-probe = []
 # 故障注入（手册 §12.1 L5 / §9.2）：制造一次真实的重复释放。
 # L4 升级必须生效，否则该构建会以 35 而不是 39 收场。
 fault-double-free = []
+# 故障注入（P1c / ADR-063）：共享帧 frame_put 到 0 之后再 put 一次，验证 refcnt 的
+# DoubleFree 判定升 L4。与 fault-double-free 同构，但走的是 frame_put 这条共享路径。
+fault-put-double-free = []
 # 故障注入（ADR-018）：要一个超过大小类上限的分配，验证全局分配器的失败出口
 # null -> handle_alloc_error -> panic -> 39。没有这个构建，ADR-018 只能靠文档承诺。
 fault-heap-oom = []

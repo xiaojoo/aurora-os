@@ -68,6 +68,47 @@ fn t_frame_info_alloc_free_equivalence() -> bool {
 }
 ktest!(KT_FRAME_INFO_EQUIV, t_frame_info_alloc_free_equivalence);
 
+/// P1c（ADR-063）：共享帧 N 次 get、N 次 put 才归还，多一次 put 判 DoubleFree。
+/// 这是"refcnt 驱动归还时机"的直接见证（P1b 等价用例只证 free_frames 记账，不证这个）：
+/// ① 分配独占帧（refcnt 1）；② frame_get N 次（refcnt 1+N）；③ 丢独占主人——refcnt>1 不归还；
+/// ④ 逐个丢共享凭证，前 N-1 个不归还、**最后一个才归还**（free_frames 此刻才 +1）；
+/// ⑤ 再 put 一次 ⇒ DoubleFree。反空转：get 之后、最后一个 put 之前 free_frames 必须不动。
+fn t_frame_refcount_get_put() -> bool {
+    const N: usize = 3;
+    let base = mm::free_frames();
+    let live0 = crate::resource::live_of(mm::MOD_TEST);
+    let f = match mm::phys_alloc(0, mm::MOD_TEST) {
+        Ok(f) => f,
+        Err(e) => { crate::log_fatal!("refcount: 分配失败 {:?}", e); return false; }
+    };
+    let frame = f.base().0 / mm::PAGE as u64;
+    let after_alloc = mm::free_frames();
+    let mut shares: [Option<mm::SharedFrame>; N] = core::array::from_fn(|_| None);
+    for s in shares.iter_mut() {
+        *s = Some(mm::frame_get(frame));
+    }
+    drop(f); // 独占主人放手：refcnt 1+N -> N，仍 >0，不归还
+    let after_owner_drop = mm::free_frames();
+    let mut mid_ok = true;
+    for i in 0..N {
+        drop(shares[i].take());
+        let now = mm::free_frames();
+        let expect = if i == N - 1 { base } else { after_alloc };
+        if now != expect {
+            crate::log_fatal!("refcount: 第 {} 个 put 后 free={} 期望 {}", i, now, expect);
+            mid_ok = false;
+        }
+    }
+    let extra = mm::frame_put(frame); // 已归还，再 put 必须 DoubleFree
+    let live_back = crate::resource::live_of(mm::MOD_TEST) == live0;
+    crate::log_info!(
+        "refcount(P1c): N={} base={} alloc后={} 主人放手后={} 最后put回基线={} 多put={:?} live回基线={}",
+        N, base, after_alloc, after_owner_drop, mm::free_frames() == base, extra, live_back);
+    after_alloc == base - 1 && after_owner_drop == after_alloc && mid_ok
+        && mm::free_frames() == base && extra == Err(mm::MmError::DoubleFree) && live_back
+}
+ktest!(KT_FRAME_REFCOUNT, t_frame_refcount_get_put);
+
 /// 映射 -> 写入 -> 读回 -> 解映射，且所有权随 Mapping 归还（§6.3 R13）
 fn t_map_write_unmap() -> bool {
     const MAGIC: u64 = 0x5176_0dae_1234_beef;
@@ -209,4 +250,13 @@ fn t_double_free_must_escalate() -> bool {
 }
 #[cfg(feature = "fault-double-free")]
 ktest!(KT_DOUBLE_FREE, t_double_free_must_escalate);
+
+/// 共享帧多 put 必须升 L4（退出码 39）。只在 fault-put-double-free 注入构建里存在（P1c）。
+#[cfg(feature = "fault-put-double-free")]
+fn t_put_double_free_must_escalate() -> bool {
+    crate::log_warn!("fault-put-double-free: 这条用例按设计对已归还的共享帧再 put 一次");
+    mm::force_put_double_free_for_test()
+}
+#[cfg(feature = "fault-put-double-free")]
+ktest!(KT_PUT_DOUBLE_FREE, t_put_double_free_must_escalate);
 
