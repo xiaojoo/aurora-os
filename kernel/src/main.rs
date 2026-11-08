@@ -480,6 +480,12 @@ fn run_ktests_and_finish() -> ! {
         ls.wait_max_cycles, ls.wait_timeouts
     );
     crate::log_info!("percpu: registered={} unmatched_self_lookups={}", cpu::registered(), cpu::unmatched_self_lookups());
+    // P5 的见证读数：idle 与 AP 工人真的进了 hlt（内核自报，宿主机解析这一行；
+    // 不是独立见证——`-d int` 不记录 hlt，仓库里没有数它的仪器，见 ADR-057）
+    crate::log_info!(
+        "idle hlt: bsp={} ap={:?}（自报数；判据在 t_percpu_queues）",
+        sched::idle_hlt_count(cpu::BSP_SLOT),
+        [smp::ap_worker_hlt(1), smp::ap_worker_hlt(2), smp::ap_worker_hlt(3)]);
     let c = mm::counters();
     crate::log_info!(
         "mm counters: map_calls={} mapped_pages={} unmapped_pages={} page_table_pages={} early_pool={}",

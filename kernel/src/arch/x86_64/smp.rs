@@ -510,10 +510,29 @@ pub fn ap_spawn_failures() -> usize {
 /// 而那条用例的判据根本没打算管 AP。不收工也没关系：
 /// `stop_aps()` 会让空闲上下文跳出主循环，这条 CPU 之后不再取任务。
 fn ap_worker() -> ! {
+    let slot = cpu::self_slot();
+    // P5：从"常驻自旋"改成 hlt 等中断。自己开窗口、永不关（本任务不退出），
+    // 与 AP 空闲上下文同一形状；不用 `with_interrupts`，理由见 sched::idle_entry。
+    // **没有退掉这个任务**：它的 WORK 计数仍是 t_percpu_queues 的 `worked_aps` 证人，
+    // 退掉它就得先换证人（ADR-047/§113a）。改成 hlt 既不再烧 CPU，又保住证人。
+    apic::open_cpu_window(slot);
     loop {
         (crate::hooks::sched().bump_current_work)();
-        tsc::spin(3_000);
+        if slot < cpu::MAX_CPUS {
+            AP_WORKER_HLT[slot].fetch_add(1, Ordering::Relaxed);
+        }
+        // SAFETY: hlt 停到下一个中断；窗口已开，本地 tick（~10ms）与 resched IPI 都能叫醒。
+        unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
     }
+}
+
+/// 每个 AP 的工人进入 hlt 的次数（P5 的见证读数，内核自报）。
+static AP_WORKER_HLT: [AtomicU64; cpu::MAX_CPUS] = [const { AtomicU64::new(0) }; cpu::MAX_CPUS];
+
+/// AP 工人的 hlt 次数。与 `idle_hlt_count` 一样是自报数，不是独立见证。
+pub fn ap_worker_hlt(cpu: usize) -> u64 {
+    if cpu >= cpu::MAX_CPUS { return 0; }
+    AP_WORKER_HLT[cpu].load(Ordering::Relaxed)
 }
 
 // ------------------------------------------------------ 跨核竞争：一把锁两个人抢

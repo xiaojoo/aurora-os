@@ -4609,6 +4609,51 @@ P4c-1（跨核 IPI 与 EOI 不对称）、P4c-2（四核并发证明、慢轮比
 **P5 的只读准备修正了范围（实测，见 §131）**：AP 的**空闲上下文**早就在 hlt
 （`smp.rs` 步骤 9），设计文档说的"AP 常驻自旋"指的是 `ap_worker` **任务**，两者不是一回事。
 
+## 131. P5：两个自旋体改 hlt，并抓到一次"空判据"（2026-11-08，实测）
+
+**范围修正（只读准备时就发现）**：AP 的**空闲上下文**早就在 hlt（`smp.rs` 步骤 8/9），
+设计文档说的"AP 常驻自旋"指 `ap_worker` **任务**。真正的自旋体只有两个：
+`ap_worker()` 与 P3b-2 造的 `idle_entry()`。两个都改成"自己开窗口、永不关 + hlt"
+（**不用 `with_interrupts`**：它返回时把牌一律置 false，在任务里用等于关掉别人的窗口，
+BACKLOG 82 的嵌套隐患）。**没有退掉 `ap_worker`** ⇒ `worked_aps` 证人保住，不需要换证人。
+
+**抓到一次空判据（本轮最重要的教训）**：第一版计数在 hlt **前一步**自增，
+所以把 hlt 换成自旋它照样涨——**两条变异都没咬**（H1 得 `bsp_hlt=133` 仍 PASS、
+H2 得 `halted=3` 仍 PASS）。它量的是"idle 跑过"，不是"idle 真的停住了"。
+改成 regime 分界上界后实测分界极干净：
+- BSP idle：真 hlt 增量 **1**，自旋版 **133/170** ⇒ 判据 `0 < 增量 <= 4`。
+- AP 工人：hlt 版 **≈140**（ticks≈40，约 3.5 倍），自旋版 **≈120000~147000**（约 3000 倍）
+  ⇒ 判据 `0 < loops <= ticks*32+64`。
+改后 **MUTATION-H1 ⇒ `bsp_hlt 0->170` FAIL(35)**、**MUTATION-H2 ⇒ `halted=0`、
+`ap=[140947,126124,147210]` FAIL(35)**，还原 ⇒ PASS。两条都确定性。
+
+**BSP idle 原本一次都不会跑（实测 `bsp=0`）**：整个用例链里 BSP 总有别的可运行任务，
+`pick_next` 永远选不到 idle ⇒ 那段 hlt 等于改了没验。新增 `t_idle_hlt_wakes`：
+清场 → 启动上下文在等待队列上阻塞 → 回落 idle → idle 进 hlt → AP 跨核唤醒发 IPI 叫醒它。
+现在 `bsp_hlt 0 -> 1`、`idle_runs=1`、`被唤醒=true`。
+
+**过程中两个时序竞态，都用例适配、没改内核**：
+1. AP 一看到 `Blocked` 就唤醒 ⇒ 赶在 `yield_now` 之前把它改回 Runnable ⇒
+   `pick_next` 看 prev 还活着就返回 prev ⇒ **回落分支 0 次命中**。这是 ADR-053
+   "放锁后切走"窗口的**正确行为**（不丢唤醒），所以改 AP 的等待条件。
+2. 改成等 `current_of(BSP) != boot` 仍不够：`s.current = next` 写在 `context_load` **之前**，
+   此时发 IPI 会在 idle 刚 `sti` 时立刻被取走，idle **连第一条 hlt 都执行不到**
+   （实测 `idle_runs=1` 而 `bsp_hlt=0`）。最终改成等 `idle_hlt_count` 前进才是对的证人。
+
+**读数（实测）**：默认档 **3/3 PASS、60/60**，
+`percpu sched: … worked=3 halted=3 checked=3`、`idle hlt: bsp=1 ap=[145,146,120]`。
+
+**见证的诚实边界**：`idle_hlt_count`/`ap_worker_hlt` 是**内核自报**，宿主机只是解析那一行。
+`-d int` 不记录 hlt、仓库里没有数它的仪器（§97a 实测），所以**不得宣称这是独立见证**。
+ finding a QEMU 通道能数 halted 状态仍是未决。
+
+**登记面**：`sched` U1 3→4、`smp` U1 4→5（两处 hlt asm），普查 293→295、U1 54→56；
+`public_api` +2。**棘轮要求收紧一处**：`arch->time` 23→**22**（`ap_worker` 不再调 `tsc::spin`）
+——这是进度，按 ADR-044 显式登记收紧，不留可被悄悄用掉的余量。`check` 17/17。
+
+**未决**：hlt 的独立见证通道；两个上界是 TCG 下的 regime 分界，真机/KVM 要重测；
+P6 定时器轮落地后唤醒源变多，两个上界要重测分布再定。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

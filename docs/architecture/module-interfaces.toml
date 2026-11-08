@@ -111,6 +111,7 @@ public_api = [
   "hooks::sched",
   "smp::released_count",
   "smp::stop_aps",
+  "smp::ap_worker_hlt",
   "smp::stuck_online_count",
   "trap::PF_TAKEN",
   "trap::TRAP_FRAME_BYTES",
@@ -249,6 +250,7 @@ public_api = [
   "sched::is_user",
   "sched::install_wait_ops",
   "sched::idle_of",
+  "sched::idle_hlt_count",
   "sched::init_idle",
   "sched::state_of",
   "user::park_current",
@@ -644,7 +646,7 @@ known_scc = [
 "arch->memory" = 21
 "arch->pci" = 4
 "arch->sync" = 8
-"arch->time" = 23
+"arch->time" = 22
 "boot->diagnostics" = 11
 "boot->sync" = 4
 "diagnostics->arch" = 25

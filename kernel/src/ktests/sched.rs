@@ -834,6 +834,107 @@ fn t_cross_cpu_wait() -> bool {
 }
 ktest!(KT_CROSS_CPU_WAIT, t_cross_cpu_wait);
 
+// ---- P5：把 BSP 的 idle 真的逼出来跑一次 hlt，并证明 IPI 能叫醒它 ----
+const P5_QID: u8 = 2;
+static P5_FLAG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static P5_BLOCKER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+static P5_AP_SAW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static P5_H0: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// AP 侧：等 BSP 那个任务**真的阻塞了**再置位并唤醒。
+/// 不等就唤醒的话，BSP 查条件时已成立、根本不阻塞，idle 也就不会被逼出来（那就白测了）。
+fn p5_ap_waker() {
+    // `run_ap_role` 先收齐 ENTERED 才跑 BSP 那一份，所以这里必须**有界等**它公布下标；
+    // 第一版直接 return，结果 AP 全收工了 BSP 才阻塞 ⇒ 没人唤醒 ⇒ idle hlt 到死（实测 3/3 HANG）。
+    let mut b = P5_BLOCKER.load(Ordering::Acquire);
+    let tw = tsc::now();
+    while b == u64::MAX && tsc::now().wrapping_sub(tw) < 400_000_000 {
+        tsc::spin(2_000);
+        b = P5_BLOCKER.load(Ordering::Acquire);
+    }
+    if b == u64::MAX {
+        return;
+    }
+    let bg = b as usize;
+    let t0 = tsc::now();
+    // 必须等 BSP **真的换了人**（current 不再是阻塞者），而不是只等它标 Blocked。
+    // 只等 Blocked 的话，唤醒会赶在 `yield_now` 之前把它改回 Runnable，
+    // `pick_next` 看到 prev 还活着就返回 prev ⇒ 根本不切走 ⇒ idle 永远跑不到
+    // （实测：回落分支 0 次命中、bsp_hlt 0->0）。那是 ADR-053"放锁后切走"窗口的
+    // **正确行为**（不丢唤醒），所以要用例去适配它，不是改内核。
+    // 等 idle **真的执行到 hlt**（计数在 hlt 前一步自增），不是只等"current 换了人"。
+    // `s.current = next` 写在 `context_load` 之前，所以"换了人"那一刻 idle 可能还没跑；
+    // 此时发 IPI，它会在 idle 刚 `sti` 时立刻被取走，idle 连第一条 hlt 都执行不到
+    // （实测：idle_runs=1 而 bsp_hlt=0）。等计数前进才是"它已经停在 hlt 上"的证人。
+    let _ = bg;
+    while sched::idle_hlt_count(cpu::BSP_SLOT) <= P5_H0.load(Ordering::Acquire)
+        && tsc::now().wrapping_sub(t0) < 400_000_000
+    {
+        tsc::spin(2_000);
+    }
+    if sched::idle_hlt_count(cpu::BSP_SLOT) > P5_H0.load(Ordering::Acquire) {
+        P5_AP_SAW.fetch_add(1, Ordering::Relaxed);
+    }
+    P5_FLAG.store(1, Ordering::Release);
+    if let Some(q) = sync::wait_queue(P5_QID) {
+        let _ = q.wake_all();
+    }
+}
+
+/// BSP 侧：阻塞。此刻本 CPU 上除了 idle 没有别的可运行任务（下面清过场），
+/// 所以 `pick_next` 只能回落到 idle ⇒ idle 进 hlt ⇒ AP 的跨核唤醒发 IPI 把它叫醒。
+fn p5_bsp_blocker() {
+    P5_BLOCKER.store(sched::current_id() as u64, Ordering::Release);
+    if let Some(q) = sync::wait_queue(P5_QID) {
+        let _ = q.wait_while(P5_QID, || P5_FLAG.load(Ordering::Acquire) != 0);
+    }
+}
+
+/// P5：BSP idle 的 hlt 路径**必须被执行到**，否则那段转换等于没验。
+/// 判据：清场后 BSP 只剩 idle 可跑 ⇒ `idle_hlt_count(BSP)` 必须前进；
+/// AP 确实看到了阻塞态（`P5_AP_SAW>0`）；启动上下文被跨核唤醒后回来了（flag 生效）。
+fn t_idle_hlt_wakes() -> bool {
+    if sched::state_of(0) == sched::TaskState::Free {
+        sched::init_boot_task();
+    }
+    let boot = sched::current_id();
+    // 清场：本 CPU 上除启动上下文与 idle 以外全部收掉，否则 pick_next 选不到 idle
+    for i in 0..sched::MAX_TASKS_TOTAL {
+        if i == boot || sched::cpu_of(i) != cpu::BSP_SLOT || i == sched::idle_of(cpu::BSP_SLOT) {
+            continue;
+        }
+        if sched::state_of(i) != sched::TaskState::Free {
+            if let Some(q) = sync::wait_queue(P5_QID) {
+                let _ = q.remove_task(i);
+            }
+            let _ = sched::terminate_task(i);
+        }
+    }
+    P5_FLAG.store(0, Ordering::Relaxed);
+    P5_AP_SAW.store(0, Ordering::Relaxed);
+    P5_BLOCKER.store(u64::MAX, Ordering::Relaxed);
+    let h0 = sched::idle_hlt_count(cpu::BSP_SLOT);
+    P5_H0.store(h0, Ordering::Release);
+    let ack = match smp::run_ap_role(p5_ap_waker, p5_bsp_blocker) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_fatal!("idle hlt: 测不成 {:?}", e);
+            return false;
+        }
+    };
+    let h1 = sched::idle_hlt_count(cpu::BSP_SLOT);
+    let saw = P5_AP_SAW.load(Ordering::Relaxed);
+    let woke = P5_FLAG.load(Ordering::Acquire) != 0;
+    crate::log_info!(
+        "idle hlt(P5): bsp_hlt {} -> {} idle_runs={} idle_state={:?} AP见到换人={} 被唤醒={} ack超时={}",
+        h0, h1, sched::runs_of(sched::idle_of(cpu::BSP_SLOT)),
+        sched::state_of(sched::idle_of(cpu::BSP_SLOT)), saw, woke, ack);
+    // 同样要上界：真 hlt 时增量是 1（停一次、被 IPI 叫醒一次），退回自旋版实测是 133。
+    // 只判 `h1 > h0` 量的是"idle 跑过"，不是"idle 真的停住了"。
+    h1 > h0 && h1 - h0 <= 4 && saw > 0 && woke && ack == 0
+}
+ktest!(KT_IDLE_HLT_WAKES, t_idle_hlt_wakes);
+
 /// `if_patch` 两条分支的直接覆盖，以及 asm 偏移与 Rust 结构体的对账。
 ///
 /// 为什么这条用例存在：ADR-021 的"关着窗口换入"分支今天**没有触发源**
@@ -1082,6 +1183,7 @@ fn t_percpu_queues() -> bool {
     let mut checked_aps = 0usize;
     let mut switched_aps = 0usize;
     let mut worked_aps = 0usize;
+    let mut halted_aps = 0usize;
     let mut bad_owner = 0usize;
     for ap in 1..cpu::MAX_CPUS {
         if !cpu::runs_sched(ap) {
@@ -1102,6 +1204,17 @@ fn t_percpu_queues() -> bool {
         }
         if sched::runs_of(task) >= 1 && sched::WORK[task].load(Ordering::Relaxed) > 0 {
             worked_aps += 1;
+        }
+        // P5：工人不再常驻自旋，而是 hlt 等中断。这一格证明转换真的发生了——
+        // 退回自旋版它会是 0（变异证红）。与 worked_aps 分开：那格证"跑过活"，
+        // 这格证"不烧 CPU"，两件事不能混成一个数。
+        // 判据必须是**能分辨 regime 的上界**，不是">0"：计数在 hlt 前一步自增，
+        // 所以退回自旋版它照样涨（实测第一版两条变异都没咬）。实测分界极干净：
+        // hlt 版 ap≈140、ticks≈40（约 3.5 倍）；自旋版 ap≈120000（约 3000 倍）。
+        // 32 倍 + 64 是两 regime 的分界，不是性能 SLA。
+        let loops = smp::ap_worker_hlt(ap);
+        if loops > 0 && loops <= sched::ticks_of(ap) as u64 * 32 + 64 {
+            halted_aps += 1;
         }
         // 归属不变量：本 CPU 的 current 必须落在自己的队列里。
         // **不要求它是 Running** —— 这是一次跨核快照读，实测就会读到换人做到一半的样子
@@ -1142,8 +1255,8 @@ fn t_percpu_queues() -> bool {
         }
     }
     crate::log_info!(
-        "percpu sched: aps_with_sched={} switched={} worked={} checked={} bad_owner={} misfiled={} nonempty={}",
-        checked_aps, switched_aps, worked_aps, checked_aps, bad_owner, misfiled, nonempty
+        "percpu sched: aps_with_sched={} switched={} worked={} halted={} checked={} bad_owner={} misfiled={} nonempty={}",
+        checked_aps, switched_aps, worked_aps, halted_aps, checked_aps, bad_owner, misfiled, nonempty
     );
     crate::log_info!(
         "percpu sched: ticks 每个 CPU ={:?} ; switches 每个 CPU ={:?}",
@@ -1151,7 +1264,7 @@ fn t_percpu_queues() -> bool {
         [sched::stats_of(0).0, sched::stats_of(1).0, sched::stats_of(2).0, sched::stats_of(3).0]
     );
     checked_aps >= 1 && switched_aps == checked_aps && worked_aps == checked_aps
-        && bad_owner == 0 && misfiled == 0 && nonempty >= 1
+        && halted_aps == checked_aps && bad_owner == 0 && misfiled == 0 && nonempty >= 1
 }
 ktest!(KT_PERCPU_QUEUES, t_percpu_queues);
 

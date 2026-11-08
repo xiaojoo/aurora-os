@@ -902,12 +902,33 @@ pub fn idle_of(cpu: usize) -> usize {
     IDLE_GIDX[cpu].load(Ordering::Relaxed)
 }
 
-/// idle 的入口：只自旋。**第一版不 `hlt`**——那要动 IF 语义（ADR-021），属 P5。
+/// idle 的入口：开窗口后 `hlt` 等中断（P5/ADR-057）。
 /// 它只在"没有别的可运行任务"时才会被选中（见 `pick_next` 的两遍扫描）。
 fn idle_entry() -> ! {
+    let cpu = crate::arch::x86_64::cpu::self_slot();
+    // 自己开窗口、**永不关**：本任务不退出，与 AP 空闲上下文（smp 步骤 8/9）同一形状。
+    // 不能用 `with_interrupts`：它返回时把牌一律置 false（不恢复原值），在任务里用
+    // 等于关掉别人开的窗口（BACKLOG 82 的嵌套隐患）。牌开着，换入的下个任务按 ADR-021
+    // 由 `context_load` 供 IF，语义不变。
+    crate::arch::x86_64::apic::open_cpu_window(cpu);
     loop {
-        core::hint::spin_loop();
+        if cpu < crate::arch::x86_64::cpu::MAX_CPUS {
+            IDLE_HLT[cpu].fetch_add(1, Ordering::Relaxed);
+        }
+        // SAFETY: hlt 只停到下一个中断；上面已开窗口（IF=1），所以本地 tick 或
+        // resched IPI 都能叫醒它。不访问内存、不动栈。
+        unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
     }
+}
+
+/// 每个 CPU 的 idle 任务进入 `hlt` 的次数（P5 的见证读数）。
+static IDLE_HLT: [core::sync::atomic::AtomicU64; crate::arch::x86_64::cpu::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; crate::arch::x86_64::cpu::MAX_CPUS];
+
+/// idle 的 hlt 次数。**这是内核自报**，宿主机只能解析这一行，不是独立见证（ADR-057 写明）。
+pub fn idle_hlt_count(cpu: usize) -> u64 {
+    if cpu >= crate::arch::x86_64::cpu::MAX_CPUS { return 0; }
+    IDLE_HLT[cpu].load(Ordering::Relaxed)
 }
 
 /// 给**本 CPU**登记一个专属 idle 任务（ADR-051 决策 3，P3b-2）。
