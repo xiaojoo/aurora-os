@@ -935,6 +935,80 @@ fn t_idle_hlt_wakes() -> bool {
 }
 ktest!(KT_IDLE_HLT_WAKES, t_idle_hlt_wakes);
 
+// ---- P6：sleep_until 的精度判据，BSP 与 AP 各一档 ----
+static P6_AP_ELAPSED: [core::sync::atomic::AtomicU64; cpu::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; cpu::MAX_CPUS];
+static P6_AP_OK: [core::sync::atomic::AtomicU64; cpu::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; cpu::MAX_CPUS];
+static P6_D: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// AP 档：在自己的 CPU 上睡同样长，量自己的 elapsed（tick 源是本地 LAPIC，不是 BSP 的 PIT）
+fn p6_ap_sleeper() {
+    let slot = cpu::self_slot();
+    let d = P6_D.load(Ordering::Acquire);
+    let t0 = tsc::now();
+    let ok = sched::sleep_until(t0.wrapping_add(d));
+    P6_AP_ELAPSED[slot].store(tsc::now().wrapping_sub(t0), Ordering::Release);
+    P6_AP_OK[slot].store(if ok { 1 } else { 0 }, Ordering::Release);
+}
+
+fn p6_bsp_noop() {}
+
+/// P6（ADR-058）：`sleep_until` 必须落在 `[d, d+2 tick]`，**tick 按被睡 CPU 自己的源计**。
+/// BSP 的 tick 来自 PIT→IOAPIC 向量 32，AP 来自本地 LAPIC 0xF1，两本账不许混
+/// （`watchdog.rs` 的既有口径）。所以这里 BSP 与 AP **各测一档**，不是一个数糊过去。
+/// 另外三格：确实由定时器叫醒（返回 true）、`fired` 前进、轮上无残留项。
+fn t_sleep_until() -> bool {
+    if sched::state_of(0) == sched::TaskState::Free {
+        sched::init_boot_task();
+    }
+    // tick 周期用标定值；没标定就用保守上界（与 clock 的既有口径一致）
+    let tick = clock::current().map_or_else(clock::max_tick_period_cycles, |c| c.tick_period_cycles);
+    let d = tick * 2;
+    P6_D.store(d, Ordering::Release);
+    // 用例自足：轮靠 tick 扫，而 .ktests 顺序由链接器定，前面的用例可能把表停了
+    // （实测不保证就直接 HANG 3/3）。先量进来时心跳有没有在走，不在走就开表，收尾按原样放回。
+    let tick_in = apic::ticks();
+    let probe = apic::wait_ticks(tick_in, 1, clock::window_cycles(1));
+    let was_running = probe.ticks >= 1;
+    if !was_running {
+        apic::timer_start().ok();
+    }
+    let (reg0, fired0, _) = sched::timer_stats(cpu::BSP_SLOT);
+    let t0 = tsc::now();
+    let bsp_ok = sched::sleep_until(t0.wrapping_add(d));
+    let bsp_el = tsc::now().wrapping_sub(t0);
+    let (reg1, fired1, pend) = sched::timer_stats(cpu::BSP_SLOT);
+    // AP 档
+    let (n, aps) = smp::participant_slots();
+    for &s in &aps[..n] {
+        P6_AP_ELAPSED[s].store(0, Ordering::Relaxed);
+        P6_AP_OK[s].store(0, Ordering::Relaxed);
+    }
+    let ack = smp::run_ap_role(p6_ap_sleeper, p6_bsp_noop);
+    let mut ap_ok = n > 0;
+    let mut ap_min = u64::MAX;
+    let mut ap_max = 0u64;
+    for &s in &aps[..n] {
+        let e = P6_AP_ELAPSED[s].load(Ordering::Acquire);
+        if e < ap_min { ap_min = e; }
+        if e > ap_max { ap_max = e; }
+        if P6_AP_OK[s].load(Ordering::Acquire) != 1 || e < d || e > d + 2 * tick {
+            ap_ok = false;
+        }
+    }
+    if !was_running {
+        apic::timer_stop().ok();
+    }
+    crate::log_info!(
+        "sleep(P6): tick={} d={} BSP elapsed={} ok={} registered {}->{} fired {}->{} 残留={} AP档={} min={} max={} ack={:?}",
+        tick, d, bsp_el, bsp_ok, reg0, reg1, fired0, fired1, pend, ap_ok, ap_min, ap_max, ack);
+    bsp_ok && bsp_el >= d && bsp_el <= d + 2 * tick
+        && fired1 > fired0 && reg1 > reg0 && pend == 0
+        && ap_ok && ack.is_ok()
+}
+ktest!(KT_SLEEP_UNTIL, t_sleep_until);
+
 /// `if_patch` 两条分支的直接覆盖，以及 asm 偏移与 Rust 结构体的对账。
 ///
 /// 为什么这条用例存在：ADR-021 的"关着窗口换入"分支今天**没有触发源**

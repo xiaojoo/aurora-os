@@ -74,6 +74,10 @@ pub struct WaitToken {
 /// 又必须低于 `HEAP(10)`，方向才与"从外到内递增"一致。0 是"没持锁"的哨兵，不能当等级用。
 /// 嵌套方向唯一：`WAITQ -> RUNQ`；反向在同 CPU 上由 `lock()` 的等级判据当场升 L4。
 pub const RANK_WAITQ: LockRank = LockRank(5);
+/// 定时器轮（P6/ADR-058）。等级 6：夹在 `WAITQ(5)` 与 `RUNQ(8)` 之间，因为两个方向都要嵌套它——
+/// `wait_while` 持 WAITQ 注册到期项（5→6），tick 扫描持 TIMER 叫醒任务要取 RUNQ（6→8）。
+/// 0 是"没持锁"哨兵、5/8 已占，1..9 里只剩 6/7/9 可用，取 6 给两侧都留了余地。
+pub const RANK_TIMER: LockRank = LockRank(6);
 
 /// 队列数与每队列 waiter 槽数（ADR-047 决策 3）。**定长、不进堆**：
 /// 理由不是 ISR 禁令（ISR 内分配是 L3 拒绝、可观察），而是 `LARGE_MAX = 2048`

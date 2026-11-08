@@ -6,6 +6,7 @@
 | 锁 | 等级 | 保护的量 | 允许在它内部获取 | 依据（实测的调用关系） |
 | --- | --- | --- | --- | --- |
 | `RANK_WAITQ` | 5 | `sync::WaitQueue` 的链表头尾、waiter 槽与计数 | RUNQ(8)、HEAP(10)、VMM(20)、PMM(30)、台账(40) | **已落地（ADR-053/P4b，2026-11-08）**：持等待队列锁时叫醒别人即取运行队列锁；实测负样本 `重入获取 rank=5` ⇒ 39、`锁序违规，外层 rank=8 本次 rank=5` ⇒ 39 |
+| `RANK_TIMER` | 6 | 每 CPU 定时器轮的到期项与计数（`sched::WHEELS`） | RUNQ(8)、HEAP(10)、VMM(20)、PMM(30)、台账(40) | **已落地（ADR-058/P6，2026-11-08）**：`wait_while` 持 WAITQ(5) 注册到期项（5→6），tick 扫轮持 TIMER 叫醒要取 RUNQ(8)（6→8）。扫轮**必须在 need 闸之后**，否则持 VMM 时的同步 #PF 会撞 `外层 rank=20 本次 rank=6`（实测 3/3 39） |
 | `RANK_RUNQ` | 8 | 每 CPU 运行队列的所有权（`sched::RQ` 的 `QueueCell.lock`） | HEAP(10)、VMM(20)、PMM(30)、台账(40) | **已落地（ADR-048，2026-11-08）**：`spawn` 在队列锁内要任务栈 ⇒ 向下要页；实测取证跑 `acquires=348877 order_violations=0 reentrant_hits=0 wait_events=2556 wait_timeouts=0`，重入负样本 `L4 sync: 重入获取 rank=8` ⇒ 39 |
 | `RANK_HEAP` | 10 | `heap::Heap` 的光标/自由链表 | VMM(20)、PMM(30)、台账(40) | `try_alloc` → `map_more_through` → `mm::map` → `new_table_frame` → `phys_alloc` → 台账 |
 | `RANK_VMM` | 20 | 页表结构与 VA 保留登记表 | PMM(30)、台账(40) | `map`/`alloc_va_range` 内部要新页表页，走 `phys_alloc` |

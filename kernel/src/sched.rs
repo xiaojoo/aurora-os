@@ -921,6 +921,118 @@ fn idle_entry() -> ! {
     }
 }
 
+// ---- P6：每 CPU 定时器轮（ADR-058）----
+//
+// 为什么放 `sched` 而不是 `time`：轮到点要叫醒任务，放 `time` 就新增 `time -> sched` 边，
+// 而 `time` 在环 A 内、`sched` 是环外单点 ⇒ 会把 sched 拉进强连通分量，SCC 闸与棘轮同时红。
+// 放这里则只用到已有的 `sched -> sync`（锁）与 `sched -> time`（TSC）边，依赖图不变。
+
+/// 定时器轮的保留队列号：不与任何 `WaitQueue`（0..MAX_WAIT_QUEUES）冲突，
+/// 所以它的世代号不会被误当成某个等待队列的唤醒。
+const TIMER_QID: u8 = u8::MAX;
+/// 每 CPU 的到期项槽数。**上限**，不是 workload 钉出来的（与 ADR-054 的 16×16 同一口径）。
+const WHEEL_SLOTS: usize = 64;
+
+#[derive(Clone, Copy)]
+struct TimerEntry {
+    used: bool,
+    deadline: u64,
+    task: usize,
+    token: crate::sync::WaitToken,
+}
+
+struct Wheel {
+    slots: [TimerEntry; WHEEL_SLOTS],
+    seq: u64,
+    registered: u64,
+    fired: u64,
+}
+
+/// 每 CPU 一个轮，锁与数据同体（`RANK_TIMER`）。`Wheel` 全是普通数据 ⇒ Send ⇒ 锁自动 Sync，
+/// 不需要再包一层 UnsafeCell（比 `RoleCell`/`OpsCell` 少三处 unsafe）。
+static WHEELS: [crate::sync::IrqSpinLock<Wheel>; crate::arch::x86_64::cpu::MAX_CPUS] =
+    [const { crate::sync::IrqSpinLock::new(crate::sync::RANK_TIMER, Wheel {
+        slots: [TimerEntry { used: false, deadline: 0, task: 0,
+                 token: crate::sync::WaitToken { queue: TIMER_QID, seq: 0 } }; WHEEL_SLOTS],
+        seq: 0, registered: 0, fired: 0,
+    }) }; crate::arch::x86_64::cpu::MAX_CPUS];
+
+/// 睡到 `deadline`（TSC 绝对值）。返回 true = 由定时器叫醒（到期），
+/// false = 没睡成（槽满/不是任务/已过期）或被别人提前叫醒。
+/// **必须放锁后再切走**（ADR-053 决策 2）：持轮锁睡眠会让锁在整段睡眠里不释放。
+pub fn sleep_until(deadline: u64) -> bool {
+    let cpu = crate::arch::x86_64::cpu::self_slot();
+    if cpu >= crate::arch::x86_64::cpu::MAX_CPUS {
+        return false;
+    }
+    if deadline <= crate::tsc::now() {
+        return false; // 已过期：不睡，调用方自己决定怎么处理
+    }
+    let me = current_id();
+    let token = {
+        let mut g = WHEELS[cpu].lock();
+        let w = g.get();
+        let Some(slot) = w.slots.iter().position(|e| !e.used) else {
+            return false; // 槽满：不阻塞，调用方必须处理
+        };
+        w.seq = w.seq.wrapping_add(1);
+        let tok = crate::sync::WaitToken { queue: TIMER_QID, seq: w.seq };
+        w.slots[slot] = TimerEntry { used: true, deadline, task: me, token: tok };
+        w.registered += 1;
+        tok
+    };
+    if !block_current(token) {
+        let mut g = WHEELS[cpu].lock();
+        let w = g.get();
+        for e in w.slots.iter_mut() {
+            if e.used && e.token == token {
+                e.used = false;
+            }
+        }
+        return false;
+    }
+    yield_now(); // 锁已放掉，这时才切走
+    // 回来：条目已被 wheel_tick 摘掉 ⇒ 是到期叫醒；还在 ⇒ 被别人提前叫醒，自己摘掉
+    let mut g = WHEELS[cpu].lock();
+    let w = g.get();
+    for e in w.slots.iter_mut() {
+        if e.used && e.task == me && e.token == token {
+            e.used = false;
+            return false;
+        }
+    }
+    true
+}
+
+/// tick 路径上扫轮：把到期的项叫醒。**在 ISR 顶半之外**调用（`preempt_point` 开头），
+/// 所以可以取锁；顶半只立牌，不碰轮（ADR-047 决策 7）。
+fn wheel_tick(cpu: usize) {
+    if cpu >= crate::arch::x86_64::cpu::MAX_CPUS {
+        return;
+    }
+    let now = crate::tsc::now();
+    let mut g = WHEELS[cpu].lock();
+    let w = g.get();
+    for e in w.slots.iter_mut() {
+        if e.used && e.deadline <= now {
+            e.used = false;
+            w.fired += 1;
+            // 持 TIMER(6) 取 RUNQ(8)：方向合法，见 lock-order.md
+            let _ = wake_task(e.task, e.token);
+        }
+    }
+}
+
+/// `(registered, fired, 仍挂着的项数)`。判据用它对账，不靠串口猜。
+pub fn timer_stats(cpu: usize) -> (u64, u64, usize) {
+    if cpu >= crate::arch::x86_64::cpu::MAX_CPUS {
+        return (0, 0, 0);
+    }
+    let mut g = WHEELS[cpu].lock();
+    let w = g.get();
+    (w.registered, w.fired, w.slots.iter().filter(|e| e.used).count())
+}
+
 /// 每个 CPU 的 idle 任务进入 `hlt` 的次数（P5 的见证读数）。
 static IDLE_HLT: [core::sync::atomic::AtomicU64; crate::arch::x86_64::cpu::MAX_CPUS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; crate::arch::x86_64::cpu::MAX_CPUS];
@@ -1296,6 +1408,11 @@ pub unsafe fn preempt_point(frame: u64, cpu: usize) {
     if !FLAGS[cpu].need.load(Ordering::Acquire) {
         return;
     }
+    // P6：扫定时器轮。**必须在 need 闸之后**：need 只由 tick/resched IPI 立，而那些只在
+    // IF=1 时被取走 ⇒ 被中断的上下文不可能持着锁。放在闸之前会让**每次异常出口**都扫轮，
+    // 包括持 VMM(20) 时发生的同步 #PF ⇒ `锁序违规 外层 rank=20 本次 rank=6`（实测 3/3 39）。
+    // 仍在取 RUNQ 之前，所以嵌套方向是 TIMER(6) -> RUNQ(8)，与锁序表一致。
+    wheel_tick(cpu);
     let t0 = crate::tsc::now();
     let me = current_of(cpu);
     let mslot = slot_of(me);

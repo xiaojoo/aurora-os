@@ -4677,6 +4677,40 @@ P6 定时器轮落地后唤醒源变多，两个上界要重测分布再定。
 （今天它没有时限，因为阻塞期间没有东西能叫醒它；"卡住"只能由调用方有界让出发现）。
 判据按 ADR-047：sleep 落在 `[d, d+2 tick]`，tick 按**被睡 CPU 自己的源**计，BSP/AP 各一档。
 
+## 133. P6a：每 CPU 定时器轮与 sleep_until（2026-11-08，实测）
+
+**交付（ADR-058）**：轮放 `sched`（放 `time` 会新增 `time->sched` 把 sched 拉进环 A）；
+`RANK_TIMER=6` 夹在 WAITQ(5) 与 RUNQ(8) 之间（两个方向都要嵌套它）；
+`IrqSpinLock<Wheel>` 每 CPU 一个、64 槽上限；`sleep_until(deadline)`、`timer_stats(cpu)`；
+扫轮接在 `preempt_point` 里。用例数 60 → **61**。
+
+**两次实测失败，都不是"轮不工作"**：
+1. **扫轮放在 need 闸之前** ⇒ 每次异常出口都扫，包括**持 VMM(20) 时的同步 #PF**
+   ⇒ `L4 sync: 锁序违规，外层 rank=20 本次 rank=6`，**3/3 判定 39**。
+   移到闸之后就好了：need 只由 tick/resched IPI 立，而那些只在 IF=1 时被取走 ⇒
+   被中断的上下文不可能持锁。既有 RUNQ 取锁本来就在闸之后，所以以前没暴露。
+2. **用例不保证时钟在走** ⇒ **3/3 HANG**（`.ktests` 顺序由链接器定，前面的用例可能停过表）。
+   改成先量"进来时心跳在不在走"、不在走就开表、收尾按原样放回（`t_watchdog` 的既有做法）。
+
+**读数（实测）**：默认档 **3/3 PASS、61/61**，
+`tick≈32.3M d=2tick≈64.6M BSP elapsed=66.5M/66.4M/71.3M ok=true
+registered 0->1 fired 0->1 残留=0 AP档=true min=65~97M max=94~99M ack=Ok(0)`
+⇒ **BSP 与 AP 各一档**都落在 `[d, d+2 tick]` 内（两本 tick 账没混，ADR-024 口径）。
+
+**MUTATION-T（实测确定性）**：`wheel_tick` 不看到期就立刻叫醒 ⇒
+`BSP elapsed=1129942`（≈1.1M ≪ d=64.9M）、`AP档=false` → FAIL(35)。还原 ⇒ PASS。
+
+**登记面**：`sync.public_api` +1（`RANK_TIMER`）、`lock-order.md` 加一行（含"扫轮必须在
+need 闸之后"的理由与那次 39 的读数）。**unsafe 普查零变化**——`Wheel` 全是普通数据 ⇒
+Send ⇒ 锁自动 Sync，不需要再包 UnsafeCell（比 RoleCell/OpsCell 少三处 U4）。
+依赖图与环内边站点数不变。`check` 17/17。
+
+**未决**：P6b（`wait_while` 的时限与超时返回，共用 token 的形状已定）；
+64 槽无 workload 依据；**残留隐患**——need 闸之后仍可能"上次 tick 立了牌、随后本任务取锁
+并发生同步异常"时扫轮，彻底解法是异常出口取锁前先看被中断上下文是否持锁
+（`sync` 需暴露只读 innermost 查询），与 §128 的 L4 退出路径级联反向嵌套是同一处欠账；
+真机/KVM 的精度余量未测。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。
