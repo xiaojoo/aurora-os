@@ -4645,7 +4645,7 @@ H2 得 `halted=3` 仍 PASS）。它量的是"idle 跑过"，不是"idle 真的�
 
 **见证的诚实边界**：`idle_hlt_count`/`ap_worker_hlt` 是**内核自报**，宿主机只是解析那一行。
 `-d int` 不记录 hlt、仓库里没有数它的仪器（§97a 实测），所以**不得宣称这是独立见证**。
- finding a QEMU 通道能数 halted 状态仍是未决。
+找到一个能数 halted 状态的 QEMU 通道仍是未决。
 
 **登记面**：`sched` U1 3→4、`smp` U1 4→5（两处 hlt asm），普查 293→295、U1 54→56；
 `public_api` +2。**棘轮要求收紧一处**：`arch->time` 23→**22**（`ap_worker` 不再调 `tsc::spin`）
@@ -4653,6 +4653,29 @@ H2 得 `halted=3` 仍 PASS）。它量的是"idle 跑过"，不是"idle 真的�
 
 **未决**：hlt 的独立见证通道；两个上界是 TCG 下的 regime 分界，真机/KVM 要重测；
 P6 定时器轮落地后唤醒源变多，两个上界要重测分布再定。
+
+## 132. P5 复验全绿：矩阵 41/41，hlt 判据跨 39 个变体读数一致（2026-11-08，实测）
+
+**读数（实测）**：整轮矩阵 **41 行全符合、0 不符**；两处 HANG 仍是期望行，无意外挂死。
+- `worked=3 halted=3 checked=3` 在 **39 份留档里完全一致**；
+- `bsp_hlt 0 -> 1` 也在 **39 份里完全一致** ⇒ BSP idle 的 hlt 路径在每个变体都被执行到一次，
+  并被跨核 IPI 叫醒（不是只在默认档凑巧跑到）。
+- `t_idle_hlt_wakes` 与 `t_percpu_queues` 零失败。
+
+**P5 关闭**。两个自旋体（`ap_worker`、`idle_entry`）都已 hlt 化，判据是能分辨 regime 的上界
+（第一版">0"是空判据，两条变异都不咬，已在 §131 记下读数），两条变异现在确定性证红。
+`ap_worker` 没有退掉，所以 `worked_aps` 证人原样保住。
+
+**仍开着的未决（不藏）**：
+1. **hlt 没有独立见证**：两个计数是内核自报、宿主机只解析那一行；`-d int` 不记录 hlt。
+   找到 QEMU 侧能数 halted 的通道之前，这一格不得宣称独立见证。
+2. 两个上界（增量 ≤4、loops ≤ ticks*32+64）是 **TCG 下**测出的 regime 分界，
+   真机/KVM 要重测；P6 定时器轮落地后唤醒源变多，也要重测分布再定。
+3. `arch->time` 棘轮已按进度收紧到 22（`ap_worker` 不再调 `tsc::spin`）。
+
+**下一步 P6**：每 CPU 定时器轮 + `sleep_until(deadline)`，并给 `wait_while` 加时限参数
+（今天它没有时限，因为阻塞期间没有东西能叫醒它；"卡住"只能由调用方有界让出发现）。
+判据按 ADR-047：sleep 落在 `[d, d+2 tick]`，tick 按**被睡 CPU 自己的源**计，BSP/AP 各一档。
 
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
