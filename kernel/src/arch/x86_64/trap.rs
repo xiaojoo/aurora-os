@@ -980,6 +980,17 @@ pub fn dispatch(frame: &mut TrapFrame) -> Action {
             // 有登记、但这次故障不是它：地雷被别人的故障撞上了。计数，判据要能看见它。
             PF_STALE_HITS.fetch_add(1, Ordering::Relaxed);
         }
+        // ADR-067/P5 修复接缝：三条合取全成立才修（ring3 ∧ 页不存在 ∧ 非取指），
+        // 且位置必须在恢复登记消费**之后**——否则修复分支会截走 PF_EXPECT/PF_LO 的
+        // 现场（ADR-026 的地雷形状；负样本 M5-4 反着钉这条顺序）。
+        // "修复时不持任何 sync 锁"由来源保证：ring3 故障的被中断上下文是用户态
+        //（持 IrqSpinLock 意味着 IF=0 且在 ring0），实现内部依次取 PMM/VMM、不碰 RUNQ。
+        // 任一不成立 ⇒ 下面既有 kill/fatal 路径逐字不变（方案 :147 的"非法则杀"原样）。
+        if from_user(frame) && frame.error_code & 0x1 == 0 && frame.error_code & 0x10 == 0
+            && (crate::hooks::sched().demand_zero)(frame.cr2)
+        {
+            return Action::Resume;
+        }
         // **标签跟着决定走**：同一行现场，ring3 来的叫 `kill`，内核自己的才叫 `fatal`。
         // 之前一律打 `fatal`，结果"越界的用户任务被隔离掉"这条判据在串口上读起来
         // 像内核要挂了——症状与后果不符，排查时会往错的方向走（§9.2 的分级就是为这个）。

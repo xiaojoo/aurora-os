@@ -176,6 +176,17 @@ public_api = [
   "mm::MAX_TASKS_SUPPORTED",
   "mm::MOD_TEST",
   "mm::KBuf",
+  "mm::LazyHandle",
+  "mm::demand_zero_try",
+  "mm::lazy_new",
+  "mm::demand_zero_count",
+  "mm::demand_zero_lost",
+  "mm::lazy_region_count",
+  "mm::split_huge",
+  "mm::map_hole",
+  "mm::unmap",
+  "mm::phys_of",
+  "mm::leaf_value",
   "mm::Mapping",
   "mm::MmError",
   "mm::MmioMapping",
@@ -229,7 +240,7 @@ error_classes = ["A", "B", "C", "D"]
 resource_ownership = "物理帧分配状态、VA 保留表、页表、Mapping 所有权对象、内核堆、TLB shootdown 请求与回执。"
 error_policy = "非法参数/未映射 → Err；耗尽 → OutOfMemory/ResourceExhausted；DoubleFree/所有权破坏/shootdown 超时 → L4。"
 unsafe_scope = ["mm:U1,U2,U4", "heap:U2"]
-test_targets = ["t_alloc_free_returns_frames", "t_map_write_unmap", "t_guard_page_blocks_access", "t_wx_construction_rejected", "t_map_refused_inside_huge_page", "t_double_free_must_escalate", "t_global_allocator_backs_vec", "t_heap_reuses_freed_slot", "t_heap_rejects_oversize", "t_heap_slots_are_mapped"]
+test_targets = ["t_alloc_free_returns_frames", "t_map_write_unmap", "t_guard_page_blocks_access", "t_wx_construction_rejected", "t_map_refused_inside_huge_page", "t_double_free_must_escalate", "t_global_allocator_backs_vec", "t_heap_reuses_freed_slot", "t_heap_rejects_oversize", "t_heap_slots_are_mapped", "t_split_huge", "t_map_hole", "t_demand_zero"]
 status = "部分落地"
 
 [modules."sched"]

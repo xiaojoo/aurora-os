@@ -109,9 +109,17 @@ pub struct Task {
 /// 见 §10.7 的 `MAX_OWNED` 那一行、BACKLOG 的 R33 那节。
 pub const MAX_OWNED: usize = 8;
 
-/// 一组"任务名下的映射"。见 `Task::owned` 与 `MAX_OWNED` 的注释。
+/// 一组"任务名下的拥有项"（ADR-067 决策 2）。计数的仍是**条**——ADR-027 的计数规则、
+/// `owned_of` 与"回基线"判据全部不变，只是元素从单一 `Mapping` 变成两臂枚举。
+pub enum OwnedItem {
+    Map(mm::Mapping),
+    /// 惰性区间只挂**柄**：区间本体住 mm 的 LAZY 表（VMM 纪律），
+    /// 这样 #PF 修复路径不必为了碰 owned 去取 RUNQ(8)（§136 教训）。
+    Lazy(mm::LazyHandle),
+}
+
 pub struct OwnedSet {
-    items: [Option<mm::Mapping>; MAX_OWNED],
+    items: [Option<OwnedItem>; MAX_OWNED],
     n: usize,
 }
 
@@ -125,13 +133,24 @@ impl OwnedSet {
     }
 
     pub fn push(&mut self, m: mm::Mapping) -> Result<(), mm::MmError> {
+        self.push_item(OwnedItem::Map(m))
+    }
+
+    /// 惰性区间柄入列（ADR-067）：`LazyHandle::drop` 解映射已填充页、归还帧并放手 VA 保留，
+    /// 所以"任务结束账回基线"对这一臂同样由 `release_owned` 兑现，不加新路径。
+    pub fn push_lazy(&mut self, h: mm::LazyHandle) -> Result<(), mm::MmError> {
+        self.push_item(OwnedItem::Lazy(h))
+    }
+
+    fn push_item(&mut self, it: OwnedItem) -> Result<(), mm::MmError> {
         if self.n >= MAX_OWNED {
-            // 满了就把刚交来的映射就地丢弃：`Mapping::drop` 会解映射并归还页框，
-            // 所以这里没有泄漏——调用方拿到 `Err` 会停下这条装载路径。
-            drop(m);
+            // 满了就把刚交来的项就地丢弃：`Map` 走 `Mapping::drop` 解映射并归还页框、
+            // `Lazy` 走 `LazyHandle::drop` 归还整段区间——所以这里没有泄漏——
+            // 调用方拿到 `Err` 会停下这条装载路径。
+            drop(it);
             return Err(mm::MmError::Unsupported);
         }
-        self.items[self.n] = Some(m);
+        self.items[self.n] = Some(it);
         self.n += 1;
         Ok(())
     }
@@ -1596,6 +1615,8 @@ pub fn install_arch_hooks() {
         current_id,
         exit_current,
         preempt_point: preempt_hook,
+        // ADR-067/P5：#PF 修复接缝装的是 mm 的实现（sched 只是安装方，不加自己的逻辑）。
+        demand_zero: mm::demand_zero_try,
     });
 }
 

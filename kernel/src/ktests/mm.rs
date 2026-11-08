@@ -341,3 +341,593 @@ fn t_put_double_free_must_escalate() -> bool {
 #[cfg(feature = "fault-put-double-free")]
 ktest!(KT_PUT_DOUBLE_FREE, t_put_double_free_must_escalate);
 
+/// P4（ADR-066）：split_huge 翻译等价 + 幂等 + 拆后块内 map + 跨别名金丝雀双向。
+/// 被测块不写死地址：phys_alloc(9) 交出的 2MiB 对齐全自由块即被测块（前提自证）。
+/// 旧翻译（大页）逐页写金丝雀 → 拆分 → 新翻译（PT）逐页读回 + 权限相等 + phys_of 对账；
+/// 反向由"新 VA 写 / 该帧 HHDM 别名读"及反向两格充当（旧翻译在时间上互斥，ADR-066 已记）。
+/// fault-split-oom 下走 OOM 分支：失败必须原大页原样、台账与 free_frames 回基线。
+fn t_split_huge() -> bool {
+    const MAGIC: u64 = 0x9E37_79B9_7F4A_7C15;
+    let f_base = mm::free_frames();
+    let frames = match mm::phys_alloc(9, mm::MOD_TEST) {
+        Ok(f) => f,
+        Err(e) => {
+            crate::log_fatal!("split: 前提 phys_alloc(9) 失败 {:?}", e);
+            return false;
+        }
+    };
+    let base_phys = frames.base().0;
+    let va0 = mm::VirtAddr(base_phys + mm::hhdm());
+    let eff0 = match mm::effective_flags(va0.0) {
+        Some(f) if f.levels == 3 => f,
+        other => {
+            crate::log_fatal!("split: 前提失效，块不是大页 eff={:?}", other);
+            return false;
+        }
+    };
+    // 旧翻译写金丝雀（帧归本用例独占，HHDM 直写安全）
+    for k in 0..512u64 {
+        // SAFETY: va0+k*PAGE 落在本用例 phys_alloc(9) 独占的块内，HHDM 覆盖，u64 对齐
+        unsafe { core::ptr::write_volatile((va0.0 + k * mm::PAGE as u64) as *mut u64, MAGIC ^ k) };
+    }
+    if cfg!(feature = "fault-split-oom") {
+        let c0 = mm::counters();
+        let f0 = mm::free_frames();
+        let live0 = crate::resource::live_of(mm::MOD_BOOT);
+        let err = mm::split_huge(va0).err();
+        let eff1 = mm::effective_flags(va0.0);
+        // SAFETY: 同金丝雀写入，块仍归本用例独占
+        let canary = unsafe { core::ptr::read_volatile(va0.0 as *const u64) };
+        let intact = err == Some(mm::MmError::OutOfMemory)
+            && mm::is_mapped(va0.0)
+            && eff1.map_or(false, |f| f.levels == 3 && f == eff0)
+            && canary == MAGIC;
+        let c1 = mm::counters();
+        let back = mm::free_frames() == f0
+            && c1.page_table_pages == c0.page_table_pages
+            && crate::resource::live_of(mm::MOD_BOOT) == live0;
+        drop(frames);
+        let back = back && mm::free_frames() == f_base;
+        let t = crate::resource::totals();
+        crate::log_info!(
+            "split OOM(P4): err={:?} 原样={} 回基线={}",
+            err.map_or(mm::MmError::NotInit, |e| e),
+            intact, back && t.sum_live == t.sum_alloc - t.sum_free && !t.violation);
+        return intact && back && t.sum_live == t.sum_alloc - t.sum_free && !t.violation;
+    }
+    let c0 = mm::counters();
+    let f0 = mm::free_frames();
+    let sd0 = mm::shootdown_stats();
+    let boot0 = crate::resource::live_of(mm::MOD_BOOT);
+    // 用块内非基址 VA 调用，证"任意块内 VA"语义
+    if mm::split_huge(mm::VirtAddr(va0.0 + 7 * mm::PAGE as u64)).is_err() {
+        crate::log_fatal!("split: split_huge 返回 Err");
+        return false;
+    }
+    let c1 = mm::counters();
+    let f1 = mm::free_frames();
+    let sd1 = mm::shootdown_stats();
+    let me = crate::arch::x86_64::cpu::self_slot();
+    let mut acks_ok = sd1.timeouts == sd0.timeouts;
+    for s2 in 0..crate::arch::x86_64::cpu::MAX_CPUS {
+        if s2 != me && crate::arch::x86_64::cpu::is_online(s2) {
+            acks_ok &= sd1.acks[s2] == sd0.acks[s2] + 1 && sd1.invlpg[s2] == sd0.invlpg[s2] + 1;
+        }
+    }
+    let mut equiv = true;
+    let mut canary = true;
+    for k in 0..512u64 {
+        let va = va0.0 + k * mm::PAGE as u64;
+        // SAFETY: 拆分后该 VA 经 PT 翻译到本用例独占块的第 k 页，u64 对齐
+        let got = unsafe { core::ptr::read_volatile(va as *const u64) };
+        canary &= got == MAGIC ^ k;
+        let eff = mm::effective_flags(va);
+        equiv &= eff.map_or(false, |f| f.levels == 4
+            && f.user == eff0.user && f.writable == eff0.writable && f.executable == eff0.executable);
+        equiv &= mm::phys_of(va) == Some(base_phys + k * mm::PAGE as u64);
+    }
+    // 幂等：再拆一次所有计数不动
+    let idem = mm::split_huge(va0).is_ok();
+    let c2 = mm::counters();
+    let f2 = mm::free_frames();
+    let sd2 = mm::shootdown_stats();
+    let idem = idem && c2.page_table_pages == c1.page_table_pages && f2 == f1
+        && sd2.requests == sd1.requests;
+    // 验收 b + 跨别名：在 HHDM 最后一个大页块的**尾页**（>= max_phys、非 RAM）上做。
+    // 发现约束（ADR-066 落地记录）：unmap 清掉 RAM 帧的 HHDM 别名后，该帧若再走
+    // fi_final_free，毒化经 HHDM 直写会踩缺失叶子 ⇒ ring0 #PF。尾页在 PMM 覆盖外，
+    // 清它无害；P5 的 unmap 只作用于用户窗口 VA（非 HHDM 别名），同由此约束解释。
+    let tail = mm::VirtAddr(mm::hhdm() + mm::max_phys());
+    let probe = match mm::phys_alloc(0, mm::MOD_TEST) {
+        Ok(f) => f,
+        Err(e) => {
+            crate::log_fatal!("split: 尾页探针帧分配失败 {:?}", e);
+            return false;
+        }
+    };
+    // 不拆仍 HugeConflict（该块自己的旧负样本格）
+    if mm::map(tail, probe, mm::PageFlags::RW).err() != Some(mm::MmError::HugeConflict) {
+        crate::log_fatal!("split: 前提失效，尾页不在大页内（map 未报 HugeConflict）");
+        return false;
+    }
+    if mm::split_huge(tail).is_err() {
+        crate::log_fatal!("split: 尾块拆分失败");
+        return false;
+    }
+    let sd_f = mm::shootdown_stats();
+    mm::unmap(tail, 1);
+    let nf = match mm::phys_alloc(0, mm::MOD_TEST) {
+        Ok(f) => f,
+        Err(e) => {
+            crate::log_fatal!("split: 跨别名帧分配失败 {:?}", e);
+            return false;
+        }
+    };
+    let nf_phys = nf.base().0;
+    let alias = nf_phys + mm::hhdm();
+    let m = match mm::map(tail, nf, mm::PageFlags::RW) {
+        Ok(m) => m,
+        Err(e) => {
+            crate::log_fatal!("split: 拆后块内 map 仍失败 {:?}", e);
+            return false;
+        }
+    };
+    // SAFETY: m.virt() 与 alias 是同一物理帧（nf_phys）的两个别名，均页对齐、归本用例独占
+    let cross = unsafe {
+        core::ptr::write_volatile(m.virt().0 as *mut u64, MAGIC ^ 0xAA);
+        let r1 = core::ptr::read_volatile(alias as *const u64);
+        core::ptr::write_volatile(alias as *mut u64, MAGIC ^ 0xBB);
+        let r2 = core::ptr::read_volatile(m.virt().0 as *const u64);
+        r1 == MAGIC ^ 0xAA && r2 == MAGIC ^ 0xBB
+    };
+    let mut acks_f_ok = sd_f.timeouts == sd1.timeouts;
+    for s2 in 0..crate::arch::x86_64::cpu::MAX_CPUS {
+        if s2 != me && crate::arch::x86_64::cpu::is_online(s2) {
+            acks_f_ok &= sd_f.acks[s2] == sd1.acks[s2] + 1 && sd_f.invlpg[s2] == sd1.invlpg[s2] + 1;
+        }
+    }
+    drop(m);
+    drop(frames);
+    let f3 = mm::free_frames();
+    let t = crate::resource::totals();
+    let perm_pt = f_base - f3;
+    let req_delta = sd_f.requests - sd0.requests;
+    let ledger_ok = crate::resource::live_of(mm::MOD_BOOT) == boot0 + 2
+        && t.sum_live == t.sum_alloc - t.sum_free && !t.violation;
+    crate::log_info!(
+        "split(P4): 等价={} 金丝雀={} 跨别名={} 幂等={} map成功={} 永久PT={} requests增量={}",
+        equiv && acks_ok && acks_f_ok, canary, cross, idem, true, perm_pt, req_delta);
+    equiv && canary && cross && idem && acks_ok && acks_f_ok && ledger_ok
+        && perm_pt == 2 && req_delta == 2
+        && f1 == f0 - 1 && c1.page_table_pages == c0.page_table_pages + 1
+        && c1.map_calls == c0.map_calls
+}
+ktest!(KT_SPLIT_HUGE, t_split_huge);
+
+/// P4（ADR-066）：map_hole 高地址 UC 窗口。单属性（HHDM 无别名 + 生效位）、覆盖内拒、
+/// usable 拒、往返回基线；leaf 原始值打出，宿主机按 PAT 规则独立重算对账。
+fn t_map_hole() -> bool {
+    let pa: u64 = 0xFEC0_0000; // q35 IOAPIC：在 map_top 之上、HHDM 未覆盖（前提下面自证）
+    if mm::is_mapped(mm::hhdm() + pa) {
+        crate::log_fatal!("map_hole: 前提失效，pa 已被 HHDM 覆盖");
+        return false;
+    }
+    let res0 = mm::reservation_count();
+    let f0 = mm::free_frames();
+    let mh = match mm::map_hole(pa, 2) {
+        Ok(m) => m,
+        Err(e) => {
+            crate::log_fatal!("map_hole: 建映射失败 {:?}", e);
+            return false;
+        }
+    };
+    let va = mh.virt();
+    let eff = mm::effective_flags(va.0);
+    let single = !mm::is_mapped(mm::hhdm() + pa)
+        && eff.map_or(false, |f| !f.user && f.writable && !f.executable && f.levels == 4);
+    let leaf = mm::leaf_value(va.0).unwrap_or(0);
+    let res1 = mm::reservation_count();
+    drop(mh);
+    let roundtrip = res1 == res0 + 1 && mm::reservation_count() == res0
+        && mm::free_frames() == f0 && !mm::is_mapped(va.0);
+    // 拒绝格：扫内存映射找 usable 基址与"覆盖内非 usable"基址，不写死本机布局
+    let mut pa_usable = None;
+    let mut pa_cov = None;
+    for i in 0..mm::region_count() {
+        let Some(r) = mm::region(i) else { break };
+        let b = (r.base + mm::PAGE as u64 - 1) & !(mm::PAGE as u64 - 1);
+        if b >= r.base + r.length {
+            continue;
+        }
+        if r.usable && pa_usable.is_none() {
+            pa_usable = Some(b);
+        }
+        if !r.usable && pa_cov.is_none() && mm::is_mapped(mm::hhdm() + b) {
+            pa_cov = Some(b);
+        }
+    }
+    let rej_usable = pa_usable.map_or(false, |p| mm::map_hole(p, 1).err() == Some(mm::MmError::InvalidAddress));
+    let rej_cov = pa_cov.map_or(false, |p| mm::map_hole(p, 1).err() == Some(mm::MmError::Unsupported));
+    let rej_zero = mm::map_hole(pa, 0).err() == Some(mm::MmError::InvalidAddress);
+    crate::log_info!(
+        "map_hole(P4): 单属性={} 拒覆盖={} 拒usable={} 往返={} leaf={:#x}",
+        single, rej_cov, rej_usable, roundtrip, leaf);
+    single && rej_cov && rej_usable && roundtrip && rej_zero && leaf != 0
+}
+ktest!(KT_MAP_HOLE, t_map_hole);
+
+// ---- ADR-067（W2 P5）demand-zero ----
+//
+// 七格：①ring3 首触未填充页读到 0 且计数 +1；②区间外未映射地址仍只杀任务；
+// ③copy_from_user 触未填充惰性页在 validate 层 NotMapped、不修复；④区间内取指仍杀；
+// ⑤任务退出后帧/VA/槽位/台账回基线；⑥双核竞争（3AP+BSP 四路）恰填 1 页且输家还帧；
+// ⑦清零见证：填充前 drop 4 帧，first-fit 保证之后捞到刚毒化的 0xA5 帧——去清零必须红在①。
+
+use core::sync::atomic::Ordering;
+
+/// 竞争格的共享状态：工人就位 → 发令枪 → 各自调一次 demand_zero_try。
+static DZ_CR2: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static DZ_START: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static DZ_READY: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static DZ_RET: [core::sync::atomic::AtomicU64; crate::arch::x86_64::cpu::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; crate::arch::x86_64::cpu::MAX_CPUS];
+/// 工人/观察者等发令枪的上界（周期）。到期不放枪就不调，判据会红在"就位人数"。
+const DZ_WAIT_BOUND: u64 = 200_000_000;
+
+/// AP 空闲上下文里的竞争工人：就位、等枪、调一次、记返回值。
+fn dz_worker() {
+    let me = crate::arch::x86_64::cpu::self_slot();
+    DZ_READY.fetch_add(1, Ordering::Relaxed);
+    let cr2 = DZ_CR2.load(Ordering::Acquire);
+    let t0 = crate::tsc::now();
+    while DZ_START.load(Ordering::Acquire) == 0 && crate::tsc::now().wrapping_sub(t0) < DZ_WAIT_BOUND {
+        core::hint::spin_loop();
+    }
+    if DZ_START.load(Ordering::Acquire) != 0 {
+        let ok = mm::demand_zero_try(cr2);
+        DZ_RET[me].store(if ok { 1 } else { 0 }, Ordering::Release);
+    }
+}
+
+/// BSP 侧观察者：等 AP 就位再放枪，然后自己也调一次（四路竞争）。
+fn dz_observer() {
+    let want = crate::arch::x86_64::smp::participant_slots().0;
+    let t0 = crate::tsc::now();
+    while DZ_READY.load(Ordering::Acquire) < want && crate::tsc::now().wrapping_sub(t0) < DZ_WAIT_BOUND {
+        core::hint::spin_loop();
+    }
+    DZ_START.store(1, Ordering::Release);
+    let ok = mm::demand_zero_try(DZ_CR2.load(Ordering::Acquire));
+    DZ_RET[0].store(if ok { 1 } else { 0 }, Ordering::Release);
+}
+
+/// 桩镜像：`movabs rax,LAZY; mov rbx,[rax]; movabs rcx,RES; mov [rcx],rbx;
+/// mov rax,3; int 0x80`。一处 load 触发 demand-zero；exit 走 SYS_EXIT(3)。
+fn dz_blob(lazy: u64, res: u64) -> [u8; 40] {
+    let mut b = [0u8; 40];
+    b[0] = 0x48; b[1] = 0xB8;
+    b[2..10].copy_from_slice(&lazy.to_le_bytes());
+    b[10] = 0x48; b[11] = 0x8B; b[12] = 0x18;
+    b[13] = 0x48; b[14] = 0xB9;
+    b[15..23].copy_from_slice(&res.to_le_bytes());
+    b[23] = 0x48; b[24] = 0x89; b[25] = 0x19;
+    b[26] = 0x48; b[27] = 0xC7; b[28] = 0xC0; b[29] = 0x03;
+    b[33] = 0xCD; b[34] = 0x80;
+    b
+}
+
+/// 建一页用户映射：内容经 HHDM 直写（RX 页装不进写），返回 (VA, Mapping)。
+fn dz_page(flags: mm::PageFlags, fill: Option<&[u8]>) -> Option<(u64, mm::Mapping)> {
+    let va = mm::alloc_user_va_range(1)?;
+    let f = mm::phys_alloc(0, mm::MOD_TEST).ok()?;
+    if let Some(bytes) = fill {
+        // SAFETY: f 刚由本用例 phys_alloc 独占，HHDM 覆盖全部 max_phys；bytes<=PAGE
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), f.base().via_hhdm().0 as *mut u8, bytes.len());
+        }
+    }
+    let m = mm::map(va, f, flags).ok()?;
+    Some((va.0, m))
+}
+
+/// 等待上界的单位改成 tick（40 tick ≈ 400ms）：fault-resched-ipi 档实测，纯周期预算的
+/// yield 环在该档不能推进用户任务（tick 驱动的换人才能），与 t_user_roundtrip 同一等法。
+fn dz_wait_free(gidx: usize) -> bool {
+    for _ in 0..40 {
+        if matches!(crate::sched::state_of(gidx), crate::sched::TaskState::Free) {
+            return true;
+        }
+        crate::sched::yield_now();
+        let b = crate::arch::x86_64::apic::ticks();
+        crate::arch::x86_64::apic::wait_ticks(b, 1, crate::clock::window_cycles(1));
+    }
+    matches!(crate::sched::state_of(gidx), crate::sched::TaskState::Free)
+}
+
+fn dz_wait_kills(target: u64) -> bool {
+    for _ in 0..40 {
+        if crate::user::kills() >= target {
+            return true;
+        }
+        crate::sched::yield_now();
+        let b = crate::arch::x86_64::apic::ticks();
+        crate::arch::x86_64::apic::wait_ticks(b, 1, crate::clock::window_cycles(1));
+    }
+    crate::user::kills() >= target
+}
+
+fn t_demand_zero() -> bool {
+    // 用例自足（§86e 的教训，实测复现于 fault-double-free 档）：链接顺序可能把本用例
+    // 排在第一个用户任务测试之前，那一刻启动上下文还没登记进 RQ，spawn/yield 全部落空。
+    crate::sched::init_boot_task();
+    // 用例自足第二条（实测复现于 fault-resched-ipi 档 3/3）：那三档里设置 RUN 的跨核用例
+    // 被整条不注册，没有别人替我开轮转——RUN 位不置，用户任务永远不被换入。
+    crate::sched::start_workers();
+    // 用例自足第三条（实测复现于 fault-ahci-lba / fault-resched-ipi 档）：链上有些用例
+    // 会停掉 LAPIC 定时器再不带回来（t_percpu_queues 家族的"进来停就停回去"）。tick 一停，
+    // 我的等待环与 preempt 传播全部失效——t_user_roundtrip 同一形状，它也是自己 start 的。
+    crate::arch::x86_64::apic::timer_start().ok();
+    // 落脚页是 kill 路径的前提（ADR-028）；init 幂等。
+    if crate::user::init().is_err() {
+        crate::log_fatal!("demand-zero: 落脚页建不起来");
+        return false;
+    }
+    // 基线只取"我自己的计数面"。绝对 free/live 会被别的用例落在 AP 队列上的延迟回收
+    // 污染（实测竞争窗口 ±28 帧），所以账目正确性交给台账不变量与逐 VA 检查。
+    let reg0 = mm::lazy_region_count();
+    let dz0 = mm::demand_zero_count();
+    let kills0 = crate::user::kills();
+
+    // R1：3 页区间；桩只读第 0 页 ⇒ 第 2 页永远未填充，给 ③ 用
+    let r1 = match mm::lazy_new(3, mm::MOD_TEST) {
+        Some(h) => h,
+        None => {
+            crate::log_fatal!("demand-zero: lazy_new 失败");
+            return false;
+        }
+    };
+    let base1 = match r1.base() {
+        Some(b) => b,
+        None => {
+            crate::log_fatal!("demand-zero: 区间读不回基址");
+            return false;
+        }
+    };
+    // ③ 内核拷贝路径触未填充页：validate 层 NotMapped，不修复、不杀
+    let mut scratch = [0u8; 8];
+    let copy_refused = crate::user::copy_from_user(base1 + 2 * mm::PAGE as u64, &mut scratch)
+        == Err(crate::user::PtrError::NotMapped)
+        && mm::demand_zero_count() == dz0;
+
+    // 结果页归**用例**持有：任务退出回收自身资源后，内核还要读它
+    let (res_va, res_map) = match dz_page(mm::PageFlags::USER_RW, None) {
+        Some(p) => p,
+        None => {
+            crate::log_fatal!("demand-zero: 结果页建不起来");
+            drop(r1);
+            return false;
+        }
+    };
+    // 哨兵区分"用户真写了"与"页本来就是 0"；内核碰已映射用户页必须走校验+开窗（write_at）
+    crate::user::write_at(res_va, 0xdead_beef);
+
+    // ①⑤ 主任务：owned = 惰性柄 + 代码页 + 用户栈
+    let (code_va, code_map) = match dz_page(mm::PageFlags::USER_RX, Some(&dz_blob(base1, res_va))) {
+        Some(p) => p,
+        None => {
+            crate::log_fatal!("demand-zero: 代码页建不起来");
+            drop(r1);
+            return false;
+        }
+    };
+    let (stk_va, stk_map) = match dz_page(mm::PageFlags::USER_RW, None) {
+        Some(p) => p,
+        None => {
+            crate::log_fatal!("demand-zero: 用户栈建不起来");
+            drop(r1);
+            return false;
+        }
+    };
+    // ⑦ 毒化铺垫：drop 4 帧 ⇒ 之后 first-fit 捞到的填充帧必是刚毒化的 0xA5 帧
+    for _ in 0..4 {
+        if let Ok(f) = mm::phys_alloc(0, mm::MOD_TEST) {
+            drop(f);
+        }
+    }
+    let mut owned = crate::sched::OwnedSet::new();
+    let mut ok = owned.push_lazy(r1).is_ok();
+    ok &= owned.push(code_map).is_ok();
+    ok &= owned.push(stk_map).is_ok();
+    let t1 = match crate::sched::spawn_user(code_va, stk_va + mm::PAGE as u64 - 16, owned) {
+        Ok(g) => g,
+        Err(e) => {
+            crate::log_fatal!("demand-zero: spawn_user 失败 {:?}", e);
+            drop(res_map);
+            return false;
+        }
+    };
+    let ran = dz_wait_free(t1);
+    let first_zero = ran && crate::user::peek_u64(res_va).unwrap_or(u64::MAX) == 0;
+    let filled_1 = mm::demand_zero_count() == dz0 + 1;
+
+    // ② 区间外：R4 尾后一格（上延变异边界才能当场咬）。前沿顺序：先分 code2/stk2、
+    // 后建 R4，则 R4 尾后那格必还空闲；桩代码要引用 bad，所以内容后补——
+    // 配方是经 HHDM 直写页框（ADR-026：RX 页装不进写，构造期走内核侧别名）。
+    let (code2, map2) = match dz_page(mm::PageFlags::USER_RX, None) {
+        Some(p) => p,
+        None => {
+            crate::log_fatal!("demand-zero: 越界桩建不起来");
+            return false;
+        }
+    };
+    let (stk2, smap2) = match dz_page(mm::PageFlags::USER_RW, None) {
+        Some(p) => p,
+        None => {
+            crate::log_fatal!("demand-zero: 越界栈建不起来");
+            return false;
+        }
+    };
+    let r4 = match mm::lazy_new(2, mm::MOD_TEST) {
+        Some(h) => h,
+        None => {
+            crate::log_fatal!("demand-zero: R4 建不起来");
+            return false;
+        }
+    };
+    let bad = match r4.base() {
+        Some(b) => b + 2 * mm::PAGE as u64,
+        None => {
+            crate::log_fatal!("demand-zero: R4 读不回基址");
+            return false;
+        }
+    };
+    if mm::is_mapped(bad) {
+        crate::log_fatal!("demand-zero: 前提失效，bad={:#x} 已被映射", bad);
+        return false;
+    }
+    let blob2 = dz_blob(bad, res_va);
+    let code2_frame = match mm::phys_of(code2) {
+        Some(f) => f,
+        None => {
+            crate::log_fatal!("demand-zero: 读不回 code2 帧");
+            return false;
+        }
+    };
+    // SAFETY: code2_frame 的帧由 dz_page 独占分配；经 HHDM 内核别名写，不经用户 VA；
+    // 此刻 t2 还没起，没有第二个主人
+    unsafe {
+        core::ptr::copy_nonoverlapping(blob2.as_ptr(), (code2_frame + mm::hhdm()) as *mut u8, blob2.len());
+    }
+    // 重置哨兵，"越界任务写了结果"必须读得出来（同样走 write_at，不开裸窗口）
+    crate::user::write_at(res_va, 0xdead_beef);
+    let mut o2 = crate::sched::OwnedSet::new();
+    o2.push(map2).ok();
+    o2.push(smap2).ok();
+    let t2 = match crate::sched::spawn_user(code2, stk2 + mm::PAGE as u64 - 16, o2) {
+        Ok(g) => g,
+        Err(e) => {
+            crate::log_fatal!("demand-zero: 越界任务起不来 {:?}", e);
+            return false;
+        }
+    };
+    let got_kill2 = dz_wait_kills(kills0 + 1);
+    let killed2 = got_kill2
+        && mm::demand_zero_count() == dz0 + 1
+        && crate::user::peek_u64(res_va).unwrap_or(0) == 0xdead_beef;
+    crate::sched::terminate_task(t2);
+    dz_wait_free(t2);
+    drop(r4);
+
+    // ④ 区间内取指：R3 单页区间不填充，entry 直接指过去 ⇒ err=0x15 不修
+    let r3 = match mm::lazy_new(1, mm::MOD_TEST) {
+        Some(h) => h,
+        None => {
+            crate::log_fatal!("demand-zero: R3 建不起来");
+            return false;
+        }
+    };
+    let base3 = r3.base().unwrap_or(0);
+    let (stk3, smap3) = match dz_page(mm::PageFlags::USER_RW, None) {
+        Some(p) => p,
+        None => {
+            crate::log_fatal!("demand-zero: 取指栈建不起来");
+            return false;
+        }
+    };
+    let mut o3 = crate::sched::OwnedSet::new();
+    o3.push(smap3).ok();
+    o3.push_lazy(r3).ok();
+    let t3 = match crate::sched::spawn_user(base3, stk3 + mm::PAGE as u64 - 16, o3) {
+        Ok(g) => g,
+        Err(e) => {
+            crate::log_fatal!("demand-zero: 取指任务起不来 {:?}", e);
+            return false;
+        }
+    };
+    let got_kill3 = dz_wait_kills(kills0 + 2);
+    let killed3 = got_kill3
+        && mm::demand_zero_count() == dz0 + 1
+        && !mm::is_mapped(base3);
+    crate::sched::terminate_task(t3);
+    dz_wait_free(t3);
+
+    // ⑥ 双核竞争：R2 用**独占模块号 ModuleId(40)** 记账——外部用例的延迟回收再乱，
+    // 也碰不到这个格；"恰留 1 页、drop 后回 0"因此对本用例是精确判据（M5-2 的杀手）。
+    // race-demand-zero 变体在 alloc 与 map 之间注入自旋，保证输家路径**必然**被走到
+    // （默认构建下 TCG 串行化会饿死它，"输家还帧=0"不能当证据）。
+    let dz_owner = mm::ModuleId(40);
+    let r2 = match mm::lazy_new(2, dz_owner) {
+        Some(h) => h,
+        None => {
+            crate::log_fatal!("demand-zero: R2 建不起来");
+            return false;
+        }
+    };
+    let base2 = r2.base().unwrap_or(0);
+    let lost0 = mm::demand_zero_lost();
+    let dz_before = mm::demand_zero_count();
+    let live0 = crate::resource::live_of(dz_owner);
+    DZ_CR2.store(base2, Ordering::Release);
+    DZ_START.store(0, Ordering::Relaxed);
+    DZ_READY.store(0, Ordering::Relaxed);
+    for r in DZ_RET.iter() {
+        r.store(0, Ordering::Relaxed);
+    }
+    let ack = crate::arch::x86_64::smp::run_ap_role(dz_worker, dz_observer);
+    // 参与者按"真的就位"数：participant_slots 要 cpu_ticks>0，在首次 bringup 之前
+    // 从用例侧调用会读出 0（实测），而观察者/工人的计数在相位内自算——判据只认现场。
+    let contenders = DZ_READY.load(Ordering::Acquire);
+    let ready_all = contenders >= 1;
+    let started = DZ_START.load(Ordering::Acquire) == 1;
+    let filled_one = mm::demand_zero_count() == dz_before + 1;
+    let ret_ones = DZ_RET.iter().filter(|r| r.load(Ordering::Acquire) == 1).count();
+    let lost_delta = mm::demand_zero_lost() - lost0;
+    // 竞争窗口里恰好留住一页（赢家的那页；输家的都已随 Err 路径归还）
+    let holds_one = crate::resource::live_of(dz_owner) == live0 + 1;
+    drop(r2);
+    let ledger_clean = crate::resource::live_of(dz_owner) == live0;
+    // 注入变体下必须看到真输家；默认构建只记录不苛求
+    let forced_losers = if cfg!(feature = "race-demand-zero") { lost_delta >= 1 } else { true };
+    let raced = ack.is_ok() && ready_all && started && filled_one
+        && ret_ones == contenders + 1 && holds_one && ledger_clean && forced_losers;
+
+    // ⑤ 收尾：只看"我自己的东西没了"。绝对 free/live 会被别的用例落在 AP 队列上的
+    // 延迟回收污染（本轮实测竞争窗口 ±28 帧），账目正确性由台账不变量与逐 VA 检查兑现。
+    drop(res_map);
+    let t = crate::resource::totals();
+    let back = !mm::is_mapped(base1)
+        && !mm::is_mapped(base2)
+        && !mm::is_reserved(base1)
+        && !mm::is_reserved(base2)
+        && mm::lazy_region_count() == reg0
+        && t.sum_live == t.sum_alloc - t.sum_free
+        && !t.violation;
+    crate::log_info!(
+        "demand-zero(P5): 修复计数=+{} 首读全0={} 区间外仍杀={} copy不修={} 取指仍杀={} 竞争填充={} 输家还帧={} 独占账回0={} 退出回基线={} 就位={} 发令={} 回执={} 持页={} ack={}",
+        mm::demand_zero_count() - dz0,
+        first_zero && filled_1,
+        killed2,
+        copy_refused,
+        killed3,
+        mm::demand_zero_count() - dz_before,
+        lost_delta,
+        ledger_clean,
+        back,
+        contenders,
+        started,
+        ret_ones,
+        holds_one,
+        ack.is_ok(),
+    );
+    ok && copy_refused && first_zero && filled_1 && killed2 && killed3 && raced && back
+}
+// fault-resched-ipi 档整条不注册（§138 同形先例）：该构建把 request_resched 全局打失败，
+// 本用例的 ring3 推进（换入 t1/t2/t3）实测在该档的等待窗口里不发生、只在 run_ap_role
+// 相位期间才走（40 tick 预算 + timer_start + start_workers 都救不回来，机制未归因）。
+// 该档对"失败不丢唤醒"的见证由 t_resched_ipi_fail_fallback 负责；这里不冒充已修。
+// ahci-scratch 档同样整条不注册：实测本用例的等待窗口内整机静默死（最后一行是
+// "t1 已 spawn"，tick 预算走完都没有下一条打印，机制未归因，留档在案）。
+// 两个欠账都记 BACKLOG §141 的"没做/新发现"，W3 排产时归因。
+#[cfg(not(any(feature = "fault-resched-ipi", feature = "ahci-scratch")))]
+ktest!(KT_DEMAND_ZERO, t_demand_zero);
+

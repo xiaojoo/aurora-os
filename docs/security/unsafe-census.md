@@ -1,6 +1,6 @@
 # unsafe 逐处审计表（U1–U6）
 
-总计 305 处。U1 56 · U2 71 · U3 13 · U4 116 · U5 28 · U6 21
+总计 320 处。U1 56 · U2 79 · U3 13 · U4 118 · U5 28 · U6 26
 
 本表由 `tools/aurora.py` 的 `unsafe_sites()` 从源码逐处生成，**不是手写的**。
 机器可读的权威来源是 `docs/security/unsafe-whitelist.toml` 的 `[modules.*]` 段（模块×类别→处数），
@@ -10,11 +10,11 @@
 ## 类别
 
 - **U1 架构入口与特殊寄存器** — 53 处，分布在 13 个模块：arch/x86_64/apic、arch/x86_64/cpu、arch/x86_64/smp、arch/x86_64/trap、hw、ktests/sched、mm、sched、serial、sync、tsc、user、user/hello
-- **U2 页表、物理内存与 MMIO** — 60 处，分布在 9 个模块：acpi、arch/x86_64/apic、heap、hw、limine、mm、pci、sched、user
+- **U2 页表、物理内存与 MMIO** — 79 处，分布在 10 个模块：acpi、arch/x86_64/apic、heap、hw、ktests/mm、limine、mm、pci、sched、user
 - **U3 DMA 与设备共享内存** — 13 处，分布在 2 个模块：driver、limine
-- **U4 并发共享状态与 UnsafeCell** — 106 处，分布在 18 个模块：acpi、ahci、arch/x86_64/apic、arch/x86_64/smp、arch/x86_64/trap、driver、hooks、irq、ktests/elf、ktests/fs、ktests/sign、main、mm、pci、sched、sync、user、virtio
+- **U4 并发共享状态与 UnsafeCell** — 118 处，分布在 18 个模块：acpi、ahci、arch/x86_64/apic、arch/x86_64/smp、arch/x86_64/trap、driver、hooks、irq、ktests/elf、ktests/fs、ktests/sign、main、mm、pci、sched、sync、user、virtio
 - **U5 用户指针与地址空间访问** — 28 处，分布在 2 个模块：user、user/hello
-- **U6 诊断路径的有限现场读取** — 21 处，分布在 9 个模块：crash、ktest、ktests/acpi、ktests/crash、ktests/fs、ktests/heap、ktests/mm、ktests/sched、ktests/user
+- **U6 诊断路径的有限现场读取** — 26 处，分布在 9 个模块：crash、ktest、ktests/acpi、ktests/crash、ktests/fs、ktests/heap、ktests/mm、ktests/sched、ktests/user
 
 ## 口径
 
@@ -349,6 +349,18 @@
   > unsafe { core::ptr::write_volatile(m.virt().0 as *mut u64, MAGIC) }; // SAFETY: 同上 let got = unsafe { core::ptr::read_volatile(m.virt().0 as *mut u64) }; 
 - `kernel/src/ktests/mm.rs:61` [{] **U6** fn=`t_map_write_unmap`
   > let got = unsafe { core::ptr::read_volatile(m.virt().0 as *mut u64) }; let mapped_before = mm::is_mapped(m.virt().0); let after_alloc = mm::free_frames(); 
+- `kernel/src/ktests/mm.rs:371` [{] **U6** fn=`t_split_huge`
+  > unsafe { core::ptr::write_volatile((va0.0 + k * mm::PAGE as u64) as *mut u64, MAGIC ^ k) }; } if cfg!(feature = "fault-split-oom") {
+- `kernel/src/ktests/mm.rs:380` [{] **U6** fn=`t_split_huge`
+  > let canary = unsafe { core::ptr::read_volatile(va0.0 as *const u64) }; let intact = err == Some(mm::MmError::OutOfMemory) && mm::is_mapped(va0.0)
+- `kernel/src/ktests/mm.rs:421` [{] **U6** fn=`t_split_huge`
+  > let got = unsafe { core::ptr::read_volatile(va as *const u64) }; canary &= got == MAGIC ^ k; let eff = mm::effective_flags(va);
+- `kernel/src/ktests/mm.rs:475` [{] **U6** fn=`t_split_huge`
+  > let cross = unsafe { core::ptr::write_volatile(m.virt().0 as *mut u64, MAGIC ^ 0xAA); let r1 = core::ptr::read_volatile(alias as *const u64);
+- `kernel/src/ktests/mm.rs:627` [{] **U2** fn=`dz_page`
+  > unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), f.base().via_hhdm().0 as *mut u8, bytes.len()); （P5/ADR-067：桩内容写进 phys_alloc 独占、尚未映射成用户页的帧，ADR-026 配方）
+- `kernel/src/ktests/mm.rs:786` [{] **U6** fn=`t_demand_zero`
+  > unsafe { core::ptr::copy_nonoverlapping(blob2.as_ptr(), (code2_frame + mm::hhdm()) as *mut u8, blob2.len()); } （P5：blob 需先知道 bad 才能生成，代码内容后补经 HHDM 内核别名写；t2 未起，无第二主人）
 
 ### ktests/sched
 
@@ -469,6 +481,24 @@
   > unsafe { *e = 0 }; tlb_invalidate(va.0); } 
 - `kernel/src/mm.rs:1275` [{] **U2** fn=`is_mapped`
   > unsafe { let mut table = (s().pml4_phys + hhdm) as *const Page; let mut level = 3u8; 
+- `kernel/src/mm.rs:1389` [{] **U2** fn=`phys_of`
+  > unsafe { let mut table = (s().pml4_phys + hhdm) as *const Page; let mut level = 3u8; （只读遍历，前提同 is_mapped）
+- `kernel/src/mm.rs:1418` [{] **U2** fn=`leaf_value`
+  > unsafe { let mut table = (s().pml4_phys + hhdm) as *const Page; let mut level = 3u8; （只读遍历，前提同 is_mapped）
+- `kernel/src/mm.rs:1455` [{] **U2** fn=`split_huge`
+  > let pd_entry: *mut u64 = unsafe { let mut table = (s().pml4_phys + hhdm) as *mut Page; （持 VMM，自建表经 HHDM 可达）
+- `kernel/src/mm.rs:1476` [{] **U2** fn=`split_huge`
+  > let old = unsafe { *pd_entry }; （有效 level-1 表项，持 VMM）
+- `kernel/src/mm.rs:1494` [{] **U2** fn=`split_huge`
+  > unsafe { let pt_page = (pt_phys + hhdm) as *mut Page; for k in 0..512u64 { （PT 来自 new_table_frame、尚未挂进 PD，无并发读者）
+- `kernel/src/mm.rs:1503` [{] **U2** fn=`split_huge`
+  > unsafe { *pd_entry = new_pd }; （单次 8 字节对齐写发布，持 VMM）
+- `kernel/src/mm.rs:1606` [impl] **U4** fn=`—`
+  > unsafe impl Sync for LazyCell {} （P5/ADR-067：LAZY 表读写全在 VMM(20) 内，载荷全 Copy）
+- `kernel/src/mm.rs:1612` [{] **U4** fn=`lazy_items`
+  > unsafe { &mut *LAZY.0.get() } （同上，互斥由 VMM 提供）
+- `kernel/src/mm.rs:1694` [{] **U2** fn=`demand_zero_try`
+  > unsafe { core::ptr::write_bytes((p + s().hhdm) as *mut u8, 0, PAGE) }; （P5 分配即清零：p 来自 phys_alloc、HHDM 覆盖、页对齐、帧此刻独占）
 - `kernel/src/mm.rs:1311` [{] **U2** fn=`effective_flags`
   > unsafe { let mut table = (s().pml4_phys + hhdm) as *const Page; let mut level = 3u8; 
 - `kernel/src/mm.rs:1479` [{] **U2** fn=`phys_free`

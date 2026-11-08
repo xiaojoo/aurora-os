@@ -21,6 +21,10 @@ pub struct SchedHooks {
     /// 同 `current_id` 但**不取锁**（只读快照），供故障/崩溃路径用（P7a/ADR-060）。
     /// 致命故障可能发生在持 VMM/HEAP 锁时，那条路上再取 RUNQ 会级联出第二条锁序违规。
     pub current_id_snapshot: fn() -> usize,
+    /// #PF 修复接缝（ADR-067/P5）：只由 trap 在"ring3 ∧ 页不存在 ∧ 非取指"三条合取后调用，
+    /// 返回 true = 页此刻已映射、重执行将成功；false = 不修，走既有 Kill/Fatal 判据。
+    /// 走表而不是直调 `mm::`：环内 `arch->memory` 棘轮只许降不许升（ADR-040 的先例通道）。
+    pub demand_zero: fn(u64) -> bool,
     pub exit_current: fn(usize),
     /// 安全契片由 sched 安装；调用点必须在异常出口。
     pub preempt_point: fn(u64, usize),
@@ -45,6 +49,9 @@ fn no_park(_: &mut TrapFrame) {}
 fn no_id() -> usize {
     0
 }
+fn no_demand_zero(_: u64) -> bool {
+    false
+}
 fn no_exit(_: usize) {}
 fn no_preempt(_: u64, _: usize) {}
 
@@ -58,6 +65,7 @@ static HOOKS: HooksCell = HooksCell(UnsafeCell::new(SchedHooks {
     park_current: no_park,
     current_id: no_id,
     current_id_snapshot: no_id,
+    demand_zero: no_demand_zero,
     exit_current: no_exit,
     preempt_point: no_preempt,
 }));

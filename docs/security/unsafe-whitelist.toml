@@ -45,13 +45,13 @@ expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe
 # 2026-11-07 P7：hello 加了 syscall3（U1 两处）与 ring3 句柄读/close（U5 三处）。
 
 [unsafe-census]
-total = 305
+total = 320
 U1 = 56
-U2 = 71
+U2 = 79
 U3 = 13
-U4 = 116
+U4 = 118
 U5 = 28
-U6 = 21
+U6 = 26
 
 [modules."acpi"]
 U2 = 1
@@ -116,7 +116,13 @@ U6 = 3
 U6 = 6
 
 [modules."ktests/mm"]
-U6 = 3
+# P4（ADR-066）+4：t_split_huge 的金丝雀旧写/新读、OOM 格读回、跨别名双向，
+# 全部落在本用例 phys_alloc 独占的块或新帧上，页对齐、HHDM 覆盖。
+# P5（ADR-067）+1：t_demand_zero 把桩代码写进尚未启动任务的 code2 帧（HHDM 内核别名直写）。
+U6 = 8
+# P5（ADR-067）+1：dz_page 的桩内容 HHDM 直写（帧由本用例 phys_alloc 独占、尚未映射成
+# 用户页，ADR-026 配方）。分类按操作实质：物理内存直写不是诊断现场读，故 U2。
+U2 = 1
 
 [modules."ktests/sched"]
 U1 = 3
@@ -147,8 +153,14 @@ U1 = 2
 # P2（ADR-064）+3：KBuf 清零（write_bytes）、as_slice（from_raw_parts）、as_mut_slice
 # （from_raw_parts_mut）。指针 = HHDM + phys_alloc 连续帧基址，范围 [0,len<=cap)，u8 任意对齐，
 # 生命周期绑 KBuf（OwnedFrames 字段，Drop 才归还），&self/&mut self 保证访问期不归还、无别名。
-U2 = 31
-U4 = 4
+# P4（ADR-066）+6：phys_of/leaf_value 只读遍历（前提同 is_mapped：写者全在 VMM 内）；
+# split_huge 走 PD 项、读旧大页项、填 512 叶子（PT 页来自 new_table_frame、尚未挂进 PD，
+# 无并发读者）、单次对齐写发布 PD 项。全部持 VMM(20)，指针经 HHDM 可达自建表。
+U2 = 38
+# P5（ADR-067）+2：LazyCell 的 Sync（互斥由 VMM 提供，载荷全 Copy）与 lazy_items 取表。
+# 白名单理由：表读写全部在 VMM(20) 内（demand_zero_try 的锁外窗口只碰 phys_alloc/map 自己
+# 的锁序），无跨锁别名逃逸。demand_zero_try 的分配即清零 write_bytes 记在上面的 U2（37→38）。
+U4 = 6
 
 [modules."pci"]
 U2 = 3

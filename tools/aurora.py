@@ -4057,6 +4057,91 @@ def check_resched_ipi_fail(log: str) -> tuple[bool, str]:
     return True, f"失败计数 {f0}->{f1} 收到IPI=0 完成=1 ack=0"
 
 
+# ADR-066 / W2 P4：split/map_hole 的见证行。宿主机逐字段独立解，不是读内核的 bool；
+# leaf 属性位由宿主机按 SDM/PAT 规则重算（第二台仪器），内核绿而对不上 ⇒ CONTENT-MISMATCH。
+SPLIT_P4_RE = re.compile(
+    r"split\(P4\): 等价=(?P<eq>true|false) 金丝雀=(?P<can>true|false) 跨别名=(?P<cross>true|false) "
+    r"幂等=(?P<idem>true|false) map成功=(?P<map>true|false) 永久PT=(?P<pt>\d+) requests增量=(?P<req>\d+)")
+MAP_HOLE_P4_RE = re.compile(
+    r"map_hole\(P4\): 单属性=(?P<single>true|false) 拒覆盖=(?P<cov>true|false) 拒usable=(?P<us>true|false) "
+    r"往返=(?P<rt>true|false) leaf=(?P<leaf>0x[0-9a-f]+)")
+SPLIT_OOM_P4_RE = re.compile(
+    r"split OOM\(P4\): err=(?P<err>\w+) 原样=(?P<intact>true|false) 回基线=(?P<back>true|false)")
+
+
+def check_split_p4(log: str) -> list[str]:
+    m = SPLIT_P4_RE.search(log)
+    if m is None:
+        return ["没找到 split(P4) 见证行 ⇒ 用例没跑到（判据不算数，不许算绿）"]
+    bad = []
+    for g in ("eq", "can", "cross", "idem", "map"):
+        if m.group(g) != "true":
+            bad.append(f"split(P4) {g}={m.group(g)}")
+    # 用例拆两个块（被测块 + HHDM 尾块，尾页做 unmap/map 验收，见 ADR-066 落地记录）
+    if int(m.group("pt")) != 2:
+        bad.append(f"永久PT={m.group('pt')} ≠ 2（页表页台账）")
+    if int(m.group("req")) != 2:
+        bad.append(f"requests增量={m.group('req')} ≠ 2（shootdown 协议计数）")
+    return bad
+
+
+def check_map_hole_p4(log: str) -> list[str]:
+    m = MAP_HOLE_P4_RE.search(log)
+    if m is None:
+        return ["没找到 map_hole(P4) 见证行 ⇒ 用例没跑到"]
+    bad = []
+    for g in ("single", "cov", "us", "rt"):
+        if m.group(g) != "true":
+            bad.append(f"map_hole(P4) {g}={m.group(g)}")
+    # 宿主机独立重算：IOAPIC pa | P | W | PCD(UC-) | NX，与内核读回的叶子原始值对账
+    want = 0xFEC00000 | 0x1 | 0x2 | 0x10 | (1 << 63)
+    if int(m.group("leaf"), 16) != want:
+        bad.append(f"leaf={m.group('leaf')} 宿主机重算={want:#x}（UC- 属性位）")
+    return bad
+
+
+def check_split_oom_p4(log: str) -> tuple[bool, str]:
+    m = SPLIT_OOM_P4_RE.search(log)
+    if m is None:
+        return False, "没找到 split OOM(P4) 见证行 ⇒ 注入没跑到"
+    if m.group("err") != "OutOfMemory":
+        return False, f"err={m.group('err')} ≠ OutOfMemory"
+    if m.group("intact") != "true" or m.group("back") != "true":
+        return False, f"原样={m.group('intact')} 回基线={m.group('back')}"
+    return True, "OOM 被传播、原页原样、台账回基线"
+
+
+# ADR-067 / W2 P5：demand-zero 见证行。修复计数=+2 的账目：ring3 首触 1 页 + 竞争格 1 页；
+# 竞争者按"真的就位"数（participant_slots 的 ticks>0 前提在本用例调用时刻可能未成立，实测）。
+DZ_P5_RE = re.compile(
+    r"demand-zero\(P5\): 修复计数=(?P<cnt>\+\d+) 首读全0=(?P<zero>true|false) 区间外仍杀=(?P<kill>true|false) "
+    r"copy不修=(?P<copy>true|false) 取指仍杀=(?P<fetch>true|false) 竞争填充=(?P<fill>\d+) "
+    r"输家还帧=(?P<lost>\d+) 独占账回0=(?P<ledger>true|false) 退出回基线=(?P<back>true|false) "
+    r"就位=(?P<ready>\d+) 发令=(?P<start>true|false) 回执=(?P<rets>\d+) 持页=(?P<holds>true|false) ack=(?P<ack>true|false)")
+
+
+def check_demand_zero_p5(log: str, require_losers: bool = False) -> list[str]:
+    m = DZ_P5_RE.search(log)
+    if m is None:
+        return ["没找到 demand-zero(P5) 见证行 ⇒ 用例没跑到（判据不算数，不许算绿）"]
+    bad = []
+    if m.group("cnt") != "+2":
+        bad.append(f"修复计数={m.group('cnt')} ≠ +2（ring3 1 页 + 竞争 1 页）")
+    for g in ("zero", "kill", "copy", "fetch", "ledger", "back", "start", "holds", "ack"):
+        if m.group(g) != "true":
+            bad.append(f"demand-zero(P5) {g}={m.group(g)}")
+    if m.group("fill") != "1":
+        bad.append(f"竞争填充={m.group('fill')} ≠ 1（四路只能填进一页）")
+    ready, rets = int(m.group("ready")), int(m.group("rets"))
+    if ready < 1:
+        bad.append(f"就位={ready} ⇒ 竞争格没有 AP 参与，判据空转")
+    if rets != ready + 1:
+        bad.append(f"回执={rets} ≠ 就位+1={ready + 1}（BSP 自己那一路）")
+    if require_losers and int(m.group("lost")) < 1:
+        bad.append(f"输家还帧={m.group('lost')} ⇒ race-demand-zero 下没有真输家，重叠没构造出来")
+    return bad
+
+
 def check_irq_trace(log: str, src: Path | None = None) -> tuple[list[str], str]:
     """M5-g③：把 QEMU `-d int` 数到的投递与内核自己报的两本账对起来。
 
@@ -4599,6 +4684,11 @@ def do_test(timeout: int) -> int:
     print("=== 正向 ===")
     v, rc, log = do_run([], timeout)
     good = v == "PASS"
+    # ADR-066 / W2 P4：split/map_hole 两条见证由宿主机独立对账（leaf 位宿主机重算）
+    # ADR-067 / W2 P5：demand-zero 见证同样由宿主机独立解（默认档不苛求输家，见变体行）
+    p4_bad = check_split_p4(log) + check_map_hole_p4(log) + check_demand_zero_p5(log)
+    for x in p4_bad:
+        print("    对账:", x)
     print("=== 负样本（--features negative-probe，按设计应失败）===")
     IMAGE.unlink(missing_ok=True)
     nv, nrc, nlog = do_run(["negative-probe"], timeout)
@@ -4675,6 +4765,21 @@ def do_test(timeout: int) -> int:
     riv, rirc, rilog = do_run(["fault-resched-ipi"], timeout)
     rif_ok, rif_msg = check_resched_ipi_fail(rilog)
     print("    IPI失败注入:", rif_msg)
+    # ADR-066 / W2 P4：split 取 PT 页失败必须传播 Err、原大页原样。整体期望 PASS，
+    # 宿主机独立核 err/原样/回基线 三格；内核绿而对不上 ⇒ CONTENT-MISMATCH。
+    print("=== split OOM 注入（--features fault-split-oom，失败必须原页原样）===")
+    IMAGE.unlink(missing_ok=True)
+    soomv, soomrc, soomlog = do_run(["fault-split-oom"], timeout)
+    spo_ok, spo_msg = check_split_oom_p4(soomlog)
+    print("    split OOM:", spo_msg)
+    # ADR-067 / W2 P5：竞争放大变体。自旋把 alloc→map 窗口拉宽，输家路径必须被走到；
+    # 期望整体 PASS，宿主机额外苛求 输家还帧>=1 —— 内核绿而没输家 ⇒ CONTENT-MISMATCH。
+    print("=== demand-zero 四路竞争（--features race-demand-zero，必须有真输家）===")
+    IMAGE.unlink(missing_ok=True)
+    dzv, dzrc, dzlog = do_run(["race-demand-zero"], timeout)
+    dz_bad = check_demand_zero_p5(dzlog, require_losers=True)
+    for x in dz_bad:
+        print("    对账:", x)
     print("=== virtio-blk 取证（--features virtio-blk，第三块盘走 virtio）===")
     vv, vrc, vlog = do_run(["virtio-blk"], timeout)
     print("=== 启动循环保护：同一份镜像连跑四遍（--features negative-probe），第四次必须进安全模式 ===")
@@ -5021,7 +5126,7 @@ def do_test(timeout: int) -> int:
     IMAGE.unlink(missing_ok=True)
 
     rows = [
-        ("正向", v, rc, "PASS", 33),
+        ("正向", v if v != "PASS" or not p4_bad else "CONTENT-MISMATCH", rc, "PASS", 33),
         ("负样本", nv, nrc, "FAIL", 35),
         ("L4 重复释放", dv, drc, "EXCEPTION", 39),
         # P1c / ADR-063：共享帧多 put 的 DoubleFree 升 L4（走 frame_put，与上一行的 phys_free 成对）
@@ -5123,6 +5228,11 @@ def do_test(timeout: int) -> int:
         ("P7 句柄ring3读自己镜像", h3_verdict, h3rc, "PASS", 33),
         # P7 第 40 行的证红：owner 改错一格 ⇒ 容器读不到 ⇒ 必须红在 ring3 那格
         ("P7 句柄授错主人必须红", ih_verdict, ihrc, "FAIL", 35),
+        # ADR-066 / W2 P4：OOM 被传播（Err）且原页原样 ⇒ 期望 PASS(33)；
+        # 内核绿而宿主机三格对不上 ⇒ CONTENT-MISMATCH，两种成因分得开
+        ("split OOM原页原样", soomv if spo_ok else "CONTENT-MISMATCH", soomrc, "PASS", 33),
+        # ADR-067 / W2 P5：竞争放大档。PASS + 宿主机苛求真输家；没重叠就没证据 ⇒ CONTENT-MISMATCH
+        ("demand-zero四路有真输家", dzv if not dz_bad else "CONTENT-MISMATCH", dzrc, "PASS", 33),
     ]
     # 每一行对应那一跑的串口：不符时把红的那几格打出来。
     # 单独一张表而不是把日志塞进 `rows` 的元组里：元组要保持成"名字/期望/实际"这种
@@ -5160,6 +5270,8 @@ def do_test(timeout: int) -> int:
         "FAT32簇号高半抹零必须红": hilog,
         "P7 句柄ring3读自己镜像": h3log,
         "P7 句柄授错主人必须红": ihlog,
+        "split OOM原页原样": soomlog,
+        "demand-zero四路有真输家": dzlog,
     }
     all_ok = True
     print()

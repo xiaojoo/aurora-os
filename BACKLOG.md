@@ -4965,6 +4965,121 @@ FrameInfo  unsafe 普查 mm U2 累计 21→31（P1 七处 + P2 三处），total
 KBuf 大 order 碎片化长跑成功率、免清零变体、中断上下文禁用门禁（ADR-064 未决）；
 VA 256 够不够 W3、包含扫描 O(n) 热路径优化（ADR-065 未决）。下一个空 ADR **066**。
 
+## 140. W2 P4：split_huge 翻译等价拆大页 + map_hole 高地址 UC 窗口（ADR-066，2026-11-09，实测）
+
+**做了什么**：mm.rs 新增 `split_huge`（持 VMM(20)：先取清零 PT 页、填 512 翻译等价叶子
+（PAT bit12→bit7、不复制 P_HUGE）、单次对齐写换 PD 项、块基址一次 shootdown；幂等空操作；
+OOM 原大页原样）、`map_hole`（HHDM 未覆盖窗口的 UC- 映射；usable 相交拒、覆盖内拒）、
+`unmap`（公开解映射，不放手 VA 保留）、`phys_of`/`leaf_value`（只读遍历，第二台仪器）。
+用例 `t_split_huge`/`t_map_hole`（67→**69**）；特性 `fault-split-oom`；矩阵 43→**44** 行
+（"split OOM原页原样"，期望 PASS(33)，吃自己那一跑）；宿主机三个解析函数独立对账
+（leaf 位由宿主机按 PAT 规则重算）。
+
+**读数（取证跑，同一代码状态）**：
+- `check` **17/17**；默认 run **PASS、69/69**；矩阵整轮 **44/44 全符合（exit 0）**。
+- `split(P4): 等价=true 金丝雀=true 跨别名=true 幂等=true map成功=true 永久PT=2 requests增量=2`；
+  留档对账 **44 份跑到、宿主机逐格全过**。永久PT=2 因用例拆两个块（被测块+HHDM 尾块，见下）。
+- `map_hole(P4): 单属性=true 拒覆盖=true 拒usable=true 往返=true leaf=0x80000000fec00013`；
+  **45 份跑到全过**（多的一份是提前停机的注入变体跑到了 map_hole 没跑到 split）。
+- 注入档 `split OOM(P4): err=OutOfMemory 原样=true 回基线=true`，69/69 PASS；矩阵该行符合。
+- 登记面：`memory.public_api` +5、`test_targets` +2；unsafe 普查 305→**315**
+  （mm U2 31→37，ktests/mm U6 3→7，逐处见 unsafe-census.md）；环内棘轮、lock-order.md、
+  vectors.toml **零改动**。
+
+**变异证红（每条先红后绿，终端原文）**：
+- M1 叶子物理偏移错一页 ⇒ `等价=false 金丝雀=false`、`t_split_huge -> failed`、FAIL(35)。
+- M2 漏 shootdown ⇒ `requests增量=0`（等价仍 true——ADR-023 口径：TCG 量不到陈旧性，
+  协议计数才是证人）、FAIL(35)。
+- M3 PT 改走 early_frame 绕台账 ⇒ `永久PT=0`、FAIL(35)。
+- M4 map_hole 去 PCD ⇒ 内核 `t_map_hole -> ok`（自判格看不见 PCD）而宿主机重算
+  `leaf=0x80000000fec00003 ≠ 0x80000000fec00013` ⇒ 矩阵形状 CONTENT-MISMATCH。第二台仪器成立。
+- 量具自查：改坏等价/永久PT/原样/err、删行，各返回红；真行返回绿。
+- 矩阵接线负样本：新行共用正向行日志变量 ⇒ `check-matrix-wiring` 点名
+  「共用同一份串口日志变量 log 的行有 ['正向', 'split OOM原页原样']」；还原绿。
+
+**实现期抓到的真约束（新发现，已写进 unmap 文档与 ADR 落地记录）**：清掉"还将被释放的
+RAM 帧"的 HHDM 别名后，该帧走 `fi_final_free` 时毒化经 HHDM 直写会踩缺失叶子 ⇒ ring0 #PF
+（第一版用例就这么死过，现场 cr2=hhdm+0x207000 err=0x2）。验收 b 改在 HHDM 尾块的**尾页**
+（≥max_phys、PMM 覆盖外）做"空一叶再 map"；**P5 的 unmap 只许作用于用户窗口 VA**，同由此约束解释。
+
+**两处量具错（不是被测物错，记下来当提醒）**：①基线取在 frames 已分配之后，结尾 drop 把
+512 帧还回来抬高基线 ⇒ 永久PT 下溢成天文数字；改取分配前基线。②OOM 见证把 Option 包壳
+打进 `err=`（`Some(OutOfMemory)`），宿主机 `\w+` 解出 "Some"；改打内层 MmError。
+
+**没做 / 仍开**：覆盖内 WB→UC 重铺推迟（ADR-066 未决 1，与 MOD_BOOT 页表页永不归还不变量
+相撞）；`map_device` 的 HugeConflict 误报 OutOfMemory 未修（不顺手重构）；TCG 只验协议、
+真机/KVM 待重测（ADR-024 口径）；"持 VMM 等回执 vs 别核等本核回执"循环等待潜伏形状继承
+lock-order.md 未决。中间态（量具修复前）那一跑 `t_preempt_round_robin` 红过一次（§139 已知
+抖动格），最终态矩阵 44/44 零复现，如实记、不归因到本轮改动。
+
+## 141. W2 P5：demand-zero 单 AS 按需清零 + #PF 修复接缝（ADR-067，2026-11-09，实测）
+
+**做了什么**：按 ADR-067 五步落地——
+①mm.rs：`LAZY` 定长表（8 区间 ×16 页，全 Copy 数值：位图+帧物理基，读写全在 VMM(20) 内）、
+`lazy_new`/`demand_zero_try`/`lazy_release`（经非 Copy 的 `LazyHandle` Drop 归还）、
+`demand_zero_count/lost/lazy_region_count` 证人；清零在 phys_alloc 之后 map 之前（ADR-064
+同律），输家还帧靠 `map→AlreadyMapped→Err→frames Drop` 的结构，不靠自觉。
+②sched.rs：`OwnedSet` 项型 `OwnedItem { Map | Lazy }`（对 ADR-027 是扩展不是改写：计数规则、
+释放时机、owned_of/回基线判据不变；本体放 mm 表而不是 OwnedSet 里，理由=修复路径不得取
+RUNQ，§136 教训）。③hooks.rs：`SchedHooks` 加 `demand_zero: fn(u64)->bool`，默认桩 false。
+④sched.rs 安装 `mm::demand_zero_try`。⑤trap.rs:983 接缝：三条合取（ring3 ∧ 页不存在 ∧
+非取指）+ 命中才修，位置钉在恢复登记消费**之后**（ADR-026 地雷的反向防护）。
+用例 `t_demand_zero`（七格+竞争格）；特性 `race-demand-zero`（alloc→map 窗口注入定圈 pause，
+强制四路重叠；用 pause 循环而不是 tsc::spin，免得喂胖环内 memory->time 棘轮）；
+矩阵 44→**45** 行（"demand-zero四路有真输家"，期望 PASS(33)，宿主机苛求 输家还帧>=1）。
+
+**读数（取证跑）**：
+- `check` **17/17**；默认 run **PASS、70/70**；`race-demand-zero` 3/3 PASS 且输家还帧 {3,3,1}——
+  恒 >=1，竞争不是空转。见证行 `demand-zero(P5): 修复计数=+2 首读全0=true 区间外仍杀=true
+  copy不修=true 取指仍杀=true 竞争填充=1 输家还帧=n 独占账回0=true 退出回基线=true 就位=3
+  发令=true 回执=4 持页=true ack=true`（`+2`=ring3 1 页+竞争格 1 页；`独占账`用 ModuleId(40)
+  专用记账，别的用例落在 AP 队列的延迟回收实测能把 ±28 帧污染进绝对基线，所以基线只看自己）。
+- 登记面：public_api +6（lazy_new/demand_zero_try/demand_zero_count/demand_zero_lost/
+  lazy_region_count/LazyHandle）、test_targets +1；unsafe 320（P5 净增 +2：mm U2 +1 清零写、
+  ktests/mm U2 +1 dz_page 直写 + U6 +1 桩代码后补——318→320 见 census 逐处）；
+  lock-order.md / vectors.toml **零改动**；棘轮零变化。
+- 矩阵整轮复验 **45/45 全符合（exit 0）**；留档对账：demand-zero 见证 36 份跑到、宿主机
+  逐格全过、`t_demand_zero` 零失败；输家还帧分布 {0×32, 1×2, 2, 3}（默认档不苛求，
+  race 行苛求 >=1 已由矩阵符合）。
+
+**变异证红（各先红后绿；跑在门控前的同一机制代码上，事后只改了用例注册形状）**：
+- M5-1 去分配即清零 ⇒ `首读全0=false`、FAIL(35)（毒化铺垫：填充前 drop 4 帧，first-fit
+  捞到的必是 0xA5 帧——铺垫不是想当然，是这一格能咬的前提）。
+- M5-2 输家 `mem::forget(frames)` ⇒ race 档 `持页=false 独占账回0=false`、FAIL(35)。
+- M5-3 命中上界多延一页 ⇒ `区间外仍杀=false 修复计数=+3`、FAIL(35)。**这条先前是空的，
+  两次才修成能咬**：v5 饿死（t2 的 bad 周围没有活区间）；v6 用 `bad=R4 尾后` 又踩中
+  "前沿把 bad 发给了 t2 自己的代码页"（mapped=true，错因绿）；真正的原因藏在桩里——
+  `mov rax,3` 与 `int 0x80` 之间留了两字节 `00 00`，任务执行到空洞 `add [rax],al` 写地址 3，
+  **此前每一跑"区间外仍杀=true"都是错因绿**（kills 确实涨了，涨在错误上）。修桩+贴格后
+  变异以正确红因咬中。
+- M5-4（接缝排在恢复登记消费之前）按 ADR-054 口径**没有采信**：该顺序在 W2 结构上构造不出
+  预期红（恢复登记只可能由内核态设置，接缝要求 ring3），降级为结构性论证，不算证据。
+
+**排障记录（三笔，都影响最终形状）**：
+1. **链接顺序自足两条**：首轮 45 行 exit=0 但跨留档对账抓到 5 份变体档 `t_demand_zero` 判据红。
+   定向复跑 `fault-double-free` 3/3 精确复现——该档把本用例排在 `init_boot_task` 之前，
+   spawn 落进未登记的启动上下文（§86e 同族）。补 `init_boot_task()` 后该档绿。
+   又一族排在 `start_workers`/`timer_start` 之前：补 `start_workers()` + `timer_start().ok()`，
+   并把等待环从周期预算改成 40×tick（`wait_ticks` 事件驱动，与 t_user_roundtrip 同法——
+   纯周期预算在 tick 没开的上下文里空转）。
+2. **两个档暂门（机制未归因，W3 排产）**：`fault-resched-ipi` 档里本用例的 ring3 推进只在
+   run_ap_role 相位期间发生（3/3 确定性，tick 预算/自足补齐都救不回来）；
+   `ahci-scratch` 家族的 write-dir 档单跑 3/3 在等待窗口内整机静默死，而同族 highlba/
+   write-partial 档符合预期——两态现象。按 §138 先例整条不注册这两个档，不冒充已修。
+3. **我自己的量具错两笔**：脚本化补丁把 ktests/mm.rs 整文件 CRLF→LF（git diff 假涨 926 行，
+   恢复后纯新增 590 行）；"预算不足"的错误假设一度把等待上限抬到 4G 周期——回退，
+   真因是 tick 驱动缺失，不许拿放宽预算当修复。
+
+**没做 / 新发现的风险**：
+- 生产路径"两个 CPU 同时 fault 同一页"要 W3 每-AS/多线程才可达；本帖用 AP worker 机制层
+  构造，`race-demand-zero` 档 3/3 有真输家 ⇒ 还帧结构成立是**实测**，生产可达性是**推断**。
+- `MAX_LAZY_REGIONS=8 / MAX_LAZY_PAGES=16` 无 workload 依据（与轮槽/等待槽同批欠账）。
+- copy_*_user 对惰性页仍是 `NotMapped`（W2 的诚实形状）；预故障入口留给 W3 裁决（ADR-067 未决 2）。
+- 两个暂门档的机制归因没做（上面第 2 条）；归因前不许把它们的绿当已验证。
+- 真机/KVM：本帖无新时长结论；tick 预算环 40 tick 的上界余量属 TCG 口径（ADR-024）。
+- `t_demand_zero` 在 `race-demand-zero` 档之外也可能自然撞出输家（默认档实测见过还帧 1-3）——
+  默认档判据**不苛求**输家数，输家格的证据只认 `race-demand-zero` 行。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

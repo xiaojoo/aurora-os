@@ -1375,6 +1375,407 @@ pub fn effective_flags(va: u64) -> Option<EffectiveFlags> {
     }
 }
 
+// ------------------------------------------------------------------ ADR-066（W2 P4）
+
+/// 只读翻译遍历，返回 va 所在 4 KiB 页的物理基址（ADR-066 翻译等价的第二台仪器）。
+/// 前提与 `is_mapped` 同：刻意不加锁，所有写者都在 VMM(20) 内；锁外读是无保证快照。
+/// 大页 ⇒ 块物理基 + 块内偏移再下取整到 4 KiB；叶子 ⇒ 叶子物理基。不 present/非规范 ⇒ None。
+pub fn phys_of(va: u64) -> Option<u64> {
+    if !is_ready() || VirtAddr::new(va).is_none() {
+        return None;
+    }
+    let hhdm = s().hhdm;
+    // SAFETY: 只读遍历自建表，前提与 is_mapped 相同
+    unsafe {
+        let mut table = (s().pml4_phys + hhdm) as *const Page;
+        let mut level = 3u8;
+        loop {
+            let entry = (*table).0[idx(va, level)];
+            if entry & P_PRESENT == 0 {
+                return None;
+            }
+            if level == 0 {
+                return Some(entry & ADDR_MASK);
+            }
+            if entry & P_HUGE != 0 {
+                let span = 1u64 << (12 + 9 * level as u64);
+                return Some(((entry & ADDR_MASK) + (va & (span - 1))) & !(PAGE as u64 - 1));
+            }
+            table = ((entry & ADDR_MASK) + hhdm) as *const Page;
+            level -= 1;
+        }
+    }
+}
+
+/// 只读回叶子表项原始值（ADR-066 见证行用：宿主机按 PAT 规则独立重算属性位对账）。
+/// 大页 VA 返回大页项本身。前提与 `is_mapped` 同。
+pub fn leaf_value(va: u64) -> Option<u64> {
+    if !is_ready() || VirtAddr::new(va).is_none() {
+        return None;
+    }
+    let hhdm = s().hhdm;
+    // SAFETY: 只读遍历自建表，前提与 is_mapped 相同
+    unsafe {
+        let mut table = (s().pml4_phys + hhdm) as *const Page;
+        let mut level = 3u8;
+        loop {
+            let entry = (*table).0[idx(va, level)];
+            if entry & P_PRESENT == 0 {
+                return None;
+            }
+            if level == 0 || entry & P_HUGE != 0 {
+                return Some(entry);
+            }
+            table = ((entry & ADDR_MASK) + hhdm) as *const Page;
+            level -= 1;
+        }
+    }
+}
+
+/// 把覆盖 va 的 2 MiB 大页换成 512 个**翻译等价**的 4 KiB 叶子（ADR-066，W2 P4）。
+///
+/// 协议（顺序有意义）：先取清零 PT 页（失败 ⇒ OutOfMemory，原大页原样）；填 512 叶子
+/// （物理沿用同块、属性复制旧项、PAT 从大页 bit12 翻译到叶子 bit7、不复制 P_HUGE）；
+/// 单次对齐写换 PD 项（上级 P/W/U/NX 不许变窄）；本 CPU invlpg + 块基址一次 shootdown
+/// （INVLPG 失效覆盖该地址的任意条目含 2MiB，ADR-023 协议；TCG 只验协议计数）。
+/// 已是 PT ⇒ 幂等空操作；不 present ⇒ NotMapped。PT 页走 new_table_frame 同形
+/// （MOD_BOOT、永不归还）⇒ 成功拆分 free_frames 永久 −1，这是明码代价。
+/// 上下文 KERNEL/IRQ_OFF，持 VMM(20)，可能阻塞（等回执）；ISR 禁用。
+pub fn split_huge(va: VirtAddr) -> Result<(), MmError> {
+    if !is_ready() {
+        return Err(MmError::NotInit);
+    }
+    if VirtAddr::new(va.0).is_none() || (va.0 & (PAGE as u64 - 1)) != 0 {
+        return Err(MmError::InvalidAddress);
+    }
+    let block = va.0 & !(LARGE_PAGE - 1);
+    let _g = vmm();
+    let hhdm = s().hhdm;
+    // SAFETY: va 已验规范；自建表经 HHDM 可达；持 VMM，写者串行化
+    let pd_entry: *mut u64 = unsafe {
+        let mut table = (s().pml4_phys + hhdm) as *mut Page;
+        let e3 = &mut (*table).0[idx(block, 3)] as *mut u64;
+        if *e3 & P_PRESENT == 0 {
+            return Err(MmError::NotMapped);
+        }
+        if *e3 & P_HUGE != 0 {
+            return Err(MmError::Unsupported); // 1 GiB 大页本内核不铺，真出现说明表被写坏
+        }
+        table = ((*e3 & ADDR_MASK) + hhdm) as *mut Page;
+        let e2 = &mut (*table).0[idx(block, 2)] as *mut u64;
+        if *e2 & P_PRESENT == 0 {
+            return Err(MmError::NotMapped);
+        }
+        if *e2 & P_HUGE != 0 {
+            return Err(MmError::Unsupported);
+        }
+        table = ((*e2 & ADDR_MASK) + hhdm) as *mut Page;
+        &mut (*table).0[idx(block, 1)] as *mut u64
+    };
+    // SAFETY: pd_entry 是上一步走到的有效 level-1 表项；持 VMM
+    let old = unsafe { *pd_entry };
+    if old & P_PRESENT == 0 {
+        return Err(MmError::NotMapped);
+    }
+    if old & P_HUGE == 0 {
+        return Ok(()); // 已拆过：幂等空操作，不分页、不发 IPI、计数不变
+    }
+    // 故障注入（ADR-066 验收 OOM 格）：在取 PT 页的调用点强制失败，验证原大页原样。
+    let pt: Option<u64> = if cfg!(feature = "fault-split-oom") { None } else { new_table_frame() };
+    let Some(pt_phys) = pt else {
+        return Err(MmError::OutOfMemory); // 此刻尚未碰 PD 项，原大页原样
+    };
+    let attr = old & (P_WRITE | P_USER | P_NX | P_PWT | P_PCD);
+    // 大页的 PAT 在 bit12，叶子的 PAT 在 bit7：翻译而不复制（复制 P_HUGE 会把 WB 变 UC- 族）
+    let pat_leaf = if old & (1 << 12) != 0 { 1 << 7 } else { 0 };
+    let base_phys = old & ADDR_MASK;
+    // SAFETY: pt_phys 来自 new_table_frame（清零、HHDM 覆盖）；512 项在一页内；
+    // PT 尚未挂进 PD，无并发读者；持 VMM
+    unsafe {
+        let pt_page = (pt_phys + hhdm) as *mut Page;
+        for k in 0..512u64 {
+            (*pt_page).0[k as usize] = (base_phys + k * PAGE as u64) | P_PRESENT | attr | pat_leaf;
+        }
+    }
+    // 单次 8 字节对齐写发布：读者要么见旧大页、要么见填好的 PT，无半截状态
+    let new_pd = pt_phys | P_PRESENT | (old & (P_WRITE | P_USER | P_NX));
+    // SAFETY: pd_entry 有效且持 VMM；对齐 8 字节写在 x86 上原子
+    unsafe { *pd_entry = new_pd };
+    tlb_invalidate(block);
+    shootdown_others(block);
+    Ok(())
+}
+
+/// 公开解映射入口（ADR-066：P4 验收"块内空一叶再 map"、P5 惰性区间 drop 的真实调用者）。
+/// 持 VMM 调既有 unmap_pages（逐页 clear_leaf + shootdown）。**不放手 VA 保留**（调用方自理；
+/// HHDM VA 本无保留）。只作用于 4 KiB 叶子；对大页/不 present 幂等空操作（要先拆）。
+/// **约束（P4 实测踩出）**：不得清"还将被释放的 RAM 帧"的 HHDM 别名——fi_final_free 的毒化
+/// 经 HHDM 直写，别名缺失会 ring0 #PF。调用方要么先恢复叶子，要么只用非 HHDM 别名 VA
+/// （P5 惰性区间住用户窗口）或 PMM 覆盖外的尾页（P4 用例）。
+/// KERNEL；可能阻塞。不改 Mapping::drop 语义。
+pub fn unmap(va: VirtAddr, pages: usize) {
+    if VirtAddr::new(va.0).is_none() {
+        return;
+    }
+    let _g = vmm();
+    unmap_pages(va, pages);
+}
+
+/// 把一段 **HHDM 未覆盖** 的物理 MMIO 窗口映射到保留 VA，UC-（ADR-066，原文主语义：
+/// 4 GiB 之上的 MMCFG/PCI MMIO 没有映射，按 PAT 用 UC；供 ECAM 多段/MSI-X/NVMe BAR）。
+///
+/// 检查顺序：参数/ready → 与 usable 相交拒（InvalidAddress，不许把 RAM 别名 UC 化）→
+/// 区间内任一页已被 HHDM 映射拒（Unsupported，覆盖内重铺推迟，ADR-066 决策 5）。
+/// 与 map_mmio 分工：后者是今天 PCI BAR 路径（自动发 VA、无覆盖检查），不动。
+/// 返回 MmioMapping：drop 解映射 + 放手保留、不还帧（既有语义）。
+pub fn map_hole(pa: u64, pages: usize) -> Result<MmioMapping, MmError> {
+    if pages == 0 || (pa % PAGE as u64) != 0 {
+        return Err(MmError::InvalidAddress);
+    }
+    if !is_ready() {
+        return Err(MmError::NotInit);
+    }
+    let len = pages as u64 * PAGE as u64;
+    let n = s().region_count;
+    for r in &regs()[..n] {
+        if r.usable && pa < r.base + r.length && r.base < pa + len {
+            return Err(MmError::InvalidAddress);
+        }
+    }
+    let hhdm = s().hhdm;
+    for k in 0..pages as u64 {
+        if is_mapped(hhdm + pa + k * PAGE as u64) {
+            crate::log_warn!("map_hole refused: {:#x} 已被 HHDM 覆盖（覆盖内重铺推迟，ADR-066）", pa);
+            return Err(MmError::Unsupported);
+        }
+    }
+    let va = alloc_va_range(pages).ok_or(MmError::OutOfMemory)?;
+    let flags = PageFlags::DEVICE;
+    {
+        let _g = vmm();
+        for k in 0..pages {
+            let a = va.0 + (k as u64) * PAGE as u64;
+            let p = pa + (k as u64) * PAGE as u64;
+            if let Err(e) = set_leaf(a, p | flags.bits(), false, false) {
+                for j in 0..k {
+                    clear_leaf(VirtAddr(va.0 + (j as u64) * PAGE as u64));
+                }
+                return Err(e);
+            }
+            tlb_invalidate(a);
+        }
+    }
+    MAP_CALLS.fetch_add(1, Ordering::Relaxed);
+    MAPPED_PAGES.fetch_add(pages, Ordering::Relaxed);
+    Ok(MmioMapping { virt: va, pages })
+}
+
+// ------------------------------------------------------ ADR-067（W2 P5）惰性区间
+
+/// 惰性区间容量（ADR-067 未决 5：今天无 workload 依据，按"接缝够用"定尺）。
+pub const MAX_LAZY_REGIONS: usize = 8;
+pub const MAX_LAZY_PAGES: usize = 16;
+
+/// 表项。存**数值**而不是 `Option<Mapping>` 数组：后者非 Copy 不能 const 初始化，
+/// 且 Mapping::drop 会在已持 VMM 的编排里重入 VMM（重入即 L4）。归还走
+/// `unmap + phys_free` 的依次取锁编排，与 Mapping::drop 同律（解映射在归还之前，
+/// shootdown 由 unmap_pages 内部兑现，ADR-023）。
+#[derive(Clone, Copy)]
+struct LazyRegion {
+    used: bool,
+    base: u64,
+    pages: u16,
+    /// 已填充位图：占用唯一真相（ADR-065 同律）。
+    filled: u16,
+    owner: ModuleId,
+    /// 已填充页的物理基（帧 0 永不可分配 ⇒ 0 可作"无帧"哨兵）。
+    frames: [u64; MAX_LAZY_PAGES],
+}
+
+const LAZY_EMPTY: LazyRegion =
+    LazyRegion { used: false, base: 0, pages: 0, filled: 0, owner: ModuleId(0), frames: [0; MAX_LAZY_PAGES] };
+
+#[derive(Clone, Copy)]
+struct LazyTable {
+    items: [LazyRegion; MAX_LAZY_REGIONS],
+}
+
+struct LazyCell(UnsafeCell<LazyTable>);
+// SAFETY: 表的读写全部在 VMM(20) 内（lazy_new/demand_zero_try/lazy_release/查询），
+// 互斥由锁提供；锁外只读快照不存在（调用方都持锁）。载荷全为 Copy 数值，无别名逃逸。
+unsafe impl Sync for LazyCell {}
+
+static LAZY: LazyCell = LazyCell(UnsafeCell::new(LazyTable { items: [LAZY_EMPTY; MAX_LAZY_REGIONS] }));
+
+#[inline]
+fn lazy_items() -> &'static mut LazyTable {
+    unsafe { &mut *LAZY.0.get() }
+}
+
+static DEMAND_ZERO_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// 输家计数：分配了帧、但 map 撞 AlreadyMapped 而把帧归还的次数（ADR-067 决策 5 的证人）。
+static DEMAND_ZERO_LOST: AtomicUsize = AtomicUsize::new(0);
+
+/// 输家还帧次数（竞争格的直接判据；绝对帧差不用它，因为别的用例的延迟回收会污染窗口）。
+pub fn demand_zero_lost() -> usize {
+    DEMAND_ZERO_LOST.load(Ordering::Relaxed)
+}
+
+/// 已填页数（需求修复计数，用例与宿主机对账用，ADR-067 决策 7）。
+pub fn demand_zero_count() -> usize {
+    DEMAND_ZERO_COUNT.load(Ordering::Relaxed)
+}
+
+/// 在用区间数（"槽位回基线"判据的证人）。
+pub fn lazy_region_count() -> usize {
+    let _g = vmm();
+    lazy_items().items.iter().filter(|r| r.used).count()
+}
+
+/// 惰性区间柄（ADR-067 决策 2）：OwnedSet 的一项挂这个；**丢弃即归还**——
+/// 解映射全部已填充页、归还全部帧、放手整段 VA 保留。非 Copy：所有权唯一。
+pub struct LazyHandle {
+    slot: u8,
+}
+
+impl LazyHandle {
+    /// 区间起始 VA（用例装桩代码与竞争格需要；表读在 VMM 内）。
+    pub fn base(&self) -> Option<u64> {
+        let _g = vmm();
+        let r = lazy_items().items[usize::from(self.slot)];
+        if r.used { Some(r.base) } else { None }
+    }
+}
+
+impl Drop for LazyHandle {
+    fn drop(&mut self) {
+        lazy_release(self.slot);
+    }
+}
+
+/// 登记一段用户窗口内的惰性区间（决策 1/2）。VA 走 `alloc_user_va_range`（动态区、
+/// 进共用保留表，ADR-028 分区规则结构兼容）。表满/参数错返回 None（已发的 VA 就地放手，
+/// 不留无主保留）。上下文 KERNEL，取 VMM。
+#[must_use = "惰性区间柄丢弃即归还，随手丢弃等于区间不存在"]
+pub fn lazy_new(pages: usize, owner: ModuleId) -> Option<LazyHandle> {
+    if pages == 0 || pages > MAX_LAZY_PAGES || !is_ready() {
+        return None;
+    }
+    let va = alloc_user_va_range(pages)?;
+    let _g = vmm();
+    for i in 0..MAX_LAZY_REGIONS {
+        let r = &mut lazy_items().items[i];
+        if !r.used {
+            *r = LazyRegion { used: true, base: va.0, pages: pages as u16, filled: 0, owner, frames: [0; MAX_LAZY_PAGES] };
+            return Some(LazyHandle { slot: i as u8 });
+        }
+    }
+    release_va_locked(va.0);
+    None
+}
+
+/// #PF 修复入口（ADR-067 决策 3/4）。命中已登记区间才动手：
+/// 查表（VMM 内）→ 放锁 → phys_alloc（PMM）→ 清零（HHDM，ADR-064 同律）→ map（VMM）→
+/// 回表置位（VMM，并核验槽位身份未变——变了就自我清理走原 Kill 路径）。
+/// 依次获取不算嵌套（lock-order.md）；**本路径绝不碰 RUNQ**（§136 教训）。
+/// 返回 true = 页此刻已映射，重执行将成功；false = 不修，走既有 Kill/Fatal 判据。
+pub fn demand_zero_try(cr2: u64) -> bool {
+    if !is_ready() {
+        return false;
+    }
+    let va = cr2 & !(PAGE as u64 - 1);
+    let hit = {
+        let _g = vmm();
+        let mut found = None;
+        for (i, r) in lazy_items().items.iter().enumerate() {
+            if !r.used || cr2 < r.base || cr2 >= r.base + r.pages as u64 * PAGE as u64 {
+                continue;
+            }
+            let idx = (va - r.base) as usize / PAGE;
+            found = Some((i, idx, r.filled & (1 << idx) != 0, r.owner));
+            break;
+        }
+        found
+    };
+    let Some((slot, idx, already, owner)) = hit else { return false };
+    if already {
+        return true;
+    }
+    let Ok(frames) = phys_alloc(0, owner) else {
+        return false; // 分配失败不吞错、不降级：false ⇒ 走原 Kill 路径
+    };
+    let p = frames.base().0;
+    // 分配即清零：自由帧毒化是 0xA5，不清零就是把陈旧物理内存交出去（ADR-064 决策 2 同理）
+    // SAFETY: p 来自 phys_alloc，HHDM 覆盖全部 max_phys；页对齐；帧此刻归本路径独占
+    unsafe { core::ptr::write_bytes((p + s().hhdm) as *mut u8, 0, PAGE) };
+    // 竞争变体（ADR-067 验收⑥的确定性构造）：把"已查未填 → 分配 → 装页"的窗口拉宽，
+    // 让四路竞争者重叠；默认构建不睡，重叠与否由 TCG 现实时序决定。
+    // 用定圈 pause 而不是 `tsc::spin`：后者会给环内 memory->time 加引用站点（棘轮只许降）。
+    #[cfg(feature = "race-demand-zero")]
+    for _ in 0..20_000 {
+        core::hint::spin_loop();
+    }
+    let m = match map(VirtAddr(va), frames, PageFlags::USER_RW) {
+        Ok(m) => m,
+        // 输家：别人刚填了同一页。frames 已随 map 的 Err 路径 Drop 归还（毒化+台账），
+        // 页此刻已映射 ⇒ 返回 true 让赢家填的那页被重执行读到（结构自带还帧，决策 5）。
+        Err(MmError::AlreadyMapped) => {
+            DEMAND_ZERO_LOST.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        Err(_) => return false,
+    };
+    core::mem::forget(m); // 归还唯一入口是 lazy_release（表里记帧号），这里不留柄
+    let _g = vmm();
+    let r = &mut lazy_items().items[slot];
+    if !r.used || r.base != va - idx as u64 * PAGE as u64 {
+        // 槽位在锁间隙被回收/复用（W2 单 AS 里构造不出来，防御性走自我清理）
+        unmap_locked(VirtAddr(va), 1);
+        if let Err(e) = phys_free(PhysAddr(p), 0, owner) {
+            free_violation(e, PhysAddr(p), owner);
+        }
+        return false;
+    }
+    r.filled |= 1 << idx;
+    r.frames[idx] = p;
+    DEMAND_ZERO_COUNT.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// 归还一个区间（决策 2）。编排：VMM 内快照并清槽 → 放锁 → 逐页 unmap（内含
+/// shootdown）+ phys_free（解映射在归还之前，ADR-023）→ release_va 放手整段保留。
+/// **不得持有任何锁调用**（handle drop 发生在 release_owned 放掉 RUNQ 之后，§136/ADR-027）。
+fn lazy_release(slot: u8) {
+    let snap = {
+        let _g = vmm();
+        let r = &mut lazy_items().items[usize::from(slot)];
+        if !r.used {
+            return;
+        }
+        let s = *r;
+        *r = LAZY_EMPTY;
+        s
+    };
+    for i in 0..snap.pages as usize {
+        if snap.filled & (1 << i) == 0 {
+            continue;
+        }
+        unmap(VirtAddr(snap.base + i as u64 * PAGE as u64), 1);
+        if let Err(e) = phys_free(PhysAddr(snap.frames[i]), 0, snap.owner) {
+            free_violation(e, PhysAddr(snap.frames[i]), snap.owner);
+        }
+    }
+    if !release_va(snap.base) {
+        crate::log_warn!("lazy: 区间 {:#x} 的 VA 保留没放手（还有映射？）", snap.base);
+    }
+}
+
+/// demand_zero_try 的锁内变体：仅在**已经**持 VMM 的防御清理分支里用
+/// （直接调 unmap 会重入 VMM ⇒ L4）。
+fn unmap_locked(va: VirtAddr, pages: usize) {
+    unmap_pages(va, pages);
+}
+
 // ------------------------------------------------------------------ 锁
 // 两把**只当令牌用**的锁（载荷是空元组）：保证"同一时刻只有一个上下文在改结构"，
 // 状态本体仍住在 `State` 里（`s()` 这套访问已遍布本模块，塞进锁里改动量远大于收益）。

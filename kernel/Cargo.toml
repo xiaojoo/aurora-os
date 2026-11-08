@@ -28,6 +28,14 @@ fault-double-free = []
 # 故障注入（P1c / ADR-063）：共享帧 frame_put 到 0 之后再 put 一次，验证 refcnt 的
 # DoubleFree 判定升 L4。与 fault-double-free 同构，但走的是 frame_put 这条共享路径。
 fault-put-double-free = []
+# 故障注入（ADR-066 / W2 P4）：split_huge 取 PT 页的调用点强制失败，验证 OOM 时
+# 原大页原样、台账与 free_frames 回基线。失败被传播（Err）而不是 L4，故该构建期望整体 PASS。
+fault-split-oom = []
+# 竞争放大变体（ADR-067 / W2 P5）：在 demand_zero_try 的"分配之后、装页之前"注入
+# 2M 周期自旋，把已查未填→alloc→map 的窗口拉宽，让四路（3AP+BSP）竞争者确定性重叠，
+# 输家路径（AlreadyMapped→还帧）才会**必然**被执行到——TCG 默认串行化会饿死这条分支，
+# 饿死时的"输家还帧=0"是空转判据，不能当证据（§134/ADR-054 口径）。
+race-demand-zero = []
 # 故障注入（ADR-018）：要一个超过大小类上限的分配，验证全局分配器的失败出口
 # null -> handle_alloc_error -> panic -> 39。没有这个构建，ADR-018 只能靠文档承诺。
 fault-heap-oom = []
