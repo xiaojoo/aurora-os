@@ -218,16 +218,12 @@ fn stage_memory() {
         crate::log_fatal!("mm not ready after takeover");
         exit::finish(exit::Code::BootInvalid);
     }
-    // P1a 引导自洽见证：FrameInfo 影子必须与位图逐帧一致。判据放 integration（mm 不打 fatal，
-    // 环内 memory->diagnostics 受棘轮约束）；不一致就点名首个差异帧并停机。
-    let shadow_bad = mm::frame_info_shadow_mismatch();
-    if let Some(f) = shadow_bad {
-        crate::log_fatal!("L4 mm: FrameInfo 影子与位图不符，首个差异帧 #{}", f);
-        exit::finish(exit::Code::ExceptionFatal);
-    }
+    // P1b：FrameInfo 已接管分配/释放（位图退化为引导期临时量）。引导期那次的逐帧对账
+    // 已在 P1a 证红；接管后的正确性由 ktest 等价判据与 fault-double-free 链盯，不再拿
+    // 已经停更的位图做影子对账（那会在第一次 alloc 后必然不符）。
     crate::log_info!("mm: frames total={} free={} max_phys={:#x}", mm::total_frames(), mm::free_frames(), mm::max_phys());
     let (fi_frames, fi_bytes) = mm::frame_info_size();
-    crate::log_info!("mm: frame_info 影子 帧条目={} 字节={} 引导自洽={}（P1a，位图仍驱动分配）", fi_frames, fi_bytes, shadow_bad.is_none());
+    crate::log_info!("mm: frame_info 帧条目={} 字节={} 接管=true（P1b，refcnt 驱动分配）", fi_frames, fi_bytes);
     crate::log_info!("mm: usable memory = {} MiB over {} regions", mm::usable_bytes() / (1024 * 1024), mm::region_count());
     crate::log_info!("mm: bootloader regions held back = {} MiB (AP park area; reclaim is explicit, M3b)", mm::boot_reclaimable_bytes() / (1024 * 1024));
     tsc::stage("mm-takeover");

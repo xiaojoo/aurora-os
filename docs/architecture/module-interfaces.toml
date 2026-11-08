@@ -192,7 +192,6 @@ public_api = [
   "mm::boot_stack_range",
   "mm::counters",
   "mm::effective_flags",
-  "mm::frame_info_shadow_mismatch",
   "mm::frame_info_size",
   "mm::free_frames",
   "mm::hhdm",

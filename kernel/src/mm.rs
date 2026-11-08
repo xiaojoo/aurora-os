@@ -1480,30 +1480,7 @@ fn bootstrap_frame_info(limit: u64) -> Result<(), MmError> {
     Ok(())
 }
 
-/// 影子与位图逐帧对账：返回首个 refcnt 与位图状态不符的帧号（None = 全一致）。
-/// P1a 的引导见证，由 integration（main）在 init_allocator 之后调用并据此停机——
-/// mm 自己不打 fatal（环内 memory->diagnostics 棘轮）。持 PMM 锁取一致快照。
-pub fn frame_info_shadow_mismatch() -> Option<u64> {
-    let _g = pmm();
-    let st = s();
-    let addr = st.frame_info.load(Ordering::Relaxed);
-    let limit = st.frame_info_frames as u64;
-    if addr == 0 {
-        return None;
-    }
-    let arr = addr as *const FrameInfo;
-    for f in 0..limit {
-        let used = bit_get(f);
-        // SAFETY: arr 覆盖 frame_info_frames 个条目，f<limit 在界内；只读 refcnt（原子）。
-        let rc = unsafe { (*arr.add(f as usize)).refcnt.load(Ordering::Relaxed) };
-        if (rc >= 1) != used {
-            return Some(f);
-        }
-    }
-    None
-}
-
-/// FrameInfo 影子数组的规模（帧条目数, 占用字节）。P1a 供启动日志与宿主机对账。
+/// FrameInfo 数组的规模（帧条目数, 占用字节）。供启动日志与宿主机对账。
 pub fn frame_info_size() -> (usize, usize) {
     let st = s();
     (st.frame_info_frames, st.frame_info_frames * FRAME_INFO_BYTES)
@@ -1515,8 +1492,36 @@ pub fn phys_alloc(order: u8, owner: ModuleId) -> Result<OwnedFrames, MmError> {
     phys_alloc_locked(order, owner)
 }
 
+/// FrameInfo 是否已接管（引导完成后 frame_info 非 0）。P1b：接管后分配/释放走 refcnt，
+/// 位图退化为**仅引导期**的临时分配器（分出元数组那一次）。
+fn frame_info_active() -> bool {
+    s().frame_info.load(Ordering::Relaxed) != 0
+}
+
+/// 读一个帧的 refcnt（FrameInfo 已接管时才有意义）。SAFETY: 调用方持 PMM 锁、f<frame_info_frames。
+fn fi_refcnt(f: u64) -> u32 {
+    let st = s();
+    let arr = st.frame_info.load(Ordering::Relaxed) as *const FrameInfo;
+    // SAFETY: arr 覆盖 frame_info_frames 个条目，f 在界内（调用方保证）；只读原子量。
+    unsafe { (*arr.add(f as usize)).refcnt.load(Ordering::Relaxed) }
+}
+
+/// 把一个帧标为已用/自由（独占：refcnt 1/0）。SAFETY: 调用方持 PMM 锁、f<frame_info_frames。
+fn fi_set_used(f: u64, used: bool, owner: ModuleId) {
+    let st = s();
+    let arr = st.frame_info.load(Ordering::Relaxed) as *mut FrameInfo;
+    // SAFETY: arr 覆盖 frame_info_frames 个条目，f 在界内；PMM 锁保证互斥；元数组帧永不归还。
+    unsafe {
+        let e = &mut *arr.add(f as usize);
+        e.refcnt.store(if used { 1 } else { 0 }, Ordering::Relaxed);
+        e.flags = if used { FI_USED } else { FI_FREE };
+        e.owner = if used { owner } else { ModuleId(0) };
+    }
+}
+
 /// `phys_alloc` 的持锁内核：调用方**必须已持 PMM 锁**。init_allocator 的两阶段引导在
 /// 自己那把 pmm() 里分出 FrameInfo 元数组，不能再取一次 PMM（重入会升 L4），故拆出此函数。
+/// 引导期（frame_info 未就绪）走位图；接管后走 FrameInfo 的 refcnt（P1b）。
 fn phys_alloc_locked(order: u8, owner: ModuleId) -> Result<OwnedFrames, MmError> {
     let st = s();
     if !st.ready.load(Ordering::Relaxed) {
@@ -1524,24 +1529,30 @@ fn phys_alloc_locked(order: u8, owner: ModuleId) -> Result<OwnedFrames, MmError>
     }
     let n = 1usize << order;
     let limit = st.max_phys / PAGE as u64;
+    let active = frame_info_active();
     let mut f = 1u64 << order;
     while f + n as u64 <= limit {
         let mut ok = true;
         for k in 0..n as u64 {
-            if bit_get(f + k) {
+            let used = if active { fi_refcnt(f + k) >= 1 } else { bit_get(f + k) };
+            if used {
                 ok = false;
                 break;
             }
         }
         if ok {
             for k in 0..n as u64 {
-                bit_set(f + k, true);
+                if active {
+                    fi_set_used(f + k, true, owner);
+                } else {
+                    bit_set(f + k, true);
+                }
             }
             let st = s();
             st.free_frames.fetch_sub(n, Ordering::Relaxed);
             // 台账按模块聚合"活着多少"。页表页也是从这里取的（owner=MOD_BOOT）且
             // 永不归还，所以它们在账上一直挂着——这是对的，不是泄漏。
-            // 早期池不记：那部分来自 .bss，没经过分配器。
+            // 早期池不记：那部分来自 .bss，没经过分配器。记账按段（一次 n 帧），保住 call counts。
             crate::resource::account_alloc(owner, n);
             return Ok(OwnedFrames { base: PhysAddr(f * PAGE as u64), order, owner });
         }
@@ -1550,8 +1561,8 @@ fn phys_alloc_locked(order: u8, owner: ModuleId) -> Result<OwnedFrames, MmError>
     Err(MmError::OutOfMemory)
 }
 
-/// 释放：位图已是“已用”以外的状态即为重复释放。
-/// `owner` 只用于台账——所有权判定靠位图，不靠调用方自报。
+/// 释放：FrameInfo 接管后 refcnt==0 即重复释放（位图期靠位图）。
+/// `owner` 只用于台账——所有权判定靠 refcnt/位图，不靠调用方自报。
 fn phys_free(base: PhysAddr, order: u8, owner: ModuleId) -> Result<(), MmError> {
     let _g = pmm();
     let st = s();
@@ -1563,13 +1574,19 @@ fn phys_free(base: PhysAddr, order: u8, owner: ModuleId) -> Result<(), MmError> 
         return Err(MmError::Misaligned);
     }
     let first = base.0 / PAGE as u64;
+    let active = frame_info_active();
     for k in 0..n as u64 {
-        if !bit_get(first + k) {
+        let used = if active { fi_refcnt(first + k) >= 1 } else { bit_get(first + k) };
+        if !used {
             return Err(MmError::DoubleFree);
         }
     }
     for k in 0..n as u64 {
-        bit_set(first + k, false);
+        if active {
+            fi_set_used(first + k, false, ModuleId(0));
+        } else {
+            bit_set(first + k, false);
+        }
     }
     // 释放后毒化，让 use-after-free 变成可观察的错误值（§6.7）
     for b in 0..(n * PAGE) as u64 {

@@ -1,6 +1,6 @@
 # unsafe 逐处审计表（U1–U6）
 
-总计 297 处。U1 56 · U2 63 · U3 13 · U4 116 · U5 28 · U6 21
+总计 298 处。U1 56 · U2 64 · U3 13 · U4 116 · U5 28 · U6 21
 
 本表由 `tools/aurora.py` 的 `unsafe_sites()` 从源码逐处生成，**不是手写的**。
 机器可读的权威来源是 `docs/security/unsafe-whitelist.toml` 的 `[modules.*]` 段（模块×类别→处数），
@@ -475,8 +475,10 @@
   > unsafe { core::ptr::write_volatile((st.hhdm + base.0 + b) as *mut u8, 0xa5) }; } if !crate::resource::account_free(owner, n) { 
 - `kernel/src/mm.rs:1471` [{] **U2** fn=`bootstrap_frame_info`
   > P1a（ADR-063）：写 FrameInfo 影子条目。指针 = phys_alloc_locked 分出的 MOD_BOOT 帧 + HHDM；范围 [0,limit)，AtomicU32 首字段 4 对齐；元数组帧永不归还（生命周期=内核）；引导期单核 IF=0 无并发。不变量由"2^order 帧 >= limit 条目"保证。
-- `kernel/src/mm.rs:1498` [{] **U2** fn=`frame_info_shadow_mismatch`
-  > P1a：只读影子条目 refcnt 与位图对账。同一指针来源/范围/对齐；持 PMM 锁取一致快照；只读原子量，不改状态。
+- `kernel/src/mm.rs:1506` [{] **U2** fn=`fi_refcnt`
+  > P1b：只读一个帧的 refcnt。同一指针来源/范围/对齐；调用方持 PMM 锁且保证 f<frame_info_frames；只读原子量。
+- `kernel/src/mm.rs:1515` [{] **U2** fn=`fi_set_used`
+  > P1b：写一个帧的 refcnt/flags/owner（独占 1/0）。同一指针来源/范围/对齐；PMM 锁互斥；元数组帧永不归还。
 
 ### pci
 

@@ -143,6 +143,31 @@ COW/缺页/每-AS（W3）、锁序表数值（PMM/LEDGER 不变）、syscall 号
   还原 ⇒ PASS。frame 0 是 pinned-used，全填 0 后它第一个不符，所以点名 #0。
 - **矩阵整轮复验 42 行全符合、0 不符**；49 份留档**每一份**都是 `帧条目=130780 字节=1046240 引导自洽=true`。
 
+## P1b 落地记录（2026-11-08，FrameInfo 接管分配/释放）
+
+- **接管读数（实测，build/run-001.log）**：`frame_info 帧条目=130780 字节=1046240 接管=true`。
+  等价用例 `t_frame_info_alloc_free_equivalence`：order 0..=3（1/2/4/8 连续帧）分配-释放各回基线
+  （base=116420），`live回基线=true`，台账 `live=366 alloc=474 free=108`、`Σlive==Σalloc−Σfree` 不变量=true。
+  `ktests total=64 passed=64 failed=0`，判定 PASS。
+- **DoubleFree 链保留（实测）**：`fault-double-free` 仍 `EXCEPTION(39)`、`L4 integrity: DoubleFree base=0x15000 owner=3`
+  ——走 FrameInfo 的 refcnt==0 判定（不再靠位图），毒化 0xA5 与台账按段记账不变。
+- **位图退役**：位图退化为**仅引导期**临时分配器（分出元数组那一次，frame_info 尚未就绪）；
+  接管后 `phys_alloc_locked`/`phys_free` 走 `fi_refcnt`/`fi_set_used`。位图本体留在 State（引导用），
+  不再参与运行期分配。
+- **影子对账删除**：`frame_info_shadow_mismatch` 删除——接管后位图停更，拿它做影子对账会在第一次
+  alloc 后必然不符。正确性改由等价用例 + fault-double-free 链盯。public_api 去掉它，保留 frame_info_size。
+- **unsafe 普查**：mm U2 23→24（删影子对账 1、加 fi_refcnt/fi_set_used 2，净 +1）；total 297→298。
+- **负样本（P1b 实测，含一次不咬的教训）**：
+  - MUT-P1B-1（预注册的那个：`fi_set_used` 永远写 refcnt=1）**不咬**——等价用例仍绿（实测 PASS）。
+    原因：等价用例盯的是 `free_frames` 计数，而 `free_frames.fetch_add` 与 refcnt 是两本独立的账，
+    refcnt 写错不影响它。**这条不计入证据**（未咬的变异不是证据）。
+  - MUT-P1B-2（归还时删 `free_frames.fetch_add`）**咬**：等价用例四个 order 全 `不回基线`、
+    `判定=FAIL(35)`、`t_frame_info_alloc_free_equivalence -> failed`（实测）。还原 ⇒ PASS。
+  - **refcnt 真的被 consult** 由 `fault-double-free` 证：它走 `fi_refcnt>=1` 判定，注入两次释放仍升 L4；
+    若分配/释放不看 refcnt（回退位图），位图在接管后停更，这条链会 differently 行为。
+  - 局限写明：等价用例证"free_frames 记账等价"，**不直接证"refcnt 驱动分配选择"**；后者要靠 P1c 的
+    共享帧用例（N get/N put）与一条"同帧未释放再分配必拒/换帧"的判据补上。
+
 ## 审查记录（2026-11-08，P0 起草后自审，对照源码）
 
 方向不变（refcnt 单一真相、两阶段引导、保留不变量都成立），收紧七处：

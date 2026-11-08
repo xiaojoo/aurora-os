@@ -30,6 +30,44 @@ fn t_alloc_free_returns_frames() -> bool {
 }
 ktest!(KT_ALLOC_FREE, t_alloc_free_returns_frames);
 
+/// P1b（ADR-063）：FrameInfo 接管分配/释放后，多规格连续帧的分配-释放必须回基线，
+/// 且台账 Σlive==Σalloc−Σfree 不变量不破坏。这是"位图→refcnt 独占行为等价"的见证：
+/// 单帧那条（KT_ALLOC_FREE）只测 order 0，这里覆盖 order 0..=3（1/2/4/8 帧连续）。
+/// 反空转：alloc 必须真的减少 free（base>after），否则"释放回基线"可能是常量真。
+fn t_frame_info_alloc_free_equivalence() -> bool {
+    let base = mm::free_frames();
+    let live0 = crate::resource::live_of(mm::MOD_TEST);
+    let mut ok = true;
+    let mut detail = [0u64; 4];
+    for order in 0u8..4 {
+        let n = 1usize << order;
+        let f = match mm::phys_alloc(order, mm::MOD_TEST) {
+            Ok(f) => f,
+            Err(e) => {
+                crate::log_fatal!("frame_info 等价: order {} 分配失败 {:?}", order, e);
+                ok = false;
+                break;
+            }
+        };
+        let after_alloc = mm::free_frames();
+        drop(f);
+        let after_free = mm::free_frames();
+        detail[order as usize] = after_free as u64;
+        if !(after_alloc == base - n && after_free == base) {
+            crate::log_fatal!("frame_info 等价: order {} alloc={} free={} base={} 不回基线", order, after_alloc, after_free, base);
+            ok = false;
+        }
+    }
+    let t = crate::resource::totals();
+    let live_back = crate::resource::live_of(mm::MOD_TEST) == live0;
+    let ledger_ok = t.sum_live == t.sum_alloc - t.sum_free && !t.violation;
+    crate::log_info!(
+        "frame_info 等价(P1b): base={} 各order释放回={} live回基线={} 台账live={} alloc={} free={} 不变量={}",
+        base, detail[0], live_back, t.sum_live, t.sum_alloc, t.sum_free, ledger_ok);
+    ok && live_back && ledger_ok && base > 0
+}
+ktest!(KT_FRAME_INFO_EQUIV, t_frame_info_alloc_free_equivalence);
+
 /// 映射 -> 写入 -> 读回 -> 解映射，且所有权随 Mapping 归还（§6.3 R13）
 fn t_map_write_unmap() -> bool {
     const MAGIC: u64 = 0x5176_0dae_1234_beef;
