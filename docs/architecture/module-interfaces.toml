@@ -277,6 +277,7 @@ public_api = [
   "sync::RANK_PMM",
   "sync::RANK_TEST",
   "sync::RANK_VMM",
+  "sync::WaitToken",
   "sync::stats",
   "sync::IrqGuard",
   "sync::RANK_HANDLE",

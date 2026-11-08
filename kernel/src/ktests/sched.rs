@@ -516,6 +516,78 @@ fn t_idle_fallback() -> bool {
 }
 ktest!(KT_IDLE_FALLBACK, t_idle_fallback);
 
+/// P4a 的工人：标阻塞 → 告诉启动上下文 → 让出 → 被唤醒后置位 → **再让一次**还 CPU → 收工。
+/// 最后那次让出是必须的：否则它标 Done 之后就在原地自旋，启动上下文读不到 WOKE
+/// （停表时没有 tick 能把它换下去，§111 那一类）。
+static BW_MARKED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static BW_WOKE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+const BW_TOKEN: sync::WaitToken = sync::WaitToken { queue: 0, seq: 1 };
+
+fn block_wake_worker() -> ! {
+    if sched::block_current(BW_TOKEN) {
+        BW_MARKED.store(1, Ordering::Relaxed); // 此刻它确实是 Blocked 了
+        sched::yield_now();
+    }
+    BW_WOKE.store(1, Ordering::Relaxed);
+    sched::yield_now();
+    sched::finish_current();
+    loop {
+        tsc::spin(3_000);
+    }
+}
+
+/// P4a（ADR-053）：同核阻塞/唤醒的状态转移与**世代号**。
+///
+/// 判据四格：①工人真的进了 `Blocked(token)`；②**错世代号的 wake 必须无效**
+/// （返回 false 且状态仍是 Blocked）——这一格就是决策 4 的负样本，内置在判据里，
+/// 去掉世代号比较它会当场红；③对的 token 能唤醒；④工人真的被放出去跑过。
+/// 全部用 `yield_now` 驱动，不依赖 tick，所以停表状态下也确定性成立。
+fn t_block_wake() -> bool {
+    if sched::state_of(0) == sched::TaskState::Free {
+        sched::init_boot_task();
+    }
+    BW_MARKED.store(0, Ordering::Relaxed);
+    BW_WOKE.store(0, Ordering::Relaxed);
+    let w = match sched::spawn(block_wake_worker) {
+        Ok(i) => i,
+        Err(e) => {
+            crate::log_fatal!("block/wake: 工人 spawn 失败 {:?}", e);
+            return false;
+        }
+    };
+    sched::yield_now(); // 换工人上来
+    let mut n = 0usize;
+    while BW_MARKED.load(Ordering::Relaxed) == 0 && n < 1000 {
+        sched::yield_now();
+        n += 1;
+    }
+    let marked = BW_MARKED.load(Ordering::Relaxed) == 1;
+    let st_blocked = sched::state_of(w);
+    let stale = sched::wake_task(w, sync::WaitToken { queue: 0, seq: 2 });
+    let st_after_stale = sched::state_of(w);
+    let woke = sched::wake_task(w, BW_TOKEN);
+    let mut m = 0usize;
+    while BW_WOKE.load(Ordering::Relaxed) == 0 && m < 1000 {
+        sched::yield_now();
+        m += 1;
+    }
+    let woken = BW_WOKE.load(Ordering::Relaxed) == 1;
+    crate::log_info!(
+        "block/wake(ADR-053): worker=#{} marked={} 阻塞态={:?} 错token={} 之后={:?} 对token={} 被唤醒={} 让出={}/{}",
+        w, marked, st_blocked, stale, st_after_stale, woke, woken, n, m);
+    // 收干净（ADR-050 的同一纪律，这里是内核工人）：留一个仍 Runnable 的工人在队列里，
+    // 后续用例让出时就会把它选上来，而它标 Done 之后原地自旋——停表窗口里 idle 也要靠
+    // tick 才能还回 CPU，于是整机静默。实测这么挂过一次，所以用例自己 terminate 掉。
+    let _ = sched::terminate_task(w);
+    marked
+        && matches!(st_blocked, sched::TaskState::Blocked(t) if t == BW_TOKEN)
+        && !stale
+        && matches!(st_after_stale, sched::TaskState::Blocked(_))
+        && woke
+        && woken
+}
+ktest!(KT_BLOCK_WAKE, t_block_wake);
+
 /// `if_patch` 两条分支的直接覆盖，以及 asm 偏移与 Rust 结构体的对账。
 ///
 /// 为什么这条用例存在：ADR-021 的"关着窗口换入"分支今天**没有触发源**

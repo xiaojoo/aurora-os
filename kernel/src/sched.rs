@@ -56,6 +56,10 @@ pub enum TaskState {
     Runnable,
     Running,
     Done,
+    /// 阻塞在某个等待队列上（ADR-053，P4a）。**不是**"可运行"：
+    /// `pick_next` 与 `tasks_active` 的 `Runnable | Running` 过滤天然把它排除，
+    /// `reap` 也跳过它（它还活着、还持有资源）。唤醒由 `wake_task` 按世代号转移。
+    Blocked(crate::sync::WaitToken),
 }
 
 pub struct Task {
@@ -579,6 +583,8 @@ static SWITCHES_FOR: [AtomicUsize; crate::arch::x86_64::cpu::MAX_CPUS] = [const 
 
 /// 所有 CPU 上"还能被调度"的任务数之和（跨核快照，只用于日志与判据）。
 pub fn tasks_active() -> usize {
+    // `Blocked` 不在集合里（它既不是 Runnable 也不是 Running）——这不是"任务消失了"，
+    // 是它正在等；idle 也被排除（它不是工作）。两条都由 ADR-051/053 明确要求写明。
     (0..MAX_TASKS_TOTAL)
         .filter(|&i| {
             // idle 不是"工作"：把它算进去会让 active_left 一类读数凭空 +1（ADR-051 决策 4）
@@ -627,6 +633,48 @@ pub fn mark_tick() {
     let slot = crate::arch::x86_64::cpu::self_slot();
     FLAGS[slot].ticks.fetch_add(1, Ordering::Relaxed);
     FLAGS[slot].need.store(true, Ordering::Release);
+}
+
+/// 把**当前任务**标成阻塞（ADR-053 P4a）。只改状态、**不让出**——
+/// 调用方要在放掉队列锁之后自己 `yield_now()`，因为持锁切走会让 guard 在阻塞期间
+/// 一直不释放（ADR-053 决策 2 修正了 ADR-047 的措辞）。
+/// 返回 false 表示当前上下文不是可运行任务（没登记/已 Done），调用方不该再让出。
+pub fn block_current(token: crate::sync::WaitToken) -> bool {
+    let cpu = crate::arch::x86_64::cpu::self_slot();
+    let mut s = rq(cpu);
+    let me = s.current;
+    let sl = slot_of(me);
+    if !matches!(s.tasks[sl].state, TaskState::Running | TaskState::Runnable) {
+        return false;
+    }
+    s.tasks[sl].state = TaskState::Blocked(token);
+    true
+}
+
+/// 唤醒一个阻塞任务（P4a：立目标 CPU 的 need 牌；跨核 IPI 在 P4c）。
+/// **只有**目标槽确实是 `Blocked` 且世代号匹配时才转移，否则返回 false：
+/// 陈旧 wake、唤醒一个已 Free/Done 的槽、或 token 对不上，都必须是无效操作，
+/// 否则会把一个新任务误当成旧等待者放出去（ADR-053 决策 4）。
+pub fn wake_task(gidx: usize, token: crate::sync::WaitToken) -> bool {
+    if gidx >= MAX_TASKS_TOTAL {
+        return false;
+    }
+    let cpu = cpu_of(gidx);
+    let moved = {
+        let mut s = rq(cpu);
+        let sl = slot_of(gidx);
+        match s.tasks[sl].state {
+            TaskState::Blocked(t) if t == token => {
+                s.tasks[sl].state = TaskState::Runnable;
+                true
+            }
+            _ => false,
+        }
+    };
+    if moved {
+        mark_need(cpu);
+    }
+    moved
 }
 
 /// 主动让出：立牌 + 自陷 resched 向量（ADR-049，P3a）。

@@ -4381,6 +4381,44 @@ AP 侧仍用 slot 0 的空闲上下文当兜底，没有专属 idle。两者都�
 （ADR-047 决策 3/4：定长不进堆、检查条件→入队→切走同锁内、`RANK_WAITQ(5)` 已在锁序表里
 等着），配防丢唤醒计数与变异 A（把入队移出锁）/变异 B（去掉 resched IPI）。
 
+## 123. P4a：Blocked 与世代号落地，同核阻塞/唤醒有真实调用者（2026-11-08，实测）
+
+**ADR-053 先裁决了两件事**（都是落地前发现的，不是事后解释）：
+1. `sync` **不能**引用 `sched`：今天 `sched -> sync` 是单向边、`sched` 是环 A 外的单点，
+   反向引用会把 `sched` 拉进强连通分量，SCC 闸与 ADR-044 棘轮同时红。
+   所以 `WaitQueue` 将来用**回调表**反转（沿用 ADR-040 形状），`WaitToken` 类型放 `sync`。
+2. **"持等待队列锁换人"在本仓库会死锁**：`IrqGuard` 的 Drop 在函数返回时执行，
+   而阻塞的任务在被唤醒前不返回 ⇒ 睡着的整段时间锁一直被持有，唤醒方全死。
+   改为**放锁后再自陷切走**；防丢唤醒仍成立，因为致命窗口是"查条件到入队之间"，
+   那两步在同一把锁内（P4b 落地）。
+
+**P4a 交付（实测）**：`sync::WaitToken{queue:u8,seq:u64}`、`TaskState::Blocked(WaitToken)`、
+`sched::block_current(token)`（只改状态、不让出）与 `sched::wake_task(gidx,token)`
+（**只有**槽确实是 Blocked 且世代号匹配才转移，否则 false）。
+加变体后**零编译破损**：29 处产品路径引用全是赋值与 `matches!`，没有穷举匹配；
+`Runnable | Running` 的过滤天然排除 Blocked（语义正确，已写进 `tasks_active` 注释）。
+
+**真实调用者与判据（实测）**：`t_block_wake` 同核阻塞/唤醒，四格——
+真进 `Blocked(token)`、**错世代号 wake 必须无效**、对的 token 能唤醒、工人真被放出去跑过。
+读数：`marked=true 阻塞态=Blocked(seq=1) 错token=false 之后=Blocked 对token=true 被唤醒=true`，
+默认档 **3/3 PASS、56/56**。全部用 `yield_now` 驱动，停表状态下也确定性成立。
+
+**MUTATION-W（确定性证红，实测）**：去掉 `wake_task` 的世代号比较 ⇒
+`错token=true 之后=Runnable 对token=false` → `t_block_wake -> failed` → FAIL(35)。
+这正是陈旧唤醒把新任务误当旧等待者放出去的形状。还原 ⇒ PASS。
+
+**过程中真实挂过一次（实测，已修）**：第一版用例收尾留下一个仍 Runnable 的内核工人，
+后续 `t_reap_premise` 让出时把它选上来，它标 Done 后原地自旋；停表窗口里 idle 也要靠 tick
+才能还回 CPU ⇒ 整机静默（挂在 contention 之后那条）。修法与 ADR-050 同一条纪律：
+**用例自己 `terminate_task` 收干净**。这也说明 ADR-050 的不变量只覆盖用户任务是不够的，
+内核工人的残留同样能触发这一类——记为未决，不在本轮扩大判据范围。
+
+**登记面**：`sync.public_api` +1（`WaitToken`，被 sched 在产品路径引用）；
+**无新增 unsafe 站点**（两个原语都用既有 `rq()` 守卫）。`check` 17/17。
+
+**下一步**：P4b（`sync::WaitQueue` + `WaitOps` 装表 + 条件等待协议 + 定长槽位/`NoCapacity`，
+配变异 A：入队移出锁 ⇒ 丢唤醒 > 0），然后 P4c（跨核 IPI + hooks `mark_need` + 4 核压力 + 变异 B）。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

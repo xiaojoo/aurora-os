@@ -56,6 +56,19 @@ pub const RANK_ACPI: LockRank = LockRank(50);
 /// 当场报成锁序违规，而不是安静地共用一个数字。
 pub const RANK_TEST: LockRank = LockRank(60);
 
+/// 等待的世代号（ADR-053 决策 3，P4a）。
+///
+/// 为什么放 `sync` 而不是 `sched`：`sched -> sync` 这条边已经存在，类型放这边不新增依赖；
+/// 反过来放会让 `sync` 依赖 `sched`，把 `sched` 拉进环 A（SCC 闸与站点棘轮会同时红）。
+/// `seq` 用来分辨"叫醒的是这次等待"，而不是上一次遗留的那次——陈旧 wake 必须无效。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaitToken {
+    /// 等待队列编号（P4b 的 `WaitQueue` 用它定位；P4a 的同核用例填 0）
+    pub queue: u8,
+    /// 本次等待的世代号，由等待方单调递增地取
+    pub seq: u64,
+}
+
 const UNHELD: u64 = u64::MAX;
 
 pub struct IrqSpinLock<T> {
