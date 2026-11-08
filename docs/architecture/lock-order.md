@@ -49,6 +49,15 @@
 同样成立在**同一层**意义上：它的顶半只允许置标志 + EOI，真正的换人动作发生在被中断的
 上下文恢复 IF 之后（走 `preempt_point`），否则就是拿等待队列锁的 ISR 撞上请求方。
 
+**第二个应用点：`terminate_task`（P7b/ADR-061，2026-11-08）。** 终止一个 `Blocked` 任务
+要收两份注册——等待链上的 waiter（WAITQ 5）与定时器轮里的项（TIMER 6）。
+它先在持 RUNQ(8) 的那一段里读出旧 token，**放掉 RUNQ 之后**才去取这两把锁：
+持着 8 去取 5 或 6 就是上面那条反向嵌套。顺序也不能倒过来写成"先摘链再标 Free"——
+中间插进一次 wake 会把已经终止的任务标回 `Runnable`。
+取消本身是幂等的（`remove_task` 找不到返回 false，`timer_del_for_wait` 按 `(task, token)` 匹配），
+所以正常唤醒路径上这两句都是无效操作。见证：`t_kill_blocked_cleans_registrations`
+（6 轮"阻塞→杀"，改前各漏 6 格、改后 0；见 ADR-061 的红绿两跑）。
+
 ## M3b-1：等级栈必须是 per-CPU 的
 
 `sync::INNERMOST` 今天是一个 `[AtomicU8; cpu::MAX_CPUS]`。**之前是一份全局值**，

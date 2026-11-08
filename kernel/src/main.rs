@@ -422,24 +422,45 @@ fn run_ktests_and_finish() -> ! {
         let bsp = cpu::BSP_SLOT;
         let mut left = 0usize;
         let mut first = usize::MAX;
+        // P7b（欠账⑥）：**内核工人也算**。Blocked 的任务占着等待槽、可能还占着一个轮项，
+        // 用例收尾还留着它就是漏注册——与"可运行的用户任务"是两种不同的漏，所以分开点名。
+        // ADR-050 未决 1 当时豁免了内核工人（tick 在跑时会被轮转），那条豁免只对 Runnable 成立；
+        // Blocked 不会被任何 tick 轮转，只能等一个也许永远不会来的唤醒。
+        let mut blocked = 0usize;
+        let mut first_blocked = usize::MAX;
         for i in 0..sched::MAX_TASKS_TOTAL {
-            if sched::cpu_of(i) != bsp || !sched::is_user(i) {
+            if sched::cpu_of(i) != bsp {
                 continue;
             }
-            if matches!(sched::state_of(i), sched::TaskState::Runnable | sched::TaskState::Running) {
+            let st = sched::state_of(i);
+            if matches!(st, sched::TaskState::Blocked(_)) {
+                blocked += 1;
+                if first_blocked == usize::MAX {
+                    first_blocked = i;
+                }
+                continue;
+            }
+            if !sched::is_user(i) {
+                continue;
+            }
+            if matches!(st, sched::TaskState::Runnable | sched::TaskState::Running) {
                 left += 1;
                 if first == usize::MAX {
                     first = i;
                 }
             }
         }
-        if left == 0 {
-            return true;
+        if blocked != 0 {
+            crate::log_fatal!(
+                "用例收尾不变量破坏：test={} 之后本 CPU 仍有 {} 个阻塞任务（首个 #{}）⇒ 等待槽/轮项漏了",
+                name, blocked, first_blocked);
         }
-        crate::log_fatal!(
-            "用例收尾不变量破坏：test={} 之后本 CPU 仍有 {} 个可运行用户任务（首个 #{}）",
-            name, left, first);
-        false
+        if left != 0 {
+            crate::log_fatal!(
+                "用例收尾不变量破坏：test={} 之后本 CPU 仍有 {} 个可运行用户任务（首个 #{}）",
+                name, left, first);
+        }
+        left == 0 && blocked == 0
     });
     crate::log_info!("ktests: total={} passed={} failed={} table_invalid={}", s.total, s.passed, s.failed, s.table_invalid);
     // §9.6 的账本：开机到现在看过几次心跳、报过几次、处置过几次。处置次数今天必须是 0，

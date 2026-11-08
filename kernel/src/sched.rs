@@ -185,17 +185,33 @@ pub fn terminate_task(task: usize) -> bool {
         return false;
     }
     let cpu = cpu_of(task);
-    let (slot, on_cpu_now, has_bag) = {
+    let (slot, on_cpu_now, has_bag, was_blocked) = {
         let mut s = rq(cpu);
         let slot = slot_of(task);
         if s.tasks[slot].state == TaskState::Free {
             return false;
         }
+        let was_blocked = match s.tasks[slot].state {
+            TaskState::Blocked(tok) => Some(tok),
+            _ => None,
+        };
         s.tasks[slot].state = TaskState::Free;
         s.tasks[slot].frame = 0;
         s.entries[slot] = None;
-        (slot, s.current == task, s.tasks[slot].owned.n > 0)
+        (slot, s.current == task, s.tasks[slot].owned.n > 0, was_blocked)
     };
+    // P7b（欠账⑥）：阻塞着的任务还占着**两份注册**——等待链上的 waiter 与定时器轮里的项。
+    // 只改任务槽的话这两份永久留着：槽会被 spawn 复用，而注册认的是槽下标，
+    // 于是等待队列 16 格 / 轮 64 格杀够次数就再也等不了（实测 6 次杀 ⇒ 各漏 6 格）。
+    // **必须在放掉 RUNQ 之后做**：WAITQ(5)/TIMER(6) 都在 RUNQ(8) 之内，持着 RUNQ 去取是反向嵌套。
+    // 摘链与取消都用 token 里带的队列号；`timer_del_for_wait` 自己按 (task, token) 匹配，
+    // 所以陈旧调用是无效操作，不会误删别人那一格。
+    if let Some(tok) = was_blocked {
+        if let Some(q) = crate::sync::wait_queue(tok.queue) {
+            let _ = q.remove_task(task);
+        }
+        let _ = timer_del_for_wait(task, tok);
+    }
     // 放掉队列锁之后再回收：`release_owned` 自己分段取锁，而它中间要 drop `Mapping`
     // （拿 VMM 锁、可能等 shootdown 回执）。拿着队列锁去等一把跨 CPU 的锁，等于把两条
     // 不变量绑成一条——这正是 ADR-047 决策 2 禁止的形状。

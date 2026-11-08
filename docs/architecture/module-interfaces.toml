@@ -284,6 +284,7 @@ public_api = [
   "sync::RANK_VMM",
   "sync::WaitToken",
   "sync::WaitOps",
+  "sync::wait_queue",
   "sync::install_wait_ops",
   "sync::stats",
   "sync::IrqGuard",

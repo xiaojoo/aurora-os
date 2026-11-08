@@ -1094,6 +1094,116 @@ fn t_wait_timeout() -> bool {
 }
 ktest!(KT_WAIT_TIMEOUT, t_wait_timeout);
 
+const P7B_QID: u8 = 4;
+const P7B_ROUNDS: usize = 6;
+static P7B_FLAG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// 一直阻塞到被人杀掉的工人：条件永不成立，deadline 取 20 个 tick 之后。
+/// 这样它同时占着**一个等待槽**和**一个轮项**——两份注册都要有人收。
+/// deadline 不用"远在未来"：被杀之后那两份注册就是**孤儿**（槽已 Free，`wake_task` 拒绝唤醒），
+/// 修复前没有任何公开接口能取消它们。取有界的 deadline，让轮自己到期把槽放开，
+/// 红的那一跑才能把残留收干净、不连坐后面的用例。20 tick 远大于本用例一轮的耗时。
+fn p7b_blocked_worker() -> ! {
+    if let Some(q) = sync::wait_queue(P7B_QID) {
+        let tick = clock::current().map_or_else(clock::max_tick_period_cycles, |c| c.tick_period_cycles);
+        let _ = q.wait_while_until(P7B_QID, || P7B_FLAG.load(Ordering::Acquire) != 0, tsc::now().wrapping_add(tick * 20));
+    }
+    sched::finish_current();
+    loop {
+        tsc::spin(3_000);
+    }
+}
+
+/// P7b（欠账⑥）：杀掉一个**正阻塞着**的内核工人，它占的两份注册必须一起消失。
+///
+/// 为什么这条值得单独一格：`terminate_task` 原来只改任务槽（标 Free），
+/// 等待链上的 waiter 与定时器轮里的项都不动。任务槽会被 `spawn` 复用，而那两份注册
+/// 认的是**槽下标**，于是它们永久占着槽：等待队列 16 格、轮 64 格，杀够次数就再也等不了。
+/// 三条判据分开数，红的时候能指出漏的是哪一份：
+/// ①`blocked_ok` 是**防空转**格——工人必须真的到过 `Blocked` 且两份注册都涨了一格，
+///   否则"杀完残留=0"可能只是因为它压根没注册；
+/// ②每轮杀完等待链回到基线；③每轮杀完轮项回到基线。
+/// 收尾把还阻塞着的工人叫醒再终止：红的那一跑（修复前）也不许把残留留给后面的用例。
+fn t_kill_blocked_cleans_registrations() -> bool {
+    if sched::state_of(0) == sched::TaskState::Free {
+        sched::init_boot_task();
+    }
+    let Some(q) = sync::wait_queue(P7B_QID) else {
+        crate::log_fatal!("杀阻塞工人: 队列取不到");
+        return false;
+    };
+    let bsp = cpu::BSP_SLOT;
+    // 用例自足于时钟状态（与 t_wait_timeout 同一理由：链接顺序可能让前面的用例停过表）。
+    // 收尾要靠在跑的用例被 tick 换回来，表停了那一步就永远等不到。
+    let tick_in = apic::ticks();
+    let probe = apic::wait_ticks(tick_in, 1, clock::window_cycles(1));
+    let was_running = probe.ticks >= 1;
+    if !was_running {
+        apic::timer_start().ok();
+    }
+    P7B_FLAG.store(0, Ordering::Relaxed);
+    let (_, _, _, q0) = q.stats();
+    let (_, _, t0) = sched::timer_stats(bsp);
+    let mut blocked_ok = 0usize;
+    let mut q_leaks = 0usize;
+    let mut t_leaks = 0usize;
+    let mut spawned: [usize; P7B_ROUNDS] = [usize::MAX; P7B_ROUNDS];
+    for round in 0..P7B_ROUNDS {
+        let w = match sched::spawn(p7b_blocked_worker) {
+            Ok(i) => i,
+            Err(e) => {
+                crate::log_fatal!("杀阻塞工人: 第 {} 轮 spawn 失败 {:?}", round, e);
+                break;
+            }
+        };
+        spawned[round] = w;
+        // 先让工人上去阻塞：不让这一次，它还没注册就被杀，判据会变成空转
+        let mut n = 0usize;
+        loop {
+            sched::yield_now();
+            let (_, _, _, qd) = q.stats();
+            let (_, _, td) = sched::timer_stats(bsp);
+            if matches!(sched::state_of(w), sched::TaskState::Blocked(_)) && qd == q0 + 1 && td == t0 + 1 {
+                blocked_ok += 1;
+                break;
+            }
+            n += 1;
+            if n >= 200 { break; }
+        }
+        let _ = sched::terminate_task(w);
+        let (_, _, _, qd) = q.stats();
+        let (_, _, td) = sched::timer_stats(bsp);
+        if qd != q0 { q_leaks += 1; }
+        if td != t0 { t_leaks += 1; }
+    }
+    let (_, _, _, q_left) = q.stats();
+    let (_, _, t_left) = sched::timer_stats(bsp);
+    // 收尾：被杀之后那两份注册是孤儿——槽已 Free，`wake_task` 拒绝唤醒，所以既叫不醒、
+    // 也没法让工人自己跑回来取消。等待链用 `remove_task` 逐个摘（它只认槽下标）；
+    // 轮项没有公开取消接口，靠 20 tick 的 deadline 自己到期放开（`wheel_tick` 无条件清 used）。
+    // 前面三版都在这里绕：wake 完就 terminate（工人没机会跑）、按 state_of 等（槽已 Free，
+    // 条件当场成立）、按轮项数配 yield 等（孤儿项不会因 wake 消失，等到最后整机挂死）。
+    // 现在不做任何 yield：红的那一跑留给后面用例的轮项会在 200 ms 内自己到期。
+    for w in spawned {
+        if w != usize::MAX {
+            let _ = q.remove_task(w);
+        }
+    }
+    let (_, _, _, q_end) = q.stats();
+    let (_, _, t_end) = sched::timer_stats(bsp);
+    // 进来时表是停的就停回去——**但只在没有残留的时候**。修复前那一跑留着 6 个孤儿轮项，
+    // 停表等于让它们永远占着槽（后面 t_wait_timeout 的"残留=0"会被连坐）。
+    // 留着表跑，它们 20 tick 之后自己到期；这是用例自足与不污染之间唯一能两头都顾的写法。
+    if !was_running && t_end == t0 {
+        apic::timer_stop().ok();
+    }
+    crate::log_info!(
+        "杀阻塞工人(P7b): rounds={} 真阻塞过={} 等待链残留 {}->{} 轮项残留 {}->{} 漏链轮数={} 漏轮项轮数={} 收尾后 链={} 轮={}",
+        P7B_ROUNDS, blocked_ok, q0, q_left, t0, t_left, q_leaks, t_leaks, q_end, t_end);
+    blocked_ok == P7B_ROUNDS && q_leaks == 0 && t_leaks == 0
+}
+ktest!(KT_KILL_BLOCKED, t_kill_blocked_cleans_registrations);
+
 /// `if_patch` 两条分支的直接覆盖，以及 asm 偏移与 Rust 结构体的对账。
 ///
 /// 为什么这条用例存在：ADR-021 的"关着窗口换入"分支今天**没有触发源**
