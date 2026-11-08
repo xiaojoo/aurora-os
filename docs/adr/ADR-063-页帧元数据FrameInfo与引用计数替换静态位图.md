@@ -138,8 +138,10 @@ COW/缺页/每-AS（W3）、锁序表数值（PMM/LEDGER 不变）、syscall 号
   这是"新规则配负样本"之外的另一条纪律：**新增致命路径不许喂胖环内诊断边**。
 - **登记**：`memory.public_api` 补 `mm::frame_info_size`、`mm::frame_info_shadow_mismatch`；
   unsafe 普查 mm U2 21→23（引导写入 + 只读对账两处，白名单已写指针来源/范围/对齐/生命周期/并发）。
-- **负样本（P1a 预注册，P1b/P1c 兑现）**：影子对账本身是引导见证；把平移循环改成"全填 0"
-  ⇒ `frame_info_shadow_mismatch` 返回首个已用帧 ⇒ main 停机（证它对漂移会咬）。
+- **负样本（P1a 已证红）**：把平移循环改成"全填 0" ⇒ `frame_info_shadow_mismatch` 返回首个已用帧
+  ⇒ main 停机（实测 `判定=EXCEPTION qemu_rc=39`，`L4 mm: FrameInfo 影子与位图不符，首个差异帧 #0`）；
+  还原 ⇒ PASS。frame 0 是 pinned-used，全填 0 后它第一个不符，所以点名 #0。
+- **矩阵整轮复验 42 行全符合、0 不符**；49 份留档**每一份**都是 `帧条目=130780 字节=1046240 引导自洽=true`。
 
 ## 审查记录（2026-11-08，P0 起草后自审，对照源码）
 
