@@ -672,6 +672,12 @@ pub fn request_resched(cpu: usize) -> bool {
     }
 }
 
+/// `current_id` 的**不取锁**版本（P7a）：只读快照，供故障/崩溃路径用。
+/// 它不参与调度决定，所以弱读是合法的（与 `current_of` 同一条论证）。
+fn current_id_no_lock() -> usize {
+    current_of(crate::arch::x86_64::cpu::self_slot())
+}
+
 /// 把调度器实现装进 `sync` 的等待回调表（ADR-053 决策 1 的反转）。
 /// `sync` 因此不引用 `sched`，依赖方向不变、环 A 不动。启动期装一次，之后只读。
 pub fn install_wait_ops() {
@@ -1557,6 +1563,7 @@ pub fn install_arch_hooks() {
     crate::hooks::install(crate::hooks::SchedHooks {
         mark_tick,
         mark_need: mark_need_self,
+        current_id_snapshot: current_id_no_lock,
         init_idle_task,
         spawn,
         bump_current_work,

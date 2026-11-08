@@ -4010,6 +4010,29 @@ def instrument_caused_red(log: str) -> tuple[bool, str]:
 
 
 
+def l4_exit_cascade(log: str, first_anchor: str) -> tuple[bool, str]:
+    """P7a / ADR-060：致命故障停在**持锁现场**时，退出路径不许再级联出第二条 L4。
+
+    现场（改前实测）：`fault-lock-reentrant` 与 `fault-shootdown-noack` 两档各打两条 L4 ——
+    第一条是被注入的那个故障，第二条是退出路径上的 `锁序违规，外层 rank=10/20 本次 rank=8`
+    （致命路径还在持锁，`preempt_point` 去取 RUNQ(8)）。第二条污染崩溃记录：
+    `crash.thread_id` 走的是会取锁的那条路，于是记录里那一格也不是出事任务的。
+
+    判据只查"级联"这一件事，不查故障本身（那是那一行的退出码在管）：
+    * 必须有锚点行，否则注入根本没走到 —— 那是量具没咬，不许算绿；
+    * 锚点之后**到日志末尾**不许再出现 `L4 sync: 锁序违规`。锚点之前也不查：
+      将来若有别的用例故意造锁序违规，那不是这条判据要管的事。
+    """
+    i = log.find(first_anchor)
+    if i < 0:
+        return False, f"这一跑没有锚点 `{first_anchor}` ⇒ 注入没走到，判据不算数"
+    tail = log[i:]
+    n = tail.count("L4 sync: 锁序违规")
+    if n:
+        return False, f"锚点之后还有 {n} 条 `L4 sync: 锁序违规` ⇒ 退出路径级联又回来了"
+    return True, "锚点在，锚点之后无级联"
+
+
 def check_irq_trace(log: str, src: Path | None = None) -> tuple[list[str], str]:
     """M5-g③：把 QEMU `-d int` 数到的投递与内核自己报的两本账对起来。
 
@@ -4574,6 +4597,9 @@ def do_test(timeout: int) -> int:
     print("=== 锁重入注入（--features fault-lock-reentrant，held_by 必须当场叫）===")
     IMAGE.unlink(missing_ok=True)
     rv, rrc, rlog = do_run(["fault-lock-reentrant"], timeout)
+    # P7a / ADR-060：这一跑停机时正持着 HEAP(10)，退出路径不许再级联出第二条 L4。
+    rcasc_ok, rcasc_msg = l4_exit_cascade(rlog, "L4 sync: 重入获取")
+    print("    无级联:", rcasc_msg)
 
     # ADR-021 的负样本：把"IF 属于 CPU"改回"任务自己带 IF"。
     # 期望是**挂死**而不是报红——被抢占过的任务换回来时带着 IF=0，就再没有 tick 能抢占任何人。
@@ -4607,6 +4633,10 @@ def do_test(timeout: int) -> int:
     print("=== shootdown 不回执注入（--features fault-shootdown-noack，必须升 L4）===")
     IMAGE.unlink(missing_ok=True)
     sv, src, slog = do_run(["fault-shootdown-noack"], timeout)
+    # 同一条判据的第二个样本：这一跑停机时持的是 VMM(20)，级联那条的外层 rank 因此不同。
+    # 两档各查一次而不只查一档：只看其中一档，另一档的退出路径改坏了也照样绿。
+    scasc_ok, scasc_msg = l4_exit_cascade(slog, "L4 mm: shootdown 超时")
+    print("    无级联:", scasc_msg)
     print("=== virtio-blk 取证（--features virtio-blk，第三块盘走 virtio）===")
     vv, vrc, vlog = do_run(["virtio-blk"], timeout)
     print("=== 启动循环保护：同一份镜像连跑四遍（--features negative-probe），第四次必须进安全模式 ===")
@@ -4961,13 +4991,15 @@ def do_test(timeout: int) -> int:
         # 守卫拒绝之后容器路径必然走 handle_alloc_error（ADR-018 的稳定版唯一去向），
         # 所以这条构建的正确期望是 39 而不是 35：违规被**当场停机**，比继续跑完用例更好。
         ("中断内分配被挡下", av, arc, "EXCEPTION", 39),
-        ("锁重入被抓住", rv, rrc, "EXCEPTION", 39),
+        # P7a / ADR-060：期望仍是 39（注入的故障就该当场停机），但"级联出第二条 L4"
+        # 是另一种成因 ⇒ 报 CONTENT-MISMATCH，与"内核没抓到重入"分得开
+        ("锁重入被抓住", rv if rcasc_ok else "CONTENT-MISMATCH", rrc, "EXCEPTION", 39),
         # 必需项没开成 = 前提不满足，处置是**不启动**（37），不是运行中停机（39）：
         # §9.2 把这两类分成不同级正是因为处置不同，判据也必须能分辨它们。
         ("SMAP 没开成不启动", sv2, src2, "BOOT-INVALID", 37),
         # 挂死不是一种"错误码"，而是判定契约里的独立一级（§12.3）：这里它就是期望结果
         ("IF 归任务就挂死", fv, frc, "HANG", -1),
-        ("shootdown 收不齐回执升 L4", sv, src, "EXCEPTION", 39),
+        ("shootdown 收不齐回执升 L4", sv if scasc_ok else "CONTENT-MISMATCH", src, "EXCEPTION", 39),
         # 期望的是**新的一级**而不是 FAIL：这一条的故障在内核之外，rc 仍是 33
         ("块内容对账抓得出错标签", cv, crc, "CONTENT-MISMATCH", 33),
         # 这条红在**内核里**，不是对账层。原先我推测的成因是"QEMU 把命令丢掉 ⇒ 有界等待到期"，

@@ -18,6 +18,9 @@ pub struct SchedHooks {
     pub syscall_dispatch: fn(&mut TrapFrame) -> bool,
     pub park_current: fn(&mut TrapFrame),
     pub current_id: fn() -> usize,
+    /// 同 `current_id` 但**不取锁**（只读快照），供故障/崩溃路径用（P7a/ADR-060）。
+    /// 致命故障可能发生在持 VMM/HEAP 锁时，那条路上再取 RUNQ 会级联出第二条锁序违规。
+    pub current_id_snapshot: fn() -> usize,
     pub exit_current: fn(usize),
     /// 安全契片由 sched 安装；调用点必须在异常出口。
     pub preempt_point: fn(u64, usize),
@@ -54,6 +57,7 @@ static HOOKS: HooksCell = HooksCell(UnsafeCell::new(SchedHooks {
     syscall_dispatch: no_syscall,
     park_current: no_park,
     current_id: no_id,
+    current_id_snapshot: no_id,
     exit_current: no_exit,
     preempt_point: no_preempt,
 }));

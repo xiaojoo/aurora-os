@@ -53,7 +53,7 @@ pub fn dump_site(site: Site, cpu: usize) -> Result<(u8, u64), state_store::Store
         error_code: site.error_code,
         cpu: cpu as u32,
         fault_level: LEVEL_L4,
-        thread_id: (crate::hooks::sched().current_id)() as u32,
+        thread_id: (crate::hooks::sched().current_id_snapshot)() as u32,
         rip: site.rip,
         rsp: site.rsp,
         rbp: site.rbp,

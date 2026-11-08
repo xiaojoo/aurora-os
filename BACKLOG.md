@@ -4778,6 +4778,55 @@ fired 1->2 残留=0`；P5 的 `t_idle_hlt_wakes` 仍绿（增量 1 ≤ 4）。
 **下一步**：W1 之后按完整化方案是 W2（内存分层：页帧元数据/引用计数、大块分配、
 VA 保留表扩成区间表、`split_huge`、缺页处理），或先清上面这批未决。要先清哪一条请指个方向。
 
+## 136. 清欠账第 2 条：L4 退出路径的级联抓到了真凶，也否掉了我自己的第一版修复（2026-11-08，实测）
+
+**要清的是 §135 未决 2**：致命故障停在持锁现场时，退出路径又级联出第二条
+`L4 sync: 锁序违规`，污染崩溃记录。
+
+**真凶（实测，读源码 + 四跑对账）**：`sync` 判出违规时 `IrqGuard` 还没构造，
+所以外层那把锁**没有任何 Drop 会放开**；接着 `exit::finish(ExceptionFatal)` 收口一次
+`crash::ensure_dumped()` → `dump_site` 的第一格 `thread_id` 走 ADR-042 装的
+`hooks::sched().current_id`，而 `sched::current_id()` = `my_rq().current`，**要取 RUNQ(8)**。
+持 HEAP(10)/VMM(20) 时取 RUNQ(8) ⇒ 反向嵌套 ⇒ 第二条 L4。
+
+**我先写的那道闸被自己的负样本否掉了**：第一版在 `preempt_point` 开头加
+"本 CPU 持锁就什么都不做"，并给 `sync` 加了 `held_rank(cpu)`。两件事都不对：
+- 带上界检查的 `held_rank` 让 `sync->arch` 站点数 **14 → 17**，ADR-044 棘轮当场红。
+  去掉那次多余的上界检查（`preempt_point` 本来就用同一个 `cpu` 不做上界检查地索引 `FLAGS`/`REAP_PENDING`）
+  可以回到 14，但这只解决了棘轮，没解决下一条。
+- **变异 M1：只撤掉这道闸，两档负样本仍然全绿** ⇒ 级联根本不来自抢占点。
+  顺着公开 API 也构造不出那个状态：`REAP_PENDING` 只在 `terminate_task` 里为**当前任务**加一，
+  而当前任务接着就在同一个抢占点被换下并当场 reap；扫轮与换人在 `need` 闸之后，
+  `need` 只由 tick / resched IPI 在 IF=1 时立，而 `IrqSpinLock` 取锁即关 IF。
+  **一道无法证红的闸不是证据**，连同 `held_rank` 一起撤掉，登记表一行未改。
+
+**落地的修复**：`SchedHooks` 加 `current_id_snapshot`（同一个值、**不取锁**，
+实现是 `current_of(self_slot())`，走 ADR-048 已论证的弱读通道），`crash.thread_id` 改走它。
+这一条修订 ADR-042 决策 4 的"仍是同一个 `current_id()`"——值相同，取法不同。见 **ADR-060**。
+
+**常驻判据**：`l4_exit_cascade(log, 锚点)`——锚点必须在（否则是注入没走到，不算数），
+锚点之后不许再出现 `L4 sync: 锁序违规`。两档负样本各查一次，不符 ⇒ 那一行实际值改
+`CONTENT-MISMATCH`（与"内核没抓到故障"分得开）。**它咬的是日志形状，不是退出码**：
+四种组合下退出码都是 39，判定表改前根本看不见这个缺陷。
+
+| 变异 | 内容 | fault-lock-reentrant | fault-shootdown-noack |
+| --- | --- | --- | --- |
+| 绿 | 本帖修复 | L4 **1 条**，判据 True | L4 **1 条**，判据 True |
+| M1 | 只撤抢占点那道闸 | 仍绿（⇒ 闸不是修复） | 仍绿 |
+| M2 | 只把 `thread_id` 改回 `current_id` | 判据 **False**，外层 10 → 本次 8 | 判据 **False**，外层 20 → 本次 8 |
+
+**其余读数**：`check` **17/17**（`sync->arch` 棘轮仍 14，登记表零改动）；
+默认 `run` **PASS**、`ktests total=62 passed=62 failed=0`；两档负样本仍 `EXCEPTION`/39。
+矩阵复验另记。
+
+**没做 / 新发现的风险**：
+- `thread_id` 与"同跑当前任务"对账的判据仍没有（ADR-042 未决 2 原样继承）。
+- "崩溃路径上弱读与持锁读不可分辨"是**推断**，要实测需要一条能在换人窗口里触发 L4 的样本。
+- `reap` 仍排在 `need` 闸之前。本帖论证它够不着持锁现场，依据是 `REAP_PENDING` 的登记条件；
+  若将来出现"旁观者路径也登记待回收"或"持锁中 `terminate_task(self)`"，这条论证失效。
+- 崩溃路径上另一处内存访问 `walk_frames → mm::is_mapped` 已确认**不取锁**（只读页表遍历），
+  本轮不需要改它。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。
