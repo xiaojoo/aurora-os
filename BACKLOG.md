@@ -4471,6 +4471,22 @@ AP 侧仍用 slot 0 的空闲上下文当兜底，没有专属 idle。两者都�
 定时器轮能叫醒它，P6 才有），所以"卡住"只能由调用方的有界让出发现；
 `terminate_task` 与 `remove_task` 的**自动**挂接未做（用例 presently 自己先摘链再终止）。
 
+## 126. P4b 复验全绿：矩阵 41/41，阻塞路径在每个变体都真的走到（2026-11-08，实测）
+
+**读数（实测）**：整轮矩阵 **41 行全符合、0 不符**；两处 HANG 仍是期望行
+（`fault-if-carriage` 60 s、`irq-sticky-pxis` 6 s 且风暴对账=True），无意外挂死。
+`t_waitqueue` 在 **39 份留档里读数完全一致**：
+`rounds=24 done=24 blocks=24 wakes=24 empty_wakes=0 仍在链上=0 卡住=0`，零失败。
+**`blocks=24` 这件事本身是证据**：ADR-054 加的防空转一格（`blocks > 0`）在跨变体上也成立，
+不是只在默认档凑巧走到了阻塞路径。ADR-050 的收尾不变量零点名。
+
+**P4b 关闭**。等待队列、回调反转、`RANK_WAITQ` 与两条锁负样本都已落地并被整轮复验。
+
+**下一步 P4c**：跨核唤醒（hooks 加 `mark_need`、`apic` 的 resched 分支立牌、
+`wake_task` 对非本 CPU 发 `VEC_RESCHED` IPI）+ 4 核生产者/消费者压力 + **变异 B**
+（去掉 IPI ⇒ 跨核唤醒延迟超界）。那才是防丢唤醒的**并发**证明——
+本轮只有"放大窗口后的单核"证明（ADR-054 决策 4 已写明这个边界）。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。
