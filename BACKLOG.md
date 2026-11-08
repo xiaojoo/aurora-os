@@ -4419,6 +4419,21 @@ AP 侧仍用 slot 0 的空闲上下文当兜底，没有专属 idle。两者都�
 **下一步**：P4b（`sync::WaitQueue` + `WaitOps` 装表 + 条件等待协议 + 定长槽位/`NoCapacity`，
 配变异 A：入队移出锁 ⇒ 丢唤醒 > 0），然后 P4c（跨核 IPI + hooks `mark_need` + 4 核压力 + 变异 B）。
 
+## 124. P4a 复验全绿：矩阵 41/41，阻塞/唤醒判据跨变体一致（2026-11-08，实测）
+
+**读数（实测）**：整轮矩阵 **41 行全符合、0 不符**；两处 HANG 仍是期望行
+（`fault-if-carriage` 60 s、`irq-sticky-pxis` 6 s 且风暴对账=True），无意外挂死。
+`t_block_wake` 在 **39 份留档里读数完全一致**：
+`worker=#4 marked=true 阻塞态=Blocked(seq=1) 错token=false 之后=Blocked 对token=true 被唤醒=true 让出=0/1`，
+零失败；ADR-050 的收尾不变量零点名。
+
+**P4a 关闭**。`Blocked` 与世代号从此有真实调用者与确定性负样本（MUTATION-W ⇒ FAIL 35）。
+
+**下一步 P4b**：`sync::WaitQueue` + `WaitOps` 回调表（ADR-053 决策 1 的反转）+ 条件等待协议
+（查条件与入队同锁、**放锁后**自陷切走）+ 定长槽位与 `NoCapacity`，配变异 A
+（把入队移出 `WAITQ` 锁 ⇒ 丢唤醒计数 > 0）。`RANK_WAITQ(5)` 落地后锁序表那行转"已落地"，
+并按硬约束 4 配重入与反向嵌套负样本。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。
