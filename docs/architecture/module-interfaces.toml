@@ -175,6 +175,7 @@ public_api = [
   "heap::init",
   "mm::MAX_TASKS_SUPPORTED",
   "mm::MOD_TEST",
+  "mm::KBuf",
   "mm::Mapping",
   "mm::MmError",
   "mm::MmioMapping",

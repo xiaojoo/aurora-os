@@ -109,6 +109,53 @@ fn t_frame_refcount_get_put() -> bool {
 }
 ktest!(KT_FRAME_REFCOUNT, t_frame_refcount_get_put);
 
+/// P2（ADR-064）：KBuf 大块分配验收。9 档（64KiB–16MiB，2 的幂）逐档：
+/// new→清零见证（写前首末字节 0）→写满 u64 图案→读回逐字同→drop→free_frames 与台账 live 回基线。
+/// 反空转：alloc 后 free_frames 必须减少。new(0) 必须拒绝。写满/读回用 u64 字（8× 于逐字节，
+/// 各档都是 8 的倍数无尾字节），图案覆盖每一字节，等价"写满读回逐字节同"。
+fn t_kbuf_large_alloc() -> bool {
+    if mm::KBuf::new(0, mm::MOD_TEST).is_ok() {
+        crate::log_fatal!("kbuf: new(0) 居然成功");
+        return false;
+    }
+    const PAT: u64 = 0x0123_4567_89ab_cdef;
+    let pb = PAT.to_le_bytes();
+    let sizes = [64 * 1024, 128 * 1024, 256 * 1024, 512 * 1024, 1024 * 1024,
+        2 * 1024 * 1024, 4 * 1024 * 1024, 8 * 1024 * 1024, 16 * 1024 * 1024];
+    let mut base_ok = true;
+    let mut zero_ok = true;
+    let mut content_ok = true;
+    for &sz in sizes.iter() {
+        let base = mm::free_frames();
+        let live0 = crate::resource::live_of(mm::MOD_TEST);
+        let mut buf = match mm::KBuf::new(sz, mm::MOD_TEST) {
+            Ok(b) => b,
+            Err(e) => { crate::log_fatal!("kbuf: {}KiB 分配失败 {:?}", sz / 1024, e); base_ok = false; break; }
+        };
+        let after_alloc = mm::free_frames();
+        if buf.as_slice()[0] != 0 || buf.as_slice()[sz - 1] != 0 {
+            zero_ok = false;
+        }
+        for c in buf.as_mut_slice().chunks_exact_mut(8) {
+            c.copy_from_slice(&pb);
+        }
+        for c in buf.as_slice().chunks_exact(8) {
+            if c != pb { content_ok = false; break; }
+        }
+        drop(buf);
+        let after_free = mm::free_frames();
+        let live_back = crate::resource::live_of(mm::MOD_TEST) == live0;
+        if !(after_alloc < base && after_free == base && live_back) {
+            crate::log_fatal!("kbuf: {}KiB 不回基线 base={} alloc={} free={} live回={}",
+                sz / 1024, base, after_alloc, after_free, live_back);
+            base_ok = false;
+        }
+    }
+    crate::log_info!("kbuf(P2): 9档64KiB-16MiB 回基线={} 清零={} 写满读回={}", base_ok, zero_ok, content_ok);
+    base_ok && zero_ok && content_ok
+}
+ktest!(KT_KBUF_LARGE, t_kbuf_large_alloc);
+
 /// 映射 -> 写入 -> 读回 -> 解映射，且所有权随 Mapping 归还（§6.3 R13）
 fn t_map_write_unmap() -> bool {
     const MAGIC: u64 = 0x5176_0dae_1234_beef;

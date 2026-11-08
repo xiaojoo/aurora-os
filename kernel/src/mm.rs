@@ -1591,6 +1591,59 @@ impl Drop for SharedFrame {
     }
 }
 
+/// 内核大块缓冲（ADR-064，W2 P2）：一段连续物理帧经 **HHDM 直接寻址**交出，不占 VA 保留表、
+/// 不建页表映射（HHDM 已映射全部 max_phys）。填 ADR-018 留的大缓冲口子——**不经 GlobalAlloc**，
+/// 所有权就在自己的 `OwnedFrames` 字段里，失败返回 Result 可传播（不是堆那条 L4 停机路径）。
+/// 分配即清零（eager zero）：自由帧上次释放被毒化成 0xA5，不清零会泄漏陈旧物理内存。
+/// RAII：无自定义 Drop，`frames` 字段析构自动走 phys_free → refcnt 到 0 归还（ADR-063）。
+pub struct KBuf {
+    frames: OwnedFrames,
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl KBuf {
+    /// 分配至少 `bytes` 字节的连续缓冲（向上取整到 2^order 帧），清零后交出。owner 记台账。
+    /// `bytes==0` 拒绝；分不出连续帧返回 OutOfMemory（可传播）。中断上下文禁用（取 PMM 锁、可能 OOM）。
+    pub fn new(bytes: usize, owner: ModuleId) -> Result<KBuf, MmError> {
+        if bytes == 0 {
+            return Err(MmError::InvalidAddress);
+        }
+        let pages = bytes.div_ceil(PAGE);
+        let order = pages.next_power_of_two().trailing_zeros() as u8;
+        let frames = phys_alloc(order, owner)?;
+        let ptr = frames.base().via_hhdm().0 as *mut u8;
+        let cap = frames.count() * PAGE;
+        // SAFETY: ptr = HHDM + phys_alloc 分出的连续帧基址，cap 字节都在 max_phys 内（HHDM 覆盖）；
+        // 帧归 KBuf 独占，此刻无并发访问；write_bytes 按 u8 对齐（任意对齐合法）。
+        unsafe { core::ptr::write_bytes(ptr, 0, cap) };
+        Ok(KBuf { frames, ptr, len: bytes })
+    }
+
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr
+    }
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.ptr
+    }
+    /// 请求的字节数（<= 实际容量 frames.count()*PAGE）。
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: ptr 指向 KBuf 独占的连续帧，len<=cap 在界内；&self 期间帧不被归还（Drop 才归还）；
+        // u8 对齐任意合法；调用方不得跨 KBuf 析构持有该切片（生命周期绑定 &self）。
+        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
+    }
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: 同 as_slice；&mut self 保证独占访问，无别名。
+        unsafe { core::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
 /// `phys_alloc` 的持锁内核：调用方**必须已持 PMM 锁**。init_allocator 的两阶段引导在
 /// 自己那把 pmm() 里分出 FrameInfo 元数组，不能再取一次 PMM（重入会升 L4），故拆出此函数。
 /// 引导期（frame_info 未就绪）走位图；接管后走 FrameInfo 的 refcnt（P1b）。

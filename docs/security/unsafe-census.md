@@ -1,6 +1,6 @@
 # unsafe 逐处审计表（U1–U6）
 
-总计 302 处。U1 56 · U2 68 · U3 13 · U4 116 · U5 28 · U6 21
+总计 305 处。U1 56 · U2 71 · U3 13 · U4 116 · U5 28 · U6 21
 
 本表由 `tools/aurora.py` 的 `unsafe_sites()` 从源码逐处生成，**不是手写的**。
 机器可读的权威来源是 `docs/security/unsafe-whitelist.toml` 的 `[modules.*]` 段（模块×类别→处数），
@@ -487,6 +487,12 @@
   > P1c：refcnt 原子减一（不归还）。同一指针来源/范围/对齐；PMM 锁互斥；调用方保证 refcnt>=1。
 - `kernel/src/mm.rs:1663` [{] **U2** fn=`fi_final_free`
   > P1c：refcnt 到 0 最终归还时毒化 0xA5。base=frame*PAGE 在 max_phys 内，HHDM 覆盖；PMM 锁下该帧已标自由。
+- `kernel/src/mm.rs:1619` [{] **U2** fn=`KBuf::new`
+  > P2（ADR-064）：分配即清零 write_bytes(ptr,0,cap)。ptr=HHDM+phys_alloc 连续帧基址，cap 字节都在 max_phys 内（HHDM 覆盖）；帧归 KBuf 独占无并发；u8 任意对齐。
+- `kernel/src/mm.rs:1639` [{] **U2** fn=`KBuf::as_slice`
+  > P2：from_raw_parts(ptr,len)。len<=cap 在界内；&self 期间帧不归还（Drop 才归还）；生命周期绑 &self，不得跨析构持有。
+- `kernel/src/mm.rs:1643` [{] **U2** fn=`KBuf::as_mut_slice`
+  > P2：from_raw_parts_mut(ptr,len)。同 as_slice；&mut self 保证独占无别名。
 
 ### pci
 
