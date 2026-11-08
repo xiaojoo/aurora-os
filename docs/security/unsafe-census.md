@@ -1,6 +1,6 @@
 # unsafe 逐处审计表（U1–U6）
 
-总计 289 处。U1 54 · U2 61 · U3 13 · U4 112 · U5 28 · U6 21
+总计 293 处。U1 54 · U2 61 · U3 13 · U4 116 · U5 28 · U6 21
 
 本表由 `tools/aurora.py` 的 `unsafe_sites()` 从源码逐处生成，**不是手写的**。
 机器可读的权威来源是 `docs/security/unsafe-whitelist.toml` 的 `[modules.*]` 段（模块×类别→处数），
@@ -100,32 +100,38 @@
   > unsafe { let mut v: u64; core::arch::asm!("mov {}, cr4", out(reg) v, options(nomem, preserves_flags)); 
 
 ### arch/x86_64/smp
-
-- `kernel/src/arch/x86_64/smp.rs:47` [impl] **U4** fn=`—`
-  > unsafe impl Sync for ApBootCell {} static AP_ARGS: [ApBootCell; cpu::MAX_CPUS] = [const { ApBootCell(UnsafeCell::new(ApBoot { stack_top: 0, slot: 0, expect_lapic: 0 })) }; cpu::MAX_CPUS]; 
+- `kernel/src/arch/x86_64/smp.rs:47` [impl] **U4** fn=``
+  > unsafe impl Sync for ApBootCell {} static AP_ARGS: [ApBootCell; cpu::MAX_CPUS] = [const { ApBootCell(UnsafeCell::new(ApBoot { stack_top: 0, slot: 0, expect_lapic: 0 })) }; cpu::MAX_CPUS];
 - `kernel/src/arch/x86_64/smp.rs:53` [{] **U4** fn=`ap_boot_layout`
-  > let a = unsafe { &*AP_ARGS[slot].0.get() }; (a.stack_top, a.slot, a.expect_lapic) } 
-- `kernel/src/arch/x86_64/smp.rs:195` [{] **U1** fn=`ap_entry_addr`
-  > unsafe { ap_entry_gate[0] } }  
-- `kernel/src/arch/x86_64/smp.rs:275` [{] **U4** fn=`bringup`
-  > unsafe { *AP_ARGS[slot].0.get() = ApBoot { stack_top: top, slot: slot as u64, expect_lapic: lapic_id as u64 }; } 
-- `kernel/src/arch/x86_64/smp.rs:281` [{] **U4** fn=`bringup`
-  > unsafe { limine::release_mp_cpu(mp.cpu_ptrs[i] as *mut limine::MpInfo, AP_ARGS[slot].0.get() as u64, ap_entry_addr()); } 
-- `kernel/src/arch/x86_64/smp.rs:463` [{] **U1** fn=`aurora_ap_main`
-  > unsafe { core::arch::asm!("hlt", options(nomem, nostack)) }; } // 10) 停机：先关窗口（立牌 + `cli`）再关定时器，之后不再碰任何共享状态。 
-- `kernel/src/arch/x86_64/smp.rs:471` [{] **U1** fn=`aurora_ap_main`
-  > unsafe { core::arch::asm!("cli", options(nomem, nostack)) }; AP_STAGE[slot].store(3, Ordering::Release); halt_forever() 
-- `kernel/src/arch/x86_64/smp.rs:479` [{] **U1** fn=`halt_forever`
-  > unsafe { core::arch::asm!("cli", "hlt", options(nomem, nostack)) }; } } 
-- `kernel/src/arch/x86_64/smp.rs:529` [impl] **U4** fn=`ap_worker`
-  > unsafe impl Sync for RaceCell {} static RACE: RaceCell = RaceCell(UnsafeCell::new(0));  
-- `kernel/src/arch/x86_64/smp.rs:601` [{] **U4** fn=`bump`
-  > unsafe { let p = RACE.0.get(); let v = core::ptr::read_volatile(p); 
-- `kernel/src/arch/x86_64/smp.rs:757` [{] **U4** fn=`run_phase`
-  > unsafe { core::ptr::write_volatile(RACE.0.get(), 0) }; PHASE.store(phase, Ordering::Release); // 1) 等所有 AP 声称"已进入本相位"（它们会立刻开始跑，与 BSP 重叠） 
-- `kernel/src/arch/x86_64/smp.rs:775` [{] **U4** fn=`run_phase`
-  > let observed = unsafe { core::ptr::read_volatile(RACE.0.get()) }; let expected = (aps.len() as u64 + 1) * RACE_ROUNDS; // 少的那一部分就是被并发覆盖掉的更新 
-
+  > let a = unsafe { &*AP_ARGS[slot].0.get() }; (a.stack_top, a.slot, a.expect_lapic) }
+- `kernel/src/arch/x86_64/smp.rs:198` [{] **U1** fn=`ap_entry_addr`
+  > unsafe { ap_entry_gate[0] } } 
+- `kernel/src/arch/x86_64/smp.rs:278` [{] **U4** fn=`bringup`
+  > unsafe { *AP_ARGS[slot].0.get() = ApBoot { stack_top: top, slot: slot as u64, expect_lapic: lapic_id as u64 }; }
+- `kernel/src/arch/x86_64/smp.rs:284` [{] **U4** fn=`bringup`
+  > unsafe { limine::release_mp_cpu(mp.cpu_ptrs[i] as *mut limine::MpInfo, AP_ARGS[slot].0.get() as u64, ap_entry_addr()); }
+- `kernel/src/arch/x86_64/smp.rs:466` [{] **U1** fn=`aurora_ap_main`
+  > unsafe { core::arch::asm!("hlt", options(nomem, nostack)) }; } // 10) 停机：先关窗口（立牌 + `cli`）再关定时器，之后不再碰任何共享状态。
+- `kernel/src/arch/x86_64/smp.rs:474` [{] **U1** fn=`aurora_ap_main`
+  > unsafe { core::arch::asm!("cli", options(nomem, nostack)) }; AP_STAGE[slot].store(3, Ordering::Release); halt_forever()
+- `kernel/src/arch/x86_64/smp.rs:482` [{] **U1** fn=`halt_forever`
+  > unsafe { core::arch::asm!("cli", "hlt", options(nomem, nostack)) }; } }
+- `kernel/src/arch/x86_64/smp.rs:532` [impl] **U4** fn=`ap_worker`
+  > unsafe impl Sync for RaceCell {} static RACE: RaceCell = RaceCell(UnsafeCell::new(0)); 
+- `kernel/src/arch/x86_64/smp.rs:608` [{] **U4** fn=`bump`
+  > unsafe { let p = RACE.0.get(); let v = core::ptr::read_volatile(p);
+- `kernel/src/arch/x86_64/smp.rs:701` [impl] **U4** fn=`contention_round`
+  > unsafe impl Sync for RoleCell {} static AP_ROLE: RoleCell = RoleCell(core::cell::UnsafeCell::new(None)); 
+- `kernel/src/arch/x86_64/smp.rs:713` [{] **U4** fn=`run_ap_role`
+  > unsafe { *AP_ROLE.0.get() = Some(role) }; for &s in &aps[..n] { ENTERED[s].store(0, Ordering::Relaxed);
+- `kernel/src/arch/x86_64/smp.rs:735` [{] **U4** fn=`run_ap_role`
+  > unsafe { *AP_ROLE.0.get() = None }; if !ack_ok { return Err(ack_fail(PHASE_WAIT_WAKE, RaceError::AckTimeout));
+- `kernel/src/arch/x86_64/smp.rs:745` [{] **U4** fn=`run_ap_role_body`
+  > let role = unsafe { *AP_ROLE.0.get() }; if let Some(f) = role { f();
+- `kernel/src/arch/x86_64/smp.rs:825` [{] **U4** fn=`run_phase`
+  > unsafe { core::ptr::write_volatile(RACE.0.get(), 0) }; PHASE.store(phase, Ordering::Release); // 1) 等所有 AP 声称"已进入本相位"（它们会立刻开始跑，与 BSP 重叠）
+- `kernel/src/arch/x86_64/smp.rs:843` [{] **U4** fn=`run_phase`
+  > let observed = unsafe { core::ptr::read_volatile(RACE.0.get()) }; let expected = (aps.len() as u64 + 1) * RACE_ROUNDS; // 少的那一部分就是被并发覆盖掉的更新
 ### arch/x86_64/trap
 
 - `kernel/src/arch/x86_64/trap.rs:126` [{] **U4** fn=`tss_offsets`

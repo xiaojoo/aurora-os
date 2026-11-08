@@ -63,6 +63,9 @@ pub const PHASE_STOP: usize = 3;
 /// L3-A：整行原子性的并发相位。每个在线 CPU 打 `PRINT_LINES` 行，
 /// 行的 tag 是本 CPU 独有的字母——被插进一半的行会当场现形（一行里出现两个字母）。
 pub const PHASE_PRINT_LINES: usize = 4;
+/// P4c-2：跨核阻塞/唤醒压力相位。BSP 当**生产者兼观察者**（永不阻塞，所以丢唤醒时
+/// 它能报红而不是整机静默），各 AP 当消费者，在 `sync::WaitQueue` 上真的阻塞。
+pub const PHASE_WAIT_WAKE: usize = 5;
 
 /// 当前相位。BSP 写、所有 CPU 读。
 static PHASE: AtomicUsize = AtomicUsize::new(PHASE_OFF);
@@ -566,6 +569,10 @@ const PRINT_GO_MAX: u64 = 20_000_000;
 /// 锁只在 `PHASE_RACE_LOCKED` 时拿；无锁那一轮是对照组。
 fn run_race_round() {
     let phase = PHASE.load(Ordering::Acquire);
+    if phase == PHASE_WAIT_WAKE {
+        run_ap_role_body();
+        return;
+    }
     #[cfg(feature = "serial-atomic-probe")]
     if phase == PHASE_PRINT_LINES {
         let slot = crate::arch::x86_64::cpu::self_slot();
@@ -636,7 +643,7 @@ pub enum RaceError {
 
 /// 一个 AP 是否算"活着且能干活"：登记过、在线、报过到、并且自己的本地定时器确实在走。
 /// 四个条件缺一个都不能进参与者名单——否则它不会来抢锁，却占了名额。
-fn participant_slots() -> (usize, [usize; cpu::MAX_CPUS]) {
+pub fn participant_slots() -> (usize, [usize; cpu::MAX_CPUS]) {
     let mut list = [0usize; cpu::MAX_CPUS];
     let mut n = 0usize;
     for s in 1..cpu::MAX_CPUS {
@@ -678,6 +685,67 @@ pub fn contention_round() -> Result<RaceOutcome, RaceError> {
         rounds_per_cpu: RACE_ROUNDS,
         ack_timeouts: ACK_TIMEOUTS.load(Ordering::Relaxed),
     })
+}
+
+// ---- P4c-2：把 AP 编组进一个相位去跑**调用方给的角色**（ADR-056）----
+//
+// 为什么只给原语、不把压力逻辑写在这里：压力逻辑要引用 `sync::WaitQueue` 与 `clock`，
+// 写在 arch 层会让环内边 `arch->sync`、`arch->time` 变胖，ADR-044 的棘轮当场红。
+// 而它本来就是**测试**逻辑，放 ktests 里既合层次又不计产品依赖边（ADR-043）。
+// arch 只负责它真正知道的事：哪些 AP 活着、怎么编组、怎么收回执。
+
+/// 角色函数表：调用方在启动相位前装一次，相位期间只读。
+struct RoleCell(core::cell::UnsafeCell<Option<fn()>>);
+// SAFETY: 由 BSP 在发布相位**之前**写入，AP 只在相位期间读；相位收齐回执后 BSP 才可能再写。
+// 与 `hooks::HooksCell`/`sync::OpsCell` 同一论证形状（单点写、发布后只读）。
+unsafe impl Sync for RoleCell {}
+static AP_ROLE: RoleCell = RoleCell(core::cell::UnsafeCell::new(None));
+
+/// 让所有在线 AP 各跑一遍 `role`，BSP **不跑**（BSP 通常是生产者/观察者）。
+/// 返回本相位新增的 ack 超时数；AP 起不来/取不到名单/回执超期都回 Err，不静默。
+pub fn run_ap_role(role: fn(), bsp_role: fn()) -> Result<u64, RaceError> {
+    bringup().map_err(RaceError::Bringup)?;
+    let (n, aps) = participant_slots();
+    if n == 0 {
+        return Err(RaceError::NoApOnline);
+    }
+    // SAFETY: 见 RoleCell；此刻还没有发布相位，没有 AP 在读它。
+    unsafe { *AP_ROLE.0.get() = Some(role) };
+    for &s in &aps[..n] {
+        ENTERED[s].store(0, Ordering::Relaxed);
+        DONE[s].store(0, Ordering::Relaxed);
+    }
+    let ack0 = ACK_TIMEOUTS.load(Ordering::Relaxed);
+    PHASE.store(PHASE_WAIT_WAKE, Ordering::Release);
+    for &s in &aps[..n] {
+        if !wait_until(|| ENTERED[s].load(Ordering::Acquire) == PHASE_WAIT_WAKE, AP_DEADLINE_CYCLES) {
+            return Err(ack_fail(PHASE_WAIT_WAKE, RaceError::AckTimeout));
+        }
+    }
+    // BSP 跑自己那一份（通常是生产者/观察者），与 AP 重叠——与 run_phase 同一形状
+    bsp_role();
+    let mut ack_ok = true;
+    for &s in &aps[..n] {
+        if !wait_until(|| DONE[s].load(Ordering::Acquire) == PHASE_WAIT_WAKE, AP_DEADLINE_CYCLES) {
+            ack_ok = false;
+        }
+    }
+    PHASE.store(PHASE_OFF, Ordering::Release);
+    // SAFETY: 相位已收回 OFF 且回执收齐（或超时），此刻没有 AP 再读它。
+    unsafe { *AP_ROLE.0.get() = None };
+    if !ack_ok {
+        return Err(ack_fail(PHASE_WAIT_WAKE, RaceError::AckTimeout));
+    }
+    Ok((ACK_TIMEOUTS.load(Ordering::Relaxed) - ack0) as u64)
+}
+
+/// AP 侧在相位里要跑的角色（由 `run_ap_role` 的调用方提供）。
+fn run_ap_role_body() {
+    // SAFETY: 见 RoleCell；相位期间只读，且调用方保证已装入 Some。
+    let role = unsafe { *AP_ROLE.0.get() };
+    if let Some(f) = role {
+        f();
+    }
 }
 
 /// L3-A：并发打印一轮的读数。行数字段是"每个 CPU 自己数的"，锁那几本是差值——

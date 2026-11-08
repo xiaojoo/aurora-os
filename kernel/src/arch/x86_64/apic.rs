@@ -108,6 +108,12 @@ static SPURIOUS: AtomicUsize = AtomicUsize::new(0);
 /// 主动让出/重调度（向量 0xF0，软件中断）。单独一格：它既不是 IRQ 也不是 tick，
 /// 混进任何一边都会把"两台仪器数到同一个数"那条判据弄假（ADR-049）。
 static RESCHED: AtomicUsize = AtomicUsize::new(0);
+/// 只数**跨核 IPI**（0xF3）的到达次数。与 RESCHED 分开：那本账同时含自陷(0xF0)，
+/// 混在一起就读不出"IPI 到底有没有起作用"（实测混记时读数恰好是 blocks 的两倍）。
+static RESCHED_IPI_RECV: AtomicUsize = AtomicUsize::new(0);
+
+/// 跨核 resched IPI 的到达次数（P4c-2 的确定性证人）。
+pub fn resched_ipi_received() -> usize { RESCHED_IPI_RECV.load(Ordering::Relaxed) }
 static EOIS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Copy)]
@@ -566,6 +572,7 @@ pub fn on_interrupt(vector: usize) {
         // 跨核唤醒的 IPI：与自陷的 0xF0 记在同一本账（P5 对照式两边都算它），
         // 但**不 return**——真实 IPI 置了 ISR 位，必须走下面的 EOI（ADR-055）。
         RESCHED.fetch_add(1, Ordering::Relaxed);
+        RESCHED_IPI_RECV.fetch_add(1, Ordering::Relaxed);
         (crate::hooks::sched().mark_need)();
     } else if vector == crate::arch::x86_64::trap::VEC_CPU_TIMER {
         // 每个 CPU 的本地定时器（M3b-2b 起它走异常帧，所以会进到这儿来）。

@@ -705,6 +705,135 @@ fn t_cross_cpu_resched() -> bool {
 }
 ktest!(KT_CROSS_CPU_RESCHED, t_cross_cpu_resched);
 
+// ---- P4c-2：跨核阻塞/唤醒压力。逻辑全部在**测试层** ----
+// arch 只提供"把 AP 编组进相位跑给定角色"的原语（`smp::run_ap_role`）。
+// 为什么这样分层：压力逻辑要引用 `sync::WaitQueue` 与 `clock`，写进 arch 会让环内边
+// `arch->sync`、`arch->time` 变胖，ADR-044 的棘轮当场红（实测红过一次）。
+// 放 ktests 既合层次，又按 ADR-043 不计产品依赖边。
+
+const WWC_QID: u8 = 1;
+const WWC_ROUNDS: u64 = 200;
+static WWC_COUNT: [core::sync::atomic::AtomicU64; cpu::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; cpu::MAX_CPUS];
+static WWC_DONE: [core::sync::atomic::AtomicU64; cpu::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; cpu::MAX_CPUS];
+static WWC_ERR: [core::sync::atomic::AtomicU64; cpu::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; cpu::MAX_CPUS];
+/// 生产者侧的观测结果（BSP 单点写，读它在收齐回执之后）
+static WWC_MAXLAT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static WWC_SLOW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static WWC_STALLED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static WWC_PARTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static WWC_BOUND: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// AP 侧的**消费者**：条件不成立时真的阻塞，被跨核 IPI 唤醒后继续。
+fn wwc_consumer() {
+    let slot = cpu::self_slot();
+    let Some(q) = sync::wait_queue(WWC_QID) else {
+        WWC_ERR[slot].fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    let mut c = 0u64;
+    while c < WWC_ROUNDS {
+        let target = c + 1;
+        match q.wait_while(WWC_QID, || WWC_COUNT[slot].load(Ordering::Acquire) >= target) {
+            Ok(_) => {}
+            Err(_) => {
+                WWC_ERR[slot].fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+        c = target;
+        WWC_DONE[slot].store(c, Ordering::Release);
+    }
+}
+
+/// BSP 侧的**生产者兼观察者**：永不阻塞，所以丢唤醒时它能报红而不是整机静默。
+fn wwc_producer() {
+    let (n, aps) = smp::participant_slots();
+    WWC_PARTS.store(n as u64 + 1, Ordering::Relaxed);
+    let Some(q) = sync::wait_queue(WWC_QID) else { return };
+    let bound = clock::window_cycles(1) / 2;
+    WWC_BOUND.store(bound, Ordering::Relaxed);
+    let mut max_lat = 0u64;
+    let mut slow = 0u64;
+    for i in 1..=WWC_ROUNDS {
+        for &s in &aps[..n] {
+            WWC_COUNT[s].store(i, Ordering::Release);
+        }
+        let t0 = tsc::now();
+        let _ = q.wake_all();
+        let mut spins = 0u64;
+        while !aps[..n].iter().all(|&s| WWC_DONE[s].load(Ordering::Acquire) >= i) && spins < 2_000_000 {
+            core::hint::spin_loop();
+            spins += 1;
+        }
+        let lat = tsc::now().wrapping_sub(t0);
+        if lat > max_lat {
+            max_lat = lat;
+        }
+        if lat > bound {
+            slow += 1;
+        }
+        if spins >= 2_000_000 {
+            WWC_STALLED.store(1, Ordering::Relaxed);
+            break;
+        }
+    }
+    WWC_MAXLAT.store(max_lat, Ordering::Relaxed);
+    WWC_SLOW.store(slow, Ordering::Relaxed);
+}
+
+/// P4c-2（ADR-056）：跨核阻塞/唤醒的**并发**证明。
+///
+/// 八格：不卡住、全消费到轮数、无等待错误、链上无残留、`blocks == wakes`、
+/// **`blocks > 0`（防空转）**、**慢轮 ≤ 10%**、**收到的跨核 IPI > 0**。
+/// 延迟用**慢轮比例**而不是最大值：实测有 IPI 时慢轮 1.5~2.5%、最大值约 1.3 个 tick，
+/// 那部分是 TCG 把四个 vCPU 串在一个宿主线程上轮转的抖动，量的是模拟器不是内核；
+/// 去掉 IPI 则每轮都要等目标自己的 tick ⇒ 慢轮 52~77%（实测）。所以 10% 是两个 regime
+/// 的分界，不是性能 SLA；最大延迟只作观察量报出来。
+fn t_cross_cpu_wait() -> bool {
+    let (n, aps) = smp::participant_slots();
+    for &s in &aps[..n] {
+        WWC_COUNT[s].store(0, Ordering::Relaxed);
+        WWC_DONE[s].store(0, Ordering::Relaxed);
+        WWC_ERR[s].store(0, Ordering::Relaxed);
+    }
+    WWC_MAXLAT.store(0, Ordering::Relaxed);
+    WWC_SLOW.store(0, Ordering::Relaxed);
+    WWC_STALLED.store(0, Ordering::Relaxed);
+    let ipi0 = apic::resched_ipi_received() as u64;
+    let ack = match smp::run_ap_role(wwc_consumer, wwc_producer) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_fatal!("跨核等待: 测不成 {:?}", e);
+            return false;
+        }
+    };
+    let ipi = apic::resched_ipi_received() as u64 - ipi0;
+    let Some(q) = sync::wait_queue(WWC_QID) else { return false };
+    let (blocks, wakes, empty, left) = q.stats();
+    let mut errors = 0u64;
+    let mut all_consumed = true;
+    for &s in &aps[..n] {
+        errors += WWC_ERR[s].load(Ordering::Relaxed);
+        if WWC_DONE[s].load(Ordering::Acquire) < WWC_ROUNDS {
+            all_consumed = false;
+        }
+    }
+    let stalled = WWC_STALLED.load(Ordering::Relaxed) != 0;
+    let slow = WWC_SLOW.load(Ordering::Relaxed);
+    crate::log_info!(
+        "跨核等待(ADR-056): 参与={} 轮={} 全消费={} 卡住={} 错误={} blocks={} wakes={} empty={} 链上={} 最大延迟={} 上界={} 慢轮={} 收到IPI={} ack超时={}",
+        WWC_PARTS.load(Ordering::Relaxed), WWC_ROUNDS, all_consumed, stalled, errors,
+        blocks, wakes, empty, left, WWC_MAXLAT.load(Ordering::Relaxed),
+        WWC_BOUND.load(Ordering::Relaxed), slow, ipi, ack);
+    !stalled && all_consumed && errors == 0 && left == 0
+        && blocks == wakes && blocks > 0
+        && slow * 10 <= WWC_ROUNDS && ipi > 0 && ack == 0
+}
+ktest!(KT_CROSS_CPU_WAIT, t_cross_cpu_wait);
+
 /// `if_patch` 两条分支的直接覆盖，以及 asm 偏移与 Rust 结构体的对账。
 ///
 /// 为什么这条用例存在：ADR-021 的"关着窗口换入"分支今天**没有触发源**
