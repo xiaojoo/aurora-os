@@ -5220,6 +5220,49 @@ P1 `min` 5689/5709（同构建差 21）、四把尺子全部"能分辨=符合"�
 以前是**沉默的**，同一形状若出现在 AP 队列上，本轮之前完全不可见——现已扫，但 AP 侧的证人是
 我自己注入的，不是自然工作负载。
 
+## 144. W1 收尾 B3 与 B4：一条早已交付（本轮只复验），一条调研结论是"不可行"（2026-11-09）
+
+### B3：`terminate_task` 与等待队列/定时器轮的自动挂接——**本轮零改动，只复验**
+
+任务书写的是"清 ADR-061 的自动挂接"，查完代码与留档之后确认这件事**已经在 §137/ADR-061 里交付过**：
+`kernel/src/sched.rs:228-233` 就是那份自动挂接——持 RUNQ 时读出 `Blocked(tok)`，
+**放掉 RUNQ 之后**取 WAITQ(5) 摘链 + `timer_del_for_wait` 取消轮项（反向嵌套的形状在
+`lock-order.md:52-59` 写着）。用例 `t_kill_blocked_cleans_registrations` 也在册。
+
+本轮复验的读数（默认档 `build/_b2d-serial.log`，另在矩阵 42 份跑到 ktests 的留档里同样成立）：
+`杀阻塞工人(P7b): rounds=6 真阻塞过=6 等待链残留 0->0 轮项残留 0->0 漏链轮数=0 漏轮项轮数=0 收尾后 链=0 轮=0`
+⇒ 任务书要求的"杀阻塞任务不手工摘链 ⇒ 漏链轮数/漏轮项轮数 = 0"**已经成立**，
+而它的证红（改前 `漏链轮数=6 漏轮项轮数=6`、`failed=2`）在 §137 的表里已留档，本轮不重复做。
+§137 那三处手写 `q.remove_task` 原样保留（它们是"缺陷曾经存在"的证据，不是遗漏）。
+**ABA（`remove_task` 改成按 `(task, token)` 匹配）按任务书要求仍不实现**，留在 ADR-061 未决 1；
+本轮补一句：B2 把 `resident` 也做成"跟着槽位走、释放时清掉"，同一条 ABA 线现在**有两处**要防
+（豁免身份与唤醒身份），等并发 `spawn` 的调用方出现那天一起改，并配证红样本。
+
+### B4：宿主机侧数 hlt——四条路各自实测过，结论是**不可行，不加门禁**
+
+任务书只要"实验证据"，不许改行为。本机 QEMU 是 **11.1.0**（`.tools/qemu`），被测形状是
+一次正常启动里内核自报的 `idle hlt: bsp=6 ap=[170, 183, 153]` ⇒ **512 次 hlt 执行**
+（同一份留档 `build/_b4-inasm-serial.log`；判据本来就在 `t_percpu_queues`，这里只拿它当被对比的自报数）。
+
+| 路 | 做法 | 实测读数 | 结论 |
+| --- | --- | --- | --- |
+| trace events | `qemu-system-x86_64 -trace help` 全表筛 `hlt\|halt` | 命中 **0** 条事件（表里只有 `qmp_enter_x_query_interrupt_controllers` 这类） | 没有可挂的事件，此路不存在 |
+| `-d` 日志项 | `-d help` 逐项看 | 项目表里**没有** hlt/halt 项 | 同上 |
+| `-d unimp` 真跑 | `AURORA_QEMU_EXTRA="-d unimp -D …"` 跑一启 | 16,359 字节，全是 `ahci: IRQ#n level` 之类设备行，`hlt` 命中 **0** | hlt 是实现完整的指令，不进"未实现"通道 |
+| `-d in_asm` 真跑 | 同上挂 `-d in_asm` | 日志 **19,954,840 字节**，含 hlt 的行 **14 条**、去重后 **6 个访客地址**（两个 OVMF 地址 + `0xffffffff8003bc17/…c128/…c221/…50901/…40a61`），而被测物自报 **512 次执行** | 它记的是**翻译次数**不是执行次数：同一个站点重复 3–4 次、每次 tick 回来的 hlt 一条都不多 ⇒ 数不出来 |
+| QMP `query-cpus-fast` | 挂 `AURORA_QEMU_QMP`，一边跑一边轮询（`build/_b4_qmp_poll.py`） | **27,572 次采样 / 4.99 s = 5,524 次/秒**，返回字段只有 `cpu-index, props, qom-path, qom-type, target, thread-id`——**`halted` 这个字段在本版本根本不存在**（27,572/27,572 次都是缺字段）；HMP `info cpus` 也只有 `thread_id/model` | 官方文档里那句"halted 是频繁变化的瞬态"在 11.1.0 上连瞬态都不给了 |
+| TCG plugin | `-plugin foo` 看二进制认不认识 | `Could not load plugin foo: 'foo.dll': 找不到指定的模块` ⇒ **插件通道存在**，但要 QEMU 插件头文件 + 本机没有的工具链现编一个 DLL | 唯一还剩的路，代价是**引入外部依赖**；按任务书"不引入外部依赖就停下来"的口径，本轮不做 |
+
+补一条踩到的坑（写下来免得下次当成发现）：`isa-debug-exit` 的 `iobase=0xf4`（`tools/aurora.py:59`）
+与 **hlt 的操作码字节 0xF4 是同一个数**。任何按原始字节匹配的插件都会把判定通道的 `out` 数进 hlt 里，
+所以那条路如果要走，判据必须区分"取指到的字节"与"端口写入"——这条是推断，没做成样本。
+
+**结论**：QEMU 11.1.0 在现有工具链下**没有**宿主机侧数 hlt 的办法；按任务书要求**不加门禁**，
+`idle hlt` 那一行的口径保持原样（自报数，判据在 `t_percpu_queues`）。
+真机上这一格本来就要重测（ADR-057 未决、M7 待测清单），届时用的也不是 QEMU 而是硬件计数。
+脚本留档：`build/_b4_qmp_poll.py`、`build/_b4-inasm-hlt-lines.txt`（那 14 行）、
+`build/_b4-inasm-serial.log`、`build/_b4-unimp-run.txt`。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。
