@@ -64,17 +64,17 @@ const FI_FREE: u8 = 0;
 const FI_USED: u8 = 1;
 const FI_PINNED: u8 = 2;
 const FRAME_INFO_BYTES: usize = core::mem::size_of::<FrameInfo>();
-/// VA 保留登记表容量。**按能数清楚的用量算，不按"当时跑起来够用"拍**：
-/// 每个任务栈一条（最坏 `MAX_CPUS * MAX_TASKS` = 64 条）+ 固定用途 16 条
-/// （内核堆窗口、每个 CPU 的 #DF 栈、AP 栈、LAPIC/串口设备窗口、M4 的用户三页）。
-/// 24 那个数是 M2 时代拍的，M4 一开用户态就撞上：现场是
-/// `L4: VA 保留登记表已满` 而不是任何页表错误，所以容量也得跟着里程碑复算。
+/// VA 保留登记表容量。**memory 拥有的固定上限**（ADR-065 supersede ADR-041 的派生公式）：
+/// 定长 256 + 空闲位图，给 W3 每进程 VA 保留留余量。旧派生公式 `MAX_CPUS*MAX_TASKS_SUPPORTED+16`=80
+/// 在 M4 开用户态后就撞过 `L4: VA 保留登记表已满`；24 更是 M2 旧值。容量与 sched 任务槽策略解耦——
+/// `MAX_TASKS_SUPPORTED` 仍管"sched 每 CPU 最多几个任务"的契约（sched.rs 的 const 断言），不再派生 VA 容量。
 /// 登记不下时**明确失败**而不是发一条没登记的 VA（见 alloc_va_range 的注释）。
-/// VA 保留表按每 CPU 这么多个任务槽留余量；
-/// sched 的 `MAX_TASKS` 必须 <= 它（sched 里有 const 断言）。
 pub const MAX_TASKS_SUPPORTED: usize = 8;
-const MAX_VA_RESERVATIONS: usize =
-    crate::arch::x86_64::cpu::MAX_CPUS * MAX_TASKS_SUPPORTED + 16;
+const MAX_VA_RESERVATIONS: usize = 256;
+/// 占用位图字数（bit i=1 表示槽 i 已用）。所有访问都在 VMM 锁内，普通 u64 即可（非原子）。
+const VA_BITMAP_WORDS: usize = MAX_VA_RESERVATIONS / 64;
+// 位图按整 word 找空槽，容量必须是 64 的倍数，否则末 word 会找出越界槽号。
+const _: () = assert!(MAX_VA_RESERVATIONS % 64 == 0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PhysAddr(pub u64);
@@ -269,7 +269,7 @@ pub struct Region {
 struct VaReservation {
     base: u64,
     len: u64,
-    used: bool,
+    // 占用与否由 State.va_used 位图决定（ADR-065，单一真相），这里不再存 used。
 }
 
 #[repr(C)]
@@ -283,6 +283,8 @@ struct State {
     boot_stack: [u8; 64 * 1024],
     region_count: usize,
     va_res: [VaReservation; MAX_VA_RESERVATIONS],
+    /// VA 槽占用位图（bit i=1 表示槽 i 已用，ADR-065）。访问都在 VMM 锁内，普通 u64。
+    va_used: [u64; VA_BITMAP_WORDS],
     hhdm: u64,
     max_phys: u64,
     bitmap: [AtomicU64; BITMAP_WORDS],
@@ -307,7 +309,8 @@ static S: StateCell = StateCell(UnsafeCell::new(State {
     pml4_phys: 0,
     boot_stack: [0u8; 64 * 1024],
     region_count: 0,
-    va_res: [VaReservation { base: 0, len: 0, used: false }; MAX_VA_RESERVATIONS],
+    va_res: [VaReservation { base: 0, len: 0 }; MAX_VA_RESERVATIONS],
+    va_used: [0; VA_BITMAP_WORDS],
     hhdm: 0,
     max_phys: 0,
     bitmap: [const { AtomicU64::new(0) }; BITMAP_WORDS],
@@ -445,9 +448,12 @@ pub fn region_count() -> usize {
 /// `va` 落在某条保留里时返回该保留的末（不含），否则 0
 fn reserved_end(va: u64) -> u64 {
     let st = s();
-    for r in &st.va_res {
-        if r.used && va >= r.base && va < r.base + r.len {
-            return r.base + r.len;
+    for i in 0..MAX_VA_RESERVATIONS {
+        if st.va_used[i / 64] >> (i % 64) & 1 == 1 {
+            let r = &st.va_res[i];
+            if va >= r.base && va < r.base + r.len {
+                return r.base + r.len;
+            }
         }
     }
     0
@@ -471,11 +477,14 @@ fn release_va_locked(base: u64) -> bool {
     // 永不映射），所以 `Mapping` 手里的 `virt` 等于 `保留基址 + 一页`。
     // 按基址相等匹配的结果是那两条保留**永远还不回去**：`reservations` 每轮 +3 地涨，
     // 而页框（`live`）却是 0 —— 两个计数器各说对了一半，只看"重装能不能成功"根本看不出来。
-    for (i, r) in st.va_res.iter().enumerate() {
-        if r.used && base >= r.base && base < r.base + r.len {
-            idx = i;
-            len = r.len;
-            break;
+    for i in 0..MAX_VA_RESERVATIONS {
+        if st.va_used[i / 64] >> (i % 64) & 1 == 1 {
+            let r = &st.va_res[i];
+            if base >= r.base && base < r.base + r.len {
+                idx = i;
+                len = r.len;
+                break;
+            }
         }
     }
     if idx == usize::MAX {
@@ -493,7 +502,7 @@ fn release_va_locked(base: u64) -> bool {
             return false;
         }
     }
-    st.va_res[idx].used = false;
+    st.va_used[idx / 64] &= !(1u64 << (idx % 64));
     st.va_res[idx].base = 0;
     st.va_res[idx].len = 0;
     VA_RELEASED.fetch_add(1, Ordering::Relaxed);
@@ -517,19 +526,25 @@ pub fn release_va(base: u64) -> bool {
 /// 某个 base 是否还登记着保留。用例靠它判断"退出的进程有没有把地址空间还回来"。
 pub fn is_reserved(base: u64) -> bool {
     let _g = vmm();
-    s().va_res.iter().any(|r| r.used && r.base == base)
+    let st = s();
+    (0..MAX_VA_RESERVATIONS).any(|i| {
+        st.va_used[i / 64] >> (i % 64) & 1 == 1 && st.va_res[i].base == base
+    })
 }
 
 pub fn reservation_count() -> usize {
     let _g = vmm();
-    s().va_res.iter().filter(|r| r.used).count()
+    s().va_used.iter().map(|w| w.count_ones() as usize).sum()
 }
 
 fn register_va(base: u64, len: u64) -> bool {
     let st = s();
-    for r in &mut st.va_res {
-        if !r.used {
-            *r = VaReservation { base, len, used: true };
+    // 空闲位图找空槽（O(1) 定位）：4 个 word 里第一个非全 1 的，取反 trailing_zeros 即空位。
+    for w in 0..VA_BITMAP_WORDS {
+        if st.va_used[w] != u64::MAX {
+            let b = (!st.va_used[w]).trailing_zeros() as usize;
+            st.va_used[w] |= 1u64 << b;
+            st.va_res[w * 64 + b] = VaReservation { base, len };
             return true;
         }
     }

@@ -669,7 +669,8 @@ known_scc = [
 "irq->arch" = 29
 "irq->memory" = 1
 "irq->sync" = 1
-"memory->arch" = 67
+# P3（ADR-065）：VA 容量改 256 定长，删掉派生公式里的 cpu::MAX_CPUS 引用 ⇒ 67→64（解耦，收紧）。
+"memory->arch" = 64
 "memory->boot" = 8
 "memory->diagnostics" = 7
 "memory->resource" = 2

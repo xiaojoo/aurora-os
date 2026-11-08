@@ -156,6 +156,40 @@ fn t_kbuf_large_alloc() -> bool {
 }
 ktest!(KT_KBUF_LARGE, t_kbuf_large_alloc);
 
+/// P3（ADR-065）：VA 区间表扩容 + 空闲位图。分配 100 段 1 页 VA（**> 旧容量 80**，证扩容到 256），
+/// reservation_count 应 +100；逐段 release_va 回基线、va_released +100。
+/// 旧 80 容量下第 81 段会表满 L4 停机——所以这条用例在改前必停机，是扩容的直接见证。
+/// 位图作占用唯一真相：register 漏置位 ⇒ count 不涨/释放找不到槽 ⇒ 红（负样本）。
+fn t_va_interval_table() -> bool {
+    const N: usize = 100;
+    let base = mm::reservation_count();
+    let rel0 = mm::va_released();
+    let mut vas = [0u64; N];
+    let mut alloc_ok = true;
+    for i in 0..N {
+        match mm::alloc_va_range(1) {
+            Some(v) => vas[i] = v.0,
+            None => { crate::log_fatal!("va区间表: 第 {} 段分配失败", i); alloc_ok = false; break; }
+        }
+    }
+    let after_alloc = mm::reservation_count();
+    let mut release_ok = true;
+    for i in 0..N {
+        if vas[i] != 0 && !mm::release_va(vas[i]) {
+            crate::log_fatal!("va区间表: 第 {} 段释放失败 base={:#x}", i, vas[i]);
+            release_ok = false;
+        }
+    }
+    let after_release = mm::reservation_count();
+    let rel1 = mm::va_released();
+    crate::log_info!(
+        "va区间表(P3): N={} base={} alloc后={} release后={} 分配成={} 释放成={} released {}->{}",
+        N, base, after_alloc, after_release, alloc_ok, release_ok, rel0, rel1);
+    alloc_ok && release_ok && after_alloc == base + N && after_release == base
+        && rel1 >= rel0 + N as u64
+}
+ktest!(KT_VA_INTERVAL, t_va_interval_table);
+
 /// 映射 -> 写入 -> 读回 -> 解映射，且所有权随 Mapping 归还（§6.3 R13）
 fn t_map_write_unmap() -> bool {
     const MAGIC: u64 = 0x5176_0dae_1234_beef;
