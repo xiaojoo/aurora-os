@@ -4954,8 +4954,16 @@ FrameInfo  unsafe 普查 mm U2 累计 21→31（P1 七处 + P2 三处），total
 这是 TCG 下 trace 窗口对齐的偶发抖动，不是回归；**不去松判据**（check_deliver_layer 注释点名的 71a 同源错法）。
 真机/KVM 要重测这一格（ADR-024 口径）。
 
-**仍开**：P3 VA 区间表（supersede ADR-041）、P4 split_huge+map_hole(UC)、P5 demand-zero（单 AS）；
-KBuf 大 order 碎片化长跑成功率、免清零变体、中断上下文禁用门禁（ADR-064 未决）。下一个空 ADR **065**。
+**P3（ADR-065，supersede ADR-041 容量公式）**：VA 保留表 80→**256 定长** + `va_used` 空闲位图作占用
+唯一真相（去 `used` 字段），找空槽/计数 O(1)，释放/冲突仍按区间包含扫描；保留"表满→L4"。
+保留 ADR-041 的所有权归 memory + sched 编译期断言。验收分配 100 段（>旧 80）全成、释放回基线；
+两条负样本证红（漏置位图⇒count 不涨；容量缩 64⇒第 65 段表满 L4）。加编译期断言 `容量%64==0`。
+**结构收益**：删容量公式里的 `cpu::MAX_CPUS` 引用 ⇒ 环内 `memory->arch` 棘轮 **67→64**（解耦后果，登记收紧）。
+矩阵 43/43，VA 见证 41 份留档全过（base 随变体 6–24，各回各基线）。用例 66→**67**。
+
+**仍开**：P4 split_huge+map_hole(UC)、P5 demand-zero（单 AS）；
+KBuf 大 order 碎片化长跑成功率、免清零变体、中断上下文禁用门禁（ADR-064 未决）；
+VA 256 够不够 W3、包含扫描 O(n) 热路径优化（ADR-065 未决）。下一个空 ADR **066**。
 
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
