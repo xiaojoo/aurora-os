@@ -788,7 +788,7 @@ fn t_probe_ring3() -> bool {
         && start_ret == 0;
     let probe_owner = sched::identity_of(t2).unwrap_or((usize::MAX, 0));
     // 进程身份要在**收场之前**取走：terminate + reap 之后它的句柄就被撤销了
-    let (pid, _pgen) = match crate::handle::resolve(crate::handle::Handle(proc_h), probe_owner, 0) {
+    let (pid, pgen) = match crate::handle::resolve(crate::handle::Handle(proc_h), probe_owner, 0) {
         Ok((crate::handle::ObjRef::Proc { slot, gen }, _)) => (slot, gen),
         _ => (u16::MAX, 0),
     };
@@ -833,15 +833,41 @@ fn t_probe_ring3() -> bool {
         && rd64(8) == si_h0 && si_h0 != 0
         && crate::handle::Handle(dup_ret).unpack().is_some();
     let child_ran = cg != usize::MAX && sched::runs_of(cg) > 0;
+    let child_as = crate::proc::proc_aspace(pid, pgen).map(|(a, _)| a);
     let run_ok = magic_ok && abi_ok && handle_ok && write_ok && va_ok && readback == 1
         && done == 1 && xform_ok && wx_ok && un_ok && loader_ok && child_ok && child_ran;
-    // 收场顺序（ADR-074 的契约）：**子线程先死** → 两个探针死 → reap 还映射与句柄 → 才销毁进程与 Job
+    // ---- **"父先退"负样本**：把那条限制从推导变成直接读数 ----
+    // 装载器的资源袋里挂着子进程的代码/栈/表/数据四页（ADR-074 按任务归属）。
+    // 先杀装载器 ⇒ reap 丢掉那些映射 ⇒ 子进程下一条指令就取不到 ⇒ ring3 #PF ⇒ 被杀。
+    // 这不是"要修好的 bug"，是**本刀如实证出来的限制**：进程级归属是 P7 的账。
+    let kills0 = user::kills();
+    let rel_p = sched::reap_released();
+    let _ = sched::terminate_task(t2);
+    let drained_p = sched::reap_released() > rel_p || crate::ktests::common::drain_reap();
+    // 给子进程一个真会跑起来的机会（它停在 `jmp .`，代码页没了就当场故障）
+    apic::timer_start().ok();
+    apic::with_interrupts(|| {
+        let t0 = tsc::now();
+        while tsc::now().wrapping_sub(t0) < 300_000_000 {
+            if !matches!(sched::state_of(cg), sched::TaskState::Runnable | sched::TaskState::Running) {
+                break;
+            }
+            tsc::spin(20_000);
+        }
+    });
+    apic::timer_stop().ok();
+    let code_gone = child_as
+        .and_then(|a| mm::aspace_effective_flags(a, 0x3000_0000))
+        .is_none();
+    let parent_first_ok = drained_p && code_gone && user::kills() > kills0
+        && !matches!(sched::state_of(cg), sched::TaskState::Runnable | sched::TaskState::Running);
+    // 收场：子进程已被故障路径标结束，这里补一刀保证槽位交回去，然后 reap → 销毁进程与 Job
     let rel0 = sched::reap_released();
     if cg != usize::MAX {
         let _ = sched::terminate_task(cg);
     }
-    let _ = sched::terminate_task(t2);
-    let drained = drained_a && (sched::reap_released() > rel0 || crate::ktests::common::drain_reap());
+    let drained = drained_a && drained_p
+        && (sched::reap_released() > rel0 || crate::ktests::common::drain_reap());
     // 子线程被杀 ⇒ terminate_task 给进程记了收工（退出码 1）⇒ 走 reap 而不是 discard
     let preaped = pid != u16::MAX && crate::proc::proc_reap(pid).is_ok();
     let jdel = crate::proc::job_destroy(job).is_ok();
@@ -854,18 +880,19 @@ fn t_probe_ring3() -> bool {
         && crate::proc::proc_residual().0 == 0 && crate::proc::job_residual().0 == 0
         && mm::aspace_count() == 0;
     crate::log_info!(
-        "probe(P5c-3b): 魔数={} ABI位={} 句柄={} 写={} VA={} 自读回={} 生效位={:?} 内核读回={} 扩展形=(请求{:#x} 返回{:#x} 判据{} 读回{}) W+X拒={} 非对齐拒={} 装载器=(proc{} thread{} ret16={}) 子进程=(读回{} magic={:#x} nhandles{}/{} 句柄{:#x}/{:#x} dup{:#x} 跑过{}) 收场=(drained{} reap{} jdel{} free{}->{} va{}->{} live{}->{} vmo{}->{}) served={}/{}",
+        "probe(P5c-3b): 魔数={} ABI位={} 句柄={} 写={} VA={} 自读回={} 生效位={:?} 内核读回={} 扩展形=(请求{:#x} 返回{:#x} 判据{} 读回{}) W+X拒={} 非对齐拒={} 装载器=(proc{} thread{} ret16={}) 子进程=(读回{} magic={:#x} nhandles{}/{} 句柄{:#x}/{:#x} dup{:#x} 跑过{}) 父先退=(代码页没了{} kills{}->{}) 收场=(drained{} reap{} jdel{} free{}->{} va{}->{} live{}->{} vmo{}->{}) served={}/{}",
         magic_ok, abi_ok, handle_ok, write_ok, va_ok, readback == 1, eff, kernel_read,
         x_req, x_ret, xform_ok, x_read, wx_ok, un_ok,
         crate::handle::Handle(proc_h).unpack().is_some(), crate::handle::Handle(thread_h).unpack().is_some(),
         start_ret, child_read, rd32(0), rd32(4), si_n, rd64(8), si_h0, dup_ret, child_ran,
+        code_gone, kills0, user::kills(),
         drained, preaped, jdel, f0, f1, va0, va1, lv0, crate::handle::live(), v0,
         crate::vmo::vmo_count(), served, served2);
-    let ok = run_ok && eff_ok && kernel_read && base_ok;
+    let ok = run_ok && eff_ok && kernel_read && parent_first_ok && base_ok;
     if !ok {
         crate::log_fatal!(
-            "probe: 判据不成立 跑={} 生效位={} 内核读回={} 装载器={} 子进程={} 跑过={} 收场={} 原始=[magic={:#x} abi={:#x} h={:#x} n={} va={:#x} rb={} done={} proc={:#x} th={:#x} ret16={:#x}]",
-            run_ok, eff_ok, kernel_read, loader_ok, child_ok, child_ran, base_ok,
+            "probe: 判据不成立 跑={} 生效位={} 内核读回={} 装载器={} 子进程={} 跑过={} 父先退={} 收场={} 原始=[magic={:#x} abi={:#x} h={:#x} n={} va={:#x} rb={} done={} proc={:#x} th={:#x} ret16={:#x}]",
+            run_ok, eff_ok, kernel_read, loader_ok, child_ok, child_ran, parent_first_ok, base_ok,
             magic, abi, h, n, mva, readback, done, proc_h, thread_h, start_ret);
     }
     ok
