@@ -1495,6 +1495,158 @@ fn t_handle_vmo_release() -> bool {
 }
 #[cfg(feature = "handles")]
 ktest!(KT_HANDLE_VMO_RELEASE, t_handle_vmo_release);
+#[cfg(feature = "handles")]
+fn kinds_sleep() -> ! {
+    // 只存在、不需要跑：C4 判的是"槽里有没有这条线程"，不是它有没有收工
+    loop {
+        crate::tsc::spin(2000);
+    }
+}
+
+/// P5c-1（ADR-075 决策 4）：句柄的四种新 kind、`RIGHT_CREATE`、世代号、
+/// 以及"**close/revoke 只撤名字，不销毁本体**"这条与 VMO 不同的语义。
+/// 七格各自一条证人，收场必须回到进来之前的三本账（proc/job/AS 各一）。
+#[cfg(feature = "handles")]
+fn t_handle_kinds() -> bool {
+    use crate::{handle, proc, sync};
+    let owner: (usize, u32) = (7, 9101);
+    let lv0 = handle::live();
+    let (jp0, _) = proc::job_residual();
+    let (pp0, _) = proc::proc_residual();
+    let as0 = mm::aspace_count();
+    let ls0 = sync::stats();
+    let R = handle::RIGHT_READ | handle::RIGHT_DUP;
+
+    // ①② Job：带 CREATE 与不带 CREATE 是两格，拒绝必须记在 denied 而不是 no_such
+    let job = match proc::job_create(None, 4, 64) {
+        Ok(j) => j,
+        Err(e) => { crate::log_fatal!("hkind: job_create {:?}", e); return false; }
+    };
+    let jgen = proc::job_gen(job).unwrap_or(0);
+    let hj = match handle::grant_job(owner, job, jgen, R | handle::RIGHT_CREATE) {
+        Ok(h) => h,
+        Err(e) => { crate::log_fatal!("hkind: grant_job {:?}", e); return false; }
+    };
+    let d0 = handle::counters().denied;
+    let hj_plain = handle::grant_job(owner, job, jgen, R);
+    let create_ok = handle::has(hj, owner, handle::RIGHT_CREATE)
+        && match hj_plain {
+            Ok(h) => {
+                let no = !handle::has(h, owner, handle::RIGHT_CREATE);
+                handle::close(h, owner).ok();
+                no
+            }
+            Err(_) => false,
+        }
+        && handle::counters().denied > d0;
+
+    // ③ Proc
+    let p = match proc::proc_create(job) {
+        Ok(v) => v,
+        Err(e) => { crate::log_fatal!("hkind: proc_create {:?}", e); return false; }
+    };
+    let pgen = proc::proc_gen(p).unwrap_or(0);
+    let hp = match handle::grant_proc(owner, p, pgen, R) {
+        Ok(h) => h,
+        Err(e) => { crate::log_fatal!("hkind: grant_proc {:?}", e); return false; }
+    };
+    let proc_ok = handle::resolve(hp, owner, 0)
+        .map(|(o, _)| matches!(o, handle::ObjRef::Proc { slot, .. } if slot == p))
+        .unwrap_or(false);
+
+    // ④ ASpace：活着能解析；**销毁之后**同一个句柄必须 `NoSuch`（世代号唯一的证人）
+    let a = match mm::aspace_new() {
+        Some(h) => h,
+        None => { crate::log_fatal!("hkind: aspace_new 建不起来"); return false; }
+    };
+    let slot_a = a.slot();
+    let ha = match handle::grant_aspace(owner, slot_a, R) {
+        Ok(h) => h,
+        Err(e) => { crate::log_fatal!("hkind: grant_aspace {:?}", e); return false; }
+    };
+    // C1b：句柄层**看不出** Job/Proc 的死亡（`capability -> sched` 这条边会把 sched 拖进
+    // 冻结的核心环，见 `handle::grant_job`），sched 那侧看得出 ⇒ "谁判活性"是可判的分工，不是注释。
+    let (j2, g2) = match proc::job_create(None, 1, 8) {
+        Ok(v) => (v, proc::job_gen(v).unwrap_or(0)),
+        Err(e) => { crate::log_fatal!("hkind: job_create(2) {:?}", e); return false; }
+    };
+    let hj2 = match handle::grant_job(owner, j2, g2, R) {
+        Ok(h) => h,
+        Err(e) => { crate::log_fatal!("hkind: grant_job(2) {:?}", e); return false; }
+    };
+    let jd2 = proc::job_destroy(j2).is_ok();
+    let split_ok = jd2 && handle::resolve(hj2, owner, 0).is_ok() && !proc::job_live(j2, g2);
+    // 这一格只是证人，不留句柄在表里：⑥/⑦ 的账要按"只剩 ASpace 那一个"算
+    handle::close(hj2, owner).ok();
+    let as_live = handle::resolve(ha, owner, 0)
+        .map(|(o, _)| matches!(o, handle::ObjRef::ASpace { slot, .. } if slot == slot_a))
+        .unwrap_or(false);
+    let n0 = handle::counters().no_such;
+    drop(a);
+    let as_stale = handle::resolve(ha, owner, 0).is_err() && handle::counters().no_such > n0;
+
+    // ⑤ Thread：任务是槽 + id 两格；terminate 之后槽标 Free ⇒ 同一个句柄 `NoSuch`
+    let gi = match crate::sched::spawn(kinds_sleep) {
+        Ok(g) => g,
+        Err(_) => { crate::log_fatal!("hkind: spawn 失败"); return false; }
+    };
+    let th_id = crate::sched::id_of(gi);
+    let ht = match handle::grant_thread(owner, gi, th_id, R) {
+        Ok(h) => h,
+        Err(e) => { crate::log_fatal!("hkind: grant_thread {:?}", e); return false; }
+    };
+    let th_live = handle::resolve(ht, owner, 0)
+        .map(|(o, _)| matches!(o, handle::ObjRef::Thread { gidx, .. } if gidx == gi))
+        .unwrap_or(false);
+    let t1 = crate::sched::terminate_task(gi);
+    // C4 的形状是**两半**：句柄层看不见线程死亡（设计上不判，见 grant_thread），
+    // sched 那侧看得见 ⇒ 安全性由消费方（c-3 的 thread_create/process_start）兜住。
+    // 只写"resolve 报错"会把这条分工判成假的。
+    let th_gone = t1
+        && !crate::sched::thread_live(gi, th_id)
+        && crate::sched::id_of(gi) == th_id
+        && handle::resolve(ht, owner, 0).is_ok();
+
+    // ⑥ close 不销毁本体：关到只剩"内核那一份都没有"，三本账一个都不能动
+    let _ = handle::close(hj, owner);
+    let _ = handle::close(hp, owner);
+    let _ = handle::close(ht, owner);
+    let (jp1, _) = proc::job_residual();
+    let (pp1, _) = proc::proc_residual();
+    let noclose_ok = jp1 == jp0 + 1 && pp1 == pp0 + 1 && mm::aspace_count() == as0
+        && handle::live() == lv0 + 1;
+
+    // ⑦ revoke 只摘名字：撤掉这一路剩下的那一个句柄（ASpace），本体账不变
+    let rv = handle::revoke_task(owner.0, owner.1);
+    let rev_ok = rv == 1 && handle::live() == lv0;
+
+    // 收场：对象按各自的显式路径销毁（进程先弃、Job 后销，反了就是 Denied）
+    let disc = proc::proc_discard(p).is_ok();
+    let jdel = proc::job_destroy(job).is_ok();
+    let ls1 = sync::stats();
+    let lock_ok = ls1.order_violations == ls0.order_violations && ls1.reentrant_hits == ls0.reentrant_hits;
+    let base_ok = disc && jdel && handle::live() == lv0
+        && proc::job_residual().0 == jp0 && proc::proc_residual().0 == pp0
+        && mm::aspace_count() == as0;
+    crate::log_info!(
+        "hkind(P5c-1): CREATE={} proc={} 活性分工={} AS活={} AS世代={} 线程活={} 线程撤销={} close不动本体={} revoke={} 锁序=(viol{}->{}/reent{}->{}) 基线=(live{}->{} AS{}->{} job{}->{} proc{}->{})",
+        create_ok, proc_ok, split_ok, as_live, as_stale, th_live, th_gone, noclose_ok, rev_ok,
+        ls0.order_violations, ls1.order_violations, ls0.reentrant_hits, ls1.reentrant_hits,
+        lv0, handle::live(), as0, mm::aspace_count(), jp0, proc::job_residual().0,
+        pp0, proc::proc_residual().0);
+    let ok = create_ok && proc_ok && split_ok && as_live && as_stale && th_live && th_gone
+        && noclose_ok && rev_ok && lock_ok && base_ok;
+    if !ok {
+        crate::log_fatal!(
+            "hkind: 判据不成立 CREATE={} proc={} 活性分工={} AS活={} AS世代={} 线程={} 线程撤={} close={} revoke={} 锁序={} 收场={}",
+            create_ok, proc_ok, split_ok, as_live, as_stale, th_live, th_gone, noclose_ok, rev_ok,
+            lock_ok, base_ok);
+    }
+    // ASpace 那个句柄在 ⑦ 已经被 revoke 摘走；a 已经 drop，这里没有 leftovers
+    ok
+}
+#[cfg(feature = "handles")]
+ktest!(KT_HANDLE_KINDS, t_handle_kinds);
 
 // ---- ADR-074（W3 P4b）12/13/14 三个号 + 退出时归还 ----
 //

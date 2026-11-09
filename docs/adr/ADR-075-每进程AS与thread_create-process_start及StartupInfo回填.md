@@ -92,8 +92,12 @@ HandleDesc  { role: u32, kind: u32, handle: u64 }
   `PARENT_CHAN`（Channel 对象不存在）、`LOG`（控制台对象不存在）、`NS_ROOT`（要 FAT16+GPT 或 initramfs）
   **一律不传** ⇒ 按 §10.2 的语义"没传的角色就是不存在"，进程凭空取不到。
   这条要写进 ABI 文档，不许摆一个没人填的角色槽。
-- `MAX_STARTUP_HANDLES` 初版 **8**（不是设计举例的 16）：今天能传的角色只有 4 个，
-  句柄表本身也只有 16 格；取 8 是"接缝够用 + 余量一倍"，**欠 workload 依据**（未决 3）。
+- `MAX_STARTUP_HANDLES` = **16**（使用者裁决，2026-11-10：选"照设计举例，不留返工"）。
+  本文原先提议 8（"接缝够用 + 余量一倍"），改裁的理由是加角色不该再动一页布局与 ABI。
+  **代价要一起写死**：表里会有 12 格永久为空，而"空槽"会被读成"该传但没传"。
+  口径 ⇒ 读取方只许信 `handles[0..nhandles]`，`nhandles` 之后必须全零；
+  `process_start` 校验"越界非零"直接拒绝，判据里要有一格专喂"nhandles 之后有垃圾"。
+  `24 × 16 + 表头 24 = 408 ≤ 4096`，一页装得下。
 
 ### 4. 句柄表：P5 仍用全局 16 格，转移 = 改 owner + bump gen
 
@@ -106,7 +110,7 @@ HandleDesc  { role: u32, kind: u32, handle: u64 }
   只有 `StartupInfo` 里列出的那几个成功，其余回 `NotOwner`/`NoSuch`（**不是** `Stale`——
   别人的槽根本没发给它，这两种拒绝要分开数）。
 - `process_create(job_handle)` 必须出示带 `CREATE` 的 Job 句柄。`CREATE` 是 Q7 裁的唯一新权限位，
-  今天 `handle.rs` 还没有这个常量 ⇒ P5c 新增 `RIGHT_CREATE = 32`（`RIGHT_TRANSFER` 已占 16）。
+  今天 `handle.rs` 还没有这个常量 ⇒ P5c 新增 `RIGHT_CREATE = 32`（`RIGHT_TRANSFER` 已占 16，**已落地 P5c-1**）。
   根 Job 只交给 init（设计 §10.1）；**今天没有 init**，所以 P5c 的根 Job 由 ktest/内核持有，
   产品启动路径不授予（与 ADR-007 第一刀同一姿态，不许写成"安全启动已接通"）。
 
@@ -300,6 +304,61 @@ P5c 的 `process_start` 会把这条代价带到产品路径上——**那时换
 `AS_ON` 只增不减 + 4 个槽的容量 ⇒ P5c 若把 AS 数提上去要一并重算 `MAX_ADDR_SPACES`；
 决策 3–7（`StartupInfo`、转移、`MAX_STARTUP_HANDLES`、根 Job、`process_start` 原子性边界）仍未落地。
 
+## 补记：P5c-1 落地（四种句柄 kind + `RIGHT_CREATE` + 对象世代号，2026-11-10，实测）
+
+三刀（使用者裁决）里的第一刀：**纯内核侧**，不开新 syscall、不动 14 号。落到的形状与两处
+**草案没写到的东西**：
+
+- **对象世代号是新增的（草案里没有）**。决策 4 说"表里只存引用"，但 `proc.rs` 的
+  `JobEntry`/`ProcEntry` 只有 `used`，`mm` 的 `AspaceEntry` 只有 `used`+`pml4`——
+  **槽号是复用的**，只存槽号会让新 Job 继承旧进程留下的句柄（ADR-073 给 `Task::id` 记过同一条坑）。
+  ⇒ `JobEntry.gen` / `ProcEntry.gen` / `AspaceEntry.gen`：`*_create`/`aspace_new` 在旧值上 +1，
+  **销毁不复位**；句柄存 `(slot, gen)`，对不上就是"这个对象不是当初那个"。
+  配套读接缝：`proc::job_gen`/`proc_gen`/`job_live`/`proc_live`、`mm::aspace_gen`/`aspace_live`、
+  `sched::id_of`/`thread_live`。`Thread` 用现成的 `Task::id`（全局单调 `NEXT_ID`），不新造号。
+- **`close`/`revoke` 对这四种 kind 不销毁本体**（与 VMO 不同）。撤掉的是一份名字，
+  销毁仍走各自的显式路径（`job_destroy` / `proc_reap`+`proc_discard` / `AspaceHandle::drop` /
+  `terminate_task`）。**这条与本文"影响 3"不同**：那里写"四种 kind ⇒ HANDLE(35) 锁外要调
+  `proc`/`mm`/`sched` 三个模块"，实际只有 VMO 需要；这四种连锁外调用都没有。
+  判据 `hkind(P5c-1)` 的 `close不动本体` / `revoke` 两格把这条例言变成读数。
+- **`capability → sched` 这条边会造成新的强连通分量——所以活性判定不能放在句柄层**。
+  第一版把 `proc::job_live` / `proc::proc_live` / `sched::thread_live` 放进 `handle::resolve`，
+  `check-module-interfaces` 立刻报：
+  `强连通分量 … [['capability','sched']]，基线 [[…核心 11 模块…]]`，
+  连带 `环内新边 capability->sched(4) / capability->memory(13) / capability->storage(4) /
+  capability->sync(1)` 与 **`sched` 的十来条边全部要登记棘轮**（`sched->memory` 113、
+  `sched->arch` 258…）——因为 `proc.rs`/`user.rs`/`elf.rs` 都属于 **`sched` 模块组**，
+  而 `sched → capability`（`revoke_task`）本来就有，一条反向边就把 `sched` 从单例拖进冻结的核心环。
+  ⇒ 最终形状：**`ObjRef::Job`/`Proc`/`Thread` 的活性由 `sched` 侧的消费方判**（c-3 的 11/15/16
+  在用之前自己核 `(slot, gen)` / `(gidx, id)`）；只有 `ASpace` 在句柄层判
+  （`capability → memory` 是登记过的边，不形成环）。`grant_job/grant_proc/grant_thread`
+  因此改成**由调用方把世代号读好传进来**。
+  这条分工不是散文：用例的 `活性分工` 与 `线程撤销` 两格判的就是
+  "句柄层 `resolve` 仍然 Ok，而 `proc::job_live` / `sched::thread_live` 已经 false"。
+  **没有损失安全性**：线程/进程槽位的生死本来就在 `sched` 的入口判。
+- **新用例 `t_handle_kinds`（KT_HANDLE_KINDS，`handles` 档）取证读数**：
+  `hkind(P5c-1): CREATE=true proc=true 活性分工=true AS活=true AS世代=true 线程活=true 线程撤销=true close不动本体=true revoke=true 锁序=(viol0->0/reent0->0) 基线=(live0->0 AS0->0 job0->0 proc0->0)`
+  ⇒ `handles` 档 **83/83**（P5b 收尾是 82/82）、默认档 **80/80** 不变（用例是 `cfg(handles)`），
+  两档都 `判定=PASS qemu_rc=33`。
+- **四条变异各咬哪一格**：
+  M16 = `ObjRef::ASpace` 不判世代 ⇒ `AS世代=false`，`failed=1`，FAIL(35)。
+  M17 = `RIGHT_CREATE` 改成 0 ⇒ `CREATE=false`，FAIL(35)。
+  M18 = `revoke_task` 只撤 File/Vmo ⇒ `revoke=false` **且 `failed=19`**：
+  漏撤的名字把后面每一格用例的收尾闸都打红了（这正是"撤销漏一种 kind"应付的代价，
+  不是只漏那一格）。
+  M19 = 把活性判定留在 HANDLE(35) **锁内** ⇒ `L4 sync: 锁序违规，外层 rank=35 本次 rank=20`
+  ⇒ **EXCEPTION(39)**。这条是给"活性必须在锁外"配的门禁证人，不是给 kind 配的。
+  四条都已还原。
+- **门禁读数**：`check` **17/17**（含 `check-module-interfaces` 的 SCC/棘轮全绿——
+  即核心环仍是 11 个模块，`capability` 与 `sched` 仍是单例）；矩阵与 bench 见 BACKLOG §159。
+- **unsafe 普查 372 → 373**（`sched` U4 16→17，就是 `id_of` 那次每 CPU 快照读）；
+  `module-interfaces.toml` 只登记了产品路径真引用的 `mm::aspace_gen` / `mm::aspace_live`
+  （`proc::*`、`sched::*` 那几个只被 `testing` 用，不在登记射程内）。
+
+**这一刀之后仍开着的**：`MAX_STARTUP_HANDLES = 16` 的布局与"越界非零"校验在 **P5c-3**；
+`RIGHT_CREATE` 还没有产品调用方（11 号在 c-3）；`ASpace` 句柄的 `gen` 与 `MAX_ADDR_SPACES = 4`
+的容量要在 c-3 真给进程发 AS 时一并重算。
+
 ## 备选方案
 
 - **一刀做完 P5**：拒绝（决策 1）。换人热路径、句柄种类、ABI、新产物四件事一起动，
@@ -364,12 +423,18 @@ P5c 的 `process_start` 会把这条代价带到产品路径上——**那时换
 
 ## 未决（**需要裁决，本文不自行决定**）
 
-**已裁两条（2026-11-09，使用者裁决）**：原未决 1（14 号参数）⇒ **兼容扩展 14**，见决策 6；
-原未决 2（跳板位置）⇒ **搬进内核半区共享一份**，见决策 7。下面保留原编号，方便与草案对照。
+**已裁五条**：原未决 1（14 号参数）⇒ **兼容扩展 14**，见决策 6（2026-11-09）；
+原未决 2（跳板位置）⇒ **搬进内核半区共享一份**，见决策 7（2026-11-09）；
+原未决 3（`MAX_STARTUP_HANDLES`）⇒ **16**，见下面决策 3 那一节的修订（2026-11-10，代价是 12 格永久为空，
+判据要专门喂"nhandles 之后有垃圾"）；原未决 4（根 Job 归谁）⇒ **内核持有、只在 ktest 出示，产品路径不授予**
+（2026-11-10，与 ADR-007 第一刀同一姿态，不许写成"进程创建已接通"）；
+原未决 7（`Thread` 要不要独立句柄）⇒ **要，四种 kind 照决策 4**（2026-11-10，本文原先提议"只内部标识"已被推翻；
+P5c-1 落地时按四种做，`ObjRef::Thread { gidx, id }` 已在表里）。
+下面保留原编号，方便与草案对照。
 
-3. **`MAX_STARTUP_HANDLES` 的取值**：本文提议 8（今天只有 4 个角色真能传），
+3. ~~**`MAX_STARTUP_HANDLES` 的取值**~~（**已裁 16**，见上面的日期行）。本文原提议 8（今天只有 4 个角色真能传），
    设计举例是 16，而句柄表本身只有 16 格。取值与"每进程句柄表上限"（W4）绑定，欠 workload 依据。
-4. **`CREATE` 权限位与根 Job 的授予**：Q7 裁了"CREATE 是唯一新权限位"，但**根 Job 交给谁**今天没有 init。
+4. ~~**`CREATE` 权限位与根 Job 的授予**~~（**已裁：内核持有、只在 ktest 出示**；`RIGHT_CREATE=32` 已随 P5c-1 落地）。Q7 裁了"CREATE 是唯一新权限位"，但**根 Job 交给谁**今天没有 init。
    P5c 由 ktest/内核持有 ⇒ 产品启动路径不授予。要不要在 P5 就造一个最小 init（设计 §10.4 说 init 来自签名包/initramfs），
    还是留到 P7，需要裁。
 5. **`process_start` 的原子性边界**：②转移与③回填跨两个模块（handle 表与 VMO 帧），
@@ -380,6 +445,6 @@ P5c 的 `process_start` 会把这条代价带到产品路径上——**那时换
 6. **Done 槽回收欠账与线程上限**：Q2 裁的 9 格是零余量，而实测有效容量只有 5（BACKLOG §151）。
    P5c 的 spawn 用例按哪个数写判据？本文主张按"有效容量"并把欠账显式写进读数，
    但这也意味着**上限那笔账在 P6 之前都不算结清**。
-7. **`Thread` 对象要不要独立句柄**：设计 §10.6 第 3 条把 `thread_wait` 列为"由用例逼出来再定"。
+7. ~~**`Thread` 对象要不要独立句柄**~~（**已裁：要**，P5c-1 已发 `ObjRef::Thread`）。设计 §10.6 第 3 条把 `thread_wait` 列为"由用例逼出来再定"。
    Q3 已裁通用 `object_wait`（19 号，P6），所以线程级等待免费得到；但 `Thread` 作为一种 kind
    是否要在 P5c 就发句柄（还是只用 `gidx` 内部标识），本文提议**只内部标识**，等 P6 真需要 wait 它时再发。

@@ -11,7 +11,7 @@
 | `RANK_HEAP` | 10 | `heap::Heap` 的光标/自由链表 | VMM(20)、PMM(30)、台账(40) | `try_alloc` → `map_more_through` → `mm::map` → `new_table_frame` → `phys_alloc` → 台账 |
 | `RANK_VMM` | 20 | 页表结构与 VA 保留登记表 | PMM(30)、台账(40) | `map`/`alloc_va_range` 内部要新页表页，走 `phys_alloc` |
 | `RANK_PMM` | 30 | 物理帧位图与 `free_frames` 计数 | 台账(40) | `phys_alloc`/`phys_free` 结束时记账 |
-| `RANK_HANDLE` | 35 | 用户句柄表（`kernel/src/handle.rs`，`handles` 特性） | 台账(40) | ADR-007 裁决 E（2026-11-07 批准，同日落地）：第一版对象是只读文件、**不持有页框** ⇒ 表锁内只许调台账、不许调 mm；盘 I/O 在锁外（取票/提交两段） |
+| `RANK_HANDLE` | 35 | 用户句柄表（`kernel/src/handle.rs`，`handles` 特性） | 台账(40) | ADR-007 裁决 E（2026-11-07 批准，同日落地）：第一版对象是只读文件、**不持有页框** ⇒ 表锁内只许调台账、不许调 mm；盘 I/O 在锁外（取票/提交两段）。**P5c-1 起再加一条**：对象**活性判定**也在锁外（`resolve` 取完引用放锁，再判 `mm::aspace_live` ⇒ 那一步要取 VMM(20)）。负样本 M19：把判定留在 35 之内 ⇒ `L4 sync: 锁序违规，外层 rank=35 本次 rank=20` ⇒ EXCEPTION(39) |
 | `RANK_LEDGER` | 40 | `resource::Ledger` 的每模块计数 | （叶子） | 不再获取别的锁 |
 | `RANK_ACPI` | 50 | ACPI 解析结果静态量 | （叶子，目前只在启动期单独使用） | 解析路径不分配物理帧 |
 | `RANK_TEST` | 60 | 无（跨核竞争用例的自旋占位） | （叶子，**故意**是叶子） | `smp::contention_round`；临界区里只有一次 volatile 读改写 + 一段 `tsc::spin` |
@@ -107,6 +107,26 @@ contention: 无锁丢数 10204 / 16000 = 6377 bp（这条数字是尺子能分�
 台账在最里面，因为它谁也不叫。把顺序写反不会立即出错，只会在真正嵌套时变成
 自死锁——而自死锁在单核上的表现是"关中断自旋直到溢出"，归因极难，所以这张表
 先于代码存在。
+
+## 句柄表四种新 kind：活性判定在锁外，且**不在句柄层判 `sched` 的对象**（W3 P5c-1，ADR-075 决策 4，2026-11-10）
+
+`ObjRef` 从两种（File/Vmo）扩到六种（加 `Job`/`Proc`/`ASpace`/`Thread`）。两件事由实测定形：
+
+1. **判活性必须在放掉 HANDLE(35) 之后**。`mm::aspace_live` 要取 VMM(20)，留在 35 之内就是
+   `35 → 20` 的反向嵌套，机制当场把它升成 L4（M19 就是这么红的）。形状沿用 ADR-074 的
+   "取票（锁内）→ 锁外操作 → 提交（锁内）"，所以拒绝计数要在锁外补一次很短的取锁（`handle::note`）。
+2. **`sched` 侧的对象（`proc::job_live`/`proc_live`、`sched::thread_live`）干脆不在句柄层判**。
+   这不是锁序问题而是**依赖图**问题：`proc.rs`/`user.rs`/`elf.rs` 都属于 `sched` 模块组，
+   而 `sched → capability` 已经有 `revoke_task` 那一条边；`capability → sched` 一加上就形成
+   `[['capability','sched']]` 这个**新的二元强连通分量**，`sched` 从单例被拖进冻结的核心环，
+   `check-module-interfaces` 要一次性登记 `sched` 的十来条环内边（实测：`sched->memory` 113、
+   `sched->arch` 258、`sched->sync` 29…）。⇒ 这三类的 `(slot, gen)` / `(gidx, id)` 核对
+   归 **`sched` 侧的消费方**（P5c-3 的 11/15/16），线程/进程槽位的生死本来就在 `sched` 入口判，
+   安全性没有折扣。用例 `hkind` 的 `活性分工` 与 `线程撤销` 两格把这条分工写成读数。
+
+`close`/`revoke_task` 对这四种 kind **不销毁本体**（撤的是名字，销毁走各自显式路径），
+所以 ADR-074 那条"释放移到锁外"的注记对它们不适用；`revoke` 少撤一种 kind 的代价不是"只漏那一格"，
+而是把后续每一格用例的收尾闸都打红（M18 实测 `failed=19`）。
 
 ## 换人路径在 IF=0 下运行：CR3 写与位图登记都不许取锁（W3 P5b 收尾，ADR-075，2026-11-10）
 

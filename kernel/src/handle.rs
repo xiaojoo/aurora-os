@@ -35,6 +35,10 @@ pub const RIGHT_WRITE: u32 = 2;
 pub const RIGHT_MAP: u32 = 4;
 pub const RIGHT_DUP: u32 = 8;
 pub const RIGHT_TRANSFER: u32 = 16;
+/// **Q7 裁的唯一新权限位**（P5c-1，ADR-075 决策 4）：只有带 `CREATE` 的 Job 句柄能造进程。
+/// 它今天还没有产品调用方（11 号在 P5c-3），先把常量与校验接缝落地并各配一格负样本，
+/// 免得 c-3 同时动"新号 + 新权限位 + 新序列"三件事。
+pub const RIGHT_CREATE: u32 = 32;
 
 /// 用户拿到的那个整数。构造永远成功（它是用户可伪造的值）；校验在查表时做。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -116,6 +120,17 @@ pub struct FileObj {
 pub enum ObjRef {
     File(FileObj),
     Vmo { slot: u8 },
+    // ---- P5c-1（ADR-075 决策 4）：四种新 kind。本体各自住在 proc.rs / mm 的 AS 表 / sched 的任务表，
+    // 表里只存**带世代号的引用**：`gen`（Thread 用 `id`）对不上就当"这个对象不是当初那个"。
+    // 为什么必须有世代号：槽号是**复用的**，只比槽号会让新 Job/Proc/AS 继承旧句柄
+    // ——那正是 ADR-073 给 `Task::id` 记过的同一条坑。
+    // **这些 kind 的 close 不销毁本体**：撤掉的是一份名字，销毁仍走各自的显式路径
+    // （`job_destroy` / `proc_reap`+`proc_discard` / `AspaceHandle::drop` / `terminate_task`）。
+    // 这条与 ADR-075 影响 3 的"锁外要调三个模块"不同，已在该 ADR 的补记里记偏差。
+    Job { slot: u16, gen: u32 },
+    Proc { slot: u16, gen: u32 },
+    ASpace { slot: u8, gen: u32 },
+    Thread { gidx: usize, id: u32 },
 }
 
 #[derive(Clone, Copy)]
@@ -245,6 +260,111 @@ pub fn grant_vmo(owner: (usize, u32), id: crate::vmo::VmoId, rights: u32) -> Res
     r
 }
 
+/// 锁外判完活性之后，把这次拒绝记进台账。
+/// **必须重新取一次 35**：活性判据要取 VMM(20)（proc/mm 的表在它下面），
+/// 所以它只能在放掉句柄锁之后跑；计数还归台账，所以这里做第二次很短的取锁。
+fn note(err: HErr) -> HErr {
+    let mut g = TABLE.lock();
+    let t = g.get();
+    match err {
+        HErr::Invalid => t.c.invalid += 1,
+        HErr::NoSuch => t.c.no_such += 1,
+        HErr::Stale => t.c.stale += 1,
+        HErr::NotOwner => t.c.not_owner += 1,
+        HErr::Denied => t.c.denied += 1,
+        HErr::Exhausted => t.c.exhausted += 1,
+        HErr::Io(_) => t.c.denied += 1,
+    }
+    err
+}
+
+/// 给一个 Job 发句柄（P5c-1）。**不加引用、不销毁**：见 `ObjRef` 那段。
+///
+/// `gen` 由**调用方**读好传进来（`proc::job_gen`），本模块不引用 `proc`/`sched`。
+/// 为什么不在这里判活性：`sched → capability` 这条边本来就有（任务退出要 `revoke_task`），
+/// 再来一条反向边就是一个二元强连通分量 ⇒ `sched` 从单例被拖进**冻结的核心环**，
+/// 棘轮要一次性登记 `sched` 的十来条环内边（实测就是这么报红的，站点数 4/13/4/1）。
+/// 槽位活性与世代判据因此归 `sched` 侧的消费方（c-3 的 11/15/16 在用之前自己核），
+/// 用例把这条分工写成可判的读数，不留成散文。
+pub fn grant_job(owner: (usize, u32), job: u16, gen: u32, rights: u32) -> Result<Handle, HErr> {
+    let mut g = TABLE.lock();
+    insert(g.get(), owner, rights, ObjRef::Job { slot: job, gen })
+}
+
+/// 进程版的 `grant_job`，同样由调用方传 `gen`。
+pub fn grant_proc(owner: (usize, u32), proc_id: u16, gen: u32, rights: u32) -> Result<Handle, HErr> {
+    let mut g = TABLE.lock();
+    insert(g.get(), owner, rights, ObjRef::Proc { slot: proc_id, gen })
+}
+
+/// 给一个地址空间发句柄。形状同 `grant_job`，活性判据换成 `mm::aspace_live`。
+pub fn grant_aspace(owner: (usize, u32), slot: u8, rights: u32) -> Result<Handle, HErr> {
+    let Some(gen) = crate::mm::aspace_gen(slot) else { return Err(note(HErr::NoSuch)) };
+    let mut g = TABLE.lock();
+    insert(g.get(), owner, rights, ObjRef::ASpace { slot, gen })
+}
+
+/// 给一条线程发句柄。`id` 由**调用方**读好传进来（`sched::id_of`），本模块不引用 `sched`。
+///
+/// **为什么不在这儿判活性**：`sched → capability` 这条边本来就有（任务退出要 `revoke_task`），
+/// 反过来再来一条就是一个二元强连通分量 ⇒ `sched` 从单例被拖进冻结的核心环，
+/// 棘轮要一次性登记 `sched` 的十来条环内边（实测报红就是这件事）。
+/// 线程槽位的活性判据留在 `sched` 自己的入口（那里本来就要判 `state`），
+/// 所以句柄层少这一判**不损失安全性**；用例 C4 把这条分工变成可判的读数。
+pub fn grant_thread(owner: (usize, u32), gidx: usize, id: u32, rights: u32) -> Result<Handle, HErr> {
+    if id == 0 {
+        return Err(note(HErr::NoSuch));
+    }
+    let mut g = TABLE.lock();
+    insert(g.get(), owner, rights, ObjRef::Thread { gidx, id })
+}
+
+/// 这个名字指向的对象还活着吗（**句柄锁外**判，取 VMM/任务表快照）。
+fn obj_live(o: &ObjRef) -> bool {
+    match *o {
+        // Job/Proc/Thread 不在句柄层判：引用 proc/sched 会把 sched 拖进冻结的核心环
+        // （`sched -> capability` 已有 `revoke_task` 那一条）。判据在 sched 侧的消费方，
+        // 用例 C1b/C2b/C4 各配一格读数，把"谁判"变成可判的事实而不是注释。
+        ObjRef::Job { .. } | ObjRef::Proc { .. } => true,
+        ObjRef::ASpace { slot, gen } => crate::mm::aspace_live(slot, gen),
+        // Thread 不在句柄层判：见 `grant_thread` 的"为什么不在这儿判活性"
+        ObjRef::Thread { .. } => true,
+        // File/Vmo 有自己的活性判据（游标有效性在盘路径、VMO 引用计数在 vmo 表）
+        _ => true,
+    }
+}
+
+/// 句柄 → `(对象引用, 权限)`，供"用之前先看本体在不在"的调用点用（c-3 的 11/15/16）。
+/// 三段：锁内校验并复制引用 → 放锁后判活性 → 直接返回。中途失败只在 `note` 里补计数。
+pub fn resolve(h: Handle, owner: (usize, u32), need: u32) -> Result<(ObjRef, u32), HErr> {
+    let pair = {
+        let mut g = TABLE.lock();
+        let t = g.get();
+        let slot = check(t, h, owner, need)?;
+        match t.slots[slot].obj {
+            Some(o) => Some((o, t.slots[slot].rights)),
+            None => {
+                t.c.no_such += 1;
+                None
+            }
+        }
+    };
+    let Some((obj, rights)) = pair else { return Err(HErr::NoSuch) };
+    if !obj_live(&obj) {
+        return Err(note(HErr::NoSuch));
+    }
+    Ok((obj, rights))
+}
+
+/// 这个句柄是否**带着** `need` 里的全部权限位（`RIGHT_CREATE` 的判据接缝，c-3 用）。
+/// 拒绝已经由 `check` 记在台账里（`denied`），这里只把它变成布尔。
+pub fn has(h: Handle, owner: (usize, u32), need: u32) -> bool {
+    match resolve(h, owner, need) {
+        Ok(_) => true,
+        Err(_) => false,
+    }
+}
+
 /// 每槽独立；1..=GEN_MAX，跳过 0；到顶**回绕到 1**（设计 §9 G：承诺是计数上界，
 /// 不是"永远"）。旧句柄在 `GEN_MAX-1` 次后续复用内必然对不上。
 fn next_gen(prev: u64) -> u64 {
@@ -371,8 +491,9 @@ pub fn begin_read(h: Handle, owner: (usize, u32)) -> Result<ReadTicket, HErr> {
         Some(ObjRef::File(f)) => {
             Ok(ReadTicket { slot: slot as u16, gen: e.gen, port: f.port, cursor: f.cursor })
         }
-        // 对象类型不支持文件读：这是类型/权限不符，不是"槽不存在"，两个计数器分开
-        Some(ObjRef::Vmo { .. }) => {
+        // 不是文件对象就没有"文件读"这回事（VMO 与 P5c-1 的四种 kind 同理）：
+        // 这是类型/权限不符，不是"槽不存在"，两个计数器分开
+        Some(_) => {
             t.c.denied += 1;
             Err(HErr::Denied)
         }

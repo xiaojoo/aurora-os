@@ -1643,6 +1643,23 @@ pub fn aspace_of(i: usize) -> u8 {
 }
 
 /// 读一个任务的 proc_id（只读快照）。
+/// 这个任务槽**当前住户**的 `Task::id`（快照读，理由同 `state_of`）。
+/// `id` 由全局 `NEXT_ID` 单调发号，所以"旧 id 撞上新一任住户"在回绕前不可能发生。
+pub fn id_of(i: usize) -> u32 {
+    if i >= MAX_TASKS_TOTAL {
+        return 0;
+    }
+    // SAFETY: 只读快照，理由同 `state_of`
+    unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].id }
+}
+
+/// 线程句柄的活性判据（P5c-1）：`Free` 槽或 id 对不上都算"没有这条线程"。
+/// 语义是**保守拒绝**，不是"活着"的完备证明：判为真之后它仍可能立刻退出，
+/// 那由 `state_of` 的调用方各自处理（本函数不改任何状态）。
+pub fn thread_live(gidx: usize, id: u32) -> bool {
+    id != 0 && id_of(gidx) == id && state_of(gidx) != TaskState::Free
+}
+
 pub fn proc_id_of(i: usize) -> u16 {
     if i >= MAX_TASKS_TOTAL { return crate::proc::NO_PROC; }
     // SAFETY: 只读快照，理由同 `current_of`

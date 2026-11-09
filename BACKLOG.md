@@ -5921,6 +5921,52 @@ M15 把 `let _g = vmm();` 加回 ⇒ `不取锁=(增量1)`、`不换锁=false`�
 `process_start` 会把跨 AS 换人带到产品路径上。仍欠：Done 槽回收（P6）、Job 的页配额使用计量、
 `MAX_ADDR_SPACES = 4` 与 AS 数上升后的重算、跳板冻结前置的负样本（§157 那条"未验证"照旧）。
 
+## 159. W3 P5c-1：句柄的四种新 kind + `RIGHT_CREATE` + 对象世代号（ADR-075 决策 4 第一刀，2026-11-10，实测）
+
+三刀里的第一刀，**纯内核侧**：不开新 syscall、不动 14 号。`ObjRef` 从两种扩到六种
+（`Job{slot,gen}`/`Proc{slot,gen}`/`ASpace{slot,gen}`/`Thread{gidx,id}`），新增 `RIGHT_CREATE = 32`，
+四条 `grant_*`，统一的使用前活性接缝 `handle::resolve` + `handle::has`。
+
+**草案里没有的两件事（都由实测/门禁逼出来，代码与文档一起改，不动读数）**：
+① **对象世代号**。`JobEntry`/`ProcEntry`/`AspaceEntry` 原来只有 `used`——**槽号是复用的**，
+只存槽号会让新 Job 继承旧进程留下的句柄（ADR-073 给 `Task::id` 记过同一条坑）。
+⇒ 三张表各加 `gen: u32`，`*_create`/`aspace_new` 在旧值上 +1、**销毁不复位**；`Thread` 用现成的单调 `Task::id`。
+② **`close`/`revoke` 对这四种 kind 不销毁本体**（撤的是名字，销毁仍走 `job_destroy`/`proc_reap`+`proc_discard`/
+`AspaceHandle::drop`/`terminate_task`）。这与 ADR-075"影响 3"写的"HANDLE 锁外要调三个模块"不同，已在 ADR 补记里记偏差。
+
+**架构门禁挡下来的一条（重要，别当成微调整）**：第一版把 `proc::job_live`/`proc_live`/`sched::thread_live`
+放进 `handle::resolve` ⇒ `check-module-interfaces` 报
+`强连通分量 … [['capability','sched']]，基线 [[…核心 11 模块…]]`，
+连带要一次性登记 `capability->sched(4)/memory(13)/storage(4)/sync(1)` 与 **`sched` 的十来条环内边**
+（`sched->memory` 113、`sched->arch` 258、`sched->sync` 29…）。原因：`proc.rs`/`user.rs`/`elf.rs` 属于
+**`sched` 模块组**，而 `sched → capability`（`revoke_task`）本来就有，一条反向边就把 `sched` 从单例拖进冻结的核心环。
+⇒ 最终形状：**Job/Proc/Thread 的活性由 `sched` 侧的消费方判**（P5c-3 的 11/15/16 在用之前自己核
+`(slot,gen)`/`(gidx,id)`），只有 `ASpace` 在句柄层判（`capability->memory` 已登记，不成环）；
+`grant_job/grant_proc/grant_thread` 改成**由调用方把世代号读好传进来**。安全性不折扣：槽位生死本来就在 `sched` 入口判。
+
+**读数（取证跑，同一份代码）**：`check` **17/17**（SCC 仍是 11 个模块，`capability`/`sched` 仍是单例）；
+`ktests` 默认档 **80/80**、`handles` 档 **83/83**（P5b 收尾是 82/82，新增这一条只在 `handles` 档注册），
+两档 `判定=PASS qemu_rc=33`；矩阵 **45/45**；`bench` **4/4**，P4 地板 **0.37 %**（37 bp），
+`baselines/2026-11-09T17-20-15Z-p3p4.txt`；unsafe **372 → 373**（`sched` U4 16→17，就是 `id_of` 那次每 CPU 快照读）。
+新用例读数行：
+`hkind(P5c-1): CREATE=true proc=true 活性分工=true AS活=true AS世代=true 线程活=true 线程撤销=true close不动本体=true revoke=true 锁序=(viol0->0/reent0->0) 基线=(live0->0 AS0->0 job0->0 proc0->0)`
+
+**四条变异各咬一格**：M16 ASpace 不判世代 ⇒ `AS世代=false`（failed=1，FAIL 35）；
+M17 `RIGHT_CREATE=0` ⇒ `CREATE=false`（FAIL 35）；M18 `revoke_task` 只撤 File/Vmo ⇒ `revoke=false`
+**且 `failed=19`**（漏撤的名字把后面每一格用例的收尾闸都打红——这才是"撤销漏一种 kind"应付的代价）；
+M19 把活性判定留在 HANDLE(35) 锁内 ⇒ `L4 sync: 锁序违规，外层 rank=35 本次 rank=20` ⇒ EXCEPTION(39)
+（这条是给"活性必须在锁外"配的证人，不是给 kind 配的）。四条都已还原。
+
+**同轮裁决落地**：`MAX_STARTUP_HANDLES = 16`（不是本文原提议的 8）⇒ 代价是 12 格永久为空，
+读取方只许信 `handles[0..nhandles]`、越界非零必须拒绝，这一格判据留到 P5c-3；
+根 Job **由内核持有、只在 ktest 出示，产品启动路径不授予**（不许写成"进程创建已接通"）；
+`Thread` 独立句柄 = **要**（推翻本文原提议"只内部标识"）。
+
+**下一步**：P5c-2 = 14 号兼容扩展（`rsi` 位图 / `rdx`=AS 句柄 / `r10`=请求 VA、`ABI_MINOR` 6→7、
+`user-abi-capability.md` §4.4 同轮改、probe 侧新格、还欠的 probe.elf 宿主机对账矩阵行）；
+P5c-3 = 11/15/16 三个号 + `StartupInfo` 回填与转移 + 失败回滚 + `spawn_user` 加 `arg` + D1–D6。
+仍欠：Done 槽回收（P6）、`MAX_ADDR_SPACES=4` 的容量重算（c-3 真发 AS 时）、跳板冻结前置的负样本（§157 的"未验证"照旧）。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

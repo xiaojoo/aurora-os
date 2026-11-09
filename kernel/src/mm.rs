@@ -1709,11 +1709,14 @@ struct AspaceEntry {
     /// 但 P1 只建空 AS（1 张），给 16 是"接缝够用"的尺，不是推导值。
     pt_frames: [u64; AS_PT_SLOTS],
     pt_count: usize,
+    /// **对象世代号**（P5c-1，ADR-075 决策 4 的补充）：`aspace_new` 在旧值上 +1，
+    /// `aspace_release` 不清零 ⇒ 槽位复用后旧句柄的 `(slot, gen)` 必然对不上。
+    gen: u32,
 }
 
 const AS_PT_SLOTS: usize = 16;
 const AS_EMPTY: AspaceEntry =
-    AspaceEntry { used: false, pml4: 0, pt_frames: [0; AS_PT_SLOTS], pt_count: 0 };
+    AspaceEntry { used: false, pml4: 0, pt_frames: [0; AS_PT_SLOTS], pt_count: 0, gen: 0 };
 
 #[derive(Clone, Copy)]
 struct AspaceTable {
@@ -1839,7 +1842,8 @@ pub fn aspace_new() -> Option<AspaceHandle> {
         }
     }
     AS_ON[slot].store(0, Ordering::Release);
-    t.items[slot] = AspaceEntry { used: true, pml4, pt_frames: [0; AS_PT_SLOTS], pt_count: 0 };
+    let gen = t.items[slot].gen.wrapping_add(1);
+    t.items[slot] = AspaceEntry { used: true, pml4, pt_frames: [0; AS_PT_SLOTS], pt_count: 0, gen };
     t.items[slot].pt_frames[0] = frame;
     t.items[slot].pt_count = 1;
     AS_PT_LIVE.fetch_add(1, Ordering::Relaxed);
@@ -1880,6 +1884,19 @@ pub fn aspace_pml4_of(slot: u8) -> Option<u64> {
     let _g = vmm();
     let e = aspaces().items.get(usize::from(slot))?;
     if e.used { Some(e.pml4) } else { None }
+}
+
+/// 这个 AS 槽**当前这次使用**的世代号（不存在返回 None）。句柄要存 `(slot, gen)` 两格，
+/// 理由同 `proc::job_gen`：只比槽号会让新 AS 继承旧 AS 的句柄（槽号是复用的）。
+pub fn aspace_gen(slot: u8) -> Option<u32> {
+    let _g = vmm();
+    let e = aspaces().items.get(usize::from(slot))?;
+    if e.used { Some(e.gen) } else { None }
+}
+
+/// `(槽号, 世代)` 两者都对才算活着（句柄使用前的活性判据）。
+pub fn aspace_live(slot: u8, gen: u32) -> bool {
+    aspace_gen(slot) == Some(gen)
 }
 
 /// 此刻存在的非内核 AS 数（收尾判据与用例自足用）。

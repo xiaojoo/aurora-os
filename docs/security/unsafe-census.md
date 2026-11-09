@@ -1,6 +1,6 @@
 # unsafe 逐处审计表（U1–U6）
 
-总计 372 处。U1 65 · U2 99 · U3 13 · U4 128 · U5 31 · U6 36
+总计 373 处。U1 65 · U2 99 · U3 13 · U4 129 · U5 31 · U6 36
 
 本表由 `tools/aurora.py` 的 `unsafe_sites()` 从源码逐处生成，**不是手写的**。
 机器可读的权威来源是 `docs/security/unsafe-whitelist.toml` 的 `[modules.*]` 段（模块×类别→处数），
@@ -12,7 +12,7 @@
 - **U1 架构入口与特殊寄存器** — 65 处，分布在 14 个模块：arch/x86_64/apic、arch/x86_64/cpu、arch/x86_64/smp、arch/x86_64/trap、hw、ktests/sched、mm、sched、serial、sync、tsc、user、user/hello
 - **U2 页表、物理内存与 MMIO** — 99 处，分布在 11 个模块：acpi、arch/x86_64/apic、heap、hw、ktests/mm、limine、mm、pci、sched、user、vmo
 - **U3 DMA 与设备共享内存** — 13 处，分布在 2 个模块：driver、limine
-- **U4 并发共享状态与 UnsafeCell** — 128 处，分布在 20 个模块：acpi、ahci、arch/x86_64/apic、arch/x86_64/smp、arch/x86_64/trap、driver、hooks、irq、ktests/elf、ktests/fs、ktests/sign、main、mm、pci、proc、sched、sync、user、virtio、vmo
+- **U4 并发共享状态与 UnsafeCell** — 129 处，分布在 20 个模块：acpi、ahci、arch/x86_64/apic、arch/x86_64/smp、arch/x86_64/trap、driver、hooks、irq、ktests/elf、ktests/fs、ktests/sign、main、mm、pci、proc、sched、sync、user、virtio、vmo
 - **U5 用户指针与地址空间访问** — 31 处，分布在 3 个模块：user、user/hello、user/probe
 - **U6 诊断路径的有限现场读取** — 36 处，分布在 9 个模块：crash、ktest、ktests/acpi、ktests/crash、ktests/fs、ktests/heap、ktests/mm、ktests/sched、ktests/user
 
@@ -660,19 +660,21 @@
   > unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].resident } } 
 - `kernel/src/sched.rs:1642` [{] **U4** fn=`aspace_of`
   > unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].as_slot } } 
-- `kernel/src/sched.rs:1649` [{] **U4** fn=`proc_id_of`
+- `kernel/src/sched.rs:1653` [{] **U4** fn=`id_of`
+  > unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].id } } 
+- `kernel/src/sched.rs:1666` [{] **U4** fn=`proc_id_of`
   > unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].proc_id } } 
-- `kernel/src/sched.rs:1657` [{] **U4** fn=`runs_of`
+- `kernel/src/sched.rs:1674` [{] **U4** fn=`runs_of`
   > unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].runs } } 
-- `kernel/src/sched.rs:1696` [fn] **U2** fn=`preempt_point`
+- `kernel/src/sched.rs:1713` [fn] **U2** fn=`preempt_point`
   > pub unsafe fn preempt_point(frame: u64, cpu: usize) { // 不跑调度器的 CPU 直接把标志倒掉再返回。今天 AP 的中断根本不经过这里 // （`isr_stub_cpu_timer` 是独立快路径），这条判断是给"把 AP 接进调度"留的
-- `kernel/src/sched.rs:1780` [{] **U2** fn=`preempt_point`
-  > unsafe { mm::aspace_switch(target, cpu) }; // 换出去的那次中断不会经过异常桩出口，所以在这里替它记账（见 trap::p3_record_irq） trap::p3_record_irq(cpu, crate::tsc::now().wrapping_sub(trap::entry_tsc_of(cpu)));
-- `kernel/src/sched.rs:1801` [{] **U1** fn=`preempt_point`
+- `kernel/src/sched.rs:1802` [{] **U2** fn=`preempt_point`
+  > unsafe { mm::aspace_switch(target, cpu, next_as_slot) }; // 换出去的那次中断不会经过异常桩出口，所以在这里替它记账（见 trap::p3_record_irq） trap::p3_record_irq(cpu, crate::tsc::now().wrapping_sub(trap::entry_tsc_of(cpu)));
+- `kernel/src/sched.rs:1823` [{] **U1** fn=`preempt_point`
   > unsafe { p1_extra_flush(frame) }; crate::tsc::spin(20_000); }
-- `kernel/src/sched.rs:1825` [{] **U1** fn=`preempt_point`
+- `kernel/src/sched.rs:1847` [{] **U1** fn=`preempt_point`
   > unsafe { context_load(resume, if_open as u64) } } 
-- `kernel/src/sched.rs:1858` [{] **U2** fn=`preempt_hook`
+- `kernel/src/sched.rs:1880` [{] **U2** fn=`preempt_hook`
   > unsafe { preempt_point(frame, cpu) } }
 
 ### serial

@@ -204,6 +204,8 @@ public_api = [
   "vmo::vmo_count",
   "mm::aspace_new",
   "mm::aspace_pml4_of",
+  "mm::aspace_gen",
+  "mm::aspace_live",
   "mm::aspace_count",
   "mm::aspace_switch",
   "mm::aspace_switch_kernel",

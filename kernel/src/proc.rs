@@ -46,6 +46,11 @@ pub enum ProcError {
 
 struct JobEntry {
     used: AtomicBool,
+    /// **对象世代号**（P5c-1，ADR-075 决策 4 的补充）。`job_create` 在旧值上 +1，
+    /// `job_destroy` **不清零也不复位** ⇒ 槽位被复用时旧值仍然对不上。
+    /// 句柄表里存的是 `(slot, gen)` 两格：只有槽号对、世代不对 ⇒ `NoSuch`（保守拒绝），
+    /// 这一位是"句柄不能指着别人新造的 Job"的唯一凭据，`used` 单独不够。
+    gen: u32,
     max_procs: u32,
     /// 只参与收窄检查，用量计量在 P4（见模块头）。
     max_pages: u64,
@@ -54,6 +59,8 @@ struct JobEntry {
 
 struct ProcEntry {
     used: AtomicBool,
+    /// 同 `JobEntry::gen`（P5c-1）：`proc_create` +1，销毁不复位。
+    gen: u32,
     /// 只在 `used` 为真期间有效；由 `proc_create` 在 VMM 内写，`proc_reap`/`proc_discard` 在 VMM 内读。
     job: u16,
     threads: AtomicU16,
@@ -62,6 +69,7 @@ struct ProcEntry {
 
 const JOB_EMPTY: JobEntry = JobEntry {
     used: AtomicBool::new(false),
+    gen: 0,
     max_procs: 0,
     max_pages: 0,
     used_procs: 0,
@@ -69,6 +77,7 @@ const JOB_EMPTY: JobEntry = JobEntry {
 
 const PROC_EMPTY: ProcEntry = ProcEntry {
     used: AtomicBool::new(false),
+    gen: 0,
     job: 0,
     threads: AtomicU16::new(0),
     signal: AtomicU32::new(SIG_RUNNING),
@@ -128,6 +137,7 @@ pub fn job_create(parent: Option<u16>, max_procs: u32, max_pages: u64) -> Result
         let slot = s.jobs.iter().position(|j| !alive_flag(&j.used)).ok_or(ProcError::TableFull)?;
         s.jobs[slot] = JobEntry {
             used: AtomicBool::new(true),
+            gen: s.jobs[slot].gen.wrapping_add(1),
             max_procs,
             max_pages,
             used_procs: 0,
@@ -152,6 +162,7 @@ pub fn proc_create(job: u16) -> Result<u16, ProcError> {
             .iter()
             .position(|p| !alive_flag(&p.used))
             .ok_or(ProcError::TableFull)?;
+        s.procs[slot].gen = s.procs[slot].gen.wrapping_add(1);
         s.procs[slot].job = job;
         s.procs[slot].threads.store(0, Ordering::Relaxed);
         s.procs[slot].signal.store(SIG_RUNNING, Ordering::Relaxed);
@@ -269,6 +280,37 @@ pub fn proc_exit_code(proc_id: u16) -> u32 {
 
 /// 收尾扫描与额度读数用：占着的进程槽数 + 首个槽号（`u16::MAX` = 一个都没有）。
 /// 含僵尸——僵尸的记录还没交出去，本来就该被点名。不取锁：见模块头的第三条分界。
+/// 这个 Job 槽**当前这次使用**的世代号（不存在返回 None）。
+/// 与 `job_create` 的返回值配对用：句柄要存 `(slot, gen)`。
+/// 取 VMM 只读一个数；跨 CPU 的"读到的 gen 已经过期"只会让发出去的句柄一落地就 `NoSuch`
+/// （fail-closed），不会把别人的 Job 错认成自己的。
+pub fn job_gen(job: u16) -> Option<u32> {
+    mm::with_vmm_lock(|| {
+        let s = st();
+        let e = s.jobs.get(job as usize)?;
+        if alive_flag(&e.used) { Some(e.gen) } else { None }
+    })
+}
+
+/// 进程版的 `job_gen`。
+pub fn proc_gen(proc_id: u16) -> Option<u32> {
+    mm::with_vmm_lock(|| {
+        let s = st();
+        let e = s.procs.get(proc_id as usize)?;
+        if alive_flag(&e.used) { Some(e.gen) } else { None }
+    })
+}
+
+/// `(槽号, 世代)` 两者都对才算活着（句柄使用前的活性判据）。
+pub fn job_live(job: u16, gen: u32) -> bool {
+    job_gen(job) == Some(gen)
+}
+
+/// 进程版的 `job_live`。
+pub fn proc_live(proc_id: u16, gen: u32) -> bool {
+    proc_gen(proc_id) == Some(gen)
+}
+
 pub fn proc_residual() -> (usize, u16) {
     let mut n = 0usize;
     let mut first = u16::MAX;
