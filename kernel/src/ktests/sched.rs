@@ -1866,28 +1866,30 @@ fn q2_worker() -> ! {
     Q2_LIVE.fetch_add(1, Ordering::AcqRel);
     let t0 = tsc::now();
     // 有界：发令丢了也不能永远占着槽（这个上限比用例的采样轮数大一个量级）。
-    // 等的时候让出而不是自旋：七条线程挤在同一颗 CPU 上，自旋的人只有 tick 才换得下去，
-    // 而链接顺序可能把本用例排在时钟标定之前——那一档 `apic::ticks()` 全程 0（fault-resched-ipi 实测）。
+    // 等的时候**自旋**而不是让出：七条线程一起 `int 0xF0` 在挂 `-d int` 的矩阵行里是中断风暴
+    // （每条中断都要写宿主机日志，实测烧穿 120 s 预算）。换人交给 tick，时钟由用例自己保证在跑。
     while Q2_RELEASE.load(Ordering::Acquire) == 0
         && tsc::now().wrapping_sub(t0) < 20_000_000_000
     {
-        sched::yield_now();
+        core::hint::spin_loop();
     }
     sched::finish_current();
-    // 收工之后照样让出：等待方靠这一次换人才回得来。
-    // `pick_next` 第二遍只在 prev 不再可运行时才回落 idle，而 idle 要等一次 tick 才能被换下。
+    // 让出**一次**把 CPU 立刻还给等待方（一条中断，不是风暴）；换不动就靠自旋等 tick。
+    sched::yield_now();
     loop {
-        sched::yield_now();
+        tsc::spin(1000);
     }
 }
 
-/// 采样：在开着的窗口里**逐轮换人**，把"同时活着的工人数"与"可调度任务数"的最大值取回来。
-/// 轮数而不是时长：`pick_next` 从 prev 的下一格开始找第一个 Runnable，一轮 yield 正好走一格，
-/// 所以 `(线程数+2)×3` 轮足够每条线程被选中好几次。
+/// 采样：在开着的窗口里**按 tick 逐轮**取样，把"同时活着的工人数"与"可调度任务数"的最大值取回来。
+/// 一轮一个 tick：轮转是按 tick 换人的，所以 `线程数+3` 轮足够每条线程被选中一次。
+/// 不用 `yield_now` 逐轮换人——工人等发令时是自旋的，让出过去要等满一个 tick 才回得来，
+/// 那样每轮都花一个 tick 却只走一格，白等（本轮实测 P4 总量因此涨了 50 %）。
 fn q2_sample(rounds: usize) {
     apic::with_interrupts(|| {
         for _ in 0..rounds {
-            sched::yield_now();
+            let b = apic::ticks();
+            apic::wait_ticks(b, 1, clock::window_cycles(2));
             let live = Q2_LIVE.load(Ordering::Acquire);
             let active = sched::tasks_active();
             if live > Q2_PEAK_LIVE.load(Ordering::Acquire) {
@@ -1995,7 +1997,7 @@ fn t_q2_workload_slots() -> bool {
 
     // 采样轮数必须容纳"每条活线程至少被选中一次"再加 boot 自己与 idle 的份；
     // 给少了峰值必然偏低，那是量具不成立而不是被测代码。
-    q2_sample((ok_n + 2) * 3);
+    q2_sample(ok_n + 3);
     let peak_live = Q2_PEAK_LIVE.load(Ordering::Acquire);
     let peak_active = Q2_PEAK_ACTIVE.load(Ordering::Acquire);
     // active 里含跑用例的 boot 上下文自己（它也是 Running），所以基线用 act0 而不是 1

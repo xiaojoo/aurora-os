@@ -129,6 +129,9 @@ pub enum OwnedItem {
     /// 惰性区间只挂**柄**：区间本体住 mm 的 LAZY 表（VMM 纪律），
     /// 这样 #PF 修复路径不必为了碰 owned 去取 RUNQ(8)（§136 教训）。
     Lazy(mm::LazyHandle),
+    /// 往 AS 铺的共享映射（ADR-074）：Drop 清叶子 + shootdown + 还帧参考 + 放手 VA 保留。
+    /// 与 `Map` 的差别是它**不拥有帧**（帧的主人是 VMO），所以还的是参考而不是所有权。
+    AsMap(mm::AspaceMapping),
 }
 
 pub struct OwnedSet {
@@ -155,11 +158,19 @@ impl OwnedSet {
         self.push_item(OwnedItem::Lazy(h))
     }
 
+    /// 共享映射入列（ADR-074）：退出时由 `release_owned` 在**锁外** drop，
+    /// 所以它的 shootdown 等待不会发生在持 RUNQ 的时候。
+    pub fn push_asmap(&mut self, m: mm::AspaceMapping) -> Result<(), mm::MmError> {
+        self.push_item(OwnedItem::AsMap(m))
+    }
+
     fn push_item(&mut self, it: OwnedItem) -> Result<(), mm::MmError> {
         if self.n >= MAX_OWNED {
             // 满了就把刚交来的项就地丢弃：`Map` 走 `Mapping::drop` 解映射并归还页框、
-            // `Lazy` 走 `LazyHandle::drop` 归还整段区间——所以这里没有泄漏——
-            // 调用方拿到 `Err` 会停下这条装载路径。
+            // `Lazy` 走 `LazyHandle::drop` 归还整段区间、`AsMap` 走 `AspaceMapping::drop`
+            // 清叶子并还帧参考——所以这里没有泄漏——调用方拿到 `Err` 会停下这条装载路径。
+            // **注意**：这条就地丢弃只发生在装载路径（不持 RUNQ）；syscall 路径走
+            // `own_current`，它满了会先放锁再丢，因为 AsMap 的 Drop 要等跨 CPU 回执。
             drop(it);
             return Err(mm::MmError::Unsupported);
         }
@@ -1554,6 +1565,20 @@ pub fn set_proc_id(i: usize, pid: u16) -> bool {
     }
     s.tasks[slot_of(i)].proc_id = pid;
     true
+}
+
+/// 把一件资源挂到**当前任务**名下（syscall 路径用；退出时由 `reap`/`release_owned` 放手）。
+/// 满了**先放 RUNQ 再丢**：`AsMap` 的 Drop 要取 VMM 并等别的 CPU 的 shootdown 回执，
+/// 持着队列锁做那件事正是 ADR-047 决策 2 禁止的形状（`push_item` 的就地丢弃只在装载路径用）。
+pub fn own_current(item: OwnedItem) -> Result<(), mm::MmError> {
+    let me = current_id();
+    let mut s = my_rq();
+    if s.tasks[slot_of(me)].owned.count() >= MAX_OWNED {
+        drop(s);
+        drop(item);
+        return Err(mm::MmError::Unsupported);
+    }
+    s.tasks[slot_of(me)].owned.push_item(item)
 }
 
 /// 读一个任务的 proc_id（只读快照）。

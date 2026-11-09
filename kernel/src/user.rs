@@ -39,10 +39,20 @@ pub const SYS_HANDLE_CLOSE: u64 = 8;
 pub const SYS_HANDLE_DUP: u64 = 9;
 /// P7：从游标继续读。`rdi`=句柄、`rsi`=用户缓冲、`rdx`=长度；成功返回字节数，`0`=EOF。
 pub const SYS_FILE_READ: u64 = 10;
+/// 12 `vmo_create(pages) -> handle`（ADR-074 / Q1 的号表）。页数 1..=MAX_VMO_PAGES，越界 -1。
+pub const SYS_VMO_CREATE: u64 = 12;
+/// 13 `vmo_write(h, offset, buf, len) -> n`。第四个参数走 **r10**（syscall 指令吃掉 rcx/r11）。
+/// len 0 ⇒ -1，len > COPY_MAX ⇒ -3，对象里放不下 ⇒ -1（**整段先校验，不留半截写**）。
+pub const SYS_VMO_WRITE: u64 = 13;
+/// 14 `aspace_map(h, writable) -> va`。**VA 由内核从动态区发**，不接受用户指定地址
+/// （那会与装载器的窗口撞）；writable 非 0 ⇒ USER_RW，否则 USER_R。**永远不给 X**，
+/// 所以 W^X 在这一层就不可能被违反。返回的映射挂进当前任务的资源袋，退出时归还。
+pub const SYS_ASPACE_MAP: u64 = 14;
 
-/// ABI 版本。minor=4 对应用户态闭环这一段（M4）；minor=5 追加 capability 句柄族（P7）。
+/// ABI 版本。minor=4 对应用户态闭环这一段（M4）；minor=5 追加 capability 句柄族（P7）；
+/// minor=6 追加 VMO 三个号（12/13/14）与 `F_VMO` 位（W3 P4b，ADR-074）。号只追加不复用（Q1）。
 pub const ABI_MAJOR: u64 = 0;
-pub const ABI_MINOR: u64 = 5;
+pub const ABI_MINOR: u64 = 6;
 pub const F_FASTPATH: u64 = 1;
 pub const F_SMAP: u64 = 2;
 pub const F_SMEP: u64 = 4;
@@ -53,6 +63,9 @@ pub const F_SAFE_MODE: u64 = 8;
 /// P7：capability 句柄表在这份构建里存在（设计 §4.3）。**读回真实状态**：
 /// 表只在 `handles` 特性里编译，正常构建这一位必须是 0，8/9/10 也必须走默认分支回 `-1`。
 pub const F_HANDLES: u64 = 16;
+/// P4b（ADR-074）：VMO 三个号在这份构建里可用。它依赖句柄表，所以与 `F_HANDLES` 同一条件；
+/// 读回真实状态，不读"我打算开"。
+pub const F_VMO: u64 = 32;
 
 /// `(major << 32) | (minor << 16) | features`。位一律**读回真实状态**，不读"我打算开"。
 pub fn abi_word() -> u64 {
@@ -72,7 +85,7 @@ pub fn abi_word() -> u64 {
     }
     #[cfg(feature = "handles")]
     {
-        f |= F_HANDLES;
+        f |= F_HANDLES | F_VMO;
     }
     (ABI_MAJOR << 32) | (ABI_MINOR << 16) | f
 }
@@ -164,6 +177,110 @@ fn handle_err(e: crate::handle::HErr) -> u64 {
 
 /// `SYS_FILE_READ`：rdi=句柄，rsi=用户缓冲，rdx=长度。长度是用户给的数：先判形状再碰盘。
 /// 读是**分块**的（一块一个扇区）：表锁不在盘 I/O 内，复制失败时票作废、游标一格不动。
+#[cfg(feature = "handles")]
+/// 12：建一个 VMO 并把创建者那一份引用**交给句柄**（所以 refs 最终是 1，不是 2）。
+#[cfg(feature = "handles")]
+fn sys_vmo_create(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let pages = frame.rdi as usize;
+    if pages == 0 || pages > crate::vmo::MAX_VMO_PAGES {
+        return E_INVALID;
+    }
+    let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
+    let id = match crate::vmo::vmo_create(pages) {
+        Ok(v) => v,
+        // 表满与帧不够都按 -6 带出：今天 ABI 没有单独的 ENOMEM（新增要 ADR 级批准）
+        Err(_) => return E_EXHAUSTED,
+    };
+    let rights = crate::handle::RIGHT_READ | crate::handle::RIGHT_WRITE
+        | crate::handle::RIGHT_MAP | crate::handle::RIGHT_DUP;
+    let r = crate::handle::grant_vmo(owner, id, rights);
+    // 句柄拿到了自己那份引用，创建者这份必须交出去；grant 失败也一样要还，否则漏帧
+    crate::vmo::vmo_unref(id);
+    match r {
+        Ok(h) => h.0,
+        Err(e) => handle_err(e),
+    }
+}
+
+/// 13：把用户缓冲写进 VMO。512 字节一块搬（与 `sys_file_read` 同一手法，不按用户的数开缓冲）。
+/// **整段先校验长度**：放不下就一个字节都不写，不留"写了一半再报错"的中间态。
+#[cfg(feature = "handles")]
+fn sys_vmo_write(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let want = frame.r10 as usize;
+    if want == 0 {
+        return E_INVALID;
+    }
+    if want > COPY_MAX {
+        return E_TOO_LONG;
+    }
+    let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
+    let id = match crate::handle::vmo_of(crate::handle::Handle(frame.rdi), owner, crate::handle::RIGHT_WRITE) {
+        Ok(v) => v,
+        Err(e) => return handle_err(e),
+    };
+    let offset = frame.rsi as usize;
+    let pages = match crate::vmo::vmo_pages(id) {
+        Some(n) => n,
+        None => return E_BAD_HANDLE,
+    };
+    match offset.checked_add(want) {
+        Some(end) if end <= pages * mm::PAGE => {}
+        _ => return E_INVALID,
+    }
+    let mut chunk = [0u8; crate::filesystem::vfs::SECTOR_BYTES];
+    let mut done = 0usize;
+    while done < want {
+        let ask = core::cmp::min(chunk.len(), want - done);
+        match copy_from_user(frame.rdx + done as u64, &mut chunk[..ask]) {
+            Ok(n) if n == ask => {}
+            _ => {
+                BAD_PTRS.fetch_add(1, Ordering::Relaxed);
+                crate::log_info!("abi: vmo_write 读用户缓冲失败，已搬 {}/{} 字节", done, want);
+                return E_FAULT;
+            }
+        }
+        match crate::vmo::vmo_write(id, offset + done, &chunk[..ask]) {
+            Ok(n) => done += n,
+            Err(_) => return E_BAD_HANDLE,
+        }
+    }
+    done as u64
+}
+
+/// 14：把 VMO 铺进调用者自己的 AS（今天 = AS_KERNEL），VA 由内核从动态区发。
+/// 映射挂进当前任务的资源袋 ⇒ 任务退出时由 `release_owned` 在锁外 drop（清叶子 + 还参考 + 放手 VA）。
+#[cfg(feature = "handles")]
+fn sys_aspace_map(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
+    let id = match crate::handle::vmo_of(crate::handle::Handle(frame.rdi), owner, crate::handle::RIGHT_MAP) {
+        Ok(v) => v,
+        Err(e) => return handle_err(e),
+    };
+    let pages = match crate::vmo::vmo_pages(id) {
+        Some(n) => n,
+        None => return E_BAD_HANDLE,
+    };
+    // 永远不给 X：写权由用户选，执行权不给，所以 W^X 在这一层就排掉了
+    let flags = if frame.rsi != 0 { mm::PageFlags::USER_RW } else { mm::PageFlags::USER_R };
+    let va = match mm::alloc_user_va_range(pages) {
+        Some(v) => v,
+        None => return E_EXHAUSTED,
+    };
+    let m = match crate::vmo::vmo_map_self(id, va, flags) {
+        Ok(m) => m,
+        Err(_) => {
+            // 铺不成就要把刚发的 VA 还回去，否则动态区会被失败调用吃光
+            mm::release_va(va.0);
+            return E_EXHAUSTED;
+        }
+    };
+    match crate::sched::own_current(crate::sched::OwnedItem::AsMap(m)) {
+        Ok(()) => va.0,
+        // 袋子满了：own_current 会**先放 RUNQ 再 drop**，映射与 VA 都由那个 Drop 还掉
+        Err(_) => E_EXHAUSTED,
+    }
+}
+
 #[cfg(feature = "handles")]
 fn sys_file_read(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let want = frame.rdx as usize;
@@ -649,6 +766,12 @@ pub fn syscall_dispatch(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> boo
         },
         #[cfg(feature = "handles")]
         SYS_FILE_READ => sys_file_read(frame),
+        #[cfg(feature = "handles")]
+        SYS_VMO_CREATE => sys_vmo_create(frame),
+        #[cfg(feature = "handles")]
+        SYS_VMO_WRITE => sys_vmo_write(frame),
+        #[cfg(feature = "handles")]
+        SYS_ASPACE_MAP => sys_aspace_map(frame),
         SYS_POKE_BUF => {
             // 内核 → 用户。写成 `Ok(n)` 而不是布尔：`n != want` 就是"中途被接住的故障"，
             // 程序核对字节时看得见的差异与内核报回的数必须一致（两台仪器不能各说各话）。

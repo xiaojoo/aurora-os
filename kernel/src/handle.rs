@@ -319,6 +319,22 @@ pub fn dup(h: Handle, owner: (usize, u32), new_rights: u32) -> Result<Handle, HE
     r
 }
 
+/// 查出句柄背后的 VMO 引用（ADR-074 的 syscall 13/14 用）。**锁内只读表**：
+/// 校验形状/世代/主人/权限之后把 Copy 的槽号带出去，对象本体的操作一律在放锁之后做。
+pub fn vmo_of(h: Handle, owner: (usize, u32), need: u32) -> Result<crate::vmo::VmoId, HErr> {
+    let mut g = TABLE.lock();
+    let t = g.get();
+    let slot = check(t, h, owner, need)?;
+    match t.slots[slot].obj {
+        Some(ObjRef::Vmo { slot }) => Ok(crate::vmo::VmoId::from_slot(slot)),
+        // 类型不符：不是"槽不存在"，计数分开
+        _ => {
+            t.c.denied += 1;
+            Err(HErr::Denied)
+        }
+    }
+}
+
 /// 读票：锁内取走游标的副本，锁外读盘，锁内提交。中途任何失败都只是丢掉这张票——
 /// 表项里的游标一格不动（"失败不提交"与 `FileCursor::read` 的语义同一条）。
 pub struct ReadTicket {

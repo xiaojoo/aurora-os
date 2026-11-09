@@ -95,6 +95,24 @@ pub fn counters() -> (usize, usize, u64) {
     })
 }
 
+/// 收尾扫描用：在用对象数 + 首个槽号（`u8::MAX` = 一个都没有）。与 proc 的两本账同形。
+pub fn vmo_residual() -> (usize, u8) {
+    mm::with_vmm_lock(|| {
+        let t = tbl();
+        let mut n = 0usize;
+        let mut first = u8::MAX;
+        for (i, e) in t.items.iter().enumerate() {
+            if e.used {
+                n += 1;
+                if first == u8::MAX {
+                    first = i as u8;
+                }
+            }
+        }
+        (n, first)
+    })
+}
+
 /// 在用对象数（收尾判据的证人）。
 pub fn vmo_count() -> usize {
     mm::with_vmm_lock(|| tbl().items.iter().filter(|e| e.used).count())
@@ -272,6 +290,31 @@ pub fn vmo_read(id: VmoId, offset: usize, dst: &mut [u8]) -> Result<usize, VmoEr
         }
         Ok(dst.len())
     })
+}
+
+/// 对象有几页（syscall 14 要先知道长度才能发 VA；不存在返回 None）。
+pub fn vmo_pages(id: VmoId) -> Option<usize> {
+    mm::with_vmm_lock(|| {
+        let e = tbl().items.get(usize::from(id.slot))?;
+        if e.used { Some(usize::from(e.pages)) } else { None }
+    })
+}
+
+/// 把整个对象铺进**内核那份 AS** 的用户半区（syscall 14 今天的形状：所有任务共用 AS_KERNEL）。
+/// 前置与 `vmo_map` 相同：调用方持着一个引用。
+pub fn vmo_map_self(id: VmoId, va: VirtAddr, flags: PageFlags) -> Result<AspaceMapping, VmoError> {
+    let mut frames = [0u64; MAX_VMO_PAGES];
+    let n = mm::with_vmm_lock(|| {
+        let t = tbl();
+        let e = t.items.get(usize::from(id.slot)).ok_or(VmoError::NoSuch)?;
+        if !e.used {
+            return Err(VmoError::NoSuch);
+        }
+        let n = usize::from(e.pages);
+        frames[..n].copy_from_slice(&e.frames[..n]);
+        Ok(n)
+    })?;
+    mm::aspace_map_self(&frames[..n], va, flags, MOD_VMO).map_err(VmoError::Mm)
 }
 
 /// 把整个对象铺进一个 AS 的用户半区（`mm::aspace_map` 的薄壳：mm 不认识 VMO，帧号由这里给）。

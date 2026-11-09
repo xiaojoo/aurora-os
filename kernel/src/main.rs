@@ -443,6 +443,22 @@ pub(crate) struct Sweep {
     /// 还存活的 Job 数。
     pub jobs: usize,
     pub first_job: u16,
+    /// W3 P4b（ADR-074 的 C9）：还没归还的 VMO 与没关的句柄。同一条收尾律。
+    pub vmos: usize,
+    pub first_vmo: u8,
+    pub handles: usize,
+}
+
+/// 句柄表只在 `handles` 特性里编译；别的构建这一格恒 0（读回真实状态，不读"我打算开"）。
+fn handles_live() -> usize {
+    #[cfg(feature = "handles")]
+    {
+        crate::handle::live()
+    }
+    #[cfg(not(feature = "handles"))]
+    {
+        0
+    }
 }
 
 pub(crate) fn finish_sweep() -> Sweep {
@@ -459,6 +475,9 @@ pub(crate) fn finish_sweep() -> Sweep {
         first_proc: u16::MAX,
         jobs: 0,
         first_job: u16::MAX,
+        vmos: 0,
+        first_vmo: u8::MAX,
+        handles: 0,
     };
     for c in 0..cpu::MAX_CPUS {
         if cpu::is_online(c) {
@@ -500,6 +519,12 @@ pub(crate) fn finish_sweep() -> Sweep {
     let (jr, jf) = proc::job_residual();
     s.jobs = jr;
     s.first_job = jf;
+    // VMO 与句柄（ADR-074 的 C9）：VMO 表在 VMM 内读，句柄表它自己那把锁内读，
+    // 两把锁不嵌套（依次获取），所以这个扫描仍然不持任何锁进入下一段。
+    let (vr, vf) = vmo::vmo_residual();
+    s.vmos = vr;
+    s.first_vmo = vf;
+    s.handles = handles_live();
     s
 }
 
@@ -538,7 +563,18 @@ fn run_ktests_and_finish() -> ! {
                 "用例收尾不变量破坏：test={} 之后仍有 {} 个 Job 没销毁（首个 #{}，名下额度必须已清零）",
                 name, sw.jobs, sw.first_job);
         }
+        if sw.vmos != 0 {
+            crate::log_fatal!(
+                "用例收尾不变量破坏：test={} 之后仍有 {} 个 VMO 没归还（首个 #{}）⇒ 最后一个引用要 vmo_unref",
+                name, sw.vmos, sw.first_vmo);
+        }
+        if sw.handles != 0 {
+            crate::log_fatal!(
+                "用例收尾不变量破坏：test={} 之后仍有 {} 个句柄没关（close 或 revoke_task）",
+                name, sw.handles);
+        }
         sw.stray == 0 && sw.blocked == 0 && sw.procs == 0 && sw.jobs == 0
+            && sw.vmos == 0 && sw.handles == 0
     });
     crate::log_info!("ktests: total={} passed={} failed={} table_invalid={}", s.total, s.passed, s.failed, s.table_invalid);
     // §9.6 的账本：开机到现在看过几次心跳、报过几次、处置过几次。处置次数今天必须是 0，

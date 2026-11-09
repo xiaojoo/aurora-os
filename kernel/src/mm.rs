@@ -1916,7 +1916,8 @@ pub fn aspace_leaf(space: &AspaceHandle, va: VirtAddr) -> Option<u64> {
 /// 不在就只还参考——表页已经归还，没有叶子可清），但少一次清叶子，所以用例按契约写。
 #[must_use = "映射柄丢弃即解映射并还参考，随手丢弃等于这段映射不存在"]
 pub struct AspaceMapping {
-    as_slot: u8,
+    /// `None` = 内核那份 AS（今天所有任务共用它，见 `aspace_map_self`）。
+    as_slot: Option<u8>,
     root: u64,
     va: VirtAddr,
     pages: usize,
@@ -1941,21 +1942,37 @@ impl Drop for AspaceMapping {
         out[..n].copy_from_slice(&self.frames[..n]);
         {
             let _g = vmm();
-            let e = &aspaces().items[usize::from(self.as_slot)];
-            if e.used && e.pml4 == self.root {
-                let mask = e.running_on;
+            // 内核 AS 没有表项可核对，它永远在；非内核 AS 要核对"还是当初那一棵"
+            let live = match self.as_slot {
+                None => true,
+                Some(slot) => {
+                    let e = &aspaces().items[usize::from(slot)];
+                    e.used && e.pml4 == self.root
+                }
+            };
+            if live {
+                let mask = match self.as_slot {
+                    None => None,
+                    Some(slot) => Some(aspaces().items[usize::from(slot)].running_on),
+                };
                 for k in 0..n {
                     let a = self.va.0 + (k as u64) * PAGE as u64;
-                    // SAFETY: root 与 as_slot 刚核对过，这段叶子是本结构铺的，持 VMM
+                    // SAFETY: root 刚核对过（或就是内核根），这段叶子是本结构铺的，持 VMM
                     if let Some(leaf) = unsafe { walk_leaf_in(self.root, None, a, false, false, false) } {
                         // SAFETY: 上一行返回的是有效表项指针
                         unsafe { *leaf = 0 };
                         tlb_invalidate(a);
                         // 清完叶子才等回执，回执收齐之前不还帧（ADR-023/072）。
-                        // 这是 shootdown_masked 的第一个产品调用者：只通知跑过这个 AS 的 CPU。
-                        shootdown_masked(a, mask);
+                        // 非内核 AS 只通知跑过它的 CPU；内核 AS 的改动仍全广播。
+                        match mask {
+                            Some(m) => shootdown_masked(a, m),
+                            None => shootdown_others(a),
+                        }
                     }
                 }
+                // VA 保留跟着映射一起放手（与 Mapping::drop 同律）。用例里那个固定 VA 没有保留，
+                // 这一句就是无效操作；syscall 路径的 VA 是 alloc_user_va_range 发的，必须还。
+                release_va_locked(self.va.0);
                 UNMAPPED_PAGES.fetch_add(n, Ordering::Relaxed);
             }
         }
@@ -1972,7 +1989,7 @@ impl Drop for AspaceMapping {
 ///
 /// 四条前置，每条都是结构性的而不是"再查一遍"：
 /// 1. **W^X**：收的是 `PageFlags`，而它只能由 `PageFlags::new` 造，W+X 在构造期就失败了。
-/// 2. **只许用户半区**：高 256 项的下层表是与内核**共享**的，往那里写叶子等于改内核表
+/// 2. **只许用户半区**：高 256 项的下层表是与内核**共享**的，写那里等于改内核表
 ///    （ADR-070 决策 2 的冻结），所以直接 `KernelHalfFrozen`。
 /// 3. **冲突在那棵树里判**：`AlreadyMapped` 查的是 `space` 的根，不是内核根——
 ///    这是"同一 VA 在两个 AS 里各自映射互不影响"（ADR-070 A4）的实现点。
@@ -1981,6 +1998,38 @@ impl Drop for AspaceMapping {
 /// 上下文 KERNEL，取 VMM；可能阻塞（Drop 里等 shootdown 回执）。失败不留半截映射。
 pub fn aspace_map(
     space: &AspaceHandle,
+    frames: &[u64],
+    va: VirtAddr,
+    flags: PageFlags,
+    owner: ModuleId,
+) -> Result<AspaceMapping, MmError> {
+    let _g = vmm();
+    let e = &aspaces().items[usize::from(space.slot)];
+    if !e.used {
+        return Err(MmError::NoSuchAspace);
+    }
+    let root = e.pml4;
+    map_shared(root, Some(space.slot), frames, va, flags, owner)
+}
+
+/// 铺进**内核那份 AS** 的用户半区（ADR-074 决策 4 的 P4b 形状）。
+/// 今天所有任务共用 AS_KERNEL，所以 syscall 14 的"映射进调用者自己的 AS"就是这一份；
+/// P5 起每进程一份 AS，那个入口改成查任务的 AS 槽，本函数留给内核自己的映射用。
+/// 与 `aspace_map` 的三点不同：根是内核 PML4、新建表页记 `MOD_BOOT`（内核生命周期）、
+/// 解映射时**全广播** shootdown（内核 AS 在每颗在线 CPU 上都跑过）。
+pub fn aspace_map_self(
+    frames: &[u64],
+    va: VirtAddr,
+    flags: PageFlags,
+    owner: ModuleId,
+) -> Result<AspaceMapping, MmError> {
+    map_shared(s().pml4_phys, None, frames, va, flags, owner)
+}
+
+/// 两个入口共用的铺设体。调用方已持 VMM 并核对过根。
+fn map_shared(
+    root: u64,
+    as_slot: Option<u8>,
     frames: &[u64],
     va: VirtAddr,
     flags: PageFlags,
@@ -2001,16 +2050,10 @@ pub fn aspace_map(
     }
     let n = frames.len();
     let mut got = [0u64; MAX_AS_MAP_PAGES];
-    let _g = vmm();
-    let e = &aspaces().items[usize::from(space.slot)];
-    if !e.used {
-        return Err(MmError::NoSuchAspace);
-    }
-    let root = e.pml4;
     // 先整段查冲突：不留"铺了一半才发现冲突"的中间态
     for k in 0..n {
         let a = va.0 + (k as u64) * PAGE as u64;
-        // SAFETY: root 是刚核对过的有效 PML4，va 规范且页对齐，持 VMM
+        // SAFETY: root 是调用方核对过的有效 PML4，va 规范且页对齐，持 VMM
         if let Some(leaf) = unsafe { walk_leaf_in(root, None, a, false, false, false) } {
             // SAFETY: 上一行返回的是有效表项指针
             if unsafe { *leaf } & P_PRESENT != 0 {
@@ -2022,16 +2065,15 @@ pub fn aspace_map(
         let a = va.0 + (k as u64) * PAGE as u64;
         let f = frames[k];
         // frame_get 取 PMM(30)，这里持 VMM(20)：正向嵌套（lock-order.md）
-        let _shared = frame_get(f);
+        let shared = frame_get(f);
         got[k] = f;
-        // 参考已经拿在手里，凭证交给 Drop 之前不能丢：这里 forget 掉 RAII 凭证，
-        // 所有权改记在返回的 AspaceMapping 里（与 aspace_new 记 pt_frames 同一手法）。
-        core::mem::forget(_shared);
-        if let Err(err) = set_leaf_in(root, Some(space.slot), a, f * PAGE as u64 | flags.bits(), false, flags.user) {
+        // 参考改记在返回的 AspaceMapping 里（与 aspace_new 记 pt_frames 同一手法）
+        core::mem::forget(shared);
+        if let Err(err) = set_leaf_in(root, as_slot, a, f * PAGE as u64 | flags.bits(), false, flags.user) {
             // 回滚：清掉已铺的叶子，还掉已拿的参考（含这一次）
             for j in 0..=k {
                 let b = va.0 + (j as u64) * PAGE as u64;
-                // SAFETY: 同上；只清本次铺的（j < k 已写成，j == k 可能没写成，清它是幂等空操作）
+                // SAFETY: 同上；j == k 那一页可能没写成，清它是幂等空操作
                 if let Some(leaf) = unsafe { walk_leaf_in(root, None, b, false, false, false) } {
                     // SAFETY: 有效表项指针
                     unsafe { *leaf = 0 };
@@ -2049,14 +2091,7 @@ pub fn aspace_map(
     }
     MAP_CALLS.fetch_add(1, Ordering::Relaxed);
     MAPPED_PAGES.fetch_add(n, Ordering::Relaxed);
-    let mut out = AspaceMapping {
-        as_slot: space.slot,
-        root,
-        va,
-        pages: n,
-        frames: [0; MAX_AS_MAP_PAGES],
-        owner,
-    };
+    let mut out = AspaceMapping { as_slot, root, va, pages: n, frames: [0; MAX_AS_MAP_PAGES], owner };
     out.frames[..n].copy_from_slice(&got[..n]);
     Ok(out)
 }

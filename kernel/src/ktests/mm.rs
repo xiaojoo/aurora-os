@@ -749,11 +749,14 @@ ktest!(KT_SHOOTDOWN_MASKED, t_shootdown_masked);
 
 fn p3_worker() -> ! {
     crate::sched::finish_current();
-    // æ¶å·¥ä¹å**è®©åº**èä¸æ¯çº¯èªæï¼Done çä»»å¡ä¸åè¢«éä¸­ï¼ä½å®è¿å ç CPUï¼
-    // åªæå®èªå·± yield ä¸æ¬¡ï¼ç­å¾æ¹æé è¿æ¬¡æ¢äººåæ¥ã
-    // çº¯èªæççæ¬å¨"æ¶éè¿æ²¡æ å®"çæ¡£ä½éææ´æºææ­» 45 sï¼fault-resched-ipi æ°å®æµï¼ã
+    // 让出**一次**把 CPU 立刻还给等待方（一条中断，不是风暴）；换不动就靠下面的自旋等 tick。
+    crate::sched::yield_now();
+    // 收工之后**有界自旋**，等下一次 tick 把 CPU 换走（Done 的任务不会再被选中）。
+    // 刻意不用 `loop { yield_now() }`：每次让出都是一条 `int 0xF0`，而挂 `-d int` 的矩阵行
+    // 把每条中断写进宿主机日志 ⇒ 自旋让出在那一档变成中断风暴，实测烧穿 120 s 预算（BACKLOG §153）。
+    // 换人靠 tick，所以用例必须保证时钟在跑（下面的探测与按需标定），这条前提比让出便宜得多。
     loop {
-        crate::sched::yield_now();
+        crate::tsc::spin(1000);
     }
 }
 
@@ -1492,3 +1495,233 @@ fn t_handle_vmo_release() -> bool {
 }
 #[cfg(feature = "handles")]
 ktest!(KT_HANDLE_VMO_RELEASE, t_handle_vmo_release);
+
+// ---- ADR-074（W3 P4b）12/13/14 三个号 + 退出时归还 ----
+//
+// 为什么要在**工人任务**里打这三个号而不是在用例上下文里：14 返回的映射挂进的是
+// **当前任务**的资源袋，只有任务退出才由 `release_owned` 在锁外 drop。在用例上下文里打号，
+// 那份映射会跟着启动任务活到整机停机 ⇒ 帧参考与 VA 保留都回不来，基线格必然红。
+// 所以这条用例顺带把 C9 的真正内容证了：**任务退出 ⇒ 映射、VA、帧参考一起回来**。
+// 变异：M7 去掉 13 的整段长度预校验 ⇒ 越界格红（且会留下半截写）；
+// M8 让 14 不给任务挂袋（直接 forget 映射）⇒ 基线格红；M9 去掉 F_VMO 位 ⇒ ABI 格红。
+
+#[cfg(feature = "handles")]
+static VMO_SYS: [core::sync::atomic::AtomicU64; 10] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 10];
+
+#[cfg(feature = "handles")]
+fn vmo_sys_worker() -> ! {
+    use crate::sched;
+    use crate::arch::x86_64::trap::TrapFrame;
+    use crate::handle::{Handle, RIGHT_READ};
+    use crate::user::{
+        COPY_MAX, F_VMO, SYS_ASPACE_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUP, SYS_VMO_CREATE,
+        SYS_VMO_WRITE, abi_word, copy_from_user, copy_to_user, syscall_dispatch,
+    };
+    let put = |i: usize, v: u64| VMO_SYS[i].store(v, core::sync::atomic::Ordering::Release);
+    let mut f = TrapFrame {
+        cr2: 0, r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
+        rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0, vector: 0,
+        error_code: 0, rip: 0, cs: 0, rflags: 0, rsp: 0, ss: 0,
+    };
+    // 用户缓冲页：真实映射（user+writable），13 的读方向必须过页面校验
+    let va = match mm::alloc_user_va_range(1) {
+        Some(v) => v,
+        None => { put(0, u64::MAX); sched::finish_current(); loop { crate::tsc::spin(1000); } }
+    };
+    let frames = match mm::phys_alloc(0, mm::MOD_TEST) {
+        Ok(fr) => fr,
+        Err(_) => { put(0, u64::MAX); sched::finish_current(); loop { crate::tsc::spin(1000); } }
+    };
+    let flags = mm::PageFlags::new(true, false, true).ok();
+    let map = flags.and_then(|fl| mm::map(va, frames, fl).ok());
+    let Some(user_buf) = map else {
+        put(0, u64::MAX);
+        sched::finish_current();
+        loop { crate::tsc::spin(1000); }
+    };
+    let pat = [0x5Au8, 1, 2, 3, 4, 5, 6, 7];
+    if copy_to_user(&pat, va.0) != Ok(8) {
+        put(0, u64::MAX);
+        sched::finish_current();
+        loop { crate::tsc::spin(1000); }
+    }
+
+    // ① 12：建两页的对象，拿到句柄
+    f.rax = SYS_VMO_CREATE;
+    f.rdi = 2;
+    syscall_dispatch(&mut f);
+    let h = f.rax;
+    put(0, h);
+    // ② 13：从用户缓冲写 8 字节到 offset 0
+    f.rax = SYS_VMO_WRITE;
+    f.rdi = h;
+    f.rsi = 0;
+    f.rdx = va.0;
+    f.r10 = 8;
+    syscall_dispatch(&mut f);
+    put(1, f.rax);
+    // ③ 长度三态：0 ⇒ -1；COPY_MAX+1 ⇒ -3；对象里放不下 ⇒ -1（整段先校验）
+    f.rax = SYS_VMO_WRITE;
+    f.rdi = h;
+    f.rsi = 0;
+    f.rdx = va.0;
+    f.r10 = 0;
+    syscall_dispatch(&mut f);
+    put(2, f.rax);
+    f.rax = SYS_VMO_WRITE;
+    f.r10 = (COPY_MAX + 1) as u64;
+    syscall_dispatch(&mut f);
+    put(3, f.rax);
+    f.rax = SYS_VMO_WRITE;
+    f.rsi = (2 * mm::PAGE - 3) as u64;
+    f.r10 = 8;
+    syscall_dispatch(&mut f);
+    put(4, f.rax);
+    // ④ 14：铺进自己的 AS，拿到一个用户 VA；从它读回必须等于写进去的图案
+    f.rax = SYS_ASPACE_MAP;
+    f.rdi = h;
+    f.rsi = 1;
+    syscall_dispatch(&mut f);
+    let mva = f.rax;
+    put(5, mva);
+    let mut back = [0u8; 8];
+    let read_back = copy_from_user(mva, &mut back) == Ok(8) && back == pat;
+    // 反向：往映射里写新值，对象那边必须看得到（同一份帧的双向证明）
+    let newv = [0xA5u8; 8];
+    let wrote = copy_to_user(&newv, mva) == Ok(8);
+    let id = crate::handle::vmo_of(Handle(h), crate::sched::current_identity().unwrap_or((0, 0)), RIGHT_READ).ok();
+    let mut seen = [0u8; 8];
+    let shared = match id {
+        Some(i) => crate::vmo::vmo_read(i, 0, &mut seen) == Ok(8) && seen == newv,
+        None => false,
+    };
+    put(6, if read_back && wrote && shared { 1 } else { 0 });
+    // ⑤ 权限：dup 到只读之后 13/14 都必须 -4
+    f.rax = SYS_HANDLE_DUP;
+    f.rdi = h;
+    f.rsi = RIGHT_READ as u64;
+    syscall_dispatch(&mut f);
+    let hro = f.rax;
+    f.rax = SYS_VMO_WRITE;
+    f.rdi = hro;
+    f.rsi = 0;
+    f.rdx = va.0;
+    f.r10 = 8;
+    syscall_dispatch(&mut f);
+    put(7, f.rax);
+    f.rax = SYS_ASPACE_MAP;
+    f.rdi = hro;
+    f.rsi = 1;
+    syscall_dispatch(&mut f);
+    put(8, f.rax);
+    // ⑥ ABI 位读回真实状态
+    put(9, abi_word() & F_VMO);
+    // 收尾：关两个句柄；映射留在袋里，**退出时**由 reap 还（这正是本用例要证的那条）
+    f.rax = SYS_HANDLE_CLOSE;
+    f.rdi = h;
+    syscall_dispatch(&mut f);
+    f.rax = SYS_HANDLE_CLOSE;
+    f.rdi = hro;
+    syscall_dispatch(&mut f);
+    // 用户缓冲页需要**显式** drop：工人收工之后不再返回（它在自旋让出里等着被回收），
+    // 局部变量的析构永远不会跑。第一版忘了这一句，基线格红在"少 1 帧、多 1 条 VA 保留"。
+    drop(user_buf);
+    sched::finish_current();
+    loop {
+        sched::yield_now();
+    }
+}
+
+#[cfg(feature = "handles")]
+fn t_vmo_syscalls() -> bool {
+    use crate::sched;
+    use crate::user::{E_DENIED, E_INVALID, E_TOO_LONG, F_VMO};
+    use core::sync::atomic::Ordering;
+    // 用例自足（P3 撞出来的四条，一条都不能省）：登记要在 spawn 之前、时钟要自己探测
+    sched::init_boot_task();
+    sched::start_workers();
+    if crate::clock::current().is_none() {
+        crate::calibrate_clock_once();
+    }
+    let tick_in = crate::arch::x86_64::apic::ticks();
+    let probe = crate::arch::x86_64::apic::wait_ticks(tick_in, 1, crate::clock::window_cycles(1));
+    let was_running = probe.ticks >= 1;
+    if !was_running {
+        crate::arch::x86_64::apic::timer_start().ok();
+    }
+    for i in 0..10 {
+        VMO_SYS[i].store(0, Ordering::Relaxed);
+    }
+    let f0 = mm::free_frames();
+    let va0 = mm::reservation_count();
+    let rel0 = sched::reap_released();
+    let v0 = crate::vmo::vmo_count();
+    let g = match sched::spawn(vmo_sys_worker) {
+        Ok(g) => g,
+        Err(e) => { crate::log_fatal!("vmosys: spawn {:?}", e); return false; }
+    };
+    let waited = crate::arch::x86_64::apic::with_interrupts(|| {
+        sched::wait_for_task(g, crate::clock::window_cycles(8))
+    });
+    let _ = sched::terminate_task(g);
+    let drained = sched::reap_released() > rel0 || drain_reap();
+    if !was_running {
+        crate::arch::x86_64::apic::timer_stop().ok();
+    }
+    let r: [u64; 10] = core::array::from_fn(|i| VMO_SYS[i].load(Ordering::Acquire));
+    let create_ok = waited && crate::handle::Handle(r[0]).unpack().is_some();
+    let write_ok = r[1] == 8;
+    let len_ok = r[2] == E_INVALID && r[3] == E_TOO_LONG && r[4] == E_INVALID;
+    let map_ok = r[5] != 0 && r[5] < u64::MAX && r[6] == 1;
+    let rights_ok = r[7] == E_DENIED && r[8] == E_DENIED;
+    let abi_ok = r[9] == F_VMO;
+    // 退出之后：对象、句柄、帧、VA 保留全部回基线（映射是挂在工人袋里的那一份）
+    let f1 = mm::free_frames();
+    let va1 = mm::reservation_count();
+    let base_ok = drained && f1 == f0 && va1 == va0 && crate::vmo::vmo_count() == v0
+        && crate::handle::live() == 0;
+    crate::log_info!(
+        "vmosys(P4b): 建={} 写={} 长度三态={} 映射双向={} 权限={} ABI={} 退出回基线=(drained{} free{}->{} va{}->{} vmo{} live{})",
+        create_ok, write_ok, len_ok, map_ok, rights_ok, abi_ok,
+        drained, f0, f1, va0, va1, crate::vmo::vmo_count(), crate::handle::live());
+    let ok = create_ok && write_ok && len_ok && map_ok && rights_ok && abi_ok && base_ok;
+    if !ok {
+        crate::log_fatal!(
+            "vmosys: 判据不成立 建={} 写={} 长度={} 映射={} 权限={} ABI={} 基线={} 原始={:?}",
+            create_ok, write_ok, len_ok, map_ok, rights_ok, abi_ok, base_ok, r);
+    }
+    ok
+}
+#[cfg(feature = "handles")]
+ktest!(KT_VMO_SYSCALLS, t_vmo_syscalls);
+
+/// 没有 `handles` 的构建里，12/13/14 必须走默认分支回 -1，且 ABI 的 F_VMO 位必须是 0。
+/// 这一格与上面那条互斥注册：它证的是"少了一个特性，用户看得见"，不是"号悄悄成功"。
+#[cfg(not(feature = "handles"))]
+fn t_vmo_numbers_absent() -> bool {
+    use crate::sched;
+    use crate::arch::x86_64::trap::TrapFrame;
+    use crate::user::{E_INVALID, F_VMO, SYS_ASPACE_MAP, SYS_VMO_CREATE, SYS_VMO_WRITE, abi_word, syscall_dispatch};
+    sched::init_boot_task();
+    let mut f = TrapFrame {
+        cr2: 0, r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
+        rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0, vector: 0,
+        error_code: 0, rip: 0, cs: 0, rflags: 0, rsp: 0, ss: 0,
+    };
+    let mut rets = [0u64; 3];
+    for (i, n) in [SYS_VMO_CREATE, SYS_VMO_WRITE, SYS_ASPACE_MAP].iter().enumerate() {
+        f.rax = *n;
+        f.rdi = 1;
+        f.rsi = 0;
+        f.rdx = 0;
+        f.r10 = 8;
+        syscall_dispatch(&mut f);
+        rets[i] = f.rax;
+    }
+    let bit = abi_word() & F_VMO;
+    crate::log_info!("vmosys-absent(P4b): 三号返回={:?} F_VMO位={}", rets, bit);
+    rets.iter().all(|&v| v == E_INVALID) && bit == 0
+}
+#[cfg(not(feature = "handles"))]
+ktest!(KT_VMO_NUMBERS_ABSENT, t_vmo_numbers_absent);
