@@ -45,11 +45,11 @@ expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe
 # 2026-11-07 P7：hello 加了 syscall3（U1 两处）与 ring3 句柄读/close（U5 三处）。
 
 [unsafe-census]
-total = 336
+total = 340
 U1 = 59
 U2 = 84
 U3 = 13
-U4 = 121
+U4 = 125
 U5 = 28
 U6 = 31
 
@@ -166,10 +166,19 @@ U4 = 8
 U2 = 3
 U4 = 7
 
+[modules."proc"]
+# W3 P3（ADR-073）：进程/Job 定长表。三处都是同一形状——
+# 指针来源是本模块静态 `StateCell(UnsafeCell<ProcState>)` 的 `get()`，地址范围固定在
+# `S` 这一个静态对象内，对齐由编译器保证，生命周期是 'static，
+# 并发规则：非原子字段只在 VMM(20) 内读写，used/threads/signal 是原子量、锁外也可碰；
+# 上下文约束：收工出口（proc_thread_exited）可能在故障路径上被调，所以那条路径一个锁都不取；
+# 不变量由 `unsafe impl Sync for StateCell` 上面那段论证保证。
+U4 = 3
+
 [modules."sched"]
 U1 = 4
 U2 = 6
-U4 = 14
+U4 = 15
 
 [modules."serial"]
 U1 = 2

@@ -1,6 +1,6 @@
 # unsafe 逐处审计表（U1–U6）
 
-总计 336 处。U1 59 · U2 84 · U3 13 · U4 121 · U5 28 · U6 31
+总计 340 处。U1 59 · U2 84 · U3 13 · U4 125 · U5 28 · U6 31
 
 本表由 `tools/aurora.py` 的 `unsafe_sites()` 从源码逐处生成，**不是手写的**。
 机器可读的权威来源是 `docs/security/unsafe-whitelist.toml` 的 `[modules.*]` 段（模块×类别→处数），
@@ -12,7 +12,7 @@
 - **U1 架构入口与特殊寄存器** — 59 处，分布在 13 个模块：arch/x86_64/apic、arch/x86_64/cpu、arch/x86_64/smp、arch/x86_64/trap、hw、ktests/sched、mm、sched、serial、sync、tsc、user、user/hello
 - **U2 页表、物理内存与 MMIO** — 84 处，分布在 10 个模块：acpi、arch/x86_64/apic、heap、hw、ktests/mm、limine、mm、pci、sched、user
 - **U3 DMA 与设备共享内存** — 13 处，分布在 2 个模块：driver、limine
-- **U4 并发共享状态与 UnsafeCell** — 121 处，分布在 18 个模块：acpi、ahci、arch/x86_64/apic、arch/x86_64/smp、arch/x86_64/trap、driver、hooks、irq、ktests/elf、ktests/fs、ktests/sign、main、mm、pci、sched、sync、user、virtio
+- **U4 并发共享状态与 UnsafeCell** — 125 处，分布在 19 个模块：acpi、ahci、arch/x86_64/apic、arch/x86_64/smp、arch/x86_64/trap、driver、hooks、irq、ktests/elf、ktests/fs、ktests/sign、main、mm、pci、proc、sched、sync、user、virtio
 - **U5 用户指针与地址空间访问** — 28 处，分布在 2 个模块：user、user/hello
 - **U6 诊断路径的有限现场读取** — 31 处，分布在 9 个模块：crash、ktest、ktests/acpi、ktests/crash、ktests/fs、ktests/heap、ktests/mm、ktests/sched、ktests/user
 
@@ -547,6 +547,15 @@
 - `kernel/src/pci.rs:214` [{] **U2** fn=`ecam_class`
   > unsafe { core::ptr::read_volatile((va + o) as *const u32) } } None => 0, 
 
+### proc
+
+- `kernel/src/proc.rs:86` [impl] **U4** fn=`—`
+  > unsafe impl Sync for StateCell {}  static S: StateCell = StateCell(core::cell::UnsafeCell::new(ProcState {
+- `kernel/src/proc.rs:96` [{] **U4** fn=`st`
+  > unsafe { &mut *S.0.get() } } 
+- `kernel/src/proc.rs:103` [{] **U4** fn=`st_atomic`
+  > unsafe { &*S.0.get() } } 
+
 ### sched
 - `kernel/src/sched.rs:350` [impl] **U4** fn=`reap`
   > unsafe impl Sync for QueueCell {} static RQ: [QueueCell; crate::arch::x86_64::cpu::MAX_CPUS] = [const { QueueCell { lock: crate::sync::IrqSpinLock::new(crate::sync::RANK_RUNQ, ()), data: core::cell::UnsafeCell::new(EMPTY_QUEUE) }
@@ -598,6 +607,9 @@
   > unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].resident } }
   （W1 收尾 B2 新增，与 `is_user`/`state_of` 同一形状：只读快照、不取队列锁，
   只用于用例收尾的豁免判定，不参与任何调度决定。）
+- `kernel/src/sched.rs:1560` [{] **U4** fn=`proc_id_of`
+  > unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].proc_id } } 
+  （W3 P3 新增，同一形状：只读快照，用途是证明 `set_proc_id` 真的写进了那一槽；不参与调度决定。）
 ### serial
 
 - `kernel/src/serial.rs:23` [{] **U1** fn=`out8`

@@ -87,6 +87,9 @@ pub struct Task {
     /// 取值只有五个来源，就是下面五个 `Task` 字面量；`terminate_task` 释放槽位时清掉，
     /// 所以"槽位被复用"不会把常驻身份带给下一个任务（ADR-061 未决 1 的 ABA 同一条线）。
     pub resident: bool,
+    /// 所属进程槽号（`proc::NO_PROC` = 无进程/内核任务）。W3 P3（ADR-073）。
+    /// 收工出口据此置 signal + 减线程计数；收尾判据据此判"用例造的进程线程必须清零"。
+    pub proc_id: u16,
     /// **属于哪个 CPU 的队列**（`cpu` 模块的槽位号）。
     ///
     /// 为什么要把"在哪个 CPU 上"从 `state` 里分出来：M3a 那次挂死就是两者共用一个字段造成的——
@@ -226,6 +229,9 @@ pub fn terminate_task(task: usize) -> bool {
         // 常驻身份跟着槽位走，所以释放时必须清掉：否则下一个复用这条槽的任务
         // 会白白拿到豁免（ADR-061 未决 1 那条 ABA 的同一家族）。
         s.tasks[slot].resident = false;
+        // 进程归属同理（W3 P3，ADR-073）：留着的话，复用这条槽的任务收工时会把
+        // **别人的**进程线程计数减一次——那个进程就永远等不到结局。
+        s.tasks[slot].proc_id = crate::proc::NO_PROC;
         s.entries[slot] = None;
         (slot, s.current == task, s.tasks[slot].owned.n > 0, was_blocked)
     };
@@ -360,6 +366,7 @@ const EMPTY_TASK: Task = Task {
     state: TaskState::Free,
     user: false,
     resident: false,
+    proc_id: crate::proc::NO_PROC,
     on_cpu: 0,
     runs: 0,
     left_tsc: 0,
@@ -930,6 +937,7 @@ pub fn init_boot_task() {
         state: TaskState::Running,
         user: false,
         resident: true, // 每 CPU 的启动/空闲上下文：设计上不退出（名单见 Task::resident）
+        proc_id: crate::proc::NO_PROC,
         on_cpu: cpu as u8,
         runs: 1,
         left_tsc: 0,
@@ -960,6 +968,7 @@ pub fn init_idle_task(stack_lo: u64, stack_hi: u64, guarded: bool) {
         state: TaskState::Running,
         user: false,
         resident: true, // 每 CPU 的启动/空闲上下文：设计上不退出（名单见 Task::resident）
+        proc_id: crate::proc::NO_PROC,
         on_cpu: cpu as u8,
         runs: 1,
         left_tsc: 0,
@@ -1192,6 +1201,7 @@ pub fn init_idle() -> bool {
         state: TaskState::Runnable,
         user: false,
         resident: true, // 兜底 idle 永不退出（ADR-051）：它是"没人可换"时的最后一格
+        proc_id: crate::proc::NO_PROC,
         on_cpu: cpu as u8,
         runs: 0,
         left_tsc: 0,
@@ -1266,6 +1276,7 @@ fn spawn_inner(entry: fn() -> !, resident: bool) -> Result<usize, mm::MmError> {
         state: TaskState::Runnable,
         user: false,
         resident,
+        proc_id: crate::proc::NO_PROC,
         on_cpu: cpu as u8,
         runs: 0,
         left_tsc: 0,
@@ -1321,6 +1332,7 @@ pub fn spawn_user(entry_rip: u64, user_stack_top: u64, mut res: OwnedSet) -> Res
         state: TaskState::Runnable,
         user: true,
         resident: false, // 用户任务永远不进常驻名单：收尾判据对它本来就点名（ADR-050）
+        proc_id: crate::proc::NO_PROC,
         on_cpu: cpu as u8,
         runs: 0,
         left_tsc: 0,
@@ -1340,6 +1352,15 @@ extern "C" fn trampoline() -> ! {
     };
     if let Some(f) = entry {
         f();
+    }
+    // W3 P3：工人函数返回 = 正常退出（exit_code=0）。顺序是"先置结局、再摘牌"：
+    // 等待方以 Done 当"结局可读"的凭据，反序给它一个看到 Done 却读不到退出码的空窗。
+    // proc_id 是一次性边令牌（取走即置回 NO_PROC），所以自己调过 finish_current、
+    // 又从工人函数 return 出来的任务不会被减两次线程计数。
+    let pid = my_rq().tasks[slot_of(me)].proc_id;
+    if pid != crate::proc::NO_PROC {
+        my_rq().tasks[slot_of(me)].proc_id = crate::proc::NO_PROC;
+        crate::proc::proc_thread_exited(pid, 0);
     }
     {
         let mut s = my_rq();
@@ -1385,6 +1406,27 @@ pub fn wait_for_boot_task(budget_cycles: u64) -> bool {
     true
 }
 
+/// W3 P3（ADR-071 决策 1）：等一个任务收工。有界时限 + yield 推进（不是纯自旋）。
+/// 返回 `true` = 目标已 Done/Free（Condition）；`false` = 超时（TimedOut）。
+/// 调用方必须是**被调度的任务**（boot 上下文是 slot 0，满足）；不持任何锁。
+/// 目标收工后 `proc::proc_is_terminated` 可查退出码（进程级）；
+/// 任务级直接看 `state_of(target)` 是否 Done/Free。
+pub fn wait_for_task(target: usize, deadline_cycles: u64) -> bool {
+    let t0 = crate::tsc::now();
+    loop {
+        let st = state_of(target);
+        if matches!(st, TaskState::Done | TaskState::Free) {
+            return true;
+        }
+        if crate::tsc::now().wrapping_sub(t0) > deadline_cycles {
+            return false;
+        }
+        // yield 推进：让目标有机会被调度、跑完、收工。
+        // 停表时 yield_now 靠自陷 0xF0 换人（ADR-049），不依赖 tick。
+        yield_now();
+    }
+}
+
 /// 把当前任务标成 Done：之后 `pick_next` 不会再选它。
 ///
 /// 这里直接写非原子的 `state` 字段是有意的简化，但前提已经换成一条更窄的论证：
@@ -1393,6 +1435,12 @@ pub fn wait_for_boot_task(budget_cycles: u64) -> bool {
 /// 跨 CPU 读（`state_of`）只是观测快照，不参与决策。
 pub fn finish_current() {
     let me = current_id();
+    // W3 P3：先置结局再摘牌（同 trampoline 那条理由）；proc_id 取走即置回哨兵，边只走一次。
+    let pid = my_rq().tasks[slot_of(me)].proc_id;
+    if pid != crate::proc::NO_PROC {
+        my_rq().tasks[slot_of(me)].proc_id = crate::proc::NO_PROC;
+        crate::proc::proc_thread_exited(pid, 0);
+    }
     my_rq().tasks[slot_of(me)].state = TaskState::Done;
 }
 
@@ -1404,6 +1452,13 @@ pub fn finish_current() {
 pub fn kill_current() {
     let me = current_id();
     let cpu = cpu_of(me);
+    // W3 P3：被杀也置结局（退出码 1 = 非正常）。本函数在故障路径上也会被调，
+    // 所以这条边一个锁都不取（proc_thread_exited 只动原子量）。
+    let pid = my_rq().tasks[slot_of(me)].proc_id;
+    if pid != crate::proc::NO_PROC {
+        my_rq().tasks[slot_of(me)].proc_id = crate::proc::NO_PROC;
+        crate::proc::proc_thread_exited(pid, 1);
+    }
     my_rq().tasks[slot_of(me)].state = TaskState::Done;
     REAP_PENDING[cpu].fetch_add(1, Ordering::AcqRel);
 }
@@ -1477,6 +1532,32 @@ pub fn is_resident(i: usize) -> bool {
     }
     // SAFETY: 只读快照，理由同 `current_of`
     unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].resident }
+}
+
+/// W3 P3：把一个已 spawn 的任务挂到进程上（用例用；将来 P5 的 `thread_create` 走同一条登记）。
+///
+/// 返回 `false` = 没挂上，调用方必须当成失败处理。两种拒绝：
+/// - 目标不在**本 CPU** 的队列上：`QueueCell` 的论证是"每 CPU 的队列只由本 CPU 写"（ADR-047 决策 2），
+///   跨 CPU 写要等远程登记那套一起重做；
+/// - 目标已经不是 Ready：它在我们登记之前就跑完了 ⇒ 收工边走的是 `NO_PROC`，线程计数减不到，
+///   这时候静默返回会让等待方一直空转到超时。
+pub fn set_proc_id(i: usize, pid: u16) -> bool {
+    if i >= MAX_TASKS_TOTAL || cpu_of(i) != crate::arch::x86_64::cpu::self_slot() {
+        return false;
+    }
+    let mut s = my_rq();
+    if !matches!(s.tasks[slot_of(i)].state, TaskState::Runnable | TaskState::Running) {
+        return false;
+    }
+    s.tasks[slot_of(i)].proc_id = pid;
+    true
+}
+
+/// 读一个任务的 proc_id（只读快照）。
+pub fn proc_id_of(i: usize) -> u16 {
+    if i >= MAX_TASKS_TOTAL { return crate::proc::NO_PROC; }
+    // SAFETY: 只读快照，理由同 `current_of`
+    unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].proc_id }
 }
 
 pub fn runs_of(i: usize) -> u64 {

@@ -254,13 +254,17 @@ status = "部分落地"
 module_id = "sched"
 owner = "sched"
 layer = "service"
-source_modules = ["sched", "user", "elf"]
+source_modules = ["sched", "proc", "user", "elf"]
 public_api = [
   "elf::ElfError",
   "elf::Program",
   "elf::USER_VA_TOP",
   "elf::describe",
   "elf::parse",
+  "proc::NO_PROC",
+  "proc::job_residual",
+  "proc::proc_residual",
+  "proc::proc_thread_exited",
   "sched::OwnedSet",
   "sched::current_identity",
   "sched::install_arch_hooks",
@@ -287,10 +291,10 @@ forbidden_dependencies = []
 known_violations = []
 context = ["KERNEL", "IRQ_OFF", "ISR_TOP"]
 error_classes = ["A", "B", "D"]
-resource_ownership = "任务槽位、每 CPU 运行队列、当前任务与 CPU 归属、任务状态、任务拥有的映射集合、退出与待回收状态。"
+resource_ownership = "任务槽位、每 CPU 运行队列、当前任务与 CPU 归属、任务状态、任务拥有的映射集合、退出与待回收状态；进程与 Job 记录（定长表、僵尸期保留到被收走）。"
 error_policy = "创建失败 → MmError；非法槽位 → false/None；退出与延迟回收不返回业务错误，账目不平 → FAIL/L4。"
-unsafe_scope = ["sched:U1,U2,U4", "user:U1,U2,U4,U5"]
-test_targets = ["t_preempt_round_robin", "t_task_stack_guard", "t_task_exit", "t_user_roundtrip", "t_elf_container", "t_elf_load_run", "t_user_pointer_checks", "t_copy_user", "t_syscall_fastpath"]
+unsafe_scope = ["sched:U1,U2,U4", "proc:U4", "user:U1,U2,U4,U5"]
+test_targets = ["t_preempt_round_robin", "t_task_stack_guard", "t_task_exit", "t_user_roundtrip", "t_elf_container", "t_elf_load_run", "t_user_pointer_checks", "t_copy_user", "t_syscall_fastpath", "t_proc_job_wait", "t_q2_workload_slots"]
 status = "部分落地"
 
 [modules."sync"]

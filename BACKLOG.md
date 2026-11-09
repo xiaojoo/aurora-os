@@ -5467,6 +5467,114 @@ SD_VA 多槽留到 per-AS VMM 锁引入那天。
 ②`shootdown_inner` 的 `mask.map_or(true, |m| m & (1 << s2) != 0)` 在循环里每次重新算，
 MAX_CPUS=8 所以无所谓，但若将来扩到 64 核要改成预计算。
 
+## 150. W3 P3：Process/Job 对象 + 僵尸结局记录 + `wait_for_task` + Q2 的 workload 实测（ADR-073，2026-11-09，实测）
+
+**范围**：`kernel/src/proc.rs`（新，190 行）+ 三个收工出口各一条边 + `terminate_task` 清 `proc_id`
++ `finish_sweep` 两本新账 + 两条用例（`t_proc_job_wait` 六格、`t_q2_workload_slots` 五格）。
+`lock-order.md` 零改动（没有新锁级，`RUNQ→VMM` 这条嵌套刻意不存在）。
+
+**决策的形状**（细节在 ADR-073）：
+1. 结局比等待者活得久：最后一条线程收工只置 `signal = TERMINATED|码`，**槽位与 Job 额度留到 `proc_reap`**；
+   从没起过线程的进程走 `proc_discard`。第一版就地清表，实测 ①格红在 `terminated=false`——
+   是被自己的判据打回的，不是先想到再写下的。
+2. 收工边**零锁**（只动 `AtomicBool/AtomicU16/AtomicU32`）：`kill_current` 在故障路径上会被调，
+   那一刻 VMM 可能已被本 CPU 持有（硬约束 6）。表操作全在 VMM(20) 内，读数（`*_residual`）也零锁——
+   为此两张表的 `used` 都是 `AtomicBool`，与 ADR-069 的"收尾扫描不拿锁"对齐。
+3. `proc_id` 是一次性边令牌（取走即置回 `NO_PROC`），`terminate_task` 释放槽位时与 `resident` 一起清；
+   留着的效果是"复用这条槽的任务替别人的进程减一次线程计数"，症状是那个进程永远等不到结局。
+4. Q7 的页数额度**只落了收窄检查**，用量计量要等 P4 的进程→AS/VMO 归属；这条写进 ADR-073 决策 9，
+   不藏在代码注释里。
+
+**四次红/挂，全在量具与用例侧，逐条带读数（ADR-073 的补记就是这四条）**：
+1. HANG（rc=-1，120 s）：`wait_for_task` 换到工人之后要靠 tick 换回来，而它前面的 `wait_ticks`
+   返回时把窗口关了（ADR-068）⇒ 工人带 `IF=0` 跑。修法：等待包在 `apic::with_interrupts` 里。
+2. HANG（rc=-1，90 s）：Q2 用例假设别处已经把时钟开着。修法：自己探测、自己 `timer_start`、收尾还原。
+3. `ahci-scratch` 档 HANG（45 s）+ `fault-resched-ipi` 档 `wait=false`：现场读数
+   `runs_g=1 st_g=Running switches=0 active=1`（前者）与 `apic_ticks 0->0 runs_g=0 st_g=Runnable`（后者）。
+   两个成因：①`init_boot_task()` 被我放在 spawn **之后**，那一刻 `current_of` 还是 `usize::MAX`，
+   抢占点在错误的槽位上记账；②排在时钟标定之前时根本没有 tick 源，而**`yield_now` 自己推不动换人**
+   （自陷只立牌，换人发生在中断出口路过 `preempt_point`）。修法：登记提到用例第一句；
+   `clock::current().is_none()` 就补一次幂等标定（与 `smp::bringup` 同一入口）；工人收尾循环改成让出而不是纯自旋。
+   修完：`ahci-scratch` **78/78**、`fault-resched-ipi` **73/73**。
+4. 矩阵两轮各出现一次**不同的**单行不符：第一轮 `virtio 写落盘` 那行的 `t_copy_user` 红
+   （`va: 保留 … 第 2 页仍已映射` + 三格判定全 true 却 failed，**未单独复现、未归因**）；
+   第二轮 `中断投递由宿主机数到`（`irq-affinity-probe` + `-d int`）拿到 `HANG(-1)`，
+   串口最后一行正是 `t_q2_workload_slots -> ok`。可归因的机制：两条用例各自无条件调 `drain_reap()`，
+   而回收早在窗口前就地完成 ⇒ 每跑白烧 1G 周期（≈300 ms）客时，`-d int` 把客时放大成墙钟。
+   修法：`reap_released() > 基线 || drain_reap()`（先看增量再决定要不要花窗口）。
+   修完：两条 `reap: 窗口内没看到回收` 的 warn 消失、正常构建启动用时 5.0 s → **4.2 s**、
+   同一份代码整轮矩阵 **45/45**（`.scratch/p3-test4.log`，rc=0）。
+   ⇒ 新规则：**用例里的有界等待要先问"事件是不是已经发生了"**，否则量具自己会把别的行挤红。
+
+**run-of-record**（收尾那一跑：`.scratch/p3-final-green-serial.log`，ELF `a3176d6b1919`，判定 **PASS/33**，用时 4.4 s）：
+- `proc(P3): 登记=true wait=true terminated=true code=0 quota=true narrow=true release=true baseline=(drained free116274->116274 pc0 jc0 released38->39)`
+- `q2(P3): 请求=7 成功=4 拒绝=3 峰值同活=4 active基线=7 active峰值=11 收工=4 收尸=3 回滚=1 每CPU槽上限=8 参考需线程+boot+idle=9 回基线=(drained true free116237->116237 va23->23 active7)`
+- `ktests: total=76 passed=76 failed=0 table_invalid=false`
+- 四档各一遍：normal 76/76、`fault-resched-ipi` 73/73、`ahci-scratch` 78/78、
+  `fault-ahci-highlba` 两条 P3 用例全绿（该档唯一红的是它自己的负样本 `t_ahci_high_lba`，期望就是 FAIL）。
+
+**四条变异各自咬各自的那一格**（在**收尾代码状态**上重跑过一遍，日志留档 `.scratch/p3-m{A,B,C,D}-serial.log`）：
+| 变异 | 改哪 | 红在哪 | 其余 |
+| --- | --- | --- | --- |
+| MUT-P3a | `proc_create` 去掉额度检查 | `quota=false`（②独红） | 残留 1 进程/1 Job 被收尾判据点名（98 条 fatal），下游 51 格连带红 |
+| MUT-P3b | `finish_current` 去掉收工边 | `terminated=false` + `release=false`（①④） | 同上，`failed=51` |
+| MUT-P3c | `proc_discard` 去掉状态闸 | **只有** `release=false` | `failed=1`（红得最干净的一条） |
+| MUT-P3d | `spawn` 满槽路径 `forget(owned)` | **只有** Q2 的 `rollback=false`（`free116224->116212`、`va23->26`） | `failed=1`；反证今天失败路径的帧与 VA 保留确实回滚 |
+
+**Q2 的读数怎么说**（ADR-073 决策 10）：参考形状需要 **9 格**（7 线程 + boot 上下文 + 兜底 idle），
+`MAX_TASKS = 8` ⇒ **单颗 CPU 装不下**；这一条是编译期容量的算术。同一次实测里只成功 4 条是因为
+别的用例留下了活跃任务（`active基线=7`，含 3 颗 AP 的常驻工人）⇒ **跨轮只许引用"需要 9 格"**，
+观测值受链接顺序影响。本轮**没有**动 `MAX_TASKS`：提它要同时重算 `sched.rs:30` 那条断言、
+VA 前沿、`.bss` 与 bench 的 P1 地板，留给使用者裁（候选 9/12/16 与代价写在 ADR-073 未决 1）。
+
+**登记面**：unsafe 336 → **340**（`proc` U4 三处 + `sched::proc_id_of` 一处），
+`unsafe-whitelist.toml` 加 `[modules."proc"] U4 = 3` 与来源/范围/生命周期/并发规则/上下文那段；
+`module-interfaces.toml` 的 `[modules."sched"]`：`source_modules += proc`、
+`public_api += proc::NO_PROC/proc_residual/job_residual/proc_thread_exited`、`unsafe_scope += proc:U4`、
+`test_targets += t_proc_job_wait/t_q2_workload_slots`。`check-interface-change` 在 ADR-073 落盘前
+确实红（"toml 有改动而工作树无 ADR"），落盘后转绿——这道门的证人本轮又跑了一次。
+
+**门禁与尺子（收尾读数，全部取自同一个代码状态 ELF `a3176d6b1919`）**：`check` **17/17**（rc=0，`.scratch/p3-check-final.log`）；
+矩阵整轮 **45/45 全符合、0 不符**（`.scratch/p3-test-final.log`，`test` rc=0）；
+`bench` **4/4 PASS**（`baselines/2026-11-09T09-37-44Z-p3p4.txt`）：P4 地板 **0.89 %**（89 bp）、
+P1 `min` 6338/7347（同构建地板 **1010** 周期）→ 注入 31,606；P3 `min` 344/326 → 注入 196,092；
+P2 读 490、1 遍 vs 4 遍 3.7×、DMA 42,557 vs 一次读 490 = 87×。
+（同一轮 earlier 还有一跑 `09-23-20Z`：地板 1.44 %、P1 地板 176；那一跑在四条变异重跑之前，
+代码状态与收尾不同 ⇒ 只作第二个地板样本登记，不与收尾读数混引。）
+串口量 154,536~154,546 → **155,028~155,033**（+~490 B）、P1 样本 50 → **52**，两格都归因到本轮两条新用例
+⇒ 按规则 2，P1/P3/P4 的绝对数与上一轮**不可直接比**（6338 对 5559 不当回归读）。
+产品热路径真正新增的只有三个收工出口各一次原子减与槽位释放清一个 u16，差值小于 1010 的地板 ⇒ **读不出来**。
+阈值仍按这一列最大观测值（5.15 %）停在 **8 %** 不动；已登记进 `docs/testing/p4-tolerance.md`。
+
+**取证方法的一条修正（重要）**：本轮实测 `还原 = 同一个 ELF sha` **不成立**——
+`proc_discard` 里一个 `if` 条件折行（多一行、语义不变）就把 sha 从 `46ca075fb32f` 变成 `2ee917cce9f8`，
+而同一份代码连续两次构建（`touch` 后重建）sha **相同**。原因是 debug 构建把行号带进调试信息。
+⇒ 变异还原的证人改用"逐格读数一致 + 判定 PASS"，sha 只用来确认"这一次跑的 ELF 就是这一次构建的"。
+顺带一条：`free frames` 的**绝对值**会随 ELF 体积变（本轮 116262 ↔ 116275），
+跨轮只能比"回到自己本轮的基线"，这是 79g-4 那条口径的具体化。
+
+**没做的**：
+- `TASK_QID` 与唤醒边（等待仍是轮询，最坏延迟一次 tick）⇒ 随 P6。
+- `wait_for_task` 的**超时**结局今天没有正样本（要一个永不收工的工人）⇒ 记"未验证"，随 P6 同批。
+- 页数额度的用量计量与超页拒绝 ⇒ 随 P4（ADR-073 决策 9）。
+- 进程级 `resident` 名单：常驻进程今天为 0，不开空名单（硬约束 2）⇒ 随 P7 的 init。
+- Q2 的"余量"数值：只量不提（见上）。
+- 跨 CPU 的 `set_proc_id`：现在只允许同 CPU 并返回 `bool`，越界与已收工一律拒绝（前提格当证人）。
+
+**新发现的风险**：
+1. `t_resource_ledger_balanced` 在链接顺序上排在 `t_q2_workload_slots` **之前**，
+   所以 MUT-P3d 那种"满槽泄漏"不会被台账格抓到（它当时确实是绿的，`live=395 violation=false`）。
+   本轮唯一的证人是用例自己的 `rollback` 格。要不要把台账格挪到全部用例之后重算，
+   属于"量具的排布"问题，未动（动它要先归一用例顺序，AGENTS.md 的口径）。
+2. 僵尸继续占额度 ⇒ 任何新用例造了进程就必须收尸，否则下一个用例边界点名；
+   这条纪律目前只写在 ADR-073 与 `finish_sweep` 的 fatal 文案里。
+3. `proc::proc_thread_exited` 在收工边零锁，读的是 `used`/`threads`/`signal` 三个原子量；
+   `proc_create` 复用空槽时先写非原子的 `job` 再 `used.store(true, Release)`——
+   顺序反了的话收工边可能读到"已占用但 job 归属是上一任"。今天靠 Release/Acquire 配对，
+   P4 如果加 per-进程页账，这段论证要重新走一遍。
+4. `MAX_PROCESSES = 4` 与 Q2 的参考形状一样大 ⇒ 用例之间没有余量：任何新用例再建一个进程
+   就会撞 `TableFull`，而不是撞额度。这是本轮定的数，也是未决 1 要一起裁的东西。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

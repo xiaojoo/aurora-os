@@ -42,6 +42,7 @@ pub(crate) use ktests::common::{HELLO_ELF, P7_CALLS, drain_reap};
 pub(crate) use ktests::fs::{FAT_PORT_A, FAT_PORT_B};
 mod limine;
 mod mm;
+mod proc;
 mod sched;
 mod serial;
 mod sign;
@@ -435,6 +436,12 @@ pub(crate) struct Sweep {
     pub residents: usize,
     /// 扫了几颗在线 CPU（含 BSP）
     pub cpus: usize,
+    /// W3 P3（ADR-073）：还占着的进程槽数（含僵尸）。同一条收尾律——用例造的记录用例自己收。
+    pub procs: usize,
+    pub first_proc: u16,
+    /// 还存活的 Job 数。
+    pub jobs: usize,
+    pub first_job: u16,
 }
 
 pub(crate) fn finish_sweep() -> Sweep {
@@ -447,6 +454,10 @@ pub(crate) fn finish_sweep() -> Sweep {
         blocked_cpu: usize::MAX,
         residents: 0,
         cpus: 0,
+        procs: 0,
+        first_proc: u16::MAX,
+        jobs: 0,
+        first_job: u16::MAX,
     };
     for c in 0..cpu::MAX_CPUS {
         if cpu::is_online(c) {
@@ -480,6 +491,14 @@ pub(crate) fn finish_sweep() -> Sweep {
             _ => {}
         }
     }
+    // W3 P3（ADR-073）：进程与 Job 上同一条收尾律。两张表是全局的（不属于某个 CPU），
+    // 所以不进上面的 CPU 循环；读数不取锁，理由写在 proc::proc_residual 的头注释里。
+    let (pr, pf) = proc::proc_residual();
+    s.procs = pr;
+    s.first_proc = pf;
+    let (jr, jf) = proc::job_residual();
+    s.jobs = jr;
+    s.first_job = jf;
     s
 }
 
@@ -508,7 +527,17 @@ fn run_ktests_and_finish() -> ! {
                 "用例收尾不变量破坏：test={} 之后 cpu{} 仍有 {} 个未登记的可运行任务（首个 #{}，用户或内核工人在 `Task::resident` 名单之外）",
                 name, sw.stray_cpu, sw.stray, sw.first_stray);
         }
-        sw.stray == 0 && sw.blocked == 0
+        if sw.procs != 0 {
+            crate::log_fatal!(
+                "用例收尾不变量破坏：test={} 之后仍有 {} 个进程记录没交出去（首个 #{}）⇒ 僵尸走 proc_reap、没起线程的走 proc_discard",
+                name, sw.procs, sw.first_proc);
+        }
+        if sw.jobs != 0 {
+            crate::log_fatal!(
+                "用例收尾不变量破坏：test={} 之后仍有 {} 个 Job 没销毁（首个 #{}，名下额度必须已清零）",
+                name, sw.jobs, sw.first_job);
+        }
+        sw.stray == 0 && sw.blocked == 0 && sw.procs == 0 && sw.jobs == 0
     });
     crate::log_info!("ktests: total={} passed={} failed={} table_invalid={}", s.total, s.passed, s.failed, s.table_invalid);
     // §9.6 的账本：开机到现在看过几次心跳、报过几次、处置过几次。处置次数今天必须是 0，

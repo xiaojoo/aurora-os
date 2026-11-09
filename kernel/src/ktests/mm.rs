@@ -3,6 +3,7 @@
 use crate::arch::x86_64::{trap};
 use crate::{mm};
 use crate::ktest;
+use crate::ktests::common::drain_reap;
 
 /// 分配-释放是否真的回到基线（不比对基线就等于没测）
 fn t_alloc_free_returns_frames() -> bool {
@@ -736,6 +737,165 @@ fn t_shootdown_masked() -> bool {
     ok
 }
 ktest!(KT_SHOOTDOWN_MASKED, t_shootdown_masked);
+
+// ---- ADR-073（W3 P3）Process / Job / wait_for_task ----
+//
+// 六格：①建 Job/Process + 挂线程 + wait 收工 + 退出码；②进程数额度（僵尸仍占额度）；
+// ③子 Job 只能收窄（进程数、页数各一格）；④两种还槽（reap 带回退出码 / discard 只给没起过线程的）；
+// ⑤回基线（槽数、Job 数、额度、空闲帧）；⑥登记本身的前提格。
+// 变异：M1 去掉 proc_create 的额度检查 ⇒ ②红；M2 去掉收工处的置 signal ⇒ ①只能超时红；
+// M3 把 proc_reap 的"未终止也放行"⇒ ④的 Denied 格红；M4 去掉 terminate_task 清 proc_id ⇒
+// 复用槽的任务把别人的线程计数减掉 ⇒ ①/④在连着跑两轮的形状下红（本轮用 ④ 的读回当证人）。
+
+fn p3_worker() -> ! {
+    crate::sched::finish_current();
+    // æ¶å·¥ä¹å**è®©åº**èä¸æ¯çº¯èªæï¼Done çä»»å¡ä¸åè¢«éä¸­ï¼ä½å®è¿å ç CPUï¼
+    // åªæå®èªå·± yield ä¸æ¬¡ï¼ç­å¾æ¹æé è¿æ¬¡æ¢äººåæ¥ã
+    // çº¯èªæççæ¬å¨"æ¶éè¿æ²¡æ å®"çæ¡£ä½éææ´æºææ­» 45 sï¼fault-resched-ipi æ°å®æµï¼ã
+    loop {
+        crate::sched::yield_now();
+    }
+}
+
+fn t_proc_job_wait() -> bool {
+    use crate::{proc, sched};
+    // 用例自足第一条（本轮在 ahci-scratch 与 fault-resched-ipi 两档实测撞出来的）：
+    // 链接顺序可能把本用例排在第一个"依赖任务上下文"的测试之前，那一刻启动上下文还没登记进 RQ，
+    // `current_of` 还是 `usize::MAX`，`yield_now` 的抢占点就在错误的槽位上记账——
+    // 症状是 `runs=1` 而 `state` 永远停在 Running、等待方一次都等不到，甚至整机静默。
+    // 所以登记必须在**建对象与 spawn 之前**，而不是在等待之前。
+    crate::sched::init_boot_task();
+    crate::sched::start_workers();
+    // 前提格：表是空的（用例自足，不假设别的用例收过尾）
+    let (pc0, pf0) = proc::proc_residual();
+    let (jc0, jf0) = proc::job_residual();
+    if pc0 != 0 || jc0 != 0 {
+        crate::log_fatal!(
+            "proc: 前提失效 残留进程={}({:#x}) 残留Job={}({:#x})",
+            pc0, pf0, jc0, jf0);
+        return false;
+    }
+    let f0 = mm::free_frames();
+
+    // ① 根 Job（额度 2 个进程、64 页）→ 进程 → **先**登记线程计数 → spawn → 挂 proc_id
+    // 顺序是有意的：反过来的话任务可能在两步之间就跑完了，收工边看到的是 NO_PROC，
+    // 线程计数永远减不到，等待方只能空转到超时。
+    let job = match proc::job_create(None, 2, 64) {
+        Ok(j) => j,
+        Err(e) => { crate::log_fatal!("proc: job_create {:?}", e); return false; }
+    };
+    let p = match proc::proc_create(job) {
+        Ok(p) => p,
+        Err(e) => { crate::log_fatal!("proc: proc_create {:?}", e); return false; }
+    };
+    if proc::proc_attach_thread(p).is_err() {
+        crate::log_fatal!("proc: proc_attach_thread 失败");
+        return false;
+    }
+    let g = match sched::spawn(p3_worker) {
+        Ok(g) => g,
+        Err(e) => { crate::log_fatal!("proc: spawn {:?}", e); return false; }
+    };
+    // ⑥ 登记的前提格：同 CPU、还活着才收得到；读回证明写进去的是这一槽
+    let reg_ok = sched::set_proc_id(g, p) && sched::proc_id_of(g) == p;
+
+    // 时钟：这里的推进**不靠** tick——工人收工后自己让出（见 `p3_worker`），停表也能等到结局。
+    // 开时钟只为让 `drain_reap` 那一步有 tick 可等；停表时它退化成"没看到增量"的一句 warn，
+    // 判据仍然靠 `reap_released` 的增量成立（就地回收那条路径不等窗口）。
+    //
+    // 用例自足三条（前两条与 `t_demand_zero` 同一套，第三条是本轮新撞的）：
+    // ①启动上下文可能还没登记进 RQ（链接顺序排在第一个用户任务测试之前）⇒ spawn/yield 全落空；
+    // ②`RUN` 位可能没别人替我开回来（依赖跨核 IPI 的几条用例在某些档位不注册）；
+    // ③有些用例会停掉 LAPIC 定时器再不带回来 ⇒ 探测一次，不在跑就自己开、收尾还原。
+    // 用例自足第四条（本轮 fault-resched-ipi 档实测）：链接顺序可能把本用例排在**时钟标定之前**，
+    // 而今天 `yield_now` 的自陷只把牌立起来，真正换人发生在**中断出口路过 `preempt_point`** 的那一刻
+    // （`switches=0` 而 `runs=0`、`state` 永远停在 Runnable 就是这一档的现场）。
+    // 所以这里按 `smp::bringup` 的同一入口补一次幂等标定，再自己把定时器开回来。
+    if crate::clock::current().is_none() {
+        crate::calibrate_clock_once();
+    }
+    let tick_in = crate::arch::x86_64::apic::ticks();
+    let probe = crate::arch::x86_64::apic::wait_ticks(tick_in, 1, crate::clock::window_cycles(1));
+    let was_running = probe.ticks >= 1;
+    if !was_running { crate::arch::x86_64::apic::timer_start().ok(); }
+    // wait_ticks 返回时窗口已经关掉（ADR-068）；等待必须开在窗口里，否则换过去之后
+    // 再也不会被 tick 抢占回来。
+    // 预算按 tick 给（40 个窗 ≈ 400 ms，与 `dz_wait_free` 同一口径）：fault-resched-ipi 档实测
+    // 纯周期预算推不动换人，只给 8 个窗在这一档不够（本轮第一版就是这么红的）。
+    let waited = crate::arch::x86_64::apic::with_interrupts(|| {
+        sched::wait_for_task(g, crate::clock::window_cycles(8))
+    });
+    let terminated = proc::proc_is_terminated(p);
+    let code = proc::proc_exit_code(p);
+    let wait_ok = reg_ok && waited && terminated && code == 0;
+
+    // ② 进程数额度：僵尸还占着槽 ⇒ 第二个可以，第三个必须被拒
+    let p2 = proc::proc_create(job);
+    let p3 = proc::proc_create(job);
+    let quota_ok = p2.is_ok() && p3 == Err(proc::ProcError::QuotaProcs)
+        && proc::job_used_procs(job) == Some(2);
+
+    // ③ 子 Job 只能收窄：放大进程数、放大页数各一条拒绝，两项都收才放行
+    let wide_procs = proc::job_create(Some(job), 3, 32);
+    let wide_pages = proc::job_create(Some(job), 2, 128);
+    let child = proc::job_create(Some(job), 1, 32);
+    let narrow_ok = wide_procs == Err(proc::ProcError::Denied)
+        && wide_pages == Err(proc::ProcError::Denied)
+        && child.is_ok();
+
+    // ④ 两种还槽。p 是僵尸 ⇒ reap 放行并带回退出码；p2 从没起过线程 ⇒ discard 放行、reap 拒绝。
+    // 顺序：先各自试一次"不该成功的"，再走对的那条。
+    let pid2 = p2.unwrap_or(u16::MAX);
+    let reap_running = proc::proc_reap(pid2);
+    let discard_zombie = proc::proc_discard(p);
+    let reap_zombie = proc::proc_reap(p);
+    let discard_gone = proc::proc_discard(p);
+    let discard_running = proc::proc_discard(pid2);
+    let release_ok = reap_running == Err(proc::ProcError::Denied)
+        && discard_zombie == Err(proc::ProcError::Denied)
+        && reap_zombie == Ok(0)
+        && discard_gone == Err(proc::ProcError::NoSuchProc)
+        && discard_running.is_ok();
+
+    // ⑤ 回基线。**先**把工人槽交出去并等到真回收，再读数：任务的内核栈是 4 帧，
+    // 它们只在"标 Free + 过一次抢占点"之后才回来（`terminate_task` 与 `drain_reap` 的分工）。
+    // released0 必须在 terminate 之前取——就地回收那条路径不等窗口，靠增量才能认出它已经发生。
+    let released0 = sched::reap_released();
+    let _ = sched::terminate_task(g);
+    // 顺序有意：先看增量，再决定要不要烧那个 1G 周期的窗口。就地回收（旁观者路径）
+    // 不等窗口，绝大多数时候增量已经在了；反过来写会**每跑一次白烧 ~300 ms 的客时**，
+    // 而 `-d int` 那两行把每个中断都写进宿主机日志，客时被放大成墙钟 ⇒ 本轮实测把
+    // "中断投递由宿主机数到"那一行挤成 HANG(-1)。
+    let drained = sched::reap_released() > released0 || drain_reap();
+    let up_after = proc::job_used_procs(job);
+    let jd_child = match child {
+        Ok(c) => proc::job_destroy(c),
+        Err(e) => Err(e),
+    };
+    let jd_job = proc::job_destroy(job);
+    let (pc1, _) = proc::proc_residual();
+    let (jc1, _) = proc::job_residual();
+    let f1 = mm::free_frames();
+    let baseline_ok = drained
+        && up_after == Some(0)
+        && jd_child.is_ok() && jd_job.is_ok()
+        && pc1 == 0 && jc1 == 0 && f1 == f0;
+
+    if !was_running { crate::arch::x86_64::apic::timer_stop().ok(); }
+
+    crate::log_info!(
+        "proc(P3): 登记={} wait={} terminated={} code={} quota={} narrow={} release={} baseline=(drained free{}->{} pc{} jc{} released{}->{})",
+        reg_ok, waited, terminated, code, quota_ok, narrow_ok, release_ok,
+        f0, f1, pc1, jc1, released0, sched::reap_released());
+    let ok = wait_ok && quota_ok && narrow_ok && release_ok && baseline_ok;
+    if !ok {
+        crate::log_fatal!(
+            "proc: 判据不成立 wait={} quota={} narrow={} release={} baseline={}",
+            wait_ok, quota_ok, narrow_ok, release_ok, baseline_ok);
+    }
+    ok
+}
+ktest!(KT_PROC_JOB, t_proc_job_wait);
 
 // ---- ADR-067（W2 P5）demand-zero ----
 //
