@@ -2202,11 +2202,48 @@ def ktests_in_elf(elf: Path) -> list[str]:
 
 # ------------------------------------------------------------------------ 门禁
 
+_MEMBERS_CACHE: list[Path] | None = None
+
+
+def workspace_members() -> list[Path] | None:
+    """workspace 成员包的根目录（按名字排序）。**唯一来源是 cargo metadata**，不是写死的路径表。
+
+    W3 P5 之前这里有两处写死：`check_lints_wired` 只扫 kernel 与 crates/*，
+    `_unsafe_roots()` 只扫 kernel/src 与 user/hello/src ⇒ 新增一个用户态产物时，
+    它的 `[lints]` 不会被查、它的 unsafe 一处都不会被普查（BACKLOG §154 的两个盲区）。
+    取不到成员集时返回 None，**调用方必须报红**：静默退回写死表就是把盲区又装回去。
+    """
+    global _MEMBERS_CACHE
+    if _MEMBERS_CACHE is not None:
+        return _MEMBERS_CACHE
+    out = subprocess.run([str(CARGO), "metadata", "--format-version", "1", "--no-deps"],
+                         capture_output=True, text=True, env=env())
+    if out.returncode != 0:
+        return None
+    import json
+    try:
+        pkgs = json.loads(out.stdout)["packages"]
+    except (ValueError, KeyError):
+        return None
+    dirs = sorted({Path(pkg["manifest_path"]).parent for pkg in pkgs}, key=lambda d: d.as_posix())
+    _MEMBERS_CACHE = dirs
+    return dirs
+
+
 def check_lints_wired() -> list[str]:
-    """[workspace.lints] 不会自动作用于成员 crate；没接线就是“门禁空转”。"""
+    """[workspace.lints] 不会自动作用于成员 crate；没接线就是“门禁空转”。
+
+    范围 = **全部 workspace 成员**（P5 起；此前只扫 kernel 与 crates/*，user/ 下的产物漏在外面）。
+    """
+    members = workspace_members()
+    if members is None:
+        return ["cargo metadata 失败：查不到成员集 ⇒ 这道门不能装作只扫 kernel 就算绿"]
     bad = []
-    manifests = [ROOT / "kernel" / "Cargo.toml", *(ROOT / "crates").glob("*/Cargo.toml")] if (ROOT / "crates").exists() else [ROOT / "kernel" / "Cargo.toml"]
-    for m in manifests:
+    for d in members:
+        m = d / "Cargo.toml"
+        if not m.exists():
+            bad.append(f"{d.relative_to(ROOT)} 没有 Cargo.toml")
+            continue
         s = m.read_text(encoding="utf-8")
         if "[lints]" not in s or "workspace = true" not in s:
             bad.append(f"{m.relative_to(ROOT)} 缺 [lints] workspace = true")
@@ -2242,8 +2279,16 @@ UNSAFE_ARCH_TABLE = ("tss.", "gdt", "idt", "gdtr", "write_unaligned")
 
 
 def _unsafe_roots() -> list[Path]:
-    """普查范围 = 两个成员包的源文件。与 check_unsafe_registry 的按包对账同一份来源。"""
-    return [ROOT / "kernel" / "src", ROOT / "user" / "hello" / "src"]
+    """普查范围 = **全部 workspace 成员**的 src。与 check_unsafe_registry 的按包对账同一份来源。
+
+    P5 之前这里写死两个根（kernel/src 与 user/hello/src），新产物一处都不会被普查；
+    现在跟着 cargo metadata 走。取不到成员集时退回空表 ⇒ 普查算出 0 处，
+    与登记表的非零总数对不上 ⇒ check-unsafe 报红（不会静默绿）。
+    """
+    members = workspace_members()
+    if members is None:
+        return []
+    return [d / "src" for d in members if (d / "src").is_dir()]
 
 
 def unsafe_extern_syms() -> dict[str, str]:
@@ -2313,10 +2358,15 @@ def unsafe_sites() -> list[dict]:
     for root in _unsafe_roots():
         for f in sorted(root.rglob("*.rs")):
             rel = f.relative_to(ROOT)
-            # 模块名 = 包内相对路径去掉 .rs。用户程序那个包今天只有一个文件，
-            # 给它一个稳定的名字而不是 "main"（与内核的 main 撞名，普查表会读成同一个模块）。
-            if rel.as_posix().startswith("user/hello/"):
-                module = "user/hello"
+            # 模块名：内核包 = 包内相对路径去掉 .rs（既有键一格不动）；
+            # 别的成员包 = 包目录相对仓库根（`user/hello`、`user/<probe>`…），
+            # 入口文件（main.rs/lib.rs）就用包目录本身，免得以 "main" 与内核的 main 撞名；
+            # 包里再有别的文件就接在后面。**不再写死 user/hello 前缀**（P5 之前的盲区）。
+            pkg = next((d for d in _unsafe_roots() if root == d), None)
+            if pkg is not None and pkg.parent != ROOT / "kernel":
+                base = pkg.parent.relative_to(ROOT).as_posix()
+                sub = f.relative_to(pkg).with_suffix("").as_posix()
+                module = base if sub in ("main", "lib") else f"{base}/{sub}"
             else:
                 module = f.relative_to(ROOT / "kernel" / "src").with_suffix("").as_posix()
             lines = f.read_text(encoding="utf-8").splitlines()

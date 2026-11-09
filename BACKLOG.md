@@ -5775,6 +5775,38 @@ P3 为了让等待方不依赖 tick，把工人收尾写成 `loop { yield_now() 
 `tools/`、`kernel/`、门禁登记面**一行未改**；没有跑 build/test/bench（无代码可跑）。
 P5 开工时按本文的清单动手，第一件事是把两个盲区补上并让 `check` 重新绿。
 
+## 155. W3 P5-0：两道门禁改成扫全部 workspace 成员（2026-11-09，实测；只动 tools/aurora.py）
+
+§154 裁决的第二条落地。**范围**：`tools/aurora.py` 一个文件（+59/−9），`kernel/` 与登记面零改动。
+
+**改了什么**：
+1. 新增 `workspace_members()`：成员集的**唯一来源是 `cargo metadata --no-deps`**（带缓存），
+   取不到就返回 `None`，**调用方必须报红**——静默退回写死表等于把盲区又装回去。
+2. `check_lints_wired` 从"只扫 kernel/Cargo.toml 与 crates/*"改成扫全部成员的 Cargo.toml。
+3. `_unsafe_roots()` 从写死的两个根（kernel/src、user/hello/src）改成全部成员的 src；
+   取不到成员集时退回空表 ⇒ 普查算出 0 处、与登记表对不上 ⇒ check-unsafe 报红（不会静默绿）。
+4. `unsafe_sites()` 的模块命名去掉写死的 `user/hello/` 前缀分支：内核包保持既有方案（键一格不动），
+   别的成员包用"包目录相对仓库根"，入口文件（main.rs/lib.rs）就用包目录本身，其余文件接在后面。
+
+**两条变异各自证红**（都是临时改、当场还原）：
+| 变异 | 改哪 | 实测 |
+| --- | --- | --- |
+| MUT-P5-0 | 摘掉 `user/hello/Cargo.toml` 的 `[lints] workspace = true` | `check-lints-wired` 点名 `user\hello\Cargo.toml 缺 [lints] workspace = true`（**改之前这一处根本不在扫描范围里，会静默绿**） |
+| MUT-P5-0b | 把 `user/hello` 从根 `Cargo.toml` 的 `members` 里去掉 | 普查 **355 → 321**（正好少 34 = user/hello 的 U1 12 + U5 22），check-unsafe 报"白名单虚报"，check-crates 报"登记了但不存在" ⇒ 证明范围真的跟着成员集走，不是写死表 |
+
+**读数**：`check` **17/17**（rc=0）；普查总数 **355 不变**、`user/hello` 仍是 U1 12 / U5 22
+（命名方案换了而键没变，所以白名单与审计表**一格都不用改**）；`ktests` 注册 **79** 条不变。
+内核 ELF sha **`cc2faeae5f78`**，与 P4b 的 run-of-record **逐字相同** ⇒ 本轮**没有重跑矩阵与 bench**：
+被测物一个字节没动，P4b 那轮的 45/45 与 4/4 仍然覆盖这个代码状态（这条是按"同一代码状态"的口径说的，
+不是省略取证）。`tools/aurora.py` 保持 **CRLF**（5510/5510），没有发生行尾伪 diff。
+
+**没做的**：新产物本身（`user/<probe>` 包、第二套构建常量与夹具、crates.toml/sbom 登记）留给 P5-1；
+`_unsafe_roots()` 对**新包**的覆盖要等那个包真存在才能证红（本轮只证了"范围跟着成员集走"这一半）。
+
+**新发现的风险**：`workspace_members()` 每次门禁跑都要起一次 cargo metadata（有缓存，一轮 check 里只起一次）；
+ cargo 不在位或网络锁被占时这道门会报红而不是跳过——这是有意的（宁可用例红，不要门禁空转），
+ 但它把"cargo 能不能跑"变成了 check 的前置条件，离线环境要注意。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。
