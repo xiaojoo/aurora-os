@@ -46,7 +46,11 @@ P5 的目标形状一次做完会同时动"换人热路径 + 句柄对象种类 
 | **P5c** | 句柄的四种新 kind + 11 `process_create` / 15 `thread_create` / 16 `process_start` + `StartupInfo` 回填与转移 | 由 P5a 的产物在 ring3 真打；判据取设计 §10.5 那五条 |
 
 **11 `process_create` 归 P5c**（不是 P5b）：它要返回 `proc` 与 `aspace` 两个**句柄**，
-所以必须等句柄表有那两种 kind。设计 §10.3 的七步序列里它是第 1 步，但落地顺序上它依赖 P5b 的 AS 归属。
+所以必须等句柄表有那两种 kind。
+> **勘误（2026-11-10，使用者授权本文定案，见下面的决策 8）**：这一句的"两个句柄"**不成立**——
+> 一个 `u64` 装不下两个句柄（16 位槽号 + 48 位世代已占满）。最终形状是
+> **11 只返回 Proc 句柄**，父进程要往子 AS 铺映射时用 **14 号的 `rdx` 出示 Proc 句柄**
+> （由 `user.rs` 解析成那个进程的 AS 槽号）。原文不回改，差异记在决策 8。设计 §10.3 的七步序列里它是第 1 步，但落地顺序上它依赖 P5b 的 AS 归属。
 
 ### 2. 每进程一份 AS：归属挂在 `Task` 上，换人时"不同才写"
 
@@ -451,6 +455,42 @@ P5c 的 `process_start` 会把这条代价带到产品路径上——**那时换
 ② **启动映射的归属**：14 号铺出来的映射今天挂在**创建者任务的资源袋**里（ADR-074 按任务归属），
    父进程先退，子线程的代码/栈映射就当场没了。这一版照现状实现并配"父先退"的负样本让它可判，
    改成进程级归属是本文留给 P7 的那笔账，不在 c-3 偷偷做。
+
+### 8. `process_create` 的返回值：**只返回 Proc 句柄**，14 号的 `rdx` 兼收 Proc 句柄（2026-11-10 定案）
+
+使用者把这一件授权给本文定（"把 process_create 的返回值方案定一下"）。定案如下，**尚未落地**：
+
+- **11 `process_create(rdi = Job 句柄)` → `rax` = Proc 句柄**（要 `RIGHT_CREATE`）。
+  子进程那张 AS 由内核建（`mm::aspace_new_kernel`）并记在 proc 表里，**不交给父进程**。
+- **14 `aspace_map` 的 `rdx` 兼收两种 kind**：`ObjRef::ASpace`（c-2 已落地）与 **`ObjRef::Proc`**
+  （= "往这个进程的 AS 里铺"）。对 Proc 句柄要求 **`RIGHT_MAP`**，与 ASpace 同一位，
+  语义就是"装载器可以往它的地址空间里铺映射"，**不新增权限位**。
+- **解析放在 `user.rs`，不放在 `handle.rs`**：`user.rs` 属 `sched` 模块组
+  （`module-interfaces.toml` 的 `source_modules = ["sched","proc","user","elf"]`），
+  它调 `handle::resolve` 拿到 `ObjRef` 之后，若是 `Proc{slot,gen}` 就调 `proc::proc_aspace` 换成 AS 槽号。
+  **这条位置约束是硬的**：c-1 实测过，`handle.rs`（= `capability`）一旦引用 `proc`/`sched`
+  就与既有的 `sched → capability`（`revoke_task`）合成二元强连通分量，
+  把 `sched` 从单例拖进冻结的核心环、要一次性登记十来条环内边。
+- **子进程自己的 `SELF_ASPACE` 角色由内核 grant**（决策 3 的角色表），父进程从头到尾不需要那个名字。
+
+**为什么不是"出参指针"方案（`rax` 给 Proc、`rsi` 给 8 字节指针装 AS 句柄）**——三条可核的理由：
+1. **位预算**：`Handle::pack` 是 `slot(16 位) | gen<<16`，`GEN_MAX = 2^48-1`
+   （[kernel/src/handle.rs:29-31](file:///H:/aurora-os/kernel/src/handle.rs#L29-L31)）⇒ 一个 `u64` 已经占满，
+   塞两个句柄要么改句柄格式（所有已发布的号都要跟着改），要么缩短世代（削弱 ABA 防护，本轮刚修过那条洞）。
+2. **出参方案会造一个新的中间态**：proc 与 AS 都建好之后写用户缓冲仍可能失败（`-2`），
+   那时必须把整条创建序列回滚（表页、名额、句柄、AS）。这条回滚路径今天不存在，
+   等于给 11 号新增一条失败语义与一格负样本；而"只返回一个值"没有这个中间态。
+3. **少交出去一个名字**：父进程真正需要的动作只有"往子 AS 铺映射"，
+   14 号兼收 Proc 句柄就够；AS 句柄留在内核与子进程自己手里，攻击面不扩大
+   （持有 Proc + `MAP` 与持有 AS + `MAP` 是同一种权限，不是新增一种）。
+
+**落地时要同轮做的四件**：①`proc::proc_aspace(pid, gen)` 与 proc 表里的 `(aspace, as_gen)` 两格；
+②14 号 `rdx` 的 kind 分派 + 一格"拿 Proc 句柄铺进子 AS、内核 AS 里那段 VA 仍然没有映射"的证人；
+③`ABI_MINOR` 7 → **8** 与 `user-abi-capability.md` §4.4b 同轮改（`rdx` 那一行要写清兼收两种 kind）；
+④一格负样本：拿**不带 `MAP`** 的 Proc 句柄调 14 ⇒ `-4`，且 `denied` 计数涨。
+
+**兼容性**：`rdx = 0`（自己的 AS）与 `rdx = ASpace 句柄` 的行为**逐字不变**，
+c-2 的探针三格与 `t_aspace_map_vmo` 的三格继续当证人；这次只是**多接受一种 kind**。
 
 ## 备选方案
 
