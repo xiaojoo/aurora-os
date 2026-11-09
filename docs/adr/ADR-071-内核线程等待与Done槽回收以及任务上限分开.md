@@ -44,13 +44,25 @@ ADR-027（释放推迟到"不是它"）、ADR-063（FrameInfo）、ADR-070（`Ad
 
 ## 决策（草案，待验收）
 
-### 1. `wait_for_task(gidx, deadline) -> WaitOutcome`
+### 1. 等待：内核侧 `wait_for_task`，用户侧**通用** `object_wait`（Q3 已裁决，2026-11-09）
+
+使用者按主流口径选了通用对象等待（Zircon `zx_object_wait_async` / Linux `pidfd_open`+`waitid(P_PIDFD)` /
+Windows `WaitForSingleObject`+`GetExitCodeProcess`），所以**原语从八个变九个**：
+`object_wait(handle, signals, deadline) -> (observed_signals, exit_code)` 占 **19 号**，
+`process_wait`（17 号）与将来的 `thread_wait` 都是它的薄壳。退出码由 signal 带出，
+不另开一个"取退出码"的调用。设计文档 §10 的"八原语"因此需要勘误（那份文档未跟踪，
+差异记在 `docs/design/w3-立项-依赖图与切片计划.md` §6 与 BACKLOG §146）。
+
+内核侧的地基仍然是这一条：
 
 - 复用 ADR-054/059 已验证的形状：**一个 token 同时挂在等待链与轮项上**，
   条件唤醒与到期唤醒谁先到都认，后到者返回 false。
 - 新增一个保留队列号（与 `TIMER_QID = u8::MAX` 同一手法）`TASK_QID`，
   被等待者的 `Blocked` 槽注册在它上面；三个收工出口（`finish_current`/`kill_current`/
-  `trampoline` 的 `Done`）都必须唤醒 `TASK_QID` 上的等待者。
+  `trampoline` 的 `Done`）都必须唤醒 `TASK_QID` 上的等待者，**并把对象的 signal 置成
+  `TERMINATED` + 退出码**——`object_wait` 等的就是这个 signal，不是任务槽的状态。
+  这条顺序很重要：先置 signal 再唤醒，否则等待者醒来会看到"醒了但没有 signal"的空转
+  （ADR-054 的"单调用协议防空转"就是防这个）。
 - **允许启动上下文等待**：这就要放开 `sync.rs:199` 那条 `me == usize::MAX ⇒ NotInstalled`。
   本文的取舍是：**不放开 `WaitQueue`**，而是给 `wait_for_task` 一条自己的阻塞路径
   （调用者 = 本 CPU 的当前槽，`block_current(token)` 已经存在，`sched.rs:790-800`），
@@ -79,15 +91,19 @@ ADR-027（释放推迟到"不是它"）、ADR-063（FrameInfo）、ADR-070（`Ad
   等待者醒来看到的是"已经没有线程可选中"，不做遍历。这条顺序很重要，否则等待者
   会在别的 CPU 还在跑该进程的线程时提前减引用。
 
-### 3. 上限分开：`MAX_THREADS_PER_CPU` 与 `MAX_PROCESSES`
+### 3. 上限分开：`MAX_THREADS_PER_CPU` 与 `MAX_PROCESSES`（Q2 已裁决：先实测再定数）
 
 - **本文不做动态任务表**，也**不改 `gidx` 编码**（编码一动，句柄世代、台账、收尾名单三处口径同时变，
   属于 ADR-069/`handle.rs` 的账，不该搭在 W3 第一刀上）。
-- 做法：`MAX_TASKS` 从 8 **按 workload 提到 16**（每 CPU），同时新增独立的
-  `MAX_PROCESSES`（建议 8）与一张定长进程表；编译期断言那条
+- **数值不拍**（使用者裁定）：P3 开工前先加一条 workload 用例（init + 3 子进程 × 2 线程），
+  量"每 CPU 同时存活线程数"的最大观测值，再按**最大观测值 + 余量**定
+  `MAX_THREADS_PER_CPU` 与 `MAX_PROCESSES`，写回本 ADR 的补记。
+  下面那句"从 8 提到 16"是**举例说明绑定关系**，不是裁决出来的数。
+- 做法（**数值是举例，等 workload 实测回填**）：`MAX_TASKS` 从 8 提到某个实测值（例如 16），
+  同时新增独立的 `MAX_PROCESSES`（例如 8）与一张定长进程表；编译期断言那条
   （`sched.rs:30` ⇒ `mm::MAX_TASKS_SUPPORTED`，`mm.rs:72`）要一起重算，
-  并且**必须重新量 VA 前沿**：今天每 CPU 16 线程 × 每线程 2 页栈 = 与 ADR-065 的 256 格保留表
-  第一次真正接近上限，这条要写成 P1 的前置而不是"到时候再说"。
+  并且**必须重新量 VA 前沿**：按"每 CPU 16 线程 × 每线程 2 页栈"这种量级估，
+  与 ADR-065 的 256 格保留表第一次真正接近上限，这条要写成 P3 的前置而不是"到时候再说"。
 - 提上限的**依据必须是 workload**，不是拍数：ADR-054 的口径是"上限由 workload 钉出来"，
   而 `WHEEL_SLOTS = 64`、`MAX_OWNED = 8` 今天都还欠着这条（`AGENTS.md` 的已知脆性）。
   本文要求 P3 之前先有一次实测："一个 init + 三个子进程、每个两条线程" 这种形状下
@@ -149,10 +165,19 @@ ADR-027（释放推迟到"不是它"）、ADR-063（FrameInfo）、ADR-070（`Ad
 
 ## 未决
 
-1. `thread_wait` 要不要（设计文档 §10.6 第 3 条，本文 Q3）。
-2. 退出码的载体与宽度（`process_wait` 返回什么，今天 `kill_current` 只有"杀"没有码）。
-3. 任务槽与 `gidx` 编码的长期形状（进程/线程两套 id 还是同一套）；本文选择"不改编码"，
+**Q1–Q8 已由使用者裁决**（2026-11-09，逐条见 `docs/design/w3-立项-依赖图与切片计划.md` §4）。
+与本文相关的三条已闭：Q3 ⇒ 通用 `object_wait`（决策 1 已改写，`thread_wait` 将来免费得到）；
+Q2 ⇒ 上限先实测再定（决策 3 的数值改成举例）；Q7 ⇒ `Job` 额度只管**进程数 + 页数**
+（落在 P3 的 ADR-073，不在本文）。仍然开着的是：
+
+1. **signal 位布局与退出码宽度**：Q3 裁了"退出码由 signal 带出"，没裁位怎么分
+   （Zircon 把退出码放在 signal 的高位）。今天 `kill_current`（`sched.rs:1404-1409`）只有"杀"没有码，
+   所以宽度与"被杀"和"正常退出"怎么区分要在起草 19 号调用时一起定。
+2. 任务槽与 `gidx` 编码的长期形状（进程/线程两套 id 还是同一套）；本文选择"不改编码"，
    但 `MAX_PROCESSES` 一旦超过 `MAX_TASKS_TOTAL` 就必须重开这条。
-4. 跨 CPU 迁移仍未做（`sched.rs:7-9`）；`spawn` 只能建在调用者 CPU 上，
+3. 跨 CPU 迁移仍未做（`sched.rs:7-9`）；`spawn` 只能建在调用者 CPU 上，
    这会让"一个进程的多条线程全挤在同一 CPU"成为默认形状，负载均衡是 W3 之后的事。
-5. 真机：`TimedOut` 的上界与轮槽 64 都没有 workload 依据（ADR-059 未决 2 同一条）。
+   **Q2 的 workload 实测要在这个前提下量**，否则量出来的"每 CPU 存活线程数"会偏小。
+4. 真机：`TimedOut` 的上界与轮槽 64 都没有 workload 依据（ADR-059 未决 2 同一条）。
+5. `object_wait` 的等待者上限：今天 `WaitQueue` 是 16 队列 × 16 等待者（`sync.rs:86-87`），
+   而决策 1 刻意**不走**那张表；内核侧等待槽要另定一个数，同样欠 workload 依据。

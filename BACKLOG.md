@@ -5300,6 +5300,41 @@ P1 `min` 5689/5709（同构建差 21）、四把尺子全部"能分辨=符合"�
 `check` **17/17** 仍然全绿（纯文档改动，读一遍确认门禁没被碰）。
 两份 ADR 的所有"将来时"都标着待切片实测，没有一条写成已验证。
 
+## 146. W3 立项的 Q1–Q8 已裁决（2026-11-09，使用者按主流内核口径逐题选定；仍是纯文档）
+
+§145 留了八个问题给使用者。本轮把选项按主流内核的实际做法摆出来（每题标了它是哪家的形状），
+使用者逐题选定，**裁决与后果写进 `docs/design/w3-立项-依赖图与切片计划.md` §4**，
+两份 ADR 草案跟着改：
+
+| # | 裁决 | 主流锚点 | 改到哪 |
+| --- | --- | --- | --- |
+| Q1 | 0 保留作 invalid，新号 **11–19 连续追加** | Linux 号只追加不复用；Zircon `0 = ZX_SYSCALL_INVALID` | 计划 §4、N13 行、P5/P6 |
+| Q2 | 上限**先实测 workload 再定**，进程数与线程数是两个数 | seL4 CNode 由创建者定；Linux `MAX_PID`+cgroup；Windows Job 限额 | ADR-071 决策 3（数值改成举例）、P3 前置 |
+| Q3 | **通用 `object_wait(handle, signals, deadline)`**，`process_wait`/`thread_wait` 是薄壳，退出码由 signal 带出 | Zircon `zx_object_wait_async`；Linux `pidfd`+`waitid`；Windows `WaitForSingleObject` | ADR-071 决策 1 改写、N16 行、P6 |
+| Q4 | P1 读数**分 `same-as` / `cross-as` 两格** + `cr3-writes` 计数 | Linux 把 `switch_mm` 与任务切换分开量 | ADR-070 决策 4、P1 判据、§6 第 2 条 |
+| Q5 | 每 AS 一份 PML4 页，**高 256 项复制、下层表共享**，内核半区创建后冻结 | Linux `pgd_alloc`；seL4/Zircon 内核空间同形 | ADR-070 决策 2 |
+| Q6 | W3 **不做 PCID/KPTI**；跨 AS = `mov cr3` + 全冲刷，代价单列一格 | seL4/Zircon 用 ASID 不做 KPTI；Linux 两者都开；设计文档 D5 | ADR-070 决策 4 |
+| Q7 | `Job` 额度只管**进程数 + 页数**，`CREATE` 是唯一新权限位，子 Job 只能收窄 | Windows Job 的 ActiveProcessLimit + 内存限额 | P3 判据与两条变异、P6 |
+| Q8 | **不动 `hello.elf`，另起 `user/` 产物**（同 workspace 多 bin，不算拆 crate） | Zircon 测试二进制独立、内核不装载 ELF | P5 前置与预计触碰、§6 第 3 条 |
+
+**裁决带来的三处文档修正**（记在计划 §6，本轮**不改那份未跟踪的设计方案原文**）：
+1. **原语从八个变九个**（Q3 加了 19 号 `object_wait`）。`docs/Aurora OS 内核完整化设计方案（AUR-KERNEL-NEXT-1.0）.md`
+   §10 通篇写"八个原语"、§10.3 的七步序列里没有等待调用 ⇒ 需要勘误。那份文档在仓库里**未跟踪**
+   （`AGENTS.md` 明写"要修订它先问"），所以差异只记在计划 §6 与本节，等它入库时一并改。
+2. **P1 读数分格之后与历史不可直接比**（§12.4.1 规则 2：样本来源变了）。
+   `p4-tolerance.md` 的 8 % 阈值与"同构建地板"口径**不变**，只是多一类样本；
+   第一次分格的那份基线头上要写明这条。
+3. **`user/` 多一个 bin**：workspace 多产物，不触发"拆 crate 先问"。新产物有自己的 PKG 上限与 sha，
+   `hello.elf`（实测 **32,672 / 32,768 字节，余量 96**）与吃它 sha 的 6 行判据来路不变。
+   **还欠一次问**：`tools/aurora.py` 的 `ensure_image`/签名包链要不要认识第二个产物——本轮没改 `tools/`。
+
+**仍然开着的（裁决没覆盖，不算未决翻案）**：ADR-070 决策 3 的 **3a/3b**（VA 保留表全局一张还是每 AS 一张）
+不在 Q1–Q8 里，P1 开工前要单独问；`object_wait` 的 **signal 位布局与退出码宽度**（Q3 只裁了"由 signal 带出"）；
+Q2 的**具体数值**（等 workload 实测）；页表页归还（N7）的**现状基线还没量**。
+
+**本轮读数**：`check` **17/17 rc=0**（纯文档改动，复跑一遍确认门禁没被碰）；
+没跑 `test`/`bench`（无代码可跑）；`kernel/` 与 `tools/` **零改动**（`git status` 里只有 `docs/` 与 `BACKLOG.md`）。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。
