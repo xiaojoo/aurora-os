@@ -54,6 +54,28 @@ const SYS_ABI_INFO: u64 = 7;
 const SYS_VMO_CREATE: u64 = 12;
 const SYS_VMO_WRITE: u64 = 13;
 const SYS_ASPACE_MAP: u64 = 14;
+const SYS_HANDLE_DUP: u64 = 9;
+const SYS_PROCESS_CREATE: u64 = 11;
+const SYS_THREAD_CREATE: u64 = 15;
+const SYS_PROCESS_START: u64 = 16;
+/// StartupInfo 的布局常量：**用户侧独立声明**（与内核 `user.rs` 同一组数，靠读回对账）。
+const SI_MAGIC: u32 = 0x4155_524F;
+const ROLE_JOB: u32 = 3;
+/// 11 号返回的 Proc 句柄。
+pub const OFF_PROC_H: u64 = 96;
+/// 15 号返回的 Thread 句柄。
+pub const OFF_THREAD_H: u64 = 104;
+/// 16 号的返回值（0 = 成功）。
+pub const OFF_START_RET: u64 = 112;
+/// 子进程写结果那一页的 VMO 句柄（内核用它读走子进程写的四个数）。
+pub const OFF_DATA_H: u64 = 120;
+/// StartupInfo 那一页的 VMO 句柄（内核用它交叉核对回填值）。
+pub const OFF_SI_H: u64 = 128;
+/// 四次 14 号（铺进子 AS）的原始返回值，用来分辨"哪一页没铺成"。
+pub const OFF_M1: u64 = 136;
+pub const OFF_M2: u64 = 144;
+pub const OFF_M3: u64 = 152;
+pub const OFF_M4: u64 = 160;
 
 #[repr(C, align(4096))]
 struct Slots {
@@ -69,7 +91,15 @@ struct Slots {
     x_read: AtomicU64,
     wx_ret: AtomicU64,
     un_ret: AtomicU64,
-    _spare: AtomicU64,
+    proc_h: AtomicU64,
+    thread_h: AtomicU64,
+    start_ret: AtomicU64,
+    data_h: AtomicU64,
+    si_h: AtomicU64,
+    m1: AtomicU64,
+    m2: AtomicU64,
+    m3: AtomicU64,
+    m4: AtomicU64,
 }
 
 #[link_section = ".slots"]
@@ -86,7 +116,15 @@ static SLOTS: Slots = Slots {
     x_read: AtomicU64::new(0),
     wx_ret: AtomicU64::new(0),
     un_ret: AtomicU64::new(0),
-    _spare: AtomicU64::new(0),
+    proc_h: AtomicU64::new(0),
+    thread_h: AtomicU64::new(0),
+    start_ret: AtomicU64::new(0),
+    data_h: AtomicU64::new(0),
+    si_h: AtomicU64::new(0),
+    m1: AtomicU64::new(0),
+    m2: AtomicU64::new(0),
+    m3: AtomicU64::new(0),
+    m4: AtomicU64::new(0),
 };
 
 /// 写进对象的源缓冲。放 `.rodata`（加载器给 `USER_R`）：13 号只需要**读**用户缓冲，
@@ -155,73 +193,196 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
     }
 }
 
+/// 子进程那一页代码：**手写 ring3 桩**（本刀没有第三个用户产物，装载器要映的"段"就是它）。
+/// 它做四件事，每件都往数据页写一个数，让内核与探针各读各的：
+/// ①`[rdi]` 的 magic ②`[rdi+8]` 的 nhandles（**只有内核回填之后才是 4**）
+/// ③`handles[0].handle`（转移后的新值）④拿那个句柄真调一次 `dup`（9 号）并写回返回值。
+/// ④ 是 D2 的硬证人：`dup` 只有在**主人已经是子线程**时才成功，所以它证明转移真的生效了，
+/// 而不只是"表里有个看起来像句柄的数"。
+fn child_stub(data_va: u64) -> [u8; 49] {
+    let mut s: [u8; 49] = [
+        0x48, 0xBA, 0, 0, 0, 0, 0, 0, 0, 0, // movabs rdx, data_va
+        0x8B, 0x07,                         // mov eax, [rdi]        ; magic
+        0x89, 0x02,                         // mov [rdx], eax
+        0x8B, 0x47, 0x08,                   // mov eax, [rdi+8]      ; nhandles
+        0x89, 0x42, 0x04,                   // mov [rdx+4], eax
+        0x48, 0x8B, 0x47, 0x20,             // mov rax, [rdi+32]     ; handles[0].handle
+        0x48, 0x89, 0x42, 0x08,             // mov [rdx+8], rax
+        0x48, 0x89, 0xC7,                   // mov rdi, rax
+        0xBE, 0x01, 0x00, 0x00, 0x00,       // mov esi, 1            ; RIGHT_READ
+        0xB8, 0x09, 0x00, 0x00, 0x00,       // mov eax, 9            ; SYS_HANDLE_DUP
+        0xCD, 0x80,                         // int 0x80
+        0x48, 0x89, 0x42, 0x10,             // mov [rdx+16], rax
+        0xEB, 0xFE,                         // jmp .                 ; 停在这里等内核收场
+    ];
+    s[2..10].copy_from_slice(&data_va.to_le_bytes());
+    s
+}
+
+/// 装载器序列（ADR-075 决策 1/3/5/8 的**用户态**那一半）：
+/// 11 造进程 → 建四个 VMO（代码桩/栈/StartupInfo/数据）→ 14 用 `rdx = Proc 句柄` 铺进**子 AS**
+/// → 15 建线程（停住）→ 16 转移 + 回填 + 放行。每一步的返回值都写进 `.slots`。
+fn load_child(job_h: u64) {
+    // SAFETY: 以下都是本程序自己的系统调用，号与参数照 ABI 文档（§4.4c）
+    unsafe {
+        let proc_h = sys4(SYS_PROCESS_CREATE, job_h, 0, 0, 0);
+        put(OFF_PROC_H, proc_h);
+        if (proc_h as i64) <= 0 {
+            return;
+        }
+        // **只建三个对象、只铺三次**：栈与数据共用一张 RW 页。
+        // 这不是省事，是容量账：装载器自己已占 5 格（3 段 + 用户栈 + spawn_user 的内核栈），
+        // `MAX_OWNED = 8` ⇒ 只剩 3 格。四页各铺一次会在第二页上撞 `-6`（本刀实测过），
+        // 而那条容量账写着"实测 6/8、余量 ≥ 2"，不该为了用例去改它。
+        // 桩不压栈（`int 0x80` 从 ring3 进来走 TSS 的内核栈），所以栈与数据同页不冲突：
+        // 数据写在页首 24 字节，栈顶取页尾 -16。
+        let code = sys4(SYS_VMO_CREATE, 1, 0, 0, 0);
+        let si = sys4(SYS_VMO_CREATE, 1, 0, 0, 0);
+        let data = sys4(SYS_VMO_CREATE, 1, 0, 0, 0);
+        put(OFF_DATA_H, data);
+        put(OFF_SI_H, si);
+        if (code as i64) <= 0 || (si as i64) <= 0 || (data as i64) <= 0 {
+            return;
+        }
+        // 子 AS 是空的，四个 VA 随便挑（但仍按"请求 VA"那条路走，顺带再证一次不许静默改地址）
+        let cbase: u64 = 0x3_0000_0000;
+        let code_va = cbase;
+        let data_va = cbase + PAGE; // 同时当栈（见上面那段容量账）
+        let si_va = cbase + 2 * PAGE;
+        let stack_va = data_va;
+        let stub = child_stub(data_va);
+        let n = sys4(SYS_VMO_WRITE, code, 0, stub.as_ptr() as u64, stub.len() as u64);
+        if n != stub.len() as u64 {
+            put(OFF_START_RET, u64::MAX);
+            return;
+        }
+        // StartupInfo：调用方只写 magic/ABI/nhandles 与**自己那一条**转移（ROLE_JOB），
+        // 三个 SELF_* 由内核 grant 并回填（替它填会被 16 号拒）
+        let mut hdr = [0u8; 24];
+        hdr[0..4].copy_from_slice(&SI_MAGIC.to_le_bytes());
+        hdr[4..6].copy_from_slice(&0u16.to_le_bytes()); // abi_major
+        hdr[6..8].copy_from_slice(&8u16.to_le_bytes()); // abi_minor（与内核同轮声明）
+        hdr[8..12].copy_from_slice(&1u32.to_le_bytes()); // 我传一条
+        let w = sys4(SYS_VMO_WRITE, si, 0, hdr.as_ptr() as u64, hdr.len() as u64);
+        let mut d = [0u8; 16];
+        d[0..4].copy_from_slice(&ROLE_JOB.to_le_bytes());
+        d[8..16].copy_from_slice(&job_h.to_le_bytes());
+        let w2 = sys4(SYS_VMO_WRITE, si, 24, d.as_ptr() as u64, d.len() as u64);
+        if w != 24 || w2 != 16 {
+            put(OFF_START_RET, u64::MAX - 1);
+            return;
+        }
+        let r1 = sys4(SYS_ASPACE_MAP, code, 2, proc_h, code_va); // X
+        let r2 = sys4(SYS_ASPACE_MAP, data, 1, proc_h, data_va); // W（兼栈）
+        let r3 = sys4(SYS_ASPACE_MAP, si, 0, proc_h, si_va); // 只读
+        put(OFF_M1, r1);
+        put(OFF_M2, r2);
+        put(OFF_M3, r3);
+        put(OFF_M4, 0);
+        if r1 != code_va || r2 != data_va || r3 != si_va {
+            put(OFF_START_RET, u64::MAX - 2);
+            return;
+        }
+        let th = sys4(SYS_THREAD_CREATE, proc_h, code_va, stack_va + PAGE - 16, 0);
+        put(OFF_THREAD_H, th);
+        if (th as i64) <= 0 {
+            return;
+        }
+        let sr = sys4(SYS_PROCESS_START, proc_h, th, si, si_va);
+        put(OFF_START_RET, sr);
+    }
+}
+/// `mailbox` 是内核交进来的一页用户 VA：根 Job 由内核持有、只在这条用例里出示
+/// （使用者裁决 2026-11-10），所以句柄值由内核 grant 给本任务之后写进那一格，本程序轮询它。
+/// **首参走 rdi**（15/16 号那条 ABI 的同一个位置），不是全局变量。
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn _start(mailbox: u64) -> ! {
     put(0, SLOTS_MAGIC);
     // SAFETY: 以下都是本程序自己的系统调用，号与参数照 ABI 文档
     unsafe {
         let abi = sys4(SYS_ABI_INFO, 0, 0, 0, 0);
         put(OFF_ABI, abi);
-        let h = sys4(SYS_VMO_CREATE, 2, 0, 0, 0);
-        put(OFF_HANDLE, h);
-        let n = sys4(SYS_VMO_WRITE, h, 0, src_addr(), 8);
-        put(OFF_WRITTEN, n);
-        // rsi=1 ⇒ 可写、不可执行（P4b 的形状：执行权不给）
-        let va = sys4(SYS_ASPACE_MAP, h, 1, 0, 0);
-        put(OFF_MAP_VA, va);
-        let mut ok = 1u64;
-        // 只有真拿到一个 VA 才读；负数是错误码，解引用它就是自找 #PF
-        if (va as i64) > 0 {
-            let p = va as *const u8;
-            for i in 0..8usize {
-                // SAFETY: va 是 14 号返回的用户 VA，长度 8 字节落在它那一页里（对象 2 页）；
-                // 只读、不越界。这一格正是要证"ring3 真能翻译到这个地址"。
-                if unsafe { core::ptr::read_volatile(p.add(i)) } != PATTERN[i] {
-                    ok = 0;
+        // 实验格只在**非装载器**实例里跑：装载器实例的资源袋要留给子进程那三页
+        // （`MAX_OWNED = 8`，装载器自己占 5 格，再做实验就只剩 1 格 ⇒ 实测撞 `-6`）。
+        if mailbox == 0 {
+            let h = sys4(SYS_VMO_CREATE, 2, 0, 0, 0);
+            put(OFF_HANDLE, h);
+            let n = sys4(SYS_VMO_WRITE, h, 0, src_addr(), 8);
+            put(OFF_WRITTEN, n);
+            // rsi=1 ⇒ 可写、不可执行（P4b 的形状：执行权不给）
+            let va = sys4(SYS_ASPACE_MAP, h, 1, 0, 0);
+            put(OFF_MAP_VA, va);
+            let mut ok = 1u64;
+            // 只有真拿到一个 VA 才读；负数是错误码，解引用它就是自找 #PF
+            if (va as i64) > 0 {
+                let p = va as *const u8;
+                for i in 0..8usize {
+                    // SAFETY: va 是 14 号返回的用户 VA，长度 8 字节落在它那一页里（对象 2 页）；
+                    // 只读、不越界。这一格正是要证"ring3 真能翻译到这个地址"。
+                    if unsafe { core::ptr::read_volatile(p.add(i)) } != PATTERN[i] {
+                        ok = 0;
+                    }
+                }
+            } else {
+                ok = 0;
+            }
+            put(OFF_READBACK, ok);
+            // ---- 14 号的扩展形（ADR-075 决策 6）：rsi=bit1 ⇒ 只给执行位，r10 ⇒ 请求地址
+            // 候选步进 **64 页（256 KiB），但仍落在第一次映射那同一个 2 MiB 块里**：
+            // ① 不能贴着动态边界（M21 实测：紧贴的候选会被分配器"顺手"给出来，
+            //    "返回==请求"就变成运气证人，只有非对齐那一格抓得到变异）；
+            // ② 不能跨 2 MiB 块（另一轮实测：内核 AS 里新块要新建一张页表页，而它记 MOD_BOOT、
+            //    **生命周期=内核**，于是"帧回基线"那格永久少一帧——那不是漏，是这条路径的固有代价）。
+            // 允许全部失败（保留表今天还可能被别的用例占着），但成功那一次必须读回一致。
+            let mut asked = 0u64;
+            let mut got = u64::MAX;
+            if ok == 1 {
+                for k in 1..=4u64 {
+                    let req = (va + k * 64 * PAGE) & !(PAGE - 1);
+                    let r = sys4(SYS_ASPACE_MAP, h, 2, 0, req);
+                    asked = req;
+                    got = r;
+                    if r == req {
+                        break;
+                    }
                 }
             }
-        } else {
-            ok = 0;
+            let mut x_read = 0u64;
+            if got == asked {
+                let p = asked as *const u8;
+                x_read = 1;
+                for i in 0..8usize {
+                    // SAFETY: asked 是 14 号按请求值返回的**本对象**映射（2 页），
+                    // 这里只读前 8 字节；只读、不越界。
+                    if unsafe { core::ptr::read_volatile(p.add(i)) } != PATTERN[i] {
+                        x_read = 0;
+                    }
+                }
+            }
+            put(OFF_X_REQ, asked);
+            put(OFF_X_RET, got);
+            put(OFF_X_READ, x_read);
+            // W+X 与非对齐都必须被拒成 -1（拿的是第一次成功的那个请求值）
+            put(OFF_WX_RET, sys4(SYS_ASPACE_MAP, h, 3, 0, asked));
+            put(OFF_UN_RET, sys4(SYS_ASPACE_MAP, h, 2, 0, asked + 8));
         }
-        put(OFF_READBACK, ok);
-        // ---- 14 号的扩展形（ADR-075 决策 6）：rsi=bit1 ⇒ 只给执行位，r10 ⇒ 请求地址
-        // 候选步进 **64 页（256 KiB），但仍落在第一次映射那同一个 2 MiB 块里**：
-        // ① 不能贴着动态边界（M21 实测：紧贴的候选会被分配器"顺手"给出来，
-        //    "返回==请求"就变成运气证人，只有非对齐那一格抓得到变异）；
-        // ② 不能跨 2 MiB 块（另一轮实测：内核 AS 里新块要新建一张页表页，而它记 MOD_BOOT、
-        //    **生命周期=内核**，于是"帧回基线"那格永久少一帧——那不是漏，是这条路径的固有代价）。
-        // 允许全部失败（保留表今天还可能被别的用例占着），但成功那一次必须读回一致。
-        let mut asked = 0u64;
-        let mut got = u64::MAX;
-        if ok == 1 {
-            for k in 1..=4u64 {
-                let req = (va + k * 64 * PAGE) & !(PAGE - 1);
-                let r = sys4(SYS_ASPACE_MAP, h, 2, 0, req);
-                asked = req;
-                got = r;
-                if r == req {
+        // 装载器那一半：等内核把 Job 句柄放进邮箱，然后真打 11/14/15/16
+        if mailbox != 0 {
+            let mut job_h = 0u64;
+            for _ in 0..4_000_000u32 {
+                // SAFETY: mailbox 是内核传进来的用户 VA，已映射且可读写；只读一个 u64。
+                // 轮询上限是硬的，读不到就放弃（不无限自旋）
+                let v = unsafe { core::ptr::read_volatile(mailbox as *const u64) };
+                if v != 0 {
+                    job_h = v;
                     break;
                 }
+                core::hint::spin_loop();
+            }
+            if job_h != 0 {
+                load_child(job_h);
             }
         }
-        let mut x_read = 0u64;
-        if got == asked {
-            let p = asked as *const u8;
-            x_read = 1;
-            for i in 0..8usize {
-                // SAFETY: asked 是 14 号按请求值返回的**本对象**映射（2 页），
-                // 这里只读前 8 字节；只读、不越界。
-                if unsafe { core::ptr::read_volatile(p.add(i)) } != PATTERN[i] {
-                    x_read = 0;
-                }
-            }
-        }
-        put(OFF_X_REQ, asked);
-        put(OFF_X_RET, got);
-        put(OFF_X_READ, x_read);
-        // W+X 与非对齐都必须被拒成 -1（拿的是第一次成功的那个请求值）
-        put(OFF_WX_RET, sys4(SYS_ASPACE_MAP, h, 3, 0, asked));
-        put(OFF_UN_RET, sys4(SYS_ASPACE_MAP, h, 2, 0, asked + 8));
         put(OFF_DONE, 1);
         // **故意不自己 exit**：退出即被 reap，映射与数据页当场解映射，内核用例就读不到槽了。
         // 由用例 terminate_task + 回收来收场，走的是同一条 reap/revoke_task 路径（句柄与 VMO 一样归还），

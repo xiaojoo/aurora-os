@@ -1,6 +1,6 @@
 # unsafe 逐处审计表（U1–U6）
 
-总计 376 处。U1 65 · U2 101 · U3 13 · U4 129 · U5 32 · U6 36
+总计 378 处。U1 65 · U2 101 · U3 13 · U4 129 · U5 34 · U6 36
 
 本表由 `tools/aurora.py` 的 `unsafe_sites()` 从源码逐处生成，**不是手写的**。
 机器可读的权威来源是 `docs/security/unsafe-whitelist.toml` 的 `[modules.*]` 段（模块×类别→处数），
@@ -13,7 +13,7 @@
 - **U2 页表、物理内存与 MMIO** — 101 处，分布在 11 个模块：acpi、arch/x86_64/apic、heap、hw、ktests/mm、limine、mm、pci、sched、user、vmo
 - **U3 DMA 与设备共享内存** — 13 处，分布在 2 个模块：driver、limine
 - **U4 并发共享状态与 UnsafeCell** — 129 处，分布在 20 个模块：acpi、ahci、arch/x86_64/apic、arch/x86_64/smp、arch/x86_64/trap、driver、hooks、irq、ktests/elf、ktests/fs、ktests/sign、main、mm、pci、proc、sched、sync、user、virtio、vmo
-- **U5 用户指针与地址空间访问** — 32 处，分布在 3 个模块：user、user/hello、user/probe
+- **U5 用户指针与地址空间访问** — 34 处，分布在 3 个模块：user、user/hello、user/probe
 - **U6 诊断路径的有限现场读取** — 36 处，分布在 9 个模块：crash、ktest、ktests/acpi、ktests/crash、ktests/fs、ktests/heap、ktests/mm、ktests/sched、ktests/user
 
 ## 口径
@@ -826,25 +826,29 @@
 
 ### user/probe
 
-- `user/probe/src/main.rs:103` [{] **U1** fn=`slots_base`
+- `user/probe/src/main.rs:141` [{] **U1** fn=`slots_base`
   > unsafe { core::arch::asm!("lea {}, [rip + {sym}]", out(reg) b, sym = sym SLOTS, options(nomem, nostack, preserves_flags));
-- `user/probe/src/main.rs:114` [{] **U1** fn=`src_addr`
+- `user/probe/src/main.rs:152` [{] **U1** fn=`src_addr`
   > unsafe { core::arch::asm!("lea {}, [rip + {sym}]", out(reg) b, sym = sym SRC, options(nomem, nostack, preserves_flags));
-- `user/probe/src/main.rs:124` [{] **U5** fn=`put`
+- `user/probe/src/main.rs:162` [{] **U5** fn=`put`
   > unsafe { let p = (slots_base() + off) as *const AtomicU64; (*p).store(v, Ordering::Release);
-- `user/probe/src/main.rs:131` [fn] **U1** fn=`sys4`
+- `user/probe/src/main.rs:169` [fn] **U1** fn=`sys4`
   > unsafe fn sys4(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 { let ret: u64; // SAFETY: 只有内核能处理这条中断；号走 rax、参数 rdi/rsi/rdx/r10、返回 rax。
-- `user/probe/src/main.rs:135` [{] **U1** fn=`sys4`
+- `user/probe/src/main.rs:173` [{] **U1** fn=`sys4`
   > unsafe { core::arch::asm!( "int 0x80",
-- `user/probe/src/main.rs:154` [{] **U1** fn=`panic`
+- `user/probe/src/main.rs:192` [{] **U1** fn=`panic`
   > unsafe { core::arch::asm!("2: jmp 2b", options(nomem, nostack, noreturn)) }; } }
-- `user/probe/src/main.rs:162` [{] **U5** fn=`_start`
+- `user/probe/src/main.rs:227` [{] **U5** fn=`load_child`
+  > unsafe { let proc_h = sys4(SYS_PROCESS_CREATE, job_h, 0, 0, 0); put(OFF_PROC_H, proc_h);
+- `user/probe/src/main.rs:302` [{] **U5** fn=`_start`
   > unsafe { let abi = sys4(SYS_ABI_INFO, 0, 0, 0, 0); put(OFF_ABI, abi);
-- `user/probe/src/main.rs:179` [{] **U5** fn=`_start`
+- `user/probe/src/main.rs:322` [{] **U5** fn=`_start`
   > if unsafe { core::ptr::read_volatile(p.add(i)) } != PATTERN[i] { ok = 0; }
-- `user/probe/src/main.rs:214` [{] **U5** fn=`_start`
+- `user/probe/src/main.rs:357` [{] **U5** fn=`_start`
   > if unsafe { core::ptr::read_volatile(p.add(i)) } != PATTERN[i] { x_read = 0; }
-- `user/probe/src/main.rs:233` [{] **U1** fn=`_start`
+- `user/probe/src/main.rs:375` [{] **U5** fn=`_start`
+  > let v = unsafe { core::ptr::read_volatile(mailbox as *const u64) }; if v != 0 { job_h = v;
+- `user/probe/src/main.rs:394` [{] **U1** fn=`_start`
   > unsafe { core::arch::asm!("2: jmp 2b", options(nomem, nostack, noreturn)) }; } }
 
 ### virtio

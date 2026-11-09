@@ -607,12 +607,23 @@ const PROBE_OFF_WX_RET: u64 = 80;
 #[cfg(feature = "handles")]
 const PROBE_OFF_UN_RET: u64 = 88;
 #[cfg(feature = "handles")]
+const PROBE_OFF_PROC_H: u64 = 96;
+#[cfg(feature = "handles")]
+const PROBE_OFF_THREAD_H: u64 = 104;
+#[cfg(feature = "handles")]
+const PROBE_OFF_START_RET: u64 = 112;
+#[cfg(feature = "handles")]
+const PROBE_OFF_DATA_H: u64 = 120;
+#[cfg(feature = "handles")]
+const PROBE_OFF_SI_H: u64 = 128;
+#[cfg(feature = "handles")]
 const PROBE_PATTERN: [u8; 8] = [0x5A, 0xA5, 1, 2, 3, 4, 5, 6];
-/// 探针这一版**至少**打几个调用：abi_info + create + write + map + 1 次扩展形 + 2 次被拒 = 7。
+/// 两个实例合计**至少**打几个调用：A（实验格）7 个 + B（装载器）13 个
+/// （abi_info、11、三次 create、三次 write、三次 map、15、16）+ 子进程那一次 dup = 21。
 /// 等的是"打完"而不是"开始打了"（与 `P7_CALLS` 同一条纪律）。候选最多试四组 ⇒
 /// 窗口尾部那段落地等待从 2M 提到 8M 周期。
 #[cfg(feature = "handles")]
-const PROBE_CALLS: u64 = 7;
+const PROBE_CALLS: u64 = 21;
 
 #[cfg(feature = "handles")]
 fn t_probe_ring3() -> bool {
@@ -640,6 +651,27 @@ fn t_probe_ring3() -> bool {
     sched::init_boot_task();
     sched::start_workers();
     user::clear_counters();
+    // 邮箱页：根 Job 由内核持有、只在这条用例里出示（使用者裁决），所以句柄值得由内核
+    // grant 给**探针任务自己**之后写进这一格 —— grant 需要它的 (gidx,id)，那要等 spawn 之后才知道，
+    // 于是用"首参传邮箱 VA + 探针轮询"把这条先后顺序解开（不是全局变量、不是后门）。
+    let mbox_va = match mm::alloc_user_va_range(1) {
+        Some(v) => v,
+        None => { crate::log_fatal!("probe: 邮箱 VA 发不出来"); return false; }
+    };
+    let mbox_frames = match mm::phys_alloc(0, mm::MOD_TEST) {
+        Ok(f) => f,
+        Err(_) => { crate::log_fatal!("probe: 邮箱帧拿不到"); return false; }
+    };
+    let mbox_map = match mm::PageFlags::new(true, false, true)
+        .ok().and_then(|fl| mm::map(mbox_va, mbox_frames, fl).ok()) {
+        Some(m) => m,
+        None => { crate::log_fatal!("probe: 邮箱页映不上"); return false; }
+    };
+    user::write_at(mbox_va.0, 0);
+    let job = match crate::proc::job_create(None, 2, 64) {
+        Ok(j) => j,
+        Err(e) => { crate::log_fatal!("probe: job_create {:?}", e); return false; }
+    };
     let t = match sched::spawn_user(loaded.entry, loaded.stack_top, 0, loaded.owned) {
         Ok(t) => t,
         Err(e) => { crate::log_fatal!("probe: spawn_user 失败 {:?}", e); return false; }
@@ -697,28 +729,147 @@ fn t_probe_ring3() -> bool {
         && x_read == 1;
     let wx_ok = wx_ret == user::E_INVALID;
     let un_ok = un_ret == user::E_INVALID;
-    let run_ok = magic_ok && abi_ok && handle_ok && write_ok && va_ok && readback == 1
-        && done == 1 && xform_ok && wx_ok && un_ok;
-    // 收场：终止任务 → 回收（reap 里 revoke_task 关句柄、句柄两段式还 VMO、资源袋还映射）
-    let rel0 = sched::reap_released();
+    // ---- P5c-3b：**第二个探针实例**当装载器（真打 11/14(rdx=Proc)/15/16）----
+    //
+    // 为什么必须另起一个实例而不是让同一个任务接着干：资源袋 `MAX_OWNED = 8`，
+    // 装载器自己已占 5 格（3 段 + 用户栈 + `spawn_user` 的内核栈），本子进程要 3 格
+    // （代码 RX / 数据兼栈 RW / StartupInfo 只读）⇒ 5+3=8 **刚好顶满**。
+    // 第一个实例已经用掉 2 格做 P5a/P5c-2 的实验映射（7 格），再铺就撞 `-6`（本刀实测过）。
+    // 那条容量账写着"实测 6/8、余量 ≥ 2"，**不该为了用例去改它**；
+    // 顶满这件事本身是 P7"映射归属改成进程级"的实测依据，记在 BACKLOG 里。
+    // **先把 A 收干净再装 B**：探针是 `ET_EXEC` 固定基址（0x100080000），
+    // 两个实例不能同时占那段 VA（实测第二份 load 直接"目标 VA 已被登记或已映射"）。
+    // A 的实验格上面已经读走，所以这里收掉它不影响判据。
+    let rel_a = sched::reap_released();
     let _ = sched::terminate_task(t);
-    let drained = sched::reap_released() > rel0 || crate::ktests::common::drain_reap();
+    let drained_a = sched::reap_released() > rel_a || crate::ktests::common::drain_reap();
+    let loaded2 = match user::load(PROBE_ELF) {
+        Ok(l) => l,
+        Err(e) => { crate::log_fatal!("probe2: 加载失败 —— {}", user::describe_load(e)); return false; }
+    };
+    let t2 = match sched::spawn_user(loaded2.entry, loaded2.stack_top, mbox_va.0, loaded2.owned) {
+        Ok(t) => t,
+        Err(e) => { crate::log_fatal!("probe2: spawn_user 失败 {:?}", e); return false; }
+    };
+    // 根 Job 由内核持有、只在这条用例里出示：grant 给**装载器任务自己**那两格，再写进邮箱
+    let jgen = crate::proc::job_gen(job).unwrap_or(0);
+    let hj = match sched::identity_of(t2)
+        .and_then(|ow| crate::handle::grant_job(ow, job, jgen,
+            crate::handle::RIGHT_READ | crate::handle::RIGHT_DUP
+            | crate::handle::RIGHT_CREATE | crate::handle::RIGHT_TRANSFER).ok()) {
+        Some(h) => h,
+        None => { crate::log_fatal!("probe2: grant Job 失败"); return false; }
+    };
+    user::write_at(mbox_va.0, hj.0);
+    let mut served2 = 0u64;
+    apic::timer_start().ok();
+    apic::with_interrupts(|| {
+        let t0 = tsc::now();
+        while user::served() < PROBE_CALLS && tsc::now().wrapping_sub(t0) < 600_000_000 {
+            tsc::spin(20_000);
+        }
+        served2 = user::served();
+        tsc::spin(16_000_000);
+        if !sched::wait_for_boot_task(300_000_000) {
+            crate::log_fatal!("probe2: 窗口收不了场");
+        }
+    });
+    apic::timer_stop().ok();
+    let slot2 = |off: u64| user::read_at(loaded2.data_va + off).unwrap_or(u64::MAX);
+    let proc_h = slot2(PROBE_OFF_PROC_H);
+    let thread_h = slot2(PROBE_OFF_THREAD_H);
+    let start_ret = slot2(PROBE_OFF_START_RET);
+    let data_h = slot2(PROBE_OFF_DATA_H);
+    let si_h = slot2(PROBE_OFF_SI_H);
+    crate::log_info!("probe2: 三次铺子 AS 的返回 = {:#x} {:#x} {:#x}（请求 0x300000000/1000/2000）",
+        slot2(136), slot2(144), slot2(152));
+    let loader_ok = crate::handle::Handle(proc_h).unpack().is_some()
+        && crate::handle::Handle(thread_h).unpack().is_some()
+        && start_ret == 0;
+    let probe_owner = sched::identity_of(t2).unwrap_or((usize::MAX, 0));
+    // 进程身份要在**收场之前**取走：terminate + reap 之后它的句柄就被撤销了
+    let (pid, _pgen) = match crate::handle::resolve(crate::handle::Handle(proc_h), probe_owner, 0) {
+        Ok((crate::handle::ObjRef::Proc { slot, gen }, _)) => (slot, gen),
+        _ => (u16::MAX, 0),
+    };
+    let (cg, _cid) = match crate::handle::resolve(crate::handle::Handle(thread_h), probe_owner, 0) {
+        Ok((crate::handle::ObjRef::Thread { gidx, id }, _)) => (gidx, id),
+        _ => (usize::MAX, 0),
+    };
+    // 子进程写出来的四个数（经 VMO 帧读，不碰用户页 ⇒ 与 SMAP 无关）
+    let mut child = [0u8; 24];
+    let child_read = crate::handle::vmo_of(crate::handle::Handle(data_h), probe_owner, crate::handle::RIGHT_READ)
+        .ok()
+        .and_then(|vid| crate::vmo::vmo_read(vid, 0, &mut child).ok())
+        .map(|n| n == 24)
+        .unwrap_or(false);
+    let rd32 = |b: usize| -> u32 {
+        let mut x = [0u8; 4];
+        x.copy_from_slice(&child[b..b + 4]);
+        u32::from_le_bytes(x)
+    };
+    let rd64 = |b: usize| -> u64 {
+        let mut x = [0u8; 8];
+        x.copy_from_slice(&child[b..b + 8]);
+        u64::from_le_bytes(x)
+    };
+    // 交叉核对：子进程读到的 nhandles 与句柄值，必须等于内核回填进那一页的东西
+    let mut si_area = [0u8; 40];
+    let si_read = crate::handle::vmo_of(crate::handle::Handle(si_h), probe_owner, crate::handle::RIGHT_READ)
+        .ok()
+        .and_then(|vid| crate::vmo::vmo_read(vid, 0, &mut si_area).ok())
+        .map(|n| n == 40)
+        .unwrap_or(false);
+    let si_n = u32::from_le_bytes([si_area[8], si_area[9], si_area[10], si_area[11]]);
+    let mut hb = [0u8; 8];
+    hb.copy_from_slice(&si_area[32..40]);
+    let si_h0 = u64::from_le_bytes(hb);
+    // D2 的硬证人：子进程拿转移来的句柄**真调了一次 dup**，返回值必须是形状合法的句柄。
+    // dup 只有在主人已经是子线程时才成功 ⇒ 它证明转移生效，而不只是"表里有个像句柄的数"。
+    let dup_ret = rd64(16);
+    let child_ok = child_read && si_read
+        && rd32(0) == crate::user::SI_MAGIC
+        && rd32(4) == 4 && si_n == 4
+        && rd64(8) == si_h0 && si_h0 != 0
+        && crate::handle::Handle(dup_ret).unpack().is_some();
+    let child_ran = cg != usize::MAX && sched::runs_of(cg) > 0;
+    let run_ok = magic_ok && abi_ok && handle_ok && write_ok && va_ok && readback == 1
+        && done == 1 && xform_ok && wx_ok && un_ok && loader_ok && child_ok && child_ran;
+    // 收场顺序（ADR-074 的契约）：**子线程先死** → 两个探针死 → reap 还映射与句柄 → 才销毁进程与 Job
+    let rel0 = sched::reap_released();
+    if cg != usize::MAX {
+        let _ = sched::terminate_task(cg);
+    }
+    let _ = sched::terminate_task(t2);
+    let drained = drained_a && (sched::reap_released() > rel0 || crate::ktests::common::drain_reap());
+    // 子线程被杀 ⇒ terminate_task 给进程记了收工（退出码 1）⇒ 走 reap 而不是 discard
+    let preaped = pid != u16::MAX && crate::proc::proc_reap(pid).is_ok();
+    let jdel = crate::proc::job_destroy(job).is_ok();
+    drop(mbox_map);
+    mm::release_va(mbox_va.0);
     let f1 = mm::free_frames();
     let va1 = mm::reservation_count();
-    let base_ok = drained && f1 == f0 && va1 == va0
-        && crate::handle::live() == lv0 && crate::vmo::vmo_count() == v0;
+    let base_ok = drained && preaped && jdel && f1 == f0 && va1 == va0
+        && crate::handle::live() == lv0 && crate::vmo::vmo_count() == v0
+        && crate::proc::proc_residual().0 == 0 && crate::proc::job_residual().0 == 0
+        && mm::aspace_count() == 0;
     crate::log_info!(
-        "probe(P5c-2): 魔数={} ABI位={} 句柄={} 写={} VA={} 自读回={} 生效位={:?} 内核读回={} 扩展形=(请求{:#x} 返回{:#x} 判据{} 读回{}) W+X拒={} 非对齐拒={} 收场=(drained{} free{}->{} va{}->{} live{}->{} vmo{}->{}) served={}",
+        "probe(P5c-3b): 魔数={} ABI位={} 句柄={} 写={} VA={} 自读回={} 生效位={:?} 内核读回={} 扩展形=(请求{:#x} 返回{:#x} 判据{} 读回{}) W+X拒={} 非对齐拒={} 装载器=(proc{} thread{} ret16={}) 子进程=(读回{} magic={:#x} nhandles{}/{} 句柄{:#x}/{:#x} dup{:#x} 跑过{}) 收场=(drained{} reap{} jdel{} free{}->{} va{}->{} live{}->{} vmo{}->{}) served={}/{}",
         magic_ok, abi_ok, handle_ok, write_ok, va_ok, readback == 1, eff, kernel_read,
         x_req, x_ret, xform_ok, x_read, wx_ok, un_ok,
-        drained, f0, f1, va0, va1, lv0, crate::handle::live(), v0, crate::vmo::vmo_count(), served);
+        crate::handle::Handle(proc_h).unpack().is_some(), crate::handle::Handle(thread_h).unpack().is_some(),
+        start_ret, child_read, rd32(0), rd32(4), si_n, rd64(8), si_h0, dup_ret, child_ran,
+        drained, preaped, jdel, f0, f1, va0, va1, lv0, crate::handle::live(), v0,
+        crate::vmo::vmo_count(), served, served2);
     let ok = run_ok && eff_ok && kernel_read && base_ok;
     if !ok {
         crate::log_fatal!(
-            "probe: 判据不成立 跑={} 生效位={} 内核读回={} 收场={} 原始=[magic={:#x} abi={:#x} h={:#x} n={} va={:#x} rb={} done={}]",
-            run_ok, eff_ok, kernel_read, base_ok, magic, abi, h, n, mva, readback, done);
+            "probe: 判据不成立 跑={} 生效位={} 内核读回={} 装载器={} 子进程={} 跑过={} 收场={} 原始=[magic={:#x} abi={:#x} h={:#x} n={} va={:#x} rb={} done={} proc={:#x} th={:#x} ret16={:#x}]",
+            run_ok, eff_ok, kernel_read, loader_ok, child_ok, child_ran, base_ok,
+            magic, abi, h, n, mva, readback, done, proc_h, thread_h, start_ret);
     }
     ok
 }
+
 #[cfg(feature = "handles")]
 crate::ktest!(KT_PROBE_RING3, t_probe_ring3);
