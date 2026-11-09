@@ -5723,6 +5723,52 @@ P3 为了让等待方不依赖 tick，把工人收尾写成 `loop { yield_now() 
 4. 挂核外仪器的矩阵行对"用例每圈发一条中断"极其敏感（本轮 120 s 预算被烧穿）。
    以后新增用例若要在等待环里让出，先想清楚那一行的日志量。
 
+## 154. P5 开工前那一问：签名链能不能带第二个产物（2026-11-09，只读确认 + 使用者裁决，代码零改动）
+
+**结论：签名链今天不支持第二个产物；但 P5 不必走它。** 裁决两条：①第二产物**不进签名链**，
+走"第二个内嵌夹具"；②新产物暴露的**两个门禁盲区同轮补上**。
+
+**签名链是"单载荷、单包、固定 LBA"（格式层无关内容，接线层写死）**：
+- `tools/esp_image.py:258-269` `pkg_build(payload)` 签任意 ≤32768 字节 ⇒ **格式与密码层支持**第二份载荷。
+- `tools/esp_image.py:295-302` `package_payload()` 写死读 `kernel/fixtures/hello.elf`；
+  `:739` `seed_package(img, package_payload())` 一次镜像只种一个包；`:232` `PKG_START_LBA` 只有一个槽。
+- 内核侧同数：`kernel/src/sign.rs:151-155`（`PKG_PAYLOAD_BYTES=32768`、`PKG_START_LBA=67_664`）；
+  `kernel/src/ktests/sign.rs:114/133-135` 从那个 LBA 读整包，并把载荷与 `HELLO_ELF`（内嵌夹具）对摘要。
+- 容量实测：`kernel/fixtures/hello.elf` = **32,672 字节 / 上限 32,768，余 96** ⇒ **一个包装不下两份**。
+- 宿主机对账也写死单一对象：`tools/aurora.py:3559-3566`（`check_sig_package` 比 hello.elf 的长度与摘要）。
+⇒ 真要签第二份，只有"第二个包 + 第二个 LBA"（格式不动，但 tools/kernel/门禁三处同轮改）
+或"改包格式 + 抬上限"（代价最大）。**两条都没选**。
+
+**为什么 P5 可以绕开**：签名包签的是内嵌夹具那份字节，它的角色是"两份独立实现验同一个包"，
+**不是安全启动**（验签接启动路径仍是开着的里程碑缺口）。第二产物走第二个 `include_bytes!` 夹具即可：
+- `tools/aurora.py:1473-1496` `ensure_image` 的新鲜度只看**内核 ELF 的 sha**；夹具编进内核 ⇒
+  夹具一变内核 sha 就变 ⇒ 镜像自动重造。**这一条今天就支持，不用改。**
+- 要改的是 `tools/aurora.py:110-137`：`USER_PKG`/`USER_ELF`/`FIXTURE`/`USER_RUSTFLAGS` 是**单值常量**，
+  `do_build_user()` 写死 `-p aurora-user-hello`、`user/hello/link.ld`、一个夹具路径；
+  `do_build()`（`:140-144`）每次都调它 ⇒ 第二产物要挂进同一条构建入口（复制第二套或改表驱动）。
+  **这是 W3 第一次动 `tools/`**（P1–P4 都是零改动）。
+
+**同轮要补的两个门禁盲区（使用者裁决）**：
+- `tools/aurora.py:2244-2246` `_unsafe_roots()` 只扫 `kernel/src` 与 `user/hello/src`；
+  `:2316-2321` 模块命名写死 `user/hello/` ⇒ 新产物的 unsafe **不会被普查**。
+- `tools/aurora.py:2205-2213` `check_lints_wired` 只扫 `kernel/Cargo.toml` 与 `crates/*`（今天没有 crates/）
+  ⇒ 新产物的 `[lints] workspace = true` **不会被查**。
+- 补法：两处都改成"按 `cargo metadata` 的成员集扫"，模块命名按包内相对路径生成。
+  代价：普查会把 `user/hello` 已有的 unsafe 重新算进来 ⇒ 白名单与 `unsafe-census.md` 要同轮更新
+  （今天 `user/hello` 登记 U1 12 / U5 22，重算之后总数会变，这条要按"改规则连登记一起改"的口径走）。
+
+**新增 workspace 成员的同轮登记面**：根 `Cargo.toml` 的 `members`（今天 `["kernel", "user/hello"]`）、
+`docs/architecture/crates.toml` 的 `crate.<name>`（`check-crates` 双向对账，`aurora.py:2993-3012`）、
+`license.pending.<name>` 带理由（`check-sbom`，`:3640-3677`）、重跑 `release` 生成 `docs/release/sbom.json`。
+
+**明确不走的那条路**：往两块 FAT32 真卷里加第二个文件。那会改 `.img.zz` 的字节 ⇒
+`FAT_EXPECT` 指纹（`aurora.py:2297-2300`）与内核里那批照卷量的写死期望数全部要重算，矩阵 34–39 行连带；
+而 `tools/patch_fat32_file.py` 只能就地替换**已存在**的根目录 8.3 项，不能新增文件（本机也没有 mtools）。
+
+**本轮做了什么/没做什么**：只读调查 + 两条裁决入档（本文与 §3 的 P5、§6 第 3 条已改写）。
+`tools/`、`kernel/`、门禁登记面**一行未改**；没有跑 build/test/bench（无代码可跑）。
+P5 开工时按本文的清单动手，第一件事是把两个盲区补上并让 `check` 重新绿。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。
