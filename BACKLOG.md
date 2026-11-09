@@ -5749,13 +5749,19 @@ P3 为了让等待方不依赖 tick，把工人收尾写成 `loop { yield_now() 
   **这是 W3 第一次动 `tools/`**（P1–P4 都是零改动）。
 
 **同轮要补的两个门禁盲区（使用者裁决）**：
-- `tools/aurora.py:2244-2246` `_unsafe_roots()` 只扫 `kernel/src` 与 `user/hello/src`；
-  `:2316-2321` 模块命名写死 `user/hello/` ⇒ 新产物的 unsafe **不会被普查**。
+- `tools/aurora.py:2244-2246` `_unsafe_roots()` 写死两个根：`kernel/src` 与 `user/hello/src`。
+  **勘误（本条第一版写错了）**：它今天**已经**扫 `user/hello`，白名单与审计表里也确有
+  `[modules."user/hello"] U1 = 12 / U5 = 22`（`unsafe-whitelist.toml:203`、`unsafe-census.md:725`）。
+  盲区只对**新增的那个包**：它不在这两个根里 ⇒ 它的 unsafe 一处都不会被普查；
+  而 `:2316-2321` 的模块命名只认 `user/hello/` 前缀，别的包会走
+  `f.relative_to(ROOT/"kernel"/"src")` 那条分支 ⇒ 新包的文件会被算成内核模块（或因不在该目录下而报错）。
 - `tools/aurora.py:2205-2213` `check_lints_wired` 只扫 `kernel/Cargo.toml` 与 `crates/*`（今天没有 crates/）
-  ⇒ 新产物的 `[lints] workspace = true` **不会被查**。
-- 补法：两处都改成"按 `cargo metadata` 的成员集扫"，模块命名按包内相对路径生成。
-  代价：普查会把 `user/hello` 已有的 unsafe 重新算进来 ⇒ 白名单与 `unsafe-census.md` 要同轮更新
-  （今天 `user/hello` 登记 U1 12 / U5 22，重算之后总数会变，这条要按"改规则连登记一起改"的口径走）。
+  ⇒ 新产物的 `[lints] workspace = true` **不会被查**。注意 `user/hello/Cargo.toml:15-16` 其实**已经**接了线，
+  只是这道门从来没查过它 ⇒ 盲区是"门不扫"，不是"没接线"。
+- 补法：两处都改成"按 `cargo metadata` 的成员集扫"，模块命名按包内相对路径生成（去掉写死的前缀分支）。
+  代价：**不是**"把 user/hello 重新算进来"（它本来就在账上，总数不会因它而变）——
+  变的是**新产物自己那些 unsafe**：新包要按类别登记进 `[modules."<新包>"]` 与审计表，
+  总数与分类汇总行同轮更新（"改规则连登记一起改"的口径）。`user/hello` 那 34 处一格不动。
 
 **新增 workspace 成员的同轮登记面**：根 `Cargo.toml` 的 `members`（今天 `["kernel", "user/hello"]`）、
 `docs/architecture/crates.toml` 的 `crate.<name>`（`check-crates` 双向对账，`aurora.py:2993-3012`）、
