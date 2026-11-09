@@ -45,11 +45,11 @@ expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe
 # 2026-11-07 P7：hello 加了 syscall3（U1 两处）与 ring3 句柄读/close（U5 三处）。
 
 [unsafe-census]
-total = 340
+total = 355
 U1 = 59
-U2 = 84
+U2 = 97
 U3 = 13
-U4 = 125
+U4 = 127
 U5 = 28
 U6 = 31
 
@@ -156,7 +156,11 @@ U1 = 5
 # P4（ADR-066）+6：phys_of/leaf_value 只读遍历（前提同 is_mapped：写者全在 VMM 内）；
 # split_huge 走 PD 项、读旧大页项、填 512 叶子（PT 页来自 new_table_frame、尚未挂进 PD，
 # 无并发读者）、单次对齐写发布 PD 项。全部持 VMM(20)，指针经 HHDM 可达自建表。
-U2 = 43
+# P4a（ADR-074）+10：walk_leaf_in 的遍历（根表由调用方给，仍是自建表经 HHDM）、
+# set_leaf_in 读/写叶子、aspace_map 的冲突预查与回滚清叶子、AspaceMapping::drop 清叶子、
+# aspace_leaf 只读对照、new_table_frame_in 的清零。前提与既有 walk_leaf 逐字相同：
+# va 规范、根是有效 PML4、持 VMM(20)；新增的只是"根可以是别的 AS"与"表页记进那个 AS 的清单"。
+U2 = 53
 # P5（ADR-067）+2：LazyCell 的 Sync（互斥由 VMM 提供，载荷全 Copy）与 lazy_items 取表。
 # 白名单理由：表读写全部在 VMM(20) 内（demand_zero_try 的锁外窗口只碰 phys_alloc/map 自己
 # 的锁序），无跨锁别名逃逸。demand_zero_try 的分配即清零 write_bytes 记在上面的 U2（37→38）。
@@ -202,3 +206,16 @@ U5 = 22
 
 [modules."virtio"]
 U4 = 10
+
+[modules."vmo"]
+# W3 P4（ADR-074）：VMO 对象表。指针来源有两类——
+# ①本模块静态 `VmoCell(UnsafeCell<VmoTable>)` 的 `get()`（U4 两处：Sync 论证 + tbl()），
+#   地址范围固定在这一个静态对象内，对齐由编译器保证，生命周期 'static，
+#   并发规则：表结构与三本计数全在 VMM(20) 内读写，锁外不碰；
+# ②帧的 HHDM 别名（U2 三处：create 清零、write、read），物理地址来自表里登记的帧号，
+#   那些帧在 refs>0 期间不会被归还（归还只在 unref 到 0 时发生，且先在锁内清表项），
+#   范围逐次不超过一页（k <= PAGE - po），对齐按字节，上下文 KERNEL 且持 VMM，
+#   重叠拷贝用 memmove 语义（调用方的缓冲可能就映射在这个对象里）。
+#   不变量由 `unsafe impl Sync for VmoCell` 上面那段论证与 vmo_write/vmo_read 的长度检查保证。
+U2 = 3
+U4 = 2

@@ -108,6 +108,16 @@ pub struct FileObj {
     pub cursor: FileCursor,
 }
 
+/// 表里存的**对象引用**，全 Copy（ADR-074 决策 1）。
+/// 文件对象是值（port + 游标）；VMO 只存槽号，**本体在 `vmo.rs` 的表里、由 VMM(20) 保护**。
+/// 这样 `close`/`revoke` 就不必在 HANDLE(35) 锁内丢一个持帧对象（那会是 35→20 的反向嵌套）：
+/// 锁内取走引用、放锁之后才 `vmo::vmo_unref`。
+#[derive(Clone, Copy)]
+pub enum ObjRef {
+    File(FileObj),
+    Vmo { slot: u8 },
+}
+
 #[derive(Clone, Copy)]
 struct Entry {
     /// 该槽**最近发过**的世代；0 = 从未分配。释放时保留，下一次 grant 在它上面 +1。
@@ -116,7 +126,7 @@ struct Entry {
     owner_gidx: u16,
     owner_id: u32,
     rights: u32,
-    obj: Option<FileObj>,
+    obj: Option<ObjRef>,
 }
 
 const EMPTY: Entry = Entry {
@@ -190,11 +200,8 @@ fn check(t: &mut Table, h: Handle, owner: (usize, u32), need: u32) -> Result<usi
     Ok(slot as usize)
 }
 
-/// 给一次打开好的文件发句柄。`cursor` 由调用方先 `mount`/`open_cursor` 得到——
-/// 表里存的是**值**（C1：`port + Bpb + FileStat + 游标`），不存 `Volume` 的借用。
-pub fn grant_file(owner: (usize, u32), port: u8, cursor: FileCursor, rights: u32) -> Result<Handle, HErr> {
-    let mut g = TABLE.lock();
-    let t = g.get();
+/// 占一格并提交（**锁内**）。调用方已经在锁外给对象加好了它该有的那份引用。
+fn insert(t: &mut Table, owner: (usize, u32), rights: u32, obj: ObjRef) -> Result<Handle, HErr> {
     let Some(slot) = t.slots.iter().position(|e| !e.used) else {
         t.c.exhausted += 1;
         return Err(HErr::Exhausted);
@@ -206,7 +213,7 @@ pub fn grant_file(owner: (usize, u32), port: u8, cursor: FileCursor, rights: u32
         owner_gidx: owner.0 as u16,
         owner_id: owner.1,
         rights,
-            obj: Some(FileObj { port, cursor }),
+        obj: Some(obj),
     };
     t.c.grants += 1;
     let live = t.live();
@@ -214,6 +221,28 @@ pub fn grant_file(owner: (usize, u32), port: u8, cursor: FileCursor, rights: u32
         t.c.live_peak = live;
     }
     Ok(Handle::pack(slot as u16, next))
+}
+
+/// 给一次打开好的文件发句柄。`cursor` 由调用方先 `mount`/`open_cursor` 得到——
+/// 表里存的是**值**（C1：`port + Bpb + FileStat + 游标`），不存 `Volume` 的借用。
+pub fn grant_file(owner: (usize, u32), port: u8, cursor: FileCursor, rights: u32) -> Result<Handle, HErr> {
+    let mut g = TABLE.lock();
+    insert(g.get(), owner, rights, ObjRef::File(FileObj { port, cursor }))
+}
+
+/// 给一个 VMO 发句柄（ADR-074 决策 1）。**引用在锁外加**（VMO 表那边取 VMM），
+/// 占槽失败就在锁外退回那份引用 ⇒ HANDLE(35) 锁内一次 mm 调用都没有。
+/// 调用方自己那份引用不受影响：要转移所有权就在拿到句柄之后自己 `vmo_unref`。
+pub fn grant_vmo(owner: (usize, u32), id: crate::vmo::VmoId, rights: u32) -> Result<Handle, HErr> {
+    crate::vmo::vmo_ref(id).map_err(|_| HErr::NoSuch)?;
+    let r = {
+        let mut g = TABLE.lock();
+        insert(g.get(), owner, rights, ObjRef::Vmo { slot: id.slot() })
+    };
+    if r.is_err() {
+        crate::vmo::vmo_unref(id);
+    }
+    r
 }
 
 /// 每槽独立；1..=GEN_MAX，跳过 0；到顶**回绕到 1**（设计 §9 G：承诺是计数上界，
@@ -226,51 +255,68 @@ fn next_gen(prev: u64) -> u64 {
     }
 }
 
+/// 关句柄。**两段式**（ADR-074 决策 1）：锁内校验 + 取走引用 + 清槽，
+/// **放掉 HANDLE(35) 之后**才 `vmo_unref`（它要取 VMM(20)，在锁内调就是 35→20 的反向嵌套）。
+/// 所以"句柄已失效"与"帧已归还"是两个时刻：判据要读 unref 之后的台账。
 pub fn close(h: Handle, owner: (usize, u32)) -> Result<(), HErr> {
-    let mut g = TABLE.lock();
-    let t = g.get();
-    let slot = check(t, h, owner, 0)?;
-    let e = &mut t.slots[slot];
-    e.used = false;
-    e.obj = None;
-    e.rights = 0;
-    // gen 保留：这一格下一回 grant 在它上面 +1（旧句柄因此变成 Stale）。
-    t.c.closes += 1;
+    let obj = {
+        let mut g = TABLE.lock();
+        let t = g.get();
+        let slot = check(t, h, owner, 0)?;
+        let e = &mut t.slots[slot];
+        let obj = e.obj.take();
+        e.used = false;
+        e.rights = 0;
+        // gen 保留：这一格下一回 grant 在它上面 +1（旧句柄因此变成 Stale）。
+        t.c.closes += 1;
+        obj
+    };
+    if let Some(ObjRef::Vmo { slot }) = obj {
+        crate::vmo::vmo_unref(crate::vmo::VmoId::from_slot(slot));
+    }
     Ok(())
 }
 
 /// `dup` = 新占一格、同对象、权限收窄。第一版**没有** `DUP` 就没有 `dup`；
 /// `new ⊄ old` 一律拒（扩权是这一格存在的理由）。
+///
+/// 对象语义分两种：文件对象复制的是**游标值**（两个句柄不共享读取位置，共享偏移要一张带
+/// 引用计数的对象表，设计 §3.3）；VMO 共享的是**同一份帧**（靠 `vmo_ref`，ADR-074 的 C3 判据）。
+/// VMO 那份引用必须在锁外加，所以这里是"取票（锁内）→ 加引用（锁外）→ 提交（锁内）"三段，
+/// 与 `begin_read`/`finish` 同一形状；提交失败就在锁外退回引用。
 pub fn dup(h: Handle, owner: (usize, u32), new_rights: u32) -> Result<Handle, HErr> {
-    let mut g = TABLE.lock();
-    let t = g.get();
-    let slot = check(t, h, owner, RIGHT_DUP)?;
-    let old = t.slots[slot];
-    if new_rights & !old.rights != 0 {
-        t.c.denied += 1;
-        return Err(HErr::Denied);
-    }
-    let Some(nslot) = t.slots.iter().position(|e| !e.used) else {
-        t.c.exhausted += 1;
-        return Err(HErr::Exhausted);
+    let obj = {
+        let mut g = TABLE.lock();
+        let t = g.get();
+        let slot = check(t, h, owner, RIGHT_DUP)?;
+        let old = t.slots[slot];
+        if new_rights & !old.rights != 0 {
+            t.c.denied += 1;
+            return Err(HErr::Denied);
+        }
+        match old.obj {
+            Some(o) => o,
+            None => {
+                t.c.no_such += 1;
+                return Err(HErr::NoSuch);
+            }
+        }
     };
-    let next = next_gen(t.slots[nslot].gen);
-    t.slots[nslot] = Entry {
-        gen: next,
-        used: true,
-        owner_gidx: owner.0 as u16,
-        owner_id: owner.1,
-        rights: new_rights,
-            // 对象本体与游标随表项复制：第一版没有对象表，两个句柄**不共享读取位置**。
-        // 共享偏移要一张带引用计数的对象表，那是接缓冲区对象时一起做的事（设计 §3.3）。
-        obj: old.obj,
-    };
-    t.c.grants += 1;
-    let live = t.live();
-    if live > t.c.live_peak {
-        t.c.live_peak = live;
+    if let ObjRef::Vmo { slot } = obj {
+        if crate::vmo::vmo_ref(crate::vmo::VmoId::from_slot(slot)).is_err() {
+            return Err(HErr::NoSuch);
+        }
     }
-    Ok(Handle::pack(nslot as u16, next))
+    let r = {
+        let mut g = TABLE.lock();
+        insert(g.get(), owner, new_rights, obj)
+    };
+    if r.is_err() {
+        if let ObjRef::Vmo { slot } = obj {
+            crate::vmo::vmo_unref(crate::vmo::VmoId::from_slot(slot));
+        }
+    }
+    r
 }
 
 /// 读票：锁内取走游标的副本，锁外读盘，锁内提交。中途任何失败都只是丢掉这张票——
@@ -305,11 +351,20 @@ pub fn begin_read(h: Handle, owner: (usize, u32)) -> Result<ReadTicket, HErr> {
     let t = g.get();
     let slot = check(t, h, owner, RIGHT_READ)?;
     let e = &t.slots[slot];
-    let Some(obj) = e.obj else {
-        t.c.no_such += 1;
-        return Err(HErr::NoSuch);
-    };
-    Ok(ReadTicket { slot: slot as u16, gen: e.gen, port: obj.port, cursor: obj.cursor })
+    match e.obj {
+        Some(ObjRef::File(f)) => {
+            Ok(ReadTicket { slot: slot as u16, gen: e.gen, port: f.port, cursor: f.cursor })
+        }
+        // 对象类型不支持文件读：这是类型/权限不符，不是"槽不存在"，两个计数器分开
+        Some(ObjRef::Vmo { .. }) => {
+            t.c.denied += 1;
+            Err(HErr::Denied)
+        }
+        None => {
+            t.c.no_such += 1;
+            Err(HErr::NoSuch)
+        }
+    }
 }
 
 /// 提交。表项必须仍是同一槽、同一世代——否则这次读的成果作废（返回 Stale）。
@@ -321,8 +376,8 @@ pub fn finish(ticket: ReadTicket, bytes: usize) -> Result<(), HErr> {
         t.c.stale += 1;
         return Err(HErr::Stale);
     }
-    if let Some(obj) = e.obj.as_mut() {
-        obj.cursor = ticket.cursor;
+    if let Some(ObjRef::File(f)) = e.obj.as_mut() {
+        f.cursor = ticket.cursor;
     }
     t.c.reads += 1;
     t.c.bytes += bytes as u64;
@@ -351,20 +406,34 @@ pub fn read_with(h: Handle, owner: (usize, u32), disk: &dyn Block, dst: &mut [u8
 }
 
 /// 任务退出撤销（`reap` 调用）：主人的两格都对上的表项全部清掉。
-/// 不取 mm、不释放页框——只读文件对象**不持有页框**（设计 §7）。
+/// **两段式**（ADR-074 决策 1）：锁内清槽并把 VMO 槽号抄出来，**放锁之后**逐个 `vmo_unref`。
+/// 文件对象仍然不持帧（设计 §7）；VMO 持帧，所以归还这一步必须发生在 HANDLE 锁之外。
+/// 调用点 `sched.rs:343` 也不在 RUNQ 锁内 ⇒ 这条路上没有"拿队列锁等跨 CPU 回执"的形状。
 pub fn revoke_task(gidx: usize, id: u32) -> usize {
-    let mut g = TABLE.lock();
-    let t = g.get();
-    let mut n = 0u32;
-    for e in t.slots.iter_mut() {
-        if e.used && e.owner_gidx as usize == gidx && e.owner_id == id {
-            e.used = false;
-            e.obj = None;
-            e.rights = 0;
-                    n += 1;
+    let mut vmos = [0u8; MAX_HANDLES];
+    let mut nv = 0usize;
+    let n = {
+        let mut g = TABLE.lock();
+        let t = g.get();
+        let mut n = 0u32;
+        for e in t.slots.iter_mut() {
+            if e.used && e.owner_gidx as usize == gidx && e.owner_id == id {
+                if let Some(ObjRef::Vmo { slot }) = e.obj.take() {
+                    vmos[nv] = slot;
+                    nv += 1;
+                }
+                e.used = false;
+                e.obj = None;
+                e.rights = 0;
+                n += 1;
+            }
         }
+        t.c.revoked += n;
+        n
+    };
+    for slot in vmos.iter().take(nv) {
+        crate::vmo::vmo_unref(crate::vmo::VmoId::from_slot(*slot));
     }
-    t.c.revoked += n;
     n as usize
 }
 
@@ -380,20 +449,42 @@ pub fn counters() -> Counters {
 
 #[cfg(feature = "fat32-probe")]
 pub fn preset_gen(slot: usize, gen: u64) {
-    let mut g = TABLE.lock();
-    let t = g.get();
-    if slot < MAX_HANDLES {
-        t.slots[slot].gen = gen & GEN_MAX;
-        t.slots[slot].used = false;
-        t.slots[slot].obj = None;
+    let obj = {
+        let mut g = TABLE.lock();
+        let t = g.get();
+        if slot < MAX_HANDLES {
+            t.slots[slot].gen = gen & GEN_MAX;
+            t.slots[slot].used = false;
+            t.slots[slot].obj.take()
+        } else {
+            None
+        }
+    };
+    if let Some(ObjRef::Vmo { slot }) = obj {
+        crate::vmo::vmo_unref(crate::vmo::VmoId::from_slot(slot));
     }
 }
 
 /// 只清槽，不清计数器：分段用例之间要清表，但"这一轮发生过几次拒绝"必须能累计到最后的日志。
 #[cfg(feature = "fat32-probe")]
 pub fn reset_for_test() {
-    let mut g = TABLE.lock();
-    g.get().slots = [EMPTY; MAX_HANDLES];
+    let mut vmos = [0u8; MAX_HANDLES];
+    let mut nv = 0usize;
+    {
+        let mut g = TABLE.lock();
+        let t = g.get();
+        for e in t.slots.iter_mut() {
+            if let Some(ObjRef::Vmo { slot }) = e.obj.take() {
+                vmos[nv] = slot;
+                nv += 1;
+            }
+        }
+        t.slots = [EMPTY; MAX_HANDLES];
+    }
+    // 清表也要把 VMO 的引用还掉，否则用例之间会漏帧（锁外还，同 close/revoke）
+    for slot in vmos.iter().take(nv) {
+        crate::vmo::vmo_unref(crate::vmo::VmoId::from_slot(*slot));
+    }
 }
 
 #[cfg(feature = "fat32-probe")]

@@ -1272,3 +1272,223 @@ fn t_demand_zero() -> bool {
 #[cfg(not(any(feature = "fault-resched-ipi", feature = "ahci-scratch")))]
 ktest!(KT_DEMAND_ZERO, t_demand_zero);
 
+
+// ---- ADR-074（W3 P4a）VMO / aspace_map / 句柄表两段式释放 ----
+//
+// 三条用例分工：`t_vmo_object` 管对象本身（写读回、越界、清零、还帧）；
+// `t_aspace_map_vmo` 管"往指定 AS 铺"（双 AS 同 VA、W^X、高半区、互不影响、表页归还、shootdown 收窄）；
+// `t_handle_vmo_release` 管句柄表那条裁决（dup 共享帧、close/revoke 两段式、锁序零违规）。
+// 变异：M1 去掉长度检查 ⇒ 越界格红；M2 unref 不还帧 ⇒ 基线格红；M3 去掉引用计数 ⇒ dup 格红；
+// M4 把 unref 搬进 HANDLE 锁内 ⇒ 锁序违规当场 L4(39)；M5 遍历仍用内核根 ⇒ 双 AS 格红；
+// M6 去掉高半区闸 ⇒ 内核半区被写（A1 的叶项对照红）。
+
+fn t_vmo_object() -> bool {
+    use crate::vmo;
+    let (c0, r0, b0) = vmo::counters();
+    if vmo::vmo_count() != 0 {
+        crate::log_fatal!("vmo: 前提失效，进来时已有 {} 个对象", vmo::vmo_count());
+        return false;
+    }
+    let f0 = mm::free_frames();
+    let id = match vmo::vmo_create(2) {
+        Ok(v) => v,
+        Err(e) => { crate::log_fatal!("vmo: create {:?}", e); return false; }
+    };
+    // ① 跨页写读回：offset = PAGE-3、长度 6 ⇒ 一条命令落在两页上
+    let src = [1u8, 2, 3, 4, 5, 6];
+    let w = vmo::vmo_write(id, mm::PAGE - 3, &src);
+    let mut back = [0u8; 6];
+    let r = vmo::vmo_read(id, mm::PAGE - 3, &mut back);
+    let io_ok = w == Ok(6) && r == Ok(6) && back == src;
+    // ② 越界三态：整段越界、offset+len 溢出、长度 0（都不许静默截断）
+    let big = [0u8; 8];
+    let oob = vmo::vmo_write(id, 2 * mm::PAGE - 3, &big);
+    let ovf = vmo::vmo_write(id, usize::MAX - 1, &big);
+    let zero = vmo::vmo_write(id, 0, &[]);
+    let bound_ok = oob == Err(vmo::VmoError::BadLength)
+        && ovf == Err(vmo::VmoError::BadLength)
+        && zero == Err(vmo::VmoError::BadLength);
+    // ③ 清零见证：没写过的地方读回全 0（分配器毒化过 0xA5，所以忘了清零会红在这一格）
+    let mut zb = [0xFFu8; 16];
+    let zeroed = vmo::vmo_read(id, mm::PAGE + 8, &mut zb) == Ok(16) && zb.iter().all(|&b| b == 0);
+    // ④ 最后一个引用消失 ⇒ 帧回基线、对象数归零、三本计数对得上
+    vmo::vmo_unref(id);
+    let f1 = mm::free_frames();
+    let (c1, r1, b1) = vmo::counters();
+    let base_ok = f1 == f0 && vmo::vmo_count() == 0 && c1 == c0 + 1 && r1 == r0 + 1 && b1 == b0 + 6;
+    crate::log_info!(
+        "vmo(P4): 写读={} 越界={} 清零={} 基线=(free{}->{} n{} created{}->{} released{}->{} bytes{}->{})",
+        io_ok, bound_ok, zeroed, f0, f1, vmo::vmo_count(), c0, c1, r0, r1, b0, b1);
+    let ok = io_ok && bound_ok && zeroed && base_ok;
+    if !ok {
+        crate::log_fatal!("vmo: 判据不成立 写读={} 越界={} 清零={} 基线={}", io_ok, bound_ok, zeroed, base_ok);
+    }
+    ok
+}
+ktest!(KT_VMO_OBJECT, t_vmo_object);
+
+fn t_aspace_map_vmo() -> bool {
+    use crate::vmo;
+    use crate::arch::x86_64::{cpu, smp};
+    // 收窄格要有另一颗在线 CPU 当证人（与 t_shootdown_masked 同一前提）
+    if smp::bringup().is_err() {
+        crate::log_fatal!("asmap: AP 起不来，收窄判据没有证人");
+        return false;
+    }
+    let me = cpu::self_slot();
+    let ap1 = match (0..cpu::MAX_CPUS).find(|&c| c != me && cpu::is_online(c)) {
+        Some(c) => c,
+        None => { crate::log_fatal!("asmap: 没有第二颗在线 CPU"); return false; }
+    };
+    if mm::aspace_count() != 0 {
+        crate::log_fatal!("asmap: 前提失效，进来时已有 {} 个 AS", mm::aspace_count());
+        return false;
+    }
+    let f0 = mm::free_frames();
+    let a1 = match mm::aspace_new() {
+        Some(h) => h,
+        None => { crate::log_fatal!("asmap: AS1 建不起来"); return false; }
+    };
+    let a2 = match mm::aspace_new() {
+        Some(h) => h,
+        None => { crate::log_fatal!("asmap: AS2 建不起来"); return false; }
+    };
+    let id = match vmo::vmo_create(1) {
+        Ok(v) => v,
+        Err(e) => { crate::log_fatal!("asmap: vmo {:?}", e); return false; }
+    };
+    let va = mm::VirtAddr(0x1_0000_0000); // 用户半区，两个新 AS 里都未映射
+    let flags = mm::PageFlags::USER_RW;
+
+    // ① 同一 VA 在两个 AS 里各自映射成功
+    let m1 = vmo::vmo_map(id, &a1, va, flags);
+    let m2 = vmo::vmo_map(id, &a2, va, flags);
+    let both_ok = m1.is_ok() && m2.is_ok();
+    // ② 同一棵树里重复 ⇒ AlreadyMapped（查的是那棵树，不是内核树）
+    let again = vmo::vmo_map(id, &a1, va, flags);
+    let tree_ok = matches!(again, Err(vmo::VmoError::Mm(mm::MmError::AlreadyMapped)));
+    // ③ W^X 在构造期就拒绝（aspace_map 收的是 PageFlags，根本收不到 W+X 的意图）
+    let wx_ok = mm::PageFlags::new(true, true, true) == Err(mm::MmError::WxViolation);
+    // ④ 高半区一律拒：那里的下层表与内核共享，写它就是改内核表
+    let hi = vmo::vmo_map(id, &a1, mm::VirtAddr(0xffff_8000_0000_0000), flags);
+    let hi_ok = matches!(hi, Err(vmo::VmoError::Mm(mm::MmError::KernelHalfFrozen)));
+    // ⑤ 第二台仪器：读两棵树的叶子，都指向同一个帧（不切 CR3、不碰用户页，与 SMAP 无关）
+    let l1 = mm::aspace_leaf(&a1, va);
+    let l2 = mm::aspace_leaf(&a2, va);
+    let leaf_ok = l1.is_some() && l1 == l2;
+    // ⑥ 互不影响的真正证人：丢掉 AS1 的映射之后，AS2 的同一 VA 还在
+    drop(m1);
+    let indep_ok = mm::aspace_leaf(&a1, va).is_none() && mm::aspace_leaf(&a2, va).is_some();
+    // ⑦ 收窄：把 AS2 登记到 AP1，丢它的映射 ⇒ 只有 AP1 收到回执（ADR-072 的第一个产品调用者）
+    let reg = mm::aspace_register_cpu(1, ap1);
+    let sd1 = mm::shootdown_stats();
+    drop(m2);
+    let sd2 = mm::shootdown_stats();
+    let narrowed_ok = reg.is_some()
+        && sd2.acks[ap1] == sd1.acks[ap1] + 1
+        && sd2.requests == sd1.requests + 1
+        && (0..cpu::MAX_CPUS).all(|c| c == ap1 || c == me || sd2.acks[c] == sd1.acks[c]);
+    // ⑧ 表页与帧都回基线（非内核 AS 按需建的下级表页记 MOD_AS_PT，销毁时归还）
+    drop(a1);
+    drop(a2);
+    vmo::vmo_unref(id);
+    let f1 = mm::free_frames();
+    let base_ok = f1 == f0 && mm::aspace_count() == 0 && vmo::vmo_count() == 0;
+    crate::log_info!(
+        "asmap(P4): 双AS={} 同树拒={} W^X={} 高半区拒={} 叶同帧={} 互不影响={} 收窄=(reg{} ack{}) 基线=(free{}->{} as{} vmo{})",
+        both_ok, tree_ok, wx_ok, hi_ok, leaf_ok, indep_ok, reg.is_some(),
+        sd2.acks[ap1] - sd1.acks[ap1], f0, f1, mm::aspace_count(), vmo::vmo_count());
+    let ok = both_ok && tree_ok && wx_ok && hi_ok && leaf_ok && indep_ok && narrowed_ok && base_ok;
+    if !ok {
+        crate::log_fatal!(
+            "asmap: 判据不成立 双AS={} 同树={} wx={} 高半区={} 叶={} 独立={} 收窄={} 基线={}",
+            both_ok, tree_ok, wx_ok, hi_ok, leaf_ok, indep_ok, narrowed_ok, base_ok);
+    }
+    ok
+}
+ktest!(KT_ASPACE_MAP_VMO, t_aspace_map_vmo);
+
+#[cfg(feature = "handles")]
+fn t_handle_vmo_release() -> bool {
+    use crate::{handle, sync, vmo};
+    // 合成主人（与 handle.rs 自己的用例同一手法，但取不同的两格，免得 revoke 互相清）
+    let owner: (usize, u32) = (6, 9001);
+    let lv0 = handle::live();
+    let f0 = mm::free_frames();
+    let ls0 = sync::stats();
+    if vmo::vmo_count() != 0 {
+        crate::log_fatal!("hvmo: 前提失效，进来时已有对象");
+        return false;
+    }
+    let rights = handle::RIGHT_READ | handle::RIGHT_WRITE | handle::RIGHT_DUP | handle::RIGHT_MAP;
+    let id = match vmo::vmo_create(1) {
+        Ok(v) => v,
+        Err(e) => { crate::log_fatal!("hvmo: create {:?}", e); return false; }
+    };
+    let pat = [7u8, 8, 9, 10];
+    if vmo::vmo_write(id, 0, &pat) != Ok(4) {
+        crate::log_fatal!("hvmo: 写不进对象");
+        return false;
+    }
+    let h1 = match handle::grant_vmo(owner, id, rights) {
+        Ok(h) => h,
+        Err(e) => { crate::log_fatal!("hvmo: grant {:?}", e); return false; }
+    };
+    // 创建者那一份交出去：现在句柄是唯一主人
+    vmo::vmo_unref(id);
+    let refs1 = vmo::vmo_refs(id) == Some(1);
+    // ① dup 共享同一份帧：引用数 +1，两个句柄都活着
+    let h2 = handle::dup(h1, owner, handle::RIGHT_READ | handle::RIGHT_WRITE);
+    let refs2 = vmo::vmo_refs(id) == Some(2);
+    let dup_ok = h2.is_ok() && refs1 && refs2;
+    // ② close 一个：帧还在、内容还读得到（没有引用计数的话第一次 close 就把帧还了）
+    let c1 = handle::close(h1, owner);
+    let mut b = [0u8; 4];
+    let alive = vmo::vmo_read(id, 0, &mut b) == Ok(4) && b == pat && vmo::vmo_refs(id) == Some(1);
+    // ③ 两个都 close 才还帧
+    let h2v = match h2 { Ok(h) => h, Err(_) => handle::Handle(0) };
+    let c2 = handle::close(h2v, owner);
+    let gone = vmo::vmo_refs(id).is_none() && vmo::vmo_count() == 0 && mm::free_frames() == f0;
+    let share_ok = dup_ok && c1.is_ok() && alive && c2.is_ok() && gone;
+    // ④ revoke 也走两段式：锁内清槽、锁外还帧
+    let id2 = match vmo::vmo_create(1) {
+        Ok(v) => v,
+        Err(e) => { crate::log_fatal!("hvmo: create2 {:?}", e); return false; }
+    };
+    let h3 = handle::grant_vmo(owner, id2, handle::RIGHT_READ);
+    vmo::vmo_unref(id2);
+    let rv = handle::revoke_task(owner.0, owner.1);
+    let revoke_ok = h3.is_ok() && rv == 1 && vmo::vmo_count() == 0 && mm::free_frames() == f0;
+    // ⑤ 类型不符：VMO 句柄走文件读 ⇒ Denied（不是 NoSuch，两个计数器分开）
+    let id3 = match vmo::vmo_create(1) {
+        Ok(v) => v,
+        Err(_) => { crate::log_fatal!("hvmo: create3 失败"); return false; }
+    };
+    let h4 = handle::grant_vmo(owner, id3, handle::RIGHT_READ);
+    let denied = match h4 {
+        Ok(h) => matches!(handle::begin_read(h, owner), Err(handle::HErr::Denied)),
+        Err(_) => false,
+    };
+    if let Ok(h) = h4 {
+        handle::close(h, owner).ok();
+    }
+    vmo::vmo_unref(id3);
+    // ⑥ 锁序零违规：这一格是"释放在锁外"那条裁决的正向证人（搬进锁内就是 35→20，当场 L4）
+    let ls1 = sync::stats();
+    let lock_ok = ls1.order_violations == ls0.order_violations && ls1.reentrant_hits == ls0.reentrant_hits;
+    let base_ok = handle::live() == lv0 && vmo::vmo_count() == 0 && mm::free_frames() == f0;
+    crate::log_info!(
+        "hvmo(P4): dup共享={} close一个还活着={} 两个都close才还={} revoke={} 类型拒={} 锁序=(viol{}->{}/reent{}->{}) 基线=(live{}->{} free{}->{})",
+        dup_ok, alive, gone, revoke_ok, denied,
+        ls0.order_violations, ls1.order_violations, ls0.reentrant_hits, ls1.reentrant_hits,
+        lv0, handle::live(), f0, mm::free_frames());
+    let ok = share_ok && revoke_ok && denied && lock_ok && base_ok;
+    if !ok {
+        crate::log_fatal!(
+            "hvmo: 判据不成立 共享={} revoke={} 类型={} 锁序={} 基线={}",
+            share_ok, revoke_ok, denied, lock_ok, base_ok);
+    }
+    ok
+}
+#[cfg(feature = "handles")]
+ktest!(KT_HANDLE_VMO_RELEASE, t_handle_vmo_release);

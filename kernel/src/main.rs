@@ -54,6 +54,7 @@ mod state_store;
 mod watchdog;
 mod tsc;
 mod virtio;
+mod vmo;
 
 use crate::arch::x86_64::{apic, cpu, cpuid, smp, trap};
 use core::cell::UnsafeCell;

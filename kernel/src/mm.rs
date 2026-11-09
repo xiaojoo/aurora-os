@@ -119,6 +119,8 @@ pub enum MmError {
     /// 已有非内核地址空间存在之后，再往**内核半区**铺新映射（ADR-070 决策 2 的冻结前置）。
     /// 这不是资源不够，是契约违例：内核半区在第一个 AS 创建时就定形，之后只许读。
     KernelHalfFrozen,
+    /// 句柄指的 AS 槽已经不存在（ADR-074：柄先丢、映射后丢的契约被反着用了）。
+    NoSuchAspace,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -962,12 +964,36 @@ fn map_huge(va: u64, phys: u64, flags: PageFlags) -> Result<(), MmError> {
     set_leaf(va, phys | flags.bits() | P_HUGE, true, flags.user)
 }
 
-/// 取一个清零的页表页
+/// 取一个清零的页表页（内核表：生命周期 = 内核，不归还）。
 fn new_table_frame() -> Option<u64> {
+    new_table_frame_in(None)
+}
+
+/// 取一个清零的页表页，**按它属于哪棵树记账**（ADR-074 决策 3）。
+/// `None` = 内核表：`MOD_BOOT` + `forget`，与今天逐字相同。
+/// `Some(slot)` = 那个 AS 自己的表页：`MOD_AS_PT`，帧号记进 `pt_frames`，
+/// AS 销毁时由 `aspace_release` 逐帧 `frame_put` 归还。清单满了就**把这张还回去并失败**，
+/// 不发一张没人还的表页（那正是 BACKLOG §147 第 1 条的形状）。
+fn new_table_frame_in(as_slot: Option<u8>) -> Option<u64> {
     let phys = if is_ready() {
-        let f = phys_alloc(0, MOD_BOOT).ok()?;
+        let owner = if as_slot.is_some() { MOD_AS_PT } else { MOD_BOOT };
+        let f = phys_alloc(0, owner).ok()?;
         let p = f.base().0;
-        core::mem::forget(f); // 页表生命周期 = 内核生命周期，不归还
+        core::mem::forget(f); // 主人改记在表里（内核表不记，AS 表记 pt_frames）
+        if let Some(slot) = as_slot {
+            let t = aspaces();
+            let e = &mut t.items[usize::from(slot)];
+            if !e.used || e.pt_count >= AS_PT_SLOTS {
+                // 这里持 VMM(20)，frame_put 取 PMM(30)：正向嵌套，合法（lock-order.md）
+                if let Err(err) = frame_put(p / PAGE as u64) {
+                    free_violation(err, PhysAddr(p), owner);
+                }
+                return None;
+            }
+            e.pt_frames[e.pt_count] = p / PAGE as u64;
+            e.pt_count += 1;
+            AS_PT_LIVE.fetch_add(1, Ordering::Relaxed);
+        }
         p
     } else {
         early_frame()?
@@ -986,8 +1012,24 @@ fn new_table_frame() -> Option<u64> {
 /// ——这条不是推测，`t_user_roundtrip` 用 `effective_flags` 复量了一个内核页。
 /// SAFETY: 调用方保证 `va` 是规范地址，且 pml4/hhdm 已初始化。
 unsafe fn walk_leaf(va: u64, create: bool, huge: bool, user: bool) -> Option<*mut u64> {
+    // SAFETY: 同 walk_leaf_in；根取内核那份 PML4，所以既有调用点的语义逐字不变（ADR-074 决策 3）
+    unsafe { walk_leaf_in(s().pml4_phys, None, va, create, huge, user) }
+}
+
+/// 带根表与 AS 归属的遍历（ADR-074 决策 3）。**入口仍然只有这一个**：
+/// `walk_leaf` 是它 `root = 内核 PML4、as_slot = None` 的薄壳。
+/// `as_slot = Some(i)` 时按需建的下级表页记进那个 AS 的清单（`new_table_frame_in`）。
+/// SAFETY: 调用方保证 `root` 是一份有效 PML4 的物理地址、`va` 规范、持 VMM。
+unsafe fn walk_leaf_in(
+    root: u64,
+    as_slot: Option<u8>,
+    va: u64,
+    create: bool,
+    huge: bool,
+    user: bool,
+) -> Option<*mut u64> {
     let hhdm = s().hhdm;
-    let mut table = (s().pml4_phys + hhdm) as *mut Page;
+    let mut table = (root + hhdm) as *mut Page;
     let stop: u8 = if huge { 1 } else { 0 };
     let mut level = 3u8;
     let share = if user { P_USER } else { 0 };
@@ -1004,7 +1046,7 @@ unsafe fn walk_leaf(va: u64, create: bool, huge: bool, user: bool) -> Option<*mu
                 return None;
             }
             // SAFETY: 同上
-            unsafe { *entry = new_table_frame()? | P_PRESENT | P_WRITE | share };
+            unsafe { *entry = new_table_frame_in(as_slot)? | P_PRESENT | P_WRITE | share };
         } else if cur & P_HUGE != 0 {
             // 还要继续下钻，但这一级已经是 2 MiB 大页：**拒绝**。
             // 继续走会把那块数据帧当成下一级页表，页表项就写进了数据里；
@@ -1024,8 +1066,21 @@ unsafe fn walk_leaf(va: u64, create: bool, huge: bool, user: bool) -> Option<*mu
 
 /// 写叶子表项；已存在的映射报 AlreadyMapped 而不是静默覆盖
 fn set_leaf(va: u64, value: u64, huge: bool, user: bool) -> Result<(), MmError> {
-    // SAFETY: va 由调用方保证规范，表已初始化
-    let e = unsafe { walk_leaf(va, true, huge, user).ok_or(MmError::OutOfMemory)? };
+    set_leaf_in(s().pml4_phys, None, va, value, huge, user)
+}
+
+/// 往**指定根表**写叶子（ADR-074）。`AlreadyMapped` 在那棵树里判，不查内核树——
+/// 这是"同一 VA 在两个 AS 里各自映射互不影响"（ADR-070 A4）的实现点。
+fn set_leaf_in(
+    root: u64,
+    as_slot: Option<u8>,
+    va: u64,
+    value: u64,
+    huge: bool,
+    user: bool,
+) -> Result<(), MmError> {
+    // SAFETY: va 由调用方保证规范，root 是调用方给的有效 PML4，持 VMM
+    let e = unsafe { walk_leaf_in(root, as_slot, va, true, huge, user).ok_or(MmError::OutOfMemory)? };
     // SAFETY: 上一步返回的是有效表项指针
     if unsafe { *e } & P_PRESENT != 0 {
         return Err(MmError::AlreadyMapped);
@@ -1831,6 +1886,181 @@ pub fn aspace_register_cpu(slot: u8, cpu: usize) -> Option<u8> {
     Some(old)
 }
 
+// ------------------------------------------------------ ADR-074（W3 P4）往指定 AS 铺映射
+
+/// 一次 `aspace_map` 能铺的最大页数。与 `MAX_LAZY_PAGES` 同一口径：接缝够用，欠 workload 依据。
+pub const MAX_AS_MAP_PAGES: usize = 16;
+
+/// 读**指定 AS** 里某个 VA 的叶子表项（第二台仪器：不靠切 CR3、不碰用户页，所以与 SMAP 无关）。
+/// 不存在/不 present 返回 None。ADR-074 的 C6/C7 用它对照两棵树。
+pub fn aspace_leaf(space: &AspaceHandle, va: VirtAddr) -> Option<u64> {
+    if VirtAddr::new(va.0).is_none() {
+        return None;
+    }
+    let _g = vmm();
+    let e = &aspaces().items[usize::from(space.slot)];
+    if !e.used {
+        return None;
+    }
+    // SAFETY: root 是表里核对过的有效 PML4，va 规范，持 VMM，create=false 只走已存在的表
+    let leaf = unsafe { walk_leaf_in(e.pml4, None, va.0, false, false, false)? };
+    // SAFETY: 上一行返回的是有效表项指针
+    let v = unsafe { *leaf };
+    if v & P_PRESENT == 0 { None } else { Some(v) }
+}
+
+/// 往指定 AS 铺的一段**共享**映射（ADR-074 决策 3）。帧的主人不是它（是 VMO），
+/// 这里每页只持一个 `frame_get` 参考。丢弃即"清叶子 + 按位图 shootdown + 逐帧 put"。
+///
+/// 生命周期契约：**映射柄先丢、AS 柄后丢**。反了也不泄漏帧（Drop 里核对 AS 还在不在，
+/// 不在就只还参考——表页已经归还，没有叶子可清），但少一次清叶子，所以用例按契约写。
+#[must_use = "映射柄丢弃即解映射并还参考，随手丢弃等于这段映射不存在"]
+pub struct AspaceMapping {
+    as_slot: u8,
+    root: u64,
+    va: VirtAddr,
+    pages: usize,
+    frames: [u64; MAX_AS_MAP_PAGES],
+    /// 只用于归还失败时的 L4 文案（真正的归属在 FrameInfo 里）。
+    owner: ModuleId,
+}
+
+impl AspaceMapping {
+    pub fn virt(&self) -> VirtAddr {
+        self.va
+    }
+    pub fn pages(&self) -> usize {
+        self.pages
+    }
+}
+
+impl Drop for AspaceMapping {
+    fn drop(&mut self) {
+        let n = self.pages.min(MAX_AS_MAP_PAGES);
+        let mut out = [0u64; MAX_AS_MAP_PAGES];
+        out[..n].copy_from_slice(&self.frames[..n]);
+        {
+            let _g = vmm();
+            let e = &aspaces().items[usize::from(self.as_slot)];
+            if e.used && e.pml4 == self.root {
+                let mask = e.running_on;
+                for k in 0..n {
+                    let a = self.va.0 + (k as u64) * PAGE as u64;
+                    // SAFETY: root 与 as_slot 刚核对过，这段叶子是本结构铺的，持 VMM
+                    if let Some(leaf) = unsafe { walk_leaf_in(self.root, None, a, false, false, false) } {
+                        // SAFETY: 上一行返回的是有效表项指针
+                        unsafe { *leaf = 0 };
+                        tlb_invalidate(a);
+                        // 清完叶子才等回执，回执收齐之前不还帧（ADR-023/072）。
+                        // 这是 shootdown_masked 的第一个产品调用者：只通知跑过这个 AS 的 CPU。
+                        shootdown_masked(a, mask);
+                    }
+                }
+                UNMAPPED_PAGES.fetch_add(n, Ordering::Relaxed);
+            }
+        }
+        // 锁外还参考：frame_put 到 0 才真还（毒化 + 台账 + free_frames），与 aspace_release 同律
+        for f in out.iter().take(n) {
+            if let Err(err) = frame_put(*f) {
+                free_violation(err, PhysAddr(*f * PAGE as u64), self.owner);
+            }
+        }
+    }
+}
+
+/// 把 `frames`（帧号清单，主人仍是调用方）铺进 `space` 的用户半区 `va` 处。
+///
+/// 四条前置，每条都是结构性的而不是"再查一遍"：
+/// 1. **W^X**：收的是 `PageFlags`，而它只能由 `PageFlags::new` 造，W+X 在构造期就失败了。
+/// 2. **只许用户半区**：高 256 项的下层表是与内核**共享**的，往那里写叶子等于改内核表
+///    （ADR-070 决策 2 的冻结），所以直接 `KernelHalfFrozen`。
+/// 3. **冲突在那棵树里判**：`AlreadyMapped` 查的是 `space` 的根，不是内核根——
+///    这是"同一 VA 在两个 AS 里各自映射互不影响"（ADR-070 A4）的实现点。
+/// 4. **不拥有帧**：每页 `frame_get` 拿一个参考，Drop 里 `frame_put` 还它。
+///
+/// 上下文 KERNEL，取 VMM；可能阻塞（Drop 里等 shootdown 回执）。失败不留半截映射。
+pub fn aspace_map(
+    space: &AspaceHandle,
+    frames: &[u64],
+    va: VirtAddr,
+    flags: PageFlags,
+    owner: ModuleId,
+) -> Result<AspaceMapping, MmError> {
+    if !is_ready() {
+        return Err(MmError::NotInit);
+    }
+    if frames.is_empty() || frames.len() > MAX_AS_MAP_PAGES {
+        return Err(MmError::InvalidAddress);
+    }
+    if VirtAddr::new(va.0).is_none() || (va.0 & (PAGE as u64 - 1)) != 0 {
+        return Err(MmError::InvalidAddress);
+    }
+    // 用户半区 = PML4 下标 0..256。高半区的下层表与内核共享，写它就是改内核表。
+    if idx(va.0, 3) >= 256 {
+        return Err(MmError::KernelHalfFrozen);
+    }
+    let n = frames.len();
+    let mut got = [0u64; MAX_AS_MAP_PAGES];
+    let _g = vmm();
+    let e = &aspaces().items[usize::from(space.slot)];
+    if !e.used {
+        return Err(MmError::NoSuchAspace);
+    }
+    let root = e.pml4;
+    // 先整段查冲突：不留"铺了一半才发现冲突"的中间态
+    for k in 0..n {
+        let a = va.0 + (k as u64) * PAGE as u64;
+        // SAFETY: root 是刚核对过的有效 PML4，va 规范且页对齐，持 VMM
+        if let Some(leaf) = unsafe { walk_leaf_in(root, None, a, false, false, false) } {
+            // SAFETY: 上一行返回的是有效表项指针
+            if unsafe { *leaf } & P_PRESENT != 0 {
+                return Err(MmError::AlreadyMapped);
+            }
+        }
+    }
+    for k in 0..n {
+        let a = va.0 + (k as u64) * PAGE as u64;
+        let f = frames[k];
+        // frame_get 取 PMM(30)，这里持 VMM(20)：正向嵌套（lock-order.md）
+        let _shared = frame_get(f);
+        got[k] = f;
+        // 参考已经拿在手里，凭证交给 Drop 之前不能丢：这里 forget 掉 RAII 凭证，
+        // 所有权改记在返回的 AspaceMapping 里（与 aspace_new 记 pt_frames 同一手法）。
+        core::mem::forget(_shared);
+        if let Err(err) = set_leaf_in(root, Some(space.slot), a, f * PAGE as u64 | flags.bits(), false, flags.user) {
+            // 回滚：清掉已铺的叶子，还掉已拿的参考（含这一次）
+            for j in 0..=k {
+                let b = va.0 + (j as u64) * PAGE as u64;
+                // SAFETY: 同上；只清本次铺的（j < k 已写成，j == k 可能没写成，清它是幂等空操作）
+                if let Some(leaf) = unsafe { walk_leaf_in(root, None, b, false, false, false) } {
+                    // SAFETY: 有效表项指针
+                    unsafe { *leaf = 0 };
+                    tlb_invalidate(b);
+                }
+            }
+            for j in 0..=k {
+                if let Err(e2) = frame_put(got[j]) {
+                    free_violation(e2, PhysAddr(got[j] * PAGE as u64), owner);
+                }
+            }
+            return Err(err);
+        }
+        tlb_invalidate(a);
+    }
+    MAP_CALLS.fetch_add(1, Ordering::Relaxed);
+    MAPPED_PAGES.fetch_add(n, Ordering::Relaxed);
+    let mut out = AspaceMapping {
+        as_slot: space.slot,
+        root,
+        va,
+        pages: n,
+        frames: [0; MAX_AS_MAP_PAGES],
+        owner,
+    };
+    out.frames[..n].copy_from_slice(&got[..n]);
+    Ok(out)
+}
+
 /// 把本 CPU 切到给定 PML4。**只在目标与当前 CR3 不同时才写**（ADR-070 决策 4 / A2 判据）。
 /// 返回"这次真的写了 CR3 吗"。调用方必须保证目标表的内核半区与 AS_KERNEL 等价
 /// （否则一切换内核代码就取不到指）——这个前提由 `aspace_new` 的构造保证，
@@ -2536,7 +2766,7 @@ pub fn force_put_double_free_for_test() -> bool {
     false // 走到这里说明 L4 升级没生效
 }
 
-fn free_violation(e: MmError, base: PhysAddr, owner: ModuleId) -> ! {
+pub(crate) fn free_violation(e: MmError, base: PhysAddr, owner: ModuleId) -> ! {
     crate::log_fatal!("L4 integrity: {:?} base={:#x} owner={}", e, base.0, owner.0);
     crate::exit::finish(crate::exit::Code::ExceptionFatal)
 }

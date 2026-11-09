@@ -5618,6 +5618,60 @@ P2 读 490 / 四次 1,785 / DMA 45,342。地板从上一跑的 0.89 % 抬到 2.3
 八颗核一起涨 34.6 KB。将来 Q2 重开要抬到 12/16 时，这笔账要按"每格 4.3 KB × MAX_CPUS"先算再裁，
 不能只看"多几格"。
 
+## 152. W3 P4a：VMO 持帧对象 + `aspace_map` 按 AS 写表 + 句柄释放移到锁外（ADR-074，2026-11-09，实测）
+
+**两条路线由使用者裁决**：①`lock-order.md:25-27` 预先写好的两条路里选**释放移到锁外**（`RANK_HANDLE` 保持 35）；
+②VMO 第一刀用**即时帧**后端，不接 lazy。落地形状：
+- `kernel/src/vmo.rs`（新）：定长表（`MAX_VMOS=8`/`MAX_VMO_PAGES=16`）在 VMM(20) 内、载荷全 Copy 帧号，
+  照 `LazyRegion` 同律；引用计数 1 起，`vmo_ref`/`vmo_unref`，到 0 才"锁内取清单、锁外逐帧 `frame_put`"。
+- `mm::aspace_map` + `AspaceMapping`：`walk_leaf`/`set_leaf`/`new_table_frame` 各加一个 `_in` 版本带根表与 AS 归属，
+  **既有调用点一行不改**（薄壳委托）；按需建的下级表页记 `MOD_AS_PT` 并进 `pt_frames`；每页 `frame_get`，
+  Drop 里清叶子 + `shootdown_masked(running_on)` + 锁外 `frame_put`。**这是 ADR-072 收窄路径的第一个产品调用者**。
+- `handle.rs`：`Entry.obj` 从 `Option<FileObj>` 换成 Copy 的 `ObjRef{File|Vmo{slot}}`；
+  `close`/`revoke_task` 两段式、`dup` 三段式（取票→锁外加引用→提交，失败锁外退回）、新增 `grant_vmo`。
+  **HANDLE 锁内一次 mm 调用都没有**。
+
+**读数**（run-of-record：ELF `98a675c5a5e5`，矩阵与 bench 同一代码状态）：
+`check` **17/17**；矩阵 **45/45 全符合**（C10：内核路径零扰动）；三档 ktests：normal **78/78**、
+`handles` **79/79**、`fat32-exec` **87/87**（含既有文件句柄用例 ⇒ `ObjRef` 改造没扰动它们）；
+`bench` **4/4**：P4 地板 **0.44 %**（44 bp）、P1 `min` 7648/6920（同构建地板 **729**）→ 注入 31,824、
+P3 `min` 338/324 → 196,146、P2 读 470 / 四次 1,790 / DMA 42,182（`baselines/2026-11-09T10-51-57Z-p3p4.txt`）。
+串口量 155,507/155,510、P1 样本仍 52 ⇒ 与上一轮**不可直接比**（多了两条用例的读数行，规则 2）；
+阈值仍按这一列最大观测值（5.15 %）停在 **8 %**。
+
+**六条变异各自咬中预测的格**（`.scratch/p4a-m{1,2,3,4,5,6}-serial.log`）：
+M1 长度 0 不再拒 ⇒ `越界=false`；M2 unref 不还帧 ⇒ 两条基线格红；M3 dup 不加引用 ⇒ `dup共享=false`+`close一个还活着=false`；
+**M4 把 unref 搬进锁内 ⇒ `L4 sync: 锁序违规，外层 rank=35 本次 rank=20` ⇒ EXCEPTION(39)**（裁决那条路线的唯一证人）；
+M5 仍用内核根 ⇒ 双 AS/叶同帧/互不影响/收窄四格红，**并连带 `t_elf_load_run` 红**（内核树的用户窗口被污染）；
+M6 去掉高半区闸 ⇒ `高半区拒=false`。M6 预测会连带的 A1 对照**没有发生**（那一跑自己新建 AS），不写成"A1 也会红"。
+M1 刻意只拿掉"长度 0"那一条：让变异跑真写越界会踩坏别人的帧，红在现场不可读的地方就没有归因价值。
+
+**棘轮把设计改瘦了两处**（不是放宽判据）：
+1. `memory->sync 10 > 9`：计数站点按行匹配 `sync::`，`use core::sync::atomic::…` 也算一站
+   （与 `core::arch::` 撞 arch 棘轮同形）⇒ VMO 的三本计数从原子量搬进 VMM 保护的表（本来就该与表同锁），站点回 9。
+2. `memory->diagnostics 8 > 7`：`put_or_die` 自己 `log_fatal!+exit::finish` 会新增一站 ⇒
+   改成复用 `mm::free_violation`（开成 `pub(crate)`），站点回 7，升级文案从此只有一处。
+登记面因此多 `mm::free_violation`、`mm::PhysAddr` 两条 `public_api`；unsafe 340 → **355**
+（`vmo` U2 三处 + U4 两处、`mm` U2 43 → 53），`lock-order.md` 的条件注记改成"已选第二条"并写清两条负样本。
+
+**没做的**：
+- 12 `vmo_create` / 13 `vmo_write` / 14 `aspace_map` 三个号还没接（**P4b**）；今天用户态看不见 VMO。
+- **C9 收尾判据还没长 VMO/句柄这一格**：`finish_sweep` 只数任务/进程/Job。三条用例各自在结尾查了
+  `vmo_count()==0`，所以泄漏在用例内红，但"用例之间"那道门还缺这一格 ⇒ 随 P4b 补（那时产品路径才会造 VMO）。
+- C8 的表页归还由 `free frames` 回基线**间接**证明，没单独打 `MOD_AS_PT` 的台账行。
+- C7 只到协议层（读内核自己的回执计数）：TLB 陈旧性在 TCG 上观测不到，真机 M7 要带着重做。
+- lazy 后端与"带 AS 的 demand-zero"（N19）不在本轮；`MAX_VMOS`/`MAX_VMO_PAGES`/`AS_PT_SLOTS` 三个数都欠 workload 依据。
+
+**新发现的风险**：
+1. `AspaceMapping` 与 `AspaceHandle` 的丢弃顺序是契约（映射先丢、AS 后丢）。反了不泄漏帧
+   （Drop 核对 AS 还在不在，不在就只还参考），但**少一次清叶子**；今天只有用例调它，P5 接进程时要按契约编排。
+2. `vmo_write`/`vmo_read` 整段在 VMM 内做（帧清单与帧内容必须同一个临界区看），所以一次最多 64 KiB 的拷贝
+   带着 IF=0 占着 VMM。今天判据只写几字节；P4b 接 syscall 之后要按 `COPY_MAX` 限量，别把大拷贝放进这把锁。
+3. `dup` 的三段式中间有一个"票已取、引用未加"的窗口：原句柄若在此期间被 close 到 0，
+   第二段 `vmo_ref` 会 `NoSuch` 而失败（这是正确处置，不是漏洞），但**失败计数记在哪个计数器上**今天没细分。
+4. 句柄表的 `Vmo` 臂让 `revoke_task` 第一次真的会归还页框。它的调用点 `sched.rs:343` 不在 RUNQ 锁内（本轮核对过），
+   将来若有人把这句搬进持锁段，M4 那条负样本会当场咬——**这条依赖要写在锁序表里**（已写）。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

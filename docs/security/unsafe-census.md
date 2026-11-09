@@ -1,6 +1,6 @@
 # unsafe 逐处审计表（U1–U6）
 
-总计 340 处。U1 59 · U2 84 · U3 13 · U4 125 · U5 28 · U6 31
+总计 355 处。U1 59 · U2 97 · U3 13 · U4 127 · U5 28 · U6 31
 
 本表由 `tools/aurora.py` 的 `unsafe_sites()` 从源码逐处生成，**不是手写的**。
 机器可读的权威来源是 `docs/security/unsafe-whitelist.toml` 的 `[modules.*]` 段（模块×类别→处数），
@@ -10,9 +10,9 @@
 ## 类别
 
 - **U1 架构入口与特殊寄存器** — 59 处，分布在 13 个模块：arch/x86_64/apic、arch/x86_64/cpu、arch/x86_64/smp、arch/x86_64/trap、hw、ktests/sched、mm、sched、serial、sync、tsc、user、user/hello
-- **U2 页表、物理内存与 MMIO** — 84 处，分布在 10 个模块：acpi、arch/x86_64/apic、heap、hw、ktests/mm、limine、mm、pci、sched、user
+- **U2 页表、物理内存与 MMIO** — 97 处，分布在 11 个模块：acpi、arch/x86_64/apic、heap、hw、ktests/mm、limine、mm、pci、sched、user、vmo
 - **U3 DMA 与设备共享内存** — 13 处，分布在 2 个模块：driver、limine
-- **U4 并发共享状态与 UnsafeCell** — 125 处，分布在 19 个模块：acpi、ahci、arch/x86_64/apic、arch/x86_64/smp、arch/x86_64/trap、driver、hooks、irq、ktests/elf、ktests/fs、ktests/sign、main、mm、pci、proc、sched、sync、user、virtio
+- **U4 并发共享状态与 UnsafeCell** — 127 处，分布在 20 个模块：acpi、ahci、arch/x86_64/apic、arch/x86_64/smp、arch/x86_64/trap、driver、hooks、irq、ktests/elf、ktests/fs、ktests/sign、main、mm、pci、proc、sched、sync、user、virtio、vmo
 - **U5 用户指针与地址空间访问** — 28 处，分布在 2 个模块：user、user/hello
 - **U6 诊断路径的有限现场读取** — 31 处，分布在 9 个模块：crash、ktest、ktests/acpi、ktests/crash、ktests/fs、ktests/heap、ktests/mm、ktests/sched、ktests/user
 
@@ -431,98 +431,138 @@
 
 ### mm
 
-- `kernel/src/mm.rs:279` [impl] **U4** fn=`—`
-  > unsafe impl Sync for StateCell {}  static S: StateCell = StateCell(UnsafeCell::new(State { 
-- `kernel/src/mm.rs:307` [impl] **U4** fn=`—`
-  > unsafe impl Sync for RegionsCell {}  static REGIONS: RegionsCell = RegionsCell(UnsafeCell::new( 
-- `kernel/src/mm.rs:316` [{] **U4** fn=`regs`
-  > unsafe { &mut *REGIONS.0.get() } }  
-- `kernel/src/mm.rs:325` [{] **U4** fn=`s`
-  > unsafe { &mut *S.0.get() } }  
-- `kernel/src/mm.rs:738` [{] **U2** fn=`take_over`
-  > let e = unsafe { &*p }; if n >= MAX_REGIONS { return Err(MmError::Unsupported); 
-- `kernel/src/mm.rs:775` [{] **U2** fn=`take_over`
-  > let img_lo = (unsafe { &raw const __text_start } as u64) & !(PAGE as u64 - 1); let split = align_up(unsafe { &raw const __rodata_end } as u64, PAGE as u64); let data_lo = (unsafe { &raw const __data_start } as u64) & !(PAGE as u64 - 1); 
-- `kernel/src/mm.rs:776` [{] **U2** fn=`take_over`
-  > let split = align_up(unsafe { &raw const __rodata_end } as u64, PAGE as u64); let data_lo = (unsafe { &raw const __data_start } as u64) & !(PAGE as u64 - 1); let img_hi = align_up(unsafe { &raw const __bss_end } as u64, PAGE as u64); 
-- `kernel/src/mm.rs:777` [{] **U2** fn=`take_over`
-  > let data_lo = (unsafe { &raw const __data_start } as u64) & !(PAGE as u64 - 1); let img_hi = align_up(unsafe { &raw const __bss_end } as u64, PAGE as u64); let image_phys = exec_region_phys_base().ok_or(MmError::InvalidAddress)?; 
-- `kernel/src/mm.rs:778` [{] **U2** fn=`take_over`
-  > let img_hi = align_up(unsafe { &raw const __bss_end } as u64, PAGE as u64); let image_phys = exec_region_phys_base().ok_or(MmError::InvalidAddress)?; st.img_va_lo = img_lo; 
-- `kernel/src/mm.rs:815` [{] **U1** fn=`take_over`
-  > unsafe { core::arch::asm!( "call mm_relocate", 
-- `kernel/src/mm.rs:912` [{] **U2** fn=`new_table_frame`
-  > unsafe { core::ptr::write_bytes((phys + st.hhdm) as *mut u8, 0, PAGE) }; Some(phys) } 
-- `kernel/src/mm.rs:922` [fn] **U2** fn=`walk_leaf`
-  > unsafe fn walk_leaf(va: u64, create: bool, huge: bool, user: bool) -> Option<*mut u64> { let hhdm = s().hhdm; let mut table = (s().pml4_phys + hhdm) as *mut Page; 
-- `kernel/src/mm.rs:930` [{] **U2** fn=`walk_leaf`
-  > let entry = unsafe { &mut (*table).0[idx(va, level)] as *mut u64 }; if level == stop { return Some(entry); 
-- `kernel/src/mm.rs:935` [{] **U2** fn=`walk_leaf`
-  > let cur = unsafe { *entry }; if cur & P_PRESENT == 0 { if !create { 
-- `kernel/src/mm.rs:941` [{] **U2** fn=`walk_leaf`
-  > unsafe { *entry = new_table_frame()? | P_PRESENT | P_WRITE | share }; } else if cur & P_HUGE != 0 { // 还要继续下钻，但这一级已经是 2 MiB 大页：**拒绝**。 
-- `kernel/src/mm.rs:951` [{] **U2** fn=`walk_leaf`
-  > unsafe { *entry = cur | P_USER }; } // SAFETY: 表项里的物理地址经 HHDM 可达 
-- `kernel/src/mm.rs:954` [{] **U2** fn=`walk_leaf`
-  > table = unsafe { ((*entry & ADDR_MASK) + hhdm) as *mut Page }; level -= 1; } 
-- `kernel/src/mm.rs:962` [{] **U2** fn=`set_leaf`
-  > let e = unsafe { walk_leaf(va, true, huge, user).ok_or(MmError::OutOfMemory)? }; // SAFETY: 上一步返回的是有效表项指针 if unsafe { *e } & P_PRESENT != 0 { 
-- `kernel/src/mm.rs:964` [{] **U2** fn=`set_leaf`
-  > if unsafe { *e } & P_PRESENT != 0 { return Err(MmError::AlreadyMapped); } 
-- `kernel/src/mm.rs:968` [{] **U2** fn=`set_leaf`
-  > unsafe { *e = value }; Ok(()) } 
-- `kernel/src/mm.rs:983` [{] **U2** fn=`huge_block_of`
-  > unsafe { let mut table = (st.pml4_phys + hhdm) as *const Page; for level in (1u8..=3u8).rev() { 
-- `kernel/src/mm.rs:1241` [{] **U1** fn=`tlb_invalidate`
-  > unsafe { core::arch::asm!("invlpg [{}]", in(reg) va, options(nomem)) }; core::sync::atomic::compiler_fence(Ordering::SeqCst); } 
-- `kernel/src/mm.rs:1247` [{] **U2** fn=`clear_leaf`
-  > if let Some(e) = unsafe { walk_leaf(va.0, false, false, false) } { // SAFETY: walk_leaf 只返回有效表项 unsafe { *e = 0 }; 
-- `kernel/src/mm.rs:1249` [{] **U2** fn=`clear_leaf`
-  > unsafe { *e = 0 }; tlb_invalidate(va.0); } 
-- `kernel/src/mm.rs:1275` [{] **U2** fn=`is_mapped`
-  > unsafe { let mut table = (s().pml4_phys + hhdm) as *const Page; let mut level = 3u8; 
-- `kernel/src/mm.rs:1389` [{] **U2** fn=`phys_of`
-  > unsafe { let mut table = (s().pml4_phys + hhdm) as *const Page; let mut level = 3u8; （只读遍历，前提同 is_mapped）
-- `kernel/src/mm.rs:1418` [{] **U2** fn=`leaf_value`
-  > unsafe { let mut table = (s().pml4_phys + hhdm) as *const Page; let mut level = 3u8; （只读遍历，前提同 is_mapped）
-- `kernel/src/mm.rs:1455` [{] **U2** fn=`split_huge`
-  > let pd_entry: *mut u64 = unsafe { let mut table = (s().pml4_phys + hhdm) as *mut Page; （持 VMM，自建表经 HHDM 可达）
-- `kernel/src/mm.rs:1476` [{] **U2** fn=`split_huge`
-  > let old = unsafe { *pd_entry }; （有效 level-1 表项，持 VMM）
-- `kernel/src/mm.rs:1494` [{] **U2** fn=`split_huge`
-  > unsafe { let pt_page = (pt_phys + hhdm) as *mut Page; for k in 0..512u64 { （PT 来自 new_table_frame、尚未挂进 PD，无并发读者）
-- `kernel/src/mm.rs:1503` [{] **U2** fn=`split_huge`
-  > unsafe { *pd_entry = new_pd }; （单次 8 字节对齐写发布，持 VMM）
-- `kernel/src/mm.rs:1606` [impl] **U4** fn=`—`
-  > unsafe impl Sync for LazyCell {} （P5/ADR-067：LAZY 表读写全在 VMM(20) 内，载荷全 Copy）
-- `kernel/src/mm.rs:1612` [{] **U4** fn=`lazy_items`
-  > unsafe { &mut *LAZY.0.get() } （同上，互斥由 VMM 提供）
-- `kernel/src/mm.rs:1694` [{] **U2** fn=`demand_zero_try`
-  > unsafe { core::ptr::write_bytes((p + s().hhdm) as *mut u8, 0, PAGE) }; （P5 分配即清零：p 来自 phys_alloc、HHDM 覆盖、页对齐、帧此刻独占）
-- `kernel/src/mm.rs:1311` [{] **U2** fn=`effective_flags`
-  > unsafe { let mut table = (s().pml4_phys + hhdm) as *const Page; let mut level = 3u8; 
-- `kernel/src/mm.rs:1479` [{] **U2** fn=`phys_free`
-  > unsafe { core::ptr::write_volatile((st.hhdm + base.0 + b) as *mut u8, 0xa5) }; } if !crate::resource::account_free(owner, n) { 
-- `kernel/src/mm.rs:1471` [{] **U2** fn=`bootstrap_frame_info`
-  > P1a（ADR-063）：写 FrameInfo 影子条目。指针 = phys_alloc_locked 分出的 MOD_BOOT 帧 + HHDM；范围 [0,limit)，AtomicU32 首字段 4 对齐；元数组帧永不归还（生命周期=内核）；引导期单核 IF=0 无并发。不变量由"2^order 帧 >= limit 条目"保证。
-- `kernel/src/mm.rs:1506` [{] **U2** fn=`fi_refcnt`
-  > P1b：只读一个帧的 refcnt。同一指针来源/范围/对齐；调用方持 PMM 锁且保证 f<frame_info_frames；只读原子量。
-- `kernel/src/mm.rs:1514` [{] **U2** fn=`fi_owner`
-  > P1c：只读一个帧的 owner（台账归账）。同一指针来源/范围/对齐；PMM 锁下 owner 不变；只读。
-- `kernel/src/mm.rs:1523` [{] **U2** fn=`fi_set_used`
-  > P1b：写一个帧的 refcnt/flags/owner（独占 1/0）。同一指针来源/范围/对齐；PMM 锁互斥；元数组帧永不归还。
-- `kernel/src/mm.rs:1535` [{] **U2** fn=`fi_inc_refcnt`
-  > P1c：refcnt 原子加一（frame_get 共享）。同一指针来源/范围/对齐；PMM 锁互斥；前置"调用方已持参考"保证不与归还竞争。
-- `kernel/src/mm.rs:1543` [{] **U2** fn=`fi_dec_refcnt`
-  > P1c：refcnt 原子减一（不归还）。同一指针来源/范围/对齐；PMM 锁互斥；调用方保证 refcnt>=1。
-- `kernel/src/mm.rs:1663` [{] **U2** fn=`fi_final_free`
-  > P1c：refcnt 到 0 最终归还时毒化 0xA5。base=frame*PAGE 在 max_phys 内，HHDM 覆盖；PMM 锁下该帧已标自由。
-- `kernel/src/mm.rs:1619` [{] **U2** fn=`KBuf::new`
-  > P2（ADR-064）：分配即清零 write_bytes(ptr,0,cap)。ptr=HHDM+phys_alloc 连续帧基址，cap 字节都在 max_phys 内（HHDM 覆盖）；帧归 KBuf 独占无并发；u8 任意对齐。
-- `kernel/src/mm.rs:1639` [{] **U2** fn=`KBuf::as_slice`
-  > P2：from_raw_parts(ptr,len)。len<=cap 在界内；&self 期间帧不归还（Drop 才归还）；生命周期绑 &self，不得跨析构持有。
-- `kernel/src/mm.rs:1643` [{] **U2** fn=`KBuf::as_mut_slice`
-  > P2：from_raw_parts_mut(ptr,len)。同 as_slice；&mut self 保证独占无别名。
+- `kernel/src/mm.rs:313` [impl] **U4** fn=`—`
+  > unsafe impl Sync for StateCell {}  static S: StateCell = StateCell(UnsafeCell::new(State {
+- `kernel/src/mm.rs:344` [impl] **U4** fn=`—`
+  > unsafe impl Sync for RegionsCell {}  static REGIONS: RegionsCell = RegionsCell(UnsafeCell::new(
+- `kernel/src/mm.rs:353` [{] **U4** fn=`regs`
+  > unsafe { &mut *REGIONS.0.get() } } 
+- `kernel/src/mm.rs:362` [{] **U4** fn=`s`
+  > unsafe { &mut *S.0.get() } } 
+- `kernel/src/mm.rs:806` [{] **U2** fn=`take_over`
+  > let e = unsafe { &*p }; if n >= MAX_REGIONS { return Err(MmError::Unsupported);
+- `kernel/src/mm.rs:843` [{] **U2** fn=`take_over`
+  > let img_lo = (unsafe { &raw const __text_start } as u64) & !(PAGE as u64 - 1); let split = align_up(unsafe { &raw const __rodata_end } as u64, PAGE as u64); let data_lo = (unsafe { &raw const __data_start } as u64) & !(PAGE as u64 - 1);
+- `kernel/src/mm.rs:844` [{] **U2** fn=`take_over`
+  > let split = align_up(unsafe { &raw const __rodata_end } as u64, PAGE as u64); let data_lo = (unsafe { &raw const __data_start } as u64) & !(PAGE as u64 - 1); let img_hi = align_up(unsafe { &raw const __bss_end } as u64, PAGE as u64);
+- `kernel/src/mm.rs:845` [{] **U2** fn=`take_over`
+  > let data_lo = (unsafe { &raw const __data_start } as u64) & !(PAGE as u64 - 1); let img_hi = align_up(unsafe { &raw const __bss_end } as u64, PAGE as u64); let image_phys = exec_region_phys_base().ok_or(MmError::InvalidAddress)?;
+- `kernel/src/mm.rs:846` [{] **U2** fn=`take_over`
+  > let img_hi = align_up(unsafe { &raw const __bss_end } as u64, PAGE as u64); let image_phys = exec_region_phys_base().ok_or(MmError::InvalidAddress)?; st.img_va_lo = img_lo;
+- `kernel/src/mm.rs:883` [{] **U1** fn=`take_over`
+  > unsafe { core::arch::asm!( "call mm_relocate",
+- `kernel/src/mm.rs:1004` [{] **U2** fn=`new_table_frame_in`
+  > unsafe { core::ptr::write_bytes((phys + st.hhdm) as *mut u8, 0, PAGE) }; Some(phys) }
+- `kernel/src/mm.rs:1014` [fn] **U2** fn=`walk_leaf`
+  > unsafe fn walk_leaf(va: u64, create: bool, huge: bool, user: bool) -> Option<*mut u64> { // SAFETY: 同 walk_leaf_in；根取内核那份 PML4，所以既有调用点的语义逐字不变（ADR-074 决策 3） unsafe { walk_leaf_in(s().pml4_phys, None, va, create, huge, user) }
+- `kernel/src/mm.rs:1016` [{] **U2** fn=`walk_leaf`
+  > unsafe { walk_leaf_in(s().pml4_phys, None, va, create, huge, user) } } 
+- `kernel/src/mm.rs:1023` [fn] **U2** fn=`walk_leaf_in`
+  > unsafe fn walk_leaf_in( root: u64, as_slot: Option<u8>,
+- `kernel/src/mm.rs:1038` [{] **U2** fn=`walk_leaf_in`
+  > let entry = unsafe { &mut (*table).0[idx(va, level)] as *mut u64 }; if level == stop { return Some(entry);
+- `kernel/src/mm.rs:1043` [{] **U2** fn=`walk_leaf_in`
+  > let cur = unsafe { *entry }; if cur & P_PRESENT == 0 { if !create {
+- `kernel/src/mm.rs:1049` [{] **U2** fn=`walk_leaf_in`
+  > unsafe { *entry = new_table_frame_in(as_slot)? | P_PRESENT | P_WRITE | share }; } else if cur & P_HUGE != 0 { // 还要继续下钻，但这一级已经是 2 MiB 大页：**拒绝**。
+- `kernel/src/mm.rs:1059` [{] **U2** fn=`walk_leaf_in`
+  > unsafe { *entry = cur | P_USER }; } // SAFETY: 表项里的物理地址经 HHDM 可达
+- `kernel/src/mm.rs:1062` [{] **U2** fn=`walk_leaf_in`
+  > table = unsafe { ((*entry & ADDR_MASK) + hhdm) as *mut Page }; level -= 1; }
+- `kernel/src/mm.rs:1083` [{] **U2** fn=`set_leaf_in`
+  > let e = unsafe { walk_leaf_in(root, as_slot, va, true, huge, user).ok_or(MmError::OutOfMemory)? }; // SAFETY: 上一步返回的是有效表项指针 if unsafe { *e } & P_PRESENT != 0 {
+- `kernel/src/mm.rs:1085` [{] **U2** fn=`set_leaf_in`
+  > if unsafe { *e } & P_PRESENT != 0 { return Err(MmError::AlreadyMapped); }
+- `kernel/src/mm.rs:1089` [{] **U2** fn=`set_leaf_in`
+  > unsafe { *e = value }; Ok(()) }
+- `kernel/src/mm.rs:1104` [{] **U2** fn=`huge_block_of`
+  > unsafe { let mut table = (st.pml4_phys + hhdm) as *const Page; for level in (1u8..=3u8).rev() {
+- `kernel/src/mm.rs:1390` [{] **U1** fn=`tlb_invalidate`
+  > unsafe { core::arch::asm!("invlpg [{}]", in(reg) va, options(nomem)) }; core::sync::atomic::compiler_fence(Ordering::SeqCst); }
+- `kernel/src/mm.rs:1396` [{] **U2** fn=`clear_leaf`
+  > if let Some(e) = unsafe { walk_leaf(va.0, false, false, false) } { // SAFETY: walk_leaf 只返回有效表项 unsafe { *e = 0 };
+- `kernel/src/mm.rs:1398` [{] **U2** fn=`clear_leaf`
+  > unsafe { *e = 0 }; tlb_invalidate(va.0); }
+- `kernel/src/mm.rs:1424` [{] **U2** fn=`is_mapped`
+  > unsafe { let mut table = (s().pml4_phys + hhdm) as *const Page; let mut level = 3u8;
+- `kernel/src/mm.rs:1460` [{] **U2** fn=`effective_flags`
+  > unsafe { let mut table = (s().pml4_phys + hhdm) as *const Page; let mut level = 3u8;
+- `kernel/src/mm.rs:1500` [{] **U2** fn=`phys_of`
+  > unsafe { let mut table = (s().pml4_phys + hhdm) as *const Page; let mut level = 3u8;
+- `kernel/src/mm.rs:1529` [{] **U2** fn=`leaf_value`
+  > unsafe { let mut table = (s().pml4_phys + hhdm) as *const Page; let mut level = 3u8;
+- `kernel/src/mm.rs:1566` [{] **U2** fn=`split_huge`
+  > let pd_entry: *mut u64 = unsafe { let mut table = (s().pml4_phys + hhdm) as *mut Page; let e3 = &mut (*table).0[idx(block, 3)] as *mut u64;
+- `kernel/src/mm.rs:1587` [{] **U2** fn=`split_huge`
+  > let old = unsafe { *pd_entry }; if old & P_PRESENT == 0 { return Err(MmError::NotMapped);
+- `kernel/src/mm.rs:1605` [{] **U2** fn=`split_huge`
+  > unsafe { let pt_page = (pt_phys + hhdm) as *mut Page; for k in 0..512u64 {
+- `kernel/src/mm.rs:1614` [{] **U2** fn=`split_huge`
+  > unsafe { *pd_entry = new_pd }; tlb_invalidate(block); shootdown_others(block);
+- `kernel/src/mm.rs:1729` [impl] **U4** fn=`map_hole`
+  > unsafe impl Sync for AspaceCell {}  static ASPACES: AspaceCell = AspaceCell(UnsafeCell::new(AspaceTable { items: [AS_EMPTY; MAX_ADDR_SPACES] }));
+- `kernel/src/mm.rs:1736` [{] **U4** fn=`aspaces`
+  > unsafe { &mut *ASPACES.0.get() } } 
+- `kernel/src/mm.rs:1766` [{] **U2** fn=`aspaces`
+  > unsafe { let mine = (e.pml4 + hhdm) as *const Page; let kernel = (s().pml4_phys + hhdm) as *const Page;
+- `kernel/src/mm.rs:1788` [{] **U2** fn=`aspaces`
+  > unsafe { let mine = (e.pml4 + hhdm) as *const Page; Some((0..256).filter(|&i| (*mine).0[i] & P_PRESENT != 0).count())
+- `kernel/src/mm.rs:1822` [{] **U2** fn=`aspace_new`
+  > unsafe { let mine = (pml4 + hhdm) as *mut Page; core::ptr::write_bytes(mine as *mut u8, 0, PAGE);
+- `kernel/src/mm.rs:1906` [{] **U2** fn=`aspace_leaf`
+  > let leaf = unsafe { walk_leaf_in(e.pml4, None, va.0, false, false, false)? }; // SAFETY: 上一行返回的是有效表项指针 let v = unsafe { *leaf };
+- `kernel/src/mm.rs:1908` [{] **U2** fn=`aspace_leaf`
+  > let v = unsafe { *leaf }; if v & P_PRESENT == 0 { None } else { Some(v) } }
+- `kernel/src/mm.rs:1950` [{] **U2** fn=`aspace_leaf`
+  > if let Some(leaf) = unsafe { walk_leaf_in(self.root, None, a, false, false, false) } { // SAFETY: 上一行返回的是有效表项指针 unsafe { *leaf = 0 };
+- `kernel/src/mm.rs:1952` [{] **U2** fn=`aspace_leaf`
+  > unsafe { *leaf = 0 }; tlb_invalidate(a); // 清完叶子才等回执，回执收齐之前不还帧（ADR-023/072）。
+- `kernel/src/mm.rs:2014` [{] **U2** fn=`aspace_map`
+  > if let Some(leaf) = unsafe { walk_leaf_in(root, None, a, false, false, false) } { // SAFETY: 上一行返回的是有效表项指针 if unsafe { *leaf } & P_PRESENT != 0 {
+- `kernel/src/mm.rs:2016` [{] **U2** fn=`aspace_map`
+  > if unsafe { *leaf } & P_PRESENT != 0 { return Err(MmError::AlreadyMapped); }
+- `kernel/src/mm.rs:2035` [{] **U2** fn=`aspace_map`
+  > if let Some(leaf) = unsafe { walk_leaf_in(root, None, b, false, false, false) } { // SAFETY: 有效表项指针 unsafe { *leaf = 0 };
+- `kernel/src/mm.rs:2037` [{] **U2** fn=`aspace_map`
+  > unsafe { *leaf = 0 }; tlb_invalidate(b); }
+- `kernel/src/mm.rs:2075` [fn] **U1** fn=`aspace_switch`
+  > pub unsafe fn aspace_switch(pml4: u64, me: usize) -> bool { // SAFETY: 读 CR3 是特权读，调用方在 ring0；原语在上方 global_asm 里，只动 CR3 let cur = unsafe { aspace_cr3_read() };
+- `kernel/src/mm.rs:2077` [{] **U1** fn=`aspace_switch`
+  > let cur = unsafe { aspace_cr3_read() }; if cur == pml4 { return false;
+- `kernel/src/mm.rs:2082` [{] **U1** fn=`aspace_switch`
+  > unsafe { aspace_cr3_write(pml4) }; CR3_WRITES.fetch_add(1, Ordering::Relaxed); // ADR-072：登记"这颗 CPU 曾跑过这个 AS"。只增不减（换走时不摘）。
+- `kernel/src/mm.rs:2103` [fn] **U2** fn=`aspace_switch_kernel`
+  > pub unsafe fn aspace_switch_kernel(me: usize) -> bool { // SAFETY: our_cr3 是启动时建的内核表，前提由 take_over 保证 unsafe { aspace_switch(our_cr3(), me) }
+- `kernel/src/mm.rs:2105` [{] **U2** fn=`aspace_switch_kernel`
+  > unsafe { aspace_switch(our_cr3(), me) } } 
+- `kernel/src/mm.rs:2149` [impl] **U4** fn=`kernel_half_frozen`
+  > unsafe impl Sync for LazyCell {}  static LAZY: LazyCell = LazyCell(UnsafeCell::new(LazyTable { items: [LAZY_EMPTY; MAX_LAZY_REGIONS] }));
+- `kernel/src/mm.rs:2155` [{] **U4** fn=`lazy_items`
+  > unsafe { &mut *LAZY.0.get() } } 
+- `kernel/src/mm.rs:2253` [{] **U2** fn=`demand_zero_try`
+  > unsafe { core::ptr::write_bytes((p + s().hhdm) as *mut u8, 0, PAGE) }; // 竞争变体（ADR-067 验收⑥的确定性构造）：把"已查未填 → 分配 → 装页"的窗口拉宽， // 让四路竞争者重叠；默认构建不睡，重叠与否由 TCG 现实时序决定。
+- `kernel/src/mm.rs:2430` [{] **U2** fn=`bootstrap_frame_info`
+  > unsafe { let e = &mut *arr.add(f as usize); e.refcnt = AtomicU32::new(if used { 1 } else { 0 });
+- `kernel/src/mm.rs:2465` [{] **U2** fn=`fi_refcnt`
+  > unsafe { (*arr.add(f as usize)).refcnt.load(Ordering::Relaxed) } } 
+- `kernel/src/mm.rs:2473` [{] **U2** fn=`fi_owner`
+  > unsafe { (*arr.add(f as usize)).owner } } 
+- `kernel/src/mm.rs:2481` [{] **U2** fn=`fi_set_used`
+  > unsafe { let e = &mut *arr.add(f as usize); e.refcnt.store(if used { 1 } else { 0 }, Ordering::Relaxed);
+- `kernel/src/mm.rs:2494` [{] **U2** fn=`fi_inc_refcnt`
+  > unsafe { (*arr.add(f as usize)).refcnt.fetch_add(1, Ordering::Relaxed); } } 
+- `kernel/src/mm.rs:2502` [{] **U2** fn=`fi_dec_refcnt`
+  > unsafe { (*arr.add(f as usize)).refcnt.fetch_sub(1, Ordering::Relaxed); } } 
+- `kernel/src/mm.rs:2578` [{] **U2** fn=`frame_put`
+  > unsafe { core::ptr::write_bytes(ptr, 0, cap) }; Ok(KBuf { frames, ptr, len: bytes }) }
+- `kernel/src/mm.rs:2598` [{] **U2** fn=`frame_put`
+  > unsafe { core::slice::from_raw_parts(self.ptr, self.len) } } pub fn as_mut_slice(&mut self) -> &mut [u8] {
+- `kernel/src/mm.rs:2602` [{] **U2** fn=`frame_put`
+  > unsafe { core::slice::from_raw_parts_mut(self.ptr, self.len) } } }
+- `kernel/src/mm.rs:2675` [{] **U2** fn=`fi_final_free`
+  > unsafe { core::ptr::write_volatile((st.hhdm + base + b) as *mut u8, 0xa5) }; } if !ledger_free(owner, 1) {
+- `kernel/src/mm.rs:2723` [{] **U2** fn=`phys_free`
+  > unsafe { core::ptr::write_volatile((st.hhdm + base.0 + b) as *mut u8, 0xa5) }; } if !ledger_free(owner, n) {
 
 ### pci
 
@@ -775,3 +815,16 @@
   > unsafe { *NET_DEV.0.get() = Some(net) }; Ok(()) } 
 - `kernel/src/virtio.rs:982` [{] **U4** fn=`net_info`
   > unsafe { (*NET_DEV.0.get()).as_ref().map(|d| NetInfo { bdf: d.bdf, 
+
+### vmo
+
+- `kernel/src/vmo.rs:75` [impl] **U4** fn=`—`
+  > unsafe impl Sync for VmoCell {}  static T: VmoCell = VmoCell(core::cell::UnsafeCell::new(VmoTable {
+- `kernel/src/vmo.rs:87` [{] **U4** fn=`tbl`
+  > unsafe { &mut *T.0.get() } } 
+- `kernel/src/vmo.rs:127` [{] **U2** fn=`vmo_create`
+  > unsafe { core::ptr::write_bytes((pa + hhdm) as *mut u8, 0, PAGE) }; frames[got] = pa / PAGE as u64; got += 1;
+- `kernel/src/vmo.rs:237` [{] **U2** fn=`vmo_write`
+  > unsafe { core::ptr::copy(src.as_ptr().add(done), (pa + hhdm) as *mut u8, k) }; done += k; }
+- `kernel/src/vmo.rs:270` [{] **U2** fn=`vmo_read`
+  > unsafe { core::ptr::copy((pa + hhdm) as *const u8, dst.as_mut_ptr().add(done), k) }; done += k; }
