@@ -25,7 +25,10 @@ pub const MOD_STACK_KUSER: ModuleId = ModuleId(15);
 /// 全局下标 = `cpu * MAX_TASKS + slot`，所以 BSP 的任务下标仍是 0..MAX_TASKS。
 /// 6 → 8 是 M4-1 撞出来的（Done 的任务以前从不回收槽位）。加两格只是容量，
 /// 不是把回收问题解掉：过程与现在的状态见 BACKLOG 的 M4 一节。
-pub const MAX_TASKS: usize = 8;
+/// 8 → 9 是 W3 P3 的 Q2 裁决（2026-11-09，使用者选定）：参考 workload
+/// （init + 3 子进程 × 2 线程 = 7 条线程）加 boot 上下文与兜底 idle **正好 9 格、零余量**。
+/// 实测读数与三本账的代价见 ADR-071 决策 3 的补记；再要余量得重开那一题。
+pub const MAX_TASKS: usize = 9;
 // ADR-041：VA 保留表的容量归 memory 拥有；扩槽要把 memory 的容量一起抬。
 const _: () = assert!(MAX_TASKS <= crate::mm::MAX_TASKS_SUPPORTED);
 /// 全系统可登记的任务数（跨所有 CPU）。用例读 `WORK[i]` / `state_of(i)` 时用的是这个空间里的全局下标。

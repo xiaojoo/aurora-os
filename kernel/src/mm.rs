@@ -65,11 +65,13 @@ const FI_USED: u8 = 1;
 const FI_PINNED: u8 = 2;
 const FRAME_INFO_BYTES: usize = core::mem::size_of::<FrameInfo>();
 /// VA 保留登记表容量。**memory 拥有的固定上限**（ADR-065 supersede ADR-041 的派生公式）：
-/// 定长 256 + 空闲位图，给 W3 每进程 VA 保留留余量。旧派生公式 `MAX_CPUS*MAX_TASKS_SUPPORTED+16`=80
-/// 在 M4 开用户态后就撞过 `L4: VA 保留登记表已满`；24 更是 M2 旧值。容量与 sched 任务槽策略解耦——
-/// `MAX_TASKS_SUPPORTED` 仍管"sched 每 CPU 最多几个任务"的契约（sched.rs 的 const 断言），不再派生 VA 容量。
+/// 定长 256 + 空闲位图，给 W3 每进程 VA 保留留余量。旧派生公式 `MAX_CPUS*MAX_TASKS_SUPPORTED+16`
+/// （当时 8×8+16=80）在 M4 开用户态后就撞过 `L4: VA 保留登记表已满`；24 更是 M2 旧值。
+/// 容量与 sched 任务槽策略解耦——`MAX_TASKS_SUPPORTED` 仍管"sched 每 CPU 最多几个任务"的契约
+/// （sched.rs 的 const 断言），不再派生 VA 容量。W3 P3 随 sched 的 8→9 同步抬到 9（Q2 裁决），
+/// **VA 表仍是 256，不跟着派生**：每任务栈占 5 页 VA，9×8=72 条满配也只用 72 格。
 /// 登记不下时**明确失败**而不是发一条没登记的 VA（见 alloc_va_range 的注释）。
-pub const MAX_TASKS_SUPPORTED: usize = 8;
+pub const MAX_TASKS_SUPPORTED: usize = 9;
 const MAX_VA_RESERVATIONS: usize = 256;
 /// 占用位图字数（bit i=1 表示槽 i 已用）。所有访问都在 VMM 锁内，普通 u64 即可（非原子）。
 const VA_BITMAP_WORDS: usize = MAX_VA_RESERVATIONS / 64;

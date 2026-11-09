@@ -1920,6 +1920,17 @@ fn t_q2_workload_slots() -> bool {
     let rel0 = sched::reap_released();
     // active 的基线里含跑用例的 boot 上下文自己（它也是 Running），所以拿读数对读数
     let act0 = sched::tasks_active();
+    // 本 CPU 此刻占着几格：这一格解释"成功数为什么小于请求数"——链接顺序会把别的用例
+    // 留下的任务算进来，而 `spawn` 只往调用者这颗 CPU 放（今天没有迁移）。
+    let me_cpu = cpu::self_slot();
+    let slots_used0 = (0..sched::MAX_TASKS)
+        .filter(|&sl| sched::state_of(sched::gidx(me_cpu, sl)) != sched::TaskState::Free)
+        .count();
+    // 其中"已 Done 但还没被回收"的格数：这一格是 BACKLOG ⑫ 那笔欠账的容量代价——
+    // 有效容量 = MAX_TASKS - 先占，而先占里有一部分是收工了却还占着槽的任务。
+    let slots_done0 = (0..sched::MAX_TASKS)
+        .filter(|&sl| sched::state_of(sched::gidx(me_cpu, sl)) == sched::TaskState::Done)
+        .count();
     if pc0 != 0 || jc0 != 0 {
         crate::log_fatal!("q2: 前提失效 残留进程={} Job={}", pc0, jc0);
         return false;
@@ -2037,9 +2048,9 @@ fn t_q2_workload_slots() -> bool {
     let baseline_ok = drained && jd.is_ok() && pc1 == 0 && jc1 == 0 && active1 == act0;
 
     crate::log_info!(
-        "q2(P3): 请求={} 成功={} 拒绝={} 峰值同活={} active基线={} active峰值={} 收工={} 收尸={} 回滚={} 每CPU槽上限={} 参考需线程+boot+idle={} 回基线=(drained{} free{}->{} va{}->{} active{})",
+        "q2(P3): 请求={} 成功={} 拒绝={} 峰值同活={} active基线={} active峰值={} 收工={} 收尸={} 回滚={} 每CPU槽上限={} 本CPU先占={}(其中Done待收={}) 参考需线程+boot+idle={} 回基线=(drained{} free{}->{} va{}->{} active{})",
         total_req, ok_n, refused, peak_live, act0, peak_active, ended, reaped, rolled_back,
-        sched::MAX_TASKS, total_req + 2, drained, f0, f1, va0, va1, active1);
+        sched::MAX_TASKS, slots_used0, slots_done0, total_req + 2, drained, f0, f1, va0, va1, active1);
     let ok = cap_ok && peak_ok && done_ok && rollback_ok && baseline_ok;
     if !ok {
         crate::log_fatal!(
