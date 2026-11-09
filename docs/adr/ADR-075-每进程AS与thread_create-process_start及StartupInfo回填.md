@@ -1,6 +1,6 @@
 # ADR-075：每进程一份 AS、`thread_create`/`process_start` 与 `StartupInfo` 的内核回填
 
-状态：提议（2026-11-09 起草；**P5a 已落地并回填读数**，见补记；P5b/P5c 仍是设计，未验证）
+状态：提议（2026-11-09 起草；**P5a 与 P5b 的跳板那一半已落地并回填读数**，见两份补记；P5b 的 AS 换人接线与 P5c 仍是设计，未验证）
 关联：ADR-007（capability 与裁决 E）、ADR-027（释放推迟到"不是它"）、ADR-041/065（VA 保留表归 memory、定长 256）、
 ADR-044（环内边棘轮）、ADR-047 决策 2 / ADR-048 决策 3（持锁不跨未知回调、拿队列锁不等跨 CPU 的锁）、
 ADR-070（每进程一份 PML4、内核半区冻结、不做 PCID/KPTI）、ADR-071（等待与上限分开）、
@@ -199,6 +199,31 @@ probe(P5a): 魔数=true ABI位=true 句柄=true 写=true VA=true 自读回=true
 - **P5-0 留下的那一半证人本轮补上了**：登记之前 `check-unsafe` 报
   `aurora-user-probe: 有 9 处含 unsafe 的行但未登记` ⇒ 证明普查范围真的覆盖新包，
   不是只对既有的两个根生效。
+
+## 补记：P5b 第一半落地（跳板搬进内核半区，2026-11-09，实测）
+
+决策 7 已落地，**决策 2（AS 接进换人路径）还没做**——本节只覆盖跳板那一半，别把它读成 P5b 完成。
+
+- `TRAMPOLINE_VA` 从 `USER_VA_TOP - PAGE` 改成 **`0xffff_ffff_6ff0_0000`**：内核半区、
+  动态分配区上界（`0xffff_ffff_7000_0000`）之下一页，不在镜像（`0xffffffff80000000` 起）也不在 HHDM 里；
+  `reserve_va_at` 占住之后分配器跳过它 ⇒ **一份共享、不占 N 条保留**。
+- `ensure_trampoline()` 加**冻结前置**：`mm::aspace_count() != 0` 时明确拒绝并打 fatal
+  （已有非内核 AS 之后再往内核半区铺新映射就是违反 ADR-070 决策 2），不靠调用顺序的运气。
+- 决策 7 要求重验的三件事，读数如下（`handles` 档 **81/81**）：
+  ①kill 落脚处：`user: killed=true kills=1 bad_state=Free runs=0 落脚页用户可达=true`；
+  ②生效位：两处 `tramp_ok` 都绿（`user && executable && !writable`）；
+  ③SYSCALL/SYSRET 与 swapgs 窗口：`abi: … served=35 分区=true 落脚页=true` 那一格绿，
+  且全程无 SMEP 相关故障（内核没有执行过那一页）。
+- **门禁与矩阵**：`check` 17/17；矩阵跑了**两次**：第一次 44/45，红的是挂 `-d int` 的
+  "目的地由宿主机按 SP 数到"，成因 `L4 mm: shootdown 超时 va=0xffff800020597000 还差 1 个回执`；
+  **同一 ELF（`ffa7a00ffa56`）复跑 45/45**。归因：仪器把 AP 的回执拖过 6 ms 上界
+  （`p4-tolerance.md` 已有同源记录：挂 trace 的 30 跑里 3 跑标定被拒），
+  **不归因到跳板改动**——超时那条 VA 是 HHDM 别名，跳板在 `0xffff_ffff_6ff0_0000`，两者无关。
+- `bench` 4/4（P4 地板 1.35 %、P1 同构建地板 3981 周期，`baselines/2026-11-09T15-19-04Z-p3p4.txt`）。
+- **未做/未验证**：冻结前置那条新规则的**负样本没做**——今天构造不出它的前提
+  （`TRAMP` 一旦建好就幂等，而所有 AS 用例都自己收干净，所以"有 AS 且跳板未建"这个状态不可达）。
+  它防的是将来有人把第一次 `ensure_trampoline` 挪到 AS 创建之后；要证红得加一个 test-only 的
+  TRAMP 复位入口，本轮不加（那是为变异造 API）。**记为未验证，不写成已证。**
 
 ## 备选方案
 

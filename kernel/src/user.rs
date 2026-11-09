@@ -447,12 +447,21 @@ fn reset_counters() {
     BAD_PTRS.store(0, Ordering::Relaxed);
 }
 
-/// **内核拥有的用户态落脚页**（vsyscall 那一族的形状）：用户窗口最顶上一页 `USER_RX`，
-/// 内容只有 `jmp .`，建好之后永不撤销。
-/// kill 的出口必须跳进一个**不属于任何任务**的可执行用户地址，否则同一个故障每秒重演几千次；
-/// 它不能由测试脚手架提供，否则"容器被杀往哪儿跳"取决于 `.ktests` 的链接顺序。
-/// 论证、现场与判据（`tramp_ok`）：ADR-028、§10.7。
-pub const TRAMPOLINE_VA: u64 = mm::USER_VA_TOP - mm::PAGE as u64;
+/// **内核拥有的用户态落脚页**（vsyscall 那一族的形状）：`USER_RX` 一页，内容只有 `jmp .`，
+/// 建好之后永不撤销。kill 的出口必须跳进一个**不属于任何任务**的可执行用户地址，
+/// 否则同一个故障每秒重演几千次；它不能由测试脚手架提供，否则"容器被杀往哪儿跳"
+/// 取决于 `.ktests` 的链接顺序。论证、现场与判据（`tramp_ok`）：ADR-028、§10.7。
+///
+/// **W3 P5b（ADR-075 决策 7，使用者裁决）：从用户窗口顶端搬进内核半区共享一份。**
+/// 原来它是 `USER_VA_TOP - PAGE`，每个 AS 都得各自映一份，而 VA 保留表是**全局一张**
+/// （3a 裁决）⇒ N 个进程要 N 条保留、`TRAMPOLINE_VA` 也不再是常量。
+/// 搬进内核半区之后：所有 AS 的高 256 项复制自 AS_KERNEL、下层表本来就共享（ADR-070 决策 2），
+/// 一份就够，且不占动态区的保留格。选址在动态分配区的**上界之下一页**
+/// （`alloc_va_range` 扫到 `0xffff_ffff_7000_0000` 为止），既不在镜像（`0xffffffff80000000` 起）
+/// 也不在 HHDM 里；`reserve_va_at` 占住它之后分配器会跳过。
+/// **必须在第一个非内核 AS 创建之前建**（否则就是往冻结后的内核半区铺新映射），
+/// 这条下面变成显式拒绝，不靠调用顺序的运气。
+pub const TRAMPOLINE_VA: u64 = 0xffff_ffff_6ff0_0000;
 
 static TRAMP: AtomicU64 = AtomicU64::new(0);
 
@@ -466,6 +475,14 @@ pub fn ensure_trampoline() -> Option<u64> {
     let got = TRAMP.load(Ordering::Acquire);
     if got != 0 {
         return Some(got);
+    }
+    // 冻结前置（ADR-070 决策 2 / ADR-075 决策 7）：跳板现在住内核半区，
+    // 已有非内核 AS 之后再建它就是往冻结后的共享表里铺新映射 ⇒ 明确拒绝，不静默。
+    let aspaces = mm::aspace_count();
+    if aspaces != 0 {
+        crate::log_fatal!(
+            "user: trampoline 必须在第一个 AS 之前建（此刻已有 {} 个非内核 AS）", aspaces);
+        return None;
     }
     if !mm::reserve_va_at(TRAMPOLINE_VA, 1) {
         crate::log_fatal!("user: trampoline 的 VA 被占了（{:#x}）", TRAMPOLINE_VA);

@@ -5853,6 +5853,32 @@ ADR-075 未决 3–7 五条仍未裁。
 按"有没有第三个真实调用者"再定（硬约束 2）；③`release` 会重建镜像并跑复现性检查，
 它写 `docs/release/sbom.json` 与镜像摘要 ⇒ 新增成员那一轮必须跑它，否则 check-sbom 红。
 
+## 157. W3 P5b 第一半：跳板搬进内核半区共享一份（ADR-075 决策 7，2026-11-09，实测）
+
+**只做了跳板这一半，决策 2（AS 接进换人路径）还没做**——别把本节读成 P5b 完成。
+
+`TRAMPOLINE_VA`：`USER_VA_TOP - PAGE` → **`0xffff_ffff_6ff0_0000`**（内核半区、动态分配区上界之下一页，
+不在镜像也不在 HHDM；`reserve_va_at` 占住后分配器跳过）。一份共享所有 AS（高 256 项复制、下层表共享），
+**不占 N 条全局保留**。`ensure_trampoline()` 加冻结前置：已有非内核 AS 时明确拒绝 + fatal。
+
+**读数**：`check` **17/17**；`handles` 档 **81/81**（kill 落脚处 `killed=true kills=1 bad_state=Free 落脚页用户可达=true`、
+两处 `tramp_ok` 生效位绿、`abi: served=35 分区=true 落脚页=true` ⇒ SYSCALL/SYSRET 与 swapgs 窗口那一格绿、
+全程无 SMEP 故障）；矩阵**两次**：44/45 → 同一 ELF `ffa7a00ffa56` 复跑 **45/45**；
+`bench` **4/4**（P4 地板 1.35 %、P1 同构建地板 3981，`baselines/2026-11-09T15-19-04Z-p3p4.txt`）。
+
+**那次矩阵红要读清**：挂 `-d int` 的"目的地由宿主机按 SP 数到"行 `L4 mm: shootdown 超时
+va=0xffff800020597000 还差 1 个回执`；同一 ELF 复跑就绿 ⇒ 归因到**仪器把 AP 回执拖过 6 ms 上界**
+（`p4-tolerance.md` 的 `-d int` 一节已有同源记录），**不归因到跳板**（超时那条是 HHDM 别名，
+跳板在 `0xffff_ffff_6ff0_0000`）。这是该家族第二次以 shootdown 超时形态出现（第一次在 P4b 那轮的 split-OOM 行）。
+
+**未验证**：冻结前置那条新规则的**负样本没做**。它的前提（有 AS 且跳板未建）今天不可达：
+`TRAMP` 建好即幂等，而所有 AS 用例都自己收干净。要证红得加一个 test-only 的 TRAMP 复位入口，
+本轮不加（不为变异造 API）⇒ 按纪律记"未验证"，不写成已证。
+
+**下一步**：P5b 第二半 = `Task.as_slot` + 换人点"不同才写 CR3" + 两个 AS 同 VA 隔离的用例（D7/D8），
+然后才是 P5c。CR3 读表要放在**放掉 RUNQ 之后**（持队列锁去取 VMM 会把别的 CPU 的 shootdown 等待
+绑到本 CPU 的队列上，ADR-047 决策 2 的形状）。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。
