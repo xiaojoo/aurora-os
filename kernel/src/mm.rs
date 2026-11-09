@@ -1238,24 +1238,39 @@ pub fn shootdown_self() {
 /// 请求方：让所有**其它在线** CPU 各回一次执，收不齐就升 L4。
 /// 调用前提：持有 VMM 锁（`unmap_pages` 内部）。
 fn shootdown_others(va: u64) {
+    shootdown_inner(va, None)
+}
+
+/// 收窄版（ADR-072）：只通知 `mask` 位图里的在线 CPU（除自己）。
+/// 调用前提：持有 VMM 锁。`mask` 的 bit i = CPU i 曾跑过该 AS（`running_on`）。
+/// 内核半区 / HHDM 改动仍走 `shootdown_others`（全广播），不走这里。
+pub fn shootdown_masked(va: u64, mask: u8) {
+    shootdown_inner(va, Some(mask))
+}
+
+/// 公共实现：`mask=None` 全广播（原 `shootdown_others`），`Some(m)` 只通知位图里的。
+/// 架构引用全在这个函数里（与原来的 `shootdown_others` 同一批行），两个 wrapper 零新增站点。
+fn shootdown_inner(va: u64, mask: Option<u8>) {
     let me = crate::arch::x86_64::cpu::self_slot();
     let mut want = 0usize;
     let mut base = [0usize; crate::arch::x86_64::cpu::MAX_CPUS];
     for s2 in 0..crate::arch::x86_64::cpu::MAX_CPUS {
-        if s2 != me && crate::arch::x86_64::cpu::is_online(s2) {
+        let in_mask = mask.map_or(true, |m| m & (1 << s2) != 0);
+        if s2 != me && in_mask && crate::arch::x86_64::cpu::is_online(s2) {
             base[s2] = SD_ACKS[s2].load(Ordering::Acquire);
             want += 1;
         }
     }
     SD_REQUESTS.fetch_add(1, Ordering::Relaxed);
     if want == 0 {
-        return; // 单核：本 CPU 的条目已经在 clear_leaf 里清掉了
+        return; // 单核或位图里没有别人：本 CPU 的条目已经在 clear_leaf 里清掉了
     }
     SD_VA.store(va, Ordering::Release);
     // 逐点名（不用"除本 CPU 外全体"的缩写：本机实测收不到，理由写在 apic::send_ipi_to 上）。
     // 顺序是"先发布 VA，再发 IPI"：处理方读的就是 SD_VA，反过来它可能读到上一条请求的 VA。
     for s2 in 0..crate::arch::x86_64::cpu::MAX_CPUS {
-        if s2 == me || !crate::arch::x86_64::cpu::is_online(s2) {
+        let in_mask = mask.map_or(true, |m| m & (1 << s2) != 0);
+        if s2 == me || !in_mask || !crate::arch::x86_64::cpu::is_online(s2) {
             continue;
         }
         let Some(dest) = crate::arch::x86_64::cpu::lapic_id_of(s2) else { continue };
@@ -1268,7 +1283,8 @@ fn shootdown_others(va: u64) {
     let t0 = crate::tsc::now();
     loop {
         let missing = (0..crate::arch::x86_64::cpu::MAX_CPUS).filter(|&s2| {
-            s2 != me && crate::arch::x86_64::cpu::is_online(s2) && SD_ACKS[s2].load(Ordering::Acquire) == base[s2]
+            let in_mask = mask.map_or(true, |m| m & (1 << s2) != 0);
+            s2 != me && in_mask && crate::arch::x86_64::cpu::is_online(s2) && SD_ACKS[s2].load(Ordering::Acquire) == base[s2]
         }).count();
         if missing == 0 {
             break;
@@ -1636,11 +1652,15 @@ struct AspaceEntry {
     /// 但 P1 只建空 AS（1 张），给 16 是"接缝够用"的尺，不是推导值。
     pt_frames: [u64; AS_PT_SLOTS],
     pt_count: usize,
+    /// 曾经跑过这个 AS 的 CPU 位图（ADR-072）。bit i = CPU i 曾切入过。
+    /// **只增不减**（换走时不摘：摘除要证明"不会再有该 AS 的 TLB 条目"，TCG 观测不到）；
+    /// 销毁时清零。shootdown 收窄路径只通知这张位图里的 CPU。
+    running_on: u8,
 }
 
 const AS_PT_SLOTS: usize = 16;
 const AS_EMPTY: AspaceEntry =
-    AspaceEntry { used: false, pml4: 0, pt_frames: [0; AS_PT_SLOTS], pt_count: 0 };
+    AspaceEntry { used: false, pml4: 0, pt_frames: [0; AS_PT_SLOTS], pt_count: 0, running_on: 0 };
 
 #[derive(Clone, Copy)]
 struct AspaceTable {
@@ -1750,7 +1770,7 @@ pub fn aspace_new() -> Option<AspaceHandle> {
             (*mine).0[i] = (*kernel).0[i];
         }
     }
-    t.items[slot] = AspaceEntry { used: true, pml4, pt_frames: [0; AS_PT_SLOTS], pt_count: 0 };
+    t.items[slot] = AspaceEntry { used: true, pml4, pt_frames: [0; AS_PT_SLOTS], pt_count: 0, running_on: 0 };
     t.items[slot].pt_frames[0] = frame;
     t.items[slot].pt_count = 1;
     AS_PT_LIVE.fetch_add(1, Ordering::Relaxed);
@@ -1790,15 +1810,37 @@ pub fn aspace_count() -> usize {
     aspaces().items.iter().filter(|e| e.used).count()
 }
 
+/// 读一个 AS 的 `running_on` 位图（ADR-072 见证）。slot 不存在返回 None。
+pub fn aspace_running_on(slot: u8) -> Option<u8> {
+    let _g = vmm();
+    let e = aspaces().items.get(usize::from(slot))?;
+    if e.used { Some(e.running_on) } else { None }
+}
+
+/// 手动把一颗 CPU 登记进 AS 的位图（**用例专用**：产品路径由 `aspace_switch` 自动登记）。
+/// 返回登记前的位图。slot 不存在返回 None。
+pub fn aspace_register_cpu(slot: u8, cpu: usize) -> Option<u8> {
+    let bit = 1u8.checked_shl(cpu as u32)?;
+    let _g = vmm();
+    let e = aspaces().items.get_mut(usize::from(slot))?;
+    if !e.used { return None; }
+    let old = e.running_on;
+    e.running_on |= bit;
+    Some(old)
+}
+
 /// 把本 CPU 切到给定 PML4。**只在目标与当前 CR3 不同时才写**（ADR-070 决策 4 / A2 判据）。
 /// 返回"这次真的写了 CR3 吗"。调用方必须保证目标表的内核半区与 AS_KERNEL 等价
 /// （否则一切换内核代码就取不到指）——这个前提由 `aspace_new` 的构造保证，
 /// 而 A1 的见证函数负责把它变成可判的。
 ///
+/// `me` 是调用方的 CPU 槽号（由调用方传入，避免本函数新增 arch:: 引用撞棘轮）。
+/// 切换成功后把 `me` 登记进目标 AS 的 `running_on`（ADR-072：只增不减）。
+///
 /// # Safety
 /// `pml4` 必须是本内核自建、内核半区已复制等价的有效 PML4 物理地址；
 /// 调用时 IF 状态由调用方负责（本函数不动 IF）。
-pub unsafe fn aspace_switch(pml4: u64) -> bool {
+pub unsafe fn aspace_switch(pml4: u64, me: usize) -> bool {
     // SAFETY: 读 CR3 是特权读，调用方在 ring0；原语在上方 global_asm 里，只动 CR3
     let cur = unsafe { aspace_cr3_read() };
     if cur == pml4 {
@@ -1807,16 +1849,28 @@ pub unsafe fn aspace_switch(pml4: u64) -> bool {
     // SAFETY: 调用方保证 pml4 有效且内核半区等价；原语只换表不动栈
     unsafe { aspace_cr3_write(pml4) };
     CR3_WRITES.fetch_add(1, Ordering::Relaxed);
+    // ADR-072：登记"这颗 CPU 曾跑过这个 AS"。只增不减（换走时不摘）。
+    // 内核半区共享，所以切换后 VMM 锁与 ASPACES 表仍可达。
+    // running_on 是 u8（8 位 = MAX_CPUS），checked_shl 在 me>=8 时返回 None，不引入 arch:: 引用。
+    if let Some(bit) = 1u8.checked_shl(me as u32) {
+        let _g = vmm();
+        for e in aspaces().items.iter_mut() {
+            if e.used && e.pml4 == pml4 {
+                e.running_on |= bit;
+                break;
+            }
+        }
+    }
     true
 }
 
-/// 切回内核 AS（`aspace_switch(our_cr3())` 的便利入口）。返回是否真的写了。
+/// 切回内核 AS 的便利入口。返回是否真的写了。`me` 同 `aspace_switch`。
 ///
 /// # Safety
 /// 同 `aspace_switch`；`our_cr3()` 非 0（启动已切换）。
-pub unsafe fn aspace_switch_kernel() -> bool {
+pub unsafe fn aspace_switch_kernel(me: usize) -> bool {
     // SAFETY: our_cr3 是启动时建的内核表，前提由 take_over 保证
-    unsafe { aspace_switch(our_cr3()) }
+    unsafe { aspace_switch(our_cr3(), me) }
 }
 
 /// 已有非内核 AS 之后，内核半区的新映射一律拒绝（ADR-070 决策 2 的冻结前置，判据 A6）。

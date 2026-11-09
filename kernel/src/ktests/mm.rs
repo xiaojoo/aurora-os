@@ -596,16 +596,17 @@ fn t_aspace_create_switch_destroy() -> bool {
     // A2：切过去（真的写一次）→ 同 AS 连切 8 次（一次都不许写）→ 切回来（再写一次）
     // 切换期间跑的是**内核代码**（本用例自己），这正是"内核半区等价"的意义：
     // 不等价的话第一条指令就取不到，根本走不到读数行。
-    let w_cross = unsafe { mm::aspace_switch(pml4) };
+    let me = crate::arch::x86_64::cpu::self_slot();
+    let w_cross = unsafe { mm::aspace_switch(pml4, me) };
     let mut same_writes = 0usize;
     for _ in 0..8 {
-        if unsafe { mm::aspace_switch(pml4) } {
+        if unsafe { mm::aspace_switch(pml4, me) } {
             same_writes += 1;
         }
     }
     // 在新 AS 上读一次自己的内核数据（证明确实在那个表上跑了一段）
     let alive_on_aspace = mm::is_ready() && mm::free_frames() > 0;
-    let w_back = unsafe { mm::aspace_switch_kernel() };
+    let w_back = unsafe { mm::aspace_switch_kernel(me) };
     let c1 = mm::counters();
     let a2 = w_cross && same_writes == 0 && w_back
         && c1.cr3_writes == c0.cr3_writes + 2 && alive_on_aspace;
@@ -654,6 +655,87 @@ fn t_aspace_create_switch_destroy() -> bool {
     ok
 }
 ktest!(KT_ASPACE, t_aspace_create_switch_destroy);
+
+// ---- ADR-072（W3 P2）shootdown 按 AS 收窄 ----
+//
+// 四格：①位图登记（切入后 running_on 含 BSP）；②narrowed 只通知位图里的 CPU；
+// ③broadcast 通知全在线 CPU；④销毁后位图清零。
+// 变异：narrowed 忽略 mask 全广播 ⇒ ②的 ack 增量等于③ ⇒ 红。
+
+fn t_shootdown_masked() -> bool {
+    // 前提：AP 必须在线（narrowed 与 broadcast 的区别只在多核时可见）
+    if crate::arch::x86_64::smp::bringup().is_err() {
+        crate::log_fatal!("sd-mask: AP 起不来，收窄判据没有证人");
+        return false;
+    }
+    let me = crate::arch::x86_64::cpu::self_slot();
+    let n0 = mm::aspace_count();
+    if n0 != 0 {
+        crate::log_fatal!("sd-mask: 前提失效，进来时已有 {} 个 AS", n0);
+        return false;
+    }
+    let h = match mm::aspace_new() {
+        Some(h) => h,
+        None => {
+            crate::log_fatal!("sd-mask: 建 AS 失败");
+            return false;
+        }
+    };
+    let pml4 = match h.pml4() {
+        Some(p) => p,
+        None => { crate::log_fatal!("sd-mask: 读不回 PML4"); return false; }
+    };
+    // ① 切入 → 位图应含 BSP
+    let _ = unsafe { mm::aspace_switch(pml4, me) };
+    let _ = unsafe { mm::aspace_switch_kernel(me) };
+    let bm_after_switch = mm::aspace_running_on(0).unwrap_or(0);
+    let reg_ok = bm_after_switch & (1 << me) != 0;
+
+    // 手动登记 AP1（模拟"那颗 CPU 也曾跑过这个 AS"）
+    let ap1 = 1usize;
+    let _ = mm::aspace_register_cpu(0, ap1);
+    let bm = mm::aspace_running_on(0).unwrap_or(0);
+
+    // ② narrowed：只通知位图里的（BSP+AP1），BSP 是 self 排除 ⇒ 只 AP1 收到
+    let va: u64 = 0x1_0000_0000; // 用户半区，未映射，invlpg 无害
+    let s0 = mm::shootdown_stats();
+    mm::with_vmm_lock(|| mm::shootdown_masked(va, bm));
+    let s1 = mm::shootdown_stats();
+    let ack_delta: [usize; crate::arch::x86_64::cpu::MAX_CPUS] =
+        core::array::from_fn(|i| s1.acks[i] - s0.acks[i]);
+    // AP1 应 +1，AP2/AP3 应 +0
+    let narrowed_ok = ack_delta[ap1] == 1
+        && ack_delta[2] == 0 && ack_delta[3] == 0
+        && s1.requests == s0.requests + 1;
+
+    // ③ broadcast：全在线 CPU 都收到（AP1/AP2/AP3 各 +1）
+    let s2 = mm::shootdown_stats();
+    mm::with_vmm_lock(|| mm::shootdown_masked(va, 0xFF)); // 0xFF = 全广播等价
+    let s3 = mm::shootdown_stats();
+    let bcast_delta: [usize; crate::arch::x86_64::cpu::MAX_CPUS] =
+        core::array::from_fn(|i| s3.acks[i] - s2.acks[i]);
+    let online_aps = (1..crate::arch::x86_64::cpu::MAX_CPUS)
+        .filter(|&c| crate::arch::x86_64::cpu::is_online(c)).count();
+    let bcast_ok = (1..crate::arch::x86_64::cpu::MAX_CPUS)
+        .all(|c| !crate::arch::x86_64::cpu::is_online(c) || bcast_delta[c] == 1)
+        && s3.requests == s2.requests + 1;
+
+    // ④ 销毁后位图清零（AS_EMPTY.running_on = 0）
+    drop(h);
+    let bm_after_drop = mm::aspace_running_on(0);
+
+    crate::log_info!(
+        "sd-mask(P2): 登记={} 位图={:#x} narrowed_ack={:?} broadcast_ack={:?} 在线AP={} 销毁后位图={:?}",
+        reg_ok, bm, ack_delta, bcast_delta, online_aps, bm_after_drop);
+    let ok = reg_ok && narrowed_ok && bcast_ok && online_aps >= 1 && bm_after_drop.is_none();
+    if !ok {
+        crate::log_fatal!(
+            "sd-mask: 判据不成立 登记={} narrowed={} broadcast={} 销毁后={:?}",
+            reg_ok, narrowed_ok, bcast_ok, bm_after_drop);
+    }
+    ok
+}
+ktest!(KT_SHOOTDOWN_MASKED, t_shootdown_masked);
 
 // ---- ADR-067（W2 P5）demand-zero ----
 //

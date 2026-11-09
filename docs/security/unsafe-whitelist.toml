@@ -45,13 +45,13 @@ expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe
 # 2026-11-07 P7：hello 加了 syscall3（U1 两处）与 ring3 句柄读/close（U5 三处）。
 
 [unsafe-census]
-total = 334
+total = 336
 U1 = 59
 U2 = 84
 U3 = 13
 U4 = 121
 U5 = 28
-U6 = 29
+U6 = 31
 
 [modules."acpi"]
 U2 = 1
@@ -119,7 +119,7 @@ U6 = 6
 # P4（ADR-066）+4：t_split_huge 的金丝雀旧写/新读、OOM 格读回、跨别名双向，
 # 全部落在本用例 phys_alloc 独占的块或新帧上，页对齐、HHDM 覆盖。
 # P5（ADR-067）+1：t_demand_zero 把桩代码写进尚未启动任务的 code2 帧（HHDM 内核别名直写）。
-U6 = 11
+U6 = 13
 # P5（ADR-067）+1：dz_page 的桩内容 HHDM 直写（帧由本用例 phys_alloc 独占、尚未映射成
 # 用户页，ADR-026 配方）。分类按操作实质：物理内存直写不是诊断现场读，故 U2。
 U2 = 1

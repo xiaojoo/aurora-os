@@ -5430,6 +5430,43 @@ P1 的 `aspace_switch` 今天不被产品路径的 `preempt_point` 调用，所�
 A1 读数之前，意味着**内核半区等价这条判据的红方向只能靠"机器死了"来兑现**，没有可读的 diff 行；
 真机上若要区分"哪一项不等价"，得在切换**之前**先比对（今天 `kernel_half_matches` 是切换之后才调的）。
 
+## 149. W3 P2：shootdown 按 AS 位图收窄（ADR-072，2026-11-09，实测）
+
+**范围**：`running_on: u8` 位图 + 登记/不摘/销毁清零；`shootdown_masked(va, mask)` 收窄路径；
+内核半区/HHDM 仍全广播。SD_VA 今天 VMM 串行化不是 bug（记录不改）。用例数 73 → **74**。
+
+**动了什么**：
+1. `mm.rs`：`AspaceEntry` 加 `running_on: u8`；`aspace_switch(pml4, me)` 写 CR3 后登记
+   （`1u8.checked_shl(me)` 零 arch:: 引用）；原 `shootdown_others` 重构为
+   `shootdown_inner(va, mask: Option<u8>)` + 两个 wrapper（`shootdown_others` = None，
+   `shootdown_masked` = Some）——**架构引用全在 inner 里，wrapper 零新增站点**；
+   见证 `aspace_running_on`/`aspace_register_cpu`；`aspace_release` 清表项时位图归零。
+2. `ktests/mm.rs`：P1 用例签名更新（加 `me`）；新用例 `t_shootdown_masked`（四格）。
+3. 登记面：unsafe 334 → **336**（ktests/mm U6 +2）；`public_api` 不变（新 pub 只被 ktests 引用）；
+   棘轮 `memory->arch` **仍 64**。
+
+**正向读数**（`build/_p2-final-serial.log:685`）：
+`sd-mask(P2): 登记=true 位图=0x3 narrowed_ack=[0, 1, 0, 0, 0, 0, 0, 0] broadcast_ack=[0, 1, 1, 1, 0, 0, 0, 0] 在线AP=3 销毁后位图=None`
+⇒ 74/74、PASS/33。narrowed 只通知 AP1（位图里除 self 外唯一一颗）；broadcast 通知全 3 AP。
+
+**MUTATION-P2**（`build/_p2-m-serial.log:685`）：`shootdown_masked` 忽略 mask 调 None ⇒
+`narrowed_ack=[0, 1, 1, 1, …]`（与 broadcast 相同）⇒ `narrowed=false`，`failed=1`、**35**。
+只有②红，①③④绿。还原后回 PASS。
+
+**门禁与矩阵**：`check` **17/17**；矩阵整轮 **45/45 全符合、0 不符**（`build/_p2-test.txt`，`test rc=0`）。
+bench（`baselines/2026-11-09T06-45-59Z-p3p4.txt`）：4/4 PASS、P4 地板 **0.34 %**、
+P1 `min` 5559/6189（同构建差 631）、`mean` 45494/47427；四把尺子全"能分辨=符合"。
+`shootdown_masked` 今天不被产品路径调用（用户半区为空），P1 均值不动在预期内。
+
+**没做的**：P4 的 `aspace_map`/`unmap` 路径还没接 `shootdown_masked`（今天用户半区为空，
+没有产品路径调用者）；位图保守偏大的代价（多余 IPI）在真机上要量；
+SD_VA 多槽留到 per-AS VMM 锁引入那天。
+
+**新发现的风险**：①`aspace_switch` 签名加了 `me` 参数，P3 的 `preempt_point` 接上时
+要从 sched 传 CPU 槽号（sched→arch 不套棘轮，所以那边可以直接调 `cpu::self_slot()`）；
+②`shootdown_inner` 的 `mask.map_or(true, |m| m & (1 << s2) != 0)` 在循环里每次重新算，
+MAX_CPUS=8 所以无所谓，但若将来扩到 64 核要改成预计算。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。
