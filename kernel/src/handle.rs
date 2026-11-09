@@ -411,8 +411,13 @@ pub fn transfer(h: Handle, from: (usize, u32), to: (usize, u32)) -> Result<Handl
 
 /// 回滚一次转移（`process_start` 第③步失败时调，ADR-075 决策 3 的那条"②③任一步失败必须回滚②"）。
 /// 用**新句柄值**定位槽位、核对现在的主人就是 `to`，然后把 owner 改回 `from` 并**再 bump 一次世代**
-/// ⇒ 中间态那个新句柄当场失效，两边都不会拿着一个"看起来有效其实已被回滚"的名字。
-pub fn transfer_rollback(new_h: Handle, to: (usize, u32), from: (usize, u32)) -> Result<(), HErr> {
+/// ⇒ 中间态那个新句柄当场失效。
+///
+/// **返回回滚之后的可用名字**（P5c-3 的 refinement，实测逼出来的）：bump 之后**发送方原来那个
+/// 句柄也一起失效**，如果这里只返回 `()`，那一格就变成"谁都 close 不掉的孤儿"——
+/// 现场是漏一份 VMO 引用与一帧、并把后面 14 格用例的收尾闸全打红。
+/// 交回新名字之后调用方 `close` 它即可回到基线，不需要动用 `revoke_task` 那种大范围撤销。
+pub fn transfer_rollback(new_h: Handle, to: (usize, u32), from: (usize, u32)) -> Result<Handle, HErr> {
     let mut g = TABLE.lock();
     let t = g.get();
     let Some((slot, gen)) = new_h.unpack() else {
@@ -425,11 +430,12 @@ pub fn transfer_rollback(new_h: Handle, to: (usize, u32), from: (usize, u32)) ->
         t.c.no_such += 1;
         return Err(HErr::NoSuch);
     }
-    e.gen = next_gen(gen);
+    let next = next_gen(gen);
+    e.gen = next;
     e.owner_gidx = from.0 as u16;
     e.owner_id = from.1;
     t.c.transfers += 1;
-    Ok(())
+    Ok(Handle::pack(slot, next))
 }
 
 /// 每槽独立；1..=GEN_MAX，跳过 0；到顶**回绕到 1**（设计 §9 G：承诺是计数上界，

@@ -1,6 +1,6 @@
 # unsafe 逐处审计表（U1–U6）
 
-总计 374 处。U1 65 · U2 99 · U3 13 · U4 129 · U5 32 · U6 36
+总计 376 处。U1 65 · U2 101 · U3 13 · U4 129 · U5 32 · U6 36
 
 本表由 `tools/aurora.py` 的 `unsafe_sites()` 从源码逐处生成，**不是手写的**。
 机器可读的权威来源是 `docs/security/unsafe-whitelist.toml` 的 `[modules.*]` 段（模块×类别→处数），
@@ -10,7 +10,7 @@
 ## 类别
 
 - **U1 架构入口与特殊寄存器** — 65 处，分布在 14 个模块：arch/x86_64/apic、arch/x86_64/cpu、arch/x86_64/smp、arch/x86_64/trap、hw、ktests/sched、mm、sched、serial、sync、tsc、user、user/hello
-- **U2 页表、物理内存与 MMIO** — 99 处，分布在 11 个模块：acpi、arch/x86_64/apic、heap、hw、ktests/mm、limine、mm、pci、sched、user、vmo
+- **U2 页表、物理内存与 MMIO** — 101 处，分布在 11 个模块：acpi、arch/x86_64/apic、heap、hw、ktests/mm、limine、mm、pci、sched、user、vmo
 - **U3 DMA 与设备共享内存** — 13 处，分布在 2 个模块：driver、limine
 - **U4 并发共享状态与 UnsafeCell** — 129 处，分布在 20 个模块：acpi、ahci、arch/x86_64/apic、arch/x86_64/smp、arch/x86_64/trap、driver、hooks、irq、ktests/elf、ktests/fs、ktests/sign、main、mm、pci、proc、sched、sync、user、virtio、vmo
 - **U5 用户指针与地址空间访问** — 32 处，分布在 3 个模块：user、user/hello、user/probe
@@ -371,17 +371,19 @@
   > unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), f.base().via_hhdm().0 as *mut u8, bytes.len()); }
 - `kernel/src/ktests/mm.rs:1142` [{] **U6** fn=`t_demand_zero`
   > unsafe { core::ptr::copy_nonoverlapping(blob2.as_ptr(), (code2_frame + mm::hhdm()) as *mut u8, blob2.len()); }
-- `kernel/src/ktests/mm.rs:1752` [{] **U2** fn=`as_worker`
+- `kernel/src/ktests/mm.rs:2004` [{] **U2** fn=`proc_sys_worker`
+  > unsafe { core::ptr::read_volatile((fr as usize + 10 * 8) as *const u64) } } None => u64::MAX,
+- `kernel/src/ktests/mm.rs:2362` [{] **U2** fn=`as_worker`
   > let v = unsafe { core::ptr::read_volatile(AS_VA as *const u64) }; ASR[idx].store(v, Ordering::Release); crate::sched::finish_current();
-- `kernel/src/ktests/mm.rs:1850` [{] **U6** fn=`t_aspace_switch_isolation`
+- `kernel/src/ktests/mm.rs:2460` [{] **U6** fn=`t_aspace_switch_isolation`
   > let _ = unsafe { mm::aspace_switch_kernel(me) }; let lock_in = crate::sync::stats().acquires; // SAFETY: pml4_a2 是自建表根且内核半区等价；此刻 IF 状态由本用例负责，本函数不动 IF
-- `kernel/src/ktests/mm.rs:1853` [{] **U6** fn=`t_aspace_switch_isolation`
+- `kernel/src/ktests/mm.rs:2463` [{] **U6** fn=`t_aspace_switch_isolation`
   > let wrote_a2 = unsafe { mm::aspace_switch(pml4_a2, me, Some(a2.slot())) }; let lock_delta = crate::sync::stats().acquires.wrapping_sub(lock_in); // 位图必须照样登记（不取锁不等于不记账）；这句**在 delta 之后**取 VMM
-- `kernel/src/ktests/mm.rs:1858` [{] **U6** fn=`t_aspace_switch_isolation`
+- `kernel/src/ktests/mm.rs:2468` [{] **U6** fn=`t_aspace_switch_isolation`
   > let back_kernel = unsafe { mm::aspace_switch_kernel(me) }; let bit_me = 1u8.checked_shl(me as u32).unwrap_or(0); let nolock_ok = wrote_a2 && back_kernel && lock_delta == 0 && bm_a2 & bit_me != 0;
-- `kernel/src/ktests/mm.rs:1866` [{] **U6** fn=`t_aspace_switch_isolation`
+- `kernel/src/ktests/mm.rs:2476` [{] **U6** fn=`t_aspace_switch_isolation`
   > let _ = unsafe { mm::aspace_switch_kernel(me) }; // SAFETY: 同一个内核根再切一次；返回 false 才说明 CR3 确实已经在内核表上 let back = !unsafe { mm::aspace_switch(mm::our_cr3(), me, None) };
-- `kernel/src/ktests/mm.rs:1868` [{] **U6** fn=`t_aspace_switch_isolation`
+- `kernel/src/ktests/mm.rs:2478` [{] **U6** fn=`t_aspace_switch_isolation`
   > let back = !unsafe { mm::aspace_switch(mm::our_cr3(), me, None) }; // 任务先死、映射再丢、AS 最后销毁（ADR-074 的契约顺序） let _ = sched::terminate_task(w0);
 
 ### ktests/sched
@@ -620,61 +622,63 @@
 
 ### sched
 
-- `kernel/src/sched.rs:440` [impl] **U4** fn=`reap`
+- `kernel/src/sched.rs:449` [impl] **U4** fn=`reap`
   > unsafe impl Sync for QueueCell {} static RQ: [QueueCell; crate::arch::x86_64::cpu::MAX_CPUS] = [const { QueueCell { lock: crate::sync::IrqSpinLock::new(crate::sync::RANK_RUNQ, ()), data: core::cell::UnsafeCell::new(EMPTY_QUEUE) }
-- `kernel/src/sched.rs:461` [{] **U4** fn=`reap`
+- `kernel/src/sched.rs:470` [{] **U4** fn=`reap`
   > unsafe { &*self.cell.data.get() } } }
-- `kernel/src/sched.rs:468` [{] **U4** fn=`reap`
+- `kernel/src/sched.rs:477` [{] **U4** fn=`reap`
   > unsafe { &mut *self.cell.data.get() } } }
-- `kernel/src/sched.rs:654` [{] **U4** fn=`current_of`
+- `kernel/src/sched.rs:663` [{] **U4** fn=`current_of`
   > unsafe { (*RQ[cpu].data.get()).current } } 
-- `kernel/src/sched.rs:890` [{] **U1** fn=`yield_now`
+- `kernel/src/sched.rs:926` [{] **U1** fn=`yield_now`
   > unsafe { core::arch::asm!("int {}", const crate::arch::x86_64::trap::VEC_RESCHED) }; } 
-- `kernel/src/sched.rs:935` [{] **U2** fn=`frame_rflags_of`
+- `kernel/src/sched.rs:971` [{] **U2** fn=`frame_rflags_of`
   > Some(unsafe { core::ptr::read_volatile((f as usize + RFLAGS_OFF) as *const u64) }) } 
-- `kernel/src/sched.rs:945` [{] **U4** fn=`owned_of`
+- `kernel/src/sched.rs:981` [{] **U4** fn=`owned_of`
   > unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].owned.count() } } 
-- `kernel/src/sched.rs:956` [{] **U4** fn=`task_frame`
+- `kernel/src/sched.rs:992` [{] **U4** fn=`task_frame`
   > Some(unsafe { (*RQ[cpu_of(task)].data.get()).tasks[slot_of(task)].frame }) } 
-- `kernel/src/sched.rs:1037` [impl] **U4** fn=`init_idle_task`
+- `kernel/src/sched.rs:1073` [impl] **U4** fn=`init_idle_task`
   > unsafe impl Sync for IdleStackCell {} static IDLE_STACKS: [IdleStackCell; crate::arch::x86_64::cpu::MAX_CPUS] = [const { IdleStackCell(core::cell::UnsafeCell::new(IdleStack([0; IDLE_STACK_BYTES]))) };
-- `kernel/src/sched.rs:1075` [{] **U1** fn=`idle_entry`
+- `kernel/src/sched.rs:1111` [{] **U1** fn=`idle_entry`
   > unsafe { core::arch::asm!("hlt", options(nomem, nostack)) }; } }
-- `kernel/src/sched.rs:1230` [{] **U2** fn=`init_idle`
+- `kernel/src/sched.rs:1266` [{] **U2** fn=`init_idle`
   > unsafe { core::ptr::write_volatile((f + i * 8) as *mut u64, *v) }; } let gi = gidx(cpu, slot);
-- `kernel/src/sched.rs:1307` [{] **U2** fn=`spawn_inner`
+- `kernel/src/sched.rs:1343` [{] **U2** fn=`spawn_inner`
   > unsafe { core::ptr::write_volatile((f + i * 8) as *mut u64, *v) }; } s.entries[slot] = Some(entry);
-- `kernel/src/sched.rs:1365` [{] **U2** fn=`spawn_user`
+- `kernel/src/sched.rs:1405` [{] **U2** fn=`spawn_user`
   > unsafe { core::ptr::write_volatile((f + i * 8) as *mut u64, *v) }; } s.entries[slot] = None; // 用户任务没有内核入口函数
-- `kernel/src/sched.rs:1521` [{] **U4** fn=`on_cpu_of`
+- `kernel/src/sched.rs:1561` [{] **U4** fn=`on_cpu_of`
   > Some(unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].on_cpu as usize }) } 
-- `kernel/src/sched.rs:1530` [{] **U4** fn=`stack_bounds`
+- `kernel/src/sched.rs:1570` [{] **U4** fn=`stack_bounds`
   > let t = unsafe { &(*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)] }; if t.stack_lo == 0 { return None;
-- `kernel/src/sched.rs:1547` [{] **U4** fn=`kstack_top_of`
+- `kernel/src/sched.rs:1587` [{] **U4** fn=`kstack_top_of`
   > let t = unsafe { &(*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)] }; if t.kstack_hi == 0 { return None;
-- `kernel/src/sched.rs:1559` [{] **U4** fn=`state_of`
+- `kernel/src/sched.rs:1599` [{] **U4** fn=`state_of`
   > unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].state } } 
-- `kernel/src/sched.rs:1569` [{] **U4** fn=`is_user`
+- `kernel/src/sched.rs:1621` [{] **U2** fn=`set_thread_arg`
+  > unsafe { core::ptr::write_volatile((f as usize + 10 * 8) as *mut u64, arg) }; true }
+- `kernel/src/sched.rs:1632` [{] **U4** fn=`is_user`
   > unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].user } } 
-- `kernel/src/sched.rs:1581` [{] **U4** fn=`is_resident`
+- `kernel/src/sched.rs:1644` [{] **U4** fn=`is_resident`
   > unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].resident } } 
-- `kernel/src/sched.rs:1642` [{] **U4** fn=`aspace_of`
+- `kernel/src/sched.rs:1705` [{] **U4** fn=`aspace_of`
   > unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].as_slot } } 
-- `kernel/src/sched.rs:1653` [{] **U4** fn=`id_of`
+- `kernel/src/sched.rs:1716` [{] **U4** fn=`id_of`
   > unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].id } } 
-- `kernel/src/sched.rs:1666` [{] **U4** fn=`proc_id_of`
+- `kernel/src/sched.rs:1729` [{] **U4** fn=`proc_id_of`
   > unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].proc_id } } 
-- `kernel/src/sched.rs:1674` [{] **U4** fn=`runs_of`
+- `kernel/src/sched.rs:1737` [{] **U4** fn=`runs_of`
   > unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].runs } } 
-- `kernel/src/sched.rs:1713` [fn] **U2** fn=`preempt_point`
+- `kernel/src/sched.rs:1776` [fn] **U2** fn=`preempt_point`
   > pub unsafe fn preempt_point(frame: u64, cpu: usize) { // 不跑调度器的 CPU 直接把标志倒掉再返回。今天 AP 的中断根本不经过这里 // （`isr_stub_cpu_timer` 是独立快路径），这条判断是给"把 AP 接进调度"留的
-- `kernel/src/sched.rs:1802` [{] **U2** fn=`preempt_point`
+- `kernel/src/sched.rs:1865` [{] **U2** fn=`preempt_point`
   > unsafe { mm::aspace_switch(target, cpu, next_as_slot) }; // 换出去的那次中断不会经过异常桩出口，所以在这里替它记账（见 trap::p3_record_irq） trap::p3_record_irq(cpu, crate::tsc::now().wrapping_sub(trap::entry_tsc_of(cpu)));
-- `kernel/src/sched.rs:1823` [{] **U1** fn=`preempt_point`
+- `kernel/src/sched.rs:1886` [{] **U1** fn=`preempt_point`
   > unsafe { p1_extra_flush(frame) }; crate::tsc::spin(20_000); }
-- `kernel/src/sched.rs:1847` [{] **U1** fn=`preempt_point`
+- `kernel/src/sched.rs:1910` [{] **U1** fn=`preempt_point`
   > unsafe { context_load(resume, if_open as u64) } } 
-- `kernel/src/sched.rs:1880` [{] **U2** fn=`preempt_hook`
+- `kernel/src/sched.rs:1943` [{] **U2** fn=`preempt_hook`
   > unsafe { preempt_point(frame, cpu) } }
 
 ### serial

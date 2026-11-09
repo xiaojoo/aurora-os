@@ -50,9 +50,9 @@ expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe
 # 2026-11-07 P7：hello 加了 syscall3（U1 两处）与 ring3 句柄读/close（U5 三处）。
 
 [unsafe-census]
-total = 374
+total = 376
 U1 = 65
-U2 = 99
+U2 = 101
 U3 = 13
 U4 = 129
 U5 = 32
@@ -130,7 +130,8 @@ U6 = 6
 U6 = 18
 # P5（ADR-067）+1：dz_page 的桩内容 HHDM 直写（帧由本用例 phys_alloc 独占、尚未映射成
 # 用户页，ADR-026 配方）。分类按操作实质：物理内存直写不是诊断现场读，故 U2。
-U2 = 2
+# P5c-3（ADR-075）+1：读被停住线程的首帧第 10 格（rdi），证"16 号真的把 StartupInfo 的 VA 交给了它"。
+U2 = 3
 
 [modules."ktests/sched"]
 U1 = 3
@@ -189,7 +190,8 @@ U4 = 3
 
 [modules."sched"]
 U1 = 4
-U2 = 7
+# P5c-3（ADR-075）+1：set_thread_arg 写已停住线程的首帧 rdi（持 RUNQ、任务是 Blocked ⇒ 无人同时读它）。
+U2 = 8
 # P5c-1（ADR-075）+1：`id_of` 的每 CPU 任务表快照读（与 `state_of` 同一条 SAFETY 论证）。
 U4 = 17
 

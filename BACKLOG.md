@@ -6060,6 +6060,47 @@ P4 地板 **0.13 %**（13 bp），`baselines/2026-11-09T18-38-44Z-p3p4.txt`；
 ②**仍开着**：启动映射今天挂在**创建者任务的资源袋**里（ADR-074 按任务归属），父先退子线程的代码/栈就没了——
 这一版照现状实现并配"父先退"负样本，进程级归属是 P7 的账，不在 c-3 偷偷做。
 
+## 162. W3 P5c-3：11/15/16 三个号 + StartupInfo 回填与转移（ADR-075 决策 1/3/5/8，2026-11-10，实测）
+
+`ABI_MINOR` **7 → 8**、新特性位 **`F_PROC = 64`**（与 F_HANDLES/F_VMO 同一条件、读回真实状态）。
+11 `process_create` 只返回 **Proc 句柄**（决策 8），子进程的 AS 由 `aspace_new_kernel` 建、
+`(slot,gen)` 记在 `ProcEntry`，`proc_reap`/`proc_discard` 在**放掉 VMM 之后**销毁它；
+14 的 `rdx` 兼收 **Proc 句柄**（解析在 `user.rs`，不在 `handle.rs`，否则造 `capability→sched` 的新环）；
+15 `thread_create` 用 `mm::aspace_effective_flags` 核**子 AS** 的生效位（入口可执行、栈页可写），
+建出来立刻 `block_task` 停住；16 `process_start` 四步：校验 → 转移 → 经 **VMO 帧的 HHDM** 回填 → 写首参 + 放行。
+`MAX_STARTUP_HANDLES=16` ⇒ 调用方最多传 13 条，**`nhandles` 之后必须全零**，三个 `SELF_*` 不许调用方替填。
+
+**为什么 spawn 与停住之间不会被抢走**（不需要新关中断原语、也不需要 `Task.parked`）：
+两条用户→内核入口都关 IF——`int 0x80` 是**中断门**（`idt_gate` 的 `trap_gate=(v==2)`），
+SYSCALL 快路径的 `SFMASK` 含 `0x200`（trap.rs:1279）。
+
+**修掉一条 P3 遗留洞**：`terminate_task` 清 `proc_id` 时**不给进程记收工** ⇒ 被杀线程的进程
+`threads` 永远减不到 0 ⇒ 永远 reap/discard 不掉，**名额与它名下的 AS 一起漏**。
+修法：放掉 RUNQ 之后调 `proc_thread_exited(dead_proc, 1)`。变异 **M32** 实测
+`收场=(discfalse jdelfalse … as1)`、free 少 4 帧。配套新增 `proc_detach_thread`
+（只给创建失败的回滚用：只减计数、**不碰 signal**）。
+
+**四条变异**：M29 回填 nhandles 不算内核那三条 ⇒ `nhandles1`（应 4）；M30 不停住线程 ⇒ `Blocked0`；
+M31 不校验 CREATE ⇒ `造=false` 且连带 15 格红；M32 上面那条计数洞 ⇒ `收场=false`。全部还原。
+
+**两处量具自纠**：①`Stale计数` 第一版只比计数器增量 ⇒ **假红**（转移后没人拿旧句柄查过表，
+而 `stale` 是在 `check` 里加的、`revoke` 不走它）；改成显式 resolve 旧句柄要求返回 `Stale`。
+②收场第一版用 `proc_discard` ⇒ 红（被杀线程已把进程标成终止态，那道闸要求 SIG_RUNNING），改用 `proc_reap`。
+另：线程句柄第一版只给 READ/DUP/TRANSFER，16 号要求 WRITE ⇒ 当场 `-4`，已给 WRITE。
+
+**读数（取证跑，同一份代码 `normal/elf 5ad5f9ba017d`）**：`check` **17/17**；
+`ktests` 默认档 **80/80**、`handles` 档 **85/85**；矩阵 **45/45**；`bench` **4/4**，
+P4 地板 **0.78 %**（78 bp），`baselines/2026-11-09T19-20-29Z-p3p4.txt`；unsafe **374 → 376**
+（`ktests/mm` U2 2→3 读被停住线程的首帧 rdi；`sched` U2 7→8 `set_thread_arg` 写那一格）。
+`psys(P5c-3): 无CREATE拒=true Proc句柄=true 14的Proc别名=true 15停住=(未映射拒true 句柄true Blocked1 runs0)
+形状拒且不转移=true 16=(ret0 nhandles4 新值0x60001 kind1 三角色1) 首参=true 放行=1 Stale计数=true
+收场=(drainedtrue disctrue jdeltrue live0 vmo0 free116005->116005 va21->21 as0)`。
+
+**仍开着（不在本刀偷偷做）**：①**启动映射挂在创建者任务的资源袋里**（ADR-074 按任务归属），
+父先退子线程的代码/栈就没了——本刀用例让工人跑号、收工由 reap 还映射，所以这条限制没被掩盖但也没被证，
+c-3b 要补"父先退"负样本，进程级归属是 P7 的账；②子进程**真读真用**回填后的角色表（D2 完整形态）在 c-3b；
+③探针的宿主机侧对账矩阵行（§156/§160 欠的）仍在 c-3b。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

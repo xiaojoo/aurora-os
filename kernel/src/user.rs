@@ -52,7 +52,7 @@ pub const SYS_ASPACE_MAP: u64 = 14;
 /// ABI 版本。minor=4 对应用户态闭环这一段（M4）；minor=5 追加 capability 句柄族（P7）；
 /// minor=6 追加 VMO 三个号（12/13/14）与 `F_VMO` 位（W3 P4b，ADR-074）。号只追加不复用（Q1）。
 pub const ABI_MAJOR: u64 = 0;
-pub const ABI_MINOR: u64 = 7;
+pub const ABI_MINOR: u64 = 8;
 pub const F_FASTPATH: u64 = 1;
 pub const F_SMAP: u64 = 2;
 pub const F_SMEP: u64 = 4;
@@ -66,6 +66,58 @@ pub const F_HANDLES: u64 = 16;
 /// P4b（ADR-074）：VMO 三个号在这份构建里可用。它依赖句柄表，所以与 `F_HANDLES` 同一条件；
 /// 读回真实状态，不读"我打算开"。
 pub const F_VMO: u64 = 32;
+/// P5c-3（ADR-075 决策 1/8）：11/15/16 三个号在这份构建里可用。依赖句柄表，
+/// 与 `F_HANDLES`/`F_VMO` 同一条件、同样**读回真实状态**。
+pub const F_PROC: u64 = 64;
+
+// ---- 11/15/16 三个号（ADR-075 决策 1/3/5/8）----
+/// 11：`rdi` = 带 `CREATE` 的 Job 句柄 → `rax` = **Proc 句柄**（决策 8：只返回一个名字，
+/// 子进程的 AS 由内核建并记在 proc 表里；父进程要往子 AS 铺映射就用 14 号的 `rdx` 出示这个 Proc 句柄）。
+pub const SYS_PROCESS_CREATE: u64 = 11;
+/// 15：`rdi` = Proc 句柄（要 `WRITE`）、`rsi` = 子 AS 里的入口 VA、`rdx` = 子 AS 里的用户栈顶、
+/// `r10` = 首参 → `rax` = Thread 句柄。**建出来就停住**（`Blocked`），等 16 号回填完才放它跑。
+pub const SYS_THREAD_CREATE: u64 = 15;
+/// 16：`rdi` = Proc 句柄、`rsi` = Thread 句柄、`rdx` = StartupInfo 那一页的 VMO 句柄、
+/// `r10` = 它在**子 AS** 里的只读 VA → 成功返回 0。顺序固定：校验 → 转移 → 回填 → 放线程跑。
+pub const SYS_PROCESS_START: u64 = 16;
+
+// ---- StartupInfo 布局（ADR-075 决策 3；用户侧要独立声明同一组偏移，靠读回对账）----
+/// 魔数：证明读到的确实是这一页（与 `.slots` 的魔数同一手法）。
+pub const SI_MAGIC: u32 = 0x4155_524F;
+pub const SI_OFF_MAGIC: usize = 0;
+pub const SI_OFF_ABI_MAJOR: usize = 4;
+pub const SI_OFF_ABI_MINOR: usize = 6;
+/// 调用方写"我传了几条"，内核回填成"总共几条"（= 调用方的条数 + 内核自己 grant 的三个 SELF_*）。
+pub const SI_OFF_NHANDLES: usize = 8;
+pub const SI_OFF_ARGS_OFF: usize = 12;
+pub const SI_OFF_ARGS_LEN: usize = 16;
+pub const SI_OFF_HANDLES: usize = 24;
+/// `HandleDesc { role: u32, kind: u32, handle: u64 }`
+pub const SI_DESC_BYTES: usize = 16;
+pub const SI_DESC_ROLE: usize = 0;
+pub const SI_DESC_KIND: usize = 4;
+pub const SI_DESC_HANDLE: usize = 8;
+/// 使用者裁决（2026-11-10）：照设计举例取 16，不留返工。代价是会有空槽 ⇒
+/// **读取方只许信 `handles[0..nhandles]`**，内核校验"nhandles 之后必须全零"。
+pub const MAX_STARTUP_HANDLES: usize = 16;
+/// 内核自己 grant 三个 SELF_*，所以调用方最多传 13 条。
+pub const MAX_STARTUP_TRANSFERS: usize = MAX_STARTUP_HANDLES - 3;
+pub const ROLE_SELF_PROC: u32 = 0;
+pub const ROLE_SELF_ASPACE: u32 = 1;
+pub const ROLE_SELF_THREAD: u32 = 2;
+pub const ROLE_JOB: u32 = 3;
+/// 下面三个今天**一律不填**（Channel/控制台/NS_ROOT 对象都还不存在）：
+/// 按设计 §10.2 的语义"没传的角色就是不存在"，不摆一个没人填的角色槽。
+pub const ROLE_PARENT_CHAN: u32 = 4;
+pub const ROLE_LOG: u32 = 5;
+pub const ROLE_NS_ROOT: u32 = 6;
+/// kind 编号与 `handle::ObjRef` 的六种一一对应（用户侧独立声明同一组数）。
+pub const KIND_FILE: u32 = 1;
+pub const KIND_VMO: u32 = 2;
+pub const KIND_JOB: u32 = 3;
+pub const KIND_PROC: u32 = 4;
+pub const KIND_ASPACE: u32 = 5;
+pub const KIND_THREAD: u32 = 6;
 
 /// `(major << 32) | (minor << 16) | features`。位一律**读回真实状态**，不读"我打算开"。
 pub fn abi_word() -> u64 {
@@ -85,7 +137,7 @@ pub fn abi_word() -> u64 {
     }
     #[cfg(feature = "handles")]
     {
-        f |= F_HANDLES | F_VMO;
+        f |= F_HANDLES | F_VMO | F_PROC;
     }
     (ABI_MAJOR << 32) | (ABI_MINOR << 16) | f
 }
@@ -278,12 +330,29 @@ fn sys_aspace_map(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
         Err(_) => return E_INVALID,
     };
     // 先认 AS 再要 VA：句柄不对就不该占用动态区（失败路径要留零残留）
+    // `rdx` 兼收两种 kind（ADR-075 决策 8）：ASpace 句柄直接用；**Proc 句柄**换成它名下那张 AS。
+    // 解析放在这里（`user.rs` 属 `sched` 模块组）而不是 `handle.rs`：后者引用 `proc` 会与既有的
+    // `sched → capability` 合成新的强连通分量，把 `sched` 拖进冻结的核心环（P5c-1 实测）。
     let as_slot = if frame.rdx == 0 {
         None
     } else {
-        match crate::handle::aspace_of(crate::handle::Handle(frame.rdx), owner, crate::handle::RIGHT_MAP) {
-            Ok(s) => Some(s),
+        let (obj, _) = match crate::handle::resolve(crate::handle::Handle(frame.rdx), owner, crate::handle::RIGHT_MAP) {
+            Ok(v) => v,
             Err(e) => return handle_err(e),
+        };
+        match obj {
+            crate::handle::ObjRef::ASpace { slot, .. } => Some(slot),
+            crate::handle::ObjRef::Proc { slot, gen } => {
+                if !crate::proc::proc_live(slot, gen) {
+                    return E_BAD_HANDLE;
+                }
+                match crate::proc::proc_aspace(slot, gen) {
+                    Some((s, _)) => Some(s),
+                    None => return E_BAD_HANDLE,
+                }
+            }
+            // 类型不符按 -4（与"槽不存在"分开计数，口径同 `vmo_of`）
+            _ => return E_DENIED,
         }
     };
     let va = if frame.r10 == 0 {
@@ -333,7 +402,356 @@ fn sys_aspace_map(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     }
 }
 
+/// 16 号停线程用的 token：**不注册任何等待队列项**（它不等事件，只等 16 号），
+/// 所以 `terminate_task` 里那两句摘链天然是无效操作。seq 由 `(gidx, id)` 确定性推出，
+/// 15 号与 16 号各自算一遍就必然相同，不需要把 token 存在任何表里。
 #[cfg(feature = "handles")]
+fn start_token(gidx: usize, id: u32) -> crate::sync::WaitToken {
+    crate::sync::WaitToken { queue: 15, seq: ((gidx as u64) << 32) | u64::from(id) }
+}
+
+#[cfg(feature = "handles")]
+fn kind_of(o: &crate::handle::ObjRef) -> u32 {
+    match o {
+        crate::handle::ObjRef::File(_) => KIND_FILE,
+        crate::handle::ObjRef::Vmo { .. } => KIND_VMO,
+        crate::handle::ObjRef::Job { .. } => KIND_JOB,
+        crate::handle::ObjRef::Proc { .. } => KIND_PROC,
+        crate::handle::ObjRef::ASpace { .. } => KIND_ASPACE,
+        crate::handle::ObjRef::Thread { .. } => KIND_THREAD,
+    }
+}
+
+/// 16 号失败路径的回滚（ADR-075 决策 3 的"②③任一步失败必须回滚②"）。
+/// `transfer_rollback` **交回一个可用名字**：bump 之后发送方原来那个句柄也死了，
+/// 只有这个新名字 close 得掉那格；不 close 就是永久漏一份对象引用（P5c-3a 实测：
+/// 漏一份 VMO 引用与一帧，并把后面 14 格用例的收尾闸全打红）。
+#[cfg(feature = "handles")]
+fn undo_transfers(newvals: &[u64], done: usize, child: (usize, u32), parent: (usize, u32)) {
+    for v in newvals.iter().take(done) {
+        if let Ok(restored) = crate::handle::transfer_rollback(crate::handle::Handle(*v), child, parent) {
+            let _ = crate::handle::close(restored, parent);
+        }
+    }
+}
+
+/// 11：造一个进程（要带 `CREATE` 的 Job 句柄）。**只返回 Proc 句柄**（ADR-075 决策 8）：
+/// 子进程的 AS 由内核建、记在 proc 表里，父进程要往子 AS 铺映射就用 14 号的 `rdx` 出示这个 Proc 句柄。
+/// 每一步失败都把前面几步收干净（AS → 进程名额），不留半截。
+#[cfg(feature = "handles")]
+fn sys_process_create(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
+    let (obj, _) = match crate::handle::resolve(crate::handle::Handle(frame.rdi), owner, crate::handle::RIGHT_CREATE) {
+        Ok(v) => v,
+        Err(e) => return handle_err(e),
+    };
+    let (job, jgen) = match obj {
+        crate::handle::ObjRef::Job { slot, gen } => (slot, gen),
+        _ => return E_DENIED,
+    };
+    if !crate::proc::job_live(job, jgen) {
+        return E_BAD_HANDLE;
+    }
+    let pid = match crate::proc::proc_create(job) {
+        Ok(p) => p,
+        Err(_) => return E_EXHAUSTED,
+    };
+    let pgen = crate::proc::proc_gen(pid).unwrap_or(0);
+    let (aslot, agen) = match crate::mm::aspace_new_kernel() {
+        Some(v) => v,
+        None => {
+            let _ = crate::proc::proc_discard(pid);
+            return E_EXHAUSTED;
+        }
+    };
+    if crate::proc::proc_set_aspace(pid, aslot, agen).is_err() {
+        crate::mm::aspace_destroy(aslot);
+        let _ = crate::proc::proc_discard(pid);
+        return E_EXHAUSTED;
+    }
+    let rights = crate::handle::RIGHT_READ | crate::handle::RIGHT_WRITE | crate::handle::RIGHT_MAP
+        | crate::handle::RIGHT_DUP | crate::handle::RIGHT_TRANSFER;
+    match crate::handle::grant_proc(owner, pid, pgen, rights) {
+        Ok(h) => h.0,
+        Err(e) => {
+            crate::mm::aspace_destroy(aslot);
+            let _ = crate::proc::proc_discard(pid);
+            handle_err(e)
+        }
+    }
+}
+
+/// 15：在子进程的 AS 里建一条线程，**建出来就停住**，等 16 号回填完 `StartupInfo` 才放它跑。
+///
+/// 为什么 spawn 与 block 之间不会被抢走：两条用户→内核入口都关 IF——`int 0x80` 是**中断门**
+/// （`idt_gate` 的 `trap_gate = (v == 2)`，0x80 不在其中），SYSCALL 快路径的 `SFMASK` 含 `0x200`。
+/// 所以这一段没有 tick 能插进来把刚建好的线程换上去跑（那会让它看到没回填的表）。
+#[cfg(feature = "handles")]
+fn sys_thread_create(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
+    let (obj, _) = match crate::handle::resolve(crate::handle::Handle(frame.rdi), owner, crate::handle::RIGHT_WRITE) {
+        Ok(v) => v,
+        Err(e) => return handle_err(e),
+    };
+    let (pid, pgen) = match obj {
+        crate::handle::ObjRef::Proc { slot, gen } => (slot, gen),
+        _ => return E_DENIED,
+    };
+    if !crate::proc::proc_live(pid, pgen) {
+        return E_BAD_HANDLE;
+    }
+    let Some((aslot, _)) = crate::proc::proc_aspace(pid, pgen) else { return E_BAD_HANDLE };
+    let entry = frame.rsi;
+    let sp = frame.rdx;
+    if entry < mm::USER_VA_BASE || entry >= mm::USER_VA_TOP || sp < mm::USER_VA_BASE || sp > mm::USER_VA_TOP {
+        return E_INVALID;
+    }
+    // 第二台仪器：读**子 AS** 的生效位，不是"调用方说它映了"。入口要可执行、栈顶那一页要可写。
+    let ok_code = mm::aspace_effective_flags(aslot, entry).is_some_and(|f| f.user && f.executable);
+    let ok_stack = sp > mm::USER_VA_BASE
+        && mm::aspace_effective_flags(aslot, sp - 1).is_some_and(|f| f.user && f.writable);
+    if !ok_code || !ok_stack {
+        return E_INVALID;
+    }
+    // 先登记再 spawn（ADR-073 的顺序：反序的话任务可能两步之间就跑完，那条边看到 NO_PROC）
+    if crate::proc::proc_attach_thread(pid).is_err() {
+        return E_EXHAUSTED;
+    }
+    let g = match crate::sched::spawn_user(entry, sp, frame.r10, crate::sched::OwnedSet::new()) {
+        Ok(v) => v,
+        Err(_) => {
+            let _ = crate::proc::proc_detach_thread(pid);
+            return E_EXHAUSTED;
+        }
+    };
+    let id = crate::sched::id_of(g);
+    if !crate::sched::set_aspace(g, aslot) || !crate::sched::set_proc_id(g, pid) {
+        let _ = crate::sched::terminate_task(g);
+        let _ = crate::proc::proc_detach_thread(pid);
+        return E_EXHAUSTED;
+    }
+    if !crate::sched::block_task(g, start_token(g, id)) {
+        let _ = crate::sched::terminate_task(g);
+        let _ = crate::proc::proc_detach_thread(pid);
+        return E_EXHAUSTED;
+    }
+    // 要带 WRITE：16 号"放它跑"是对这条线程的写操作，只有 READ/TRANSFER 的名字不该能启动它
+    let rights = crate::handle::RIGHT_READ | crate::handle::RIGHT_WRITE
+        | crate::handle::RIGHT_DUP | crate::handle::RIGHT_TRANSFER;
+    match crate::handle::grant_thread(owner, g, id, rights) {
+        Ok(h) => h.0,
+        Err(e) => {
+            let _ = crate::sched::terminate_task(g);
+            let _ = crate::proc::proc_detach_thread(pid);
+            handle_err(e)
+        }
+    }
+}
+
+#[cfg(feature = "handles")]
+fn si_put32(vid: crate::vmo::VmoId, off: usize, v: u32) -> bool {
+    crate::vmo::vmo_write(vid, off, &v.to_le_bytes()) == Ok(4)
+}
+
+#[cfg(feature = "handles")]
+fn si_put64(vid: crate::vmo::VmoId, off: usize, v: u64) -> bool {
+    crate::vmo::vmo_write(vid, off, &v.to_le_bytes()) == Ok(8)
+}
+
+/// 16 号失败路径的全套回滚：转移逐条回滚并 close 掉交回来的名字，内核自己 grant 的那几个也关掉。
+#[cfg(feature = "handles")]
+fn undo_start(
+    newvals: &[u64],
+    done: usize,
+    granted: &[u64],
+    ng: usize,
+    child: (usize, u32),
+    parent: (usize, u32),
+) {
+    undo_transfers(newvals, done, child, parent);
+    for v in granted.iter().take(ng) {
+        let _ = crate::handle::close(crate::handle::Handle(*v), child);
+    }
+}
+
+/// 16：校验 → 转移 → 回填 → 放线程跑（ADR-075 决策 3 的四步，顺序不可换）。
+///
+/// **不是真原子**（使用者裁决 2026-11-10）：②③之间另一个 CPU 能看到"句柄已转移但表还没填"。
+/// 子线程看不到——它到最后一步才被 `wake_task` 放出来；父进程若并发查自己的旧句柄会看到 `Stale`，
+/// 而 `Stale` 本来就是"转移"的语义。②③任一步失败都走 `undo_start` 回到基线。
+///
+/// 回填走 **VMO 的帧（HHDM）**，不需要子 AS 的写权限——那一页在子 AS 里是**只读**的，
+/// 这正是"只读页也能被内核填"的实现点，也是子进程改不了自己角色表的安全前提。
+#[cfg(feature = "handles")]
+fn sys_process_start(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let Some(parent) = crate::sched::current_identity() else { return E_BAD_HANDLE };
+    // ① 校验：进程、线程、页、形状
+    let (pobj, _) = match crate::handle::resolve(crate::handle::Handle(frame.rdi), parent, crate::handle::RIGHT_WRITE) {
+        Ok(v) => v,
+        Err(e) => return handle_err(e),
+    };
+    let (pid, pgen) = match pobj {
+        crate::handle::ObjRef::Proc { slot, gen } => (slot, gen),
+        _ => return E_DENIED,
+    };
+    if !crate::proc::proc_live(pid, pgen) {
+        return E_BAD_HANDLE;
+    }
+    let Some((aslot, _)) = crate::proc::proc_aspace(pid, pgen) else { return E_BAD_HANDLE };
+    let (tobj, _) = match crate::handle::resolve(crate::handle::Handle(frame.rsi), parent, crate::handle::RIGHT_WRITE) {
+        Ok(v) => v,
+        Err(e) => return handle_err(e),
+    };
+    let (gidx, tid) = match tobj {
+        crate::handle::ObjRef::Thread { gidx, id } => (gidx, id),
+        _ => return E_DENIED,
+    };
+    if !crate::sched::thread_live(gidx, tid) || crate::sched::proc_id_of(gidx) != pid {
+        return E_DENIED;
+    }
+    let vid = match crate::handle::vmo_of(crate::handle::Handle(frame.rdx), parent,
+        crate::handle::RIGHT_READ | crate::handle::RIGHT_WRITE) {
+        Ok(v) => v,
+        Err(e) => return handle_err(e),
+    };
+    if crate::vmo::vmo_pages(vid) != Some(1) {
+        return E_INVALID;
+    }
+    let va = frame.r10;
+    if va < mm::USER_VA_BASE || va >= mm::USER_VA_TOP || va % mm::PAGE as u64 != 0 {
+        return E_INVALID;
+    }
+    // 那一页必须在**子 AS** 里已映射且**只读**（可写就意味着子进程能改自己的角色表）
+    let page_ok = mm::aspace_effective_flags(aslot, va).is_some_and(|f| f.user && !f.writable);
+    if !page_ok {
+        return E_INVALID;
+    }
+    let mut hdr = [0u8; SI_OFF_HANDLES];
+    if crate::vmo::vmo_read(vid, 0, &mut hdr) != Ok(SI_OFF_HANDLES) {
+        return E_FAULT;
+    }
+    let magic = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+    let major = u16::from_le_bytes([hdr[4], hdr[5]]);
+    let minor = u16::from_le_bytes([hdr[6], hdr[7]]);
+    let n = u32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]) as usize;
+    if magic != SI_MAGIC || u64::from(major) != ABI_MAJOR || u64::from(minor) != ABI_MINOR {
+        return E_INVALID;
+    }
+    if n > MAX_STARTUP_TRANSFERS {
+        return E_INVALID;
+    }
+    let mut area = [0u8; MAX_STARTUP_HANDLES * SI_DESC_BYTES];
+    if crate::vmo::vmo_read(vid, SI_OFF_HANDLES, &mut area) != Ok(area.len()) {
+        return E_FAULT;
+    }
+    let mut olds = [0u64; MAX_STARTUP_TRANSFERS];
+    for i in 0..MAX_STARTUP_HANDLES {
+        let b = i * SI_DESC_BYTES;
+        let role = u32::from_le_bytes([area[b], area[b + 1], area[b + 2], area[b + 3]]);
+        let mut hb = [0u8; 8];
+        hb.copy_from_slice(&area[b + SI_DESC_HANDLE..b + SI_DESC_HANDLE + 8]);
+        let hv = u64::from_le_bytes(hb);
+        if i >= n {
+            // `MAX_STARTUP_HANDLES = 16` 的代价：会有空槽。**nhandles 之后必须全零**，
+            // 否则"空槽"与"该传但没传"就分不开（使用者选 16 时同轮定下的口径）
+            let kind_zero = area[b + SI_DESC_KIND..b + SI_DESC_HANDLE].iter().all(|&x| x == 0);
+            if role != 0 || hv != 0 || !kind_zero {
+                return E_INVALID;
+            }
+            continue;
+        }
+        // 三个 SELF_* 由内核自己 grant，调用方不许替它填（否则就能把别人的名字塞进子进程的角色表）
+        if role == ROLE_SELF_PROC || role == ROLE_SELF_ASPACE || role == ROLE_SELF_THREAD || hv == 0 {
+            return E_INVALID;
+        }
+        olds[i] = hv;
+    }
+
+    // ② 转移：owner 改成子线程那两格 + bump 世代（发送方当场 Stale）
+    let child = (gidx, tid);
+    let mut newvals = [0u64; MAX_STARTUP_TRANSFERS];
+    let mut kinds = [0u32; MAX_STARTUP_TRANSFERS];
+    let mut done = 0usize;
+    for i in 0..n {
+        let h = crate::handle::Handle(olds[i]);
+        let (obj, _) = match crate::handle::resolve(h, parent, crate::handle::RIGHT_TRANSFER) {
+            Ok(v) => v,
+            Err(e) => {
+                undo_transfers(&newvals, done, child, parent);
+                return handle_err(e);
+            }
+        };
+        kinds[i] = kind_of(&obj);
+        match crate::handle::transfer(h, parent, child) {
+            Ok(nh) => {
+                newvals[i] = nh.0;
+                done += 1;
+            }
+            Err(e) => {
+                undo_transfers(&newvals, done, child, parent);
+                return handle_err(e);
+            }
+        }
+    }
+
+    // ③ 回填：先 grant 三个 SELF_*（失败就把②整套回滚），再经帧的 HHDM 写进那一页
+    let mut granted = [0u64; 3];
+    let mut ng = 0usize;
+    let rr = crate::handle::RIGHT_READ | crate::handle::RIGHT_DUP | crate::handle::RIGHT_TRANSFER;
+    let selfs = [
+        (ROLE_SELF_PROC, crate::handle::grant_proc(child, pid, pgen, rr).map(|h| h.0)),
+        (ROLE_SELF_ASPACE, crate::handle::grant_aspace(child, aslot, rr | crate::handle::RIGHT_MAP).map(|h| h.0)),
+        (ROLE_SELF_THREAD, crate::handle::grant_thread(child, gidx, tid, rr).map(|h| h.0)),
+    ];
+    for (role, r) in selfs {
+        match r {
+            Ok(v) => {
+                granted[ng] = v;
+                ng += 1;
+                let b = SI_OFF_HANDLES + (n + ng - 1) * SI_DESC_BYTES;
+                let k = match role {
+                    ROLE_SELF_PROC => KIND_PROC,
+                    ROLE_SELF_ASPACE => KIND_ASPACE,
+                    _ => KIND_THREAD,
+                };
+                if !si_put32(vid, b + SI_DESC_ROLE, role)
+                    || !si_put32(vid, b + SI_DESC_KIND, k)
+                    || !si_put64(vid, b + SI_DESC_HANDLE, v)
+                {
+                    undo_start(&newvals, done, &granted, ng, child, parent);
+                    return E_FAULT;
+                }
+            }
+            Err(e) => {
+                undo_start(&newvals, done, &granted, ng, child, parent);
+                return handle_err(e);
+            }
+        }
+    }
+    for i in 0..n {
+        let b = SI_OFF_HANDLES + i * SI_DESC_BYTES;
+        if !si_put32(vid, b + SI_DESC_KIND, kinds[i]) || !si_put64(vid, b + SI_DESC_HANDLE, newvals[i]) {
+            undo_start(&newvals, done, &granted, ng, child, parent);
+            return E_FAULT;
+        }
+    }
+    if !si_put32(vid, SI_OFF_NHANDLES, (n + 3) as u32) {
+        undo_start(&newvals, done, &granted, ng, child, parent);
+        return E_FAULT;
+    }
+
+    // ④ 最后才放它跑：首参 = 那一页在子 AS 里的 VA。
+    // 这一格失败仍然回滚（线程还没被放出来）；**wake 成功之后就没有失败路径了**。
+    if !crate::sched::set_thread_arg(gidx, va) {
+        undo_start(&newvals, done, &granted, ng, child, parent);
+        return E_EXHAUSTED;
+    }
+    if !crate::sched::wake_task(gidx, start_token(gidx, tid)) {
+        undo_start(&newvals, done, &granted, ng, child, parent);
+        return E_EXHAUSTED;
+    }
+    0
+}#[cfg(feature = "handles")]
 fn sys_file_read(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let want = frame.rdx as usize;
     if want == 0 {
@@ -841,6 +1259,12 @@ pub fn syscall_dispatch(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> boo
         SYS_VMO_WRITE => sys_vmo_write(frame),
         #[cfg(feature = "handles")]
         SYS_ASPACE_MAP => sys_aspace_map(frame),
+        #[cfg(feature = "handles")]
+        SYS_PROCESS_CREATE => sys_process_create(frame),
+        #[cfg(feature = "handles")]
+        SYS_THREAD_CREATE => sys_thread_create(frame),
+        #[cfg(feature = "handles")]
+        SYS_PROCESS_START => sys_process_start(frame),
         SYS_POKE_BUF => {
             // 内核 → 用户。写成 `Ok(n)` 而不是布尔：`n != want` 就是"中途被接住的故障"，
             // 程序核对字节时看得见的差异与内核报回的数必须一致（两台仪器不能各说各话）。

@@ -458,7 +458,7 @@ P5c 的 `process_start` 会把这条代价带到产品路径上——**那时换
 
 ### 8. `process_create` 的返回值：**只返回 Proc 句柄**，14 号的 `rdx` 兼收 Proc 句柄（2026-11-10 定案）
 
-使用者把这一件授权给本文定（"把 process_create 的返回值方案定一下"）。定案如下，**尚未落地**：
+使用者把这一件授权给本文定（"把 process_create 的返回值方案定一下"）。定案如下，**已于 P5c-3 落地**（见下面的补记）：
 
 - **11 `process_create(rdi = Job 句柄)` → `rax` = Proc 句柄**（要 `RIGHT_CREATE`）。
   子进程那张 AS 由内核建（`mm::aspace_new_kernel`）并记在 proc 表里，**不交给父进程**。
@@ -492,6 +492,71 @@ P5c 的 `process_start` 会把这条代价带到产品路径上——**那时换
 **兼容性**：`rdx = 0`（自己的 AS）与 `rdx = ASpace 句柄` 的行为**逐字不变**，
 c-2 的探针三格与 `t_aspace_map_vmo` 的三格继续当证人；这次只是**多接受一种 kind**。
 
+## 补记：P5c-3 落地（11/15/16 三个号 + StartupInfo 回填与转移），2026-11-10，实测
+
+决策 1/3/5/8 的 ABI 面已落地：`ABI_MINOR` **7 → 8**、新特性位 **`F_PROC = 64`**（与 `F_HANDLES`/`F_VMO`
+同一条件、读回真实状态）。三个号的形状与证人如下，**子进程真读真用那一格留给 c-3b 的探针**。
+
+- **11 `process_create(rdi = 带 CREATE 的 Job 句柄) → rax = Proc 句柄**（决策 8）。
+  子进程的 AS 由 `mm::aspace_new_kernel` 建、`(slot, gen)` 记在 `ProcEntry`，
+  `proc_reap`/`proc_discard` 在**放掉 VMM 之后**调 `mm::aspace_destroy`（锁内调就是重入 ⇒ L4）。
+  每一步失败都把前面几步收干净（AS → 进程名额），不留半截。
+- **14 的 `rdx` 兼收 `ObjRef::Proc`**（决策 8 的别名）：解析在 `user.rs`（属 `sched` 模块组），
+  不在 `handle.rs`——后者引用 `proc` 会造出 `capability → sched` 的新环（c-1 实测）。
+  证人：`psys` 的 `14的Proc别名` 一格（三页都按请求 VA 落进**子 AS**）。
+- **15 `thread_create(rdi=Proc, rsi=入口 VA, rdx=用户栈顶, r10=首参) → rax = Thread 句柄`**。
+  入口/栈顶用 `mm::aspace_effective_flags(aslot, va)` 核**子 AS 的生效位**（入口要可执行、栈页要可写），
+  不是"调用方说它映了"。建出来**立刻 `block_task` 停住**。
+  **为什么 spawn 与 block 之间不会被抢走**：两条用户→内核入口都关 IF——`int 0x80` 是**中断门**
+  （`idt_gate` 的 `trap_gate = (v == 2)`，0x80 不在其中），SYSCALL 快路径的 `SFMASK` 含 `0x200`
+  （[kernel/src/arch/x86_64/trap.rs:1279](file:///H:/aurora-os/kernel/src/arch/x86_64/trap.rs#L1279)）。
+  所以不需要新的关中断原语，也不需要给 `Task` 加 `parked` 标志。
+  线程句柄带 **`WRITE`**：16 号"放它跑"是对这条线程的写操作（第一版只给 READ/DUP/TRANSFER，
+  16 号当场 `-4`，实测打回）。
+- **16 `process_start(rdi=Proc, rsi=Thread, rdx=StartupInfo 的 VMO 句柄, r10=它在子 AS 里的只读 VA)`**：
+  ①校验（进程/线程归属、页必须已映射且**只读**、magic 与 ABI 版本、`nhandles ≤ 13`、
+  **`nhandles` 之后必须全零**、三个 `SELF_*` 角色不许调用方替填）→ ②转移（owner 改成子线程两格 + bump gen）
+  → ③回填（先 grant 三个 `SELF_*`，再经 **VMO 帧的 HHDM** 写 kind 与新句柄值，最后写 `nhandles = n + 3`）
+  → ④`set_thread_arg(gidx, va)` + `wake_task`。**④之后不再有失败路径**。
+  `MAX_STARTUP_HANDLES = 16` ⇒ 调用方最多传 13 条（`MAX_STARTUP_TRANSFERS`）。
+- **转移的 token 不存表**：`start_token(gidx, id) = WaitToken { queue: 15, seq: (gidx<<32)|id }`，
+  15 与 16 各自算一遍必然相同；**不注册任何等待队列项**，所以 `terminate_task` 的摘链天然是无效操作。
+
+**本刀撞出来并修掉的一条 P3 遗留洞**：`terminate_task` 清 `proc_id` 时**不给进程记收工**。
+被杀的线程永远不走 `finish_current`/`kill_current` ⇒ 进程的 `threads` 减不到 0 ⇒
+那个进程永远 reap/discard 不掉，**名额与它名下的 AS 一起漏**。
+修法：在放掉 RUNQ 之后调 `proc::proc_thread_exited(dead_proc, 1)`（退出码 1 = 非正常，与 `kill_current` 同口径）。
+变异 **M32**（把这一句短路）实测：`收场=(discfalse jdelfalse … as1)`、`free` 少 4 帧 ⇒ 红。
+配套新增 `proc::proc_detach_thread`（**只给创建失败的回滚用**：只减计数、**不碰 signal**，
+否则一次失败的 `thread_create` 会把整个进程标成已终止）。
+
+**四条变异各咬哪一格**（全部还原）：
+M29 = 回填 `nhandles` 时不算内核 grant 的三条 ⇒ `16=(nhandles1 …)` 红（应为 4）；
+M30 = 15 号不停住线程 ⇒ `15停住=(… Blocked0 runs0)` 红；
+M31 = 11 号不校验 `CREATE` ⇒ `造=false` 且连带 15 格红（进程与 Job 漏在表里）；
+M32 = 上面那条计数洞 ⇒ `收场=false`。
+
+**两处量具自纠（都是"绿而无效/假红"，当场改）**：
+① `Stale计数` 第一版只比 `counters().stale` 的增量 ⇒ **假红**：转移之后没人拿旧句柄查过表，
+   而 `stale` 是在 `check` 里加的（`revoke` 不走 `check`）。改成**显式拿旧句柄 resolve 一次**，
+   要求它返回 `Stale` 且计数涨。
+② 收场第一版用 `proc_discard` ⇒ 红：被杀的线程已经把进程标成终止态，
+   `proc_discard` 的闸要求 `SIG_RUNNING`。改用 `proc_reap`（它同时销毁那张 AS）。
+
+**取证读数**：`check` **17/17**；`ktests` 默认档 **80/80**、`handles` 档 **85/85**；
+`psys(P5c-3): 无CREATE拒=true Proc句柄=true 14的Proc别名=true 15停住=(未映射拒true 句柄true Blocked1 runs0)
+形状拒且不转移=true 16=(ret0 nhandles4 新值0x60001 kind1 三角色1) 首参=true 放行=1 Stale计数=true
+收场=(drainedtrue disctrue jdeltrue live0 vmo0 free116005->116005 va21->21 as0)`；
+矩阵与 bench 的读数见 BACKLOG §162。unsafe **374 → 376**（`ktests/mm` U2 2→3：读被停住线程的首帧 rdi；
+`sched` U2 7→8：`set_thread_arg` 写那一格）。
+
+**仍开着（不在本刀偷偷做）**：
+① **启动映射挂在创建者任务的资源袋里**（ADR-074 按任务归属）⇒ 父先退，子线程的代码/栈映射就没了。
+   本刀的用例刻意让**工人**跑号、收工后由 reap 还映射，所以这条限制没有被用例掩盖，
+   但也**没有被证**；c-3b 要补一格"父先退"的负样本把它变成可判的读数，进程级归属是 P7 的账。
+② 子进程**真读真用**回填后的角色表（D2 的完整形态）在 c-3b 的探针里；本刀只证到
+   "首参确实是那一页的 VA、线程确实被放出来跑过"。
+③ 探针的宿主机侧独立对账矩阵行（§156/§160 欠的）仍在 c-3b。
 ## 备选方案
 
 - **一刀做完 P5**：拒绝（决策 1）。换人热路径、句柄种类、ABI、新产物四件事一起动，

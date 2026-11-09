@@ -1452,13 +1452,38 @@ pub struct EffectiveFlags {
 }
 
 pub fn effective_flags(va: u64) -> Option<EffectiveFlags> {
-    if !is_ready() || VirtAddr::new(va).is_none() {
+    if !is_ready() {
+        return None;
+    }
+    effective_flags_in(s().pml4_phys, va)
+}
+
+/// 按**槽号**读另一张 AS 里某个 VA 的生效位（P5c-3：15/16 号要校验 entry 可执行、
+/// 栈页可写、StartupInfo 页**只读**，而那些页都在子 AS 里，不在当前 CR3 上）。
+/// 与 `effective_flags` 共用同一段遍历，差别只有根从哪来。
+pub fn aspace_effective_flags(slot: u8, va: u64) -> Option<EffectiveFlags> {
+    if !is_ready() {
+        return None;
+    }
+    let root = {
+        let _g = vmm();
+        let e = aspaces().items.get(usize::from(slot))?;
+        if !e.used {
+            return None;
+        }
+        e.pml4
+    };
+    effective_flags_in(root, va)
+}
+
+fn effective_flags_in(root: u64, va: u64) -> Option<EffectiveFlags> {
+    if VirtAddr::new(va).is_none() {
         return None;
     }
     let hhdm = s().hhdm;
     // SAFETY: 只读遍历自建表，前提与 `is_mapped` 相同（所有写者都在 VMM(20) 锁里）
     unsafe {
-        let mut table = (s().pml4_phys + hhdm) as *const Page;
+        let mut table = (root + hhdm) as *const Page;
         let mut level = 3u8;
         let mut permit = !0u64;
         let mut nx_any = 0u64;
@@ -1981,20 +2006,26 @@ pub const MAX_AS_MAP_PAGES: usize = 16;
 
 /// 读**指定 AS** 里某个 VA 的叶子表项（第二台仪器：不靠切 CR3、不碰用户页，所以与 SMAP 无关）。
 /// 不存在/不 present 返回 None。ADR-074 的 C6/C7 用它对照两棵树。
-pub fn aspace_leaf(space: &AspaceHandle, va: VirtAddr) -> Option<u64> {
+/// `aspace_leaf` 的按槽号版（P5c-3：15/16 号要校验 entry/sp/StartupInfo 的 VA 在**子 AS** 里已映射，
+/// 而那时手里只有 proc 表记的槽号，没有 RAII 柄）。判据与它逐字相同：槽在、根有效、只走已存在的表。
+pub fn aspace_leaf_slot(slot: u8, va: VirtAddr) -> Option<u64> {
     if VirtAddr::new(va.0).is_none() {
         return None;
     }
     let _g = vmm();
-    let e = &aspaces().items[usize::from(space.slot)];
+    let e = aspaces().items.get(usize::from(slot))?;
     if !e.used {
         return None;
     }
-    // SAFETY: root 是表里核对过的有效 PML4，va 规范，持 VMM，create=false 只走已存在的表
+    // SAFETY: 根是表里核对过的有效 PML4，va 规范，持 VMM，create=false 只走已存在的表
     let leaf = unsafe { walk_leaf_in(e.pml4, None, va.0, false, false, false)? };
     // SAFETY: 上一行返回的是有效表项指针
     let v = unsafe { *leaf };
     if v & P_PRESENT == 0 { None } else { Some(v) }
+}
+
+pub fn aspace_leaf(space: &AspaceHandle, va: VirtAddr) -> Option<u64> {
+    aspace_leaf_slot(space.slot, va)
 }
 
 /// 往指定 AS 铺的一段**共享**映射（ADR-074 决策 3）。帧的主人不是它（是 VMO），

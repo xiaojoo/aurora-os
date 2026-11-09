@@ -24,6 +24,8 @@ pub const MAX_PROCESSES: usize = 4;
 pub const MAX_JOBS: usize = 4;
 /// Task.proc_id 的"无进程"哨兵。
 pub const NO_PROC: u16 = 0xFFFF;
+/// `ProcEntry::aspace` 的"这个进程还没有地址空间"哨兵（与 `sched::NO_ASPACE` 同值不同模块）。
+pub const NO_ASPACE: u8 = 0xFF;
 /// signal：bit31 = 0 表示还在跑。
 const SIG_RUNNING: u32 = 0;
 /// signal：bit31 = 1 表示已终止，低 31 位是退出码。
@@ -65,6 +67,12 @@ struct ProcEntry {
     job: u16,
     threads: AtomicU16,
     signal: AtomicU32,
+    /// 这个进程名下那张 AS 的 `(槽号, 世代)`（P5c-3a，ADR-075 决策 8）。
+    /// **主人是这张表**，不是 RAII 柄：`AspaceHandle` 是 non-Copy 且 Drop 里要取 VMM，
+    /// 放进表里既不能 const 初始化也不能在锁内丢（P1 撞过）。销毁走 `mm::aspace_destroy`，
+    /// 而且**必须在放掉 VMM 之后**调（它自己要取 VMM，锁内调就是重入 ⇒ L4）。
+    aspace: u8,
+    as_gen: u32,
 }
 
 const JOB_EMPTY: JobEntry = JobEntry {
@@ -78,6 +86,8 @@ const JOB_EMPTY: JobEntry = JobEntry {
 const PROC_EMPTY: ProcEntry = ProcEntry {
     used: AtomicBool::new(false),
     gen: 0,
+    aspace: NO_ASPACE,
+    as_gen: 0,
     job: 0,
     threads: AtomicU16::new(0),
     signal: AtomicU32::new(SIG_RUNNING),
@@ -172,6 +182,26 @@ pub fn proc_create(job: u16) -> Result<u16, ProcError> {
     })
 }
 
+/// 撤掉一次登记（**只给创建失败的回滚路径用**，P5c-3）。
+/// 与 `proc_thread_exited` 的差别：那条是"线程真的跑完并收工"，会写结局信号；
+/// 这条是"线程根本没建起来"，只把计数减回去，**不碰 signal**——
+/// 否则一次失败的 thread_create 会把整个进程标成已终止。
+pub fn proc_detach_thread(proc_id: u16) -> Result<(), ProcError> {
+    mm::with_vmm_lock(|| {
+        let s = st();
+        let p = s.procs.get_mut(proc_id as usize).ok_or(ProcError::NoSuchProc)?;
+        if !alive_flag(&p.used) {
+            return Err(ProcError::NoSuchProc);
+        }
+        let n = p.threads.load(Ordering::Acquire);
+        if n == 0 {
+            return Err(ProcError::Denied);
+        }
+        p.threads.store(n - 1, Ordering::Release);
+        Ok(())
+    })
+}
+
 /// 给进程登记一条线程（**在 `spawn` 之前**调：反序的话任务可能两步之间就跑完了，
 /// 那条边看到的是 `NO_PROC`，计数永远减不到）。
 pub fn proc_attach_thread(proc_id: u16) -> Result<(), ProcError> {
@@ -210,7 +240,7 @@ pub fn proc_thread_exited(proc_id: u16, exit_code: u32) {
 /// 收走一个**已终止**的进程（僵尸）：还额度、清槽，返回退出码。
 /// 只在进程上下文里调（取 VMM），**不在故障路径上**。
 pub fn proc_reap(proc_id: u16) -> Result<u32, ProcError> {
-    mm::with_vmm_lock(|| {
+    let (code, aspace) = mm::with_vmm_lock(|| {
         let s = st();
         let p = s.procs.get_mut(proc_id as usize).ok_or(ProcError::NoSuchProc)?;
         if !alive_flag(&p.used) {
@@ -222,6 +252,7 @@ pub fn proc_reap(proc_id: u16) -> Result<u32, ProcError> {
         }
         let code = sig & !SIG_TERMINATED;
         let job = p.job;
+        let aspace = p.aspace;
         // **gen 必须活过销毁**（P5c-3a 修的那条 ABA）：整项写回 EMPTY 会把 gen 复位成 0，
         // 下一次 create 又变 1 ⇒ 旧句柄的 `(slot, gen)` 重新匹配上。
         let gen = p.gen;
@@ -230,14 +261,19 @@ pub fn proc_reap(proc_id: u16) -> Result<u32, ProcError> {
         if let Some(j) = s.jobs.get_mut(job as usize) {
             j.used_procs = j.used_procs.saturating_sub(1);
         }
-        Ok(code)
-    })
+        Ok((code, aspace))
+    })?;
+    // 锁外销毁：`aspace_destroy` 自己取 VMM，留在上面那个闭包里就是重入
+    if aspace != NO_ASPACE {
+        mm::aspace_destroy(aspace);
+    }
+    Ok(code)
 }
 
 /// 回滚一条**还没起过线程**的进程记录（占额度的动作已经发生，线程创建失败要能退回去）。
 /// 有线程或已终止的一律拒绝——那种结局只能走 `proc_reap`。
 pub fn proc_discard(proc_id: u16) -> Result<(), ProcError> {
-    mm::with_vmm_lock(|| {
+    let aspace = mm::with_vmm_lock(|| {
         let s = st();
         let p = s.procs.get_mut(proc_id as usize).ok_or(ProcError::NoSuchProc)?;
         if !alive_flag(&p.used) {
@@ -249,6 +285,7 @@ pub fn proc_discard(proc_id: u16) -> Result<(), ProcError> {
             return Err(ProcError::Denied);
         }
         let job = p.job;
+        let aspace = p.aspace;
         // **gen 必须活过销毁**（P5c-3a 修的那条 ABA）：整项写回 EMPTY 会把 gen 复位成 0，
         // 下一次 create 又变 1 ⇒ 旧句柄的 `(slot, gen)` 重新匹配上。
         let gen = p.gen;
@@ -257,11 +294,47 @@ pub fn proc_discard(proc_id: u16) -> Result<(), ProcError> {
         if let Some(j) = s.jobs.get_mut(job as usize) {
             j.used_procs = j.used_procs.saturating_sub(1);
         }
+        Ok(aspace)
+    })?;
+    if aspace != NO_ASPACE {
+        mm::aspace_destroy(aspace);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------- 读数
+
+/// 记下这个进程名下那张 AS（`process_create` 用）。槽号与世代一起存，
+/// 理由同句柄：槽号复用，只有 `(slot, gen)` 才能证明"还是当初那张表"。
+pub fn proc_set_aspace(proc_id: u16, slot: u8, gen: u32) -> Result<(), ProcError> {
+    mm::with_vmm_lock(|| {
+        let s = st();
+        let p = s.procs.get_mut(proc_id as usize).ok_or(ProcError::NoSuchProc)?;
+        if !alive_flag(&p.used) {
+            return Err(ProcError::NoSuchProc);
+        }
+        if p.aspace != NO_ASPACE {
+            // 一个进程只有一张 AS；重复登记是调用方的错，不静默覆盖（覆盖就漏一张表）
+            return Err(ProcError::Denied);
+        }
+        p.aspace = slot;
+        p.as_gen = gen;
         Ok(())
     })
 }
 
-// ---------------------------------------------------------------- 读数
+/// 这个进程名下那张 AS 的 `(槽号, 世代)`；没有或进程已不在返回 None。
+/// `gen` 必须与 `proc_gen` 读到的那一次一致（调用方拿 Proc 句柄里的世代来核）。
+pub fn proc_aspace(proc_id: u16, gen: u32) -> Option<(u8, u32)> {
+    mm::with_vmm_lock(|| {
+        let s = st();
+        let p = s.procs.get(proc_id as usize)?;
+        if !alive_flag(&p.used) || p.gen != gen || p.aspace == NO_ASPACE {
+            return None;
+        }
+        Some((p.aspace, p.as_gen))
+    })
+}
 
 /// 读进程的 signal。0=还在跑，bit31=已终止（低 31 位=退出码）。
 /// `NO_PROC` 与空槽一律读成"已终止、码 0"：调用方是等待方，读到"永不终止"会空转到超时。

@@ -236,7 +236,7 @@ pub fn terminate_task(task: usize) -> bool {
         return false;
     }
     let cpu = cpu_of(task);
-    let (slot, on_cpu_now, has_bag, was_blocked, dead_id) = {
+    let (slot, on_cpu_now, has_bag, was_blocked, dead_id, dead_proc) = {
         let mut s = rq(cpu);
         let slot = slot_of(task);
         if s.tasks[slot].state == TaskState::Free {
@@ -253,14 +253,23 @@ pub fn terminate_task(task: usize) -> bool {
         s.tasks[slot].resident = false;
         // 进程归属同理（W3 P3，ADR-073）：留着的话，复用这条槽的任务收工时会把
         // **别人的**进程线程计数减一次——那个进程就永远等不到结局。
+        let dead_proc = s.tasks[slot].proc_id;
         s.tasks[slot].proc_id = crate::proc::NO_PROC;
         // AS 归属同样跟着槽位走（W3 P5b）：留着的话复用这条槽的任务会被换进一个
         // 已经销毁的表。契约是"任务先死、AS 后销毁"，这里把槽位那一侧清干净。
         s.tasks[slot].as_slot = NO_ASPACE;
         s.tasks[slot].as_pml4 = 0;
         s.entries[slot] = None;
-        (slot, s.current == task, s.tasks[slot].owned.n > 0, was_blocked, s.tasks[slot].id)
+        (slot, s.current == task, s.tasks[slot].owned.n > 0, was_blocked, s.tasks[slot].id, dead_proc)
     };
+    // **被杀的线程也要给它的进程记一笔收工**（P5c-3 修的一条 P3 遗留洞）：
+    // 这条路径不走 `finish_current`/`kill_current`，只清 `proc_id` 的话进程的 `threads`
+    // 永远减不到 0 ⇒ 那个进程永远 reap/discard 不掉（名额与它名下的 AS 一起漏）。
+    // 退出码 1 = 非正常，与 `kill_current` 同一口径。放在放掉 RUNQ 之后：
+    // `proc_thread_exited` 今天只动原子量，但这条边不该依赖"它恰好不取锁"。
+    if dead_proc != crate::proc::NO_PROC {
+        crate::proc::proc_thread_exited(dead_proc, 1);
+    }
     // P7b（欠账⑥）：阻塞着的任务还占着**两份注册**——等待链上的 waiter 与定时器轮里的项。
     // 只改任务槽的话这两份永久留着：槽会被 spawn 复用，而注册认的是槽下标，
     // 于是等待队列 16 格 / 轮 64 格杀够次数就再也等不了（实测 6 次杀 ⇒ 各漏 6 格）。
@@ -1588,6 +1597,29 @@ pub fn state_of(i: usize) -> TaskState {
     }
     // SAFETY: 只读快照，理由同 `current_of`
     unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].state }
+}
+
+/// 改一条**已停住**的用户线程的首参（首帧 `rdi` = 第 10 格）。`process_start` 第④步用：
+/// 回填完 `StartupInfo` 之后才把它的 VA 交给子线程，然后 `wake_task` 放它跑。
+/// 只许对 `Blocked` 的槽做：Runnable/Running 的帧可能正被出口路径读，改它就是数据竞争。
+pub fn set_thread_arg(gidx: usize, arg: u64) -> bool {
+    if gidx >= MAX_TASKS_TOTAL {
+        return false;
+    }
+    let cpu = cpu_of(gidx);
+    let mut s = rq(cpu);
+    let sl = slot_of(gidx);
+    if !matches!(s.tasks[sl].state, TaskState::Blocked(_)) || !s.tasks[sl].user {
+        return false;
+    }
+    let f = s.tasks[sl].frame;
+    if f == 0 {
+        return false;
+    }
+    // SAFETY: f 是这条任务内核栈上的真实异常帧（spawn_user 建帧时算过 kstack_hi - TRAP_FRAME_BYTES），
+    // 23 个 u64 已映射；第 10 格是 rdi（TrapFrame 字段序），持 RUNQ 且任务是 Blocked ⇒ 无人同时在读它
+    unsafe { core::ptr::write_volatile((f as usize + 10 * 8) as *mut u64, arg) };
+    true
 }
 
 /// 这个槽位是不是用户态任务（P3a-2 的收尾不变量要用它区分"内核工人"与"容器任务"）。

@@ -206,6 +206,8 @@ public_api = [
   "mm::aspace_new",
   "mm::aspace_pml4_of",
   "mm::aspace_map_slot",
+  "mm::aspace_effective_flags",
+  "mm::aspace_leaf_slot",
   "mm::aspace_gen",
   "mm::aspace_new_kernel",
   "mm::aspace_destroy",
@@ -316,6 +318,27 @@ public_api = [
   "sched::init_idle",
   "sched::state_of",
   "sched::block_task",
+  "sched::id_of",
+  "sched::proc_id_of",
+  "sched::set_proc_id",
+  "sched::set_thread_arg",
+  "sched::spawn_user",
+  "sched::terminate_task",
+  "sched::thread_live",
+  "sched::wake_task",
+  "proc::job_live",
+  "proc::proc_gen",
+  "proc::proc_live",
+  "proc::proc_create",
+  "proc::proc_discard",
+  "proc::proc_attach_thread",
+  "proc::proc_detach_thread",
+  "proc::proc_aspace",
+  "proc::proc_set_aspace",
+  "user::SYS_PROCESS_CREATE",
+  "user::SYS_THREAD_CREATE",
+  "user::SYS_PROCESS_START",
+  "user::F_PROC",
   "user::park_current",
   "user::syscall_dispatch",
 ]
@@ -618,6 +641,8 @@ public_api = [
   "handle::live",
   "handle::vmo_of",
   "handle::aspace_of",
+  "handle::ObjRef",
+  "handle::RIGHT_TRANSFER",
   "handle::abort",
   "handle::begin_read",
   "handle::close",
@@ -632,7 +657,6 @@ public_api = [
   "handle::grant_thread",
   "handle::resolve",
   "handle::has",
-  "handle::aspace_of",
   "handle::transfer",
   "handle::transfer_rollback",
 ]
@@ -645,7 +669,7 @@ error_classes = ["A", "C"]
 resource_ownership = "16 格句柄表、Rights、owner 两格、slot:u16+gen:u48；两种对象引用：File 是值（port+游标），Vmo 只存槽号（本体在 memory 的 vmo 表里）。表锁内不归还任何页框：VMO 的引用增减一律在放掉 HANDLE(35) 之后做（ADR-074 决策 1）。"
 error_policy = "NoSuchHandle/StaleHandle/NotOwner/Denied/BadRights；越权拒绝并记安全事件。"
 unsafe_scope = []
-test_targets = ["t_handle_table", "t_handle_syscalls", "t_handle_reap", "t_handle_vmo_release", "t_vmo_syscalls", "t_vmo_numbers_absent", "t_handle_kinds", "t_handle_transfer"]
+test_targets = ["t_handle_table", "t_handle_syscalls", "t_handle_reap", "t_handle_vmo_release", "t_vmo_syscalls", "t_vmo_numbers_absent", "t_handle_kinds", "t_handle_transfer", "t_process_startup"]
 status = "部分落地"
 
 [modules."resource"]

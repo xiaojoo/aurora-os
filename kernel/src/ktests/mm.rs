@@ -1744,11 +1744,14 @@ fn t_handle_transfer() -> bool {
     let self_tr = matches!(handle::transfer(h2, to, to), Err(handle::HErr::Invalid));
 
     // ④ 回滚：owner 改回 from，且**中间态那个新句柄当场失效**（再 bump 一次世代）
-    if let Err(e) = handle::transfer_rollback(h2, to, from) {
-        crate::log_fatal!("tr: rollback {:?}", e);
-        return false;
-    }
-    let back_ok = handle::vmo_of(h2, from, handle::RIGHT_READ).is_err()
+    // 回滚**交回一个可用名字**（P5c-3 的 refinement）：bump 之后 h1/h2 都死了，
+    // 只有这个新名字能 close 得掉那格；只返回 () 的话那格就是孤儿（实测漏一份引用与一帧）。
+    let h4 = match handle::transfer_rollback(h2, to, from) {
+        Ok(h) => h,
+        Err(e) => { crate::log_fatal!("tr: rollback {:?}", e); return false; }
+    };
+    let back_ok = handle::vmo_of(h4, from, handle::RIGHT_READ).is_ok()
+        && handle::vmo_of(h2, from, handle::RIGHT_READ).is_err()
         && handle::vmo_of(h1, from, handle::RIGHT_READ).is_err()
         && handle::counters().transfers == c1.transfers + 1;
     // 回滚点不在那个状态上（已被别的核接走/已关掉）⇒ 明确 NoSuch，绝不硬改
@@ -1763,6 +1766,7 @@ fn t_handle_transfer() -> bool {
     // （实测 `live0->1 vmo1 free 少 1 帧`，把后面 14 格用例的收尾闸全打红）。
     // ⇒ 16 号的失败路径必须**连着 revoke 一起走**，这是设计 §10.3 第 7 步"整条装载序列回滚"的一部分。
     let sender_dead = matches!(handle::close(h1, from), Err(handle::HErr::Stale));
+    let restored_closes = handle::close(h4, from).is_ok();
 
     // ⑤ 内核侧 AS：建、数、销、二次销（幂等）、越界槽
     let k1 = match mm::aspace_new_kernel() {
@@ -1816,13 +1820,15 @@ fn t_handle_transfer() -> bool {
     handle::close(h2, from).ok();
     let revoked_from = handle::revoke_task(from.0, from.1);
     handle::revoke_task(to.0, to.1);
-    let rollback_collected = sender_dead && revoked_from >= 1;
+    // 回滚给回来的名字已经 close 掉了 ⇒ revoke 这边应当一无所获（0 格），
+    // 这正是"不再需要大范围撤销"的证人
+    let rollback_collected = sender_dead && restored_closes && revoked_from == 0;
     let _ = crate::sched::terminate_task(gi);
     let base_ok = rollback_collected && handle::live() == lv0 && vmo::vmo_count() == 0
         && mm::free_frames() == f0 && mm::aspace_count() == as0
         && crate::sched::state_of(gi) == crate::sched::TaskState::Free;
     crate::log_info!(
-        "tr(P5c-3a): 转移后可用={} 旧句柄Stale={} 计数=(transfers{}->{}) 同对象={} 无权限拒={} 自转拒={} 回滚到位={} 二次回滚拒={} 回滚需revoke={} AS建销=(1{} 2{} 越界{}) ABA={} 停={} 停Running拒={} 陈旧wake={} 唤醒={} 基线=(live{}->{} vmo{} free{}->{} as{})",
+        "tr(P5c-3a): 转移后可用={} 旧句柄Stale={} 计数=(transfers{}->{}) 同对象={} 无权限拒={} 自转拒={} 回滚到位={} 二次回滚拒={} 回滚交回名字={} AS建销=(1{} 2{} 越界{}) ABA={} 停={} 停Running拒={} 陈旧wake={} 唤醒={} 基线=(live{}->{} vmo{} free{}->{} as{})",
         new_owner_ok, old_stale, c0.transfers, handle::counters().transfers, same_obj,
         no_right, self_tr, back_ok, re_bad, rollback_collected, first_destroy, second_destroy,
         out_of_range, aba_ok, parked, self_no, stale_wake && still_blocked, woke,
@@ -1832,7 +1838,7 @@ fn t_handle_transfer() -> bool {
         && parked && self_no && stale_wake && still_blocked && woke && base_ok;
     if !ok {
         crate::log_fatal!(
-            "tr: 判据不成立 转移={} 旧Stale={} 计数={} 同对象={} 无权限={} 自转={} 回滚={} 二次={} 需revoke={} AS={} ABA={} 停={} 停Running拒={} 陈旧={} 唤醒={} 收场={}",
+            "tr: 判据不成立 转移={} 旧Stale={} 计数={} 同对象={} 无权限={} 自转={} 回滚={} 二次={} 交回名字={} AS={} ABA={} 停={} 停Running拒={} 陈旧={} 唤醒={} 收场={}",
             new_owner_ok, old_stale, count_ok, same_obj, no_right, self_tr, back_ok, re_bad,
             rollback_collected, created_ok && destroy_ok, aba_ok, parked, self_no,
             stale_wake && still_blocked, woke, base_ok);
@@ -1842,6 +1848,255 @@ fn t_handle_transfer() -> bool {
 #[cfg(feature = "handles")]
 ktest!(KT_HANDLE_TRANSFER, t_handle_transfer);
 
+// ---- ADR-075（W3 P5c-3）11/15/16 三个号：进程/线程/StartupInfo ----
+//
+// 形状照 `t_vmo_syscalls`：**工人跑号**（映射挂工人袋里，收工后由 reap 还），
+// 父任务等它收工、读走结果、再销毁进程与 Job。子线程的代码页只放 `jmp .`（EB FE）：
+// 本刀证的是"回填完才放它跑、首参确实是那一页的 VA"，**子进程真读真用那一格留给 c-3b 的探针**。
+
+#[cfg(feature = "handles")]
+static PROC_SYS: [core::sync::atomic::AtomicU64; 27] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 27];
+
+#[cfg(feature = "handles")]
+fn proc_sys_worker() -> ! {
+    use crate::arch::x86_64::trap::TrapFrame;
+    use crate::handle::{self, Handle, RIGHT_CREATE, RIGHT_DUP, RIGHT_READ, RIGHT_TRANSFER};
+    use crate::sched;
+    use crate::user::{
+        self, E_DENIED, E_INVALID, ROLE_JOB, ROLE_SELF_ASPACE, ROLE_SELF_PROC, ROLE_SELF_THREAD,
+        SI_DESC_BYTES, SI_DESC_HANDLE, SI_DESC_KIND, SI_DESC_ROLE, SI_MAGIC, SI_OFF_HANDLES,
+        SI_OFF_NHANDLES, SYS_ASPACE_MAP, SYS_PROCESS_CREATE, SYS_PROCESS_START, SYS_THREAD_CREATE,
+        syscall_dispatch,
+    };
+    use crate::{proc, vmo};
+    let put = |i: usize, v: u64| PROC_SYS[i].store(v, core::sync::atomic::Ordering::Release);
+    let bail = |code: u64| -> ! {
+        put(25, code);
+        sched::finish_current();
+        loop { crate::tsc::spin(1000); }
+    };
+    let Some(owner) = sched::current_identity() else { bail(1) };
+    let mut f = TrapFrame {
+        cr2: 0, r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
+        rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0, vector: 0,
+        error_code: 0, rip: 0, cs: 0, rflags: 0, rsp: 0, ss: 0,
+    };
+    // 根 Job 由内核持有、只在这里出示（使用者裁决 2026-11-10：产品启动路径不授予）
+    let job = match proc::job_create(None, 2, 64) { Ok(v) => v, Err(_) => bail(2) };
+    let jgen = proc::job_gen(job).unwrap_or(0);
+    put(0, job as u64);
+    let hj_plain = match handle::grant_job(owner, job, jgen, RIGHT_READ | RIGHT_DUP) {
+        Ok(h) => h, Err(_) => bail(3),
+    };
+    let hj = match handle::grant_job(owner, job, jgen, RIGHT_READ | RIGHT_DUP | RIGHT_CREATE | RIGHT_TRANSFER) {
+        Ok(h) => h, Err(_) => bail(4),
+    };
+    // ① 无 CREATE 的 Job 句柄造不出进程（-4），带 CREATE 的可以
+    f.rax = SYS_PROCESS_CREATE; f.rdi = hj_plain.0; f.rsi = 0; f.rdx = 0; f.r10 = 0;
+    syscall_dispatch(&mut f);
+    put(5, f.rax);
+    f.rax = SYS_PROCESS_CREATE; f.rdi = hj.0;
+    syscall_dispatch(&mut f);
+    let hp = Handle(f.rax);
+    put(6, hp.0);
+    let (pid, pgen) = match handle::resolve(hp, owner, 0) {
+        Ok((handle::ObjRef::Proc { slot, gen }, _)) => (slot, gen),
+        _ => bail(5),
+    };
+    put(2, pid as u64); put(3, pgen as u64);
+    let aslot = match proc::proc_aspace(pid, pgen) { Some((s, _)) => s, None => bail(6) };
+    put(4, aslot as u64);
+
+    // 三页都经 14 号铺进**子 AS**（rdx = Proc 句柄，决策 8 的那条别名）
+    let code = match vmo::vmo_create(1) { Ok(v) => v, Err(_) => bail(7) };
+    let stack = match vmo::vmo_create(1) { Ok(v) => v, Err(_) => bail(8) };
+    let si = match vmo::vmo_create(1) { Ok(v) => v, Err(_) => bail(9) };
+    // 代码页只放 `jmp .`：本刀不证"子进程读懂了什么"，只证它被放出来跑过
+    if vmo::vmo_write(code, 0, &[0xEB, 0xFE]) != Ok(2) { bail(10) }
+    let hc = match handle::grant_vmo(owner, code, RIGHT_READ | handle::RIGHT_WRITE | handle::RIGHT_MAP) {
+        Ok(h) => h, Err(_) => bail(11),
+    };
+    let hs = match handle::grant_vmo(owner, stack, RIGHT_READ | handle::RIGHT_WRITE | handle::RIGHT_MAP) {
+        Ok(h) => h, Err(_) => bail(12),
+    };
+    let hi = match handle::grant_vmo(owner, si, RIGHT_READ | handle::RIGHT_WRITE | handle::RIGHT_MAP) {
+        Ok(h) => h, Err(_) => bail(13),
+    };
+    vmo::vmo_unref(code); vmo::vmo_unref(stack); vmo::vmo_unref(si);
+    let base = 0x2_4000_0000u64;
+    let mut map = |h: Handle, flags: u64, va: u64| -> u64 {
+        f.rax = SYS_ASPACE_MAP; f.rdi = h.0; f.rsi = flags; f.rdx = hp.0; f.r10 = va;
+        syscall_dispatch(&mut f);
+        f.rax
+    };
+    let code_va = map(hc, 2, base);            // bit1 = X
+    let stack_va = map(hs, 1, base + 0x1000);  // bit0 = W
+    let si_va = map(hi, 0, base + 0x2000);     // 只读
+    put(7, code_va); put(8, stack_va); put(9, si_va);
+    if code_va != base || stack_va != base + 0x1000 || si_va != base + 0x2000 { bail(14) }
+
+    // ② 15：入口没映射必须拒；映好了则建出一条**停住**的线程
+    f.rax = SYS_THREAD_CREATE; f.rdi = hp.0; f.rsi = base + 0x8000; f.rdx = stack_va + 0x1000 - 16; f.r10 = 0;
+    syscall_dispatch(&mut f);
+    put(10, f.rax);
+    f.rax = SYS_THREAD_CREATE; f.rdi = hp.0; f.rsi = code_va; f.rdx = stack_va + 0x1000 - 16; f.r10 = 0;
+    syscall_dispatch(&mut f);
+    let ht = Handle(f.rax);
+    put(11, ht.0);
+    let (gidx, tid) = match handle::resolve(ht, owner, 0) {
+        Ok((handle::ObjRef::Thread { gidx, id }, _)) => (gidx, id),
+        _ => bail(15),
+    };
+    put(12, gidx as u64); put(13, tid as u64);
+    put(14, matches!(sched::state_of(gidx), sched::TaskState::Blocked(_)) as u64);
+    put(15, sched::runs_of(gidx));
+
+    // ③ 16：形状不对（魔数错）必须拒，而且**一条都不许转移**
+    let mut hdr = [0u8; SI_OFF_HANDLES];
+    hdr[0..4].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+    if vmo::vmo_write(si, 0, &hdr) != Ok(hdr.len()) { bail(16) }
+    f.rax = SYS_PROCESS_START; f.rdi = hp.0; f.rsi = ht.0; f.rdx = hi.0; f.r10 = si_va;
+    syscall_dispatch(&mut f);
+    put(16, f.rax);
+    put(17, handle::resolve(hj, owner, 0).is_ok() as u64); // 旧 Job 句柄必须还活着
+
+    // 正确的表：magic + ABI + 一条 ROLE_JOB 转移
+    hdr[0..4].copy_from_slice(&SI_MAGIC.to_le_bytes());
+    hdr[4..6].copy_from_slice(&(user::ABI_MAJOR as u16).to_le_bytes());
+    hdr[6..8].copy_from_slice(&(user::ABI_MINOR as u16).to_le_bytes());
+    hdr[8..12].copy_from_slice(&1u32.to_le_bytes());
+    if vmo::vmo_write(si, 0, &hdr) != Ok(hdr.len()) { bail(17) }
+    let mut d = [0u8; SI_DESC_BYTES];
+    d[SI_DESC_ROLE..SI_DESC_ROLE + 4].copy_from_slice(&ROLE_JOB.to_le_bytes());
+    d[SI_DESC_HANDLE..SI_DESC_HANDLE + 8].copy_from_slice(&hj.0.to_le_bytes());
+    if vmo::vmo_write(si, SI_OFF_HANDLES, &d) != Ok(SI_DESC_BYTES) { bail(18) }
+    f.rax = SYS_PROCESS_START; f.rdi = hp.0; f.rsi = ht.0; f.rdx = hi.0; f.r10 = si_va;
+    syscall_dispatch(&mut f);
+    put(18, f.rax);
+
+    // 读回内核回填的东西（第二台仪器：内核自己再读一遍那一页）
+    let mut nh = [0u8; 4];
+    let nh_ok = vmo::vmo_read(si, SI_OFF_NHANDLES, &mut nh) == Ok(4);
+    put(19, if nh_ok { u32::from_le_bytes(nh) as u64 } else { u64::MAX });
+    let mut area = [0u8; 4 * SI_DESC_BYTES];
+    if vmo::vmo_read(si, SI_OFF_HANDLES, &mut area) != Ok(area.len()) { bail(19) }
+    let rd32 = |b: usize| -> u32 {
+        let mut x = [0u8; 4]; x.copy_from_slice(&area[b..b + 4]); u32::from_le_bytes(x)
+    };
+    let rd64 = |b: usize| -> u64 {
+        let mut x = [0u8; 8]; x.copy_from_slice(&area[b..b + 8]); u64::from_le_bytes(x)
+    };
+    put(20, rd64(SI_DESC_HANDLE));                       // 转移后的新 Job 句柄值
+    put(21, (rd32(SI_DESC_KIND) == user::KIND_JOB) as u64);
+    let roles_ok = rd32(SI_DESC_BYTES + SI_DESC_ROLE) == ROLE_SELF_PROC
+        && rd32(2 * SI_DESC_BYTES + SI_DESC_ROLE) == ROLE_SELF_ASPACE
+        && rd32(3 * SI_DESC_BYTES + SI_DESC_ROLE) == ROLE_SELF_THREAD;
+    let kinds_ok = rd32(SI_DESC_BYTES + SI_DESC_KIND) == user::KIND_PROC
+        && rd32(2 * SI_DESC_BYTES + SI_DESC_KIND) == user::KIND_ASPACE
+        && rd32(3 * SI_DESC_BYTES + SI_DESC_KIND) == user::KIND_THREAD;
+    put(22, (roles_ok && kinds_ok) as u64);
+    // 首参确实是那一页的 VA（读它的首帧第 10 格 = rdi）
+    let rdi = match sched::task_frame(gidx) {
+        Some(fr) => {
+            // SAFETY: fr 是这条任务内核栈上的真实异常帧（spawn_user 建帧时算过），
+            // 23 个 u64 已映射；只读第 10 格，任务此刻已被 16 号放行但读一个数不改状态
+            unsafe { core::ptr::read_volatile((fr as usize + 10 * 8) as *const u64) }
+        }
+        None => u64::MAX,
+    };
+    put(23, rdi);
+    put(24, (!matches!(sched::state_of(gidx), sched::TaskState::Blocked(_))) as u64);
+    // D3 的证人必须**真的拿旧句柄去查一次表**：`stale` 是在 `check` 里加的，
+    // 转移之后没人查它就永远是 0（第一版只比计数器，结果这一格假红）。
+    let stale_seen = matches!(handle::resolve(hj, owner, 0), Err(handle::HErr::Stale));
+    put(26, stale_seen as u64);
+
+    // 收场（工人这一侧）：杀子线程 → 关句柄。进程与 Job 留给父任务在 reap 之后销毁
+    // （顺序：任务先死、映射再丢、AS 最后销 —— 映射在工人袋里，reap 才丢）
+    let _ = sched::terminate_task(gidx);
+    let _ = handle::close(hc, owner);
+    let _ = handle::close(hs, owner);
+    let _ = handle::close(hi, owner);
+    let _ = handle::close(ht, owner);
+    let _ = handle::close(hp, owner);
+    let _ = handle::close(hj_plain, owner);
+    let _ = handle::revoke_task(owner.0, owner.1);
+    put(25, 0);
+    sched::finish_current();
+    loop { crate::tsc::spin(1000); }
+}
+
+/// P5c-3：11/15/16 三个号的内核侧证人（子进程真读真用那一格在 c-3b 的探针里）。
+#[cfg(feature = "handles")]
+fn t_process_startup() -> bool {
+    use crate::{handle, proc, sched, vmo};
+    use crate::arch::x86_64::{apic, cpu};
+    use crate::ktests::common::drain_reap;
+    sched::init_boot_task();
+    sched::start_workers();
+    if crate::clock::current().is_none() { crate::calibrate_clock_once(); }
+    if proc::proc_residual().0 != 0 || proc::job_residual().0 != 0 || mm::aspace_count() != 0
+        || vmo::vmo_count() != 0 || handle::live() != 0 {
+        crate::log_fatal!("psys: 前提失效，进来就有残留");
+        return false;
+    }
+    let f0 = mm::free_frames();
+    let va0 = mm::reservation_count();
+    let c0 = handle::counters();
+    let tick_in = apic::ticks();
+    let probe = apic::wait_ticks(tick_in, 1, crate::clock::window_cycles(1));
+    let was_running = probe.ticks >= 1;
+    if !was_running { apic::timer_start().ok(); }
+    for a in PROC_SYS.iter() { a.store(0, core::sync::atomic::Ordering::Relaxed); }
+    let g = match sched::spawn(proc_sys_worker) { Ok(v) => v, Err(_) => { crate::log_fatal!("psys: spawn 失败"); return false; } };
+    let waited = apic::with_interrupts(|| sched::wait_for_task(g, crate::clock::window_cycles(16)));
+    let rel0 = sched::reap_released();
+    let _ = sched::terminate_task(g);
+    let drained = sched::reap_released() > rel0 || drain_reap();
+    if !was_running { apic::timer_stop().ok(); }
+    let r: [u64; 27] = core::array::from_fn(|i| PROC_SYS[i].load(core::sync::atomic::Ordering::Acquire));
+    if r[25] != 0 {
+        crate::log_fatal!("psys: 工人半路退场 code={} 原始={:?}", r[25], r);
+        return false;
+    }
+    let (job, pid) = (r[0] as u16, r[2] as u16);
+    // 映射已经在 reap 里丢掉了，这才轮到销毁进程（它名下那张 AS 由 proc_reap/discard 还）
+    // 被杀的线程已经把进程标成终止态（`terminate_task` 现在会给进程记一笔收工），
+    // 所以这里走 `proc_reap` 而不是 `proc_discard`（后者的闸要求 SIG_RUNNING）
+    let disc = proc::proc_reap(pid).is_ok();
+    let jdel = proc::job_destroy(job).is_ok();
+    let create_ok = r[5] == crate::user::E_DENIED && handle::Handle(r[6]).unpack().is_some();
+    let alias_ok = r[7] == 0x2_4000_0000 && r[8] == 0x2_4000_1000 && r[9] == 0x2_4000_2000;
+    let thread_ok = r[10] == crate::user::E_INVALID && handle::Handle(r[11]).unpack().is_some()
+        && r[14] == 1 && r[15] == 0;
+    let shape_ok = r[16] == crate::user::E_INVALID && r[17] == 1;
+    let start_ok = r[18] == 0 && r[19] == 4 && r[20] != 0 && r[21] == 1 && r[22] == 1;
+    let arg_ok = r[23] == r[9] && r[24] == 1;
+    // D3：转移之后父进程那个旧 Job 句柄必须 Stale，而且计数对得上
+    let stale_ok = r[26] == 1 && handle::counters().stale > c0.stale;
+    let base_ok = drained && disc && jdel && handle::live() == 0 && vmo::vmo_count() == 0
+        && mm::free_frames() == f0 && mm::reservation_count() == va0
+        && mm::aspace_count() == 0 && proc::proc_residual().0 == 0 && proc::job_residual().0 == 0;
+    crate::log_info!(
+        "psys(P5c-3): 无CREATE拒={} Proc句柄={} 14的Proc别名={} 15停住=(未映射拒{} 句柄{} Blocked{} runs{}) 形状拒且不转移={} 16=(ret{} nhandles{} 新值{:#x} kind{} 三角色{}) 首参={} 放行={} Stale计数={} 收场=(drained{} disc{} jdel{} live{} vmo{} free{}->{} va{}->{} as{})",
+        r[5] == crate::user::E_DENIED, handle::Handle(r[6]).unpack().is_some(), alias_ok,
+        r[10] == crate::user::E_INVALID, handle::Handle(r[11]).unpack().is_some(), r[14], r[15],
+        shape_ok, r[18], r[19], r[20], r[21], r[22], r[23] == r[9], r[24], stale_ok,
+        drained, disc, jdel, handle::live(), vmo::vmo_count(), f0, mm::free_frames(),
+        va0, mm::reservation_count(), mm::aspace_count());
+    let ok = waited && create_ok && alias_ok && thread_ok && shape_ok && start_ok && arg_ok
+        && stale_ok && base_ok;
+    if !ok {
+        crate::log_fatal!(
+            "psys: 判据不成立 等={} 造={} 别名={} 线程={} 形状={} 启动={} 首参={} Stale={} 收场={} 原始={:?}",
+            waited, create_ok, alias_ok, thread_ok, shape_ok, start_ok, arg_ok, stale_ok, base_ok, r);
+    }
+    let _ = cpu::self_slot();
+    ok
+}
+#[cfg(feature = "handles")]
+ktest!(KT_PROCESS_STARTUP, t_process_startup);
 // ---- ADR-074（W3 P4b）12/13/14 三个号 + 退出时归还 ----
 //
 // 为什么要在**工人任务**里打这三个号而不是在用例上下文里：14 返回的映射挂进的是
