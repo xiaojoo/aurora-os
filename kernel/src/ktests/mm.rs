@@ -598,10 +598,10 @@ fn t_aspace_create_switch_destroy() -> bool {
     // 切换期间跑的是**内核代码**（本用例自己），这正是"内核半区等价"的意义：
     // 不等价的话第一条指令就取不到，根本走不到读数行。
     let me = crate::arch::x86_64::cpu::self_slot();
-    let w_cross = unsafe { mm::aspace_switch(pml4, me) };
+    let w_cross = unsafe { mm::aspace_switch(pml4, me, Some(h.slot())) };
     let mut same_writes = 0usize;
     for _ in 0..8 {
-        if unsafe { mm::aspace_switch(pml4, me) } {
+        if unsafe { mm::aspace_switch(pml4, me, Some(h.slot())) } {
             same_writes += 1;
         }
     }
@@ -687,7 +687,7 @@ fn t_shootdown_masked() -> bool {
         None => { crate::log_fatal!("sd-mask: 读不回 PML4"); return false; }
     };
     // ① 切入 → 位图应含 BSP
-    let _ = unsafe { mm::aspace_switch(pml4, me) };
+    let _ = unsafe { mm::aspace_switch(pml4, me, Some(h.slot())) };
     let _ = unsafe { mm::aspace_switch_kernel(me) };
     let bm_after_switch = mm::aspace_running_on(0).unwrap_or(0);
     let reg_ok = bm_after_switch & (1 << me) != 0;
@@ -1725,3 +1725,171 @@ fn t_vmo_numbers_absent() -> bool {
 }
 #[cfg(not(feature = "handles"))]
 ktest!(KT_VMO_NUMBERS_ABSENT, t_vmo_numbers_absent);
+// ---- ADR-075（W3 P5b 第二半）AS 接进换人路径：D7 隔离 / D8 只在不同时写 CR3 ----
+//
+// 两个工人各跑在自己的 AS 里，读**同一个用户半区 VA**：a1 里映的是 v1、a2 里映的是 v2，
+// 图案不同 ⇒ 读回来的数不同就证明换人真的换了表（不是"两张表内容碰巧一样"）。
+// 映射用**内核可见**的 flags（不给 U/S）：工人是内核任务，读用户页会撞 SMAP，
+// 而这一格要证的是地址空间隔离，不是 ring3 可达性（那一格由 t_aspace_map_vmo 与探针证）。
+// D8 分两段：先把两个工人都登记到 a1（同 AS）跑一段 ⇒ 换人多次而 CR3 至多写一次；
+// 再把 w2 改登记到 a2 ⇒ 跨 AS 的换人必须真的写。
+// 变异：M13 换人点去掉 `prev_as != next_as` 的比较（无条件写）⇒ D8 第一段红；
+// M14 换人点整段删掉（永不写 CR3）⇒ D7 两个读数相同 ⇒ 红。
+
+static ASGO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static ASR: [core::sync::atomic::AtomicU64; 2] = [const { core::sync::atomic::AtomicU64::new(0) }; 2];
+/// 两个 AS 共用的那个 VA（用户半区、别的用例不用它）。
+const AS_VA: u64 = 0x2_0000_0000;
+
+fn as_worker(idx: usize) -> ! {
+    use core::sync::atomic::Ordering;
+    let t0 = crate::tsc::now();
+    while ASGO.load(Ordering::Acquire) == 0 && crate::tsc::now().wrapping_sub(t0) < 20_000_000_000 {
+        core::hint::spin_loop();
+    }
+    // SAFETY: AS_VA 由本用例在**两个 AS 里各自**映过（内核可见的 RW 页），
+    // 本任务跑在哪个 AS 由换人点写 CR3 决定；只读一个 u64，落在这一页内。
+    let v = unsafe { core::ptr::read_volatile(AS_VA as *const u64) };
+    ASR[idx].store(v, Ordering::Release);
+    crate::sched::finish_current();
+    crate::sched::yield_now();
+    loop {
+        crate::tsc::spin(1000);
+    }
+}
+
+fn as_w0() -> ! {
+    as_worker(0)
+}
+fn as_w1() -> ! {
+    as_worker(1)
+}
+
+fn t_aspace_switch_isolation() -> bool {
+    use crate::sched;
+    use crate::vmo;
+    use core::sync::atomic::Ordering;
+    let me = crate::arch::x86_64::cpu::self_slot();
+    if mm::aspace_count() != 0 {
+        crate::log_fatal!("assw: 前提失效，进来已有 {} 个 AS", mm::aspace_count());
+        return false;
+    }
+    // 用例自足：登记与时钟（P3/P5a 撞出来的那几条）
+    sched::init_boot_task();
+    sched::start_workers();
+    if crate::clock::current().is_none() {
+        crate::calibrate_clock_once();
+    }
+    let tick_in = crate::arch::x86_64::apic::ticks();
+    let probe = crate::arch::x86_64::apic::wait_ticks(tick_in, 1, crate::clock::window_cycles(1));
+    let was_running = probe.ticks >= 1;
+    if !was_running {
+        crate::arch::x86_64::apic::timer_start().ok();
+    }
+    ASGO.store(0, Ordering::Relaxed);
+    ASR[0].store(0, Ordering::Relaxed);
+    ASR[1].store(0, Ordering::Relaxed);
+    let f0 = mm::free_frames();
+    let a1 = match mm::aspace_new() { Some(h) => h, None => { crate::log_fatal!("assw: a1 建不起来"); return false; } };
+    let a2 = match mm::aspace_new() { Some(h) => h, None => { crate::log_fatal!("assw: a2 建不起来"); return false; } };
+    let v1 = match vmo::vmo_create(1) { Ok(v) => v, Err(_) => { crate::log_fatal!("assw: v1 建不起来"); return false; } };
+    let v2 = match vmo::vmo_create(1) { Ok(v) => v, Err(_) => { crate::log_fatal!("assw: v2 建不起来"); return false; } };
+    let p1 = 0x1122_3344_5566_7788u64;
+    let p2 = 0x8877_6655_4433_2211u64;
+    let _ = vmo::vmo_write(v1, 0, &p1.to_le_bytes());
+    let _ = vmo::vmo_write(v2, 0, &p2.to_le_bytes());
+    // 内核可见的 RW（不给 U/S）：工人是内核任务，读用户页会撞 SMAP
+    let flags = match mm::PageFlags::new(true, false, false) {
+        Ok(f) => f,
+        Err(_) => { crate::log_fatal!("assw: flags 造不出来"); return false; }
+    };
+    let va = mm::VirtAddr(AS_VA);
+    let m1 = vmo::vmo_map(v1, &a1, va, flags);
+    let m2 = vmo::vmo_map(v2, &a2, va, flags);
+    let maps_ok = m1.is_ok() && m2.is_ok();
+    let w0 = match sched::spawn(as_w0) { Ok(g) => g, Err(_) => { crate::log_fatal!("assw: w0 spawn 失败"); return false; } };
+    let w1 = match sched::spawn(as_w1) { Ok(g) => g, Err(_) => { crate::log_fatal!("assw: w1 spawn 失败"); return false; } };
+    // 第一段：**三方都在 a1**（启动任务也要登记，否则 boot↔工人 每次都跨 AS，
+    // 第一版就是这么把 21 次换人数出 14 次写的）⇒ 同 AS 换人不该写 CR3
+    let boot = sched::current_id();
+    let reg_same = sched::set_aspace(w0, 0) && sched::set_aspace(w1, 0) && sched::set_aspace(boot, 0);
+    let c0 = mm::counters().cr3_writes;
+    let s0 = sched::stats_of(me).0;
+    crate::arch::x86_64::apic::with_interrupts(|| {
+        for _ in 0..6 {
+            sched::yield_now();
+        }
+    });
+    let c1 = mm::counters().cr3_writes;
+    let s1 = sched::stats_of(me).0;
+    let switches_a = s1.saturating_sub(s0);
+    let writes_a = c1.saturating_sub(c0);
+    // 至多一次：从内核 AS 第一次切进 a1。之后全是 a1↔a1 ⇒ 0 次
+    let same_as_ok = reg_same && switches_a >= 3 && writes_a <= 1;
+    // 第二段：w1 改到 a2，发令 ⇒ 两个工人各读自己 AS 里的那一页
+    let reg_diff = sched::set_aspace(w1, 1);
+    let c2 = mm::counters().cr3_writes;
+    ASGO.store(1, Ordering::Release);
+    let e0 = crate::arch::x86_64::apic::with_interrupts(|| sched::wait_for_task(w0, crate::clock::window_cycles(8)));
+    let e1 = crate::arch::x86_64::apic::with_interrupts(|| sched::wait_for_task(w1, crate::clock::window_cycles(8)));
+    let c3 = mm::counters().cr3_writes;
+    let r0 = ASR[0].load(Ordering::Acquire);
+    let r1 = ASR[1].load(Ordering::Acquire);
+    let isolate_ok = reg_diff && maps_ok && e0 && e1 && r0 == p1 && r1 == p2 && r0 != r1;
+    let cross_ok = c3 > c2;
+    // D9：换人路径上那一次切换**不取任何锁**（ADR-075 决策 2 的实现约束）。
+    // 形状与生产调用点一致：`aspace_switch(目标根, me, Some(槽号))`。
+    // 判据是"这一次调用的取锁次数增量为 0"——增量的口径是 sync 的全局 acquire 计数，
+    // 而这一句里除它自己没有任何别的取锁来源，所以 delta 就是它自己的取锁数。
+    // 负样本（M15）：把 `let _g = vmm();` 加回 aspace_switch ⇒ delta=1 ⇒ 本格红。
+    let pml4_a2 = match a2.pml4() { Some(p) => p, None => { crate::log_fatal!("assw: a2 读不回 PML4"); return false; } };
+    // 先把 CR3 定回内核根，否则第二段跑完停在谁的表上是不确定的，
+    // 那会让"这一次调用真的写了表"变成运气——提前返回把登记一起短路，
+    // 停在 a2 时 delta=0 是**空转出来的绿**，量具不能靠运气。
+    // SAFETY: our_cr3 是启动建的内核根
+    let _ = unsafe { mm::aspace_switch_kernel(me) };
+    let lock_in = crate::sync::stats().acquires;
+    // SAFETY: pml4_a2 是自建表根且内核半区等价；此刻 IF 状态由本用例负责，本函数不动 IF
+    let wrote_a2 = unsafe { mm::aspace_switch(pml4_a2, me, Some(a2.slot())) };
+    let lock_delta = crate::sync::stats().acquires.wrapping_sub(lock_in);
+    // 位图必须照样登记（不取锁不等于不记账）；这句**在 delta 之后**取 VMM
+    let bm_a2 = mm::aspace_running_on(a2.slot()).unwrap_or(0);
+    // SAFETY: 切回启动时建的内核根
+    let back_kernel = unsafe { mm::aspace_switch_kernel(me) };
+    let bit_me = 1u8.checked_shl(me as u32).unwrap_or(0);
+    let nolock_ok = wrote_a2 && back_kernel && lock_delta == 0 && bm_a2 & bit_me != 0;
+    // 收场：**先把启动任务的 CR3 真的换回内核**，再销毁 AS。
+    // 只改 as_slot 不改 CR3 的话，下面 drop(a1) 之后本 CPU 还站在一张已经还掉的表上。
+    // 上面 D9 那段已经把它换回内核了，所以这里判"状态对不对"而不是"又写了一次"。
+    let unreg = sched::set_aspace(boot, sched::NO_ASPACE);
+    // SAFETY: 内核根由启动建立且一直有效；此刻 IF 状态由调用方负责
+    let _ = unsafe { mm::aspace_switch_kernel(me) };
+    // SAFETY: 同一个内核根再切一次；返回 false 才说明 CR3 确实已经在内核表上
+    let back = !unsafe { mm::aspace_switch(mm::our_cr3(), me, None) };
+    // 任务先死、映射再丢、AS 最后销毁（ADR-074 的契约顺序）
+    let _ = sched::terminate_task(w0);
+    let _ = sched::terminate_task(w1);
+    drop(m1);
+    drop(m2);
+    vmo::vmo_unref(v1);
+    vmo::vmo_unref(v2);
+    drop(a1);
+    drop(a2);
+    if !was_running {
+        crate::arch::x86_64::apic::timer_stop().ok();
+    }
+    let f1 = mm::free_frames();
+    let base_ok = unreg && back && f1 == f0 && mm::aspace_count() == 0 && vmo::vmo_count() == 0;
+    crate::log_info!(
+        "assw(P5b): 同AS段=(换人{} 写CR3{}) 隔离=(r0={:#x} r1={:#x} 期望 {:#x}/{:#x}) 跨AS写={} 不取锁=(增量{} 位图{:#x}/应含{:#x}) 映射={} 收场={} free{}->{}",
+        switches_a, writes_a, r0, r1, p1, p2, c3.saturating_sub(c2),
+        lock_delta, bm_a2, bit_me, maps_ok, base_ok, f0, f1);
+    let ok = same_as_ok && isolate_ok && cross_ok && nolock_ok && base_ok;
+    if !ok {
+        crate::log_fatal!(
+            "assw: 判据不成立 同AS={} 隔离={} 跨AS={} 不换锁={} 收场={}",
+            same_as_ok, isolate_ok, cross_ok, nolock_ok, base_ok);
+    }
+    ok
+}
+ktest!(KT_ASPACE_SWITCH, t_aspace_switch_isolation);

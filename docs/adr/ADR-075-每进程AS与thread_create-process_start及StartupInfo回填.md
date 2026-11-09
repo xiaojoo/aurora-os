@@ -55,6 +55,10 @@ P5 的目标形状一次做完会同时动"换人热路径 + 句柄对象种类 
 - 换人点（`preempt_point` 里装 `TSS.rsp0` 的同一处）比较 `prev.as_slot` 与 `next.as_slot`：
   不同才调 `mm::aspace_switch(pml4, me)`（ADR-070 A2 的"只在不同时变"已经有计数与负样本）。
   **CR3 写落在 P1 尺子的被测区间里**（与 `RSP0_WRITES` 同一处），所以 Q4 的"跨 AS 那一格"从这一刀起有真读数。
+  > **落地勘误（P5b 第二半，2026-11-09，见下面的补记）**：这一条比较的**基准写错了**。
+  > 不能拿"上一个任务的记录"与实际 CR3 混着比：`set_aspace` 只改记录、不改 CR3，
+  > 所以记录与实际可以不一致，按记录比会**漏写**。正确写法是拿**下一个任务的目标表**与
+  > **实际 CR3** 比（即 `aspace_switch` 内部那条 `cur == pml4` 判据），代价是每次换人多一条特权读。
 - 不做 PCID、不做 KPTI（Q6 已裁）⇒ 每次跨 AS 切换是**全 TLB 冲刷**，代价单列一格，不许写成看起来免费。
 - 进程的最后一条线程收工时由**内核**还 AS（ADR-071 决策 2 的那条顺序：等待者不做遍历）。
   归还顺序：先丢掉它名下的 `AspaceMapping`（清叶子 + 还帧参考 + 放手 VA），再丢 `AspaceHandle`
@@ -224,6 +228,77 @@ probe(P5a): 魔数=true ABI位=true 句柄=true 写=true VA=true 自读回=true
   （`TRAMP` 一旦建好就幂等，而所有 AS 用例都自己收干净，所以"有 AS 且跳板未建"这个状态不可达）。
   它防的是将来有人把第一次 `ensure_trampoline` 挪到 AS 创建之后；要证红得加一个 test-only 的
   TRAMP 复位入口，本轮不加（那是为变异造 API）。**记为未验证，不写成已证。**
+
+## 补记：P5b 第二半落地（AS 接进换人路径）+ 收尾（换人路径不碰 VMM），2026-11-10，实测
+
+决策 2 已落地 ⇒ **P5b 完整**。落到的位置：`Task` 多 `as_slot: u8` / `as_pml4: u64`
+（六处 `Task` 字面量全部初始化成 `NO_ASPACE`/`0`），`sched::set_aspace` / `aspace_of`，
+`mm::aspace_pml4_of` / `mm::AspaceHandle::slot`，换人点在
+[kernel/src/sched.rs:1781-1785](file:///H:/aurora-os/kernel/src/sched.rs#L1781-L1785)，
+`terminate_task` 收身份时把 `as_slot`/`as_pml4` 一并清掉（身份随槽走，与 P3 的 `resident`/`proc_id` 同一条）。
+
+- **登记与热路径分开**：`set_aspace` 在登记那一刻取一次 VMM 读根表（`aspace_pml4_of`），
+  把根表与槽号一起缓存进 `Task`；换人点只读这两个 Copy 字段 ⇒ **换人路径上一次锁都不取**
+  （RUNQ 自身除外）。`NO_ASPACE` 缓存成 `0`/`None`，所以**内核任务恒不写表**
+  （决策 2 那句"既有路径一次 CR3 都不多写"实测成立，见下面 D8）。
+- **草案那句"比较 `prev.as_slot` 与 `next.as_slot`"是错的**（已在决策 2 下面留了勘误指针）：
+  `set_aspace` 只改记录、不改 CR3，记录与实际可以不一致 ⇒ 按记录比会**漏写**。
+  最终写法是拿**下一个任务的目标表**与**实际 CR3** 比，比较留在 `aspace_switch` 内部那条
+  `cur == pml4` 判据上；代价是每次换人多一条特权读 `CR3`，它落在 P1 区间里、如实计入。
+- **本刀撞出来的第二条（使用者裁决"同轮修掉"）**：`aspace_switch` 原来在真的写表之后要取
+  **VMM(20)** 去登记 `running_on`，而它的调用点之一 `preempt_point` 跑在 **IF=0** 的异常出口
+  （[kernel/src/arch/x86_64/trap.rs:1124](file:///H:/aurora-os/kernel/src/arch/x86_64/trap.rs#L1124)，
+  出口在 `iretq` 之前不 `sti`）。于是：别的 CPU 持 VMM 等 shootdown 回执 → 给本 CPU 发 IPI →
+  本 CPU 卡在取 VMM 的自旋里、IF 一直是 0 → 取不到那枚 IPI → 互等到 6 ms 上界 ⇒ L4。
+  这不是推演：M13（见下）把它跑成了实测的 `L4 mm: shootdown 超时`。
+  **修法**：位图从 `AspaceEntry` 搬进 `static AS_ON: [AtomicU8; MAX_ADDR_SPACES]`
+  （[kernel/src/mm.rs:1736](file:///H:/aurora-os/kernel/src/mm.rs#L1736)），
+  `aspace_switch` 多收一个调用方本来就有的槽号，登记变成一次 `fetch_or`
+  （[kernel/src/mm.rs:2139](file:///H:/aurora-os/kernel/src/mm.rs#L2139)）。复位只在 `aspace_new`
+  发布槽位之前，所以不存在"复位吃掉并发登记"的窗口；最坏只会把 IPI 集合**放宽**，不会漏。
+  规则与两条证据写进 `docs/architecture/lock-order.md` 的新节"换人路径在 IF=0 下运行"。
+- **新用例 `t_aspace_switch_isolation`（KT_ASPACE_SWITCH）四格判据与取证读数**：
+  `assw(P5b): 同AS段=(换人18 写CR31) 隔离=(r0=0x1122334455667788 r1=0x8877665544332211 期望 0x1122334455667788/0x8877665544332211) 跨AS写=2 不取锁=(增量0 位图0x1/应含0x1) 映射=true 收场=true free116146->116146`
+  - D7 隔离：两个工人在**同一个 VA** `0x2_0000_0000` 读到各自 VMO 的内容且互不相等。
+  - D8 同 AS 不写表：写 CR3 **恒为 1 次**（只有第一次从内核表切进 a1）；跨 AS 段 2 次写。
+    `换人` 那一格**跨跑散布 18~21**（同一份 ELF 的矩阵四跑里两种都出现过）——那是抢占散布，
+    判据只要求 `>= 3` 与 `写 CR3 <= 1`；引数时要写清是哪一路。
+  - D9 换人不取锁：单独一次 `aspace_switch(目标根, me, Some(槽))` 的 `sync::stats().acquires`
+    **增量为 0**，且位图照样登记。前置那句"先把 CR3 定回内核根"是防**空转出来的绿**：
+    CR3 已经在目标表上时提前返回会同时短路掉取锁与登记，增量 0 就成了假证人。
+  - **D8 的第一版前提写错过**：只把两个工人登记进 a1、启动任务留在内核 AS，
+    于是 boot↔工人 每次都算跨 AS（21 次换人 / 14 次写）。三方都登记之后才是"同 AS 段"。
+- **三条变异各咬哪一格（2026-11-10 复跑取证，读数以这一版为准）**：
+  - M13 = 把"相同就不写"那条提前返回短路掉 ⇒ `同AS段=(换人18 写CR354)` 红，
+    `t_aspace_create_switch_destroy`（P1 那条"只在不同时变"）一起红，
+    该跑最后落在 `L4 mm: shootdown 超时 va=0xffff8000205a5000 还差 1 个回执` ⇒ **EXCEPTION(39)**。
+    **54 比换人数还大**不是记账错：登记段每次都要取 VMM ⇒ 把 VMM 的流量挂在了换人频率上，
+    这正是上面那条互等的成因。
+  - M14 = 换人点根本不写 CR3 ⇒ 工人跑在内核表上读自己 AS 的 VA：
+    `unexpected #PF rip=0xffffffff8003eb32 cr2=0x200000000 err=0x0 cpu_cpl=0` 升 **EXCEPTION(39)**。
+  - M15 = 把 `let _g = vmm();` 原样加回 `aspace_switch` ⇒ **确定性**红：
+    `不取锁=(增量1 位图0x1/应含0x1)`、`判据不成立 … 不换锁=false`、`ktests 79/80`、判定 **FAIL(35)**。
+  三条都已还原；还原后同一份代码 `判定=PASS qemu_rc=33`、`ktests 80/80`。
+- **收场顺序是撞出来的**（决策 2 只写了"先丢映射再丢 AS"，没写"先把本 CPU 的 CR3 换回内核"）：
+  只 `set_aspace(boot, NO_ASPACE)` 而实际 CR3 还指着 a1，`drop(a1)` 之后本 CPU 就站在一张
+  已经还掉的表上 ⇒ 用例里显式切回内核根，并把判据从"又写了一次"改成"CR3 确实在内核根上"
+  （D9 已经切回去一次，再判"写没写"会假红）。
+- **门禁读数**：`check` **17/17**；`ktests` 默认档 **80/80**、`handles` 档 **82/82**（P5a 是 81/81）；
+  矩阵 **45/45 符合**（`normal/elf 0bc1586a66e4`，收尾前后各跑过一轮，
+  收尾前那一轮第一次 44/45、红在挂设备的"边沿与消息由设备事件数到"行、同一 ELF 复跑 45/45，
+  成因仍是 `L4 mm: shootdown 超时` 那个仪器边缘家族——**但本轮已经把它与上面那条真隐患区分开**：
+  隐患由 M13/M15 确定性复现，不靠那一跑的运气）；
+  `bench` **4/4**，P4 地板 **0.21 %**（21 bp），`baselines/2026-11-09T16-41-13Z-p3p4.txt`。
+- **unsafe 普查 364 → 372**（本半刀累计 +8：`ktests/mm` U2 1→2、U6 13→18；`sched` U2 6→7、U4 15→16），
+  白名单 `[modules]` 与 `[unsafe-census]` 汇总、`unsafe-census.md` 汇总行与 ktests/mm 逐处节同轮重算；
+  `module-interfaces.toml` 加 `mm::aspace_pml4_of`、`sched::NO_ASPACE`、`sched::set_aspace`、
+  `sched::aspace_of` 与新用例名（`mm::aspace_switch` 已在册，只改签名；`AspaceHandle::slot` 归在已有的
+  `mm::AspaceHandle` 条目下）。
+
+**这一刀之后仍开着的**：跨 AS 是**全 TLB 冲刷**（无 PCID/KPTI，Q6 已裁），
+P5c 的 `process_start` 会把这条代价带到产品路径上——**那时换人路径的零取锁就是硬前提**；
+`AS_ON` 只增不减 + 4 个槽的容量 ⇒ P5c 若把 AS 数提上去要一并重算 `MAX_ADDR_SPACES`；
+决策 3–7（`StartupInfo`、转移、`MAX_STARTUP_HANDLES`、根 Job、`process_start` 原子性边界）仍未落地。
 
 ## 备选方案
 

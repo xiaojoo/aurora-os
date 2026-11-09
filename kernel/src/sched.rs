@@ -29,6 +29,9 @@ pub const MOD_STACK_KUSER: ModuleId = ModuleId(15);
 /// （init + 3 子进程 × 2 线程 = 7 条线程）加 boot 上下文与兜底 idle **正好 9 格、零余量**。
 /// 实测读数与三本账的代价见 ADR-071 决策 3 的补记；再要余量得重开那一题。
 pub const MAX_TASKS: usize = 9;
+/// `Task::as_slot` 的"内核 AS"哨兵（W3 P5b，ADR-075 决策 2）。
+/// **内核任务恒为它**，所以既有路径一次 CR3 都不多写（矩阵 45 行不该变的论证基础）。
+pub const NO_ASPACE: u8 = 0xFF;
 // ADR-041：VA 保留表的容量归 memory 拥有；扩槽要把 memory 的容量一起抬。
 const _: () = assert!(MAX_TASKS <= crate::mm::MAX_TASKS_SUPPORTED);
 /// 全系统可登记的任务数（跨所有 CPU）。用例读 `WORK[i]` / `state_of(i)` 时用的是这个空间里的全局下标。
@@ -93,6 +96,11 @@ pub struct Task {
     /// 所属进程槽号（`proc::NO_PROC` = 无进程/内核任务）。W3 P3（ADR-073）。
     /// 收工出口据此置 signal + 减线程计数；收尾判据据此判"用例造的进程线程必须清零"。
     pub proc_id: u16,
+    /// 这个任务跑在哪个地址空间里（`NO_ASPACE` = 内核那份）。W3 P5b（ADR-075 决策 2）。
+    pub as_slot: u8,
+    /// 登记时缓存下来的根表物理地址（0 = 内核 AS）。**换人时只比较它，不查表**：
+    /// 查表要取 VMM，而换人点 IF=0，持 VMM 等别的 CPU 回执会把两边绑死（ADR-047 决策 2）。
+    pub as_pml4: u64,
     /// **属于哪个 CPU 的队列**（`cpu` 模块的槽位号）。
     ///
     /// 为什么要把"在哪个 CPU 上"从 `state` 里分出来：M3a 那次挂死就是两者共用一个字段造成的——
@@ -246,6 +254,10 @@ pub fn terminate_task(task: usize) -> bool {
         // 进程归属同理（W3 P3，ADR-073）：留着的话，复用这条槽的任务收工时会把
         // **别人的**进程线程计数减一次——那个进程就永远等不到结局。
         s.tasks[slot].proc_id = crate::proc::NO_PROC;
+        // AS 归属同样跟着槽位走（W3 P5b）：留着的话复用这条槽的任务会被换进一个
+        // 已经销毁的表。契约是"任务先死、AS 后销毁"，这里把槽位那一侧清干净。
+        s.tasks[slot].as_slot = NO_ASPACE;
+        s.tasks[slot].as_pml4 = 0;
         s.entries[slot] = None;
         (slot, s.current == task, s.tasks[slot].owned.n > 0, was_blocked, s.tasks[slot].id)
     };
@@ -390,6 +402,8 @@ const EMPTY_TASK: Task = Task {
     user: false,
     resident: false,
     proc_id: crate::proc::NO_PROC,
+    as_slot: NO_ASPACE,
+    as_pml4: 0,
     on_cpu: 0,
     runs: 0,
     left_tsc: 0,
@@ -961,6 +975,8 @@ pub fn init_boot_task() {
         user: false,
         resident: true, // 每 CPU 的启动/空闲上下文：设计上不退出（名单见 Task::resident）
         proc_id: crate::proc::NO_PROC,
+        as_slot: NO_ASPACE,
+        as_pml4: 0,
         on_cpu: cpu as u8,
         runs: 1,
         left_tsc: 0,
@@ -992,6 +1008,8 @@ pub fn init_idle_task(stack_lo: u64, stack_hi: u64, guarded: bool) {
         user: false,
         resident: true, // 每 CPU 的启动/空闲上下文：设计上不退出（名单见 Task::resident）
         proc_id: crate::proc::NO_PROC,
+        as_slot: NO_ASPACE,
+        as_pml4: 0,
         on_cpu: cpu as u8,
         runs: 1,
         left_tsc: 0,
@@ -1225,6 +1243,8 @@ pub fn init_idle() -> bool {
         user: false,
         resident: true, // 兜底 idle 永不退出（ADR-051）：它是"没人可换"时的最后一格
         proc_id: crate::proc::NO_PROC,
+        as_slot: NO_ASPACE,
+        as_pml4: 0,
         on_cpu: cpu as u8,
         runs: 0,
         left_tsc: 0,
@@ -1300,6 +1320,8 @@ fn spawn_inner(entry: fn() -> !, resident: bool) -> Result<usize, mm::MmError> {
         user: false,
         resident,
         proc_id: crate::proc::NO_PROC,
+        as_slot: NO_ASPACE,
+        as_pml4: 0,
         on_cpu: cpu as u8,
         runs: 0,
         left_tsc: 0,
@@ -1356,6 +1378,8 @@ pub fn spawn_user(entry_rip: u64, user_stack_top: u64, mut res: OwnedSet) -> Res
         user: true,
         resident: false, // 用户任务永远不进常驻名单：收尾判据对它本来就点名（ADR-050）
         proc_id: crate::proc::NO_PROC,
+        as_slot: NO_ASPACE,
+        as_pml4: 0,
         on_cpu: cpu as u8,
         runs: 0,
         left_tsc: 0,
@@ -1590,6 +1614,34 @@ pub fn own_current(item: OwnedItem) -> Result<(), mm::MmError> {
     s.tasks[slot_of(me)].owned.push_item(item)
 }
 
+/// 把一个任务登记到某个 AS 上（W3 P5b；用例用，P5c 的 `thread_create` 走同一条）。
+/// **在这里查一次根表并缓存**，换人时就不再取 VMM。只允许本 CPU 的活任务（同 `set_proc_id`）。
+pub fn set_aspace(i: usize, slot: u8) -> bool {
+    if i >= MAX_TASKS_TOTAL || cpu_of(i) != crate::arch::x86_64::cpu::self_slot() {
+        return false;
+    }
+    let pml4 = if slot == NO_ASPACE { 0 } else { mm::aspace_pml4_of(slot).unwrap_or(0) };
+    if slot != NO_ASPACE && pml4 == 0 {
+        return false;
+    }
+    let mut s = my_rq();
+    if !matches!(s.tasks[slot_of(i)].state, TaskState::Runnable | TaskState::Running) {
+        return false;
+    }
+    s.tasks[slot_of(i)].as_slot = slot;
+    s.tasks[slot_of(i)].as_pml4 = pml4;
+    true
+}
+
+/// 读一个任务的 AS 归属（只读快照，判据用）。
+pub fn aspace_of(i: usize) -> u8 {
+    if i >= MAX_TASKS_TOTAL {
+        return NO_ASPACE;
+    }
+    // SAFETY: 只读快照，理由同 `current_of`
+    unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].as_slot }
+}
+
 /// 读一个任务的 proc_id（只读快照）。
 pub fn proc_id_of(i: usize) -> u16 {
     if i >= MAX_TASKS_TOTAL { return crate::proc::NO_PROC; }
@@ -1690,6 +1742,11 @@ pub unsafe fn preempt_point(frame: u64, cpu: usize) {
         return;
     }
     let nslot = slot_of(next);
+    // 锁内只取下一个任务的归属值（Copy），写 CR3 在放锁之后做
+    let (next_as, next_slot) = {
+        let s = rq(cpu);
+        (s.tasks[nslot].as_pml4, s.tasks[nslot].as_slot)
+    };
     {
         let mut s = rq(cpu);
         // 只有 Running 才降级成 Runnable。**不能**把 Done 又改回 Runnable：
@@ -1714,6 +1771,18 @@ pub unsafe fn preempt_point(frame: u64, cpu: usize) {
             RSP0_WRITES.fetch_add(1, Ordering::Relaxed);
         }
     }
+    // W3 P5b（ADR-075 决策 2）：换入谁的表就与**实际 CR3** 比，相同不写（A2 的"不同才写"）。
+    // **不拿 prev 任务的记录来比**：登记（`set_aspace`）只改记录、不改 CR3，所以"当前任务的记录"
+    // 与实际 CR3 可以不一致；按记录比会漏写，实测后果是工人跑在内核表上读它自己 AS 的 VA
+    // ⇒ ring0 `#PF cr2=0x200000000 err=0x0` 升 L4。`aspace_switch` 内部读 CR3 再决定写不写，
+    // 那是唯一可靠的不变量（代价是每次换人多一条特权读，它在 P1 区间里，如实计入）。
+    // 位置三条约束：①放掉 RUNQ 之后；②在 P1 的 `t0..d` 区间之内（§7.2：CR3 写是被测成本）；
+    // ③在 `context_load` 之前，此后到换人只碰内核半区（所有 AS 共享，ADR-070 A1）⇒ 不会踩空。
+    let target = if next_as == 0 { mm::our_cr3() } else { next_as };
+    // SAFETY: target 来自登记时核对过的 AS 表项或内核根；内核半区等价由 aspace_new 保证；
+    // 槽号与根表来自同一格的同一次读，所以位图写的是"这个表所属的 AS"
+    let next_as_slot = if next_slot == NO_ASPACE { None } else { Some(next_slot) };
+    unsafe { mm::aspace_switch(target, cpu, next_as_slot) };
     // 换出去的那次中断不会经过异常桩出口，所以在这里替它记账（见 trap::p3_record_irq）
     trap::p3_record_irq(cpu, crate::tsc::now().wrapping_sub(trap::entry_tsc_of(cpu)));
     FLAGS[cpu].switches.fetch_add(1, Ordering::Relaxed);

@@ -9,7 +9,7 @@
 //!   手册"首期 4 KiB 基础页"指的是**分配粒度**，不约束区域映射。
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::sync::{self, IrqGuard, IrqSpinLock};
 
@@ -1709,15 +1709,11 @@ struct AspaceEntry {
     /// 但 P1 只建空 AS（1 张），给 16 是"接缝够用"的尺，不是推导值。
     pt_frames: [u64; AS_PT_SLOTS],
     pt_count: usize,
-    /// 曾经跑过这个 AS 的 CPU 位图（ADR-072）。bit i = CPU i 曾切入过。
-    /// **只增不减**（换走时不摘：摘除要证明"不会再有该 AS 的 TLB 条目"，TCG 观测不到）；
-    /// 销毁时清零。shootdown 收窄路径只通知这张位图里的 CPU。
-    running_on: u8,
 }
 
 const AS_PT_SLOTS: usize = 16;
 const AS_EMPTY: AspaceEntry =
-    AspaceEntry { used: false, pml4: 0, pt_frames: [0; AS_PT_SLOTS], pt_count: 0, running_on: 0 };
+    AspaceEntry { used: false, pml4: 0, pt_frames: [0; AS_PT_SLOTS], pt_count: 0 };
 
 #[derive(Clone, Copy)]
 struct AspaceTable {
@@ -1729,6 +1725,15 @@ struct AspaceCell(UnsafeCell<AspaceTable>);
 unsafe impl Sync for AspaceCell {}
 
 static ASPACES: AspaceCell = AspaceCell(UnsafeCell::new(AspaceTable { items: [AS_EMPTY; MAX_ADDR_SPACES] }));
+
+/// "这颗 CPU 曾跑过这个 AS"的位图，**从表项里搬出来单独放**（ADR-075 决策 2 的实现约束）。
+/// bit i = CPU i 曾切入过；只增不减（换走时不摘：摘除要证明"不会再有该 AS 的 TLB 条目"，TCG 观测不到）。
+/// 唯一的写点是 `aspace_switch`（换人路径）与 `aspace_register_cpu`（用例），**都不取 VMM**：
+/// 换人点在 IF=0 下运行，为了登记位图去取 VMM(20) 会把本 CPU 的 shootdown 回执
+/// 绑在"别的 CPU 正持着 VMM 等回执"上 ⇒ 跨 CPU 互等（实测见 M13：每次换人都登记 = `L4 mm: shootdown 超时`）。
+/// 复位只发生在 `aspace_new` 发布槽位**之前**：那时还没有任何任务能切进这个槽，
+/// 所以不存在"复位吃掉并发登记"的窗口；槽位被复用时同理。
+static AS_ON: [AtomicU8; MAX_ADDR_SPACES] = [const { AtomicU8::new(0) }; MAX_ADDR_SPACES];
 
 #[inline]
 fn aspaces() -> &'static mut AspaceTable {
@@ -1745,6 +1750,12 @@ pub struct AspaceHandle {
 }
 
 impl AspaceHandle {
+    /// 这个 AS 的槽号（`AS_ON` 的索引，也是 `Task::as_slot` 里存的那个数）。
+    /// 纯数值，不取锁；柄本身已经保证槽号是当初那个 AS 的。
+    pub fn slot(&self) -> u8 {
+        self.slot
+    }
+
     /// 这个 AS 的 PML4 物理地址（切换要用；表读在 VMM 内）。
     pub fn pml4(&self) -> Option<u64> {
         let _g = vmm();
@@ -1827,7 +1838,8 @@ pub fn aspace_new() -> Option<AspaceHandle> {
             (*mine).0[i] = (*kernel).0[i];
         }
     }
-    t.items[slot] = AspaceEntry { used: true, pml4, pt_frames: [0; AS_PT_SLOTS], pt_count: 0, running_on: 0 };
+    AS_ON[slot].store(0, Ordering::Release);
+    t.items[slot] = AspaceEntry { used: true, pml4, pt_frames: [0; AS_PT_SLOTS], pt_count: 0 };
     t.items[slot].pt_frames[0] = frame;
     t.items[slot].pt_count = 1;
     AS_PT_LIVE.fetch_add(1, Ordering::Relaxed);
@@ -1861,17 +1873,27 @@ fn aspace_release(slot: u8) {
     AS_PT_LIVE.fetch_sub(frames.1, Ordering::Relaxed);
 }
 
+/// 按槽号读它的 PML4 物理地址（槽不存在返回 None）。**给登记路径用一次**：
+/// 换人热路径不该为了查根表去取 VMM——那会把别的 CPU 的 shootdown 等待绑到本 CPU 上，
+/// 而本 CPU 此刻 IF=0（ADR-075 决策 2 的实现约束）。
+pub fn aspace_pml4_of(slot: u8) -> Option<u64> {
+    let _g = vmm();
+    let e = aspaces().items.get(usize::from(slot))?;
+    if e.used { Some(e.pml4) } else { None }
+}
+
 /// 此刻存在的非内核 AS 数（收尾判据与用例自足用）。
 pub fn aspace_count() -> usize {
     let _g = vmm();
     aspaces().items.iter().filter(|e| e.used).count()
 }
 
-/// 读一个 AS 的 `running_on` 位图（ADR-072 见证）。slot 不存在返回 None。
+/// 读一个 AS 的 CPU 位图（ADR-072 见证）。slot 不存在返回 None。
+/// 位图本体是 `AS_ON`（不取锁的原子）；这里取 VMM 只为了判"这个槽还在不在"。
 pub fn aspace_running_on(slot: u8) -> Option<u8> {
     let _g = vmm();
     let e = aspaces().items.get(usize::from(slot))?;
-    if e.used { Some(e.running_on) } else { None }
+    if e.used { Some(AS_ON[usize::from(slot)].load(Ordering::Acquire)) } else { None }
 }
 
 /// 手动把一颗 CPU 登记进 AS 的位图（**用例专用**：产品路径由 `aspace_switch` 自动登记）。
@@ -1879,10 +1901,10 @@ pub fn aspace_running_on(slot: u8) -> Option<u8> {
 pub fn aspace_register_cpu(slot: u8, cpu: usize) -> Option<u8> {
     let bit = 1u8.checked_shl(cpu as u32)?;
     let _g = vmm();
-    let e = aspaces().items.get_mut(usize::from(slot))?;
+    let e = aspaces().items.get(usize::from(slot))?;
     if !e.used { return None; }
-    let old = e.running_on;
-    e.running_on |= bit;
+    let cell = &AS_ON[usize::from(slot)];
+    let old = cell.fetch_or(bit, Ordering::AcqRel);
     Some(old)
 }
 
@@ -1953,7 +1975,7 @@ impl Drop for AspaceMapping {
             if live {
                 let mask = match self.as_slot {
                     None => None,
-                    Some(slot) => Some(aspaces().items[usize::from(slot)].running_on),
+                    Some(slot) => Some(AS_ON[usize::from(slot)].load(Ordering::Acquire)),
                 };
                 for k in 0..n {
                     let a = self.va.0 + (k as u64) * PAGE as u64;
@@ -2102,12 +2124,19 @@ fn map_shared(
 /// 而 A1 的见证函数负责把它变成可判的。
 ///
 /// `me` 是调用方的 CPU 槽号（由调用方传入，避免本函数新增 arch:: 引用撞棘轮）。
-/// 切换成功后把 `me` 登记进目标 AS 的 `running_on`（ADR-072：只增不减）。
+/// `as_slot` 是目标 AS 的槽号（`None` = 切回内核表）；切换成功后把 `me` 登记进
+/// `AS_ON[as_slot]`（ADR-072：只增不减）。
+///
+/// **本函数不取任何锁**（ADR-075 决策 2 的实现约束）：它的调用点之一是 IF=0 下的换人路径
+/// （`sched::preempt_point`，异常出口），在那里取 VMM(20) 会让本 CPU 停在自旋里、
+/// 取不到别的 CPU 发来的 shootdown IPI，而那个 CPU 正持着 VMM 等本 CPU 的回执 ⇒ 互等 6 ms 到 L4。
+/// 槽号由调用方（`Task.as_slot`，登记时已核对过）传入，所以这里不需要为查表而拿锁。
 ///
 /// # Safety
 /// `pml4` 必须是本内核自建、内核半区已复制等价的有效 PML4 物理地址；
-/// 调用时 IF 状态由调用方负责（本函数不动 IF）。
-pub unsafe fn aspace_switch(pml4: u64, me: usize) -> bool {
+/// `as_slot` 必须是 `pml4` 所属 AS 的槽号（错传只会把一个多余的 CPU 位写进别的 AS 的位图，
+/// 后果是收窄范围放大，不会漏通知）；调用时 IF 状态由调用方负责（本函数不动 IF）。
+pub unsafe fn aspace_switch(pml4: u64, me: usize, as_slot: Option<u8>) -> bool {
     // SAFETY: 读 CR3 是特权读，调用方在 ring0；原语在上方 global_asm 里，只动 CR3
     let cur = unsafe { aspace_cr3_read() };
     if cur == pml4 {
@@ -2117,15 +2146,11 @@ pub unsafe fn aspace_switch(pml4: u64, me: usize) -> bool {
     unsafe { aspace_cr3_write(pml4) };
     CR3_WRITES.fetch_add(1, Ordering::Relaxed);
     // ADR-072：登记"这颗 CPU 曾跑过这个 AS"。只增不减（换走时不摘）。
-    // 内核半区共享，所以切换后 VMM 锁与 ASPACES 表仍可达。
-    // running_on 是 u8（8 位 = MAX_CPUS），checked_shl 在 me>=8 时返回 None，不引入 arch:: 引用。
-    if let Some(bit) = 1u8.checked_shl(me as u32) {
-        let _g = vmm();
-        for e in aspaces().items.iter_mut() {
-            if e.used && e.pml4 == pml4 {
-                e.running_on |= bit;
-                break;
-            }
+    // 位图在 `AS_ON`（原子，不取锁）——见上面那段"本函数不取任何锁"。
+    // 位图是 u8（8 位 = MAX_CPUS），checked_shl 在 me>=8 时返回 None，不引入 arch:: 引用。
+    if let (Some(slot), Some(bit)) = (as_slot, 1u8.checked_shl(me as u32)) {
+        if let Some(cell) = AS_ON.get(usize::from(slot)) {
+            cell.fetch_or(bit, Ordering::AcqRel);
         }
     }
     true
@@ -2136,8 +2161,8 @@ pub unsafe fn aspace_switch(pml4: u64, me: usize) -> bool {
 /// # Safety
 /// 同 `aspace_switch`；`our_cr3()` 非 0（启动已切换）。
 pub unsafe fn aspace_switch_kernel(me: usize) -> bool {
-    // SAFETY: our_cr3 是启动时建的内核表，前提由 take_over 保证
-    unsafe { aspace_switch(our_cr3(), me) }
+    // SAFETY: our_cr3 是启动时建的内核表，前提由 take_over 保证；内核表没有 AS 槽
+    unsafe { aspace_switch(our_cr3(), me, None) }
 }
 
 /// 已有非内核 AS 之后，内核半区的新映射一律拒绝（ADR-070 决策 2 的冻结前置，判据 A6）。

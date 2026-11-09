@@ -1,0 +1,7 @@
+# P3/P4 原始输出（2026-11-09T16-41-13Z）。可比性依据 §12.4.1 规则 2，跨机只看比值。
+host_cpu=Intel64 Family 6 Model 183 Stepping 1, GenuineIntel qemu_cpu=max smp=4 mem=512M rust=见 tools/versions.toml
+discriminate=yes p4_repeat_spread_bps=21
+no-load#1 verdict=PASS rc=33 p3_faults,mean,min,max=(10, 119482, 464, 513351) p4_stages,total,bytes=(7, 9125736822, 156520) p1_samples,mean,min,max=(75, 49024, 7361, 1059600) p2_mmio_rd=(64, 2609, 476, 135014) p2_mmio_wr=(64, 2349, 515, 116113) p2_dma=(64, 48750, 42733, 335195) p2_ruler_1v4=(476, 1856)
+no-load#2 verdict=PASS rc=33 p3_faults,mean,min,max=(10, 121922, 459, 477169) p4_stages,total,bytes=(7, 9105847633, 155992) p1_samples,mean,min,max=(75, 51451, 7184, 1004576) p2_mmio_rd=(64, 2765, 494, 144007) p2_mmio_wr=(64, 2448, 524, 121728) p2_dma=(64, 47281, 41714, 347141) p2_ruler_1v4=(494, 1846)
+bench-pf-load verdict=PASS rc=33 p3_faults,mean,min,max=(10, 417795, 223972, 850351) p4_stages,total,bytes=(7, 8588483883, 157379) p1_samples,mean,min,max=(37, 68850, 9549, 1005549) p2_mmio_rd=(64, 5174, 927, 269232) p2_mmio_wr=(64, 6235, 2488, 230620) p2_dma=(64, 50970, 42968, 494259) p2_ruler_1v4=(927, 1795)
+bench-switch-load verdict=PASS rc=33 p3_faults,mean,min,max=(10, 159229, 340, 978728) p4_stages,total,bytes=(7, 9128051383, 156173) p1_samples,mean,min,max=(63, 92910, 36457, 1363227) p2_mmio_rd=(64, 2636, 484, 136764) p2_mmio_wr=(64, 3272, 1324, 121387) p2_dma=(64, 52241, 46984, 351642) p2_ruler_1v4=(484, 1812)

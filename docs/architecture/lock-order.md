@@ -108,6 +108,47 @@ contention: 无锁丢数 10204 / 16000 = 6377 bp（这条数字是尺子能分�
 自死锁——而自死锁在单核上的表现是"关中断自旋直到溢出"，归因极难，所以这张表
 先于代码存在。
 
+## 换人路径在 IF=0 下运行：CR3 写与位图登记都不许取锁（W3 P5b 收尾，ADR-075，2026-11-10）
+
+**事实前提（实测）**：`preempt_point` 的调用点是异常出口
+（[kernel/src/arch/x86_64/trap.rs:1124](file:///H:/aurora-os/kernel/src/arch/x86_64/trap.rs#L1124)），
+出口代码在 `iretq` 之前没有 `sti`，所以那一刻 **IF=0**。这条不是推测：`aspace_switch` 里那句
+CR3 写就在这个窗口里执行。
+
+**由此得到的一条规则**：换人路径上除了 RUNQ(8) 自身，**不许为了换表这件事再取别的锁**。
+具体是 `mm::aspace_switch` 不取 VMM(20)：
+
+```
+持 VMM 的那颗 CPU（A）正在等 shootdown 回执
+    ↓ 它给 B 发了 IPI
+B 在 preempt_point 里要取 VMM ⇒ 自旋期间 IF 一直是 0 ⇒ 取不到那枚 IPI
+    ↓
+A 等 B 的回执，B 等 A 放锁 ⇒ 互等到 SHOOTDOWN_DEADLINE_CYCLES（≈6 ms）⇒ L4
+```
+
+这就是本页"处理方不得取任何锁"那条的**对偶**：那条管的是 IPI 进门之后，这一条管的是
+"还没进门就已经把自己堵在锁外面"。跨 CPU 互等看不见 per-CPU 等级栈，`sync` 判不出来。
+
+**落地形态**：`running_on` 位图从 `AspaceEntry` 里搬到
+`static AS_ON: [AtomicU8; MAX_ADDR_SPACES]`（[kernel/src/mm.rs:1733-1741](file:///H:/aurora-os/kernel/src/mm.rs#L1733-L1741)）。
+槽号由调用方传入（`Task::as_slot`，登记时已核对过），所以登记不需要查表 ⇒ 不需要锁。
+复位只在 `aspace_new` 发布槽位之前 ⇒ 不存在"复位吃掉并发登记"的窗口；
+写的是 `fetch_or`，最坏情况是位被**多**记（IPI 集合放宽），不会漏。
+
+**证据（两条各咬一格）**：
+- M13（把"相同就不写"的提前返回短路掉，于是每次换人都走登记段）：同 AS 段从 `写CR3 1` 涨到 `写CR3 54`，
+  `t_aspace_switch_isolation` 与 `t_aspace_create_switch_destroy` 两格红，且该跑最后落在
+  `L4 mm: shootdown 超时 va=0xffff8000205a5000 还差 1 个回执` ⇒ **上面那条互等形状是实测出来的**，
+  54 比换人数还大正是因为登记段每次都要取 VMM。
+- M15（把 `let _g = vmm();` 原样加回 `aspace_switch`）：新格 `不取锁=(增量1 …)` 红
+  ⇒ `判据不成立 … 不换锁=false`，`ktests 79/80`，判定 **FAIL(35)**。这条是**确定性**负样本，
+  不需要碰运气撞超时。
+
+**判据本身**（D9，`t_aspace_switch_isolation` 内）：先把 CR3 定回内核根，再单独调一次
+`aspace_switch(pml4_a2, me, Some(slot))`，判 `sync::stats().acquires` 增量为 0 **且**位图照样登记。
+"先定回内核根"是防**空转出来的绿**：CR3 已经在目标表上时提前返回会同时短路掉取锁与登记，
+增量 0 就成了假证人。
+
 ## 尚未覆盖的（写清楚，不留白）
 
 - **持锁期间禁止**（§7.1）：睡眠、堆分配（`RANK_HEAP` 自己除外，它是分配器的叶子锁）、
