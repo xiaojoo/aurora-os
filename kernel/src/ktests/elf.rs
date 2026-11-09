@@ -379,7 +379,7 @@ fn t_elf_load_run() -> bool {
     sched::start_workers();
     user::clear_counters();
     // 装载产物（代码/数据/用户栈）连同 `spawn_user` 自己加的内核栈一起归这个任务
-    let t = match sched::spawn_user(loaded.entry, loaded.stack_top, loaded.owned) {
+    let t = match sched::spawn_user(loaded.entry, loaded.stack_top, 0, loaded.owned) {
         Ok(t) => t,
         Err(e) => {
             crate::log_fatal!("elfload: spawn_user 失败 {:?}", e);
@@ -640,7 +640,7 @@ fn t_probe_ring3() -> bool {
     sched::init_boot_task();
     sched::start_workers();
     user::clear_counters();
-    let t = match sched::spawn_user(loaded.entry, loaded.stack_top, loaded.owned) {
+    let t = match sched::spawn_user(loaded.entry, loaded.stack_top, 0, loaded.owned) {
         Ok(t) => t,
         Err(e) => { crate::log_fatal!("probe: spawn_user 失败 {:?}", e); return false; }
     };

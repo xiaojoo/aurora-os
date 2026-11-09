@@ -843,6 +843,33 @@ pub fn block_current(token: crate::sync::WaitToken) -> bool {
     true
 }
 
+/// 把**别的**任务标成阻塞（P5c-3a，使用者裁决的方案 B）。
+///
+/// 为什么要有这一条：`thread_create`（15 号）把新线程建出来就必须**停住它**，
+/// 直到 `process_start`（16 号）把 `StartupInfo` 回填完（D2 要求子线程看到的是填好的表）。
+/// 已有的 `block_current` 只能停"自己"，而刚 spawn 的任务不是当前任务。
+///
+/// 复用 `Blocked(token)` 而不是给 `Task` 加一个 `parked` 标志：状态机、picker 的跳过、
+/// `wake_task` 的世代核对、以及 ADR-061 那条"杀阻塞任务要摘两份注册"全都已经实测过；
+/// 加标志位要同时动 pick/terminate/收尾扫描三处判据。
+/// **这里不给 token 注册任何等待队列项**（它不等事件，只等 16 号），
+/// 所以 terminate 路径上那两句摘链天然是无效操作，也不会漏出"格数"来。
+pub fn block_task(gidx: usize, token: crate::sync::WaitToken) -> bool {
+    if gidx >= MAX_TASKS_TOTAL {
+        return false;
+    }
+    let cpu = cpu_of(gidx);
+    let mut s = rq(cpu);
+    let sl = slot_of(gidx);
+    // 只停 Runnable：正在 CPU 上的该用 `block_current`（它还要负责让出），
+    // Done/Free/Blocked 都不该被这条路径改写。
+    if s.tasks[sl].state != TaskState::Runnable || current_of(cpu) == gidx {
+        return false;
+    }
+    s.tasks[sl].state = TaskState::Blocked(token);
+    true
+}
+
 /// 唤醒一个阻塞任务（P4a：立目标 CPU 的 need 牌；跨核 IPI 在 P4c）。
 /// **只有**目标槽确实是 `Blocked` 且世代号匹配时才转移，否则返回 false：
 /// 陈旧 wake、唤醒一个已 Free/Done 的槽、或 token 对不上，都必须是无效操作，
@@ -1337,7 +1364,10 @@ fn spawn_inner(entry: fn() -> !, resident: bool) -> Result<usize, mm::MmError> {
 /// 三条规则：①帧必须落在内核栈上，那道"帧在不在这条栈上"的检查才继续成立；
 /// ②首次运行的帧同样是 `TrapFrame`（`cs/ss` 是 RPL3、`rsp` 指向用户栈），
 /// 与内核任务共用 `context_load`；③`rflags` 里不写 IF——IF 由 CPU 供（ADR-021）。
-pub fn spawn_user(entry_rip: u64, user_stack_top: u64, mut res: OwnedSet) -> Result<usize, mm::MmError> {
+/// 建一条用户线程。`arg` 写进首帧的 `rdi`（`TrapFrame` 的第 10 格），
+/// 也就是子线程第一条用户指令看到的第一个参数（ADR-075 决策 5）。
+/// **既有调用点全部传 0** ⇒ 行为逐字不变（`t_elf_load_run` 那一族本来就不看 rdi）。
+pub fn spawn_user(entry_rip: u64, user_stack_top: u64, arg: u64, mut res: OwnedSet) -> Result<usize, mm::MmError> {
     let cpu = crate::arch::x86_64::cpu::self_slot();
     let win = mm::alloc_va_range(STACK_VA_PAGES).ok_or(mm::MmError::OutOfMemory)?;
     let map_lo = win.0 + mm::PAGE as u64;
@@ -1352,6 +1382,7 @@ pub fn spawn_user(entry_rip: u64, user_stack_top: u64, mut res: OwnedSet) -> Res
     let mut frame = [0u64; 23];
     frame[16] = 0; // vector
     frame[17] = 0; // error_code
+    frame[10] = arg; // 用户入口的第一个参数（16 号传的是 StartupInfo 的 VA）
     frame[18] = entry_rip; // 用户代码入口
     frame[19] = trap::ucode_sel(); // cs = 0x23（RPL3）
     // 与内核任务同理：IF 由 CPU 供（ADR-021），这里只留保留位 0x2。

@@ -41,7 +41,7 @@ fn run_one(flag: u64, calls: u64, tag: &str, expect_end: bool) -> Option<Round> 
     let (base, stack_top, entry, owned) = (l.data_va, l.stack_top, l.entry, l.owned);
     let (image_lo, image_hi) = (l.image_lo, l.image_hi);
     user::write_at(base + user::ABI_SLOT_FLAG, flag);
-    let t = match sched::spawn_user(entry, stack_top, owned) {
+    let t = match sched::spawn_user(entry, stack_top, 0, owned) {
         Ok(t) => t,
         Err(e) => {
             crate::log_fatal!("abi {tag}: 任务建不起来 {:?}", e);
@@ -226,7 +226,7 @@ fn t_copy_user() -> bool {
     user::write_at(l.data_va + user::ABI_SLOT_SELF_VA, l.data_va);
     user::write_at(l.data_va + user::ABI_SLOT_FLAG, user::FLAG_BUF);
     let (base, entry, stack_top, owned) = (l.data_va, l.entry, l.stack_top, l.owned);
-    let t = match sched::spawn_user(entry, stack_top, owned) {
+    let t = match sched::spawn_user(entry, stack_top, 0, owned) {
         Ok(v) => v,
         Err(e) => {
             crate::log_fatal!("copy: 任务建不起来 {:?}", e);
@@ -385,7 +385,7 @@ fn t_syscall_fastpath() -> bool {
     };
     user::write_at(l.data_va + user::ABI_SLOT_FLAG, user::FLAG_FASTPATH);
     let (base, entry, stack_top, owned) = (l.data_va, l.entry, l.stack_top, l.owned);
-    let t = match sched::spawn_user(entry, stack_top, owned) {
+    let t = match sched::spawn_user(entry, stack_top, 0, owned) {
         Ok(v) => v,
         Err(e) => {
             crate::log_fatal!("fast: 任务建不起来 {:?}", e);

@@ -164,6 +164,9 @@ pub struct Counters {
     pub invalid: u32,
     pub no_such: u32,
     pub revoked: u32,
+    /// 成功转移的次数（P5c-3a，ADR-075 决策 4）。D3 的证人是 `stale` 的增量，
+    /// 这一格是"转移真的发生了"的正向计数，两个数不能互相替代。
+    pub transfers: u32,
     pub reads: u32,
     pub bytes: u64,
     pub live_peak: u32,
@@ -177,7 +180,7 @@ struct Table {
 impl Table {
     const fn empty() -> Table {
         Table { slots: [EMPTY; MAX_HANDLES], c: Counters {
-            grants: 0, closes: 0, stale: 0, not_owner: 0, denied: 0, exhausted: 0,
+            grants: 0, closes: 0, stale: 0, not_owner: 0, denied: 0, exhausted: 0, transfers: 0,
             invalid: 0, no_such: 0, revoked: 0, reads: 0, bytes: 0, live_peak: 0,
         } }
     }
@@ -380,6 +383,53 @@ pub fn aspace_of(h: Handle, owner: (usize, u32), need: u32) -> Result<u8, HErr> 
             Err(HErr::Denied)
         }
     }
+}
+
+/// 转移一个句柄的**所有权**（P5c-3a，ADR-075 决策 4）：改 `owner` 两格 + bump 世代。
+///
+/// - 要 `RIGHT_TRANSFER`（16 号位，ADR-073 已占）。
+/// - **发送方的旧句柄当场 `Stale`**：世代号在 `check` 里比不过 ⇒ 这条不需要新计数器，
+///   `counters().stale` 的增量就是证人（D3）。
+/// - 返回的是**新句柄值**——`process_start` 回填 `StartupInfo.handles[].handle` 用的正是它。
+///   这也解释了为什么回填必须在转移之后：句柄值含世代号，转移之前谁也填不出来。
+/// - 表仍是全局 16 格（决策 4）：这里没有"移进新进程的表"，只有名字换了主人。
+pub fn transfer(h: Handle, from: (usize, u32), to: (usize, u32)) -> Result<Handle, HErr> {
+    if from == to {
+        return Err(note(HErr::Invalid));
+    }
+    let mut g = TABLE.lock();
+    let t = g.get();
+    let slot = check(t, h, from, RIGHT_TRANSFER)?;
+    let e = &mut t.slots[slot];
+    let next = next_gen(e.gen);
+    e.gen = next;
+    e.owner_gidx = to.0 as u16;
+    e.owner_id = to.1;
+    t.c.transfers += 1;
+    Ok(Handle::pack(slot as u16, next))
+}
+
+/// 回滚一次转移（`process_start` 第③步失败时调，ADR-075 决策 3 的那条"②③任一步失败必须回滚②"）。
+/// 用**新句柄值**定位槽位、核对现在的主人就是 `to`，然后把 owner 改回 `from` 并**再 bump 一次世代**
+/// ⇒ 中间态那个新句柄当场失效，两边都不会拿着一个"看起来有效其实已被回滚"的名字。
+pub fn transfer_rollback(new_h: Handle, to: (usize, u32), from: (usize, u32)) -> Result<(), HErr> {
+    let mut g = TABLE.lock();
+    let t = g.get();
+    let Some((slot, gen)) = new_h.unpack() else {
+        t.c.invalid += 1;
+        return Err(HErr::Invalid);
+    };
+    let e = &mut t.slots[slot as usize];
+    if !e.used || e.gen != gen || e.owner_gidx as usize != to.0 || e.owner_id != to.1 {
+        // 回滚点已经不在这个状态上（槽被关掉/被别人接走）：不硬来，报 NoSuch 让调用方整段退场
+        t.c.no_such += 1;
+        return Err(HErr::NoSuch);
+    }
+    e.gen = next_gen(gen);
+    e.owner_gidx = from.0 as u16;
+    e.owner_id = from.1;
+    t.c.transfers += 1;
+    Ok(())
 }
 
 /// 每槽独立；1..=GEN_MAX，跳过 0；到顶**回绕到 1**（设计 §9 G：承诺是计数上界，
@@ -1041,7 +1091,7 @@ mod tests {
             }
         };
         crate::user::write_at(l.data_va + crate::user::ABI_SLOT_FLAG, crate::user::FLAG_EXIT);
-        let t = match crate::sched::spawn_user(l.entry, l.stack_top, l.owned) {
+        let t = match crate::sched::spawn_user(l.entry, l.stack_top, 0, l.owned) {
             Ok(t) => t,
             Err(_) => return false,
         };

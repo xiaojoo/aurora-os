@@ -222,7 +222,11 @@ pub fn proc_reap(proc_id: u16) -> Result<u32, ProcError> {
         }
         let code = sig & !SIG_TERMINATED;
         let job = p.job;
+        // **gen 必须活过销毁**（P5c-3a 修的那条 ABA）：整项写回 EMPTY 会把 gen 复位成 0，
+        // 下一次 create 又变 1 ⇒ 旧句柄的 `(slot, gen)` 重新匹配上。
+        let gen = p.gen;
         *p = PROC_EMPTY;
+        p.gen = gen;
         if let Some(j) = s.jobs.get_mut(job as usize) {
             j.used_procs = j.used_procs.saturating_sub(1);
         }
@@ -245,7 +249,11 @@ pub fn proc_discard(proc_id: u16) -> Result<(), ProcError> {
             return Err(ProcError::Denied);
         }
         let job = p.job;
+        // **gen 必须活过销毁**（P5c-3a 修的那条 ABA）：整项写回 EMPTY 会把 gen 复位成 0，
+        // 下一次 create 又变 1 ⇒ 旧句柄的 `(slot, gen)` 重新匹配上。
+        let gen = p.gen;
         *p = PROC_EMPTY;
+        p.gen = gen;
         if let Some(j) = s.jobs.get_mut(job as usize) {
             j.used_procs = j.used_procs.saturating_sub(1);
         }
@@ -362,7 +370,10 @@ pub fn job_destroy(job: u16) -> Result<(), ProcError> {
         if j.used_procs != 0 {
             return Err(ProcError::Denied);
         }
+        // 同 `proc_reap`/`proc_discard`：gen 活过销毁
+        let gen = j.gen;
         *j = JOB_EMPTY;
+        j.gen = gen;
         Ok(())
     })
 }

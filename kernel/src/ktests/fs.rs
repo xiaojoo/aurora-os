@@ -786,7 +786,7 @@ fn t_fat32_exec() -> bool {
     sched::init_boot_task();
     sched::start_workers();
     user::clear_counters();
-    let t = match sched::spawn_user(loaded.entry, loaded.stack_top, loaded.owned) {
+    let t = match sched::spawn_user(loaded.entry, loaded.stack_top, 0, loaded.owned) {
         Ok(t) => t,
         Err(e) => {
             crate::log_fatal!("elfdisk: spawn_user 失败 {:?}", e);

@@ -103,7 +103,7 @@ fn t_user_roundtrip() -> bool {
     // `OwnedSet::new()` 不是占位：手写镜像那三页是**测试脚手架**，两个任务共用同一套页，
     // 所以它们不属于任何一个任务（属于谁就该在谁结束时释放）。容器那条路径
     // （`t_elf_load_run`）才是"一次装载一份资源"，那份资源交给任务持有。
-    let utask = match sched::spawn_user(entry, stop, sched::OwnedSet::new()) {
+    let utask = match sched::spawn_user(entry, stop, 0, sched::OwnedSet::new()) {
         Ok(t) => t,
         Err(e) => {
             crate::log_fatal!("user: spawn_user 失败 {:?}", e);
@@ -118,7 +118,7 @@ fn t_user_roundtrip() -> bool {
     // 所以取指必然 #PF(err=0x15) —— 判据不依赖"我猜这条指令的第二个字节会解码成什么"。
     // （之前写成 `entry + 1`，实测那条字节串 `C7 C0 01 00 00 00` = `mov eax,1` 是**合法**
     // 指令，任务照常跑完三次调用，`kills` 读出 0：判据抓不到任何东西。）
-    let bad = match sched::spawn_user(prog.data_va, stop, sched::OwnedSet::new()) {
+    let bad = match sched::spawn_user(prog.data_va, stop, 0, sched::OwnedSet::new()) {
         Ok(t) => t,
         Err(e) => {
             crate::log_fatal!("user: 第二条（从数据页取指）任务建不起来 {:?}", e);
@@ -292,7 +292,7 @@ fn t_task_exit() -> bool {
         }
     };
     let entry_page = l1.entry;
-    let t1 = match sched::spawn_user(l1.entry, l1.stack_top, l1.owned) {
+    let t1 = match sched::spawn_user(l1.entry, l1.stack_top, 0, l1.owned) {
         Ok(t) => t,
         Err(e) => {
             crate::log_fatal!("exit: 第一个任务建不起来 {:?}", e);
@@ -354,7 +354,7 @@ fn t_task_exit() -> bool {
         // 通过 SMAP 窗口往它的 flag 格写非 0：程序跑完调用序列之后就自己结束。
         // 这一步同时是 §10.3 的最小预览（内核开窗口**写**用户页），不是测试专用的后门。
         user::write_at(l2.data_va + 48, 1);
-        match sched::spawn_user(l2.entry, l2.stack_top, l2.owned) {
+        match sched::spawn_user(l2.entry, l2.stack_top, 0, l2.owned) {
             Ok(t2) => {
                 apic::with_interrupts(|| {
                     let t0 = tsc::now();

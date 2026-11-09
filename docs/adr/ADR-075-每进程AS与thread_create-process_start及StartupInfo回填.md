@@ -395,6 +395,63 @@ P5c 的 `process_start` 会把这条代价带到产品路径上——**那时换
   `user-abi-capability.md` §4.4 第 2/3 条的勘误块改成落地事实并新增 §4.4b；
   ADR-074 号表那条勘误指针标上"已落地"。
 
+## 补记：P5c-3a 的底座落地（转移/回滚、停线程、内核侧 AS、ABA 修复），2026-11-10，实测
+
+11/15/16 三个号还没接，本补记只覆盖**它们要用的四样原语**，外加一条**上一刀留下的真洞**。
+这四样原语在接号之前没有产品调用者（硬约束 2），所以同轮补了 `t_handle_transfer`
+（KT_HANDLE_TRANSFER）当它们的真实调用者兼证人。
+
+- **ABA：P5c-1 加的世代号原本防不住槽位复用**。`aspace_release` / `proc_reap` / `proc_discard` /
+  `job_destroy` 都是整项写回 `*_EMPTY`，而 `gen` 在项里 ⇒ 销毁把 gen 复位成 0，
+  下一次 create 复用同格又变 1 ⇒ **旧句柄的 `(slot, gen)` 重新匹配上**。
+  `AS世代` 那格当时是绿的，只因为用例销毁后没有复用槽位（**绿而无效**的典型）。
+  修法：四处都保留 `gen`；用例改成"销毁 → 复用同格再建 → 旧句柄仍须解析不过"，
+  AS 与 Job 两张表各一格。变异 **M24**（去掉 mm 那处保留）实测咬中 `AS复用ABA=false`，
+  `failed=1`、FAIL(35)。
+- **`handle::transfer` / `transfer_rollback`**（决策 4 的实体）：改 owner 两格 + bump 世代；
+  回滚再 bump 一次让中间态那个新句柄当场失效。新增 `counters().transfers` 作正向计数
+  （D3 的证人仍是 `stale` 增量，两个数不能互相替代）。
+  **实测撞出来的连带后果**：回滚 bump 之后**发送方手里那个旧句柄也失效了** ⇒ 那格名字谁都
+  `close` 不掉，只有 `revoke_task(from)` 收得走。只回滚不 revoke 的代价不是"少一格名字"，
+  而是永久漏一份 VMO 引用与一帧：现场 `live0->1 vmo1 free 少 1 帧`，
+  把后面 **14 格**用例的收尾闸全打红。⇒ **16 号的失败路径必须连着 `revoke_task` 一起走**，
+  这是设计 §10.3 第 7 步"整条装载序列回滚"的一部分，不能只调 `transfer_rollback`。
+  这条已经写成用例里的 `回滚需revoke` 一格（红→绿即证人）。
+- **`sched::block_task(gidx, token)`**（使用者裁决的方案 B）：停一个**不是当前**的 `Runnable`，
+  复用 `Blocked`/`wake_task`/ADR-061 的杀阻塞清理，**不给 token 注册任何等待队列项**
+  （它不等事件，只等 16 号）。**一格判据被证伪并降级**：`停自己` 那一格在变异 **M27**
+  （删掉 `current_of(cpu) == gidx` 守卫）之后**仍然全绿**——当前任务的状态是 `Running`，
+  前一个条件已经把它挡住了，那道守卫今天走不到。按 ADR-054 的口径把它降级成
+  **结构性论证**（防将来有人先标 Runnable 再来停），判据改名为 `停Running拒`，
+  注释里写明它证的不是那道守卫。**不写成"已实测"。**
+- **`mm::aspace_new_kernel()` / `aspace_destroy(slot)`**（使用者批准的形状）：进程名下那张 AS 的
+  主人是 proc 表，与 `aspace_new` 共用 `aspace_new_slot` 实体，差别只在谁负责收；
+  ktest 自己的 AS 继续用 RAII。`aspace_destroy` 的越界守卫用 `get` 而不是 `min` 夹到最后一格
+  （第一版写成 `min` 就是"销毁别人的 AS"）。变异 **M28**（两道守卫都去掉）以 **EXCEPTION(39)**
+  形态咬中越界那一格（`aspace_release` 先下标后判 `used`）；**M28b**（只去 `used`、留边界）
+  精确咬中幂等那一格 `AS=false`、FAIL(35)。
+- **`spawn_user` 加第 4 参 `arg`**（决策 5）：写进首帧 `rdi`（`TrapFrame` 第 10 格），
+  **13 个调用点全部补 0** ⇒ 既有行为逐字不变。
+- **`MAX_ADDR_SPACES` 4 → 8**：依据写在代码注释里（进程 4 格 + 用例族实测会同时要的 2 格 = 6，
+  留一格余量），代价是 `.bss` 每格约 152 字节。
+- **取证读数**：`check` **17/17**；`ktests` 默认档 **80/80**、`handles` 档 **84/84**（新增这一条）；
+  `tr(P5c-3a): 转移后可用=true 旧句柄Stale=true 计数=(transfers0->2) 同对象=true 无权限拒=true
+  自转拒=true 回滚到位=true 二次回滚拒=true 回滚需revoke=true AS建销=(1true 2false 越界false)
+  ABA=true 停=true 停Running拒=true 陈旧wake=true 唤醒=true 基线=(live0->0 vmo0 free116022->116022 as0)`；
+  矩阵与 bench 的取证读数见 BACKLOG §161。变异 **M25**（转移不 bump）咬 `旧Stale=false` 与 `计数=false`；
+  **M26**（回滚不 bump）咬 `回滚=false`；M24/M27/M28/M28b 见上。
+- **登记面**：`module-interfaces.toml` 的 capability 加 `RIGHT_CREATE`/四个 `grant_*`/`resolve`/`has`/
+  `aspace_of`/`transfer`/`transfer_rollback` 与两个新用例名，memory 加 `aspace_new_kernel`/`aspace_destroy`，
+  sched 加 `block_task`。
+
+**接 11/15/16 之前还要裁的两件（本文不自行决定）**：
+① `process_create` 要交回 **Proc 与 ASpace 两个句柄**，而 syscall 只有一个返回值——
+   倾向"`rax` 给 Proc、`rsi` 给一个 8 字节出参指针装 AS 句柄"（与 `peek_buf`/`poke_buf` 同形），
+   备选是再开一个号（要重开 Q1 的号表）。
+② **启动映射的归属**：14 号铺出来的映射今天挂在**创建者任务的资源袋**里（ADR-074 按任务归属），
+   父进程先退，子线程的代码/栈映射就当场没了。这一版照现状实现并配"父先退"的负样本让它可判，
+   改成进程级归属是本文留给 P7 的那笔账，不在 c-3 偷偷做。
+
 ## 备选方案
 
 - **一刀做完 P5**：拒绝（决策 1）。换人热路径、句柄种类、ABI、新产物四件事一起动，

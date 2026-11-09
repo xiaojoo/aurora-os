@@ -1695,7 +1695,15 @@ pub fn map_hole(pa: u64, pages: usize) -> Result<MmioMapping, MmError> {
 
 /// 非内核地址空间的定长表容量。与 `MAX_LAZY_REGIONS` 同一口径：今天无 workload 依据，
 /// 按"接缝够用"定尺；P3 的 workload 实测（Q2）之后再重定。
-pub const MAX_ADDR_SPACES: usize = 4;
+/// AS 表容量。**P5c-3a 从 4 提到 8**，依据是两条真实并存的用量，不是"凑个 2 的幂"：
+/// - 进程侧：`proc::MAX_PROCESSES = 4`，而 `process_create` 一进程一张 AS ⇒ 上限 4；
+/// - 用例侧：`t_aspace_switch_isolation` 同时持有 2 张（a1/a2，跑的过程中不与进程重叠，
+///   但 `t_aspace_map_vmo`/P1 那一族的 2 张与 c-3 用例的 4 张**可能同 boot 串行共存**，
+///   因为它们都在 `.ktests` 里注册、彼此只要求"进来得是空的"，不是"全局只许两张"）；
+/// - 4 + 2 = 6 是实测会同时要格子的最大组合，取 8 留一格余量。
+///   **代价如实写**：`AS_ON` 与表项数组同步变大（每格 `AspaceEntry` 约 152 字节 ⇒ 8 格 1.2 KB，
+///   在 `.bss`），且槽号位宽不变（`u8`），`running_on` 只增不减的语义不变。
+pub const MAX_ADDR_SPACES: usize = 8;
 
 /// 表项。全 Copy 数值（与 `LazyRegion` 同律）：PML4 物理地址 + 它自己建的表页帧号清单。
 /// **只记自己建的**：高 256 项复制的是*项*，下层表是共享的内核表，销毁时绝不能还它们
@@ -1815,7 +1823,7 @@ impl Drop for AspaceHandle {
 /// 建一个非内核地址空间：新 PML4 页（`MOD_AS_PT`，有主人），高 256 项从 `AS_KERNEL`
 /// **复制项**（下层表共享，Linux `pgd_alloc` 的形状，Q5 裁决），低 256 项清零。
 /// 表满/分配失败返回 None（已取的帧就地归还，不留无主帧）。上下文 KERNEL，取 VMM。
-pub fn aspace_new() -> Option<AspaceHandle> {
+fn aspace_new_slot() -> Option<(u8, u32)> {
     if !is_ready() {
         return None;
     }
@@ -1847,7 +1855,43 @@ pub fn aspace_new() -> Option<AspaceHandle> {
     t.items[slot].pt_frames[0] = frame;
     t.items[slot].pt_count = 1;
     AS_PT_LIVE.fetch_add(1, Ordering::Relaxed);
-    Some(AspaceHandle { slot: slot as u8 })
+    Some((slot as u8, gen))
+}
+
+/// 建一张 AS 并交出一个 **RAII 柄**（丢弃即销毁）。用例与内核自己的映射继续用它。
+pub fn aspace_new() -> Option<AspaceHandle> {
+    let (slot, _) = aspace_new_slot()?;
+    Some(AspaceHandle { slot })
+}
+
+/// 建一张**内核侧持有**的 AS，返回 `(槽号, 世代)`，**不给 RAII 柄**（P5c-3a，ADR-075 决策 2/3）。
+///
+/// 为什么要另一种入口：`AspaceHandle` 是 non-Copy 且 `Drop` 里要取 VMM，
+/// 放进 `proc::ProcEntry` 既不能 const 初始化、也不可能在 VMM 锁内安全丢弃（P1 就撞过这条）。
+/// 所以进程名下那张 AS 的**主人是 proc 表**：`process_create` 记下 `(slot, gen)`，
+/// `proc_discard`/`proc_reap` 归还名额时调 `aspace_destroy`。
+/// 与 `aspace_new` 共用同一段实体（同一格 `gen` 递增、同一份 `AS_ON` 复位、同样只记自建表页），
+/// 差别只在"谁负责收"——ktest 自己的 AS 继续用 RAII，两条路各配自己的证人。
+pub fn aspace_new_kernel() -> Option<(u8, u32)> {
+    aspace_new_slot()
+}
+
+/// 销毁内核侧持有的那张 AS（`aspace_new_kernel` 的另一半）。
+/// 槽不存在返回 false（幂等：`proc_reap` 与显式收场都调它，第二次就是无效操作）。
+/// **调用前提是这张 AS 上没有活着的任务**（ADR-074 的契约顺序：任务先死、映射再丢、AS 最后销），
+/// 这条前提不由本函数检查——它由 `proc` 的 `threads == 0` 闸保证。
+pub fn aspace_destroy(slot: u8) -> bool {
+    let live = {
+        let _g = vmm();
+        // `get` 而不是下标：槽号越界必须是"没有这张 AS"，
+        // 而不是把越界夹到最后一格去销毁别人的 AS（第一版写成 min 就是这个错）
+        aspaces().items.get(usize::from(slot)).map_or(false, |e| e.used)
+    };
+    if !live {
+        return false;
+    }
+    aspace_release(slot);
+    true
 }
 
 /// 销毁一个 AS（柄丢弃时调）。P1 的低半区为空，所以今天只做"归还自己建的表页 + 清表项"。
@@ -1865,7 +1909,12 @@ fn aspace_release(slot: u8) {
         let n = e.pt_count;
         let mut out = [0u64; AS_PT_SLOTS];
         out[..n].copy_from_slice(&e.pt_frames[..n]);
+        // **gen 活过销毁**（P5c-3a 修的那条 ABA，`proc::job_destroy` 同一形状）：
+        // 整项写回 AS_EMPTY 会把 gen 复位成 0，下一张 AS 复用这格又变 1
+        // ⇒ 旧句柄的 `(slot, gen)` 重新匹配上，世代号就白加了。
+        let gen = e.gen;
         *e = AS_EMPTY;
+        e.gen = gen;
         (out, n)
     };
     // 锁外归还：frame_put 到 0 才真还（毒化 + 台账 + free_frames），与 SharedFrame::drop 同律

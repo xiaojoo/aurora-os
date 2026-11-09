@@ -1082,7 +1082,7 @@ fn t_demand_zero() -> bool {
     let mut ok = owned.push_lazy(r1).is_ok();
     ok &= owned.push(code_map).is_ok();
     ok &= owned.push(stk_map).is_ok();
-    let t1 = match crate::sched::spawn_user(code_va, stk_va + mm::PAGE as u64 - 16, owned) {
+    let t1 = match crate::sched::spawn_user(code_va, stk_va + mm::PAGE as u64 - 16, 0, owned) {
         Ok(g) => g,
         Err(e) => {
             crate::log_fatal!("demand-zero: spawn_user 失败 {:?}", e);
@@ -1147,7 +1147,7 @@ fn t_demand_zero() -> bool {
     let mut o2 = crate::sched::OwnedSet::new();
     o2.push(map2).ok();
     o2.push(smap2).ok();
-    let t2 = match crate::sched::spawn_user(code2, stk2 + mm::PAGE as u64 - 16, o2) {
+    let t2 = match crate::sched::spawn_user(code2, stk2 + mm::PAGE as u64 - 16, 0, o2) {
         Ok(g) => g,
         Err(e) => {
             crate::log_fatal!("demand-zero: 越界任务起不来 {:?}", e);
@@ -1181,7 +1181,7 @@ fn t_demand_zero() -> bool {
     let mut o3 = crate::sched::OwnedSet::new();
     o3.push(smap3).ok();
     o3.push_lazy(r3).ok();
-    let t3 = match crate::sched::spawn_user(base3, stk3 + mm::PAGE as u64 - 16, o3) {
+    let t3 = match crate::sched::spawn_user(base3, stk3 + mm::PAGE as u64 - 16, 0, o3) {
         Ok(g) => g,
         Err(e) => {
             crate::log_fatal!("demand-zero: 取指任务起不来 {:?}", e);
@@ -1590,7 +1590,17 @@ fn t_handle_kinds() -> bool {
         Err(e) => { crate::log_fatal!("hkind: grant_job(2) {:?}", e); return false; }
     };
     let jd2 = proc::job_destroy(j2).is_ok();
-    let split_ok = jd2 && handle::resolve(hj2, owner, 0).is_ok() && !proc::job_live(j2, g2);
+    // 另两张表的同一个 ABA（gen 必须活过销毁）：复用这格再建一个 Job，旧 `(slot, gen)` 仍对不上。
+    let j3 = proc::job_create(None, 1, 8);
+    let job_aba = match j3 {
+        Ok(v) => {
+            let back = v == j2 && !proc::job_live(j2, g2);
+            proc::job_destroy(v).ok();
+            back
+        }
+        Err(_) => false,
+    };
+    let split_ok = jd2 && job_aba && handle::resolve(hj2, owner, 0).is_ok() && !proc::job_live(j2, g2);
     // 这一格只是证人，不留句柄在表里：⑥/⑦ 的账要按"只剩 ASpace 那一个"算
     handle::close(hj2, owner).ok();
     let as_live = handle::resolve(ha, owner, 0)
@@ -1599,6 +1609,15 @@ fn t_handle_kinds() -> bool {
     let n0 = handle::counters().no_such;
     drop(a);
     let as_stale = handle::resolve(ha, owner, 0).is_err() && handle::counters().no_such > n0;
+    // ABA 证人（P5c-3a 补的）：**复用同一格再建一张 AS**，旧句柄仍然必须解析不过。
+    // 只判"销毁之后"不够：销毁若把 gen 复位成 0，下一张 AS 复用这格又变 1，
+    // 旧句柄的 (slot, gen) 就重新匹配上了——世代号白加（本轮实测第一版正是这样）。
+    let a_b = mm::aspace_new();
+    let ab_slot = a_b.as_ref().map(|h| h.slot());
+    let as_aba = ab_slot == Some(slot_a)
+        && handle::resolve(ha, owner, 0).is_err()
+        && mm::aspace_live(slot_a, mm::aspace_gen(slot_a).unwrap_or(0));
+    drop(a_b);
 
     // ⑤ Thread：任务是槽 + id 两格；terminate 之后槽标 Free ⇒ 同一个句柄 `NoSuch`
     let gi = match crate::sched::spawn(kinds_sleep) {
@@ -1644,24 +1663,184 @@ fn t_handle_kinds() -> bool {
         && proc::job_residual().0 == jp0 && proc::proc_residual().0 == pp0
         && mm::aspace_count() == as0;
     crate::log_info!(
-        "hkind(P5c-1): CREATE={} proc={} 活性分工={} AS活={} AS世代={} 线程活={} 线程撤销={} close不动本体={} revoke={} 锁序=(viol{}->{}/reent{}->{}) 基线=(live{}->{} AS{}->{} job{}->{} proc{}->{})",
-        create_ok, proc_ok, split_ok, as_live, as_stale, th_live, th_gone, noclose_ok, rev_ok,
+        "hkind(P5c-3a): CREATE={} proc={} 活性分工={} AS活={} AS世代={} AS复用ABA={} 线程活={} 线程撤销={} close不动本体={} revoke={} 锁序=(viol{}->{}/reent{}->{}) 基线=(live{}->{} AS{}->{} job{}->{} proc{}->{})",
+        create_ok, proc_ok, split_ok, as_live, as_stale, as_aba, th_live, th_gone, noclose_ok, rev_ok,
         ls0.order_violations, ls1.order_violations, ls0.reentrant_hits, ls1.reentrant_hits,
         lv0, handle::live(), as0, mm::aspace_count(), jp0, proc::job_residual().0,
         pp0, proc::proc_residual().0);
-    let ok = create_ok && proc_ok && split_ok && as_live && as_stale && th_live && th_gone
-        && noclose_ok && rev_ok && lock_ok && base_ok;
+    let ok = create_ok && proc_ok && split_ok && as_live && as_stale && as_aba
+        && th_live && th_gone && noclose_ok && rev_ok && lock_ok && base_ok;
     if !ok {
         crate::log_fatal!(
-            "hkind: 判据不成立 CREATE={} proc={} 活性分工={} AS活={} AS世代={} 线程={} 线程撤={} close={} revoke={} 锁序={} 收场={}",
-            create_ok, proc_ok, split_ok, as_live, as_stale, th_live, th_gone, noclose_ok, rev_ok,
-            lock_ok, base_ok);
+            "hkind: 判据不成立 CREATE={} proc={} 活性分工={} AS活={} AS世代={} AS复用ABA={} 线程={} 线程撤={} close={} revoke={} 锁序={} 收场={}",
+            create_ok, proc_ok, split_ok, as_live, as_stale, as_aba, th_live, th_gone,
+            noclose_ok, rev_ok, lock_ok, base_ok);
     }
     // ASpace 那个句柄在 ⑦ 已经被 revoke 摘走；a 已经 drop，这里没有 leftovers
     ok
 }
 #[cfg(feature = "handles")]
 ktest!(KT_HANDLE_KINDS, t_handle_kinds);
+/// 一个只自旋、自己不会收工的工人：给 `block_task`/`wake_task` 当被试对象。
+#[cfg(feature = "handles")]
+fn tr_worker() -> ! {
+    loop {
+        crate::tsc::spin(2_000);
+    }
+}
+
+/// P5c-3a 底座那一半的**真实调用者**：`handle::transfer` / `transfer_rollback`、
+/// `sched::block_task`、`mm::aspace_new_kernel` / `aspace_destroy`。
+/// 这四样在 11/15/16 落地之前只有实现没有调用者（硬约束 2），所以本用例就是它们的调用者，
+/// 同时把"转移即失效""回滚不留中间态""内核侧 AS 的所有权与幂等销毁"写成可判的读数。
+#[cfg(feature = "handles")]
+fn t_handle_transfer() -> bool {
+    use crate::{handle, sync, vmo};
+    let from: (usize, u32) = (4, 8101);
+    let to: (usize, u32) = (5, 8202);
+    let lv0 = handle::live();
+    let c0 = handle::counters();
+    let f0 = mm::free_frames();
+    let as0 = mm::aspace_count();
+    if vmo::vmo_count() != 0 || as0 != 0 {
+        crate::log_fatal!("tr: 前提失效，进来已有对象 vmo={} as={}", vmo::vmo_count(), as0);
+        return false;
+    }
+
+    // ① 转移：新句柄可用、旧句柄当场 Stale、两个计数各涨各的
+    let id = match vmo::vmo_create(1) {
+        Ok(v) => v,
+        Err(e) => { crate::log_fatal!("tr: create {:?}", e); return false; }
+    };
+    let rights = handle::RIGHT_READ | handle::RIGHT_DUP | handle::RIGHT_TRANSFER;
+    // 先 grant（它自己加一份引用）再交出创建者那一份——顺序反了就是 unref 到 0 把对象销毁，
+    // grant 当场 NoSuch（本用例第一版就是这么红的）
+    let h1 = match handle::grant_vmo(from, id, rights) {
+        Ok(h) => h,
+        Err(e) => { crate::log_fatal!("tr: grant {:?}", e); return false; }
+    };
+    vmo::vmo_unref(id);
+    let h2 = match handle::transfer(h1, from, to) {
+        Ok(h) => h,
+        Err(e) => { crate::log_fatal!("tr: transfer {:?}", e); return false; }
+    };
+    let new_owner_ok = handle::vmo_of(h2, to, handle::RIGHT_READ).is_ok();
+    let old_stale = matches!(handle::vmo_of(h1, from, handle::RIGHT_READ), Err(handle::HErr::Stale));
+    let c1 = handle::counters();
+    let count_ok = c1.transfers == c0.transfers + 1 && c1.stale > c0.stale
+        // 转移**不占新格子**（决策 4：表里还是那 16 格，只是名字换了主人）
+        && handle::live() == lv0 + 1;
+    // ② 类型/kind 跟着走：同一个 VMO 槽，不是复制出一个新对象
+    let same_obj = handle::vmo_of(h2, to, handle::RIGHT_READ).ok() == Some(id);
+    // ③ 没有 TRANSFER 权限 ⇒ Denied（计数与 Stale 分开）
+    let h3 = match handle::grant_vmo(from, id, handle::RIGHT_READ | handle::RIGHT_DUP) {
+        Ok(h) => h,
+        Err(e) => { crate::log_fatal!("tr: grant3 {:?}", e); return false; }
+    };
+    let c2 = handle::counters();
+    let no_right = matches!(handle::transfer(h3, from, to), Err(handle::HErr::Denied))
+        && handle::counters().denied > c2.denied;
+    // 自己转自己必须是形状非法，不是"静默成功"
+    let self_tr = matches!(handle::transfer(h2, to, to), Err(handle::HErr::Invalid));
+
+    // ④ 回滚：owner 改回 from，且**中间态那个新句柄当场失效**（再 bump 一次世代）
+    if let Err(e) = handle::transfer_rollback(h2, to, from) {
+        crate::log_fatal!("tr: rollback {:?}", e);
+        return false;
+    }
+    let back_ok = handle::vmo_of(h2, from, handle::RIGHT_READ).is_err()
+        && handle::vmo_of(h1, from, handle::RIGHT_READ).is_err()
+        && handle::counters().transfers == c1.transfers + 1;
+    // 回滚点不在那个状态上（已被别的核接走/已关掉）⇒ 明确 NoSuch，绝不硬改
+    let re_bad = matches!(
+        handle::transfer_rollback(h2, to, from),
+        Err(handle::HErr::NoSuch) | Err(handle::HErr::Invalid)
+    );
+
+    // ④b **回滚的连带后果（本用例实测撞出来的）**：回滚再 bump 一次世代，所以**发送方手里那个
+    // 旧句柄也已经失效** ⇒ 那格名字谁都 `close` 不掉，只有 `revoke_task(from)` 收得走。
+    // 只回滚不 revoke 的代价不是"少一格名字"，而是永久漏一份 VMO 引用与一帧
+    // （实测 `live0->1 vmo1 free 少 1 帧`，把后面 14 格用例的收尾闸全打红）。
+    // ⇒ 16 号的失败路径必须**连着 revoke 一起走**，这是设计 §10.3 第 7 步"整条装载序列回滚"的一部分。
+    let sender_dead = matches!(handle::close(h1, from), Err(handle::HErr::Stale));
+
+    // ⑤ 内核侧 AS：建、数、销、二次销（幂等）、越界槽
+    let k1 = match mm::aspace_new_kernel() {
+        Some(v) => v,
+        None => { crate::log_fatal!("tr: aspace_new_kernel 失败"); return false; }
+    };
+    let created_ok = mm::aspace_count() == as0 + 1 && mm::aspace_live(k1.0, k1.1);
+    let first_destroy = mm::aspace_destroy(k1.0);
+    let second_destroy = mm::aspace_destroy(k1.0);
+    let out_of_range = mm::aspace_destroy(u8::MAX);
+    let destroy_ok = first_destroy && !second_destroy && !out_of_range
+        && mm::aspace_count() == as0;
+    // 复用同一格再建一次：世代必须对不上旧读数（与 hkind 的 ABA 格同一口径，但走内核侧入口）
+    let k2 = mm::aspace_new_kernel();
+    let aba_ok = match k2 {
+        Some((slot, gen)) => {
+            let r = slot == k1.0 && gen != k1.1 && !mm::aspace_live(slot, k1.1);
+            mm::aspace_destroy(slot);
+            r
+        }
+        None => false,
+    };
+
+    // ⑥ block_task：停住一个不是当前的 Runnable，wake 放回来；停自己/停已死的不许动
+    crate::sched::init_boot_task();
+    crate::sched::start_workers();
+    let me = crate::arch::x86_64::cpu::self_slot();
+    let gi = match crate::sched::spawn(tr_worker) {
+        Ok(g) => g,
+        Err(_) => { crate::log_fatal!("tr: spawn 失败"); return false; }
+    };
+    let tok = sync::WaitToken { queue: 15, seq: 0xA11C };
+    let parked = crate::sched::block_task(gi, tok)
+        && crate::sched::state_of(gi) == crate::sched::TaskState::Blocked(tok);
+    // 停一个**正在 CPU 上跑**的任务必须是无效操作（那是 `block_current` 的活，它还要负责让出）。
+    // **诚实记一笔**：这一格证的是"Running 不许被 block_task 改写"，**不是** `block_task` 里
+    // 那道 `current_of(cpu) == gidx` 守卫——M27 把那道守卫删掉之后本用例仍然全绿，
+    // 因为当前任务的状态是 `Running`，前一个条件已经把它挡住了。
+    // 那道守卫按 ADR-054 的口径**降级为结构性论证**（防将来有人先把它标成 Runnable 再来停），
+    // 不写成"已实测"。
+    let self_no = !crate::sched::block_task(crate::sched::current_of(me), tok);
+    // 陈旧 token 的 wake 不放人（ADR-053 决策 4 的口径），同 token 才放
+    let stale_wake = !crate::sched::wake_task(gi, sync::WaitToken { queue: 15, seq: 0xDEAD });
+    let still_blocked = crate::sched::state_of(gi) == crate::sched::TaskState::Blocked(tok);
+    let woke = crate::sched::wake_task(gi, tok)
+        && crate::sched::state_of(gi) == crate::sched::TaskState::Runnable;
+
+    // 收场：按"整条装载序列回滚"的口径收 —— h3 还能 close，h1/h2 都已 Stale，
+    // 那格只能靠 revoke_task(from) 收走（④b 就是它的证人）
+    handle::close(h3, from).ok();
+    handle::close(h2, from).ok();
+    let revoked_from = handle::revoke_task(from.0, from.1);
+    handle::revoke_task(to.0, to.1);
+    let rollback_collected = sender_dead && revoked_from >= 1;
+    let _ = crate::sched::terminate_task(gi);
+    let base_ok = rollback_collected && handle::live() == lv0 && vmo::vmo_count() == 0
+        && mm::free_frames() == f0 && mm::aspace_count() == as0
+        && crate::sched::state_of(gi) == crate::sched::TaskState::Free;
+    crate::log_info!(
+        "tr(P5c-3a): 转移后可用={} 旧句柄Stale={} 计数=(transfers{}->{}) 同对象={} 无权限拒={} 自转拒={} 回滚到位={} 二次回滚拒={} 回滚需revoke={} AS建销=(1{} 2{} 越界{}) ABA={} 停={} 停Running拒={} 陈旧wake={} 唤醒={} 基线=(live{}->{} vmo{} free{}->{} as{})",
+        new_owner_ok, old_stale, c0.transfers, handle::counters().transfers, same_obj,
+        no_right, self_tr, back_ok, re_bad, rollback_collected, first_destroy, second_destroy,
+        out_of_range, aba_ok, parked, self_no, stale_wake && still_blocked, woke,
+        lv0, handle::live(), vmo::vmo_count(), f0, mm::free_frames(), mm::aspace_count());
+    let ok = new_owner_ok && old_stale && count_ok && same_obj && no_right && self_tr
+        && back_ok && re_bad && rollback_collected && created_ok && destroy_ok && aba_ok
+        && parked && self_no && stale_wake && still_blocked && woke && base_ok;
+    if !ok {
+        crate::log_fatal!(
+            "tr: 判据不成立 转移={} 旧Stale={} 计数={} 同对象={} 无权限={} 自转={} 回滚={} 二次={} 需revoke={} AS={} ABA={} 停={} 停Running拒={} 陈旧={} 唤醒={} 收场={}",
+            new_owner_ok, old_stale, count_ok, same_obj, no_right, self_tr, back_ok, re_bad,
+            rollback_collected, created_ok && destroy_ok, aba_ok, parked, self_no,
+            stale_wake && still_blocked, woke, base_ok);
+    }
+    ok
+}
+#[cfg(feature = "handles")]
+ktest!(KT_HANDLE_TRANSFER, t_handle_transfer);
 
 // ---- ADR-074（W3 P4b）12/13/14 三个号 + 退出时归还 ----
 //

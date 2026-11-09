@@ -6003,6 +6003,58 @@ M22 去掉对齐预检 ⇒ `非对齐拒=false`（-1 变 -6）；M23 `aspace_map
 探针的**宿主机侧独立对账**（§156 记的那条）本轮仍没做，还是留给 c-3 同轮（要动 tools 的 rows/logs 两块）；
 `MAX_ADDR_SPACES = 4` 的容量重算仍在 c-3。
 
+## 161. W3 P5c-3a 底座：转移/回滚、停线程、内核侧 AS，外加修掉 P5c-1 的 ABA（ADR-075，2026-11-10，实测）
+
+11/15/16 还没接，本刀只做它们要用的四样原语 + 一条**上一刀留下的真洞**。
+四样原语在接号之前没有产品调用者（硬约束 2），所以同轮补 `t_handle_transfer`（KT_HANDLE_TRANSFER）
+当真实调用者兼证人；`spawn_user` 加第 4 参 `arg`（写首帧 `rdi` = `frame[10]`），**13 个调用点全补 0**。
+
+**修掉的 ABA（P5c-1 的世代号原本防不住槽位复用）**：`aspace_release`/`proc_reap`/`proc_discard`/
+`job_destroy` 都整项写回 `*_EMPTY`，而 `gen` 在项里 ⇒ 销毁把 gen 复位成 0、下一次 create 复用同格又变 1
+⇒ **旧句柄的 `(slot, gen)` 重新匹配上**。`AS世代` 那格当时绿是因为用例销毁后没复用槽位（**绿而无效**）。
+修法：四处保留 `gen`；用例改成"销毁 → 复用同格再建 → 旧句柄仍须解析不过"，AS 与 Job 各一格。
+变异 **M24** 咬中 `AS复用ABA=false`（failed=1，FAIL 35）。
+
+**转移的连带后果（实测撞出来，写进 16 号的失败路径要求）**：`transfer_rollback` 再 bump 一次世代，
+所以**发送方那个旧句柄也一起失效** ⇒ 那格名字谁都 `close` 不掉，只有 `revoke_task(from)` 收得走。
+只回滚不 revoke 的现场是 `live0->1 vmo1 free 少 1 帧`，把后面 **14 格**用例的收尾闸全打红。
+⇒ 设计 §10.3 第 7 步的"整条装载序列回滚"**必须包含 revoke**，不能只调 `transfer_rollback`。
+这一格（`回滚需revoke`）的红→绿就是证人。
+
+**一格判据被证伪并降级（按 ADR-054 的口径，不写成"已实测"）**：`停自己` 那格在变异 **M27**
+（删掉 `block_task` 里 `current_of(cpu) == gidx` 守卫）之后**仍然全绿**——当前任务状态是 `Running`，
+前一个条件已经挡住，那道守卫今天走不到。判据改名 `停Running拒`，守卫降级为**结构性论证**
+（防将来有人先标 Runnable 再来停）。
+
+**内核侧 AS 的所有权**（使用者批准）：`mm::aspace_new_kernel() -> (slot, gen)` / `aspace_destroy(slot)`，
+主人是 proc 表、销毁走显式路径；与 `aspace_new` 共用 `aspace_new_slot` 实体，ktest 自己的 AS 继续 RAII。
+`aspace_destroy` 的越界守卫用 `get` 而不是 `min` 夹到最后一格（第一版写 `min` 就是"销毁别人的 AS"）。
+变异 **M28**（两道守卫都去）以 EXCEPTION(39) 咬越界格（`aspace_release` 先下标后判 `used`）；
+**M28b**（只去 `used`、留边界）精确咬幂等格 `AS=false`、FAIL(35)。
+**`MAX_ADDR_SPACES` 4 → 8**：进程 4 格 + 用例族实测会同时要的 2 格 = 6，留一格余量（依据写在代码注释里）。
+
+**读数（取证跑，同一份代码 `normal/elf c8aa91dd3e99`）**：`check` **17/17**；
+`ktests` 默认档 **80/80**、`handles` 档 **84/84**；矩阵 **45/45**；`bench` **4/4**，
+P4 地板 **0.13 %**（13 bp），`baselines/2026-11-09T18-38-44Z-p3p4.txt`；
+`tr(P5c-3a): 转移后可用=true 旧句柄Stale=true 计数=(transfers0->2) 同对象=true 无权限拒=true 自转拒=true
+回滚到位=true 二次回滚拒=true 回滚需revoke=true AS建销=(1true 2false 越界false) ABA=true 停=true
+停Running拒=true 陈旧wake=true 唤醒=true 基线=(live0->0 vmo0 free116022->116022 as0)`。
+变异 M25（转移不 bump）咬 `旧Stale=false`+`计数=false`；M26（回滚不 bump）咬 `回滚=false`。
+
+**两处量具/流程错（都当场改，不留在树里）**：
+① 我把 `ktest!(KT_HANDLE_TRANSFER, …)` 漏了 `#[cfg(feature="handles")]` ⇒ **默认档编译不过**，
+是矩阵抓到的（`check` 不编译默认档所以没看见）；补上之后矩阵 45/45。
+② `bench` 第一跑 no-load#2 红在 `t_ap_released_and_ticking`、读数 `isr_depth_stuck=1`
+（其余全绿：released=3 online_ap=3 cpu_ticks=[0,73,73,73] ready_timeout=0）。
+**同一 ELF 复跑 4/4 全绿** ⇒ 归因到**仪器**：那条判据是对活量 `apic::isr_depth(s)` 的快照，
+读的一瞬间某颗 AP 正当 tick ISR 里深度就是 1 ⇒ 假红。**不归因到本刀**（该判据本轮一行没动）。
+这条与 P4b/P5b 那三次的 `shootdown 超时` 是**不同家族**，单列一笔。
+
+**接 11/15/16 之前仍要裁的两件**：①`process_create` 要交回 Proc 与 ASpace **两个**句柄而 syscall 只有一个返回值
+（倾向 `rax` 给 Proc、`rsi` 给 8 字节出参指针装 AS 句柄，与 peek_buf/poke_buf 同形；备选再开号要重开 Q1 号表）；
+②启动映射今天挂在**创建者任务的资源袋**里（ADR-074 按任务归属），父先退子线程的代码/栈就没了——
+这一版照现状实现并配"父先退"负样本，进程级归属是 P7 的账，不在 c-3 偷偷做。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。
