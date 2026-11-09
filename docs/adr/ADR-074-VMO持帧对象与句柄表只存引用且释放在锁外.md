@@ -210,6 +210,11 @@ M6 预测的连带伤害（ADR-070 的 A1 内核半区对照）**没有发生**�
 | 13 `vmo_write` | `rdi=h, rsi=offset, rdx=用户缓冲, r10=len` → 字节数 | 第四参走 **r10**（`syscall` 吃掉 rcx/r11）。`len=0 ⇒ -1`、`len>COPY_MAX ⇒ -3`、对象里放不下 ⇒ `-1`。**整段先校验再动手**，不留半截写；搬运按 512 字节一块（与 `sys_file_read` 同一手法，不按用户的数开缓冲） |
 | 14 `aspace_map` | `rdi=h, rsi=writable` → 用户 VA | **VA 由内核从动态区发**（`alloc_user_va_range`），不接受用户指定地址——那会与装载器的窗口撞。`writable≠0 ⇒ USER_RW`，否则 `USER_R`；**永远不给 X**，所以 W^X 在这一层就排掉了。需要 `RIGHT_MAP`，只读句柄调它 ⇒ `-4` |
 
+> **后续勘误（ADR-075 决策 6，2026-11-09 使用者裁决"兼容扩展 14"）**：上表 14 那一行与"永远不给 X"
+> 只描述 **P4b 落地的形状**。P5c 会把 14 扩成四参（`rsi` 改 flags 位图、`rdx` = AS 句柄、`r10` = 请求 VA），
+> 扩展形**可以给 X**（用户态装载器要映 ELF 的 RX 代码段），但 W+X 仍在构造期拒绝；
+> 旧调用方传 `rdx=r10=0`、`rsi` 只有 bit0 ⇒ 行为逐字不变。落地时同轮改 `user-abi-capability.md` §4.4 与 `ABI_MINOR`。
+
 三个号都只在 `handles` 构建里存在，ABI 的 **`F_VMO = 32`** 与 `F_HANDLES` 同一条件、读回真实状态；
 别的构建里三个号走默认分支回 `-1` 且该位为 0（`t_vmo_numbers_absent` 与 `t_vmo_syscalls` 互斥注册，各证一边）。
 
