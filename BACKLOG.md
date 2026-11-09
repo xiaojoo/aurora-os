@@ -6154,6 +6154,32 @@ reap 丢掉它袋里那三页，再给子进程一个真会跑起来的机会 �
 **仍开着（留给 c-3b 下一刀）**：**探针的宿主机侧独立对账矩阵行**（§156/§160 欠的，
 要同轮改 tools 的 rows/logs 两块）。
 
+## 164. W3 P5c-3b 收尾：探针几何的宿主机侧独立对账进判定表（45 → 46 行，2026-11-10，实测）
+
+§156/§160 欠的那条还清了。新增判定行 `探针几何与宿主机对账`，**另一台实现**：
+`tools/aurora.py::check_probe_elf` 用 Python 独立解析 `kernel/fixtures/probe.elf` 的 ELF64 程序头，
+自己算 `segs`（memsz>0 的 PT_LOAD 数）、`pages`（Σceil(memsz/4096)）、`entry`（e_entry）、
+`data`（第一个可写段的 p_vaddr，与 `user::load` 同口径）与夹具字节数，再与内核装载器报的对账；
+不一致 ⇒ **CONTENT-MISMATCH**（与"内核跑挂了"分得开）。用 `handles` 档跑（探针只在这一档出现）。
+
+**读数**：`check` **17/17**；矩阵 **46/46 符合**、rc=0，新行 `PASS(rc=33) 期望 PASS(rc=33) -> 符合`。
+**新仪器被证一次会咬**：M36 让内核报 `loaded.segs + 1` ⇒ 宿主机当场给出
+`段数：宿主机数出 3 个 PT_LOAD，内核报 4`，已还原。
+**取证同一性**：矩阵那一行用 `handles/elf f40181a9f690`，还原后重新构建 sha 逐字相同；
+默认档仍 `normal/elf 5ad5f9ba017d`（与 P5c-3 那轮相同）⇒ bench 沿用
+`baselines/2026-11-09T19-20-29Z-p3p4.txt`（4/4、地板 0.78 %），本轮不重跑。
+
+**流程错一处（当场改，值得记）**：新函数用了 `struct` 而 `tools/aurora.py` 只导了 `re`；
+`check` **不执行 do_test**，所以 17 道门禁全绿也发现不了这个 NameError ⇒ 补 `import struct`，
+靠**跑矩阵**才验到这一行。与"check 不编译默认档"同一类教训：**静态门禁绿 ≠ 那条路径真能跑**。
+
+**P5c 到此完整**：c-1（四种 kind + RIGHT_CREATE + 世代号）、c-2（14 号兼容扩展 + ABI 7）、
+c-3（11/15/16 + StartupInfo 回填与转移 + ABI 8/F_PROC）、c-3b（探针真打 + 子进程真 dup +
+父先退直接读数 + 宿主机对账行）。**仍开着的是 P7 的账**：映射归属改进程级
+（父先退子进程就没了代码页，已有 `父先退=(代码页没了true kills0->1)` 的直接读数）、
+Done 槽回收、`MAX_ADDR_SPACES`/`MAX_OWNED` 两条容量账在真实 workload 下的重算
+（本刀实测装载器 5 格 + 子进程 3 格 = 8 **刚好顶满** `MAX_OWNED`）。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

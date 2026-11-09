@@ -22,6 +22,7 @@ import argparse
 import fnmatch
 import os
 import re
+import struct
 import hashlib
 import subprocess
 import sys
@@ -4763,6 +4764,66 @@ def do_check(elf: Path | None) -> int:
 
 # -------------------------------------------------------------------- 负样本
 
+def check_probe_elf(log: str) -> list[str]:
+    """探针夹具的**宿主机侧独立对账**（第二台仪器，§156/§160 欠的那条）。
+
+    内核那侧的装载器自己报 `segs/pages/entry/data/夹具字节数`，它的判据比的是"自己算的和自己写的"。
+    这里用 Python 独立解析 `kernel/fixtures/probe.elf` 的 ELF64 程序头再算一遍同样的四个数：
+      segs  = PT_LOAD 且 memsz>0 的段数
+      pages = Σ ceil(p_memsz / 4096)
+      entry = e_entry
+      data  = **第一个可写** PT_LOAD 段的 p_vaddr（内核 `user::load` 就是这个口径）
+    两边不一致就是 CONTENT-MISMATCH：可能是装载器数错了，也可能是夹具被换过而日志没跟上。
+    """
+    bad: list[str] = []
+    m = re.search(
+        r"probe: segs=(\d+) pages=(\d+) entry=(0x[0-9a-f]+) data=(0x[0-9a-f]+) "
+        r"stack_top=(0x[0-9a-f]+) 夹具=(\d+)B",
+        log,
+    )
+    if not m:
+        return ["内核没报探针的装载几何（segs/pages/entry/data/夹具），宿主机对账没有对象"]
+    k_segs, k_pages = int(m.group(1)), int(m.group(2))
+    k_entry, k_data, k_size = int(m.group(3), 16), int(m.group(4), 16), int(m.group(6))
+    if not PROBE_FIXTURE.exists():
+        return [f"夹具不在：{PROBE_FIXTURE}"]
+    b = PROBE_FIXTURE.read_bytes()
+    if len(b) != k_size:
+        bad.append(f"夹具字节数：内核说 {k_size}，宿主机读到的文件是 {len(b)}")
+    if b[:4] != b"\x7fELF" or b[4] != 2:
+        return bad + ["夹具不是 ELF64，宿主机没法独立解析"]
+    e_entry = struct.unpack_from("<Q", b, 0x18)[0]
+    e_phoff = struct.unpack_from("<Q", b, 0x20)[0]
+    e_phentsize = struct.unpack_from("<H", b, 0x36)[0]
+    e_phnum = struct.unpack_from("<H", b, 0x38)[0]
+    segs = 0
+    pages = 0
+    first_w = None
+    for i in range(e_phnum):
+        o = e_phoff + i * e_phentsize
+        p_type = struct.unpack_from("<I", b, o)[0]
+        if p_type != 1:  # PT_LOAD
+            continue
+        p_flags = struct.unpack_from("<I", b, o + 4)[0]
+        p_vaddr = struct.unpack_from("<Q", b, o + 0x10)[0]
+        p_memsz = struct.unpack_from("<Q", b, o + 0x28)[0]
+        if p_memsz == 0:
+            continue
+        segs += 1
+        pages += (p_memsz + 4095) // 4096
+        if first_w is None and (p_flags & 2):  # PF_W
+            first_w = p_vaddr
+    if segs != k_segs:
+        bad.append(f"段数：宿主机数出 {segs} 个 PT_LOAD，内核报 {k_segs}")
+    if pages != k_pages:
+        bad.append(f"页数：宿主机按 Σceil(memsz/4096) 算出 {pages}，内核报 {k_pages}")
+    if e_entry != k_entry:
+        bad.append(f"入口：ELF 头里是 {e_entry:#x}，内核报 {k_entry:#x}")
+    if first_w is None:
+        bad.append("宿主机没找到任何可写 PT_LOAD 段，data_va 无从对账")
+    elif first_w != k_data:
+        bad.append(f"第一个可写段：宿主机算出 {first_w:#x}，内核报 {k_data:#x}")
+    return bad
 def do_test(timeout: int) -> int:
     """正向必须 33、负样本必须 35。只跑正向的话，永远分不清“代码没问题”
     和“判定链根本没生效”。"""
@@ -5109,6 +5170,16 @@ def do_test(timeout: int) -> int:
     DELIVER_LOG.unlink(missing_ok=True)
     IMAGE.unlink(missing_ok=True)
 
+    print("=== 探针夹具：宿主机独立解析 probe.elf，与内核装载器报的几何对账（第二台仪器）===")
+    # 内核那侧比的是"自己算的和自己写的"；这一行换成"和另一台实现"（Python 解析 ELF64 程序头）。
+    # 用 handles 档跑：探针用例与它的装载器几何只在这一档里出现。
+    IMAGE.unlink(missing_ok=True)
+    pbv, pbrc, pblog = do_run(["handles"], timeout)
+    pb_bad = check_probe_elf(pblog)
+    pb_verdict = pbv if pbv != "PASS" else ("PASS" if not pb_bad else "CONTENT-MISMATCH")
+    for x in pb_bad:
+        print("    对账:", x)
+
     print("=== FAT32 只读解析：两块卷挂 AHCI 口 3/4，内核读回的每个数由宿主机再解析一遍 ===")
     # 内核那十三条判据比的是"自己和写死的期望数"，这一行把它们换成"和另一台实现"：
     # 几何 14 格、每个文件 12 格、以及引导盘该崩在哪一道闸。两块卷的角色不重叠——
@@ -5311,6 +5382,8 @@ def do_test(timeout: int) -> int:
         # P7 ⑤：装载器把 READ|DUP 句柄授给**容器**（owner 两格），ring3 读自己的镜像。
         # 期望值与句柄形状由宿主机独立算；内核那行 true 只是它的自述。
         ("P7 句柄ring3读自己镜像", h3_verdict, h3rc, "PASS", 33),
+        # P5c-3b：探针夹具的宿主机侧独立对账（§156/§160 欠的那条），判据是"另一台实现算出同样的数"
+        ("探针几何与宿主机对账", pb_verdict, pbrc, "PASS", 33),
         # P7 第 40 行的证红：owner 改错一格 ⇒ 容器读不到 ⇒ 必须红在 ring3 那格
         ("P7 句柄授错主人必须红", ih_verdict, ihrc, "FAIL", 35),
         # ADR-066 / W2 P4：OOM 被传播（Err）且原页原样 ⇒ 期望 PASS(33)；
@@ -5354,6 +5427,7 @@ def do_test(timeout: int) -> int:
         "FAT32④段内字节改了必须红": eblog,
         "FAT32簇号高半抹零必须红": hilog,
         "P7 句柄ring3读自己镜像": h3log,
+        "探针几何与宿主机对账": pblog,
         "P7 句柄授错主人必须红": ihlog,
         "split OOM原页原样": soomlog,
         "demand-zero四路有真输家": dzlog,
