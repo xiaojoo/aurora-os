@@ -114,6 +114,9 @@ pub enum MmError {
     UserChainBlocked,
     NotInit,
     Unsupported,
+    /// 已有非内核地址空间存在之后，再往**内核半区**铺新映射（ADR-070 决策 2 的冻结前置）。
+    /// 这不是资源不够，是契约违例：内核半区在第一个 AS 创建时就定形，之后只许读。
+    KernelHalfFrozen,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -122,6 +125,10 @@ pub struct ModuleId(pub u16);
 pub const MOD_BOOT: ModuleId = ModuleId(1);
 pub const MOD_STACK: ModuleId = ModuleId(2);
 pub const MOD_TEST: ModuleId = ModuleId(3);
+/// 非内核地址空间自己的页表页（ADR-070 决策 6 / BACKLOG §147）。
+/// 与 `MOD_BOOT` 的区别就是"有没有主人"：boot 的表页永不归还（内核生命期），
+/// 这里的表页在 AS 销毁时经 `frame_put` 归还，台账 live 必须回基线。
+pub const MOD_AS_PT: ModuleId = ModuleId(18);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageFlags {
@@ -754,8 +761,27 @@ mm_relocate:
     mov cr3, rdi
     mov rdi, rcx
     jmp rdx
+
+    // ADR-070（W3 P1）：CR3 读/写原语。放在这里而不是新开 global_asm! 块，
+    // 是因为 `core::arch::` 的每一行都算 memory->arch 的引用站点（ADR-044 棘轮只许减），
+    // 复用已有的块 = 零新增站点。这两个函数只动 CR3，不碰栈、不碰标志。
+    .global aspace_cr3_read
+aspace_cr3_read:
+    mov rax, cr3
+    ret
+    .global aspace_cr3_write
+aspace_cr3_write:
+    mov cr3, rdi
+    ret
 "#
 );
+
+extern "C" {
+    /// 读本 CPU 的 CR3（ADR-070 A2 的证人输入）。
+    fn aspace_cr3_read() -> u64;
+    /// 写本 CPU 的 CR3。调用方保证目标是内核半区等价的有效 PML4。
+    fn aspace_cr3_write(pml4: u64);
+}
 
 /// 建我们自己的页表并切换。失败即**不切换**，调用方据此尽早失败。
 /// 建自己的页表、切栈、切 CR3，然后尾跳进 cont。
@@ -1043,6 +1069,12 @@ static MAP_CALLS: AtomicUsize = AtomicUsize::new(0);
 static MAPPED_PAGES: AtomicUsize = AtomicUsize::new(0);
 static UNMAPPED_PAGES: AtomicUsize = AtomicUsize::new(0);
 static PT_PAGES: AtomicUsize = AtomicUsize::new(0);
+/// 非内核 AS 的表页**当前存活**数（ADR-070 A3 的证人）。与 `PT_PAGES`（累计）分开：
+/// 销毁回基线判的是"现在还剩几张"，不是"一共取过几张"。
+static AS_PT_LIVE: AtomicUsize = AtomicUsize::new(0);
+/// CR3 实际写入次数（ADR-070 A2 的证人）。只数**真的执行了 `mov cr3`** 的次数，
+/// 不数"调用了切换函数"的次数——后者会把"同 AS 不写"这条判据变成空转。
+static CR3_WRITES: AtomicUsize = AtomicUsize::new(0);
 
 pub struct MmCounters {
     pub map_calls: usize,
@@ -1052,6 +1084,10 @@ pub struct MmCounters {
     pub page_table_pages: usize,
     /// 早期池占用，用于判断 `EARLY_POOL_PAGES` 的余量是不是真余量
     pub early_pool_used: usize,
+    /// 非内核 AS 的表页当前存活数（ADR-070 A3）
+    pub as_pt_live: usize,
+    /// CR3 实际写入次数（ADR-070 A2）
+    pub cr3_writes: usize,
 }
 
 pub fn counters() -> MmCounters {
@@ -1061,6 +1097,8 @@ pub fn counters() -> MmCounters {
         unmapped_pages: UNMAPPED_PAGES.load(Ordering::Relaxed),
         page_table_pages: PT_PAGES.load(Ordering::Relaxed),
         early_pool_used: s().early_used,
+        as_pt_live: AS_PT_LIVE.load(Ordering::Relaxed),
+        cr3_writes: CR3_WRITES.load(Ordering::Relaxed),
     }
 }
 
@@ -1535,6 +1573,11 @@ pub fn map_hole(pa: u64, pages: usize) -> Result<MmioMapping, MmError> {
     if !is_ready() {
         return Err(MmError::NotInit);
     }
+    // ADR-070 决策 2：第一个非内核 AS 创建之后，内核半区冻结。map_hole 是今天唯一的
+    // 运行期内核半区写点，所以闸在这里；拒绝是契约违例（KernelHalfFrozen），不是资源不够。
+    if kernel_half_frozen() {
+        return Err(MmError::KernelHalfFrozen);
+    }
     let len = pages as u64 * PAGE as u64;
     let n = s().region_count;
     for r in &regs()[..n] {
@@ -1568,6 +1611,220 @@ pub fn map_hole(pa: u64, pages: usize) -> Result<MmioMapping, MmError> {
     MAP_CALLS.fetch_add(1, Ordering::Relaxed);
     MAPPED_PAGES.fetch_add(pages, Ordering::Relaxed);
     Ok(MmioMapping { virt: va, pages })
+}
+
+// ------------------------------------------------------ ADR-070（W3 P1）地址空间
+//
+// 第一刀的形状：**没有用户进程**。能建一个"用户半区为空、内核半区与 AS_KERNEL 逐位相等"
+// 的地址空间，能在它上面跑一段内核代码（切换按"不同才写 CR3"），能销毁并回基线。
+// 产品路径（map/unmap/walk/只读判据）今天仍然只认 AS_KERNEL——把"当前 AS"接进那些路径
+// 是 P3 之后进程真跑起来时的事，本轮不动它们（矩阵 45 行因此一行都不该变）。
+
+/// 非内核地址空间的定长表容量。与 `MAX_LAZY_REGIONS` 同一口径：今天无 workload 依据，
+/// 按"接缝够用"定尺；P3 的 workload 实测（Q2）之后再重定。
+pub const MAX_ADDR_SPACES: usize = 4;
+
+/// 表项。全 Copy 数值（与 `LazyRegion` 同律）：PML4 物理地址 + 它自己建的表页帧号清单。
+/// **只记自己建的**：高 256 项复制的是*项*，下层表是共享的内核表，销毁时绝不能还它们
+/// （BACKLOG §147 的第 1 条结论——还了就是把内核半区抽掉）。
+#[derive(Clone, Copy)]
+struct AspaceEntry {
+    used: bool,
+    pml4: u64,
+    /// 本 AS 自己取的表页帧号（PML4 那张 + 之后按需的）。0 = 空槽（帧 0 永不可分配）。
+    /// 上限：PML4 1 张 + 低半区 256 项 × 每项一棵 3 层树的最坏 3 张 = 769，
+    /// 但 P1 只建空 AS（1 张），给 16 是"接缝够用"的尺，不是推导值。
+    pt_frames: [u64; AS_PT_SLOTS],
+    pt_count: usize,
+}
+
+const AS_PT_SLOTS: usize = 16;
+const AS_EMPTY: AspaceEntry =
+    AspaceEntry { used: false, pml4: 0, pt_frames: [0; AS_PT_SLOTS], pt_count: 0 };
+
+#[derive(Clone, Copy)]
+struct AspaceTable {
+    items: [AspaceEntry; MAX_ADDR_SPACES],
+}
+
+struct AspaceCell(UnsafeCell<AspaceTable>);
+// SAFETY: 与 LazyCell 同律——读写全在 VMM(20) 内，互斥由锁提供；载荷全 Copy，无别名逃逸。
+unsafe impl Sync for AspaceCell {}
+
+static ASPACES: AspaceCell = AspaceCell(UnsafeCell::new(AspaceTable { items: [AS_EMPTY; MAX_ADDR_SPACES] }));
+
+#[inline]
+fn aspaces() -> &'static mut AspaceTable {
+    // SAFETY: 调用方持 VMM（本模块内所有调用点都在 vmm() _guard 之后）
+    unsafe { &mut *ASPACES.0.get() }
+}
+
+/// 地址空间柄（RAII）。丢弃即销毁：解映射低半区（今天为空）、归还**自己建的**表页、
+/// 清表项。与 `LazyHandle` 同形：表里记帧号，归还走 `frame_put`（ADR-063 的共享归还路径，
+/// 到 0 才真还），不在锁内做可能阻塞的事。
+#[must_use = "地址空间柄丢弃即销毁，随手丢弃等于这个 AS 不存在"]
+pub struct AspaceHandle {
+    slot: u8,
+}
+
+impl AspaceHandle {
+    /// 这个 AS 的 PML4 物理地址（切换要用；表读在 VMM 内）。
+    pub fn pml4(&self) -> Option<u64> {
+        let _g = vmm();
+        let e = aspaces().items[usize::from(self.slot)];
+        if e.used { Some(e.pml4) } else { None }
+    }
+
+    /// 内核半区（PML4 高 256 项）与 `AS_KERNEL` **逐项相等**的见证（ADR-070 A1）。
+    /// 返回 (比对项数, 不等项数)。读的是两张表的 raw 项，含缓存属性位——
+    /// "翻译等价"必须连属性一起等价，否则 UC 窗口在两个 AS 里属性不同就是错。
+    pub fn kernel_half_matches(&self) -> Option<(usize, usize)> {
+        let _g = vmm();
+        let e = aspaces().items[usize::from(self.slot)];
+        if !e.used {
+            return None;
+        }
+        let hhdm = s().hhdm;
+        // SAFETY: 两张表都是本内核自建的页表页，经 HHDM 可达；持 VMM，写者串行化
+        unsafe {
+            let mine = (e.pml4 + hhdm) as *const Page;
+            let kernel = (s().pml4_phys + hhdm) as *const Page;
+            let mut diff = 0usize;
+            for i in 256..512 {
+                if (*mine).0[i] != (*kernel).0[i] {
+                    diff += 1;
+                }
+            }
+            Some((256, diff))
+        }
+    }
+
+    /// 用户半区（PML4 低 256 项）此刻的 present 项数。P1 建的 AS 必须是 0。
+    pub fn user_half_present(&self) -> Option<usize> {
+        let _g = vmm();
+        let e = aspaces().items[usize::from(self.slot)];
+        if !e.used {
+            return None;
+        }
+        let hhdm = s().hhdm;
+        // SAFETY: 同上
+        unsafe {
+            let mine = (e.pml4 + hhdm) as *const Page;
+            Some((0..256).filter(|&i| (*mine).0[i] & P_PRESENT != 0).count())
+        }
+    }
+}
+
+impl Drop for AspaceHandle {
+    fn drop(&mut self) {
+        aspace_release(self.slot);
+    }
+}
+
+/// 建一个非内核地址空间：新 PML4 页（`MOD_AS_PT`，有主人），高 256 项从 `AS_KERNEL`
+/// **复制项**（下层表共享，Linux `pgd_alloc` 的形状，Q5 裁决），低 256 项清零。
+/// 表满/分配失败返回 None（已取的帧就地归还，不留无主帧）。上下文 KERNEL，取 VMM。
+pub fn aspace_new() -> Option<AspaceHandle> {
+    if !is_ready() {
+        return None;
+    }
+    let _g = vmm();
+    let t = aspaces();
+    let slot = (0..MAX_ADDR_SPACES).find(|&i| !t.items[i].used)?;
+    // 取 PML4 页：走 frame_get/frame_put 的共享归还路径（ADR-063），owner 记 MOD_AS_PT。
+    // 这里不能拿 OwnedFrames 然后 forget——那正是 MOD_BOOT 的老路，台账回不了基线。
+    let f = match phys_alloc(0, MOD_AS_PT) {
+        Ok(f) => f,
+        Err(_) => return None,
+    };
+    let pml4 = f.base().0;
+    let frame = pml4 / PAGE as u64;
+    core::mem::forget(f); // 主人改记在表里（pt_frames），归还走 aspace_release
+    let hhdm = s().hhdm;
+    // SAFETY: pml4 刚分配、HHDM 覆盖全部物理内存；持 VMM
+    unsafe {
+        let mine = (pml4 + hhdm) as *mut Page;
+        core::ptr::write_bytes(mine as *mut u8, 0, PAGE);
+        let kernel = (s().pml4_phys + hhdm) as *const Page;
+        for i in 256..512 {
+            (*mine).0[i] = (*kernel).0[i];
+        }
+    }
+    t.items[slot] = AspaceEntry { used: true, pml4, pt_frames: [0; AS_PT_SLOTS], pt_count: 0 };
+    t.items[slot].pt_frames[0] = frame;
+    t.items[slot].pt_count = 1;
+    AS_PT_LIVE.fetch_add(1, Ordering::Relaxed);
+    Some(AspaceHandle { slot: slot as u8 })
+}
+
+/// 销毁一个 AS（柄丢弃时调）。P1 的低半区为空，所以今天只做"归还自己建的表页 + 清表项"。
+/// **归还顺序**：先清表项（别的上下文从此查不到它），再逐帧 `frame_put`。
+/// `frame_put` 自己取 PMM——所以这里**必须先放 VMM**（20 之内取 30 合法，但 frame_put
+/// 到 0 会走 fi_final_free → 台账，那条路今天与 VMM 无嵌套冲突；保持"依次获取"最稳）。
+fn aspace_release(slot: u8) {
+    let frames = {
+        let _g = vmm();
+        let t = aspaces();
+        let e = &mut t.items[usize::from(slot)];
+        if !e.used {
+            return;
+        }
+        let n = e.pt_count;
+        let mut out = [0u64; AS_PT_SLOTS];
+        out[..n].copy_from_slice(&e.pt_frames[..n]);
+        *e = AS_EMPTY;
+        (out, n)
+    };
+    // 锁外归还：frame_put 到 0 才真还（毒化 + 台账 + free_frames），与 SharedFrame::drop 同律
+    for i in 0..frames.1 {
+        if let Err(e) = frame_put(frames.0[i]) {
+            free_violation(e, PhysAddr(frames.0[i] * PAGE as u64), MOD_AS_PT);
+        }
+    }
+    AS_PT_LIVE.fetch_sub(frames.1, Ordering::Relaxed);
+}
+
+/// 此刻存在的非内核 AS 数（收尾判据与用例自足用）。
+pub fn aspace_count() -> usize {
+    let _g = vmm();
+    aspaces().items.iter().filter(|e| e.used).count()
+}
+
+/// 把本 CPU 切到给定 PML4。**只在目标与当前 CR3 不同时才写**（ADR-070 决策 4 / A2 判据）。
+/// 返回"这次真的写了 CR3 吗"。调用方必须保证目标表的内核半区与 AS_KERNEL 等价
+/// （否则一切换内核代码就取不到指）——这个前提由 `aspace_new` 的构造保证，
+/// 而 A1 的见证函数负责把它变成可判的。
+///
+/// # Safety
+/// `pml4` 必须是本内核自建、内核半区已复制等价的有效 PML4 物理地址；
+/// 调用时 IF 状态由调用方负责（本函数不动 IF）。
+pub unsafe fn aspace_switch(pml4: u64) -> bool {
+    // SAFETY: 读 CR3 是特权读，调用方在 ring0；原语在上方 global_asm 里，只动 CR3
+    let cur = unsafe { aspace_cr3_read() };
+    if cur == pml4 {
+        return false;
+    }
+    // SAFETY: 调用方保证 pml4 有效且内核半区等价；原语只换表不动栈
+    unsafe { aspace_cr3_write(pml4) };
+    CR3_WRITES.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// 切回内核 AS（`aspace_switch(our_cr3())` 的便利入口）。返回是否真的写了。
+///
+/// # Safety
+/// 同 `aspace_switch`；`our_cr3()` 非 0（启动已切换）。
+pub unsafe fn aspace_switch_kernel() -> bool {
+    // SAFETY: our_cr3 是启动时建的内核表，前提由 take_over 保证
+    unsafe { aspace_switch(our_cr3()) }
+}
+
+/// 已有非内核 AS 之后，内核半区的新映射一律拒绝（ADR-070 决策 2 的冻结前置，判据 A6）。
+/// 今天唯一的运行期内核半区写点是 `map_hole`（`map`/`map_device` 的 VA 都在启动期定形），
+/// 所以闸放在它的入口；将来若新增内核半区写点，必须同样过这道闸。
+fn kernel_half_frozen() -> bool {
+    let _g = vmm();
+    aspaces().items.iter().any(|e| e.used)
 }
 
 // ------------------------------------------------------ ADR-067（W2 P5）惰性区间

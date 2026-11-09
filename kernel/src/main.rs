@@ -557,8 +557,9 @@ fn run_ktests_and_finish() -> ! {
         [smp::ap_worker_hlt(1), smp::ap_worker_hlt(2), smp::ap_worker_hlt(3)]);
     let c = mm::counters();
     crate::log_info!(
-        "mm counters: map_calls={} mapped_pages={} unmapped_pages={} page_table_pages={} early_pool={}",
-        c.map_calls, c.mapped_pages, c.unmapped_pages, c.page_table_pages, c.early_pool_used
+        "mm counters: map_calls={} mapped_pages={} unmapped_pages={} page_table_pages={} early_pool={} as_pt_live={} cr3_writes={}",
+        c.map_calls, c.mapped_pages, c.unmapped_pages, c.page_table_pages, c.early_pool_used,
+        c.as_pt_live, c.cr3_writes
     );
     tsc::stage("ktests");
 

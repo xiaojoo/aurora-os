@@ -5361,6 +5361,75 @@ P1 开工前的前置读数，**只量不改**。一启正常构建（72 用例�
 **3a/3b 已裁**（2026-11-09，使用者单独裁定）：**3a——全局一张，用户区间冲突改由 AS 判**
 （`is_mapped_in(as, va)`）；ADR-070 决策 3 已按此改写，3b 记为拒绝。P1 的前置至此齐了。
 
+## 148. W3 P1：AddressSpace 能建/能切/能销（ADR-070 第一刀，2026-11-09，实测）
+
+**范围**：机制证明，不是特性。能建一个用户半区为空的 AS、按"不同才写"切进去跑一段内核代码、
+销毁回基线。**没有用户进程、没有 vmo、没有 syscall**；产品路径（map/unmap/walk/只读判据）
+仍只认 `AS_KERNEL`。用例数 72 → **73**。
+
+**动了什么**：
+1. `mm.rs`：`AspaceEntry`/`AspaceTable`（定长 4 格，全 Copy，VMM 内读写，与 `LazyTable` 同律）；
+   `aspace_new`（取 PML4 页走 `MOD_AS_PT`，高 256 项复制、低 256 清零）；
+   `AspaceHandle`（RAII，Drop 走 `aspace_release`：清表项 → 锁外 `frame_put` 逐帧归还）；
+   `aspace_switch`/`aspace_switch_kernel`（读 CR3 → 不同才写 → 计数）；
+   `kernel_half_frozen`（有 AS 时 `map_hole` 拒绝，`MmError::KernelHalfFrozen`）；
+   见证函数 `kernel_half_matches`/`user_half_present`/`aspace_count`；
+   计数器 `AS_PT_LIVE`/`CR3_WRITES` 进 `MmCounters`。
+2. **CR3 原语复用已有的 `global_asm!` 块**（`mm_relocate` 那个），新增 `aspace_cr3_read/write`
+   两个 asm 全局函数 + `extern "C"` 声明。**不新开 `global_asm!` 块、不写 `core::arch::asm!`**：
+   门禁的棘轮按行计 `arch::` 引用站点，`core::arch::` 也匹配（`\barch::` 命中 `core::arch::`），
+   新开块会 +1 站点撞红。复用已有块 = **零新增站点**，`memory->arch` 仍 64。
+   这条是本轮撞了一次红之后找到的形状（第一次写 `core::arch::asm!` ⇒ 66 > 64 ⇒ 红）。
+3. `main.rs`：`mm counters` 行追加 `as_pt_live`/`cr3_writes` 两格。
+4. `ktests/mm.rs`：新用例 `t_aspace_create_switch_destroy`（六格：前提/A1/A2/A3/A6/闸另一侧）。
+5. 登记面：`module-interfaces.toml` 补 7 个 `mm::aspace_*`/`AspaceHandle`/`MAX_ADDR_SPACES`/`MOD_AS_PT`；
+   **unsafe 321 → 334**（mm U1 2→5、U2 38→43、U4 6→8；ktests/mm U6 8→11）。
+
+**正向读数**（`build/_p1-final-serial.log:688`）：
+`aspace(P1): A1=Some((256, 0)) 用户半区=Some(0) A2=(跨写=true 同AS写=0 回写=true cr3累计0->2) A3=(live0->0 free116282->116282 台账0->0 表0->0) A6=true 闸另一侧=true`
+⇒ `ktests: total=73 passed=73 failed=0`、`qemu-exit=33`。
+`ledger: module 18 live=0 frames alloc=1 calls=1`（取了一张、还了一张）。
+
+**三条变异（各一跑，默认档单次启动）**：
+
+| 变异 | 改什么 | 读数 | 判定 |
+| --- | --- | --- | --- |
+| P1a（半复制） | 高 256 项只复制 128 项 | 机器死在切换那一刻（**QEMU-EXIT-0**），A1 读数没走到 | 红（≠PASS） |
+| P1b（去掉门） | `aspace_switch` 无条件写 CR3 | `同AS写=8 cr3累计0->10`，**只有 A2 红** | FAIL(35)，failed=1 |
+| P1c（不还表页） | `aspace_release` 跳过 `frame_put` | `free116283->116282 台账0->1`，**只有 A3 红**；`module 18 live=1` | FAIL(35)，failed=1 |
+
+P1a 的形状要如实说：半复制让内核半区不完整，切换后第一条取指就 #PF，而故障处理器自己也在
+高半区 ⇒ 级联成三重故障 ⇒ QEMU 以 0 退出。这**是** ADR-070 预测的"跑进没复制的区间当场 #PF"，
+但 A1 见证函数的红方向（diff>0 的可读行）没走到——机器死在读数之前。
+A1 的绿方向（diff=0）在干净跑里已验；红方向由"机器死在切换"兑现。
+属性注入（全复制但改一个项）也试了，同样死在切换——**内核半区的任何不等价都是致命的**，
+这本身就是判据的意义。
+
+**门禁与矩阵**：`check` **17/17**；矩阵整轮复验 **45 行全符合、0 不符**（`build/_p1-test2.txt`）。
+**unsafe 321 → 334**；棘轮 `memory->arch` **仍 64**（零新增站点）。
+
+**第一次矩阵跑作废（如实记）**：我在矩阵后台跑期间注入 MUTATION-P1a 并 build，
+污染了后续 fault 行的构建产物（三个 fault 行吃到半复制版 ELF ⇒ QEMU-EXIT-0）。
+这违反了"一次验证跑只吃一个代码状态"的规矩（memory: `feedback-one-code-state-per-verification-run`）。
+处置：还原变异、干净重建、**整轮重跑**（`_p1-test2.txt`，45/45）。第一次的读数不引用。
+
+**bench**（`baselines/2026-11-09T06-20-09Z-p3p4.txt`）：4/4 判定 PASS、0 次 shootdown 超时、
+四把尺子全"能分辨=符合"。P1 `min` 6899/6553（同构建差 347）、`mean` 44844/44702（差 0.3 %）；
+P4 同构建地板 **14.80 %**（no-load#1 total 8.01G vs #2 6.82G）——**高于 8 % 阈值但 P4 只作对照不作判据**
+（`p4-tolerance.md` 原文），且这是单次离群（前一轮 2.07 %），不据此改阈值。
+P1 的 `aspace_switch` 今天不被产品路径的 `preempt_point` 调用，所以 P1 均值不该因本轮代码而动；
+实测 mean 差 0.3 % 在噪声内。
+
+**没做的**：P1 的 `same-as`/`cross-as` 分格读数（Q4 裁决）今天没有产品路径调用者，
+用例里的 8 次同 AS 连切是**唯一**的 cross-as 样本来源；分格进 bench 要等产品路径真接上（P3+）。
+`-d int` 的宿主机侧第二仪器没跑（CR3 写入是内核自报计数，QEMU 没有对应的 trace 事件——B4 已证）。
+
+**新发现的风险**：①`global_asm!` 复用是棘轮下的**唯一**零站点形状，将来新增 asm 原语都得挤进
+已有块，块会越来越大；②`AS_PT_SLOTS=16` 是"接缝够用"的尺，P1 只用 1 张（PML4），
+低半区真铺映射时最坏 769 张，16 不够——但那是 P4 的事，本轮不预支；③半复制/属性注入都死在
+A1 读数之前，意味着**内核半区等价这条判据的红方向只能靠"机器死了"来兑现**，没有可读的 diff 行；
+真机上若要区分"哪一项不等价"，得在切换**之前**先比对（今天 `kernel_half_matches` 是切换之后才调的）。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

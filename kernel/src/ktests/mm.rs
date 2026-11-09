@@ -556,6 +556,105 @@ fn t_map_hole() -> bool {
 }
 ktest!(KT_MAP_HOLE, t_map_hole);
 
+// ---- ADR-070（W3 P1）AddressSpace：能建、能切、能销 ----
+//
+// 六格：A1 内核半区逐项相等（含属性位）；A2 CR3 只在不同才写（同 AS 连切 N 次=0、
+// 跨 AS 一次=1）；A3 销毁回基线（as_pt_live / free_frames / MOD_AS_PT 台账 / 表计数）；
+// 前提格（进来时 aspace_count=0）；用户半区为空；A6 冻结闸（有 AS 时 map_hole 拒绝）。
+// 负样本（落地时各跑一遍）：半复制 ⇒ A1 红；去掉"不同才写"的门 ⇒ A2 红；
+// 不还表页 ⇒ A3 红。三条都要实测，没跑过的不算证据。
+
+fn t_aspace_create_switch_destroy() -> bool {
+    // 前提：进来时没有别的 AS（.ktests 顺序由链接器定，不能假设有别人替我清场）
+    let n0 = mm::aspace_count();
+    if n0 != 0 {
+        crate::log_fatal!("aspace: 前提失效，进来时已有 {} 个 AS", n0);
+        return false;
+    }
+    let c0 = mm::counters();
+    let f0 = mm::free_frames();
+    let led0 = crate::resource::live_of(mm::MOD_AS_PT);
+
+    let h = match mm::aspace_new() {
+        Some(h) => h,
+        None => {
+            crate::log_fatal!("aspace: 建不起来");
+            return false;
+        }
+    };
+    // A1：内核半区 256 项逐项相等（含缓存属性位）；用户半区 0 个 present
+    let a1 = h.kernel_half_matches();
+    let user0 = h.user_half_present();
+    let pml4 = match h.pml4() {
+        Some(p) => p,
+        None => {
+            crate::log_fatal!("aspace: 读不回 PML4");
+            return false;
+        }
+    };
+
+    // A2：切过去（真的写一次）→ 同 AS 连切 8 次（一次都不许写）→ 切回来（再写一次）
+    // 切换期间跑的是**内核代码**（本用例自己），这正是"内核半区等价"的意义：
+    // 不等价的话第一条指令就取不到，根本走不到读数行。
+    let w_cross = unsafe { mm::aspace_switch(pml4) };
+    let mut same_writes = 0usize;
+    for _ in 0..8 {
+        if unsafe { mm::aspace_switch(pml4) } {
+            same_writes += 1;
+        }
+    }
+    // 在新 AS 上读一次自己的内核数据（证明确实在那个表上跑了一段）
+    let alive_on_aspace = mm::is_ready() && mm::free_frames() > 0;
+    let w_back = unsafe { mm::aspace_switch_kernel() };
+    let c1 = mm::counters();
+    let a2 = w_cross && same_writes == 0 && w_back
+        && c1.cr3_writes == c0.cr3_writes + 2 && alive_on_aspace;
+
+    // A6：有这个 AS 在，map_hole 必须拒绝（内核半区冻结）。用 t_map_hole 同款前提：
+    // IOAPIC 那一页今天已被启动期映过，所以这里挑"usable 内存基址"那条拒绝路径不行
+    // （它先撞 InvalidAddress）；直接验"冻结闸在其它检查之前"用一个**本来能成功**的 pa。
+    // 0xFEC00000 已被 HHDM 覆盖 ⇒ 会撞 Unsupported 而不是 KernelHalfFrozen，
+    // 所以先找一个 HHDM 未覆盖的非 usable 页（与 t_map_hole 的 pa_cov 同法）。
+    let mut pa_frozen = None;
+    for i in 0..mm::region_count() {
+        let Some(r) = mm::region(i) else { break };
+        let b = (r.base + mm::PAGE as u64 - 1) & !(mm::PAGE as u64 - 1);
+        if b >= r.base + r.length {
+            continue;
+        }
+        if !r.usable && !mm::is_mapped(mm::hhdm() + b) {
+            pa_frozen = Some(b);
+            break;
+        }
+    }
+    let a6 = pa_frozen.map_or(false, |p| mm::map_hole(p, 1).err() == Some(mm::MmError::KernelHalfFrozen));
+
+    // A3：销毁回基线
+    drop(h);
+    let c2 = mm::counters();
+    let f2 = mm::free_frames();
+    let led2 = crate::resource::live_of(mm::MOD_AS_PT);
+    let n2 = mm::aspace_count();
+    let a3 = c2.as_pt_live == c0.as_pt_live && f2 == f0 && led2 == led0 && n2 == 0;
+
+    // 冻结闸的"另一侧"：没有 AS 时 map_hole 不被这道闸拦（今天它可能因别的前提拒绝，
+    // 但只要不是 KernelHalfFrozen 就证明闸真的只看"有没有 AS"）
+    let gate_off = pa_frozen.map_or(true, |p| mm::map_hole(p, 1).err() != Some(mm::MmError::KernelHalfFrozen));
+
+    crate::log_info!(
+        "aspace(P1): A1={:?} 用户半区={:?} A2=(跨写={} 同AS写={} 回写={} cr3累计{}->{}) A3=(live{}->{} free{}->{} 台账{}->{} 表{}->{}) A6={} 闸另一侧={}",
+        a1, user0, w_cross, same_writes, w_back, c0.cr3_writes, c1.cr3_writes,
+        c0.as_pt_live, c2.as_pt_live, f0, f2, led0, led2, n0, n2, a6, gate_off);
+    let ok = a1 == Some((256, 0)) && user0 == Some(0) && a2 && a3 && a6 && gate_off;
+    if !ok {
+        crate::log_fatal!(
+            "aspace: 判据不成立 A1={:?} 用户={:?} A2={} A3={} A6={} 闸另一侧={}",
+            a1, user0, a2, a3, a6, gate_off);
+    }
+    ok
+}
+ktest!(KT_ASPACE, t_aspace_create_switch_destroy);
+
 // ---- ADR-067（W2 P5）demand-zero ----
 //
 // 七格：①ring3 首触未填充页读到 0 且计数 +1；②区间外未映射地址仍只杀任务；
