@@ -5335,6 +5335,32 @@ Q2 的**具体数值**（等 workload 实测）；页表页归还（N7）的**�
 **本轮读数**：`check` **17/17 rc=0**（纯文档改动，复跑一遍确认门禁没被碰）；
 没跑 `test`/`bench`（无代码可跑）；`kernel/` 与 `tools/` **零改动**（`git status` 里只有 `docs/` 与 `BACKLOG.md`）。
 
+## 147. P1-0：N7（页表页归还）现状基线实测（2026-11-09，`build/_p1-n7-baseline.log`，PASS/33）
+
+P1 开工前的前置读数，**只量不改**。一启正常构建（72 用例全过），三本账的形状：
+
+| 账 | 读数 | 含义 |
+| --- | --- | --- |
+| `mm counters` | `map_calls=152 mapped_pages=598 unmapped_pages=211 page_table_pages=15 early_pool=6` | **PT_PAGES=15**：9 张来自早期池（`.bss`，不占帧），6 张 `phys_alloc(0, MOD_BOOT)` 后 `forget` |
+| `free frames` | `reclaimed=12484 … free frames now 128797` | 收尾时点的空闲帧；`MOD_BOOT live=266` 是"内核生命期占用"的聚合（含页表页、FrameInfo 元数组、早期杂项） |
+| `ledger: module 1` | `live=266 frames alloc=266 calls=266` | **alloc==live、free=0**：MOD_BOOT 从不归还，这正是 N7 的现状——"建 N 个 AS 杀 N 个回基线"若不还页表页，`module 1` 的 live 会单调涨 |
+| VA 保留 | 启动 `in force=3`，用例后 `reservations=9 live=1`（`t_task_exit` 收尾） | 全局 256 格表的占用极低；**用户窗口今天只占个位数** ⇒ 3a/3b 之争在容量上暂不构成约束 |
+
+**对 P1 的直接结论**：
+1. 页表页归还的**最小面**是"新 AS 的低半区页表页"（PML4 1 张 + 按需的 PD/PT），高半区复制项指向的
+   **下层表是共享的、归内核**，销毁 AS 时**绝不能还**它们（还了就是把内核半区抽掉）。
+   所以 P1 的销毁路径必须区分"这张表页是我这个 AS 自己建的"与"这是复制项指向的共享表"——
+   前者还、后者不动。这条区分就是 P1 里最容易写错、也最值得先写判据的一处。
+2. `MOD_BOOT` 的"永不归还"语义**本轮不推翻**：P1 只给**新 AS 的表页**开归还路径
+   （新 owner 域或复用 `frame_put`），内核自己的 15 张照旧。ADR-027 的补记只记"AS 表页有主人"，
+   不改"boot 表页无主人"那条已验证语义。
+3. 早期池 24 张今天用了 6 张（`early_pool=6`），余量 18；P1 的新 AS 在 `is_ready()` 之后建，
+   走 `phys_alloc` 不走早期池，所以不占这 18 张余量。
+
+**没做的**：没改任何代码。
+**3a/3b 已裁**（2026-11-09，使用者单独裁定）：**3a——全局一张，用户区间冲突改由 AS 判**
+（`is_mapped_in(as, va)`）；ADR-070 决策 3 已按此改写，3b 记为拒绝。P1 的前置至此齐了。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。
