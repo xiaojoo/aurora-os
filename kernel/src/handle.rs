@@ -365,6 +365,23 @@ pub fn has(h: Handle, owner: (usize, u32), need: u32) -> bool {
     }
 }
 
+/// 句柄 → 地址空间**槽号**（ADR-075 决策 6：14 号的 `rdx`）。形状照 `vmo_of`：
+/// 锁内查表取引用，槽号是 Copy ⇒ 不需要锁外那一步。
+/// 世代与 `used` 的活性核对留给 `mm::aspace_map_slot`（`capability -> memory` 已登记，
+/// 但那两把锁的取放次序归 mm 自己，句柄层不在 35 之内取 VMM）。
+pub fn aspace_of(h: Handle, owner: (usize, u32), need: u32) -> Result<u8, HErr> {
+    let mut g = TABLE.lock();
+    let t = g.get();
+    let slot = check(t, h, owner, need)?;
+    match t.slots[slot].obj {
+        Some(ObjRef::ASpace { slot, .. }) => Ok(slot),
+        _ => {
+            t.c.denied += 1;
+            Err(HErr::Denied)
+        }
+    }
+}
+
 /// 每槽独立；1..=GEN_MAX，跳过 0；到顶**回绕到 1**（设计 §9 G：承诺是计数上界，
 /// 不是"永远"）。旧句柄在 `GEN_MAX-1` 次后续复用内必然对不上。
 fn next_gen(prev: u64) -> u64 {

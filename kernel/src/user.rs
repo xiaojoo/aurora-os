@@ -52,7 +52,7 @@ pub const SYS_ASPACE_MAP: u64 = 14;
 /// ABI 版本。minor=4 对应用户态闭环这一段（M4）；minor=5 追加 capability 句柄族（P7）；
 /// minor=6 追加 VMO 三个号（12/13/14）与 `F_VMO` 位（W3 P4b，ADR-074）。号只追加不复用（Q1）。
 pub const ABI_MAJOR: u64 = 0;
-pub const ABI_MINOR: u64 = 6;
+pub const ABI_MINOR: u64 = 7;
 pub const F_FASTPATH: u64 = 1;
 pub const F_SMAP: u64 = 2;
 pub const F_SMEP: u64 = 4;
@@ -247,7 +247,19 @@ fn sys_vmo_write(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     done as u64
 }
 
-/// 14：把 VMO 铺进调用者自己的 AS（今天 = AS_KERNEL），VA 由内核从动态区发。
+/// 14：把 VMO 铺进某个 AS 的用户半区。**ADR-075 决策 6 的兼容扩展形**（`ABI_MINOR` 6 → 7）：
+///
+/// | 寄存器 | 扩展后语义 | 传旧值时 |
+/// | --- | --- | --- |
+/// | `rdi` | VMO 句柄 | 不变 |
+/// | `rsi` | flags 位图：bit0 可写、bit1 可执行 | `0`⇒`USER_R`、`1`⇒`USER_RW`，与 P4b 逐字相同 |
+/// | `rdx` | AS 句柄（`ObjRef::ASpace`） | `0` = 调用者自己的 AS（今天 = 内核那份，即 `aspace_map_self`） |
+/// | `r10` | 请求的用户 VA | `0` = 内核从动态区发（P4b 的行为） |
+///
+/// 三条不许打折：①W+X 在**构造期**失败（`PageFlags::new` ⇒ `WxViolation` ⇒ `-1`），
+/// 所以这一刀虽然开始给 X，仍然给不出 RWX；②请求的 VA **要么原样拿到、要么明确拒绝**，
+/// 绝不静默改地址——这是"ELF 的 `p_vaddr` 搬不动"与"两个主人不能同信一段 VA"的交点；
+/// ③失败路径必须把刚登记的 VA 保留还回去，否则动态区被失败调用吃光。
 /// 映射挂进当前任务的资源袋 ⇒ 任务退出时由 `release_owned` 在锁外 drop（清叶子 + 还参考 + 放手 VA）。
 #[cfg(feature = "handles")]
 fn sys_aspace_map(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
@@ -260,16 +272,56 @@ fn sys_aspace_map(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
         Some(n) => n,
         None => return E_BAD_HANDLE,
     };
-    // 永远不给 X：写权由用户选，执行权不给，所以 W^X 在这一层就排掉了
-    let flags = if frame.rsi != 0 { mm::PageFlags::USER_RW } else { mm::PageFlags::USER_R };
-    let va = match mm::alloc_user_va_range(pages) {
-        Some(v) => v,
-        None => return E_EXHAUSTED,
+    let flags = match mm::PageFlags::new(frame.rsi & 1 != 0, frame.rsi & 2 != 0, true) {
+        Ok(f) => f,
+        // W+X 与非法位都在这一格拒掉：给的是 -1（形状非法），不是 -4（权限）
+        Err(_) => return E_INVALID,
     };
-    let m = match crate::vmo::vmo_map_self(id, va, flags) {
+    // 先认 AS 再要 VA：句柄不对就不该占用动态区（失败路径要留零残留）
+    let as_slot = if frame.rdx == 0 {
+        None
+    } else {
+        match crate::handle::aspace_of(crate::handle::Handle(frame.rdx), owner, crate::handle::RIGHT_MAP) {
+            Ok(s) => Some(s),
+            Err(e) => return handle_err(e),
+        }
+    };
+    let va = if frame.r10 == 0 {
+        match mm::alloc_user_va_range(pages) {
+            Some(v) => v,
+            None => return E_EXHAUSTED,
+        }
+    } else {
+        let want = frame.r10;
+        // 对齐自己判：`reserve_va_at` 也会拒非对齐，但那是"要不到地址"（-6），
+        // 而**请求本身非法**应该是 -1——两种拒绝在判据里要分得开。
+        if want % mm::PAGE as u64 != 0 {
+            return E_INVALID;
+        }
+        let end = want.checked_add(pages as u64 * mm::PAGE as u64);
+        // 页对齐由 `reserve_va_at` 判；这里判的是"必须落在用户半区"，
+        // 高 256 项的下层表与内核共享，写那里就是违反 ADR-070 的冻结。
+        if want < mm::USER_VA_BASE || end.is_none_or(|e| e > mm::USER_VA_TOP) {
+            return E_INVALID;
+        }
+        if !mm::reserve_va_at(want, pages) {
+            return E_EXHAUSTED;
+        }
+        match mm::VirtAddr::new(want) {
+            Some(v) => v,
+            None => {
+                mm::release_va(want);
+                return E_INVALID;
+            }
+        }
+    };
+    let m = match as_slot {
+        None => crate::vmo::vmo_map_self(id, va, flags),
+        Some(s) => crate::vmo::vmo_map_slot(id, s, va, flags),
+    };
+    let m = match m {
         Ok(m) => m,
         Err(_) => {
-            // 铺不成就要把刚发的 VA 还回去，否则动态区会被失败调用吃光
             mm::release_va(va.0);
             return E_EXHAUSTED;
         }

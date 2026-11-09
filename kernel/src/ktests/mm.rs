@@ -1382,6 +1382,19 @@ fn t_aspace_map_vmo() -> bool {
     // ⑥ 互不影响的真正证人：丢掉 AS1 的映射之后，AS2 的同一 VA 还在
     drop(m1);
     let indep_ok = mm::aspace_leaf(&a1, va).is_none() && mm::aspace_leaf(&a2, va).is_some();
+    // ⑥b 按**槽号**铺（ADR-075 决策 6：14 号的 `rdx`=AS 句柄走的就是这条实体）。
+    // 与 ① 的 `vmo_map(&a2, ..)` 互为对照：同一棵树、同一个入口，引用来源从 RAII 柄换成槽号。
+    let va2 = mm::VirtAddr(0x1_0000_1000);
+    let ms = vmo::vmo_map_slot(id, a2.slot(), va2, flags);
+    let slot_ok = ms.is_ok()
+        && mm::aspace_leaf(&a2, va2).is_some()
+        && mm::aspace_leaf(&a1, va2).is_none();
+    // ⑥c 槽号不存在必须明确拒绝（这条判据的存在理由：`aspace_map` 有柄可依赖，
+    // `aspace_map_slot` 没有 ⇒ `used` 必须自己核，漏核就是往一张已销毁的表里写叶子）
+    let dead = mm::aspace_map_slot(3, &[], va2, flags, crate::vmo::MOD_VMO);
+    let dead_ok = matches!(dead, Err(mm::MmError::NoSuchAspace));
+    drop(ms);
+    let slot_gone = mm::aspace_leaf(&a2, va2).is_none();
     // ⑦ 收窄：把 AS2 登记到 AP1，丢它的映射 ⇒ 只有 AP1 收到回执（ADR-072 的第一个产品调用者）
     let reg = mm::aspace_register_cpu(1, ap1);
     let sd1 = mm::shootdown_stats();
@@ -1398,14 +1411,16 @@ fn t_aspace_map_vmo() -> bool {
     let f1 = mm::free_frames();
     let base_ok = f1 == f0 && mm::aspace_count() == 0 && vmo::vmo_count() == 0;
     crate::log_info!(
-        "asmap(P4): 双AS={} 同树拒={} W^X={} 高半区拒={} 叶同帧={} 互不影响={} 收窄=(reg{} ack{}) 基线=(free{}->{} as{} vmo{})",
-        both_ok, tree_ok, wx_ok, hi_ok, leaf_ok, indep_ok, reg.is_some(),
+        "asmap(P5c-2): 双AS={} 同树拒={} W^X={} 高半区拒={} 叶同帧={} 互不影响={} 按槽铺={} 死槽拒={} 丢掉后没了={} 收窄=(reg{} ack{}) 基线=(free{}->{} as{} vmo{})",
+        both_ok, tree_ok, wx_ok, hi_ok, leaf_ok, indep_ok, slot_ok, dead_ok, slot_gone, reg.is_some(),
         sd2.acks[ap1] - sd1.acks[ap1], f0, f1, mm::aspace_count(), vmo::vmo_count());
-    let ok = both_ok && tree_ok && wx_ok && hi_ok && leaf_ok && indep_ok && narrowed_ok && base_ok;
+    let ok = both_ok && tree_ok && wx_ok && hi_ok && leaf_ok && indep_ok
+        && slot_ok && dead_ok && slot_gone && narrowed_ok && base_ok;
     if !ok {
         crate::log_fatal!(
-            "asmap: 判据不成立 双AS={} 同树={} wx={} 高半区={} 叶={} 独立={} 收窄={} 基线={}",
-            both_ok, tree_ok, wx_ok, hi_ok, leaf_ok, indep_ok, narrowed_ok, base_ok);
+            "asmap: 判据不成立 双AS={} 同树={} wx={} 高半区={} 叶={} 独立={} 按槽铺={} 死槽拒={} 丢后没={} 收窄={} 基线={}",
+            both_ok, tree_ok, wx_ok, hi_ok, leaf_ok, indep_ok, slot_ok, dead_ok, slot_gone,
+            narrowed_ok, base_ok);
     }
     ok
 }
@@ -1734,6 +1749,13 @@ fn vmo_sys_worker() -> ! {
     f.rax = SYS_ASPACE_MAP;
     f.rdi = h;
     f.rsi = 1;
+    // **必须显式清 rdx 与 r10**（P5c-2 实测撞出来的，两个都撞了一次）：这一格复用同一个合成帧，
+    // 13 号把 `r10` 留成 8、把 `rdx` 留成一个用户 VA，而扩展形里它们分别是"请求的 VA"与"AS 句柄"
+    // ⇒ 脏的 rdx 连句柄形状都过不了（`unpack` 拒 ⇒ -1）。
+    // 所以决策 6 的承诺准确说法是"旧调用方**把新参数传 0** 行为不变"，
+    // **不是**"不传/随便传也不变"——寄存器是调用方负责清零的，这条要写进 ABI 文档。
+    f.rdx = 0;
+    f.r10 = 0;
     syscall_dispatch(&mut f);
     let mva = f.rax;
     put(5, mva);
@@ -1765,6 +1787,8 @@ fn vmo_sys_worker() -> ! {
     f.rax = SYS_ASPACE_MAP;
     f.rdi = hro;
     f.rsi = 1;
+    f.r10 = 0;
+    f.rdx = 0;
     syscall_dispatch(&mut f);
     put(8, f.rax);
     // ⑥ ABI 位读回真实状态

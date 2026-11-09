@@ -50,12 +50,12 @@ expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe
 # 2026-11-07 P7：hello 加了 syscall3（U1 两处）与 ring3 句柄读/close（U5 三处）。
 
 [unsafe-census]
-total = 373
+total = 374
 U1 = 65
 U2 = 99
 U3 = 13
 U4 = 129
-U5 = 31
+U5 = 32
 U6 = 36
 
 [modules."acpi"]
@@ -220,11 +220,12 @@ U5 = 22
 # 上下文 USER_ENTRY，不变量由 ABI 约定（号 rax、参数 rdi/rsi/rdx/r10、返回 rax）保证。
 # **为什么用 lea 而不是 addr_of!**：镜像基址在 4 GiB 之上，relocation-model=static 下
 # 取静态量地址会退化成 R_X86_64_32S，链接期就 out of range（本轮实测撞到）。
-# U5 三处 = 往自己 .slots 的原子写（偏移 0..=48，结构 64 字节）、_start 的调用序列块、
-# 从 14 号返回的用户 VA 读回 8 字节（只读、长度落在同一页内、先判返回值非负才解引用）。
+# U5 四处 = 往自己 .slots 的原子写（偏移 0..=88，结构 104 字节）、_start 的调用序列块、
+# 从 14 号返回的用户 VA 读回 8 字节、以及 P5c-2 新增的"从**请求的** VA 读回 8 字节"
+# （同一判据：先要求返回逐字等于请求值才解引用，只读、8 字节落在同一页内）。
 # 生命周期 = 本进程；单任务访问无并发；分类规则本轮从写死 user/hello 改成认 user/ 前缀。
 U1 = 6
-U5 = 3
+U5 = 4
 
 [modules."virtio"]
 U4 = 10

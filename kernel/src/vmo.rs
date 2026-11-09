@@ -317,6 +317,28 @@ pub fn vmo_map_self(id: VmoId, va: VirtAddr, flags: PageFlags) -> Result<AspaceM
     mm::aspace_map_self(&frames[..n], va, flags, MOD_VMO).map_err(VmoError::Mm)
 }
 
+/// `vmo_map` 的按槽号版（ADR-075 决策 6：14 号的 `rdx` 给的是 AS **句柄**，不是 RAII 柄）。
+/// 帧清单的取法与 `vmo_map` 逐字相同，只是把 `mm::aspace_map` 换成 `mm::aspace_map_slot`。
+pub fn vmo_map_slot(
+    id: VmoId,
+    slot: u8,
+    va: VirtAddr,
+    flags: PageFlags,
+) -> Result<AspaceMapping, VmoError> {
+    let mut frames = [0u64; MAX_VMO_PAGES];
+    let n = mm::with_vmm_lock(|| {
+        let t = tbl();
+        let e = t.items.get(usize::from(id.slot)).ok_or(VmoError::NoSuch)?;
+        if !e.used {
+            return Err(VmoError::NoSuch);
+        }
+        let n = usize::from(e.pages);
+        frames[..n].copy_from_slice(&e.frames[..n]);
+        Ok(n)
+    })?;
+    mm::aspace_map_slot(slot, &frames[..n], va, flags, MOD_VMO).map_err(VmoError::Mm)
+}
+
 /// 把整个对象铺进一个 AS 的用户半区（`mm::aspace_map` 的薄壳：mm 不认识 VMO，帧号由这里给）。
 /// 前置：调用方持着一个引用（句柄），所以清单拷出来之后帧不会被别人还掉。
 pub fn vmo_map(

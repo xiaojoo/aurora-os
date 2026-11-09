@@ -597,11 +597,22 @@ const PROBE_OFF_READBACK: u64 = 40;
 #[cfg(feature = "handles")]
 const PROBE_OFF_DONE: u64 = 48;
 #[cfg(feature = "handles")]
-const PROBE_PATTERN: [u8; 8] = [0x5A, 0xA5, 1, 2, 3, 4, 5, 6];
-/// 探针这一版会打的调用数：abi_info + vmo_create + vmo_write + aspace_map = 4。
-/// 等的是"打完"而不是"开始打了"（与 `P7_CALLS` 同一条纪律）。
+const PROBE_OFF_X_REQ: u64 = 56;
 #[cfg(feature = "handles")]
-const PROBE_CALLS: u64 = 4;
+const PROBE_OFF_X_RET: u64 = 64;
+#[cfg(feature = "handles")]
+const PROBE_OFF_X_READ: u64 = 72;
+#[cfg(feature = "handles")]
+const PROBE_OFF_WX_RET: u64 = 80;
+#[cfg(feature = "handles")]
+const PROBE_OFF_UN_RET: u64 = 88;
+#[cfg(feature = "handles")]
+const PROBE_PATTERN: [u8; 8] = [0x5A, 0xA5, 1, 2, 3, 4, 5, 6];
+/// 探针这一版**至少**打几个调用：abi_info + create + write + map + 1 次扩展形 + 2 次被拒 = 7。
+/// 等的是"打完"而不是"开始打了"（与 `P7_CALLS` 同一条纪律）。候选最多试四组 ⇒
+/// 窗口尾部那段落地等待从 2M 提到 8M 周期。
+#[cfg(feature = "handles")]
+const PROBE_CALLS: u64 = 7;
 
 #[cfg(feature = "handles")]
 fn t_probe_ring3() -> bool {
@@ -643,8 +654,8 @@ fn t_probe_ring3() -> bool {
             tsc::spin(20_000);
         }
         served = user::served();
-        // 写完第四个槽之后还要读回映射再写两格，给一小段落地时间
-        tsc::spin(2_000_000);
+        // 写完最后一个槽之前还要打扩展形与两次被拒，给一段落地时间（8M 周期 ≈ 2.4 ms）
+        tsc::spin(8_000_000);
         if !sched::wait_for_boot_task(300_000_000) {
             crate::log_fatal!("probe: 窗口收不了场（启动上下文没回到 CPU）");
         }
@@ -672,7 +683,22 @@ fn t_probe_ring3() -> bool {
     // 内核侧再独立读一遍映射内容：与探针自己读回的那一格互为两台仪器
     let mut back = [0u8; 8];
     let kernel_read = user::copy_from_user(mva, &mut back) == Ok(8) && back == PROBE_PATTERN;
-    let run_ok = magic_ok && abi_ok && handle_ok && write_ok && va_ok && readback == 1 && done == 1;
+    // ---- 14 号扩展形（ADR-075 决策 6）三格
+    let x_req = slot(PROBE_OFF_X_REQ);
+    let x_ret = slot(PROBE_OFF_X_RET);
+    let x_read = slot(PROBE_OFF_X_READ);
+    let wx_ret = slot(PROBE_OFF_WX_RET);
+    let un_ret = slot(PROBE_OFF_UN_RET);
+    // 这一格**不许空转**：`x_ret == x_req` 本身就要求"有一次按请求值拿到了地址"
+    // （一次都没成功时探针留下的是一对不相等的值），再加生效位与读回三件。
+    let xform_ok = x_ret == x_req
+        && x_req >= mm::USER_MMAP_BASE && x_req < mm::USER_VA_TOP
+        && mm::effective_flags(x_req).is_some_and(|f| f.user && f.executable && !f.writable)
+        && x_read == 1;
+    let wx_ok = wx_ret == user::E_INVALID;
+    let un_ok = un_ret == user::E_INVALID;
+    let run_ok = magic_ok && abi_ok && handle_ok && write_ok && va_ok && readback == 1
+        && done == 1 && xform_ok && wx_ok && un_ok;
     // 收场：终止任务 → 回收（reap 里 revoke_task 关句柄、句柄两段式还 VMO、资源袋还映射）
     let rel0 = sched::reap_released();
     let _ = sched::terminate_task(t);
@@ -682,8 +708,9 @@ fn t_probe_ring3() -> bool {
     let base_ok = drained && f1 == f0 && va1 == va0
         && crate::handle::live() == lv0 && crate::vmo::vmo_count() == v0;
     crate::log_info!(
-        "probe(P5a): 魔数={} ABI位={} 句柄={} 写={} VA={} 自读回={} 生效位={:?} 内核读回={} 收场=(drained{} free{}->{} va{}->{} live{}->{} vmo{}->{}) served={}",
+        "probe(P5c-2): 魔数={} ABI位={} 句柄={} 写={} VA={} 自读回={} 生效位={:?} 内核读回={} 扩展形=(请求{:#x} 返回{:#x} 判据{} 读回{}) W+X拒={} 非对齐拒={} 收场=(drained{} free{}->{} va{}->{} live{}->{} vmo{}->{}) served={}",
         magic_ok, abi_ok, handle_ok, write_ok, va_ok, readback == 1, eff, kernel_read,
+        x_req, x_ret, xform_ok, x_read, wx_ok, un_ok,
         drained, f0, f1, va0, va1, lv0, crate::handle::live(), v0, crate::vmo::vmo_count(), served);
     let ok = run_ok && eff_ok && kernel_read && base_ok;
     if !ok {

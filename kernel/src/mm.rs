@@ -2065,6 +2065,28 @@ pub fn aspace_map_self(
     map_shared(s().pml4_phys, None, frames, va, flags, owner)
 }
 
+/// 按**槽号**铺映射（ADR-075 决策 6：14 号的 `rdx`=AS 句柄那条路）。
+/// 与 `aspace_map` 是同一实体，差别只在引用的来源：那里是"当初建它的 RAII 柄"，
+/// 这里是句柄表里核过世代号的槽号 ⇒ 没有柄可依赖，`used` 必须自己核。
+/// 槽位在这一步之后被销毁也不危险：`AspaceMapping::drop` 本来就要重核
+/// `e.used && e.pml4 == self.root`，核不过就不清叶子（ADR-074 的契约）。
+///
+/// 上下文 KERNEL，取 VMM；失败不留半截映射。
+pub fn aspace_map_slot(
+    slot: u8,
+    frames: &[u64],
+    va: VirtAddr,
+    flags: PageFlags,
+    owner: ModuleId,
+) -> Result<AspaceMapping, MmError> {
+    let _g = vmm();
+    let e = aspaces().items.get(usize::from(slot)).ok_or(MmError::NoSuchAspace)?;
+    if !e.used {
+        return Err(MmError::NoSuchAspace);
+    }
+    map_shared(e.pml4, Some(slot), frames, va, flags, owner)
+}
+
 /// 两个入口共用的铺设体。调用方已持 VMM 并核对过根。
 fn map_shared(
     root: u64,

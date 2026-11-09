@@ -32,6 +32,18 @@ pub const OFF_MAP_VA: u64 = 32;
 pub const OFF_READBACK: u64 = 40;
 /// 跑完标记：内核等的是这一格，不是"开始跑了"。
 pub const OFF_DONE: u64 = 48;
+/// 14 号扩展形（ADR-075 决策 6）实际**请求**的 VA；0 = 四次候选都没拿到。
+pub const OFF_X_REQ: u64 = 56;
+/// 那一次调用的原始返回值（判据要求它与 `OFF_X_REQ` **逐字相等** ⇒ 不许静默改地址）。
+pub const OFF_X_RET: u64 = 64;
+/// 从请求 VA 读回比对的结果（1=一致）⇒ 拿到了地址还不算，得真翻译到同一份帧。
+pub const OFF_X_READ: u64 = 72;
+/// W+X（rsi=3）的原始返回，必须是 -1。
+pub const OFF_WX_RET: u64 = 80;
+/// 非对齐请求（+8）的原始返回，必须是 -1。
+pub const OFF_UN_RET: u64 = 88;
+/// 页大小（与内核 `mm::PAGE` 同一事实的第二次声明，靠读回对账）。
+const PAGE: u64 = 4096;
 /// 写进对象、再从映射读回来比对的图案。内核用例里有同一份常量的第二份声明。
 pub const PATTERN: [u8; 8] = [0x5A, 0xA5, 1, 2, 3, 4, 5, 6];
 /// ABI 的 VMO 特性位（`user.rs` 的 `F_VMO`）。
@@ -52,6 +64,11 @@ struct Slots {
     map_va: AtomicU64,
     readback: AtomicU64,
     done: AtomicU64,
+    x_req: AtomicU64,
+    x_ret: AtomicU64,
+    x_read: AtomicU64,
+    wx_ret: AtomicU64,
+    un_ret: AtomicU64,
     _spare: AtomicU64,
 }
 
@@ -64,6 +81,11 @@ static SLOTS: Slots = Slots {
     map_va: AtomicU64::new(0),
     readback: AtomicU64::new(0),
     done: AtomicU64::new(0),
+    x_req: AtomicU64::new(0),
+    x_ret: AtomicU64::new(0),
+    x_read: AtomicU64::new(0),
+    wx_ret: AtomicU64::new(0),
+    un_ret: AtomicU64::new(0),
     _spare: AtomicU64::new(0),
 };
 
@@ -162,6 +184,44 @@ pub extern "C" fn _start() -> ! {
             ok = 0;
         }
         put(OFF_READBACK, ok);
+        // ---- 14 号的扩展形（ADR-075 决策 6）：rsi=bit1 ⇒ 只给执行位，r10 ⇒ 请求地址
+        // 候选步进 **64 页（256 KiB），但仍落在第一次映射那同一个 2 MiB 块里**：
+        // ① 不能贴着动态边界（M21 实测：紧贴的候选会被分配器"顺手"给出来，
+        //    "返回==请求"就变成运气证人，只有非对齐那一格抓得到变异）；
+        // ② 不能跨 2 MiB 块（另一轮实测：内核 AS 里新块要新建一张页表页，而它记 MOD_BOOT、
+        //    **生命周期=内核**，于是"帧回基线"那格永久少一帧——那不是漏，是这条路径的固有代价）。
+        // 允许全部失败（保留表今天还可能被别的用例占着），但成功那一次必须读回一致。
+        let mut asked = 0u64;
+        let mut got = u64::MAX;
+        if ok == 1 {
+            for k in 1..=4u64 {
+                let req = (va + k * 64 * PAGE) & !(PAGE - 1);
+                let r = sys4(SYS_ASPACE_MAP, h, 2, 0, req);
+                asked = req;
+                got = r;
+                if r == req {
+                    break;
+                }
+            }
+        }
+        let mut x_read = 0u64;
+        if got == asked {
+            let p = asked as *const u8;
+            x_read = 1;
+            for i in 0..8usize {
+                // SAFETY: asked 是 14 号按请求值返回的**本对象**映射（2 页），
+                // 这里只读前 8 字节；只读、不越界。
+                if unsafe { core::ptr::read_volatile(p.add(i)) } != PATTERN[i] {
+                    x_read = 0;
+                }
+            }
+        }
+        put(OFF_X_REQ, asked);
+        put(OFF_X_RET, got);
+        put(OFF_X_READ, x_read);
+        // W+X 与非对齐都必须被拒成 -1（拿的是第一次成功的那个请求值）
+        put(OFF_WX_RET, sys4(SYS_ASPACE_MAP, h, 3, 0, asked));
+        put(OFF_UN_RET, sys4(SYS_ASPACE_MAP, h, 2, 0, asked + 8));
         put(OFF_DONE, 1);
         // **故意不自己 exit**：退出即被 reap，映射与数据页当场解映射，内核用例就读不到槽了。
         // 由用例 terminate_task + 回收来收场，走的是同一条 reap/revoke_task 路径（句柄与 VMO 一样归还），
