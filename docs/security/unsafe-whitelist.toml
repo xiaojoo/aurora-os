@@ -20,6 +20,11 @@ scope_actual = "asm 全局符号与异常桩(trap/sched/cpu) · 描述符表与 
 expires = "M2：按 §2.5 拆出 aurora-arch / aurora-hw / aurora-mm-core 后，本条改为逐 crate 登记"
 
 # M4-2：第一个用户程序（测试夹具）。它的 unsafe 只有两类，都写在源码注释里。
+[crate.aurora-user-probe]
+reason = "第二个用户产物（W3 P5a）：unsafe 需求是 int 0x80 的四参入口、两处 RIP 相对 lea 取自己段的基址、两个自跳转，以及往自己 .slots 写结果与从 14 号返回的用户 VA 读回 8 字节；不碰任何内核对象"
+scope = "main.rs：sys4 的 int 0x80（rax/rdi/rsi/rdx/r10）· slots_base/src_addr 的 lea（镜像基址在 4 GiB 之上，addr_of! 会退化成 R_X86_64_32S）· put 的原子写（偏移 0..=48）· _start 的读回比对（只读、同页内、先判返回值非负）· panic 与收尾自跳转"
+expires = "P5c 之后若它开始打 11/15/16 或读 StartupInfo，unsafe 面会扩，那时回这条账重登记"
+
 [crate.aurora-user-hello]
 reason = "它是产物而不是库：唯一的 unsafe 需求是 `int 0x80` 与一个自跳转，没有任何指针算术、没有内存操作、不碰任何内核对象"
 scope = "main.rs：3 次 int 0x80（inlateout rax + in rdi/rsi）、panic 与收尾各一个 `jmp .` 自跳转"
@@ -45,12 +50,12 @@ expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe
 # 2026-11-07 P7：hello 加了 syscall3（U1 两处）与 ring3 句柄读/close（U5 三处）。
 
 [unsafe-census]
-total = 355
-U1 = 59
+total = 364
+U1 = 65
 U2 = 97
 U3 = 13
 U4 = 127
-U5 = 28
+U5 = 31
 U6 = 31
 
 [modules."acpi"]
@@ -203,6 +208,19 @@ U5 = 6
 [modules."user/hello"]
 U1 = 12
 U5 = 22
+
+[modules."user/probe"]
+# W3 P5a（ADR-075）：第二个用户产物，真在 ring3 打 12/13/14。
+# U1 六处 = 五个 asm 现场（int 0x80 的四参入口、两处 RIP 相对 lea 取 .slots/.rodata 基址、
+# panic 与收尾的自跳转）加 `unsafe fn sys4` 的入口声明本身。指针来源：无（只动寄存器与号），
+# 上下文 USER_ENTRY，不变量由 ABI 约定（号 rax、参数 rdi/rsi/rdx/r10、返回 rax）保证。
+# **为什么用 lea 而不是 addr_of!**：镜像基址在 4 GiB 之上，relocation-model=static 下
+# 取静态量地址会退化成 R_X86_64_32S，链接期就 out of range（本轮实测撞到）。
+# U5 三处 = 往自己 .slots 的原子写（偏移 0..=48，结构 64 字节）、_start 的调用序列块、
+# 从 14 号返回的用户 VA 读回 8 字节（只读、长度落在同一页内、先判返回值非负才解引用）。
+# 生命周期 = 本进程；单任务访问无并发；分类规则本轮从写死 user/hello 改成认 user/ 前缀。
+U1 = 6
+U5 = 3
 
 [modules."virtio"]
 U4 = 10

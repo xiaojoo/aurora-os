@@ -1,6 +1,6 @@
 # ADR-075：每进程一份 AS、`thread_create`/`process_start` 与 `StartupInfo` 的内核回填
 
-状态：提议（2026-11-09，W3 P5 开工前草案；**本文只有设计，无实测读数**，落地时按 ADR-070/073/074 的同一办法回填）
+状态：提议（2026-11-09 起草；**P5a 已落地并回填读数**，见补记；P5b/P5c 仍是设计，未验证）
 关联：ADR-007（capability 与裁决 E）、ADR-027（释放推迟到"不是它"）、ADR-041/065（VA 保留表归 memory、定长 256）、
 ADR-044（环内边棘轮）、ADR-047 决策 2 / ADR-048 决策 3（持锁不跨未知回调、拿队列锁不等跨 CPU 的锁）、
 ADR-070（每进程一份 PML4、内核半区冻结、不做 PCID/KPTI）、ADR-071（等待与上限分开）、
@@ -152,6 +152,53 @@ HandleDesc  { role: u32, kind: u32, handle: u64 }
   所以这条约束不变，但要确认没有任何内核路径跳进它。
 - ADR-070 的 A1（内核半区逐项相等）**不受影响**：跳板在 boot 期就进了 `AS_KERNEL`，
   子 AS 复制的是同一批项；判据仍然逐位对照。
+
+## 补记：P5a 落地（第二个用户产物，2026-11-09，实测）
+
+决策 1 的第一刀已落地：`user/probe`（`aurora-user-probe`，bin 名 `probe`，26,264 字节，
+sha `929bb4598f0e`），基址 **0x100080000** 与 hello 的 0x100000000 错开（两者都在加载器窗口
+`[USER_VA_BASE, USER_MMAP_BASE)` 里 ⇒ 可以共存）。它真在 ring3 打 `abi_info` + 12/13/14，
+自己从映射读回比对，把七个结果写进 `.slots`；**不自己 exit**（退出即回收、槽就读不到了），
+由用例 `terminate_task` + 回收收场，走的是同一条 reap/revoke 路径。
+
+**读数**（run-of-record：矩阵与 bench 同一代码状态，normal ELF `3861ba5f6916`）：
+`check` **17/17**、`release` **符合**（sbom 三个成员）、矩阵 **45/45**、`handles` 档 ktests **81/81**、
+`bench` **4/4**（P4 地板 **0.17 %**、P1 同构建地板 **1908** 周期，`baselines/2026-11-09T14-16-33Z-p3p4.txt`）。
+```
+probe(P5a): 魔数=true ABI位=true 句柄=true 写=true VA=true 自读回=true
+            生效位=Some(user:true writable:true executable:false levels:4) 内核读回=true
+            收场=(drained true free116071->116071 va21->21 live0->0 vmo0->0) served=4
+```
+变异 **M10**（探针不打 14）⇒ `VA=false 自读回=false 生效位=None 内核读回=false`、`served=3`、failed=1，
+而收场格仍绿（VMO 与句柄照样归还）⇒ 红得很局部。
+
+### P5a 撞出来的三件事（都不在草案里）
+
+1. **旁观者终止不撤销句柄（真漏洞，已修）**。`terminate_task` 的"不在 CPU 上"分支就地
+   `release_owned`，而句柄撤销只在 `reap` 里做；就地释放之后袋子空了 ⇒ `reap` 的 `has_bag` 闸
+   把这一格跳过 ⇒ **句柄与它背后的 VMO/帧永远回不来**。第一版探针用例的收场格就是这么红的：
+   `live0->1 vmo0->1 free 少 2 帧`（留档 `.scratch/p5a-revoke-leak-evidence.log`）。
+   修法：在那个分支里、放掉 RUNQ 之后调 `revoke_task(task, dead_id)`（`id` 在锁内一并读出）。
+   自退出路径不变（还在跑就撤销会让它手上的句柄当场失效，所以留给 reap）。
+   **这条红→绿本身就是负样本**，不另造变异。
+2. **链接期陷阱：基址在 4 GiB 之上时 `addr_of!(静态量)` 会退化成 `R_X86_64_32S`**。
+   hello 的模块头记过这个坑，本轮实测又撞一次（`relocation out of range … references .rodata`）。
+   改用 **RIP 相对 `lea`** 取 `.slots`/`.rodata` 基址（`slots_base()`/`src_addr()`），两处 asm 进 U1 账。
+3. **`run` 不重建用户产物**：只有 `build`/`do_image` 会调 `do_build_user`/`do_build_probe`。
+   还原探针源码之后直接 `run`，镜像被判"新鲜"（内核 sha 没变，因为夹具没变）⇒ 跑的还是变异那份。
+   实测现场：还原后 `served=3`、ELF sha 与变异跑相同；先 `build` 再 `run` 才回到 `served=4`。
+   ⇒ **改了用户程序必须先 `build`**（这条对 hello 同样成立，是既有行为，本轮才撞明白）。
+
+### 登记面与规则改动
+
+- 新包进 `Cargo.toml` members、`crates.toml`（`crate.` 与 `license.pending.` 各一条）、
+   sbom 由 `release` 重生成（三个成员、外部 crate 仍 0）。
+- unsafe：新包 **U1 6 / U5 3**，总数 355 → **364**。**分类规则改了一处**：原来写死
+  `if module == "user/hello"`，新包会掉进 U2 兜底；改成 `module.starts_with("user/")`
+  （按"类别判错了改规则、不改登记数去凑"的口径）。`user/hello` 的 U1 12 / U5 22 **一格未变**。
+- **P5-0 留下的那一半证人本轮补上了**：登记之前 `check-unsafe` 报
+  `aurora-user-probe: 有 9 处含 unsafe 的行但未登记` ⇒ 证明普查范围真的覆盖新包，
+  不是只对既有的两个根生效。
 
 ## 备选方案
 

@@ -9,3 +9,7 @@ version = "0.0.0"
 [[package]]
 name = "aurora-user-hello"
 version = "0.0.0"
+
+[[package]]
+name = "aurora-user-probe"
+version = "0.0.0"

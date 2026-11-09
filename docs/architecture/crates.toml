@@ -12,6 +12,11 @@ crate.aurora-kernel = "aurora-kernel"
 # 登记它是为了让 §2.5 R10 的双向比对覆盖到"仓库里存在的包都必须有说明"这条。
 crate.aurora-user-hello = "aurora-user-hello"
 
+# W3 P5a（ADR-075 决策 1、Q8 裁决"不动 hello.elf"）：第二个用户产物。
+# 它是**第一个真在 ring3 打 VMO 三个号（12/13/14）的调用方**，走第二个内嵌夹具，
+# **不进签名链**（2026-11-09 裁决：签名包单载荷、余量只有 96 字节）。
+crate.aurora-user-probe = "aurora-user-probe"
+
 # ---------------------------------------------------------------- 许可证策略（§11.2 R10 / ADR-009b）
 #
 # 白名单与"登记过的留空"的唯一来源就在这里，`check-sbom` 直接读这两段。
@@ -29,3 +34,4 @@ license.allow[] = "MPL-2.0"
 
 license.pending.aurora-kernel = "ADR-009b 未定（发布许可证由安全委员会在 M9 前确定，手册 §11.2/§15.4）"
 license.pending.aurora-user-hello = "同上：它是内核的产物夹具，许可证随内核一起定"
+license.pending.aurora-user-probe = "同上：第二个用户产物夹具（W3 P5a），许可证随内核一起定"

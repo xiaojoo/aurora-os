@@ -11,6 +11,10 @@ use crate::{sched, tsc};
 /// 我手编不出来的形状。手编的字节只能证明"我读的位置和我写的位置一致"，
 /// 证明不了"我假设的那个形状真的存在"。
 pub(crate) static HELLO_ELF: &[u8] = include_bytes!("../../fixtures/hello.elf");
+/// 第二个用户产物（W3 P5a，ADR-075）：真在 ring3 打 12/13/14 的探针。
+/// 与 hello 一样由 `tools/aurora.py build` 现构建、只在字节变了时覆写；**不进签名链**。
+#[cfg(feature = "handles")]
+pub(crate) static PROBE_ELF: &[u8] = include_bytes!("../../fixtures/probe.elf");
 
 /// M4-2 第二段：把**真 ELF** 装进用户窗口并跑起来。
 ///

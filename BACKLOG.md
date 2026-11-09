@@ -5807,6 +5807,52 @@ P5 开工时按本文的清单动手，第一件事是把两个盲区补上并�
  cargo 不在位或网络锁被占时这道门会报红而不是跳过——这是有意的（宁可用例红，不要门禁空转），
  但它把"cargo 能不能跑"变成了 check 的前置条件，离线环境要注意。
 
+## 156. W3 P5a：第二个用户产物真在 ring3 打 12/13/14（ADR-075，2026-11-09，实测）
+
+**落地**：`user/probe`（`aurora-user-probe`，bin `probe`，26,264 字节，sha `929bb4598f0e`），
+基址 0x100080000 与 hello 错开（都在加载器窗口里 ⇒ 可共存）；`tools/aurora.py` 加第二套构建常量
+与 `do_build_probe()`（**不改 do_build_user**，那条打印与夹具路径被既有来路吃着）；
+`PROBE_ELF` 内嵌夹具（cfg handles）；新用例 `t_probe_ring3` 八格。
+**不进签名链**（§154 裁决），ESP/镜像/签名包一行未动。
+
+**读数**（矩阵与 bench 同一代码状态，normal ELF `3861ba5f6916`）：`check` **17/17**、`release` **符合**
+（sbom 三成员、外部 crate 仍 0）、矩阵 **45/45**、`handles` 档 ktests **81/81**、`bench` **4/4**
+（P4 地板 **0.17 %**、P1 同构建地板 **1908**、P3 min 716/312→205,526、P2 读 486/四次 1,810/DMA 44,310，
+`baselines/2026-11-09T14-16-33Z-p3p4.txt`）。四把尺子的构建都不带 handles ⇒ 探针用例不进这四跑。
+`probe(P5a): 魔数/ABI位/句柄/写/VA/自读回/内核读回 全 true，生效位 user+writable+!executable，
+收场=(drained true free116071->116071 va21->21 live0->0 vmo0->0) served=4`。
+变异 **M10**（探针不打 14）⇒ VA/自读回/生效位/内核读回四格红、served=3、failed=1，收场格仍绿。
+
+**本轮撞出来的三件事（详证据在 ADR-075 的 P5a 补记）**：
+1. **真漏洞：旁观者终止不撤销句柄**。`terminate_task` 的"不在 CPU 上"分支就地 `release_owned`，
+   而撤销只在 `reap` 里；就地释放后袋子空了 ⇒ `reap` 的 `has_bag` 闸跳过这一格 ⇒
+   句柄与它背后的 VMO/帧永远回不来。第一版收场格红在 `live0->1 vmo0->1 free 少 2 帧`
+   （`.scratch/p5a-revoke-leak-evidence.log`）。修法：该分支放掉 RUNQ 之后调 `revoke_task(task, dead_id)`。
+   自退出路径不变（还在跑就撤销会让它手上句柄当场失效）。**这条红→绿就是负样本**。
+   它今天才暴露，是因为在 P4 之前句柄只持文件游标、不持帧，漏了也看不出帧数差。
+2. **链接期陷阱**：基址在 4 GiB 之上时 `addr_of!(静态量)` 退化成 `R_X86_64_32S` ⇒ out of range。
+   改用 RIP 相对 `lea` 取 `.slots`/`.rodata` 基址（hello 的模块头记过同一个坑）。
+3. **`run` 不重建用户产物**：只有 `build`/`do_image` 调 `do_build_user`/`do_build_probe`。
+   还原探针源码后直接 `run`，镜像被判新鲜（内核 sha 没变，因为夹具没变）⇒ 跑的还是变异那份
+   （实测 served=3、ELF sha 与变异跑相同）；先 `build` 再 `run` 才回到 served=4。
+   ⇒ **改了用户程序必须先 build**，这条对 hello 同样成立。
+
+**登记面与一处规则改动**：members + `crates.toml`（crate. 与 license.pending. 各一条）+ sbom 重生成；
+unsafe 新包 **U1 6 / U5 3**、总数 355 → **364**；分类规则从写死 `module == "user/hello"` 改成
+`module.starts_with("user/")`（新包否则掉进 U2 兜底）——**改规则不改登记数去凑**，
+`user/hello` 的 U1 12 / U5 22 一格未变。**P5-0 留的那一半证人本轮补上**：登记前 check-unsafe 报
+`aurora-user-probe: 有 9 处含 unsafe 的行但未登记` ⇒ 普查范围真的覆盖新包。
+
+**没做的**：P5b（每进程 AS 接进换人路径、跳板搬内核半区）与 P5c（四种 kind + 11/15/16 + StartupInfo）；
+探针的宿主机侧独立对账（今天第二台仪器是 `mm::effective_flags` 与内核侧再读一遍映射，
+**不是宿主机解析 probe.elf**）——要加矩阵行的话得同轮改 tools 的 rows/logs 两块，留给 P5c 一起做；
+ADR-075 未决 3–7 五条仍未裁。
+
+**新发现的风险**：①探针不自己 exit，所以"自退出 ⇒ 撤销"这条路径今天仍只由 `t_handle_reap` 覆盖，
+两条路径要各自有证人；②第二套构建常量是显式复制的，将来第三个产物出现时要不要抽成表驱动，
+按"有没有第三个真实调用者"再定（硬约束 2）；③`release` 会重建镜像并跑复现性检查，
+它写 `docs/release/sbom.json` 与镜像摘要 ⇒ 新增成员那一轮必须跑它，否则 check-sbom 红。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

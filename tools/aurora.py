@@ -137,8 +137,40 @@ def do_build_user() -> Path:
     return FIXTURE
 
 
+# 第二个用户程序（W3 P5a，ADR-075 决策 1）：与 hello 平行的第二套常量。
+# 刻意**不**把 do_build_user 改成表驱动：那条函数的打印与夹具路径被既有判据与日志来路吃着，
+# 两份显式常量比一个"通用产物构建器"更容易核对（AGENTS.md 硬约束 2 的同一条口径）。
+# 它**不进签名链**（2026-11-09 裁决）：签名包单载荷、余量 96 字节，这个产物走第二个内嵌夹具。
+PROBE_PKG = "aurora-user-probe"
+PROBE_ELF = ROOT / "target" / TARGET / "debug" / "probe"
+PROBE_FIXTURE = ROOT / "kernel" / "fixtures" / "probe.elf"
+PROBE_RUSTFLAGS = "-C link-arg=-Tuser/probe/link.ld -C relocation-model=static -C panic=abort -C opt-level=1"
+
+
+def do_build_probe() -> Path:
+    r = subprocess.run(
+        [str(CARGO), "build", "--target", TARGET, "-p", PROBE_PKG],
+        capture_output=True, text=True, cwd=str(ROOT),
+        env={**env(), "RUSTFLAGS": PROBE_RUSTFLAGS},
+    )
+    if r.returncode != 0:
+        sys.exit("探针程序构建失败：" + (r.stdout + r.stderr)[-2000:])
+    data = PROBE_ELF.read_bytes()
+    PROBE_FIXTURE.parent.mkdir(exist_ok=True)
+    # 与 hello 同一条纪律：只在字节真变了时才覆写，否则 include_bytes! 的 mtime 依赖
+    # 会让内核每次全量重编，"增量构建"静默失效。
+    changed = not PROBE_FIXTURE.exists() or PROBE_FIXTURE.read_bytes() != data
+    if changed:
+        PROBE_FIXTURE.write_bytes(data)
+    import hashlib
+    print(f"探针程序: {PROBE_FIXTURE.relative_to(ROOT)}  {len(data)} 字节  "
+          f"sha256={hashlib.sha256(data).hexdigest()[:12]} {'（夹具已更新）' if changed else '（与夹具一致）'}")
+    return PROBE_FIXTURE
+
+
 def do_build(features: list[str]) -> Path:
     do_build_user()
+    do_build_probe()
     elf = kernel_binary(features)
     print(f"内核: {elf}  ({elf.stat().st_size} 字节)")
     return elf
@@ -2340,7 +2372,10 @@ def _classify_unsafe(kind: str, text: str, module: str, fn: str,
         return "U4"
     if module in ("crash", "ktest"):
         return "U6"
-    if module == "user/hello":
+    # 用户态成员包一律按"入口声明 = U1、其余 = 用户指针 U5"归类。
+    # **不写死 user/hello**（P5a 实测：新包 user/probe 掉进 U2 兜底，而它做的是 syscall 跨界
+    # 与读自己映射的用户页，语义就是 U1/U5）。这是改规则，不是改登记数去凑。
+    if module.startswith("user/"):
         return "U1" if kind == "fn" else "U5"
     if module == "driver" and any(k in text for k in ("read_volatile", "write_volatile", "write_bytes")):
         return "U3"

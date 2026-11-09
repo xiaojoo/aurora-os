@@ -228,7 +228,7 @@ pub fn terminate_task(task: usize) -> bool {
         return false;
     }
     let cpu = cpu_of(task);
-    let (slot, on_cpu_now, has_bag, was_blocked) = {
+    let (slot, on_cpu_now, has_bag, was_blocked, dead_id) = {
         let mut s = rq(cpu);
         let slot = slot_of(task);
         if s.tasks[slot].state == TaskState::Free {
@@ -247,7 +247,7 @@ pub fn terminate_task(task: usize) -> bool {
         // **别人的**进程线程计数减一次——那个进程就永远等不到结局。
         s.tasks[slot].proc_id = crate::proc::NO_PROC;
         s.entries[slot] = None;
-        (slot, s.current == task, s.tasks[slot].owned.n > 0, was_blocked)
+        (slot, s.current == task, s.tasks[slot].owned.n > 0, was_blocked, s.tasks[slot].id)
     };
     // P7b（欠账⑥）：阻塞着的任务还占着**两份注册**——等待链上的 waiter 与定时器轮里的项。
     // 只改任务槽的话这两份永久留着：槽会被 spawn 复用，而注册认的是槽下标，
@@ -267,10 +267,19 @@ pub fn terminate_task(task: usize) -> bool {
     if on_cpu_now {
         // 正在 CPU 上：等下一次抢占点换下去（`mark_need` 由调用方负责，
         // SYS_EXIT 的路径会立刻立牌；旁观者路径靠本 CPU 的下一次 tick）。
+        // 句柄撤销留给 `reap`：它此刻还在跑，撤销会让它手上的句柄当场失效。
         REAP_PENDING[cpu].fetch_add(1, Ordering::AcqRel);
-    } else if has_bag {
-        // 已经不在 CPU 上了，就地回收安全
-        release_owned(cpu, slot);
+    } else {
+        // 已经不在 CPU 上了，就地回收安全。**句柄也要在这里撤销**（W3 P5a 实测撞出来的漏洞）：
+        // 撤销原来只在 `reap` 里做，而这条路径就地 release_owned 之后袋子空了 ⇒
+        // `reap` 的 `has_bag` 闸把这一格跳过 ⇒ 句柄与它背后的 VMO/帧永远回不来。
+        // 现场：probe 用例收场格 `live0->1 vmo0->1 free 少 2 帧`。
+        // 放在放掉 RUNQ 之后：revoke_task 取 HANDLE(35)、其 VMO 归还在锁外取 VMM(20)。
+        #[cfg(feature = "handles")]
+        crate::handle::revoke_task(task, dead_id);
+        if has_bag {
+            release_owned(cpu, slot);
+        }
     }
     true
 }

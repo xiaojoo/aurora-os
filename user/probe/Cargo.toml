@@ -1,0 +1,18 @@
+[package]
+name = "aurora-user-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# 第二个用户程序（W3 P5a，ADR-075 决策 1 的第一刀、Q8 裁决"不动 hello.elf"）。
+# 它的角色是**第一个真在 ring3 打 VMO 三个号的调用方**：12 vmo_create / 13 vmo_write / 14 aspace_map。
+# 与 hello 一样不是普通成员：另一个链接脚本、另一个入口、永远不该被宿主 cargo test 编译，
+# 构建入口只有 python tools/aurora.py（它给这个包单独传 RUSTFLAGS）。
+# **不进签名链**（2026-11-09 裁决）：签名包是单载荷单包固定 LBA，载荷余量只有 96 字节；
+# 这个产物走第二个内嵌夹具（include_bytes!），ESP/镜像/签名包一行不动。
+[[bin]]
+name = "probe"
+path = "src/main.rs"
+
+[lints]
+workspace = true

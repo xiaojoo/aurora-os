@@ -571,4 +571,127 @@ fn t_elf_load_run() -> bool {
     roundtrip_ok
 }
 ktest!(KT_ELF_LOAD, t_elf_load_run);
+// ---- ADR-075（W3 P5a）第二个用户产物：真在 ring3 打 12/13/14 ----
+//
+// 与 `t_elf_load_run` 的分工：那条证"容器 → 页表 → ring3"这段路（用 hello），
+// 这条证**用户态自己调 VMO 三个号并读回映射**（用 probe）。两份容器基址错开
+// （hello 0x100000000 / probe 0x100080000，都在加载器窗口里），所以可以共存。
+// 八格：①魔数到位 ②ABI 的 F_VMO 位 ③12 的句柄形状 ④13 的字节数 ⑤14 的 VA 落在动态区
+// ⑥探针自己读回一致 ⑦生效位是第二台仪器 ⑧收场之后句柄/VMO/帧/VA 全回基线。
+// 变异：M10 探针不打 14 ⇒ ⑤⑥⑦红；M11 内核不回填/不映射 ⇒ ⑥红；
+// M12 新包的 unsafe 不登记 ⇒ check-unsafe 红（这条同时补 P5-0 留下的那一半证人）。
 
+/// 与 `user/probe/src/main.rs` 独立声明的同一组常量（两侧各写一遍，靠读回对账）。
+#[cfg(feature = "handles")]
+const PROBE_MAGIC: u64 = 0xa5a5_5a5a_8765_4321;
+#[cfg(feature = "handles")]
+const PROBE_OFF_ABI: u64 = 8;
+#[cfg(feature = "handles")]
+const PROBE_OFF_HANDLE: u64 = 16;
+#[cfg(feature = "handles")]
+const PROBE_OFF_WRITTEN: u64 = 24;
+#[cfg(feature = "handles")]
+const PROBE_OFF_MAP_VA: u64 = 32;
+#[cfg(feature = "handles")]
+const PROBE_OFF_READBACK: u64 = 40;
+#[cfg(feature = "handles")]
+const PROBE_OFF_DONE: u64 = 48;
+#[cfg(feature = "handles")]
+const PROBE_PATTERN: [u8; 8] = [0x5A, 0xA5, 1, 2, 3, 4, 5, 6];
+/// 探针这一版会打的调用数：abi_info + vmo_create + vmo_write + aspace_map = 4。
+/// 等的是"打完"而不是"开始打了"（与 `P7_CALLS` 同一条纪律）。
+#[cfg(feature = "handles")]
+const PROBE_CALLS: u64 = 4;
+
+#[cfg(feature = "handles")]
+fn t_probe_ring3() -> bool {
+    use crate::ktests::common::PROBE_ELF;
+    let Some(s) = acpi::summary() else { return false };
+    let Some(m) = s.madt else { return false };
+    if apic::get_or_init(&m).is_err() {
+        crate::log_fatal!("probe: APIC 起不来，跑不了时间片");
+        return false;
+    }
+    let f0 = mm::free_frames();
+    let va0 = mm::reservation_count();
+    let lv0 = crate::handle::live();
+    let v0 = crate::vmo::vmo_count();
+    let loaded = match user::load(PROBE_ELF) {
+        Ok(l) => l,
+        Err(e) => {
+            crate::log_fatal!("probe: 加载失败 —— {}", user::describe_load(e));
+            return false;
+        }
+    };
+    crate::log_info!(
+        "probe: segs={} pages={} entry={:#x} data={:#x} stack_top={:#x} 夹具={}B",
+        loaded.segs, loaded.pages, loaded.entry, loaded.data_va, loaded.stack_top, PROBE_ELF.len());
+    sched::init_boot_task();
+    sched::start_workers();
+    user::clear_counters();
+    let t = match sched::spawn_user(loaded.entry, loaded.stack_top, loaded.owned) {
+        Ok(t) => t,
+        Err(e) => { crate::log_fatal!("probe: spawn_user 失败 {:?}", e); return false; }
+    };
+    apic::timer_start().ok();
+    // 窗口内只让任务跑 + 读内核自己的计数器；**读用户页必须在窗口之外**（SMAP，
+    // 与 t_elf_load_run 同一条纪律：开着 AC 的那几行里不许有中断）。
+    let mut served = 0u64;
+    apic::with_interrupts(|| {
+        let t0 = tsc::now();
+        while user::served() < PROBE_CALLS && tsc::now().wrapping_sub(t0) < 300_000_000 {
+            tsc::spin(20_000);
+        }
+        served = user::served();
+        // 写完第四个槽之后还要读回映射再写两格，给一小段落地时间
+        tsc::spin(2_000_000);
+        if !sched::wait_for_boot_task(300_000_000) {
+            crate::log_fatal!("probe: 窗口收不了场（启动上下文没回到 CPU）");
+        }
+    });
+    apic::timer_stop().ok();
+    let slot = |off: u64| user::read_at(loaded.data_va + off).unwrap_or(u64::MAX);
+    let magic = slot(0);
+    let abi = slot(PROBE_OFF_ABI);
+    let h = slot(PROBE_OFF_HANDLE);
+    let n = slot(PROBE_OFF_WRITTEN);
+    let mva = slot(PROBE_OFF_MAP_VA);
+    let readback = slot(PROBE_OFF_READBACK);
+    let done = slot(PROBE_OFF_DONE);
+    let magic_ok = magic == PROBE_MAGIC;
+    let abi_ok = abi & crate::user::F_VMO != 0;
+    // 句柄形状由宿主机/内核各自拆：slot < 16、gen != 0（负数是错误码， unpack 会拒）
+    let handle_ok = crate::handle::Handle(h).unpack().is_some();
+    let write_ok = n == 8;
+    let va_ok = (mva as i64) > 0
+        && mva >= mm::USER_MMAP_BASE && mva < mm::USER_VA_TOP
+        && (mva & (mm::PAGE as u64 - 1)) == 0;
+    // 第二台仪器：生效位（整条链相与之后的结果），不是加载器/映射入口"打算给什么"
+    let eff = mm::effective_flags(mva);
+    let eff_ok = eff.is_some_and(|f| f.user && f.writable && !f.executable);
+    // 内核侧再独立读一遍映射内容：与探针自己读回的那一格互为两台仪器
+    let mut back = [0u8; 8];
+    let kernel_read = user::copy_from_user(mva, &mut back) == Ok(8) && back == PROBE_PATTERN;
+    let run_ok = magic_ok && abi_ok && handle_ok && write_ok && va_ok && readback == 1 && done == 1;
+    // 收场：终止任务 → 回收（reap 里 revoke_task 关句柄、句柄两段式还 VMO、资源袋还映射）
+    let rel0 = sched::reap_released();
+    let _ = sched::terminate_task(t);
+    let drained = sched::reap_released() > rel0 || crate::ktests::common::drain_reap();
+    let f1 = mm::free_frames();
+    let va1 = mm::reservation_count();
+    let base_ok = drained && f1 == f0 && va1 == va0
+        && crate::handle::live() == lv0 && crate::vmo::vmo_count() == v0;
+    crate::log_info!(
+        "probe(P5a): 魔数={} ABI位={} 句柄={} 写={} VA={} 自读回={} 生效位={:?} 内核读回={} 收场=(drained{} free{}->{} va{}->{} live{}->{} vmo{}->{}) served={}",
+        magic_ok, abi_ok, handle_ok, write_ok, va_ok, readback == 1, eff, kernel_read,
+        drained, f0, f1, va0, va1, lv0, crate::handle::live(), v0, crate::vmo::vmo_count(), served);
+    let ok = run_ok && eff_ok && kernel_read && base_ok;
+    if !ok {
+        crate::log_fatal!(
+            "probe: 判据不成立 跑={} 生效位={} 内核读回={} 收场={} 原始=[magic={:#x} abi={:#x} h={:#x} n={} va={:#x} rb={} done={}]",
+            run_ok, eff_ok, kernel_read, base_ok, magic, abi, h, n, mva, readback, done);
+    }
+    ok
+}
+#[cfg(feature = "handles")]
+crate::ktest!(KT_PROBE_RING3, t_probe_ring3);

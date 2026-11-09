@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["kernel", "user/hello"]
+members = ["kernel", "user/hello", "user/probe"]
 
 # 垂直切片阶段只有 kernel 一个 crate。§2.5 的 api/impl 拆分等第一个真实
 # 实现出现后再展开，避免"先造空壳再填肉"（Sandi Metz：错误的抽象比重复更贵）。
