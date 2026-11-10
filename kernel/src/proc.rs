@@ -38,6 +38,9 @@ pub enum ProcError {
     /// 状态不允许：子 Job 放大额度、收还在跑的进程、销毁名下还有进程的 Job。
     Denied,
     QuotaProcs,
+    /// 页额度用尽（P6b 余下：`used_pages + n > max_pages`）。与 `QuotaProcs` 分开，
+    /// 因为"进程数满"与"页数满"是两条不同的额度，判据要能分辨是哪一条拒的。
+    QuotaPages,
     NoSuchProc,
     /// 想往一个已进入终止态的进程上挂线程。
     AlreadyTerminated,
@@ -54,8 +57,14 @@ struct JobEntry {
     /// 这一位是"句柄不能指着别人新造的 Job"的唯一凭据，`used` 单独不够。
     gen: u32,
     max_procs: u32,
-    /// 只参与收窄检查，用量计量在 P4（见模块头）。
+    /// 页额度上限。子 Job 只能收窄（Q7），用量计量见 `used_pages`。
     max_pages: u64,
+    /// **已记账的页数**（P6b 余下）。记的是"铺进本 Job 名下某个进程 AS 的映射页数"：
+    /// 记账点在 `user.rs` 的 14 号（映射成功之后），退账点在 `sched` 的释放路径
+    /// （`release_owned` / `own_current` 满而丢弃）——**退还故意不放 mm**：
+    /// `AspaceMapping::drop` 在 `memory` 模块里，让它调 `proc` 就是 `memory → sched` 的新边，
+    /// 而 `sched → memory` 已存在 ⇒ 会把 `sched` 拖进冻结的核心环（P5c-1 实测过同形状）。
+    used_pages: u64,
     used_procs: u32,
 }
 
@@ -80,6 +89,7 @@ const JOB_EMPTY: JobEntry = JobEntry {
     gen: 0,
     max_procs: 0,
     max_pages: 0,
+    used_pages: 0,
     used_procs: 0,
 };
 
@@ -150,6 +160,7 @@ pub fn job_create(parent: Option<u16>, max_procs: u32, max_pages: u64) -> Result
             gen: s.jobs[slot].gen.wrapping_add(1),
             max_procs,
             max_pages,
+            used_pages: 0,
             used_procs: 0,
         };
         Ok(slot as u16)
@@ -429,6 +440,60 @@ pub fn job_used_procs(job: u16) -> Option<u32> {
             return None;
         }
         Some(j.used_procs)
+    })
+}
+
+/// 给 Job 记 `n` 页用量；超上限就拒（**不记**）。调用方在映射成功之后调它，
+/// 拒了就要把那份映射丢掉（14 号那条路自己 drop，不进资源袋）。
+pub fn job_charge_pages(job: u16, n: u64) -> Result<(), ProcError> {
+    mm::with_vmm_lock(|| {
+        let s = st();
+        let j = s.jobs.get_mut(job as usize).ok_or(ProcError::NoSuchJob)?;
+        if !alive_flag(&j.used) {
+            return Err(ProcError::NoSuchJob);
+        }
+        if j.used_pages.saturating_add(n) > j.max_pages {
+            return Err(ProcError::QuotaPages);
+        }
+        j.used_pages += n;
+        Ok(())
+    })
+}
+
+/// 退账（映射被释放时）。**饱和减**：退多了不该把用量变成天文数字，
+/// 而"退多了"本身是调用方的账错了，由判据去抓，不在这里升故障。
+pub fn job_refund_pages(job: u16, n: u64) {
+    let _ = mm::with_vmm_lock(|| {
+        let s = st();
+        if let Some(j) = s.jobs.get_mut(job as usize) {
+            if alive_flag(&j.used) {
+                j.used_pages = j.used_pages.saturating_sub(n);
+            }
+        }
+    });
+}
+
+/// 当前已记账的页数（判据用）。Job 不在返回 None。
+pub fn job_used_pages(job: u16) -> Option<u64> {
+    mm::with_vmm_lock(|| {
+        let j = st().jobs.get(job as usize)?;
+        if !alive_flag(&j.used) {
+            return None;
+        }
+        Some(j.used_pages)
+    })
+}
+
+/// 这张 AS 属于哪个 Job（扫 4 格进程表认 `aspace` 槽号）。找不到返回 None——
+/// 内核自己的 AS、用例自建的 AS 都不属于任何 Job，那些映射本来就不记账。
+/// **认的是槽号而不是世代**：调用方（释放路径）手里只有 `AspaceMapping::as_slot()`，
+/// 而槽号复用之后旧映射早该被丢掉了（ADR-074 的契约顺序），所以这里不会退错账；
+/// 真出现"AS 已销毁但映射还在"的反序，`job_of_aspace` 返回 None ⇒ 不退 ⇒ 用量偏高，
+/// 那是**保守方向**（额度只会更紧，不会放宽），由收场判据去抓。
+pub fn job_of_aspace(as_slot: u8) -> Option<u16> {
+    mm::with_vmm_lock(|| {
+        let s = st();
+        s.procs.iter().find(|p| alive_flag(&p.used) && p.aspace == as_slot).map(|p| p.job)
     })
 }
 

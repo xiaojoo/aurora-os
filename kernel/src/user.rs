@@ -392,13 +392,26 @@ fn sys_aspace_map(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
         None => crate::vmo::vmo_map_self(id, va, flags),
         Some(s) => crate::vmo::vmo_map_slot(id, s, va, flags),
     };
-    let m = match m {
+    let mut m = match m {
         Ok(m) => m,
         Err(_) => {
             mm::release_va(va.0);
             return E_EXHAUSTED;
         }
     };
+    // **页额度记账（P6b 余下，Q7 的第二项）**：只有铺进"某个进程名下的 AS"才记，
+    // 内核自己的 AS 与用例自建的 AS 不属于任何 Job ⇒ 不记。记账在映射成功之后：
+    // 额度不够就把这份映射当场丢掉（还没进资源袋，所以直接 drop 是安全的，不持锁），
+    // 并把刚登记的 VA 还回去 ⇒ 失败不留半截。
+    if let Some(s) = as_slot {
+        if let Some(job) = crate::proc::job_of_aspace(s) {
+            if crate::proc::job_charge_pages(job, m.pages() as u64).is_err() {
+                drop(m);
+                mm::release_va(va.0);
+                return E_EXHAUSTED;
+            }
+        }
+    }
     match crate::sched::own_current(crate::sched::OwnedItem::AsMap(m)) {
         Ok(()) => va.0,
         // 袋子满了：own_current 会**先放 RUNQ 再 drop**，映射与 VA 都由那个 Drop 还掉

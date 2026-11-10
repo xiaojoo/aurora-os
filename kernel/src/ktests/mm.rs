@@ -1855,8 +1855,8 @@ ktest!(KT_HANDLE_TRANSFER, t_handle_transfer);
 // 本刀证的是"回填完才放它跑、首参确实是那一页的 VA"，**子进程真读真用那一格留给 c-3b 的探针**。
 
 #[cfg(feature = "handles")]
-static PROC_SYS: [core::sync::atomic::AtomicU64; 28] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; 28];
+static PROC_SYS: [core::sync::atomic::AtomicU64; 32] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 32];
 
 #[cfg(feature = "handles")]
 fn proc_sys_worker() -> ! {
@@ -1975,6 +1975,35 @@ fn proc_sys_worker() -> ! {
     syscall_dispatch(&mut f);
     put(18, f.rax);
 
+    // 页额度：三页（代码/数据兼栈/StartupInfo）都铺进了这个 Job 名下进程的 AS ⇒ 应当记 3
+    put(28, proc::job_used_pages(job).unwrap_or(u64::MAX));
+    // 超额必须拒：另造一个 max_pages=1 的 Job，往它名下进程的 AS 铺一个**两页**的对象
+    let job2 = match proc::job_create(None, 1, 1) { Ok(v) => v, Err(_) => bail(20) };
+    let p3 = match proc::proc_create(job2) { Ok(v) => v, Err(_) => bail(21) };
+    let (as3, ag3) = match mm::aspace_new_kernel() { Some(v) => v, None => bail(22) };
+    if proc::proc_set_aspace(p3, as3, ag3).is_err() { bail(23) }
+    let g3 = proc::proc_gen(p3).unwrap_or(0);
+    let hp3 = match handle::grant_proc(owner, p3, g3, handle::RIGHT_READ | handle::RIGHT_MAP) {
+        Ok(h) => h, Err(_) => bail(24),
+    };
+    let v2 = match vmo::vmo_create(2) { Ok(v) => v, Err(_) => bail(25) };
+    let hv2 = match handle::grant_vmo(owner, v2, handle::RIGHT_READ | handle::RIGHT_MAP) {
+        Ok(h) => h, Err(_) => bail(26),
+    };
+    vmo::vmo_unref(v2);
+    f.rax = SYS_ASPACE_MAP;
+    f.rdi = hv2.0;
+    f.rsi = 1;
+    f.rdx = hp3.0;
+    f.r10 = 0x3_8000_0000;
+    syscall_dispatch(&mut f);
+    put(29, f.rax);
+    put(30, proc::job_used_pages(job2).unwrap_or(u64::MAX));
+    let _ = handle::close(hv2, owner);
+    let _ = handle::close(hp3, owner);
+    let _ = proc::proc_discard(p3);
+    let _ = proc::job_destroy(job2);
+
     // 读回内核回填的东西（第二台仪器：内核自己再读一遍那一页）
     let mut nh = [0u8; 4];
     let nh_ok = vmo::vmo_read(si, SI_OFF_NHANDLES, &mut nh) == Ok(4);
@@ -2023,6 +2052,8 @@ fn proc_sys_worker() -> ! {
     f.r10 = 0;
     syscall_dispatch(&mut f);
     put(27, f.rax);
+    // 子线程被 18 号收掉 ⇒ release_owned 退账 ⇒ 这个 Job 的用量必须回 0
+    put(31, proc::job_used_pages(job).unwrap_or(u64::MAX));
     let _ = handle::close(hc, owner);
     let _ = handle::close(hs, owner);
     let _ = handle::close(hi, owner);
@@ -2063,7 +2094,7 @@ fn t_process_startup() -> bool {
     let _ = sched::terminate_task(g);
     let drained = sched::reap_released() > rel0 || drain_reap();
     if !was_running { apic::timer_stop().ok(); }
-    let r: [u64; 28] = core::array::from_fn(|i| PROC_SYS[i].load(core::sync::atomic::Ordering::Acquire));
+    let r: [u64; 32] = core::array::from_fn(|i| PROC_SYS[i].load(core::sync::atomic::Ordering::Acquire));
     if r[25] != 0 {
         crate::log_fatal!("psys: 工人半路退场 code={} 原始={:?}", r[25], r);
         return false;
@@ -2084,22 +2115,25 @@ fn t_process_startup() -> bool {
     // D3：转移之后父进程那个旧 Job 句柄必须 Stale，而且计数对得上
     let stale_ok = r[26] == 1 && handle::counters().stale > c0.stale;
     let kill_ok = r[27] == 1;
+    // 页额度三格：记满 3、超额拒且用量不涨、子线程死后退干净
+    let quota_ok = r[28] == 3 && r[29] == crate::user::E_EXHAUSTED && r[30] == 0 && r[31] == 0;
     let base_ok = drained && disc && jdel && handle::live() == 0 && vmo::vmo_count() == 0
         && mm::free_frames() == f0 && mm::reservation_count() == va0
         && mm::aspace_count() == 0 && proc::proc_residual().0 == 0 && proc::job_residual().0 == 0;
     crate::log_info!(
-        "psys(P5c-3): 无CREATE拒={} Proc句柄={} 14的Proc别名={} 15停住=(未映射拒{} 句柄{} Blocked{} runs{}) 形状拒且不转移={} 16=(ret{} nhandles{} 新值{:#x} kind{} 三角色{}) 首参={} 放行={} Stale计数={} 18杀={} 收场=(drained{} disc{} jdel{} live{} vmo{} free{}->{} va{}->{} as{})",
+        "psys(P5c-3): 无CREATE拒={} Proc句柄={} 14的Proc别名={} 15停住=(未映射拒{} 句柄{} Blocked{} runs{}) 形状拒且不转移={} 16=(ret{} nhandles{} 新值{:#x} kind{} 三角色{}) 首参={} 放行={} Stale计数={} 18杀={} 页额度=(记{} 超额拒{:#x} 拒后用量{} 退后{}) 收场=(drained{} disc{} jdel{} live{} vmo{} free{}->{} va{}->{} as{})",
         r[5] == crate::user::E_DENIED, handle::Handle(r[6]).unpack().is_some(), alias_ok,
         r[10] == crate::user::E_INVALID, handle::Handle(r[11]).unpack().is_some(), r[14], r[15],
         shape_ok, r[18], r[19], r[20], r[21], r[22], r[23] == r[9], r[24], stale_ok, r[27],
+        r[28], r[29], r[30], r[31],
         drained, disc, jdel, handle::live(), vmo::vmo_count(), f0, mm::free_frames(),
         va0, mm::reservation_count(), mm::aspace_count());
     let ok = waited && create_ok && alias_ok && thread_ok && shape_ok && start_ok && arg_ok
-        && stale_ok && kill_ok && base_ok;
+        && stale_ok && kill_ok && quota_ok && base_ok;
     if !ok {
         crate::log_fatal!(
-            "psys: 判据不成立 等={} 造={} 别名={} 线程={} 形状={} 启动={} 首参={} Stale={} 18杀={} 收场={} 原始={:?}",
-            waited, create_ok, alias_ok, thread_ok, shape_ok, start_ok, arg_ok, stale_ok, kill_ok, base_ok, r);
+            "psys: 判据不成立 等={} 造={} 别名={} 线程={} 形状={} 启动={} 首参={} Stale={} 18杀={} 页额度={} 收场={} 原始={:?}",
+            waited, create_ok, alias_ok, thread_ok, shape_ok, start_ok, arg_ok, stale_ok, kill_ok, quota_ok, base_ok, r);
     }
     let _ = cpu::self_slot();
     ok

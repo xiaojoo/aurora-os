@@ -311,6 +311,20 @@ pub fn terminate_task(task: usize) -> bool {
 }
 
 /// 释放某个槽位名下的映射。**调用前必须确认这个槽位不在本 CPU 上运行**。
+/// 退一份共享映射的页额度账（P6b 余下）。**只在放锁之后调**：它要取 VMM（proc 表在那里），
+/// 而调用点分别是 `release_owned`（已放 RUNQ）与 `own_current` 的满而丢弃分支（已 drop 守卫）。
+/// 退账故意放在 sched 而不是 mm：`AspaceMapping::drop` 在 memory 模块里，让它调 proc
+/// 就是 `memory → sched` 的新边，会把 sched 拖进冻结的核心环（P5c-1 实测过同形状）。
+fn refund_asmap(it: &OwnedItem) {
+    if let OwnedItem::AsMap(m) = it {
+        if let Some(slot) = m.as_slot() {
+            if let Some(job) = crate::proc::job_of_aspace(slot) {
+                crate::proc::job_refund_pages(job, m.pages() as u64);
+            }
+        }
+    }
+}
+
 fn release_owned(cpu: usize, slot: usize) {
     // 一次持锁把"取走计数 + 把映射搬出槽位"做完（原来分两次，每次都要重取队列锁）。
     // `drop(bag)` 仍旧留在锁外——那才是真正可能阻塞的一步，合并取锁不能把它带进来。
@@ -333,6 +347,12 @@ fn release_owned(cpu: usize, slot: usize) {
     // 把映射从槽位里搬出来再 drop：不能在持有队列句柄的时候逐个 drop，
     // 因为 `Mapping::drop` 要拿 VMM 锁、可能等 shootdown 回执——
     // 拿着队列去等一把跨 CPU 的锁，等于把两条不变量绑在一起（ADR-048 决策 3）。
+    // 退页额度账也在这里（已放 RUNQ）：drop 之后 AS 可能已被销毁，就找不到 Job 了。
+    for it in bag.items.iter().take(bag.n) {
+        if let Some(it) = it {
+            refund_asmap(it);
+        }
+    }
     drop(bag);
     if released > 0 {
         REAP_RELEASED.fetch_add(released as u64, Ordering::Relaxed);
@@ -1979,6 +1999,7 @@ pub fn own_current(item: OwnedItem) -> Result<(), mm::MmError> {
     let mut s = my_rq();
     if s.tasks[slot_of(me)].owned.count() >= MAX_OWNED {
         drop(s);
+        refund_asmap(&item); // 已放 RUNQ 才退账（它要取 VMM）
         drop(item);
         return Err(mm::MmError::Unsupported);
     }
