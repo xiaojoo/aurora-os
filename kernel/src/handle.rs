@@ -21,7 +21,7 @@
 //! （`spawn` 找 Free 槽而退出当场就标 Free，见设计 §2.2）。
 
 use crate::filesystem::fat32::{FileCursor, FsError};
-use crate::filesystem::vfs::{AhciDisk, Block};
+use crate::filesystem::vfs::{AhciDisk, Block, Partition, PartitionView};
 use crate::sync::{IrqSpinLock, RANK_HANDLE};
 
 pub const MAX_HANDLES: usize = 16;
@@ -109,6 +109,11 @@ impl HErr {
 #[derive(Clone, Copy)]
 pub struct FileObj {
     pub port: u8,
+    /// 分区区间；`None` = 整盘（既有语义）。**它是身份的一部分**（S2b，ADR-077 补记）：
+    /// 同一个口、同一个文件名，两个不同区间是**两个对象**，读出来的字节可以不同。
+    /// 为什么必须进身份而不是只活在打开那一刻：`read` 是**按表项重建块设备**的
+    /// （见下面 `read`），表项里不带区间就只能重建出整盘 ⇒ 偏移在第一次读之后就丢了。
+    pub part: Option<Partition>,
     pub cursor: FileCursor,
 }
 
@@ -241,11 +246,23 @@ fn insert(t: &mut Table, owner: (usize, u32), rights: u32, obj: ObjRef) -> Resul
     Ok(Handle::pack(slot as u16, next))
 }
 
-/// 给一次打开好的文件发句柄。`cursor` 由调用方先 `mount`/`open_cursor` 得到——
+/// 给一次打开好的文件发句柄（**整盘**）。`cursor` 由调用方先 `mount`/`open_cursor` 得到——
 /// 表里存的是**值**（C1：`port + Bpb + FileStat + 游标`），不存 `Volume` 的借用。
 pub fn grant_file(owner: (usize, u32), port: u8, cursor: FileCursor, rights: u32) -> Result<Handle, HErr> {
+    grant_file_at(owner, port, None, cursor, rights)
+}
+
+/// 给一个**分区里**打开好的文件发句柄（S2b）。`part` 进身份：`read` 会按它重建分区视图，
+/// 所以同一口同一文件名的两个区间是两个对象。`None` 那一路（上面的 `grant_file`）语义逐字不变。
+pub fn grant_file_at(
+    owner: (usize, u32),
+    port: u8,
+    part: Option<Partition>,
+    cursor: FileCursor,
+    rights: u32,
+) -> Result<Handle, HErr> {
     let mut g = TABLE.lock();
-    insert(g.get(), owner, rights, ObjRef::File(FileObj { port, cursor }))
+    insert(g.get(), owner, rights, ObjRef::File(FileObj { port, part, cursor }))
 }
 
 /// 给一个 VMO 发句柄（ADR-074 决策 1）。**引用在锁外加**（VMO 表那边取 VMM），
@@ -534,12 +551,18 @@ pub struct ReadTicket {
     slot: u16,
     gen: u64,
     port: u8,
+    part: Option<Partition>,
     cursor: FileCursor,
 }
 
 impl ReadTicket {
     pub fn port(&self) -> u8 {
         self.port
+    }
+
+    /// 这张票属于哪个分区（`None` = 整盘）。`read` 据此决定重建整盘还是分区视图。
+    pub fn partition(&self) -> Option<Partition> {
+        self.part
     }
 
     pub fn position(&self) -> u32 {
@@ -562,7 +585,7 @@ pub fn begin_read(h: Handle, owner: (usize, u32)) -> Result<ReadTicket, HErr> {
     let e = &t.slots[slot];
     match e.obj {
         Some(ObjRef::File(f)) => {
-            Ok(ReadTicket { slot: slot as u16, gen: e.gen, port: f.port, cursor: f.cursor })
+            Ok(ReadTicket { slot: slot as u16, gen: e.gen, port: f.port, part: f.part, cursor: f.cursor })
         }
         // 不是文件对象就没有"文件读"这回事（VMO 与 P5c-1 的四种 kind 同理）：
         // 这是类型/权限不符，不是"槽不存在"，两个计数器分开
@@ -597,20 +620,29 @@ pub fn finish(ticket: ReadTicket, bytes: usize) -> Result<(), HErr> {
 /// 丢弃一张票：表项不动。显式函数而不是 `Drop`，是为了让"没有提交"在调用点看得见。
 pub fn abort(_ticket: ReadTicket) {}
 
-/// 生产路径：按表项里的口重建 `AhciDisk`。一次读全部分配的 `dst`（事务性）。
+/// 生产路径：按表项里的口**与分区区间**重建块设备。一次读全部分配的 `dst`（事务性）。
+/// 区间是身份的一部分（S2b）：这里若只重建 `AhciDisk{port}`，偏移在第一次读之后就丢了，
+/// 而句柄看起来还是"那个分区里的文件"——那种错法读出来的字节合法、内容却是别人的。
 pub fn read(h: Handle, owner: (usize, u32), dst: &mut [u8]) -> Result<usize, HErr> {
     let mut ticket = begin_read(h, owner)?;
     let disk = AhciDisk { port: ticket.port() };
-    let n = ticket.read_chunk(&disk, dst)?;
+    let n = match ticket.partition() {
+        None => ticket.read_chunk(&disk, dst)?,
+        Some(part) => ticket.read_chunk(&PartitionView { inner: &disk, part }, dst)?,
+    };
     finish(ticket, n)?;
     Ok(n)
 }
 
 /// 取证路径：注入块设备（内存夹具）。与 `read` 共用取票/提交，只有盘不同。
+/// **分区区间照样生效**：否则同一张票经两条路读出来的字节会不同，而两条路都自称"读这个句柄"。
 #[cfg(feature = "fat32-probe")]
 pub fn read_with(h: Handle, owner: (usize, u32), disk: &dyn Block, dst: &mut [u8]) -> Result<usize, HErr> {
     let mut ticket = begin_read(h, owner)?;
-    let n = ticket.read_chunk(disk, dst)?;
+    let n = match ticket.partition() {
+        None => ticket.read_chunk(disk, dst)?,
+        Some(part) => ticket.read_chunk(&PartitionView { inner: disk, part }, dst)?,
+    };
     finish(ticket, n)?;
     Ok(n)
 }

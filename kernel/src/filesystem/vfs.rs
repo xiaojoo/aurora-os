@@ -29,6 +29,55 @@ pub enum BlockError {
     Quarantined,
     /// 参数形状被拒（长度不是整扇区、扇区数超过环形缓冲容量、句柄层拒绝）
     Refused,
+    /// 分区视图里越过了 GPT 给的那个区间（S2b）。**与 `Refused` 分开**：
+    /// 一个是"这次请求的形状不对"，一个是"请求的形状对但要读的字节不属于这个分区"。
+    /// 合成一个码，负样本就再也分不开"越界被拒"与"长度不是整扇区被拒"。
+    BeyondPartition,
+}
+
+/// 一个分区在整盘上的区间，两端都是**整盘 LBA**、含末扇区。
+/// 来源只有一个：GPT 条目（`gpt::Entry` 的 `first_lba`/`last_lba`）。
+/// **这不是块层新开的容量账**：`Block` 那条"越过盘末尾由设备自己报"的承诺不变，
+/// 这里判的是"这个分区到哪儿为止"，而那个界是分区表说的，不是块层猜的。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Partition {
+    pub base: u64,
+    pub last: u64,
+}
+
+impl Partition {
+    /// 区间里的扇区数。`last < base` ⇒ 0（空区间，任何读都该被拒，而不是绕回整盘）。
+    pub fn sectors(&self) -> u64 {
+        self.last.checked_sub(self.base).map_or(0, |d| d + 1)
+    }
+}
+
+/// 分区视图：把"分区内 LBA"翻成"整盘 LBA"，**翻之前**按 GPT 给的区间判越界。
+///
+/// 为什么是包装而不是给 `Volume::mount` 加一个 base 参数：ADR-078 决定"分区能力与 mount
+/// 语义分离"，`mount` 认的一直是"这块 Block 的 LBA0 就是引导扇区"。偏移只活在这一层，
+/// 于是 FAT12/16/32 那三族解析、游标、走链**一个字都不用改**，两块 superfloppy 真卷的
+/// 读数也天然逐字不动（它们走的是 `AhciDisk`/`MemDisk`，根本不经过这里）。
+pub struct PartitionView<'a> {
+    pub inner: &'a dyn Block,
+    pub part: Partition,
+}
+
+impl Block for PartitionView<'_> {
+    fn read_sectors(&self, lba: u64, dst: &mut [u8]) -> Result<(), BlockError> {
+        if dst.is_empty() || dst.len() % SECTOR_BYTES != 0 {
+            return Err(BlockError::Refused);
+        }
+        let n = (dst.len() / SECTOR_BYTES) as u64;
+        // 越界必须在**翻译之前**拒。交给 inner 去拒的话，`base + lba` 已经落到下一个分区
+        // 或整盘末尾：那可能是"读成功但读到别人的字节"，判据就分不开"拒了"与"读错了"。
+        let end = lba.checked_add(n).ok_or(BlockError::BeyondPartition)?;
+        if end > self.part.sectors() {
+            return Err(BlockError::BeyondPartition);
+        }
+        let abs = self.part.base.checked_add(lba).ok_or(BlockError::BeyondPartition)?;
+        self.inner.read_sectors(abs, dst)
+    }
 }
 
 impl BlockError {
@@ -40,6 +89,7 @@ impl BlockError {
             BlockError::DeviceError => "设备报错",
             BlockError::Quarantined => "已隔离",
             BlockError::Refused => "参数被拒",
+            BlockError::BeyondPartition => "越出分区",
         }
     }
 }

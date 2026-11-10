@@ -536,6 +536,8 @@ public_api = [
   "vfs::Block",
   "vfs::BlockError",
   "vfs::FileStat",
+  "vfs::Partition",
+  "vfs::PartitionView",
 ]
 allowed_callers = ["capability", "diagnostics", "integration", "sched"]
 dependencies = ["arch", "boot", "driver", "irq", "memory", "pci", "sync", "time"]

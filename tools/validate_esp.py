@@ -158,11 +158,13 @@ def fnv1a64(data: bytes) -> int:
     return h
 
 
-def fat16_facts(vol: bytes) -> dict[str, str]:
-    """从**整卷**字节独立重算 FAT16 的事实（`--fat16-report` 用）。
+def fat16_facts(vol: bytes, want: str = "TEST.BIN") -> dict[str, str]:
+    """从**整卷**字节独立重算 FAT16 的事实（`--fat16-report` 与 `--esp-file` 共用）。
 
     与内核 `filesystem/fat32.rs` 的 FAT16 分支是两台实现：偏移表各写一份、FNV 各算一遍、
     不 import 内核也不 import `esp_image`。只报读到的数与自己算的数，对不对由调用方逐格比。
+    `want` 是 8.3 短名（`NAME.EXT`，与内核 `name_matches` 的拼法一致）；默认值保持
+    `--fat16-report` 那条既有读数逐字不变。
     """
     f: dict[str, str] = {}
     bps = struct.unpack_from("<H", vol, 11)[0]
@@ -201,7 +203,7 @@ def fat16_facts(vol: bytes) -> dict[str, str]:
             continue
         name = (e[0:8].decode(errors="replace").strip() + "."
                 + e[8:11].decode(errors="replace").strip())
-        if name.upper() == "TEST.BIN":
+        if name.upper() == want.upper():
             first = struct.unpack_from("<H", e, 26)[0]
             size = struct.unpack_from("<I", e, 28)[0]
             break
@@ -233,6 +235,37 @@ def fat16_facts(vol: bytes) -> dict[str, str]:
     f["after_last"] = f"0x{after:04x}"
     f["tail_bytes"] = str(size - (walked - 1) * spc * bps if walked else 0)
     f["fnv"] = f"0x{fnv1a64(body):016x}"
+    return f
+
+
+def esp_file_facts(d: bytes, want: str) -> dict[str, str]:
+    """从**整盘**字节独立走 GPT → ESP 分区 → FAT16 → 取出一个已存在的文件（`--esp-file` 用）。
+
+    这是 S2b 的第二台仪器：内核那一侧走 `gpt::find_esp` → `PartitionView` → `Volume::mount`，
+    这一侧自己解 GPT 头与条目、自己按 first_lba 切分区、自己走 FAT16 簇链，两边各算一遍 FNV。
+    分区区间取自 `gpt_facts`（同一台仪器内的同一次解析，不是第二份 GPT 实现）；
+    **切分区这一步是本函数自己做的**，内核那个 `base + lba` 翻译错了这里就对不上。
+    """
+    g = gpt_facts(d)
+    f = {k: g[k] for k in ("esp_first", "esp_last") if k in g}
+    if "esp_first" not in g or "esp_last" not in g:
+        f["found"] = "false"
+        f["why"] = "整盘上没有 ESP 条目"
+        return f
+    first, last = int(g["esp_first"]), int(g["esp_last"])
+    f["esp_sectors"] = str(last - first + 1)
+    vol = d[first * SECTOR: (last + 1) * SECTOR]
+    f["part_bytes"] = str(len(vol))
+    f["want"] = want
+    inner = fat16_facts(vol, want)
+    # 分区几何与文件事实分开命名，免得"卷的 total"与"分区的扇区数"混成一格
+    for k, v in inner.items():
+        f["vol_" + k] = v
+    f["found"] = inner.get("found", "false")
+    f["size"] = inner.get("size", "0")
+    f["fnv"] = inner.get("fnv", "0x0")
+    f["seen"] = inner.get("seen", "0")
+    f["lfn"] = inner.get("lfn", "0")
     return f
 
 
@@ -359,8 +392,20 @@ if __name__ == "__main__":
     argv = sys.argv[1:]
     report = "--report" in argv
     fat16 = "--fat16-report" in argv
-    rest = [a for a in argv if a not in ("--report", "--fat16-report")]
+    # --esp-file NAME：从整盘独立走 GPT→ESP→FAT16 取出那个文件（S2b 的第二台仪器）
+    esp_file = None
+    if "--esp-file" in argv:
+        i = argv.index("--esp-file")
+        if i + 1 >= len(argv):
+            print("--esp-file 后面要跟一个 8.3 短名"); sys.exit(2)
+        esp_file = argv[i + 1]
+    flags = ("--report", "--fat16-report", "--esp-file")
+    rest = [a for a in argv if a not in flags and a != esp_file]
     target = rest[0] if rest else "build/aurora.img"
+    if esp_file is not None:
+        for k, v in esp_file_facts(open(target, "rb").read(), esp_file).items():
+            print(f"{k}={v}")
+        sys.exit(0)
     if fat16:
         # 整卷 FAT16 的机器可读读数（合成夹具卷没有 GPT，不能走 --report 那条 GPT 路）。
         for k, v in fat16_facts(open(target, "rb").read()).items():

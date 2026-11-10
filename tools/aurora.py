@@ -292,7 +292,15 @@ VBLK_FEATURES = {"virtio-blk", "virtio-msix-probe"}
 # 六条因此必须落在一块**固件永远不会碰**的盘上：口 1，只在 gpt-probe 档挂。
 GPT_FIX = BUILD / "gpt-fixture.img"
 GPT_FIX_PORT = 1
-GPT_FEATURES = {"gpt-probe"}
+# 名单是**文本交集**，不跟 cargo 的依赖闭包走：`esp-probe` 依赖 `gpt-probe`（因此会注册
+# `t_gpt`、要读口 1 那块盘），但这里若只写 gpt-probe，盘就不挂 ⇒ 那条用例以
+# `Io(NotSettled)` 红，而红的成因看起来像驱动坏了（S2b 开工第一跑实测就是这个形状）。
+GPT_FEATURES = {"gpt-probe", "esp-probe"}
+# S2b：从口 0 的 ESP 分区里真读的那个文件。**8.3 短名**（`name_matches` 拼 `NAME.EXT`），
+# 与 `ktests/esp.rs` 的 `WANT` 由 check-fat32-ports 逐字对账。为什么不是 `/boot/aurora.bin`：
+# `open()` 只扫根、不走子目录，LFN 也没实现 ⇒ 根级常驻可开的只有 limine.conf 的短名。
+ESP_FILE_NAME = "LIMINE.CON"
+ESP_FEATURES = {"esp-probe"}
 # 配方指纹：由 tools/make_gpt_disk.py 现算（盘里没有文件系统，所以不需要 mtools）。
 # 与 FAT 那两块同一规矩：夹具跟着"要挂这块盘"走，每跑重造并核指纹，注入的寿命就是一跑。
 GPT_FIX_BYTES = 4194304
@@ -1615,6 +1623,54 @@ def check_fatal_record() -> list[str]:
     return bad
 
 
+def check_esp_partition() -> list[str]:
+    """S2b 的接线对账：分区偏移视图 + 句柄身份 + 第二台仪器，三处的口号与依赖必须机器核。
+
+    核五件：①内核读的文件名与本脚本 `ESP_FILE_NAME` 逐字；②`esp-probe` 的三条依赖都在
+    （少了 `handles` 就编不出句柄表、少了 gpt/fat16 就没有被测物）；③`esp-probe` 在挂盘名单里
+    ——**这一条是实测买来的**：名单是文本交集不跟 cargo 依赖闭包走，漏了它口 1 的盘不挂，
+    `t_gpt` 以 `Io(NotSettled)` 红，而成因看起来像驱动坏了；④偏移真的进了句柄身份
+    （`FileObj` 有 `part`、`read` 真的按它重建视图）；⑤越界有**自己的**错误码与 tag。
+    """
+    bad: list[str] = []
+    k = ROOT / "kernel" / "src" / "ktests" / "esp.rs"
+    if not k.exists():
+        return ["缺 kernel/src/ktests/esp.rs：S2b 的被测物不在位，整段对账不成立"]
+    ks = k.read_text(encoding="utf-8")
+    m = re.search(r'const WANT: &str = "([^"]+)";', ks)
+    if m is None:
+        bad.append("ktests/esp.rs 里找不到 `const WANT`（挪进函数体了？两处各写一份就会分家）")
+    elif m.group(1) != ESP_FILE_NAME:
+        bad.append(f"读的文件名：内核={m.group(1)} 本脚本 ESP_FILE_NAME={ESP_FILE_NAME}")
+    feats = (ROOT / "kernel" / "Cargo.toml").read_text(encoding="utf-8")
+    fm = re.search(r"^esp-probe = \[(.*?)\]", feats, re.M)
+    if fm is None:
+        bad.append("Cargo.toml 的 [features] 里没有 esp-probe")
+    else:
+        deps = re.findall(r'"([^"]+)"', fm.group(1))
+        for need in ("gpt-probe", "fat16-probe", "handles"):
+            if need not in deps:
+                bad.append(f"esp-probe 必须依赖 {need}（否则那一档编不出被测物），实际={deps}")
+    if not ESP_FEATURES <= GPT_FEATURES:
+        bad.append(f"esp-probe 不在 GPT_FEATURES 里 ⇒ 口 1 的夹具盘不挂，t_gpt 会以 Io(NotSettled) 红"
+                   f"（名单是文本交集，不跟 cargo 依赖闭包走）：{sorted(GPT_FEATURES)}")
+    mods = (ROOT / "kernel" / "src" / "ktests" / "mod.rs").read_text(encoding="utf-8")
+    if '#[cfg(feature = "esp-probe")]\nmod esp;' not in mods.replace("\r\n", "\n"):
+        bad.append("ktests/mod.rs 没有按 esp-probe 门控注册 mod esp ⇒ 用例进不了 .ktests 表")
+    h = (ROOT / "kernel" / "src" / "handle.rs").read_text(encoding="utf-8")
+    if "pub part: Option<Partition>" not in h:
+        bad.append("handle.rs 的 FileObj 没有 `pub part: Option<Partition>` ⇒ 偏移没进句柄身份，"
+                   "read 重建整盘之后偏移就丢了（S2b 的裁决是『偏移进身份』）")
+    if "PartitionView { inner: &disk, part }" not in h:
+        bad.append("handle::read 没有按票里的分区重建 PartitionView ⇒ 身份带了偏移也没人用")
+    v = (ROOT / "kernel" / "src" / "filesystem" / "vfs.rs").read_text(encoding="utf-8")
+    if "BeyondPartition" not in v or "越出分区" not in v:
+        bad.append("vfs.rs 缺 BeyondPartition 变体或它的 tag ⇒ 越界与形状错合成一个码，负样本分不开")
+    if "pub struct PartitionView" not in v:
+        bad.append("vfs.rs 缺 PartitionView ⇒ 偏移视图不在位")
+    return bad
+
+
 def check_fat32_ports() -> list[str]:
     """两处各写死一份口号，就必须有机器对账：内核的 `FAT_PORT_A`/`FAT_PORT_B` 与本脚本的 `FAT_PORTS`。
 
@@ -1669,6 +1725,8 @@ def check_fat32_ports() -> list[str]:
     bad += check_gpt_bounds()
     # 无锁现场记录表（§181）的接线对账：同一格"存储夹具与口号"，不新开第 18 道门禁。
     bad += check_fatal_record()
+    # S2b：分区偏移视图 + 句柄身份 + 第二台仪器的接线对账（同一格，不新开第 18 道门禁）。
+    bad += check_esp_partition()
 
     feats = (ROOT / "kernel" / "Cargo.toml").read_text(encoding="utf-8")
     for f in sorted(FAT_FEATURES):
@@ -5730,6 +5788,71 @@ def gpt_host_witness(kind: str, log: str) -> list[str]:
     return bad
 
 
+def check_esp_file(log: str) -> list[str]:
+    """ESP 分区里真读一个文件的**宿主机侧独立对账**（W4 S2b，第二台仪器）。
+
+    内核走 `gpt::find_esp` → `PartitionView` → `Volume::mount` → 游标读；这里让
+    `validate_esp.py --esp-file` 从**同一份 `build/aurora.img`** 自己解 GPT、自己按 first_lba
+    切分区、自己走 FAT16 簇链，各算一遍 FNV 再逐格比。内核绿而对不上 ⇒ 调用方改判
+    CONTENT-MISMATCH（与"内核自己红"分开）。
+    防空转三条：内核那两行缺任何一行 ⇒ 点名红；宿主机吐不到 12 个字段 ⇒ 报"仪器自己空转"；
+    必需字段缺失 ⇒ 先点名再往下比（不静默当成核过了）。
+    """
+    bad: list[str] = []
+    m1 = re.search(
+        r"esp: 口=(\d+) ESP\[first=(\d+) last=(\d+) 扇区=(\d+)\] 类型FAT16=(true|false) "
+        r"文件=(\S+) 大小=(\d+) 读到=(\d+) 装得下=(true|false) FNV=(0x[0-9a-f]+) "
+        r"扫过项=(\d+) 长名项=(\d+)", log)
+    m2 = re.search(
+        r"esp: 判据 真读=(true|false) 句柄带偏移同数=(true|false) 不带偏移不同=(true|false)"
+        r"（那一路读到=(\S+?)） 越界拒=(true|false) 形状错另码=(true|false) 空区间拒=(true|false) "
+        r"base0拒=(true|false) 合成偏移照读=(true|false) 偏移改一格内容变=(true|false)", log)
+    if not (m1 and m2):
+        miss = [n for n, m in (("读数", m1), ("判据", m2)) if not m]
+        return [f"内核没报齐 ESP 读数（缺 {'/'.join(miss)} 行）⇒ 宿主机对账没有对象"]
+    cells = ["真读", "句柄带偏移同数", "不带偏移不同", "越界拒", "形状错另码", "空区间拒",
+             "base0拒", "合成偏移照读", "偏移改一格内容变"]
+    vals = [m2.group(i) for i in (1, 2, 3, 5, 6, 7, 8, 9, 10)]
+    for name, v in zip(cells, vals):
+        if v != "true":
+            bad.append(f"ESP 判据 {name}={v}")
+    if not IMAGE.exists():
+        return [f"引导镜像不在：{IMAGE}（对账必须吃**这一跑**的那块盘）"]
+    out = subprocess.run(
+        [sys.executable, str(ROOT / "tools" / "validate_esp.py"), str(IMAGE), "--esp-file", ESP_FILE_NAME],
+        capture_output=True, text=True, encoding="utf-8", env=env())
+    if out.returncode != 0:
+        return [f"validate_esp.py --esp-file 退出 {out.returncode}：{out.stderr.strip()[:200]}"]
+    host = dict(ln.split("=", 1) for ln in out.stdout.splitlines() if "=" in ln)
+    if len(host) < 12:
+        return [f"宿主机只解析出 {len(host)} 个字段（应当 >= 12）⇒ 这台仪器自己空转了"]
+    required = ["esp_first", "esp_last", "esp_sectors", "found", "size", "fnv", "seen", "lfn",
+                "want", "vol_band", "vol_root_entries", "vol_data_start"]
+    missing = [k for k in required if k not in host]
+    if missing:
+        return [f"宿主机报告缺字段 {missing}（它自己给的成因：{host.get('why', '无')}）"]
+    if host["found"] != "true":
+        return [f"宿主机在 ESP 里开不出 {ESP_FILE_NAME}（{host.get('why', '无')}）⇒ 对账没有对象"]
+
+    def eq(tag: str, k, h) -> None:
+        if str(k) != str(h):
+            bad.append(f"ESP {tag}：内核={k} 宿主机={h}")
+
+    eq("分区 first_lba", m1.group(2), host["esp_first"])
+    eq("分区 last_lba", m1.group(3), host["esp_last"])
+    eq("分区扇区数", m1.group(4), host["esp_sectors"])
+    eq("判型（ESP 必须是 FAT16）", "Fat16" if m1.group(5) == "true" else "非Fat16", host["vol_band"])
+    eq("文件名", m1.group(6), host["want"])
+    eq("目录项大小", m1.group(7), host["size"])
+    eq("真读到的字节数", m1.group(8), host["size"])
+    eq("内容 FNV", m1.group(10), host["fnv"])
+    eq("扫过项", m1.group(11), host["seen"])
+    eq("长名项", m1.group(12), host["lfn"])
+    if m1.group(6) != ESP_FILE_NAME:
+        bad.append(f"内核读的文件名 {m1.group(6)} 与本脚本 ESP_FILE_NAME={ESP_FILE_NAME} 分家")
+    return bad
+
+
 def check_fat16(log: str) -> list[str]:
     """FAT16 合成整卷的**宿主机侧独立对账**（W4 S2a，第二台仪器）。
 
@@ -6338,6 +6461,16 @@ def do_test(timeout: int) -> int:
     for x in f16_bad:
         print("    对账:", x)
 
+    print("=== ESP 分区里真读一个已存在的文件：偏移视图 + 句柄身份（W4 S2b，第二台仪器）===")
+    # 内核走 GPT→PartitionView→mount→游标；宿主机自己解 GPT、自己切分区、自己走 FAT16 簇链。
+    # 读的是**引导盘上本来就有的** limine.conf（短名 LIMINE.CON），不往 ESP 里加新文件。
+    IMAGE.unlink(missing_ok=True)
+    espv, espc, esplog = do_run(["esp-probe"], timeout)
+    esp_bad = check_esp_file(esplog)
+    esp_verdict = espv if espv != "PASS" else ("PASS" if not esp_bad else "CONTENT-MISMATCH")
+    for x in esp_bad:
+        print("    对账:", x)
+
     print("=== FAT32 只读解析：两块卷挂 AHCI 口 3/4，内核读回的每个数由宿主机再解析一遍 ===")
     # 内核那十三条判据比的是"自己和写死的期望数"，这一行把它们换成"和另一台实现"：
     # 几何 14 格、每个文件 12 格、以及引导盘该崩在哪一道闸。两块卷的角色不重叠——
@@ -6558,6 +6691,7 @@ def do_test(timeout: int) -> int:
         # W4 S2a：FAT16 合成整卷（23 扇区、簇数落 FAT12 档而结构是 FAT16）。内核八格判据
         # 比的是"自己和写死的期望数"，这一行换成"和 validate_esp.py 的独立读表"，逐格比
         ("FAT16合成卷与宿主机对账", f16_verdict, f16rc, "PASS", 33),
+        ("ESP分区偏移真读文件", esp_verdict, espc, "PASS", 33),
         # P7 第 40 行的证红：owner 改错一格 ⇒ 容器读不到 ⇒ 必须红在 ring3 那格
         ("P7 句柄授错主人必须红", ih_verdict, ihrc, "FAIL", 35),
         # ADR-066 / W2 P4：OOM 被传播（Err）且原页原样 ⇒ 期望 PASS(33)；
@@ -6609,6 +6743,7 @@ def do_test(timeout: int) -> int:
         "GPT条目数超上界必须红": geclog,
         "GPT改first并重算CRC对账红": geflog,
         "FAT16合成卷与宿主机对账": f16log,
+        "ESP分区偏移真读文件": esplog,
         "P7 句柄授错主人必须红": ihlog,
         "split OOM原页原样": soomlog,
         "demand-zero四路有真输家": dzlog,

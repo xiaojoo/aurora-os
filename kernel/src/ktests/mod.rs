@@ -8,6 +8,8 @@ mod driver;
 mod elf;
 #[cfg(feature = "fat16-probe")]
 mod fat16;
+#[cfg(feature = "esp-probe")]
+mod esp;
 #[cfg(feature = "fat32-probe")]
 pub(crate) mod fs;
 #[cfg(feature = "gpt-probe")]
