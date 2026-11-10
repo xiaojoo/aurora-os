@@ -88,6 +88,12 @@ def kernel_binary(features: list[str]) -> Path:
         bad = ensure_fat32_mem()
         if bad:
             sys.exit("内存夹具卷不成立：" + " / ".join(bad))
+    if FAT16_FEATURES & set(features):
+        # 同一条规矩：`include_bytes!("../fixtures/fat16-mem.img")` 是编译期读的，
+        # 必须在 cargo 之前现算并核指纹，晚一步就是"构建失败"而不是"夹具不对"。
+        bad = ensure_fat16_mem()
+        if bad:
+            sys.exit("FAT16 合成夹具卷不成立：" + " / ".join(bad))
     profile = ["--release"] if features == ["release"] else []
     args = [str(CARGO), "build", "--target", TARGET, "-p", "aurora-kernel"]
     if profile:
@@ -368,6 +374,13 @@ FAT_EXPECT = {
 FAT_MEM_OUT = ROOT / "kernel" / "fixtures" / "fat32-mem.img"
 FAT_MEM_SCRIPT = ROOT / "tools" / "make_fat32_mem.py"
 FAT_MEM_EXPECT = (11_264, "28f6f1d9cf135d4ab44de4e015a5b9a271cd087f2165139987088cd0eeff89ae")
+# W4 S2a：FAT16 合成整卷（23 扇区）。与 fat32-mem 同一规矩——不在仓库里、现算、指纹登记，
+# 内核 `include_bytes!` **同一份字节**，宿主机 `validate_esp.py --fat16-report` 独立重算
+# ⇒ 两台仪器读的是同一块卷，而不是各自实现同一个配方（后者错会一起错）。
+FAT16_MEM_OUT = ROOT / "kernel" / "fixtures" / "fat16-mem.img"
+FAT16_MEM_SCRIPT = ROOT / "tools" / "make_fat16_mem.py"
+FAT16_MEM_EXPECT = (11_776, "72cbe26b0cb080a586f82a8b8a21edfa584a807d7aa212bd7bd1fafdfbc9bb25")
+FAT16_FEATURES = {"fat16-probe"}
 
 # M8-a：第一张网卡走 virtio-net（手册 §8.6 里它与 virtio-blk 同列 P1，而且 M5-f② 之后
 # split queue 这条路已经跑通，第二张网卡不该再引入一套新的环布局）。
@@ -569,6 +582,24 @@ def ensure_fat32_mem() -> list[str]:
     if len(data) != size or got != sha:
         return [f"内存夹具指纹不符：{len(data)} 字节 sha256={got[:12]}，期望 {size} 字节 {sha[:12]}"
                 "（配方改了，用例里那批写死的数必须跟着重算）"]
+    return []
+
+
+def ensure_fat16_mem() -> list[str]:
+    """现算 FAT16 合成整卷并核指纹（与 `ensure_fat32_mem` 同一规矩：红在编译之前）。"""
+    import hashlib
+    if not FAT16_MEM_SCRIPT.exists():
+        return [f"配方脚本缺失：{FAT16_MEM_SCRIPT.relative_to(ROOT)}（这块夹具卷不在仓库里，只能现算）"]
+    if sh([sys.executable, str(FAT16_MEM_SCRIPT), str(FAT16_MEM_OUT)]) != 0:
+        return ["make_fat16_mem.py 退出非零"]
+    if not FAT16_MEM_OUT.exists():
+        return [f"脚本没写出 {FAT16_MEM_OUT.relative_to(ROOT)}"]
+    data = FAT16_MEM_OUT.read_bytes()
+    size, sha = FAT16_MEM_EXPECT
+    got = hashlib.sha256(data).hexdigest()
+    if len(data) != size or got != sha:
+        return [f"FAT16 合成卷指纹不符：{len(data)} 字节 sha256={got[:12]}，期望 {size} 字节 {sha[:12]}"
+                "（配方改了，用例与对账那批写死的数必须跟着重算）"]
     return []
 
 
@@ -1623,6 +1654,30 @@ def check_fat32_ports() -> list[str]:
             bad.append(f"{f} 的 planner 竟然定位成功了 ⇒ 与『做不成』的账不符，要重新量")
         except ValueError:
             pass
+
+    # W4 S2a：FAT16 合成整卷的配方常数与内核用例里的同名常数逐字对账。
+    # 两处各写一份而不核对正是手册 V8 点名的形状：改了配方没改用例，红会落在"判据不成立"上，
+    # 而不是落在"夹具与期望分家"上——后者一眼看得出是谁的错。
+    f16_ktest = (ROOT / "kernel" / "src" / "ktests" / "fat16.rs").read_text(encoding="utf-8")
+    f16_recipe = (ROOT / "tools" / "make_fat16_mem.py").read_text(encoding="utf-8")
+    for name in ("RESERVED", "FAT_COUNT", "SPF16", "ROOT_ENTRIES", "ROOT_SECTORS",
+                 "DATA_START", "DATA_CLUSTERS", "TOTAL_SECTORS", "VOL_BYTES", "FILE_SIZE"):
+        kr = re.search(rf"^const {name}: usize = ([^;]+);", f16_ktest, re.M)
+        pr = re.search(rf"^{name} = ([^\n#]+)", f16_recipe, re.M)
+        if kr is None or pr is None:
+            bad.append(f"FAT16 常数 {name} 没在两边都找到（改名/挪走了？这条对账就不核它了）")
+            continue
+        kv = kr.group(1).replace("_", "")
+        pv = pr.group(1).strip().replace("_", "")
+        # 内核那边允许写成算式（如 ROOT_ENTRIES * 32 / SECTOR_BYTES），只在两边都是纯数字时逐字比；
+        # 算式那几格由"跑起来对不对"担保（判据里它们的值都进了串口，宿主机逐格对账）。
+        if kv.isdigit() and pv.isdigit() and int(kv) != int(pv):
+            bad.append(f"FAT16 常数 {name}：内核={kv} 配方={pv}")
+    for f in sorted(FAT16_FEATURES):
+        if not re.search(rf"^{f} = ", feats, re.M):
+            bad.append(f"Cargo.toml 的 [features] 里没有 {f}，本脚本却按它现算 FAT16 夹具")
+    if not FAT16_MEM_SCRIPT.exists():
+        bad.append("缺 tools/make_fat16_mem.py：FAT16 合成卷的配方不在位")
 
     # 内核读哪几个文件 = 这台仪器核哪几个文件。两处各写一遍就会分家，而分家的表现是
     # "对账核的是另一个对象"——那种绿比红更贵。名字表按 want_a 再 want_b 的顺序比。
@@ -5381,6 +5436,78 @@ def gpt_host_witness(kind: str, log: str) -> list[str]:
     return bad
 
 
+def check_fat16(log: str) -> list[str]:
+    """FAT16 合成整卷的**宿主机侧独立对账**（W4 S2a，第二台仪器）。
+
+    内核 `t_fat16` 自己报几何/目录/走链；这里让 `validate_esp.py --fat16-report` 从**同一份夹具字节**
+    独立重算同样的数（它不 import 内核、也不 import esp_image），逐格比。内核绿而对不上 ⇒
+    调用方改判 CONTENT-MISMATCH，与"内核自己红"分得开。
+    防空转：内核那三行缺任何一行、或宿主机吐不到 15 个字段，都直接报红并点名。
+    """
+    bad: list[str] = []
+    mg = re.search(
+        r"fat16: 几何 判型=(\w+) 簇数=(\d+) 数据起点=(\d+) 根目录区扇区=(\d+) 根项数=(\d+) "
+        r"每份扇区=(\d+) 项宽=(\d+) EOC=(0x[0-9a-f]+) 掩码=(0x[0-9a-f]+) 名字串=(true|false) "
+        r"无备份引导=(true|false) 阈值判型=(\w+)", log)
+    md = re.search(r"fat16: 目录 大小=(\d+) 首簇=(\d+) 扫过项=(\d+) 长名=(\d+)", log)
+    mw = re.search(
+        r"fat16: 走链 字节=(\d+) 簇=(\d+) 尾字节=(\d+) 末簇后继=(0x[0-9a-f]+) "
+        r"内容FNV=(0x[0-9a-f]+) 内容逐字节同=(true|false) 游标一致=(true|false)", log)
+    if not (mg and md and mw):
+        miss = [n for n, m in (("几何", mg), ("目录", md), ("走链", mw)) if not m]
+        return [f"内核没报齐 FAT16 读数（缺 {'/'.join(miss)} 行）⇒ 宿主机对账没有对象"]
+    if not FAT16_MEM_OUT.exists():
+        return [f"FAT16 夹具卷不在：{FAT16_MEM_OUT}（这一跑之后被谁删了？对账必须吃同一份字节）"]
+    out = subprocess.run(
+        [sys.executable, str(ROOT / "tools" / "validate_esp.py"), str(FAT16_MEM_OUT), "--fat16-report"],
+        capture_output=True, text=True, encoding="utf-8", env=env())
+    if out.returncode != 0:
+        return [f"validate_esp.py --fat16-report 退出 {out.returncode}：{out.stderr.strip()[:200]}"]
+    host = dict(ln.split("=", 1) for ln in out.stdout.splitlines() if "=" in ln)
+    if len(host) < 15:
+        return [f"宿主机只解析出 {len(host)} 个字段（应当 >= 15）⇒ 这台仪器自己空转了"]
+    required = ["clusters", "band", "data_start", "root_dir_sectors", "root_entries", "spf16",
+                "fat_entry_bytes", "eoc", "mask", "found", "first_cluster", "size", "seen", "lfn",
+                "walk_bytes", "walk_clusters", "tail_bytes", "after_last", "fnv"]
+    missing = [k for k in required if k not in host]
+    if missing:
+        return [f"宿主机报告缺字段 {missing}（它自己发现的问题：{host.get('chain_error', '无')}）"]
+
+    def eq(tag: str, k, h) -> None:
+        if k != h:
+            bad.append(f"FAT16 {tag}：内核={k} 宿主机={h}")
+
+    eq("判型（必须按结构收为 Fat16）", "Fat16", mg.group(1))
+    eq("簇数", int(mg.group(2)), int(host["clusters"]))
+    eq("阈值判型（只报数）", mg.group(12), host["band"])
+    eq("数据起点", int(mg.group(3)), int(host["data_start"]))
+    eq("根目录区扇区", int(mg.group(4)), int(host["root_dir_sectors"]))
+    eq("根项数", int(mg.group(5)), int(host["root_entries"]))
+    eq("每份FAT扇区", int(mg.group(6)), int(host["spf16"]))
+    eq("项宽", int(mg.group(7)), int(host["fat_entry_bytes"]))
+    eq("EOC", int(mg.group(8), 16), int(host["eoc"], 16))
+    eq("掩码", int(mg.group(9), 16), int(host["mask"], 16))
+    eq("名字串", mg.group(10), "true")
+    eq("无备份引导", mg.group(11), "true")
+    eq("目录大小", int(md.group(1)), int(host["size"]))
+    eq("首簇", int(md.group(2)), int(host["first_cluster"]))
+    eq("扫过项", int(md.group(3)), int(host["seen"]))
+    eq("长名计数", int(md.group(4)), int(host["lfn"]))
+    eq("走字节", int(mw.group(1)), int(host["walk_bytes"]))
+    eq("走簇", int(mw.group(2)), int(host["walk_clusters"]))
+    eq("尾字节", int(mw.group(3)), int(host["tail_bytes"]))
+    eq("末簇后继", int(mw.group(4), 16), int(host["after_last"], 16))
+    eq("内容FNV（两台实现各走一遍链）", int(mw.group(5), 16), int(host["fnv"], 16))
+    eq("内容逐字节同", mw.group(6), "true")
+    eq("游标一致", mw.group(7), "true")
+    mj = re.search(r"fat16: 判据 [^\n]*", log)
+    if not mj:
+        bad.append("内核没报 FAT16 判据那一行")
+    elif "false" in mj.group(0):
+        bad.append(f"FAT16 判据里有 false：{mj.group(0).strip()[:170]}")
+    return bad
+
+
 def check_gpt(log: str) -> list[str]:
     """GPT 分区表的**宿主机侧独立对账**（ADR-078 决策 5，第二台仪器）。
 
@@ -5907,6 +6034,16 @@ def do_test(timeout: int) -> int:
     gef_bad = gpt_host_witness("fault-gpt-esp-first", geflog)
     gef_verdict = gefv if gefv != "PASS" else ("CONTENT-MISMATCH" if not gef_bad else "PASS")
 
+    print("=== FAT16 合成整卷：内核读回的每个数由 validate_esp.py 独立重算（W4 S2a，第二台仪器）===")
+    # 夹具由 make_fat16_mem.py 现算、内核 include_bytes! **同一份字节**，所以两台仪器读的是同一块卷。
+    # 内核那八格判据比的是"自己和写死的期望数"；这一行换成"和另一台实现"，逐格比。
+    IMAGE.unlink(missing_ok=True)
+    f16v, f16rc, f16log = do_run(["fat16-probe"], timeout)
+    f16_bad = check_fat16(f16log)
+    f16_verdict = f16v if f16v != "PASS" else ("PASS" if not f16_bad else "CONTENT-MISMATCH")
+    for x in f16_bad:
+        print("    对账:", x)
+
     print("=== FAT32 只读解析：两块卷挂 AHCI 口 3/4，内核读回的每个数由宿主机再解析一遍 ===")
     # 内核那十三条判据比的是"自己和写死的期望数"，这一行把它们换成"和另一台实现"：
     # 几何 14 格、每个文件 12 格、以及引导盘该崩在哪一道闸。两块卷的角色不重叠——
@@ -6124,6 +6261,9 @@ def do_test(timeout: int) -> int:
         # 原计划的第六条（备份头不一致）**做不成改盘行**：固件必然治愈，实测跑完回到 pristine
         # ⇒ 那道闸由同一份 ELF 里的合成盘证（16 格之一），账记在 GPT_FAULT_UNDELIVERABLE。
         ("GPT改first并重算CRC对账红", gef_verdict, gefrc, "CONTENT-MISMATCH", 33),
+        # W4 S2a：FAT16 合成整卷（23 扇区、簇数落 FAT12 档而结构是 FAT16）。内核八格判据
+        # 比的是"自己和写死的期望数"，这一行换成"和 validate_esp.py 的独立读表"，逐格比
+        ("FAT16合成卷与宿主机对账", f16_verdict, f16rc, "PASS", 33),
         # P7 第 40 行的证红：owner 改错一格 ⇒ 容器读不到 ⇒ 必须红在 ring3 那格
         ("P7 句柄授错主人必须红", ih_verdict, ihrc, "FAIL", 35),
         # ADR-066 / W2 P4：OOM 被传播（Err）且原页原样 ⇒ 期望 PASS(33)；
@@ -6174,6 +6314,7 @@ def do_test(timeout: int) -> int:
         "GPT保护性MBR改坏必须红": gmtlog,
         "GPT条目数超上界必须红": geclog,
         "GPT改first并重算CRC对账红": geflog,
+        "FAT16合成卷与宿主机对账": f16log,
         "P7 句柄授错主人必须红": ihlog,
         "split OOM原页原样": soomlog,
         "demand-zero四路有真输家": dzlog,

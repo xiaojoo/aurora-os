@@ -149,6 +149,93 @@ def gpt_facts(d: bytes) -> dict[str, str]:
     return f
 
 
+def fnv1a64(data: bytes) -> int:
+    """64 位 FNV-1a。**第三份实现**（内核 `ahci::fnv1a64`、本仓 `aurora.fnv1a64` 各有自己的那份），
+    三份算同一个数才叫对账；共用一份就是一台仪器。"""
+    h = 0xCBF29CE484222325
+    for b in data:
+        h = ((h ^ b) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return h
+
+
+def fat16_facts(vol: bytes) -> dict[str, str]:
+    """从**整卷**字节独立重算 FAT16 的事实（`--fat16-report` 用）。
+
+    与内核 `filesystem/fat32.rs` 的 FAT16 分支是两台实现：偏移表各写一份、FNV 各算一遍、
+    不 import 内核也不 import `esp_image`。只报读到的数与自己算的数，对不对由调用方逐格比。
+    """
+    f: dict[str, str] = {}
+    bps = struct.unpack_from("<H", vol, 11)[0]
+    spc = vol[13]
+    reserved = struct.unpack_from("<H", vol, 14)[0]
+    nfats = vol[16]
+    root_entries = struct.unpack_from("<H", vol, 17)[0]
+    spf16 = struct.unpack_from("<H", vol, 22)[0]
+    spf32 = struct.unpack_from("<I", vol, 36)[0]
+    total = struct.unpack_from("<H", vol, 19)[0] or struct.unpack_from("<I", vol, 32)[0]
+    root_secs = (root_entries * 32 + bps - 1) // bps
+    data_start = reserved + nfats * spf16 + root_secs
+    clusters = (total - data_start) // spc if total > data_start else 0
+    band = "Fat12" if clusters < 4085 else ("Fat16" if clusters < 65525 else "Fat32")
+    f.update(
+        bytes_per_sector=str(bps), spc=str(spc), reserved=str(reserved), fat_count=str(nfats),
+        spf16=str(spf16), spf32=str(spf32), root_entries=str(root_entries),
+        root_dir_sectors=str(root_secs), data_start=str(data_start), total=str(total),
+        clusters=str(clusters), band=band, boot_sig=f"0x{vol[38]:02x}",
+        fs_name=vol[54:62].decode(errors="replace").rstrip(), fat_entry_bytes="2",
+        eoc="0xfff8", mask="0xffff",
+    )
+    root_off = (reserved + nfats * spf16) * bps
+    seen = lfn = 0
+    first = size = None
+    for i in range(root_entries):
+        e = vol[root_off + i * 32: root_off + (i + 1) * 32]
+        if len(e) < 32 or e[0] == 0x00:
+            break
+        seen += 1
+        attr = e[11]
+        if attr == 0x0F:
+            lfn += 1
+            continue
+        if (attr & 0x08) or (attr & 0x10) or e[0] == 0xE5:
+            continue
+        name = (e[0:8].decode(errors="replace").strip() + "."
+                + e[8:11].decode(errors="replace").strip())
+        if name.upper() == "TEST.BIN":
+            first = struct.unpack_from("<H", e, 26)[0]
+            size = struct.unpack_from("<I", e, 28)[0]
+            break
+    f["seen"] = str(seen)
+    f["lfn"] = str(lfn)
+    if first is None:
+        f["found"] = "false"
+        return f
+    f["found"] = "true"
+    f["first_cluster"] = str(first)
+    f["size"] = str(size)
+    fat_off = reserved * bps
+    out = bytearray()
+    c, walked, after = first, 0, 0
+    while True:
+        if c < 2 or c > 0xFFF6 or walked > 65535:
+            f["chain_error"] = f"bad:{c}"
+            break
+        off = data_start * bps + (c - 2) * spc * bps
+        out += vol[off: off + spc * bps]
+        walked += 1
+        after = struct.unpack_from("<H", vol, fat_off + c * 2)[0]
+        if after >= 0xFFF8:
+            break
+        c = after
+    body = bytes(out[:size])
+    f["walk_bytes"] = str(size)
+    f["walk_clusters"] = str(walked)
+    f["after_last"] = f"0x{after:04x}"
+    f["tail_bytes"] = str(size - (walked - 1) * spc * bps if walked else 0)
+    f["fnv"] = f"0x{fnv1a64(body):016x}"
+    return f
+
+
 def main(path: str) -> int:
     d = open(path, "rb").read()
     problems_all: list[str] = []
@@ -271,8 +358,14 @@ def main(path: str) -> int:
 if __name__ == "__main__":
     argv = sys.argv[1:]
     report = "--report" in argv
-    rest = [a for a in argv if a != "--report"]
+    fat16 = "--fat16-report" in argv
+    rest = [a for a in argv if a not in ("--report", "--fat16-report")]
     target = rest[0] if rest else "build/aurora.img"
+    if fat16:
+        # 整卷 FAT16 的机器可读读数（合成夹具卷没有 GPT，不能走 --report 那条 GPT 路）。
+        for k, v in fat16_facts(open(target, "rb").read()).items():
+            print(f"{k}={v}")
+        sys.exit(0)
     if report:
         # 机器可读模式：只打 key=value，给 tools/aurora.py 的判定行逐格对内核串口读数。
         # 不走 main() 的人读输出，也不因为它发现问题就退出非零——**问题数本身是一个字段**，
