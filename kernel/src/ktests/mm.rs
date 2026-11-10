@@ -869,7 +869,7 @@ fn t_proc_job_wait() -> bool {
     // 不等窗口，绝大多数时候增量已经在了；反过来写会**每跑一次白烧 ~300 ms 的客时**，
     // 而 `-d int` 那两行把每个中断都写进宿主机日志，客时被放大成墙钟 ⇒ 本轮实测把
     // "中断投递由宿主机数到"那一行挤成 HANG(-1)。
-    let drained = sched::reap_released() > released0 || drain_reap();
+    let drained = crate::ktests::common::drained_or_free(released0, g);
     let up_after = proc::job_used_procs(job);
     let jd_child = match child {
         Ok(c) => proc::job_destroy(c),
@@ -2092,7 +2092,7 @@ fn t_process_startup() -> bool {
     let waited = apic::with_interrupts(|| sched::wait_for_task(g, crate::clock::window_cycles(16)));
     let rel0 = sched::reap_released();
     let _ = sched::terminate_task(g);
-    let drained = sched::reap_released() > rel0 || drain_reap();
+    let drained = crate::ktests::common::drained_or_free(rel0, g);
     if !was_running { apic::timer_stop().ok(); }
     let r: [u64; 32] = core::array::from_fn(|i| PROC_SYS[i].load(core::sync::atomic::Ordering::Acquire));
     if r[25] != 0 {
@@ -2301,7 +2301,10 @@ fn t_object_wait() -> bool {
     let waited = apic::with_interrupts(|| sched::wait_for_task(g, crate::clock::window_cycles(40)));
     let rel0 = sched::reap_released();
     let _ = sched::terminate_task(g);
-    let drained = sched::reap_released() > rel0 || drain_reap();
+    // P6c：回收变确定之后，工人可能在窗口里就已经被收掉了 ⇒ 这里再等"释放数涨"会等不到。
+    // 判据的意图是"它的资源已经交回去了"，所以**槽已 Free** 同样算数（不是放宽，是换成等价证据）。
+    let drained = sched::reap_released() > rel0 || drain_reap()
+        || sched::state_of(g) == sched::TaskState::Free;
     if !was_running { apic::timer_stop().ok(); }
     let r: [u64; 16] = core::array::from_fn(|i| WAIT_SYS[i].load(core::sync::atomic::Ordering::Acquire));
     if r[15] != 0 {
@@ -2512,7 +2515,7 @@ fn t_vmo_syscalls() -> bool {
         sched::wait_for_task(g, crate::clock::window_cycles(8))
     });
     let _ = sched::terminate_task(g);
-    let drained = sched::reap_released() > rel0 || drain_reap();
+    let drained = crate::ktests::common::drained_or_free(rel0, g);
     if !was_running {
         crate::arch::x86_64::apic::timer_stop().ok();
     }

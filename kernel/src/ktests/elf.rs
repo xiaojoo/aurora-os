@@ -742,7 +742,7 @@ fn t_probe_ring3() -> bool {
     // A 的实验格上面已经读走，所以这里收掉它不影响判据。
     let rel_a = sched::reap_released();
     let _ = sched::terminate_task(t);
-    let drained_a = sched::reap_released() > rel_a || crate::ktests::common::drain_reap();
+    let drained_a = crate::ktests::common::drained_or_free(rel_a, t);
     let loaded2 = match user::load(PROBE_ELF) {
         Ok(l) => l,
         Err(e) => { crate::log_fatal!("probe2: 加载失败 —— {}", user::describe_load(e)); return false; }
@@ -846,7 +846,7 @@ fn t_probe_ring3() -> bool {
     let runs_before = sched::runs_of(cg);
     let rel_p = sched::reap_released();
     let _ = sched::terminate_task(t2);
-    let drained_p = sched::reap_released() > rel_p || crate::ktests::common::drain_reap();
+    let drained_p = crate::ktests::common::drained_or_free(rel_p, t2);
     // 给子进程一个真会跑起来的机会：它停在 `jmp .`，只要代码页还在就该继续被调度
     apic::timer_start().ok();
     apic::with_interrupts(|| {
@@ -869,8 +869,7 @@ fn t_probe_ring3() -> bool {
     if cg != usize::MAX {
         let _ = sched::terminate_task(cg);
     }
-    let drained = drained_a && drained_p
-        && (sched::reap_released() > rel0 || crate::ktests::common::drain_reap());
+    let drained = drained_a && drained_p && crate::ktests::common::drained_or_free(rel0, cg);
     // 子线程被杀 ⇒ terminate_task 给进程记了收工（退出码 1）⇒ 走 reap 而不是 discard
     let preaped = pid != u16::MAX && crate::proc::proc_reap(pid).is_ok();
     let jdel = crate::proc::job_destroy(job).is_ok();

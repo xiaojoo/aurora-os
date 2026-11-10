@@ -31,6 +31,16 @@ pub(crate) const P7_CALLS: u64 = 32;
 /// 为什么需要它而不是在测试里直接释放：正在 CPU 上跑的那个任务的映射**不能**由它自己解映射
 /// （rsp 就在里面）。回收只发生在"本 CPU 上跑的已经不是它"的那一刻，
 /// 而那一刻的唯一来源是中断出口路过 `preempt_point` ⇒ 想回收就得开一次窗口让 tick 进来。
+/// "它的资源已经交回去了"的判据（P6c）。**回收时刻确定之后**，释放可能发生在观测窗口之前，
+/// 所以只要求"释放数在窗口内涨"会假红（实测 `released=1→1` 而槽早已 Free）。
+/// 三个等价证据按代价从低到高排：增量已在 → 槽已归化成 Free → 才烧 `drain_reap` 那个窗口。
+/// 槽已 Free 是充分证据：`reap` 是**先释放资源、再标 Free** 的，所以 Free 蕴含释放已发生。
+pub(crate) fn drained_or_free(rel0: u64, g: usize) -> bool {
+    crate::sched::reap_released() > rel0
+        || crate::sched::state_of(g) == crate::sched::TaskState::Free
+        || drain_reap()
+}
+
 pub(crate) fn drain_reap() -> bool {
     // **等的是"回收发生了"，不是"过了多少毫秒"**。第一版这里写的是固定时长 30M 周期
     // (≈9 ms)，而 tick 的周期是 10 ms —— 于是一轮 tick 都可能进不来，

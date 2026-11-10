@@ -1576,6 +1576,11 @@ static TASK_WAITERS: [TaskWaiter; TASK_WAIT_SLOTS] = [const {
 }; TASK_WAIT_SLOTS];
 
 static TASK_WAKE_PENDING: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// 当前**已武装**的等待者数（P6c）。有了它，`task_wake_tick` 在"没人等待"时只做一次 Acquire 读，
+/// 不再每圈扫 8 个槽——那是 P6a 记在 `p4-tolerance.md` 上的成本账（抢占点与 idle 每圈都扫）。
+/// 只数 ARMED 状态的进出：登记时 +1，被信号/超时唤醒时 -1；调用方自己读走结果那一支不减
+/// （它离开 ARMED 是在登记之后立刻查条件成立那条路，那里也要减，见 task_wait_take）。
+static TASK_ARMED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 static TASK_WAIT_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 /// 观测计数：登记过几次、被信号唤醒几次、超时几次、槽满拒过几次。
 /// 没有这四个数，"等待真的阻塞过"只能指着一句"返回了 true"空谈。
@@ -1615,6 +1620,10 @@ pub fn task_wait_signal(kind: u8, target: u32, observed: u32) {
 /// 这里可以取 RUNQ（`wake_task` 内部取），因为被中断的上下文不可能持锁（同 `wheel_tick` 的论证）。
 fn task_wake_tick() -> bool {
     use core::sync::atomic::Ordering as O;
+    // 没人武装也没有待唤醒 ⇒ 一次读就返回（这是 idle 与每个抢占点都要走的热路径）
+    if TASK_ARMED.load(O::Acquire) == 0 && TASK_WAKE_PENDING.load(O::Acquire) == 0 {
+        return false;
+    }
     if TASK_WAKE_PENDING.load(O::Acquire) == 0 {
         // 没有信号也要看超时：超时是时间到了，不是谁发布的
         let now = crate::tsc::now();
@@ -1640,6 +1649,8 @@ fn task_wake_tick() -> bool {
             w.observed.store(0, O::Relaxed);
             TW_TIMEOUTS.fetch_add(1, O::Relaxed);
         }
+        // 离开 ARMED（被信号或被超时唤醒）⇒ 计数减一
+        TASK_ARMED.fetch_sub(1, O::AcqRel);
         let gidx = w.waiter.load(O::Relaxed) as usize;
         let tok = crate::sync::WaitToken { queue: TASK_QID, seq: w.seq.load(O::Relaxed) };
         // 先标已唤醒再 wake：wake 之后调用方可能立刻跑起来并读 observed/释放槽位
@@ -1670,6 +1681,7 @@ fn task_wait_register(kind: u8, target: u32, me: usize, deadline: u64) -> Option
             w.deadline.store(deadline, O::Relaxed);
             w.observed.store(0, O::Relaxed);
             w.state.store(TW_ARMED, O::Release);
+            TASK_ARMED.fetch_add(1, O::AcqRel);
             TW_REGISTERED.fetch_add(1, O::Relaxed);
             return Some((i, crate::sync::WaitToken { queue: TASK_QID, seq }));
         }
@@ -1683,7 +1695,11 @@ fn task_wait_take(slot: usize) -> Option<u32> {
     use core::sync::atomic::Ordering as O;
     let w = &TASK_WAITERS[slot];
     let v = w.observed.load(O::Acquire);
-    w.state.store(TW_FREE, O::Release);
+    // 只有"还停在 ARMED 就被调用方收走"这一支需要减计数（查条件已成立、没睡成那条路）；
+    // 已经被 drain 标成 WOKEN 的那一支在 drain 里减过了，这里再减就会下溢。
+    if w.state.swap(TW_FREE, O::AcqRel) == TW_ARMED {
+        TASK_ARMED.fetch_sub(1, O::AcqRel);
+    }
     Some(v)
 }
 
@@ -1844,6 +1860,13 @@ pub fn finish_current() {
         crate::proc::proc_thread_exited(pid, 0);
     }
     my_rq().tasks[slot_of(me)].state = TaskState::Done;
+    // P6c（ADR-071 决策 2 的"确定回收时刻"）：**正常收工也要登记待收**。
+    // 原来只有 `kill_current` 登记，而 `reap` 在 REAP_PENDING 为 0 时直接返回 ⇒
+    // 正常收工的槽要等别人去 kill/exit 才被顺手收掉，这就是"有效容量 5/9"那笔欠账的成因
+    // （改前实测 `本CPU先占=4(其中Done待收=2)`）。登记之后回收时刻是确定的：
+    // 下一次"本 CPU 跑的不是它"的抢占点。此刻它还是 current，所以 reap 会把它记成 waiting
+    // 而保持计数非零，换人之后那一轮才真收 —— 不是立刻收，也不靠运气。
+    REAP_PENDING[cpu_of(me)].fetch_add(1, Ordering::AcqRel);
     // P6a：**先置 signal 再发布等待者**。这里只原子写，真唤醒在抢占点的 need 闸之后做
     // （收工出口可能在持锁的故障路径上）。M38 实测：把这两句的顺序调换**仍然全绿**——
     // 因为唤醒是延迟到抢占点的，drain 跑起来时两句都已执行完 ⇒ 顺序在本设计里不可观测。

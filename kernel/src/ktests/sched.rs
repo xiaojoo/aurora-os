@@ -100,7 +100,12 @@ fn t_preempt_round_robin() -> bool {
         sched::stop_workers();
         // 收工标志要真的落到 Done 状态上：工人得再被调度到一次才会去检查它
         let t1 = tsc::now();
-        while (sched::state_of(w1) != sched::TaskState::Done || sched::state_of(w2) != sched::TaskState::Done)
+        // P6c：收工之后槽可能已经被回收成 Free（回收时刻从此是确定的），所以判"收工了"
+        // 要接受 Done **或** Free；只认 Done 会在回收变快之后永远等不到 ⇒ 挂死。
+        let done_or_free = |g: usize| {
+            matches!(sched::state_of(g), sched::TaskState::Done | sched::TaskState::Free)
+        };
+        while (!done_or_free(w1) || !done_or_free(w2))
             && tsc::now() - t1 < 400_000_000
         {
             sched::WORK[0].fetch_add(1, Ordering::Relaxed);
@@ -137,7 +142,12 @@ fn t_preempt_round_robin() -> bool {
     let all_worked = boot1 > boot0
         && sched::WORK[w1].load(Ordering::Relaxed) > 0
         && sched::WORK[w2].load(Ordering::Relaxed) > 0;
-    let resumed = sched::runs_of(w1) >= 1 && sched::runs_of(w2) >= 1;
+    // P6c：回收时刻确定之后，槽可能已经被归化成 Free，而 `reap` 会清 `runs`
+    // （"身份随槽走"的既有设计）⇒ 回收之后读 `runs_of` 读到的是**下一任住户**的数或 0，
+    // 这条断言就不再有意义。"两个工人都真被换上去跑过"的**幸存证据**是它们自己加的 WORK 计数
+    // （工人跑起来才加），所以改读它；判据的意图没变，只是换成回收后仍然可读的那一份。
+    let resumed = sched::WORK[w1].load(Ordering::Relaxed) > 0
+        && sched::WORK[w2].load(Ordering::Relaxed) > 0;
     let p1_sane = n > 0 && min <= mean && mean <= max && mean > 0;
     let second_window = tick_b >= tick_a + 2;
     crate::log_info!(
@@ -1979,6 +1989,11 @@ fn t_q2_workload_slots() -> bool {
         }
     }
     let cap_ok = ok_n + refused == total_req;
+    // P6c：Done 槽的回收时刻确定之后（`finish_current` 也登记待收），**参考 workload 应当全装得下**。
+    // 改前实测 `请求=7 成功=5 拒绝=2 本CPU先占=4(其中Done待收=2)`——那 2 格就是欠账的容量代价。
+    // 所以判据从"守恒"（成功+拒绝==请求，欠账时也绿）收紧成"7 条全成功"，
+    // 并把 `Done待收` 留在读数里当证人。负样本：把 finish_current 那句登记去掉 ⇒ 本格红。
+    let full_ok = ok_n == total_req;
 
     // 时钟：本条的推进**不靠** tick（工人与采样环都靠让出换人，见 `q2_worker`/`q2_sample`）；
     // 探测一次并自己开关，是为了让后面 `drain_reap` 那一步有 tick 可等——
@@ -2032,7 +2047,10 @@ fn t_q2_workload_slots() -> bool {
     let done_ok = ended == ok_n && reaped + rolled_back == shapes.len();
 
     // 先看增量再决定要不要烧窗口，理由同 `t_proc_job_wait` 那条（`-d int` 行的墙钟预算）。
-    let drained = sched::reap_released() > rel0 || drain_reap();
+    // P6c：回收变确定之后释放可能早于窗口，所以"全部槽已 Free"也是等价证据
+    // （`reap` 先释放资源再标 Free）。逐个看比只看计数稳：计数可能已被别的用例的回收涨过。
+    let all_free = (0..ok_n).all(|i| sched::state_of(gids[i]) == sched::TaskState::Free);
+    let drained = sched::reap_released() > rel0 || all_free || drain_reap();
     let jd = proc::job_destroy(job);
     let (pc1, _) = proc::proc_residual();
     let (jc1, _) = proc::job_residual();
@@ -2050,14 +2068,14 @@ fn t_q2_workload_slots() -> bool {
     let baseline_ok = drained && jd.is_ok() && pc1 == 0 && jc1 == 0 && active1 == act0;
 
     crate::log_info!(
-        "q2(P3): 请求={} 成功={} 拒绝={} 峰值同活={} active基线={} active峰值={} 收工={} 收尸={} 回滚={} 每CPU槽上限={} 本CPU先占={}(其中Done待收={}) 参考需线程+boot+idle={} 回基线=(drained{} free{}->{} va{}->{} active{})",
+        "q2(P3): 请求={} 成功={} 拒绝={} 峰值同活={} active基线={} active峰值={} 收工={} 收尸={} 回滚={} 全装得下={} 每CPU槽上限={} 本CPU先占={}(其中Done待收={}) 参考需线程+boot+idle={} 回基线=(drained{} free{}->{} va{}->{} active{})",
         total_req, ok_n, refused, peak_live, act0, peak_active, ended, reaped, rolled_back,
-        sched::MAX_TASKS, slots_used0, slots_done0, total_req + 2, drained, f0, f1, va0, va1, active1);
-    let ok = cap_ok && peak_ok && done_ok && rollback_ok && baseline_ok;
+        full_ok, sched::MAX_TASKS, slots_used0, slots_done0, total_req + 2, drained, f0, f1, va0, va1, active1);
+    let ok = cap_ok && full_ok && peak_ok && done_ok && rollback_ok && baseline_ok;
     if !ok {
         crate::log_fatal!(
-            "q2: 判据不成立 cap={} peak={} done={} rollback={} baseline={}",
-            cap_ok, peak_ok, done_ok, rollback_ok, baseline_ok);
+            "q2: 判据不成立 cap={} full={} peak={} done={} rollback={} baseline={}",
+            cap_ok, full_ok, peak_ok, done_ok, rollback_ok, baseline_ok);
     }
     ok
 }
