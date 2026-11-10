@@ -98,6 +98,7 @@ def gpt_facts(d: bytes) -> dict[str, str]:
         last = struct.unpack_from("<Q", e, 40)[0]
         f[f"part{used}_index"] = str(i)
         f[f"part{used}_type"] = tg.hex()
+        f[f"part{used}_unique"] = e[16:32].hex()
         f[f"part{used}_first"] = str(first)
         f[f"part{used}_last"] = str(last)
         if tg == ESP_TYPE_GUID and not esp_done:

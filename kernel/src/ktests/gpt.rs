@@ -267,13 +267,101 @@ fn synthetic() -> bool {
     ok
 }
 
-/// ADR-078 / W4 S1：GPT 只读解析。**两部分都必须成立**——真盘证"读得出来"，
-/// 合成盘证"每道闸真会咬"。宿主机对账行与六条改盘负样本是下一刀，本轮不宣称已对账。
+/// GPT 夹具盘挂哪个口。**与 `tools/aurora.py` 的 `GPT_FIX_PORT` 由门禁逐字对账**。
+/// 为什么负样本落在夹具盘而不是引导盘（实测）：OVMF/EDK2 启动时会用备份 GPT 把主表修回原值
+/// （数组首字节 0x29 改下去、跑完读回 0x28），四条注入根本到不了内核；另两条固件治不好 ⇒ NOBOOT。
+/// 这块盘固件永远不碰，所以改它才证得到内核那道闸。
+const GPT_FIX_PORT: u8 = 1;
+
+/// 夹具盘上第二条分区的 type GUID（`0FC63DAF-8483-4772-8E79-3D69D8477DE4`，混合端序）。
+/// 它存在的唯一理由是**反空转**：只放一条 ESP 的话，"按 GUID 找对了"与"返回了第一条"长得一样。
+const DATA_TYPE_GUID: [u8; 16] = [
+    0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47, 0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47, 0x7D, 0xE4,
+];
+
+/// 夹具盘那一半：六条改盘负样本的载体。读数打给宿主机独立对账；
+/// 判据只判结构性质（两条都在可用区间内、互不重叠、按两个 GUID 各找到各自那一条），
+/// **不写死 first/last 的具体值**——那两个数由宿主机从盘上重算，写死就退化成一台仪器。
+fn fixture_disk() -> bool {
+    if ahci::init().is_err() {
+        crate::log_fatal!("gptfix: AHCI 认领失败，没有块设备可读");
+        return false;
+    }
+    let disk = AhciDisk { port: GPT_FIX_PORT };
+    let mut calls = 0u32;
+    let mut esp: Option<gpt::Entry> = None;
+    let mut data: Option<gpt::Entry> = None;
+    let table = match gpt::scan(&disk, &mut |e| {
+        calls += 1;
+        if e.type_guid == gpt::ESP_TYPE_GUID && esp.is_none() {
+            esp = Some(*e);
+        }
+        if e.type_guid == DATA_TYPE_GUID && data.is_none() {
+            data = Some(*e);
+        }
+    }) {
+        Ok(t) => t,
+        Err(err) => {
+            // 注入就是要让它走到这里：**拒因必须点名**，宿主机证人按这个名字核。
+            crate::log_fatal!("gptfix: 扫描被拒 口{} 拒因={:?}", GPT_FIX_PORT, err);
+            return false;
+        }
+    };
+    let h = &table.header;
+    crate::log_info!(
+        "gptfix: 头 口{} revision={:#010x} header_size={} my_lba={} alternate_lba={} first_usable={} last_usable={} entry_lba={} entry_count={} entry_size={} header_crc={:#010x} array_crc={:#010x}",
+        GPT_FIX_PORT, h.revision, h.header_size, h.my_lba, h.alternate_lba, h.first_usable, h.last_usable,
+        h.entry_lba, h.entry_count, h.entry_size, h.header_crc, h.array_crc
+    );
+    crate::log_info!(
+        "gptfix: 表 扫过={} 非空={} 回调={} 数组字节={} 自算CRC={:#010x} 备份my_lba={} 备份alternate_lba={} disk_guid={:02x?}",
+        table.entries_seen, table.used, calls, table.array_bytes, table.array_crc,
+        table.backup.my_lba, table.backup.alternate_lba, h.disk_guid
+    );
+    let (e, d) = match (esp, data) {
+        (Some(e), Some(d)) => (e, d),
+        _ => {
+            crate::log_fatal!(
+                "gptfix: 两个 GUID 没各找到一条 ESP={} DATA={}（夹具只放一条就证不出查找不是返回第一条）",
+                esp.is_some(), data.is_some()
+            );
+            return false;
+        }
+    };
+    crate::log_info!(
+        "gptfix: ESP 序号={} first={} last={} attrs={:#x} type={:02x?} unique={:02x?}",
+        e.index, e.first_lba, e.last_lba, e.attrs, e.type_guid, e.unique_guid
+    );
+    crate::log_info!(
+        "gptfix: 另一条 序号={} first={} last={} attrs={:#x} type={:02x?} unique={:02x?}",
+        d.index, d.first_lba, d.last_lba, d.attrs, d.type_guid, d.unique_guid
+    );
+    let in_range = |x: gpt::Entry| x.first_lba >= h.first_usable && x.last_lba <= h.last_usable && x.first_lba <= x.last_lba;
+    let disjoint = e.last_lba < d.first_lba || d.last_lba < e.first_lba;
+    let find_esp_ok = matches!(gpt::find_esp(&disk), Ok(Some(x)) if x.index == e.index && x.first_lba == e.first_lba);
+    let find_data_ok = matches!(gpt::find_by_type(&disk, &DATA_TYPE_GUID), Ok(Some(x)) if x.index == d.index);
+    let ok = calls == table.used && table.used == 2 && table.entries_seen == h.entry_count
+        && in_range(e) && in_range(d) && disjoint && e.index != d.index && find_esp_ok && find_data_ok;
+    crate::log_info!(
+        "gptfix: 判据 回调与非空同数={} 两条={} 扫过等于头说的={} 都在可用区间={} 互不重叠={} 序号不同={} 按ESP_GUID找对={} 按DATA_GUID找对={}",
+        calls == table.used, table.used == 2, table.entries_seen == h.entry_count,
+        in_range(e) && in_range(d), disjoint, e.index != d.index, find_esp_ok, find_data_ok
+    );
+    if !ok {
+        crate::log_fatal!("gptfix: 判据不成立（上面四行是全部读数）");
+    }
+    ok
+}
+
+/// ADR-078 / W4 S1：GPT 只读解析。**三部分都必须成立**——真盘证"读得出来"，
+/// 合成盘证"每道闸真会咬"，夹具盘是六条改盘负样本的载体（固件不碰它）。
+/// 宿主机对账由 `validate_esp.py --report` 做（矩阵行 `GPT分区表与宿主机对账`）。
 #[cfg(feature = "gpt-probe")]
 fn t_gpt() -> bool {
     let real = real_disk();
     let synth = synthetic();
-    real && synth
+    let fix = fixture_disk();
+    real && synth && fix
 }
 #[cfg(feature = "gpt-probe")]
 ktest!(KT_GPT, t_gpt);

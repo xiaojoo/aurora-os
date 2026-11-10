@@ -279,6 +279,36 @@ VBLK = BUILD / "virtio-disk.qcow2"
 VBLK_MIB = 64
 VBLK_PATTERN = 0x5C
 VBLK_FEATURES = {"virtio-blk", "virtio-msix-probe"}
+# W4 S1（ADR-078 决策 7）：GPT 解析用例的夹具盘。**为什么负样本不改引导盘**（实测出来的）：
+# OVMF/EDK2 启动时会**用备份 GPT 把主表修回原值**（数组首字节 0x29 改下去、跑完读回 0x28），
+# 所以"数组 CRC/头 CRC/entry_count/备份不一致"四条注入根本到不了内核（实测都 PASS(33)）；
+# 另两条（保护性 MBR 类型 0xEE→0x0C、ESP first_lba+重算 CRC）固件治不好 ⇒ **NOBOOT**，连内核都起不来。
+# 六条因此必须落在一块**固件永远不会碰**的盘上：口 1，只在 gpt-probe 档挂。
+GPT_FIX = BUILD / "gpt-fixture.img"
+GPT_FIX_PORT = 1
+GPT_FEATURES = {"gpt-probe"}
+# 配方指纹：由 tools/make_gpt_disk.py 现算（盘里没有文件系统，所以不需要 mtools）。
+# 与 FAT 那两块同一规矩：夹具跟着"要挂这块盘"走，每跑重造并核指纹，注入的寿命就是一跑。
+GPT_FIX_BYTES = 4194304
+GPT_FIX_SHA256 = "bbf0e999a6de7eb1dc03195daa875cfd73ffb7a9d2d02ed7e24d9e059d8feceb"
+# 六条宿主机侧改盘注入（ADR-078 决策 7）。**不是 cargo 特性**：负样本用的就是正向那一跑的
+# 同一个 ELF，只有盘不同（理由与 FAT_HOST_FAULTS 那段逐字相同）。值 = 串口里必须点名的拒因；
+# 空串那条特殊：内核必须**绿**，红在宿主机对账上（证"对账能分辨"而不是"解析能拒"）。
+GPT_HOST_FAULTS = {
+    "fault-gpt-array-crc": "ArrayCrc",
+    "fault-gpt-header-crc": "HeaderCrc",
+    "fault-gpt-mbr-type": "NoProtectiveMbr",
+    "fault-gpt-entry-count": "TooManyEntries",
+    "fault-gpt-esp-first": "",
+}
+# 第六条（备份头与主表不一致）**做不成改盘负样本，这是实测结论不是偷懒**：
+# 只要有一份表是好的，EDK2 就拿它修另一份（跑完盘回到 pristine）；两份都好但字段不一致时
+# 它挑主表、重写备份 ⇒ 内核读到的永远是一致的两份。该闸由**同一份 ELF 里的合成盘**证到
+# （ktests/gpt.rs 那 16 格之一，点名 BackupMismatch）。名字留在这里当账，免得下次有人再试一遍。
+GPT_FAULT_UNDELIVERABLE = {
+    "fault-gpt-backup-mismatch": "固件必然治愈（实测跑完回到 pristine）⇒ 由合成盘证，不做改盘行",
+}
+GPT_RECIPE = BUILD / "gpt-fixture-recipe.img"
 
 # L3-C①：两块只读 FAT32 卷，挂在 AHCI 的口 3 与口 4。这两个数不是一串参数而是一张**对账表**：
 # 内核 `ktests/fs.rs` 里写死 `FAT_PORT_A`/`FAT_PORT_B`，宿主机写死在下面的 `FAT_PORTS`，两边由门禁
@@ -431,6 +461,28 @@ def make_vblk() -> list[str]:
     cmd = f"write -P 0x{VBLK_PATTERN:02x} 0 512"
     if sh([str(TOOLS / "qemu" / "qemu-io.exe"), "-f", "qcow2", "-c", cmd, str(VBLK)]) != 0:
         return ["qemu-io 写不进 virtio 盘的图案"]
+    return []
+
+
+def make_gpt_fixture() -> list[str]:
+    """现算那块 GPT 夹具盘并核指纹（与 make_fat_volumes 同一规矩：先核 pristine 再谈注入）。
+
+    每跑重造，所以注入的寿命就是一跑；指纹不符就红在跑之前，而不是跑完之后对着一行 FAIL 猜。
+    """
+    import hashlib
+    r = subprocess.run([sys.executable, str(ROOT / "tools" / "make_gpt_disk.py"), str(GPT_FIX)],
+                       capture_output=True, text=True, encoding="utf-8", env=env())
+    if r.returncode != 0:
+        return [f"make_gpt_disk.py 退出 {r.returncode}：{r.stderr.strip()[:200]}"]
+    if not GPT_FIX.exists():
+        return ["GPT 夹具盘没造出来"]
+    data = GPT_FIX.read_bytes()
+    if len(data) != GPT_FIX_BYTES:
+        return [f"GPT 夹具盘 {len(data)} 字节，配方说 {GPT_FIX_BYTES}"]
+    got = hashlib.sha256(data).hexdigest()
+    if got != GPT_FIX_SHA256:
+        return [f"GPT 夹具指纹不符：{got} != {GPT_FIX_SHA256}"
+                "（配方改了？那要连用例与对账的期望一起重量，不是把指纹改过去就算）"]
     return []
 
 
@@ -1379,6 +1431,23 @@ def check_fat32_ports() -> list[str]:
     for port, name in sorted(FAT_PORTS.items()):
         if port in taken:
             bad.append(f"口 {port} 已被 {taken[port]} 占用，却又要挂 {name}")
+    # W4 S1（ADR-078 决策 7）：GPT 夹具盘的口号同样两处各写一份，必须机器对账。
+    # 它**不能**撞引导盘（口 0）——负样本的全部意义就在于"改的是一块固件不碰的盘"，
+    # 撞上去就回到实测过的那个死路：EDK2 用备份表把主表修回去，注入到不了内核。
+    gsrc = (ROOT / "kernel" / "src" / "ktests" / "gpt.rs").read_text(encoding="utf-8")
+    gm = re.search(r"const GPT_FIX_PORT: u8 = (\d+);", gsrc)
+    if gm is None:
+        bad.append("ktests/gpt.rs 里找不到模块层的 `const GPT_FIX_PORT`（挪进函数体了？两处各写一份就会分家）")
+    elif int(gm.group(1)) != GPT_FIX_PORT:
+        bad.append(f"GPT 夹具盘口号：内核用 {gm.group(1)}，本脚本 GPT_FIX_PORT={GPT_FIX_PORT}")
+    if GPT_FIX_PORT in taken or GPT_FIX_PORT in FAT_PORTS:
+        bad.append(f"GPT 夹具盘口 {GPT_FIX_PORT} 与引导盘/scratch/FAT 卷撞了 ⇒ 改它会动到别人")
+    gfeats = (ROOT / "kernel" / "Cargo.toml").read_text(encoding="utf-8")
+    for f in sorted(GPT_FEATURES):
+        if not re.search(rf"^{f} = ", gfeats, re.M):
+            bad.append(f"Cargo.toml 的 [features] 里没有 {f}，本脚本却按它挂 GPT 夹具盘")
+    if not (ROOT / "tools" / "make_gpt_disk.py").exists():
+        bad.append("缺 tools/make_gpt_disk.py：GPT 夹具盘的配方不在位")
 
     feats = (ROOT / "kernel" / "Cargo.toml").read_text(encoding="utf-8")
     for f in sorted(FAT_FEATURES):
@@ -1427,6 +1496,42 @@ def check_fat32_ports() -> list[str]:
             bad.append(f"{f}: 现值与新值都是 {old.hex()} ⇒ 这条注入是空转")
         if not 0 <= off < FAT_EXPECT[name][0]:
             bad.append(f"{f}: 算出的镜像偏移 {off} 不在 {name} 的 {FAT_EXPECT[name][0]} 字节之内")
+
+    # GPT 那六条宿主机侧注入查同样的**反面**，外加"现在就定位得出来"（与 FAT 那六行同一纪律）。
+    gpt_ktest = (ROOT / "kernel" / "src" / "ktests" / "gpt.rs").read_text(encoding="utf-8")
+    gpt_mod = (ROOT / "kernel" / "src" / "filesystem" / "gpt.rs").read_text(encoding="utf-8")
+    for f in sorted(GPT_HOST_FAULTS):
+        if re.search(rf"^{f} = ", feats, re.M):
+            bad.append(f"Cargo.toml 里有 {f}：宿主机侧注入不该是构建变量（改了它 ELF 就变了，"
+                       "「只有盘不同」这句话就不再成立）")
+        for rel, text in (("kernel/src/ktests/gpt.rs", gpt_ktest), ("kernel/src/filesystem/gpt.rs", gpt_mod)):
+            if f'feature = "{f}"' in text:
+                bad.append(f"{rel} 里出现了 `feature = \"{f}\"`：这是宿主机侧注入，内核不该有落点")
+        try:
+            want = gpt_fault_image(f)
+            edits, _seal = gpt_host_fault_plan(f)
+        except ValueError as e:
+            bad.append(f"{f} 注入点定位不成：{e}")
+            continue
+        for at, old, new in edits:
+            if old == new:
+                bad.append(f"{f}: 现值与新值都是 {old.hex()} ⇒ 这条注入是空转")
+            if not 0 <= at < GPT_FIX_BYTES:
+                bad.append(f"{f}: 算出的偏移 {at} 不在夹具盘的 {GPT_FIX_BYTES} 字节之内")
+        if want == gpt_recipe_bytes():
+            bad.append(f"{f}: 计划改完之后与配方一字节不差 ⇒ 这条注入是空转")
+    # 做不成改盘的那一条也要有机器看着：不许有人把它悄悄加回可注入表（那会多一行永远绿的判定），
+    # 也不许把它做成 cargo 特性绕过"只有盘不同"这条纪律。
+    for f, why in sorted(GPT_FAULT_UNDELIVERABLE.items()):
+        if f in GPT_HOST_FAULTS:
+            bad.append(f"{f} 实测做不成改盘注入（{why}），却又出现在 GPT_HOST_FAULTS 里")
+        if re.search(rf"^{f} = ", feats, re.M):
+            bad.append(f"Cargo.toml 里有 {f}：做不成改盘就不许改成构建变量绕过纪律")
+        try:
+            gpt_host_fault_plan(f)
+            bad.append(f"{f} 的 planner 竟然定位成功了 ⇒ 与『做不成』的账不符，要重新量")
+        except ValueError:
+            pass
 
     # 内核读哪几个文件 = 这台仪器核哪几个文件。两处各写一遍就会分家，而分家的表现是
     # "对账核的是另一个对象"——那种绿比红更贵。名字表按 want_a 再 want_b 的顺序比。
@@ -1595,10 +1700,13 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
         sys.exit(f"QEMU 未就位：{QEMU}")
     # 宿主机侧注入不是特性（见 FAT_HOST_FAULTS 那一段）：它改盘，不改构建。
     # 两道前置闸都在这里，因为"改了盘却没人读它"与"注入名写错了"都表现为一跑看不出成因的红。
-    if host_fault and host_fault not in FAT_HOST_FAULTS:
-        sys.exit(f"不认识的宿主机侧注入：{host_fault}（有的那些：{sorted(FAT_HOST_FAULTS)}）")
-    if host_fault and not (FAT_DISK_FEATURES & set(features)):
+    if host_fault and host_fault not in FAT_HOST_FAULTS and host_fault not in GPT_HOST_FAULTS:
+        sys.exit(f"不认识的宿主机侧注入：{host_fault}"
+                 f"（有的那些：{sorted([*FAT_HOST_FAULTS, *GPT_HOST_FAULTS])}）")
+    if host_fault in FAT_HOST_FAULTS and not (FAT_DISK_FEATURES & set(features)):
         sys.exit(f"{host_fault} 改的是 FAT32 卷，这一跑却没带任何挂盘的特性 ⇒ 改了也没人读")
+    if host_fault in GPT_HOST_FAULTS and not (GPT_FEATURES & set(features)):
+        sys.exit(f"{host_fault} 改的是 GPT 夹具盘，这一跑却没带 gpt-probe ⇒ 改了也没人读")
     ensure_image(features)
     if SCRATCH_FEATURES & set(features):
         # 第二块盘每次重造：写方向那条判据（写完前后的哈希必须不同）要求目标区
@@ -1626,6 +1734,16 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
             bad = apply_fat_host_fault(host_fault)
             if bad:
                 sys.exit("FAT32 宿主机侧注入不成立：" + " / ".join(bad))
+    if GPT_FEATURES & set(features):
+        # 与 scratch/virtio/FAT 同一条规矩：夹具跟着"要挂这块盘"走，每跑重造并核指纹。
+        bad = make_gpt_fixture()
+        if bad:
+            sys.exit("GPT 夹具盘不成立：" + " / ".join(bad))
+        # 注入必须在**核完指纹之后**改盘（与 FAT 那条顺序同一理由）。
+        if host_fault in GPT_HOST_FAULTS:
+            bad = apply_gpt_host_fault(host_fault)
+            if bad:
+                sys.exit("GPT 宿主机侧注入不成立：" + " / ".join(bad))
     SERIAL_LOG.unlink(missing_ok=True)
     code, tpl = ovmf_files()
     # vars 每次从模板重拷：上一次运行写入的 NVRAM 启动项不该影响本次判定（可复现）
@@ -1654,6 +1772,11 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
         # 不同，接反了内容对账当场红）。
         for port, name in sorted(FAT_PORTS.items()):
             cmd += ["-drive", f"if=ide,index={port},format=raw,file={FAT_IMG[name]}"]
+    if GPT_FEATURES & set(features):
+        # 口号映射沿用上面那条**实测过**的关系（`if=ide,index=N` 落在 ich9-ahci 的口 N）。
+        # 这块盘固件不会去读它（不是引导盘、也没有 ESP 里的 BOOTX64.EFI），所以改它不会
+        # 触发 EDK2 那套"用备份表修主表"的治愈行为——六条负样本正是靠这一点才到得了内核。
+        cmd += ["-drive", f"if=ide,index={GPT_FIX_PORT},format=raw,file={GPT_FIX}"]
     if VBLK_FEATURES & set(features):
         # `if=none` + 显式 `virtio-blk-pci`：这台设备的寄存器布局由 PCI 能力链说，
         # 不像 ide 那样被 q35 的 AHCI 吃掉槽位。地址不写死，让 QEMU 自己挑空槽——
@@ -4826,6 +4949,315 @@ def check_probe_elf(log: str) -> list[str]:
     return bad
 
 
+def gpt_host_report(path: Path) -> tuple[dict[str, str], list[str]]:
+    """调**独立那一台**（validate_esp.py --report）从指定盘重算 GPT 事实。
+
+    它不 import 内核、也不 import esp_image 的写表常量；这里只负责把它的 key=value 收回来，
+    并守住"这台仪器自己空转/崩了"两种情况——都不许当成"对上了"。
+    """
+    if not path.exists():
+        return {}, [f"盘不在：{path}（对账必须吃同一跑的那块盘）"]
+    out = subprocess.run(
+        [sys.executable, str(ROOT / "tools" / "validate_esp.py"), str(path), "--report"],
+        capture_output=True, text=True, encoding="utf-8", env=env())
+    if out.returncode != 0:
+        return {}, [f"validate_esp.py --report 退出 {out.returncode}：{out.stderr.strip()[:200]}"]
+    host = dict(ln.split("=", 1) for ln in out.stdout.splitlines() if "=" in ln)
+    if len(host) < 20:
+        return {}, [f"宿主机只解析出 {len(host)} 个字段（应当 >= 20）⇒ 这台仪器自己空转了"]
+    return host, []
+
+
+def check_gpt_fixture(log: str) -> list[str]:
+    """夹具盘（口 1）那一半的对账：六条改盘负样本的载体，正向跑必须与宿主机逐格相同。
+
+    与引导盘那一半分开比，因为两块盘的几何与分区数不同（夹具盘故意放**两条不同类型**的分区，
+    只放一条的话"按 GUID 找对了"与"返回了第一条"长得一样）。
+    """
+    bad: list[str] = []
+    mh = re.search(
+        r"gptfix: 头 口(\d+) revision=(0x[0-9a-f]+) header_size=(\d+) my_lba=(\d+) "
+        r"alternate_lba=(\d+) first_usable=(\d+) last_usable=(\d+) entry_lba=(\d+) "
+        r"entry_count=(\d+) entry_size=(\d+) header_crc=(0x[0-9a-f]+) array_crc=(0x[0-9a-f]+)", log)
+    mt = re.search(
+        r"gptfix: 表 扫过=(\d+) 非空=(\d+) 回调=(\d+) 数组字节=(\d+) 自算CRC=(0x[0-9a-f]+) "
+        r"备份my_lba=(\d+) 备份alternate_lba=(\d+) disk_guid=\[([0-9a-f, ]+)\]", log)
+    me = re.search(
+        r"gptfix: ESP 序号=(\d+) first=(\d+) last=(\d+) attrs=(0x[0-9a-f]+) "
+        r"type=\[([0-9a-f, ]+)\] unique=\[([0-9a-f, ]+)\]", log)
+    md = re.search(
+        r"gptfix: 另一条 序号=(\d+) first=(\d+) last=(\d+) attrs=(0x[0-9a-f]+) "
+        r"type=\[([0-9a-f, ]+)\] unique=\[([0-9a-f, ]+)\]", log)
+    if not (mh and mt and me and md):
+        miss = [n for n, m in (("头", mh), ("表", mt), ("ESP", me), ("另一条", md)) if not m]
+        return [f"内核没报齐夹具盘的 GPT 读数（缺 {'/'.join(miss)} 行）⇒ 对账没有对象"]
+    # 期望来自**配方**而不是当前盘：注入是在跑之前改盘的，期望跟着当前盘走就两边同数、永远绿。
+    host, errs = gpt_host_report(gpt_recipe_file())
+    if errs:
+        return errs
+    required = ["signature", "mbr_type", "revision", "header_size", "header_crc", "header_crc_calc",
+                "my_lba", "alternate_lba", "first_usable", "last_usable", "disk_guid", "entry_lba",
+                "entry_count", "entry_size", "array_crc", "array_crc_calc", "array_bytes", "seen",
+                "used", "esp_index", "esp_type", "esp_unique", "esp_first", "esp_last", "esp_attrs",
+                "part1_index", "part1_type", "part1_unique", "part1_first", "part1_last",
+                "backup_present", "backup_my_lba", "backup_alternate_lba", "problems"]
+    missing = [k for k in required if k not in host]
+    if missing:
+        probs = "; ".join(v for k, v in host.items() if k.startswith("problem") and k != "problems")
+        return [f"宿主机报告缺字段 {missing}（它自己发现的问题：{probs or '无'}）"]
+
+    def hexbytes(s: str) -> str:
+        return "".join(re.findall(r"[0-9a-f]{2}", s))
+
+    def eq(tag: str, k, h) -> None:
+        if k != h:
+            bad.append(f"夹具盘 {tag}：内核={k} 宿主机={h}")
+
+    eq("口号", GPT_FIX_PORT, int(mh.group(1)))
+    eq("revision", int(mh.group(2), 16), int(host["revision"]))
+    for tag, ki, hk in (
+        ("header_size", 3, "header_size"), ("my_lba", 4, "my_lba"),
+        ("alternate_lba", 5, "alternate_lba"), ("first_usable", 6, "first_usable"),
+        ("last_usable", 7, "last_usable"), ("entry_lba", 8, "entry_lba"),
+        ("entry_count", 9, "entry_count"), ("entry_size", 10, "entry_size"),
+    ):
+        eq(tag, int(mh.group(ki)), int(host[hk]))
+    eq("头CRC(盘上写的)", int(mh.group(11), 16), int(host["header_crc"], 16))
+    eq("头CRC(自己算的)", int(mh.group(11), 16), int(host["header_crc_calc"], 16))
+    eq("数组CRC(盘上写的)", int(mh.group(12), 16), int(host["array_crc"], 16))
+    eq("数组CRC(内核流式算的)", int(mt.group(5), 16), int(host["array_crc_calc"], 16))
+    eq("数组字节数", int(mt.group(4)), int(host["array_bytes"]))
+    eq("扫过条目数", int(mt.group(1)), int(host["seen"]))
+    eq("非空条目数", int(mt.group(2)), int(host["used"]))
+    eq("回调次数(独立recount)", int(mt.group(3)), int(host["used"]))
+    eq("disk_guid", hexbytes(mt.group(8)), host["disk_guid"])
+    eq("备份my_lba", int(mt.group(6)), int(host["backup_my_lba"]))
+    eq("备份alternate_lba", int(mt.group(7)), int(host["backup_alternate_lba"]))
+    eq("ESP序号", int(me.group(1)), int(host["esp_index"]))
+    eq("ESP first_lba", int(me.group(2)), int(host["esp_first"]))
+    eq("ESP last_lba", int(me.group(3)), int(host["esp_last"]))
+    eq("ESP attrs", int(me.group(4), 16), int(host["esp_attrs"], 16))
+    eq("ESP type GUID", hexbytes(me.group(5)), host["esp_type"])
+    eq("ESP unique GUID", hexbytes(me.group(6)), host["esp_unique"])
+    eq("另一条序号", int(md.group(1)), int(host["part1_index"]))
+    eq("另一条 first_lba", int(md.group(2)), int(host["part1_first"]))
+    eq("另一条 last_lba", int(md.group(3)), int(host["part1_last"]))
+    eq("另一条 type GUID", hexbytes(md.group(5)), host["part1_type"])
+    eq("另一条 unique GUID", hexbytes(md.group(6)), host["part1_unique"])
+    eq("宿主机自己发现的问题数", 0, int(host["problems"]))
+    mj = re.search(r"gptfix: 判据 [^\n]*", log)
+    if not mj:
+        bad.append("内核没报夹具盘的判据那一行")
+    elif "false" in mj.group(0):
+        bad.append(f"夹具盘判据里有 false：{mj.group(0).strip()[:170]}")
+    return bad
+
+
+def gpt_recipe_bytes() -> bytes:
+    """夹具盘的**配方字节**（现算，不读 build/ 里那份可能已经被改过的镜像）。
+
+    与 `fat_host_fault_plan` 读 `.img.zz` 是同一条纪律：定位注入点与核"盘真被改成了这个样子"
+    两次算的必须是同一个数，而那个数不能来自已经被改过的那份。
+    """
+    import hashlib
+    sys.path.insert(0, str(ROOT / "tools"))
+    import make_gpt_disk  # noqa: E402
+    data = make_gpt_disk.build()
+    got = hashlib.sha256(data).hexdigest()
+    if got != GPT_FIX_SHA256:
+        raise ValueError(f"配方指纹变了：{got} != {GPT_FIX_SHA256}（要连用例与对账的期望一起重量）")
+    return data
+
+
+def gpt_recipe_file() -> Path:
+    """把配方写成一份文件，供**独立那一台**（validate_esp.py）去读。
+
+    对账的期望必须来自配方而不是当前盘：注入是在跑之前改盘的，若期望也跟着当前盘走，
+    内核与宿主机读的是同一块改过的盘 ⇒ 两边同数 ⇒ 那条负样本永远绿。
+    """
+    GPT_RECIPE.write_bytes(gpt_recipe_bytes())
+    return GPT_RECIPE
+
+
+def gpt_host_fault_plan(kind: str) -> tuple[list[tuple[int, bytes, bytes]], str]:
+    """定位一条 GPT 改盘注入：返回 ([(偏移, 现值, 新值)], 封 CRC 的方式)。
+
+    改哪一格**由解析算出来**，不写死镜像偏移（ADR-038 决策 9 的纪律：夹具重建后
+    写死的偏移会静默改到别处，而负样本照样红）。命中不唯一 / 改了等于没改 ⇒ 抛 ValueError，
+    红在跑之前而不是跑完之后对着一行 FAIL 猜。
+    """
+    import binascii
+    b = gpt_recipe_bytes()
+    g = b[512:512 + 92]
+    entry_lba = struct.unpack_from("<Q", g, 72)[0]
+    count = struct.unpack_from("<I", g, 80)[0]
+    esize = struct.unpack_from("<I", g, 84)[0]
+    alt = struct.unpack_from("<Q", g, 32)[0]
+    arr = entry_lba * 512
+    boff = alt * 512
+    # 备份阵列的 LBA 从**备份头自己说的** entry_lba 取，不靠"主头 alternate 减 32"推算。
+    barr = struct.unpack_from("<Q", b, boff + 72)[0] * 512
+    if kind == "fault-gpt-array-crc":
+        # **主备两份一起翻**：只改主份的话 EDK2 会拿备份把它修回去（实测跑完盘回到 pristine，
+        # 注入根本到不了内核）。两份都坏 ⇒ 固件无从修起 ⇒ 盘活着进内核，红在数组 CRC 那道闸。
+        if b[arr] != b[barr]:
+            raise ValueError("主备阵列的第一个字节不同 ⇒ 这条注入要重新量")
+        return [(arr, bytes([b[arr]]), bytes([b[arr] ^ 0x01])),
+                (barr, bytes([b[barr]]), bytes([b[barr] ^ 0x01]))], "none"
+    if kind == "fault-gpt-header-crc":
+        at, bat = 512 + 40, boff + 40      # first_usable 的低字节，主备各一处
+        if b[at] != b[bat]:
+            raise ValueError("主备头的 first_usable 低字节不同 ⇒ 这条注入要重新量")
+        return [(at, bytes([b[at]]), bytes([b[at] ^ 0x01])),
+                (bat, bytes([b[bat]]), bytes([b[bat] ^ 0x01]))], "none"
+    if kind == "fault-gpt-mbr-type":
+        at = 446 + 4
+        if b[at] != 0xEE:
+            raise ValueError(f"保护性 MBR 的类型字节是 {b[at]:#x} 不是 0xEE ⇒ 这条注入是空转")
+        return [(at, b"\xee", b"\x0c")], "none"
+    if kind == "fault-gpt-backup-mismatch":
+        # **这一条做不成改盘负样本（实测）**：只要主表是好的，EDK2 就会拿它把备份修回去
+        # （跑完盘回到 pristine）；反过来改主表则它拿备份修主表。两份都好但字段不一致时
+        # 它挑主表、重写备份 ⇒ 无论怎么改，内核读到的都是一致的两份。
+        # 该闸由**同一份 ELF 里的合成盘**证到（ktests/gpt.rs 的 16 格之一，BackupMismatch 点名）。
+        raise ValueError("备份不一致必然被固件治愈（实测：跑完盘回到 pristine）⇒ 改盘证不到这一格，"
+                         "它由同一份 ELF 里的合成盘证；不要为了凑六条而把这条做成空转")
+    if kind == "fault-gpt-entry-count":
+        at, bat = 512 + 80, boff + 80
+        old = struct.unpack_from("<I", b, at)[0]
+        if old != 128 or struct.unpack_from("<I", b, bat)[0] != old:
+            raise ValueError(f"entry_count 主={old} 备={struct.unpack_from('<I', b, bat)[0]}，要两份都是 128")
+        # 主备一起改 + 两份都重封头 CRC ⇒ 固件两份都算不过数组 CRC，无从修起。
+        return [(at, struct.pack("<I", old), struct.pack("<I", 129)),
+                (bat, struct.pack("<I", old), struct.pack("<I", 129))], "headers"
+    if kind == "fault-gpt-esp-first":
+        at = arr + 32                      # 第 0 条（ESP）的 first_lba
+        old = struct.unpack_from("<Q", b, at)[0]
+        if old != 34:
+            raise ValueError(f"夹具 ESP first_lba 是 {old} 不是 34 ⇒ 夹具变了")
+        # 改完**把两个 CRC 都重算** ⇒ 解析必须成功、内核 bool 全绿，红只能红在宿主机对账上。
+        return [(at, struct.pack("<Q", old), struct.pack("<Q", old + 1))], "recrc"
+    raise ValueError(f"不认识的 GPT 注入：{kind}")
+
+
+def _gpt_seal(b: bytearray, off: int) -> None:
+    import binascii
+    b[off + 16:off + 20] = b"\x00" * 4
+    struct.pack_into("<I", b, off + 16, binascii.crc32(bytes(b[off:off + 92])) & 0xFFFFFFFF)
+
+
+def gpt_fault_image(kind: str) -> bytes:
+    """按计划造出"改过之后应当长什么样"的整块盘字节（证人与注入共用这一份计算）。"""
+    import binascii
+    edits, seal = gpt_host_fault_plan(kind)
+    b = bytearray(gpt_recipe_bytes())
+    for at, old, new in edits:
+        if bytes(b[at:at + len(old)]) != old:
+            raise ValueError(f"{kind}: 偏移 {at} 现值与配方不符")
+        if old == new:
+            raise ValueError(f"{kind}: 改了等于没改 ⇒ 空转")
+        b[at:at + len(old)] = new
+    g = b[512:512 + 92]
+    alt = struct.unpack_from("<Q", g, 32)[0]
+    if seal == "recrc":
+        elba = struct.unpack_from("<Q", g, 72)[0]
+        n = struct.unpack_from("<I", g, 80)[0]
+        sz = struct.unpack_from("<I", g, 84)[0]
+        arr = elba * 512
+        ac = binascii.crc32(bytes(b[arr:arr + n * sz])) & 0xFFFFFFFF
+        struct.pack_into("<I", b, 512 + 88, ac)
+        struct.pack_into("<I", b, alt * 512 + 88, ac)
+        _gpt_seal(b, 512)
+        _gpt_seal(b, alt * 512)
+    elif seal == "headers":
+        _gpt_seal(b, 512)
+        _gpt_seal(b, alt * 512)
+    return bytes(b)
+
+
+def apply_gpt_host_fault(kind: str) -> list[str]:
+    """把注入写到 build/ 那块夹具盘上（在 make_gpt_fixture 核完指纹之后调）。
+
+    顺序反了就是拿改过的字节去核 pristine 的指纹，那条闸会把注入本身当成"夹具坏了"。
+    注入的寿命是一跑：下一跑 make_gpt_fixture 重造，跑完由 gpt_host_witness 还原。
+    """
+    try:
+        want = gpt_fault_image(kind)
+    except ValueError as e:
+        return [f"{kind} 定位不成：{e}"]
+    cur = GPT_FIX.read_bytes()
+    diffs = [i for i in range(min(len(cur), len(want))) if cur[i] != want[i]]
+    if not diffs:
+        return [f"{kind}: 计划改完之后与现盘一字节不差 ⇒ 这条注入是空转"]
+    GPT_FIX.write_bytes(want)
+    edits, seal = gpt_host_fault_plan(kind)
+    desc = " / ".join(f"偏移{at} {old.hex()}→{new.hex()}" for at, old, new in edits)
+    print(f"    宿主机侧注入 {kind}: GPT 夹具盘 {desc}（封CRC={seal}，差异 {len(diffs)} 字节；"
+          "内核用的是正向那一跑的同一个 ELF，只有这块固件不碰的盘不同）")
+    return []
+
+
+def check_gpt_fault(kind: str, log: str) -> list[str]:
+    """六条注入的证人。三件互相独立的事必须同时成立（只要求"这一跑以红收场"是不够的）：
+    1 build/ 里那块盘与配方只差**计划中的那些字节**（宿主机自己比，不信串口）；
+    2 串口点名了该点名的拒因；`esp-first` 那条反过来——内核必须绿、红在宿主机对账上；
+    3 **引导盘那一半仍绿** ⇒ 注入没波及别的盘（改的是口 1，不是口 0）。
+    """
+    bad: list[str] = []
+    try:
+        want = gpt_fault_image(kind)
+    except ValueError as e:
+        return [f"{kind} 定位不成：{e}"]
+    if not GPT_FIX.exists():
+        return [f"夹具盘不在：{GPT_FIX}"]
+    cur = GPT_FIX.read_bytes()
+    edits, _seal = gpt_host_fault_plan(kind)
+    missing = [at for at, _old, new in edits if cur[at:at + len(new)] != new]
+    if missing:
+        bad.append(f"{kind}: 计划要改的那几处没改到位（偏移 {missing}）⇒ 注入没活到内核读它")
+    if cur == gpt_recipe_bytes():
+        bad.append(f"{kind}: 盘跑完回到了 pristine ⇒ 注入被固件治愈了，这一格证不到内核")
+    # 与计划**额外**的差异只报数不判红：固件启动时会往盘上写（实测 esp-first 那一跑
+    # 备份阵列被动了 1 字节）。判据由两头担保：计划那几处在位 + 内核点名/宿主机对账红。
+    extra = sum(1 for i in range(min(len(cur), len(want))) if cur[i] != want[i])
+    print(f"    注入核对: 计划在位={not missing} 与计划额外差异={extra} 字节（固件可能写盘，只报数）")
+    want_cause = GPT_HOST_FAULTS[kind]
+    if want_cause:
+        m = re.search(r"gptfix: 扫描被拒 口(\d+) 拒因=([^\n]+)", log)
+        if not m:
+            bad.append(f"{kind}: 串口没有『gptfix: 扫描被拒 … 拒因=』那一行（红在别处就不算证到）")
+        else:
+            if int(m.group(1)) != GPT_FIX_PORT:
+                bad.append(f"{kind}: 拒的是口 {m.group(1)}，不是夹具盘口 {GPT_FIX_PORT}")
+            if want_cause not in m.group(2):
+                bad.append(f"{kind}: 拒因没点名 {want_cause}，实际={m.group(2).strip()[:120]}")
+    else:
+        if "gptfix: 扫描被拒" in log:
+            bad.append(f"{kind}: 内核竟然拒了——这一格证的是『对账能分辨』，不是『解析能拒』")
+        host_bad = check_gpt_fixture(log)
+        if not any("ESP first_lba" in x for x in host_bad):
+            bad.append(f"{kind}: 宿主机对账没红在 ESP first_lba（实际 {host_bad[:3]}）")
+    mj = re.search(r"gpt: 判据 [^\n]*", log)
+    if not mj:
+        bad.append(f"{kind}: 引导盘那一半没报判据（注入波及了别的盘？）")
+    elif "false" in mj.group(0):
+        bad.append(f"{kind}: 引导盘那一半也红了 ⇒ 注入不只改了夹具盘：{mj.group(0).strip()[:150]}")
+    return bad
+
+
+def gpt_host_witness(kind: str, log: str) -> list[str]:
+    """跑完之后叫证人。判定链那六行与手工 `run --host-fault` 走**同一个入口**。
+
+    还原放在这里而不是调用方：证人要读改过的那块盘，所以这里是两条路上最后一个读它的人，
+    再往后就必须回到 pristine，不让一块被改过的盘冒充下一跑的证据。
+    """
+    bad = check_gpt_fault(kind, log)
+    for x in bad:
+        print("    对账:", x)
+    bad += make_gpt_fixture()
+    return bad
+
+
 def check_gpt(log: str) -> list[str]:
     """GPT 分区表的**宿主机侧独立对账**（ADR-078 决策 5，第二台仪器）。
 
@@ -4856,14 +5288,9 @@ def check_gpt(log: str) -> list[str]:
         return [f"内核没报齐 GPT 读数（缺 {'/'.join(miss)} 行）⇒ 宿主机对账没有对象，这一行不许当成对上了"]
     if not IMAGE.exists():
         return [f"镜像不在：{IMAGE}（这一跑之后被谁 unlink 了？对账必须吃同一跑的盘）"]
-    out = subprocess.run(
-        [sys.executable, str(ROOT / "tools" / "validate_esp.py"), str(IMAGE), "--report"],
-        capture_output=True, text=True, encoding="utf-8", env=env())
-    if out.returncode != 0:
-        return [f"validate_esp.py --report 退出 {out.returncode}：{out.stderr.strip()[:200]}"]
-    host = dict(ln.split("=", 1) for ln in out.stdout.splitlines() if "=" in ln)
-    if len(host) < 20:
-        return [f"宿主机只解析出 {len(host)} 个字段（应当 >= 20）⇒ 这台仪器自己空转了"]
+    host, errs = gpt_host_report(IMAGE)
+    if errs:
+        return errs
     # 盘坏掉时宿主机可能根本找不到 ESP（type GUID 被改了一格就没有 esp_* 那几行）。
     # 这里**必须先点名缺字段再往下比**：直接下标会崩成 KeyError，而崩溃的表现是
     # 整张判定表挂掉、看起来像被测物坏了（本轮自查就是这么抓到自己的）。
@@ -5320,10 +5747,42 @@ def do_test(timeout: int) -> int:
     # 用 gpt-probe 档跑：解析器与它的用例只在这一档里编译（默认档 ELF 一个字节不动）。
     IMAGE.unlink(missing_ok=True)
     gptv, gptrc, gptlog = do_run(["gpt-probe"], timeout)
-    gpt_bad = check_gpt(gptlog)
+    gpt_bad = check_gpt(gptlog) + check_gpt_fixture(gptlog)
     gpt_verdict = gptv if gptv != "PASS" else ("PASS" if not gpt_bad else "CONTENT-MISMATCH")
     for x in gpt_bad:
         print("    对账:", x)
+
+    # ADR-078 决策 7：**五条**改盘负样本（原计划六条，"备份头不一致"那条实测被固件必然治愈，
+    # 账记在 GPT_FAULT_UNDELIVERABLE，由合成盘证）。载体是口 1 那块夹具盘，不是引导盘——
+    # 实测引导盘改不动：EDK2 用备份表把主表修回原值，四条注入根本到不了内核。
+    # 五行都用**正向那一跑的同一个 ELF**（gpt-probe），只有盘不同；注入名不是 cargo 特性。
+    # 前四条期望 FAIL(35) 且**红必须点名**：红了但拒因不是该点名的那道闸 ⇒ 改判 CONTENT-MISMATCH。
+    print("=== GPT 负样本①：夹具盘条目数组翻一字节（主备一起改，不重算 CRC）⇒ 必须红在数组 CRC 那道闸 ===")
+    gacv, gacrc, gaclog = do_run(["gpt-probe"], timeout, host_fault="fault-gpt-array-crc")
+    gac_bad = gpt_host_witness("fault-gpt-array-crc", gaclog)
+    gac_verdict = gacv if gacv != "FAIL" else ("FAIL" if not gac_bad else "CONTENT-MISMATCH")
+
+    print("=== GPT 负样本②：夹具盘头字段翻一字节（不重算头 CRC）⇒ 必须红在头 CRC 那道闸 ===")
+    ghcv, ghcrc, ghclog = do_run(["gpt-probe"], timeout, host_fault="fault-gpt-header-crc")
+    ghc_bad = gpt_host_witness("fault-gpt-header-crc", ghclog)
+    ghc_verdict = ghcv if ghcv != "FAIL" else ("FAIL" if not ghc_bad else "CONTENT-MISMATCH")
+
+    print("=== GPT 负样本③：夹具盘保护性 MBR 的 0xEE 改 0x0C ⇒ 第一道判型闸必须拒 ===")
+    gmtv, gmtrc, gmtlog = do_run(["gpt-probe"], timeout, host_fault="fault-gpt-mbr-type")
+    gmt_bad = gpt_host_witness("fault-gpt-mbr-type", gmtlog)
+    gmt_verdict = gmtv if gmtv != "FAIL" else ("FAIL" if not gmt_bad else "CONTENT-MISMATCH")
+
+    print("=== GPT 负样本④：夹具盘 entry_count 改 129（主备一起改 + 两份重封头 CRC）⇒ 先验上界那道闸必须拒 ===")
+    gecv, gecrc, geclog = do_run(["gpt-probe"], timeout, host_fault="fault-gpt-entry-count")
+    gec_bad = gpt_host_witness("fault-gpt-entry-count", geclog)
+    gec_verdict = gecv if gecv != "FAIL" else ("FAIL" if not gec_bad else "CONTENT-MISMATCH")
+
+    print("=== GPT 负样本⑤：夹具盘 ESP first_lba 改一格**并重算两个 CRC** ⇒ 内核必须绿、红在对账 ===")
+    # 这一格证的是"**对账能分辨**"而不是"解析能拒"：一切自洽、只有 first_lba 与配方对不上。
+    # 期望因此是 CONTENT-MISMATCH(rc=33)，与"块内容对账抓得出错标签"那一行同一形状。
+    gefv, gefrc, geflog = do_run(["gpt-probe"], timeout, host_fault="fault-gpt-esp-first")
+    gef_bad = gpt_host_witness("fault-gpt-esp-first", geflog)
+    gef_verdict = gefv if gefv != "PASS" else ("CONTENT-MISMATCH" if not gef_bad else "PASS")
 
     print("=== FAT32 只读解析：两块卷挂 AHCI 口 3/4，内核读回的每个数由宿主机再解析一遍 ===")
     # 内核那十三条判据比的是"自己和写死的期望数"，这一行把它们换成"和另一台实现"：
@@ -5532,6 +5991,16 @@ def do_test(timeout: int) -> int:
         # ADR-078 决策 5 / W4 S1：GPT 的头字段、两个 CRC、覆盖面、ESP 几何与备份头由
         # validate_esp.py 从同一跑的盘独立重算；内核绿而对不上 ⇒ CONTENT-MISMATCH
         ("GPT分区表与宿主机对账", gpt_verdict, gptrc, "PASS", 33),
+        # ADR-078 决策 7 的六条改盘负样本：同一个 ELF、只改口 1 那块固件不碰的夹具盘。
+        # 前五条红必须**点名**那道闸（红了但点错名 ⇒ 上面已改判 CONTENT-MISMATCH，不会假装符合）
+        ("GPT数组CRC改坏必须红", gac_verdict, gacrc, "FAIL", 35),
+        ("GPT头CRC改坏必须红", ghc_verdict, ghcrc, "FAIL", 35),
+        ("GPT保护性MBR改坏必须红", gmt_verdict, gmtrc, "FAIL", 35),
+        ("GPT条目数超上界必须红", gec_verdict, gecrc, "FAIL", 35),
+        # 第五条证的是"对账能分辨"：内核绿、两个 CRC 都自洽，只有 first_lba 与配方对不上。
+        # 原计划的第六条（备份头不一致）**做不成改盘行**：固件必然治愈，实测跑完回到 pristine
+        # ⇒ 那道闸由同一份 ELF 里的合成盘证（16 格之一），账记在 GPT_FAULT_UNDELIVERABLE。
+        ("GPT改first并重算CRC对账红", gef_verdict, gefrc, "CONTENT-MISMATCH", 33),
         # P7 第 40 行的证红：owner 改错一格 ⇒ 容器读不到 ⇒ 必须红在 ring3 那格
         ("P7 句柄授错主人必须红", ih_verdict, ihrc, "FAIL", 35),
         # ADR-066 / W2 P4：OOM 被传播（Err）且原页原样 ⇒ 期望 PASS(33)；
@@ -5577,6 +6046,11 @@ def do_test(timeout: int) -> int:
         "P7 句柄ring3读自己镜像": h3log,
         "探针几何与宿主机对账": pblog,
         "GPT分区表与宿主机对账": gptlog,
+        "GPT数组CRC改坏必须红": gaclog,
+        "GPT头CRC改坏必须红": ghclog,
+        "GPT保护性MBR改坏必须红": gmtlog,
+        "GPT条目数超上界必须红": geclog,
+        "GPT改first并重算CRC对账红": geflog,
         "P7 句柄授错主人必须红": ihlog,
         "split OOM原页原样": soomlog,
         "demand-zero四路有真输家": dzlog,
@@ -5729,7 +6203,8 @@ def main() -> int:
             # 第 38/39 行那两条宿主机侧注入要能脱离判定链单独复现：`run --features fat32-exec
             # --host-fault fault-fat32-exec-byte` 必须与链里那一跑是同一个证人。只给 `run`——
             # 别的子命令收下这个参数却不读它，就是"看着开了其实没开"那种绿。
-            p.add_argument("--host-fault", default="", choices=["", *sorted(FAT_HOST_FAULTS)])
+            p.add_argument("--host-fault", default="",
+                           choices=["", *sorted(FAT_HOST_FAULTS), *sorted(GPT_HOST_FAULTS)])
     a = ap.parse_args()
     feats = [f for f in a.features.split(",") if f]
     if a.cmd == "build":
@@ -5740,7 +6215,10 @@ def main() -> int:
         return 0
     if a.cmd == "run":
         v, rc, log = do_run(feats, a.timeout, host_fault=a.host_fault)
-        if a.host_fault and fat_host_witness(a.host_fault, log):
+        if a.host_fault in GPT_HOST_FAULTS:
+            if gpt_host_witness(a.host_fault, log):
+                v = "CONTENT-MISMATCH"
+        elif a.host_fault and fat_host_witness(a.host_fault, log):
             v = "CONTENT-MISMATCH"
         return 0 if v == "PASS" else 1
     if a.cmd == "release":
