@@ -1855,8 +1855,8 @@ ktest!(KT_HANDLE_TRANSFER, t_handle_transfer);
 // 本刀证的是"回填完才放它跑、首参确实是那一页的 VA"，**子进程真读真用那一格留给 c-3b 的探针**。
 
 #[cfg(feature = "handles")]
-static PROC_SYS: [core::sync::atomic::AtomicU64; 27] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; 27];
+static PROC_SYS: [core::sync::atomic::AtomicU64; 28] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 28];
 
 #[cfg(feature = "handles")]
 fn proc_sys_worker() -> ! {
@@ -1866,8 +1866,8 @@ fn proc_sys_worker() -> ! {
     use crate::user::{
         self, E_DENIED, E_INVALID, ROLE_JOB, ROLE_SELF_ASPACE, ROLE_SELF_PROC, ROLE_SELF_THREAD,
         SI_DESC_BYTES, SI_DESC_HANDLE, SI_DESC_KIND, SI_DESC_ROLE, SI_MAGIC, SI_OFF_HANDLES,
-        SI_OFF_NHANDLES, SYS_ASPACE_MAP, SYS_PROCESS_CREATE, SYS_PROCESS_START, SYS_THREAD_CREATE,
-        syscall_dispatch,
+        SI_OFF_NHANDLES, SYS_ASPACE_MAP, SYS_PROCESS_CREATE, SYS_PROCESS_KILL, SYS_PROCESS_START,
+        SYS_THREAD_CREATE, syscall_dispatch,
     };
     use crate::{proc, vmo};
     let put = |i: usize, v: u64| PROC_SYS[i].store(v, core::sync::atomic::Ordering::Release);
@@ -2014,7 +2014,15 @@ fn proc_sys_worker() -> ! {
 
     // 收场（工人这一侧）：杀子线程 → 关句柄。进程与 Job 留给父任务在 reap 之后销毁
     // （顺序：任务先死、映射再丢、AS 最后销 —— 映射在工人袋里，reap 才丢）
-    let _ = sched::terminate_task(gidx);
+    // 18 号收掉这个进程的全部线程（P6b）：应当正好 1 条（子线程）。
+    // 它自己走 terminate_task ⇒ 给进程记收工 ⇒ 父任务那边 proc_reap 才收得掉名额与 AS
+    f.rax = SYS_PROCESS_KILL;
+    f.rdi = hp.0;
+    f.rsi = 0;
+    f.rdx = 0;
+    f.r10 = 0;
+    syscall_dispatch(&mut f);
+    put(27, f.rax);
     let _ = handle::close(hc, owner);
     let _ = handle::close(hs, owner);
     let _ = handle::close(hi, owner);
@@ -2055,7 +2063,7 @@ fn t_process_startup() -> bool {
     let _ = sched::terminate_task(g);
     let drained = sched::reap_released() > rel0 || drain_reap();
     if !was_running { apic::timer_stop().ok(); }
-    let r: [u64; 27] = core::array::from_fn(|i| PROC_SYS[i].load(core::sync::atomic::Ordering::Acquire));
+    let r: [u64; 28] = core::array::from_fn(|i| PROC_SYS[i].load(core::sync::atomic::Ordering::Acquire));
     if r[25] != 0 {
         crate::log_fatal!("psys: 工人半路退场 code={} 原始={:?}", r[25], r);
         return false;
@@ -2075,22 +2083,23 @@ fn t_process_startup() -> bool {
     let arg_ok = r[23] == r[9] && r[24] == 1;
     // D3：转移之后父进程那个旧 Job 句柄必须 Stale，而且计数对得上
     let stale_ok = r[26] == 1 && handle::counters().stale > c0.stale;
+    let kill_ok = r[27] == 1;
     let base_ok = drained && disc && jdel && handle::live() == 0 && vmo::vmo_count() == 0
         && mm::free_frames() == f0 && mm::reservation_count() == va0
         && mm::aspace_count() == 0 && proc::proc_residual().0 == 0 && proc::job_residual().0 == 0;
     crate::log_info!(
-        "psys(P5c-3): 无CREATE拒={} Proc句柄={} 14的Proc别名={} 15停住=(未映射拒{} 句柄{} Blocked{} runs{}) 形状拒且不转移={} 16=(ret{} nhandles{} 新值{:#x} kind{} 三角色{}) 首参={} 放行={} Stale计数={} 收场=(drained{} disc{} jdel{} live{} vmo{} free{}->{} va{}->{} as{})",
+        "psys(P5c-3): 无CREATE拒={} Proc句柄={} 14的Proc别名={} 15停住=(未映射拒{} 句柄{} Blocked{} runs{}) 形状拒且不转移={} 16=(ret{} nhandles{} 新值{:#x} kind{} 三角色{}) 首参={} 放行={} Stale计数={} 18杀={} 收场=(drained{} disc{} jdel{} live{} vmo{} free{}->{} va{}->{} as{})",
         r[5] == crate::user::E_DENIED, handle::Handle(r[6]).unpack().is_some(), alias_ok,
         r[10] == crate::user::E_INVALID, handle::Handle(r[11]).unpack().is_some(), r[14], r[15],
-        shape_ok, r[18], r[19], r[20], r[21], r[22], r[23] == r[9], r[24], stale_ok,
+        shape_ok, r[18], r[19], r[20], r[21], r[22], r[23] == r[9], r[24], stale_ok, r[27],
         drained, disc, jdel, handle::live(), vmo::vmo_count(), f0, mm::free_frames(),
         va0, mm::reservation_count(), mm::aspace_count());
     let ok = waited && create_ok && alias_ok && thread_ok && shape_ok && start_ok && arg_ok
-        && stale_ok && base_ok;
+        && stale_ok && kill_ok && base_ok;
     if !ok {
         crate::log_fatal!(
-            "psys: 判据不成立 等={} 造={} 别名={} 线程={} 形状={} 启动={} 首参={} Stale={} 收场={} 原始={:?}",
-            waited, create_ok, alias_ok, thread_ok, shape_ok, start_ok, arg_ok, stale_ok, base_ok, r);
+            "psys: 判据不成立 等={} 造={} 别名={} 线程={} 形状={} 启动={} 首参={} Stale={} 18杀={} 收场={} 原始={:?}",
+            waited, create_ok, alias_ok, thread_ok, shape_ok, start_ok, arg_ok, stale_ok, kill_ok, base_ok, r);
     }
     let _ = cpu::self_slot();
     ok

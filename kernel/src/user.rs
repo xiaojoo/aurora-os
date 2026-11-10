@@ -52,7 +52,7 @@ pub const SYS_ASPACE_MAP: u64 = 14;
 /// ABI 版本。minor=4 对应用户态闭环这一段（M4）；minor=5 追加 capability 句柄族（P7）；
 /// minor=6 追加 VMO 三个号（12/13/14）与 `F_VMO` 位（W3 P4b，ADR-074）。号只追加不复用（Q1）。
 pub const ABI_MAJOR: u64 = 0;
-pub const ABI_MINOR: u64 = 9;
+pub const ABI_MINOR: u64 = 10;
 pub const F_FASTPATH: u64 = 1;
 pub const F_SMAP: u64 = 2;
 pub const F_SMEP: u64 = 4;
@@ -77,6 +77,10 @@ pub const SYS_PROCESS_CREATE: u64 = 11;
 /// 15：`rdi` = Proc 句柄（要 `WRITE`）、`rsi` = 子 AS 里的入口 VA、`rdx` = 子 AS 里的用户栈顶、
 /// `r10` = 首参 → `rax` = Thread 句柄。**建出来就停住**（`Blocked`），等 16 号回填完才放它跑。
 pub const SYS_THREAD_CREATE: u64 = 15;
+/// 18：`rdi` = Proc 句柄（要 `WRITE`）→ `rax` = 真收掉的线程数。
+/// **枚举方式是全文扫 72 格按 `proc_id` 认**（使用者裁决 2026-11-10），不新加每进程线程名单。
+/// 杀自己的进程一律 `-4`：那条路要交给 `SYS_EXIT`，在 syscall 里把自己标 Free 会让返回路径踩空槽。
+pub const SYS_PROCESS_KILL: u64 = 18;
 /// 16：`rdi` = Proc 句柄、`rsi` = Thread 句柄、`rdx` = StartupInfo 那一页的 VMO 句柄、
 /// `r10` = 它在**子 AS** 里的只读 VA → 成功返回 0。顺序固定：校验 → 转移 → 回填 → 放线程跑。
 pub const SYS_PROCESS_START: u64 = 16;
@@ -740,6 +744,21 @@ fn sys_process_start(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
         return E_FAULT;
     }
 
+    // ③b **归属搬迁（P6b）**：把创建者袋里"目标 AS = 子 AS"的共享映射搬进子线程的袋。
+    // 搬完之后父先退不再带走子进程的代码/栈。两个任务同 CPU（15 号就在调用者 CPU 上建的），
+    // 所以一次 RUNQ 够；失败在放行之前，仍然可以整套回滚。
+    // **勘误**：P5c-3b 那格"父先退"的 `代码页没了true` 半边是**空转的绿**——判据里把
+    // 探针基址 `0x3_0000_0000` 写成了 `0x3000_0000`（两个不同的地址），读的是一个从没映射过的 VA。
+    // 当时只有 `kills0->1` 那半是真的（M35 证的也是那半）。本轮改对地址之后，
+    // 判据翻成"父先退子仍活"，并由 M39（去掉本搬迁）证它会红。
+    let me = crate::sched::current_id();
+    match crate::sched::adopt_asmaps(me, gidx, aslot) {
+        Ok(_) => {}
+        Err(_) => {
+            undo_start(&newvals, done, &granted, ng, child, parent);
+            return E_EXHAUSTED;
+        }
+    }
     // ④ 最后才放它跑：首参 = 那一页在子 AS 里的 VA。
     // 这一格失败仍然回滚（线程还没被放出来）；**wake 成功之后就没有失败路径了**。
     if !crate::sched::set_thread_arg(gidx, va) {
@@ -824,6 +843,31 @@ fn sys_object_wait(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
     wait_on_proc(crate::handle::Handle(frame.rdi), owner, frame.rsi, frame.rdx)
 }
+/// 18：收掉一个进程的全部线程。返回真收掉的条数；杀自己的进程回 `-4`（交给 `SYS_EXIT`）。
+/// 进程本身随最后一条线程收工而被置 signal（`terminate_task` → `proc_thread_exited`），
+/// 所以调用方接着用 17/19 等它、或用 `proc_reap` 收名额与它名下的 AS，都是既有路径。
+#[cfg(feature = "handles")]
+fn sys_process_kill(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
+    let (obj, _) = match crate::handle::resolve(crate::handle::Handle(frame.rdi), owner, crate::handle::RIGHT_WRITE) {
+        Ok(v) => v,
+        Err(e) => return handle_err(e),
+    };
+    let (pid, pgen) = match obj {
+        crate::handle::ObjRef::Proc { slot, gen } => (slot, gen),
+        _ => return E_DENIED,
+    };
+    if !crate::proc::proc_live(pid, pgen) {
+        return E_BAD_HANDLE;
+    }
+    // 自杀不在这里做：syscall 返回路径还要用当前槽，把自己标 Free 就是踩空
+    let me = crate::sched::current_id();
+    if crate::sched::proc_id_of(me) == pid {
+        return E_DENIED;
+    }
+    crate::sched::kill_process_threads(pid) as u64
+}
+
 #[cfg(feature = "handles")]
 fn sys_file_read(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let want = frame.rdx as usize;
@@ -1342,6 +1386,8 @@ pub fn syscall_dispatch(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> boo
         SYS_PROCESS_WAIT => sys_process_wait(frame),
         #[cfg(feature = "handles")]
         SYS_OBJECT_WAIT => sys_object_wait(frame),
+        #[cfg(feature = "handles")]
+        SYS_PROCESS_KILL => sys_process_kill(frame),
         SYS_POKE_BUF => {
             // 内核 → 用户。写成 `Ok(n)` 而不是布尔：`n != want` 就是"中途被接住的故障"，
             // 程序核对字节时看得见的差异与内核报回的数必须一致（两台仪器不能各说各话）。

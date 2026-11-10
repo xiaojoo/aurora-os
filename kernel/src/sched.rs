@@ -1695,6 +1695,85 @@ pub fn wait_for_proc(proc_id: u16, deadline_cycles: u64) -> Option<u32> {
     }
 }
 
+/// 把创建者袋里"目标 AS = `as_slot`"的共享映射搬进子线程的袋（**P6b：进程级归属**）。
+///
+/// 为什么这样就够，不用新造一张进程级的表：`spawn_user` 就在**调用者那颗 CPU** 上建子线程，
+/// 所以两个任务的 `owned` 在同一个 `RQ` 里 ⇒ **一次 RUNQ 就够**，不必嵌套两把同级锁
+/// （8→8 是锁序违规）。搬完之后主人就是子线程：父先退不再带走子进程的代码/栈，
+/// 而子线程死时由既有 `release_owned` 在锁外 drop（清叶子 + 还帧参考 + 放手 VA），
+/// **一条新的释放路径都不用加**（ADR-027 的不变量原样保留）。
+///
+/// **先数清、确认装得下，再动手**：`push_item` 满了会就地 `drop`，而 `AsMap` 的 Drop 要取 VMM
+/// 并等跨 CPU 回执 ⇒ 持 RUNQ 时做正是 ADR-047 决策 2 禁止的形状。所以这里预检容量，
+/// 搬的过程**没有失败路径**，也不用那个会 drop 的入口。
+pub fn adopt_asmaps(parent: usize, child: usize, as_slot: u8) -> Result<usize, mm::MmError> {
+    if parent >= MAX_TASKS_TOTAL || child >= MAX_TASKS_TOTAL || parent == child {
+        return Err(mm::MmError::Unsupported);
+    }
+    let cpu = cpu_of(parent);
+    if cpu_of(child) != cpu {
+        // 跨 CPU 就要两把同级 RUNQ ⇒ 违规。今天的调用点（16 号）保证同 CPU，
+        // 这条闸是把那个前提变成显式拒绝，而不是靠"它恰好同 CPU"。
+        return Err(mm::MmError::Unsupported);
+    }
+    let mut s = rq(cpu);
+    let (psl, csl) = (slot_of(parent), slot_of(child));
+    let mut n = 0usize;
+    for it in s.tasks[psl].owned.items.iter() {
+        if matches!(it, Some(OwnedItem::AsMap(m)) if m.as_slot() == Some(as_slot)) {
+            n += 1;
+        }
+    }
+    if s.tasks[csl].owned.count() + n > MAX_OWNED {
+        return Err(mm::MmError::Unsupported);
+    }
+    let mut moved = 0usize;
+    let mut w = 0usize;
+    for i in 0..MAX_OWNED {
+        let take = matches!(&s.tasks[psl].owned.items[i],
+            Some(OwnedItem::AsMap(m)) if m.as_slot() == Some(as_slot));
+        if take {
+            let it = s.tasks[psl].owned.items[i].take();
+            let cn = s.tasks[csl].owned.count();
+            s.tasks[csl].owned.items[cn] = it;
+            s.tasks[csl].owned.n = cn + 1;
+            moved += 1;
+        } else if s.tasks[psl].owned.items[i].is_some() {
+            // 压缩创建者那一侧的空洞，保持 items[0..n] 紧排（`count()` 与它的不变量）
+            s.tasks[psl].owned.items[w] = s.tasks[psl].owned.items[i].take();
+            w += 1;
+        }
+    }
+    s.tasks[psl].owned.n = w;
+    Ok(moved)
+}
+
+/// 收掉一个进程的全部线程（**P6b：18 `process_kill`**，使用者裁决"全表扫 72 格按 proc_id 认"）。
+/// 不新加每进程线程名单：那张表要维护"槽位复用/收工漏摘"一组新不变量，而今天只有 4 个进程、
+/// 72 格扫一遍的成本可忽略。**逐个在锁外 terminate**（`terminate_task` 自己取放 RUNQ），
+/// 跨 CPU 收线程走的就是 ADR-047/061 那条已验证的线。返回真收掉了几条。
+pub fn kill_process_threads(proc_id: u16) -> usize {
+    if proc_id == crate::proc::NO_PROC {
+        return 0;
+    }
+    // 先快照出名单再动手：一边扫一边 terminate 会让同一个槽被复用后又被认成同一个进程
+    let mut list = [0usize; MAX_TASKS_TOTAL];
+    let mut n = 0usize;
+    for gi in 0..MAX_TASKS_TOTAL {
+        if state_of(gi) != TaskState::Free && proc_id_of(gi) == proc_id {
+            list[n] = gi;
+            n += 1;
+        }
+    }
+    let mut killed = 0usize;
+    for gi in list.iter().take(n) {
+        if terminate_task(*gi) {
+            killed += 1;
+        }
+    }
+    killed
+}
+
 /// 等一条任务收工（P6a 把 P3 的轮询版换成真阻塞）。语义与原来一致：
 /// 目标变成 `Done`/`Free` 返回 true，超时返回 false。**没有任务上下文时退回有界轮询**
 /// （启动早期还没 `init_boot_task` 的调用方今天的形状），不静默假装等过。

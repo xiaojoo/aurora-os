@@ -2046,6 +2046,11 @@ pub struct AspaceMapping {
 }
 
 impl AspaceMapping {
+    /// 这份映射铺在哪张 AS 里（`None` = 内核那份）。P6b 的归属搬迁用它认人：
+    /// 只搬"目标 AS 是子进程那张"的项，创建者自己的镜像映射不动。
+    pub fn as_slot(&self) -> Option<u8> {
+        self.as_slot
+    }
     pub fn virt(&self) -> VirtAddr {
         self.va
     }
