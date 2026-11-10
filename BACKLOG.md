@@ -6612,6 +6612,85 @@ S2a/S2b；S2b 的偏移信息要不要进句柄身份（`handle.rs:603` 自己�
 真机（M7）上 `entry_count`/`entry_size`/ESP 落点都可能不同，上界常量是**缓冲上限**不是"应该长这样"；
 状态区与签名包变成带 GUID 的真分区（`state_store.rs:3-8` 那条债）；
 S3 验签进启动决策要另起草 **ADR-079**（078 已被分区能力用掉），ADR-033:68-69 与
-**仓库里不存在的 ADR-011** 那条欠账仍然开着。## 文档一致性（V1.3）
+**仓库里不存在的 ADR-011** 那条欠账仍然开着。## 173. W4 S1 骨架：`filesystem/gpt.rs` 只读解析落地（流式回调 + GUID 查找），16 道闸各证红一次（ADR-078 补记，2026-11-10，实测）
+
+接 §172 的起草，使用者点"起草 gpt.rs 的只读解析骨架（流式回调 + GUID 查找）"。
+**骨架不是空壳**：AGENTS 硬约束 2 禁止没有真实调用者的模块，所以同轮带了 `gpt-probe` 档的
+取证用例 `t_gpt` 当真实调用者，并真跑过。产物：`kernel/src/filesystem/gpt.rs`（349 行，LF）、
+`kernel/src/ktests/gpt.rs`（278 行，CRLF）、`filesystem.rs` 加一行 cfg 门控的 `pub mod gpt`、
+`Cargo.toml` 加 `gpt-probe = []`、`ktests/mod.rs` 加 cfg 门控注册、
+`module-interfaces.toml` 的 storage 组登记（source_modules/public_api/test_targets/两条散文）、
+ADR-078 补记。**`fat32.rs` 零改动、`Volume::mount` 一个字没动**（决策 2 兑现）。
+
+**API 形状（决策 1 兑现）**：`scan(disk, &mut dyn FnMut(&Entry)) -> Result<Table, GptError>`
+是唯一的原语，`find_by_type` / `find_esp` 都压在它上面（一条核完整性的路，不复制第二份）。
+**不存分区名单表**：`Table` 只交回事实与覆盖面（`entries_seen` / `used` / `array_crc` / `array_bytes`
+加主头与备份头），名单在调用者那边。**只对非空条目回调**（type GUID 全零 = 空条目），
+所以回调次数 == `used`，而 `entries_seen` 是扫过的总格数——两个数分开报才证得出
+"空条目被跳过"而不是"扫到第一条就停了"。**找到也不提前退出**：CRC 必须覆盖整个数组，
+提前退出就等于没核完整性。
+
+**零 unsafe、零分配（比草案预计的更好）**：`gpt.rs` 与 `ktests/gpt.rs` 都不含 `unsafe`。
+数组按扇区流式扫，栈上只要一个扇区缓冲 + 一个条目装配缓冲（合计 1 KiB，任务栈 16 KiB 也装得下；
+boot 栈 64 KiB，用例的合成盘 2 KiB + 一份副本也放得下）。条目可以跨扇区（`entry_size` 不必整除 512），
+所以装够一条才解析、然后清空重装。⇒ **unsafe 普查仍是 378、白名单一行没改**
+（草案原本预计"静态 `UnsafeCell` 缓冲会让普查上涨"，改用栈之后那笔账不发生了）。
+上界先验再用：`entry_count <= MAX_ENTRIES(128)`、`entry_size ∈ [128, 512]`、
+`header_size ∈ [92, 512]`，三道都在读数组/算 CRC 之前。
+
+**读数（本轮取证跑，两次 gpt-probe 同 ELF 复现）**：
+- `check` **17/17**（含 check-unsafe / check-module-interfaces / check-interface-change /
+  check-fat32-ports / check-matrix-wiring / check-verdict 全绿，nofloat 浮点/向量命中 **0**）。
+- `run --features gpt-probe`：判定 **PASS / qemu_rc=33**，用时 5.4s（复跑 5.3s），
+  启动产物 **`gpt-probe/elf 26a7d968691c`**，`ktests: total=81 passed=81 failed=0 table_invalid=false`
+  （默认档 80 + `t_gpt`），串口里 **25 行 `gpt:`** 读数。归档另存 `build/s1-gpt-probe-serial.log`
+  ——**`do_run` 会覆盖 `build/run-001.log`**，本轮默认档那一跑把 gpt-probe 的归档盖掉过一次，
+  重跑并另存才留住证人（与"稀有故障要保留每一份旁证"同一条纪律）。
+- 真盘读数：`entry_count=128 entry_size=128 entry_lba=2 first_usable=34 last_usable=131038
+  my_lba=1 alternate_lba=131071`、`数组字节=16384 自算CRC=0xca7d9c75`、`扫过=128 非空=1 回调=1`、
+  备份交叉核通过（`备份my_lba=131071 备份alternate_lba=1`）；
+  ESP `序号=0 first=2048 last=67583 attrs=0x0`、type GUID 字节
+  `28 73 2a c1 1f f8 d2 11 ba 4b 00 a0 c9 3e c9 3b` ⇒ **混合端序写对了**
+  （写错不会编译不过，只会"找不到 ESP"，真盘那一格就是它的证人）。
+- **未分派那一格是被测事实不是修辞**：`状态区LBA=67648 签名包LBA=67664 被条目覆盖=(false,false)
+  都在可用区间=true 空隙成立=true` ⇒ 决策 8"不许把裸 LBA 约定当分区收进名单"兑现。
+- CRC32 外部已知答案：`空串=0x00000000`、`123456789=0xcbf43926`，两个都中。
+- 合成盘正向：`回调=1 非空=1 扫过=4 条目对=true 数组CRC=0xe09b7d45 宿主机常数=0xe09b7d45 同数=true`。
+  那个常数由 CPython `binascii.crc32` 先算出再嵌进用例 ⇒ **不是自己出题自己答**。
+- **点名负样本 16/16**，每格红在自己那道闸上：`NoProtectiveMbr`×2（`0xEE`→`0x0C`、`55 aa` 清掉）、
+  `BadSignature`、`BadRevision(2)`、`HeaderTooSmall(91)`、`HeaderTooBig(513)`、`HeaderCrc`、
+  `TooManyEntries(129)`、`EntryTooSmall(127)`、`EntryTooBig(513)`、`ArrayCrc`、`BackupSignature`、
+  `BackupCrc`、`BackupMismatch{field:"my_lba",primary:3,backup:9}`、`Io(Refused)`（备份指到盘外）、
+  `ShortSector(100)`。**改头字段的那些必须重新封头 CRC**，否则头 CRC 先 fire 就证错了对象
+  （"变异必须从点名的成因失败"）；故意证 CRC 闸的那两格不重封。
+- **宿主机手工单跑对账**（CPython `binascii.crc32` + `struct`，从 `build/aurora.img` 独立重算，
+  不 import 内核也不 import `esp_image`）：数组 CRC `0xca7d9c75`、头 CRC `0x3313701a`、
+  ESP first/last `2048/67583`、type GUID `28732ac11ff8d211ba4b00a0c93ec93b`、`used=1 seen=128`
+  ——**与内核串口逐格相同**。这是手工单跑那一遍的对账，**不是矩阵行**（决策 5 仍开着）。
+- **默认档没被动到，这条有证据不是推断**：`run`（无特性）判定 PASS/33、用时 5.3s、
+  启动产物 **`normal/elf ee0eead0ad1d`**，与 P7 那一轮记录的默认档 sha **逐字相同**；
+  `ktests: total=80 passed=80 failed=0`，串口里 **`gpt:` 零行** ⇒ cfg 门控真把整个模块挡在外面。
+
+**与草案的三处差异（如实记进 ADR-078 补记，不回改决策原文）**：
+①**`crc32` 做成 `pub` 而不是私有**——验收节要求的已知答案向量那一格需要调用者，私有就喂不进去；
+它仍住在 `gpt.rs` 里、没新建"通用校验和模块"，决策 4 的实质不变（增量形式 `crc32_update` 仍私有）。
+②**删掉一道不可达的闸 `ArrayTooBig`**：`entry_count<=128` 与 `entry_size<=512` 两道之后
+乘积必然 `<=65536=MAX_ARRAY_BYTES`，第三道永远不可能 fire ⇒ 留着就是死判据。
+`MAX_ARRAY_BYTES` 保留为走数组的字节预算，由用例那一格 `array_bytes <= MAX_ARRAY_BYTES` 当真实调用者。
+③**合成盘（4 扇区 = 2 KiB，栈上）提前到本轮**：真盘只读、没法在上面把 CRC 改坏，
+而改盘注入要等宿主机接线那一刀 ⇒ 先用合成盘证明这 16 道闸不是装饰
+（ADR-038 决策 3"合成卷只做便宜的分支覆盖"同族手法）。它**不取代**决策 7 的六条改盘负样本——
+那六条证的是"内核 ELF 逐字相同、只改盘"，合成盘证不到，仍然开着。
+
+**矩阵与 bench 本轮没跑，理由写清不假称全绿**：新档还没有矩阵行（决策 5 未落地），
+而默认档 ELF 与 P7 那一轮**逐字相同**（`ee0eead0ad1d`）⇒ 46 行判定矩阵与四把尺子的**输入没变**，
+跑它们量不到本轮的任何东西。P7 那一轮矩阵本身是 45/46（仪器家族红），**不引它当本轮读数**。
+
+**仍开着（S1 未完，ADR-078 状态仍为提议）**：决策 5 的矩阵行与 `validate_esp.py` 接线
+（扩它出机器可读读数、由新行调用、内核绿而对不上 ⇒ CONTENT-MISMATCH）；
+决策 7 的六条改盘负样本（数组 CRC、头 CRC、`0xEE`→`0x0C`、备份头不一致、
+`first_lba` 改一格**并重算两个 CRC**、`entry_count` 超上界）；
+上界常量与宿主机逐字对账的门禁（决策 4 末条）；`check-matrix-wiring`/`check-verdict` 的新行登记。
+S2a/S2b 与 ADR-078 未决 1–6 全部不变（偏移要不要进句柄身份仍要停下来问）。## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

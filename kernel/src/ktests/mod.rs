@@ -8,6 +8,8 @@ mod driver;
 mod elf;
 #[cfg(feature = "fat32-probe")]
 pub(crate) mod fs;
+#[cfg(feature = "gpt-probe")]
+mod gpt;
 mod heap;
 mod mm;
 #[cfg(feature = "virtio-net")]

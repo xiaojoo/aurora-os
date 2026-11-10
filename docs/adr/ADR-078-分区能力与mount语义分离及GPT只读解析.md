@@ -280,3 +280,60 @@ CRC32 原语要有已知答案向量（空串、`"123456789"` 的标准值 `0xCB
 6. **验签进启动决策（S3）与 init 起 ring3（S4）**：口径已由 W4 立项钉住
    （只检测不拒启、特性门控 + 新增行、Lamport 重复使用记为已知限制），
    但 ADR-033:68-69 与**仓库里不存在的 ADR-011** 那条欠账**仍然开着**，本文不关。
+
+## 补记：S1 骨架落地（2026-11-10，**部分落地**，状态仍为提议）
+
+`kernel/src/filesystem/gpt.rs` 与 `kernel/src/ktests/gpt.rs` 已写并真跑过，`gpt-probe` 档注册。
+决策 1/2/3/4/6/8 按原文落地；**决策 5（宿主机对账接进矩阵行）与决策 7（六条改盘负样本）本轮没做**，
+所以本文不升"已采纳"。
+
+**实测读数**（`run --features gpt-probe`，判定 PASS / qemu_rc=33 / 用时 5.4s，
+启动产物 `gpt-probe/elf 26a7d968691c`，串口归档 `build/run-001.log`）：
+
+- `ktests: total=81 passed=81 failed=0 table_invalid=false`（默认档 80 + `t_gpt`）。
+- 真盘：`entry_count=128 entry_size=128 entry_lba=2 first_usable=34 last_usable=131038
+  my_lba=1 alternate_lba=131071`，`数组字节=16384 自算CRC=0xca7d9c75`，
+    `扫过=128 非空=1 回调=1`，备份交叉核通过（`备份my_lba=131071 备份alternate_lba=1`）。
+- ESP：`序号=0 first=2048 last=67583 attrs=0x0`，type GUID 字节
+  `28 73 2a c1 1f f8 d2 11 ba 4b 00 a0 c9 3e c9 3b` ⇒ **混合端序写对了**
+  （写错不会编译不过，只会"找不到 ESP"，真盘那一格就是它的证人）。
+- 未分派：`状态区LBA=67648 签名包LBA=67664 被条目覆盖=(false,false) 都在可用区间=true`
+  ⇒ 决策 8 那条"不许把裸 LBA 约定当分区收进名单"是**被测事实**。
+- CRC32 外部向量：`空串=0x00000000`、`123456789=0xcbf43926`，两个都中。
+- 合成盘正向：`回调=1 非空=1 扫过=4 条目对=true 数组CRC=0xe09b7d45 宿主机常数=0xe09b7d45 同数=true`。
+- **点名负样本 16/16**，每格红在自己那道闸上：`NoProtectiveMbr`×2、`BadSignature`、
+  `BadRevision(2)`、`HeaderTooSmall(91)`、`HeaderTooBig(513)`、`HeaderCrc`、`TooManyEntries(129)`、
+  `EntryTooSmall(127)`、`EntryTooBig(513)`、`ArrayCrc`、`BackupSignature`、`BackupCrc`、
+  `BackupMismatch{field:"my_lba"}`、`Io(Refused)`、`ShortSector(100)`。
+- **宿主机手工单跑对账**（CPython `binascii.crc32` + `struct`，从 `build/aurora.img` 独立重算，
+  不 import 内核也不 import `esp_image`）：数组 CRC `0xca7d9c75`、头 CRC `0x3313701a`、
+  ESP first/last `2048/67583`、type GUID `28732ac11ff8d211ba4b00a0c93ec93b`、`used=1 seen=128`
+  ——**与内核串口逐格相同**。这是手工单跑那一遍的对账，**不是矩阵行**（决策 5 仍开着）。
+
+**与草案的三处差异（如实记，不回改上面的决策原文）**：
+
+1. **`crc32` 做成 `pub` 而不是私有**（决策 4 原写"先做成 `gpt.rs` 内部私有函数"）。
+   理由：验收节要求的**已知答案向量**那一格需要一个调用者，私有就喂不进去。
+   它仍住在 `gpt.rs` 里、**没有新建"通用校验和模块"**，决策 4 的实质（不给假想需求开模块）不变。
+   增量形式 `crc32_update` 仍是私有。
+2. **删掉了一道不可达的闸 `ArrayTooBig`**。草案没列它，是实现时自己加出来的：
+   `entry_count <= 128` 与 `entry_size <= 512` 两道之后乘积必然 `<= 65536 = MAX_ARRAY_BYTES`，
+   第三道永远不可能 fire ⇒ 留着就是死判据（本轮纪律：不可达的错误分支不留）。
+   `MAX_ARRAY_BYTES` 保留为**走数组的字节预算**，并由用例那一格
+   `table.array_bytes <= MAX_ARRAY_BYTES` 当它的真实调用者。
+3. **合成盘（4 扇区 = 2 KiB，栈上）提前到本轮**，而不是等决策 7 的改盘注入。
+   理由：真盘是只读的，没法在上面把 CRC 改坏；改盘注入要等宿主机接线那一刀。
+   先用合成盘证明这 16 道闸**不是装饰**（ADR-038 决策 3"合成卷只做便宜的分支覆盖"同族手法）。
+   它**不取代**决策 7 的六条改盘负样本——那六条证的是"内核 ELF 逐字相同、只改盘"这件事，
+   合成盘证不到，仍然开着。
+   合成盘的数组 CRC 常数 `0xE09B7D45` 由宿主机 `binascii.crc32` 先算出再嵌进用例，
+   所以"两台实现错得一样"会被那一格抓住（不是自己出题自己答）。
+
+**零 unsafe、零分配兑现了**：`gpt.rs` 与 `ktests/gpt.rs` 都不含 `unsafe`
+（缓冲全在栈上：解析器一个扇区 + 一个条目装配缓冲 = 1 KiB，任务栈 16 KiB 也装得下；
+用例的合成盘 2 KiB + 一份副本，boot 栈 64 KiB）⇒ **unsafe 普查仍是 378、白名单一行没改**。
+这比草案预计的"普查会上涨"更好，原因是放弃了 `UnsafeCell` 静态缓冲改用栈。
+
+**仍开着（S1 未完）**：决策 5 的矩阵行与 `validate_esp.py` 接线；决策 7 的六条改盘负样本；
+上界常量与宿主机逐字对账的门禁（决策 4 末条）；`check-matrix-wiring`/`check-verdict` 的新行登记。
+S2a/S2b 与未决 1–6 全部不变。

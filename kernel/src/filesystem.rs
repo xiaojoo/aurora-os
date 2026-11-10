@@ -5,4 +5,6 @@
 //! 驱动不知道什么是目录项。
 
 pub mod fat32;
+#[cfg(feature = "gpt-probe")]
+pub mod gpt;
 pub mod vfs;

@@ -501,7 +501,7 @@ status = "部分落地"
 module_id = "storage"
 owner = "storage"
 layer = "service"
-source_modules = ["ahci", "virtio", "filesystem", "filesystem/fat32", "filesystem/vfs"]
+source_modules = ["ahci", "virtio", "filesystem", "filesystem/fat32", "filesystem/gpt", "filesystem/vfs"]
 public_api = [
   "ahci::REG_CAP",
   "ahci::REG_GHC",
@@ -512,7 +512,22 @@ public_api = [
   "ahci::read_bytes",
   "ahci::write_bytes",
   "filesystem::fat32",
+  "filesystem::gpt",
   "filesystem::vfs",
+  "gpt::Entry",
+  "gpt::GptError",
+  "gpt::Header",
+  "gpt::Table",
+  "gpt::crc32",
+  "gpt::find_by_type",
+  "gpt::find_esp",
+  "gpt::parse_header",
+  "gpt::protective_mbr",
+  "gpt::scan",
+  "gpt::ESP_TYPE_GUID",
+  "gpt::MAX_ARRAY_BYTES",
+  "gpt::MAX_ENTRIES",
+  "gpt::MAX_ENTRY_BYTES",
   "vfs::AhciDisk",
   "vfs::SECTOR_BYTES",
   "ahci::AhciError",
@@ -528,10 +543,10 @@ forbidden_dependencies = []
 known_violations = []
 context = ["KERNEL", "IRQ_OFF", "ISR_TOP"]
 error_classes = ["A", "B", "D"]
-resource_ownership = "AHCI/virtio-blk 设备路径、块读写请求、FAT32 只读解析与薄 VFS。"
-error_policy = "BlockError/FsError 分层；设备超时/离线 → 错误 + 重试/隔离；读失败不许读成 0。"
+resource_ownership = "AHCI/virtio-blk 设备路径、块读写请求、FAT32 只读解析与薄 VFS；GPT 只读解析（ADR-078，gpt-probe 档）自成一格，不挂载文件系统、不存分区名单表。"
+error_policy = "BlockError/FsError/GptError 分层；设备超时/离线 → 错误 + 重试/隔离；读失败不许读成 0；GPT 每道闸各一个点名变体，BlockError 原样透传不吞不改名。"
 unsafe_scope = ["ahci:U4", "virtio:U4"]
-test_targets = ["t_ahci_claim", "t_ahci_disk", "t_ahci_high_lba", "t_ahci_write", "t_ahci_recovery", "t_fat32", "t_fat32_mem", "t_fat32_exec", "t_virtio_probe", "t_virtio_io", "t_net_tx", "t_net_rx"]
+test_targets = ["t_ahci_claim", "t_ahci_disk", "t_ahci_high_lba", "t_ahci_write", "t_ahci_recovery", "t_fat32", "t_fat32_mem", "t_fat32_exec", "t_gpt", "t_virtio_probe", "t_virtio_io", "t_net_tx", "t_net_rx"]
 status = "部分落地"
 
 [modules."diagnostics"]
