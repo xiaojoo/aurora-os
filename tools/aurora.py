@@ -1623,6 +1623,43 @@ def check_fatal_record() -> list[str]:
     return bad
 
 
+def check_wedge_probe() -> list[str]:
+    """挂死判别仪器的接线对账：读的每一个符号都必须真的是那个模块里的那个静态量。
+
+    为什么必须机器核：这台仪器按 mangle 尾部找符号，**找错了不会报错**——它会读到另一块
+    内存然后给出一个看着合理的数。所以逐个回源文件核 `static NAME:` 的存在与类型，
+    并由类型推出元素宽度（AtomicBool=1，AtomicUsize/AtomicU64=8），与仪器里写的那份比。
+    """
+    bad: list[str] = []
+    seen: dict[tuple[str, ...], str] = {}
+    for segs, label, width in WEDGE_SYMBOLS:
+        # 两个条目指向同一个符号是**复制粘贴错**的形状：逐个核都会过（那个符号确实存在），
+        # 但表里会少读一个量、多读一遍另一个，而判别表按标签取数 ⇒ 静默读错。
+        if segs in seen:
+            bad.append(f"wedge 符号 {label} 与 {seen[segs]} 指向同一个静态量（{'::'.join(segs)}）⇒ 少读一个量")
+            continue
+        seen[segs] = label
+        name = segs[-1]
+        path = ROOT / "kernel" / "src" / ("/".join(segs[:-1]) + ".rs")
+        if not path.exists():
+            bad.append(f"wedge 符号 {label}：源文件 {path.name} 不在（模块挪了？）")
+            continue
+        src = path.read_text(encoding="utf-8")
+        # 类型可能写成全限定（`core::sync::atomic::AtomicU64`），取**最后一段**；
+        # 只取第一段会拿到 `core` 然后"宽度推不出来"（本门禁第一版就是这么红的）。
+        m = re.search(rf"static {name}\s*:\s*\[?\s*([A-Za-z0-9_:]+)", src)
+        if m is None:
+            bad.append(f"wedge 符号 {label}：{path.name} 里没有 `static {name}` ⇒ 仪器会读到别的内存")
+            continue
+        ty = m.group(1).split("::")[-1]
+        want = 1 if ty == "AtomicBool" else 8
+        if ty not in ("AtomicBool", "AtomicUsize", "AtomicU64"):
+            bad.append(f"wedge 符号 {label}：类型是 {ty}，宽度推不出来 ⇒ 不许猜")
+        elif want != width:
+            bad.append(f"wedge 符号 {label}：类型 {ty} 该按 {want} 字节解，仪器写的是 {width}")
+    return bad
+
+
 def check_esp_partition() -> list[str]:
     """S2b 的接线对账：分区偏移视图 + 句柄身份 + 第二台仪器，三处的口号与依赖必须机器核。
 
@@ -1727,6 +1764,8 @@ def check_fat32_ports() -> list[str]:
     bad += check_fatal_record()
     # S2b：分区偏移视图 + 句柄身份 + 第二台仪器的接线对账（同一格，不新开第 18 道门禁）。
     bad += check_esp_partition()
+    # 挂死判别仪器读的符号逐个回源文件核（同一格，不新开第 18 道门禁）。
+    bad += check_wedge_probe()
 
     feats = (ROOT / "kernel" / "Cargo.toml").read_text(encoding="utf-8")
     for f in sorted(FAT_FEATURES):
@@ -1995,6 +2034,7 @@ def qmp_snapshot(port: int, cmds: list[str]) -> str:
     except OSError as e:
         out.append("# QMP 读取中断：" + repr(e))
     finally:
+        f.close()
         s.close()
     return nl.join(out)
 
@@ -2090,6 +2130,7 @@ def qmp_pmemsave(port: int, addr: int, size: int, path: Path) -> str:
     except OSError as e:
         return "QMP 读取中断：" + repr(e)
     finally:
+        f.close()
         s.close()
 
 
@@ -2199,8 +2240,225 @@ def fatal_selfcheck(log: str, table: list[list[int]]) -> tuple[list[str], str]:
     return [], "fatalrec 自查: 绿（内存里那一槽与串口上那五个 magic 逐格对上）"
 
 
+def data_sym(elf: Path, segs: tuple[str, ...]) -> tuple[int, int, str] | None:
+    """按 mangle 尾部找**数据**符号（STT_OBJECT），返回 (va, size, 原名)。
+
+    与 `func_syms` 同一份 ELF 解析（`_elf_sections`），只是类型过滤换成 OBJECT。
+    `st_size` 直接给出字节数 ⇒ **元素个数不用手写**（手写过的每一次数错的都会静默错位）。
+    私有 static 被 LLVM 内部化之后带 `.llvm.<hash>` 后缀，所以允许尾部跟一段 `.llvm.`；
+    除此之外必须**正好结束**，否则 `CPU_TICKS_EXTRA` 这种会被当成 `CPU_TICKS`。
+    命中不唯一就不给（宁可报"找不到"，也不许挑一个看着像的）。
+    """
+    import struct
+
+    d, secs = _elf_sections(elf)
+    if ".symtab" not in secs or ".strtab" not in secs:
+        return None
+    symtab, strtab = secs[".symtab"], secs[".strtab"]
+    tail = _mangle_tail(*segs).encode()
+    hits = []
+    for i in range(symtab[5] // symtab[9]):
+        st_name, info, _o, _x, st_value, st_size = struct.unpack_from("<IBBHQQ", d, symtab[4] + i * symtab[9])
+        if (info & 0xF) != 1 or st_value == 0 or st_size == 0:
+            continue
+        name = d[strtab[4] + st_name:].split(bytes([0]))[0]
+        j = name.find(tail)
+        if j < 0:
+            continue
+        rest = name[j + len(tail):]
+        if rest == b"" or rest.startswith(b".llvm."):
+            hits.append((st_value, st_size, name.decode(errors="replace")))
+    return hits[0] if len(hits) == 1 else None
+
+
+def _elf_first_load(elf: Path) -> tuple[int, int, int, bytes] | None:
+    """第一个 PT_LOAD 的 (文件偏移, vaddr, filesz, 整个 ELF 字节)。VA 基址与镜像头字节都从这里来。"""
+    import struct
+
+    d = elf.read_bytes()
+    e_phoff = struct.unpack_from("<Q", d, 32)[0]
+    e_phentsize, e_phnum = struct.unpack_from("<HH", d, 54)[0], struct.unpack_from("<H", d, 56)[0]
+    for i in range(e_phnum):
+        p_type, _fl, p_offset, p_vaddr, _pa, p_filesz, _ms, _al = struct.unpack_from(
+            "<IIQQQQQQ", d, e_phoff + i * e_phentsize)
+        if p_type == 1:
+            return p_offset, p_vaddr, p_filesz, d
+    return None
+
+
+# 判别表**预注册**在这里（跑之前写死，免得看到数再编解释）：
+#   两次采样全冻结                     ⇒ 中断根本没来（假设 A：中断源停了）
+#   中断计数/本地 tick/idle_hlt 涨而 WORK 冻结 ⇒ 中断来了但没任务跑（假设 B：丢唤醒 / 任务 blocked）
+#   WORK 涨                           ⇒ 有任务在跑，不是整机停住（要看串口停在哪条用例）
+# **两条语义先核清楚再写判据**（否则会写出永远成立或永远不成立的空转判据）：
+#   * `CPU_TICKS` 只数**本地 APIC 定时器**（apic.rs:577-586），BSP 的 tick 走 PIT/I-O APIC，
+#     数在 `IRQ_COUNTS[TIMER_ISA_IRQ=0]` ⇒ "中断来了"必须**两本都看**。
+#   * `RESCHED` 在**自陷 0xF0 那一支也加**（apic.rs:524），所以 `RESCHED > RESCHED_IPI_RECV`
+#     在正常跑里就成立，**不能**当成"IPI 没被取走"。第一版写了这条，核语义时抓出来删掉：
+#     marks/recv/fail 三个数只**报出来**供人判，不写成自动结论。
+# 读的全是**内核里已有的**计数器 ⇒ 这一刀零内核改动、不改串口量、不动中断语义。
+WEDGE_SYMBOLS = [
+    (("arch", "x86_64", "apic", "CPU_TICKS"), "每CPU本地tick", 8),
+    (("arch", "x86_64", "apic", "IRQ_COUNTS"), "按向量中断", 8),
+    (("arch", "x86_64", "apic", "RESCHED"), "resched合计", 8),
+    (("arch", "x86_64", "apic", "RESCHED_IPI_RECV"), "resched_IPI取走", 8),
+    (("sched", "RESCHED_MARKS"), "每CPU重排标记", 8),
+    (("sched", "RESCHED_IPI_FAIL"), "resched_IPI发失败", 8),
+    (("arch", "x86_64", "apic", "EOIS"), "EOI", 8),
+    (("arch", "x86_64", "apic", "TICK_TSC_LAST"), "最后一拍TSC", 8),
+    (("arch", "x86_64", "apic", "CPU_IF"), "每CPU_IF牌", 1),
+    (("sched", "IDLE_HLT"), "idle_hlt", 8),
+    (("sched", "WORK"), "每任务工作量", 8),
+]
+
+
+class QmpSession:
+    """一条 QMP 连接上发多条命令。
+
+    为什么必须复用：QEMU 的 `-qmp …,server=on` 一次只服务一个客户端，而 `makefile` 出来的
+    文件对象不关就会拖住 FIN ⇒ 下一笔连接被接受却没人服务。**实测**：每读一个符号新开一条连接，
+    取证跑到第 5 笔就卡住不返回（>400 s，最后只能杀进程）。所以这里一条连接读到底，
+    并且 `close()` 先关文件对象再关 socket。
+    """
+
+    def __init__(self, port: int):
+        import json
+        import socket
+
+        self._json = json
+        self.s = socket.create_connection(("127.0.0.1", port), timeout=5)
+        self.f = self.s.makefile("rw", encoding="utf-8")
+        self.f.readline()  # greeting
+        self._send({"execute": "qmp_capabilities"})
+        self.f.readline()
+
+    def _send(self, obj: dict) -> None:
+        self.f.write(self._json.dumps(obj) + "\r\n")
+        self.f.flush()
+
+    def pmemsave(self, addr: int, size: int, path: Path) -> str:
+        """空串 = 成功；否则是成因。异步事件（没有 return/error 的那些）跳过继续等。"""
+        self._send({"execute": "pmemsave",
+                    "arguments": {"val": addr, "size": size, "filename": str(path).replace("\\", "/")}})
+        while True:
+            line = self.f.readline()
+            if not line:
+                return "QMP 没有回话（连接断开）"
+            try:
+                msg = self._json.loads(line)
+            except ValueError:
+                continue
+            if "error" in msg:
+                return "pmemsave 被拒：" + self._json.dumps(msg["error"], ensure_ascii=False)
+            if "return" in msg:
+                return ""
+
+    def close(self) -> None:
+        try:
+            self.f.close()
+        finally:
+            self.s.close()
+
+
+def wedge_probe(port: int, log: str, elf: Path, build_dir: Path, seq: int) -> str:
+    """挂死时把已有计数器**读两次**（隔 3 秒），判"中断源停了"还是"丢唤醒"。
+
+    VA→PA 靠现成锚点：`fatalrec: 物理=` 那行给 FATAL_RECORD 的 PA，符号表给它的 VA，
+    两者相减得内核镜像的物理基址（ELF 里 paddr==vaddr 是链接器占位，**不能用**）。
+    **非循环自检**：拿推出来的基址去读镜像头 256 字节，必须与 ELF 第一个 PT_LOAD 的
+    文件字节逐字相同——用锚点推基址再反算锚点永远相等，那种自检是空转。
+    符号表还需要与这一跑的产物同源（image-info 的 sha），否则地址会落到另一个构建里。
+    """
+    import hashlib as _hl
+    import struct
+
+    facts = fatalrec_boot_facts(log)
+    if facts is None:
+        return "wedge: 串口没有 fatalrec 锚点行 ⇒ 推不出物理基址，整段跳过（不猜）"
+    info = build_dir / "image-info.txt"
+    rec = dict(l.split("=", 1) for l in info.read_text(encoding="utf-8").splitlines() if "=" in l) if info.exists() else {}
+    if not elf.exists():
+        return f"wedge: 产物不在 {elf}"
+    if rec.get("elf_sha256") != _hl.sha256(elf.read_bytes()).hexdigest():
+        return "wedge: 符号表与这一跑的产物不同源（image-info 的 elf_sha256 不符）⇒ 不读"
+    fr = data_sym(elf, ("crash", "FATAL_RECORD"))
+    load = _elf_first_load(elf)
+    if fr is None or load is None:
+        return "wedge: 符号表里找不到 FATAL_RECORD 或第一个 PT_LOAD ⇒ 不猜基址"
+    p_offset, va_base, _filesz, d = load
+    base = facts[0] - (fr[0] - va_base)
+    try:
+        q = QmpSession(port)
+    except OSError as e:
+        return "wedge: QMP 连不上（port=" + str(port) + "）：" + repr(e)
+    try:
+        head = build_dir / f"wedge-head-{seq:03d}.bin"
+        err = q.pmemsave(base, 256, head)
+        if err:
+            return "wedge: 镜像头读不回来（" + err + "）⇒ 基址推导无从验证，整段不读"
+        if head.read_bytes() != d[p_offset:p_offset + 256]:
+            return (f"wedge: **基址自检红** 推导基址={hex(base)}，按它读回的镜像头 256 字节与 ELF 段字节不同"
+                    " ⇒ 线性映射假设不成立，后面所有符号都不读")
+        syms = []
+        for segs, label, width in WEDGE_SYMBOLS:
+            s = data_sym(elf, segs)
+            if s is None:
+                return f"wedge: 符号 {label}（{'::'.join(segs)}）在符号表里找不到或不唯一 ⇒ 整段不读"
+            syms.append((label, width, s))
+        samples = []
+        for k in (1, 2):
+            if k == 2:
+                time.sleep(3)
+            row = {}
+            for i, (label, width, (va, size, _n)) in enumerate(syms):
+                # 文件名只用跑号/样本号/序号：中文标签进文件名在本机控制台上读起来是乱码，
+                # 而证据文件是要被人翻的。
+                f = build_dir / f"wedge-{seq:03d}-{k}-{i:02d}.bin"
+                err = q.pmemsave(base + (va - va_base), size, f)
+                if err:
+                    return f"wedge: 第 {k} 次采样读 {label} 失败（{err}）⇒ 不给半截结论"
+                b = f.read_bytes()
+                row[label] = list(struct.unpack("<" + ("Q" if width == 8 else "B") * (size // width), b))
+            samples.append(row)
+    finally:
+        q.close()
+    a, b = samples
+    out = [f"wedge: 基址={hex(base)}（锚点自检绿：镜像头 256 字节与 ELF 逐字相同）；两次采样间隔 3s"]
+    moved = []
+    deltas = {}
+    for label, width, (_va, size, _n) in syms:
+        n = size // width
+        va_, vb_ = a[label][:n], b[label][:n]
+        delta = [y - x for x, y in zip(va_, vb_)]
+        deltas[label] = delta
+        tag = "涨" if any(delta) else "冻结"
+        if any(delta):
+            moved.append(label)
+        out.append(f"  {label:16s} {tag}  一次={va_ if n <= 16 else str(va_[:8]) + '…'}"
+                   f"  增量={delta if n <= 16 else str(delta[:8]) + '…'}")
+    # "中断来了"两本都看：PIT 走 IRQ_COUNTS[0]，AP 本地定时器走 CPU_TICKS（语义见上面注释）
+    irq_moved = any(deltas["按向量中断"])
+    apict_moved = any(deltas["每CPU本地tick"])
+    idle_moved = any(deltas["idle_hlt"])
+    work_moved = any(deltas["每任务工作量"])
+    if not moved:
+        verdict = "两次采样**全冻结** ⇒ 中断根本没来（假设 A：中断源停了）"
+    elif (irq_moved or apict_moved or idle_moved) and not work_moved:
+        verdict = ("中断计数（任一向量）/本地 tick/idle 在涨而**没有任何任务在跑** ⇒ 中断来了但没人被调度"
+                   "（假设 B：丢唤醒 / 任务 blocked）")
+    elif work_moved:
+        verdict = "有任务在跑 ⇒ 这不是整机停住，是**某一格在等一个不来的东西**（要看串口停在哪条用例）"
+    else:
+        verdict = "形状不在预注册判别表里 ⇒ 只留证据，不下结论"
+    out.append(f"  参考数（只报不判：marks 含自陷，不能拿它与 recv 的差当丢唤醒）"
+               f" resched合计={b['resched合计'][0]} IPI取走={b['resched_IPI取走'][0]}"
+               f" IPI发失败={b['resched_IPI发失败'][0]} 每CPU标记={b['每CPU重排标记']}")
+    out.append("wedge 判定: " + verdict)
+    return "\n".join(out)
+
+
 def qmp_hang_evidence(port: int, log: str, build_dir: Path, seq: int) -> str:
-    """超时那一次的完整取证：寄存器/LAPIC/PIC + 无锁现场表读回 + 两种自查判据。"""
+    """超时那一次的完整取证：寄存器/LAPIC/PIC + 无锁现场表读回 + 两种自查判据 + 中断源/丢唤醒判别。"""
     dump = qmp_snapshot(port, ["info registers -a", "info lapic", "info pic"])
     text, table = fatalrec_readback(port, log, build_dir, seq)
     bad, green = fatal_selfcheck(log, table)
@@ -2208,6 +2466,10 @@ def qmp_hang_evidence(port: int, log: str, build_dir: Path, seq: int) -> str:
         text += "\n" + "；".join(bad)
     elif green:
         text += "\n" + green
+    # 判别仪器与崩溃表是两件事：表答"有没有进崩溃路径"，这一台答"为什么没人再跑"。
+    # 产物路径直接取（**不调 kernel_binary**：那会触发构建，而取证必须在 kill 之前做完）。
+    elf = ROOT / "target" / TARGET / "debug" / "aurora-kernel"
+    text += "\n" + wedge_probe(port, log, elf, build_dir, seq)
     return dump + "\n" + text + "\n"
 
 
