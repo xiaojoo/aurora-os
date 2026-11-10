@@ -1786,6 +1786,33 @@ def qmp_snapshot(port: int, cmds: list[str]) -> str:
         s.close()
     return nl.join(out)
 
+def stall_report(log: str, elapsed: float, budget: int) -> str:
+    """判定级停住（HANG/NOBOOT）的现场：停在哪条用例之后、有没有跑完、用时是否恰好等于预算。
+
+    为什么要有它：两次间歇挂的**停住点不同**（一次在 `t_q2_workload_slots` 之前、一次在
+    `t_vmo_syscalls` 之前），而归档里只有串口原文——每次都要手工 grep 才知道停在哪，
+    于是"下一跑绿了"就被当成修好了。稀有故障要买确定性而不是买跑数：这条把停住点变成
+    每次自动留痕的读数，并与归档同号存成 `run-NNN.stall.txt`。
+    """
+    # 两种 tag 都要收：成功是 `[test] … -> ok`，失败是 `[FAIL] … -> failed`。
+    # 只收 `[test]` 的话"红过的用例"永远是空——那一格就成了空转（本轮自查抓到）。
+    tests = re.findall(r"\[(?:test|FAIL)\] (0x[0-9a-f]+) (\w+) -> (\w+)", log)
+    total = re.search(r"ktests: total=(\d+) passed=(\d+) failed=(\d+)", log)
+    out = [f"判定级停住现场：用时 {elapsed:.1f}s / 预算 {budget}s"
+           + ("（**恰好等于预算** ⇒ 先怀疑预算与宿主负载，再怀疑 guest 死锁）"
+              if elapsed >= budget * 0.99 else "")]
+    out.append(f"跑过用例 {len(tests)} 条；最后一条 = "
+               + (f"{tests[-1][1]} -> {tests[-1][2]}（序号 {tests[-1][0]}）" if tests
+                  else "无（连一条用例都没跑到）"))
+    out.append(f"ktests 收尾行 = {'有: ' + total.group(0) if total else '**无**（没跑完）'}；"
+               f"退出行 = {'有' if 'qemu-exit' in log else '**无**'}")
+    tail = [l.strip() for l in log.splitlines() if l.strip()]
+    out.append("串口最后一行 = " + (tail[-1][:160] if tail else "（空）"))
+    reds = [f"{n}->{r}" for _s, n, r in tests if r != "ok"]
+    out.append("红过的用例 = " + (", ".join(reds) if reds else "无"))
+    return "\n".join(out)
+
+
 def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str = "") -> tuple[str, int, str]:
     if not QEMU.exists():
         sys.exit(f"QEMU 未就位：{QEMU}")
@@ -1945,6 +1972,11 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
         verdict = "NOEMU"
     else:
         verdict = f"QEMU-EXIT-{rc}"
+    if rc == -1:
+        # 停住点自动留痕（与归档同号）：下一次撞到就有现场，不用靠重跑撞见。
+        sr = stall_report(log, time.time() - t0, timeout)
+        print("   " + sr.replace("\n", "\n   "))
+        (BUILD / f"run-{RUN_SEQ:03d}.stall.txt").write_text(sr, encoding="utf-8")
     if verdict == "PASS":
         # 内核自报 PASS 之后还有一关：块内容必须与宿主机上的镜像对得上
         bad = check_disk_content(log)
