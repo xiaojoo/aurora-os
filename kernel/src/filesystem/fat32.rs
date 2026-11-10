@@ -53,6 +53,7 @@ pub const OFF_FSINFO: usize = 48;
 /// 备份引导扇区的位置。规范里是 **50**；写成 49 会得到 1536 这样一个"合理"的错数（模块头）。
 pub const OFF_BACKUP_BOOT: usize = 50;
 pub const OFF_DRV_NUM: usize = 64;
+pub const OFF_DRV_NUM16: usize = 36;
 /// `BS_BootSig`：0x28/0x29 表示扩展字段（卷号、卷标、文件系统名）在位。
 /// 不先看这一格就去读 82 的 `BS_FilSysType`，读到的是保留区里的随机字节。
 pub const OFF_BOOT_SIG: usize = 66;
@@ -107,6 +108,15 @@ pub const FAT32_CLUSTER_MASK: u32 = 0x0FFF_FFFF;
 /// 那不 panic、不报错，只是不回来，是 L4 之外没人认领的第三种死法。
 pub const MAX_CLUSTERS_WALKED: u32 = 65_535;
 
+// FAT16 那一族的常数（ADR-078 / W4 S2a）。**与 FAT32 的分开写**，不共用一个"看起来差不多的数"：
+// 项宽 2 vs 4、掩码 16 位 vs 28 位、EOC 0xFFF8 vs 0x0FFF_FFF8，混用会把链走飞而字节数还好看。
+pub const OFF_BOOT_SIG16: usize = 38;
+pub const OFF_FS_TYPE16: usize = 54;
+pub const FAT16_ENTRY_BYTES: usize = 2;
+pub const FAT16_CLUSTER_MASK: u32 = 0xFFFF;
+pub const FAT16_MAX_GOOD_CLUSTER: u32 = 0xFFF6;
+pub const FAT16_EOC_MARKER: u32 = 0xFFF8;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FatType {
     Fat12,
@@ -133,6 +143,17 @@ pub struct Bpb {
     pub fat_type: FatType,
     /// `BS_FilSysType` 前五个字节是不是 "FAT32"（只有 `BS_BootSig` 在位时才有意义）
     pub fs_name_ok: bool,
+    /// 固定根目录区的项数（FAT16 非零、FAT32 恒 0）。**判型只看结构**就看它与 spf16/spf32。
+    pub root_entries: u16,
+    /// 固定根目录区占几个扇区（FAT16 = ceil(root_entries×32/512)，FAT32 = 0）。
+    /// FAT16 的 `data_start` 要把它加进去，FAT32 加 0 ⇒ 那条路的算术一个数没变。
+    pub root_dir_sectors: u64,
+    /// FAT 项宽（FAT32=4、FAT16=2）。走链与游标共用这一个数，不各写一份。
+    pub fat_entry_bytes: usize,
+    /// 簇号掩码 / 合法上界 / EOC 下界：三族各一份，由 `fat_type` 决定，走链只问 Bpb。
+    pub cluster_mask: u32,
+    pub max_good_cluster: u32,
+    pub eoc_marker: u32,
 }
 
 /// 从引导扇区与 FSInfo 扇区读回来的"设备自述"，只用于报数与两侧对账。
@@ -274,30 +295,49 @@ pub fn parse_boot_sector(b: &[u8]) -> Result<Bpb, FsError> {
     if total == 0 {
         total = u32_at(b, OFF_TOTAL_SECS32) as u64;
     }
-    // 判型顺序就是这个顺序：先看结构，阈值只在"不是 FAT32"时用来给个名字。
+    // 判型顺序就是这个顺序：**先看结构**，阈值只在"两族结构都不匹配"时用来给拒因起名字。
+    // FAT16 的接受闸是 `root_entries != 0 && spf16 != 0`，与 FAT32 的闸天然互斥。
+    // **不许再加 `spf32 == 0` 这一条**：FAT16 根本没有 spf32 这个字段，偏移 36..40 那四字节是
+    // 它的扩展引导记录（36=BS_DrvNum、38=BS_BootSig、39..43=BS_VolID），真实 FAT16 卷那里**非零**
+    // （本仓 ESP 就是 0x29 + 卷标）。本轮第一版加了那一条，合成卷因为写了 BootSig=0x29 当场被拒，
+    // 而真 ESP 同样会被拒——合成卷里那个"看起来多余"的字节正是抓到它的证人。
+    // 也**绝不用簇数阈值分流**：卷A 64,496 簇按阈值是 FAT16、按结构是 FAT32，
+    // 用阈值分流会把它误路由进 FAT16 读路径，`a_counter` 那格反例当场红（ADR-038 决策 1）。
     let fat_type = if root_entries == 0 && spf16 == 0 && spf32 != 0 {
         FatType::Fat32
+    } else if root_entries != 0 && spf16 != 0 {
+        FatType::Fat16
     } else {
         if total == 0 || fat_count == 0 {
             return Err(FsError::MalformedBpb);
         }
         let spf = if spf16 != 0 { spf16 as u64 } else { spf32 as u64 };
         let clusters = total.saturating_sub(reserved as u64 + fat_count as u64 * spf) / spc as u64;
-        band_type(clusters)
+        return Err(FsError::UnsupportedFat(band_type(clusters)));
     };
-    if fat_type != FatType::Fat32 {
-        return Err(FsError::UnsupportedFat(fat_type));
-    }
     if fat_count == 0 || reserved == 0 {
         return Err(FsError::MalformedBpb);
     }
-    let sectors_per_fat = spf32;
-    let data_start = reserved as u64 + fat_count as u64 * sectors_per_fat as u64;
+    let is16 = fat_type == FatType::Fat16;
+    let sectors_per_fat = if is16 { u32::from(spf16) } else { spf32 };
+    // FAT16 的根目录是**固定区**不是簇链，数据区起点要把它加进去；FAT32 加 0
+    // ⇒ FAT32 那条路的 data_start 算术一个数没变（34–39 行与十三格判据靠这一点保持绿）。
+    let root_dir_sectors = if is16 {
+        (u64::from(root_entries) * ENTRY_BYTES as u64 + SECTOR_BYTES as u64 - 1) / SECTOR_BYTES as u64
+    } else {
+        0
+    };
+    let data_start = reserved as u64 + fat_count as u64 * sectors_per_fat as u64 + root_dir_sectors;
     if data_start >= total {
         return Err(FsError::GeometryBeyondVolume { data_start, total });
     }
     let clusters = (total - data_start) / spc as u64;
-    let boot_sig = b[OFF_BOOT_SIG];
+    // 扩展引导记录两族布局不同：FAT16 的 BootSig 在 38、名字在 54；FAT32 在 66 / 82。
+    let (boot_sig, fs_type_off, fs_name): (u8, usize, &[u8]) = if is16 {
+        (b[OFF_BOOT_SIG16], OFF_FS_TYPE16, &b"FAT16"[..])
+    } else {
+        (b[OFF_BOOT_SIG], OFF_FS_TYPE, &b"FAT32"[..])
+    };
     Ok(Bpb {
         bytes_per_sector: bps,
         sectors_per_cluster: spc,
@@ -312,8 +352,14 @@ pub fn parse_boot_sector(b: &[u8]) -> Result<Bpb, FsError> {
         clusters,
         cluster_bytes: SECTOR_BYTES * spc as usize,
         fat_type,
-        // 只有 BS_BootSig 在位（0x28/0x29）时 82 那 8 个字节才是文件系统名，否则它是保留区
-        fs_name_ok: matches!(boot_sig, 0x28 | 0x29) && &b[OFF_FS_TYPE..OFF_FS_TYPE + 5] == b"FAT32",
+        // 只有 BS_BootSig 在位（0x28/0x29）时那 8 个字节才是文件系统名，否则它是保留区
+        fs_name_ok: matches!(boot_sig, 0x28 | 0x29) && &b[fs_type_off..fs_type_off + 5] == fs_name,
+        root_entries,
+        root_dir_sectors,
+        fat_entry_bytes: if is16 { FAT16_ENTRY_BYTES } else { 4 },
+        cluster_mask: if is16 { FAT16_CLUSTER_MASK } else { FAT32_CLUSTER_MASK },
+        max_good_cluster: if is16 { FAT16_MAX_GOOD_CLUSTER } else { MAX_GOOD_CLUSTER },
+        eoc_marker: if is16 { FAT16_EOC_MARKER } else { EOC_MARKER },
     })
 }
 
@@ -338,42 +384,52 @@ impl<'a> Volume<'a> {
         disk.read_sectors(0, &mut bs).map_err(FsError::Io)?;
         let bpb = parse_boot_sector(&bs)?;
         let mut info = [0u8; SECTOR_BYTES];
-        disk.read_sectors(u64::from(bpb.fsinfo_sector), &mut info)
-            .map_err(FsError::Io)?;
-        let lead = u32_at(&info, 0);
-        let struct_sig = u32_at(&info, OFF_FSINFO_STRUCT);
-        let trail = u16_at(&info, OFF_SIG);
-        if lead != FSINFO_LEAD || struct_sig != FSINFO_STRUCT || trail != 0xAA55 {
-            return Err(FsError::FsinfoSignature { lead, struct_sig, trail });
-        }
-        let mut backup = [0u8; SECTOR_BYTES];
-        disk.read_sectors(u64::from(bpb.backup_boot_sector), &mut backup)
-            .map_err(FsError::Io)?;
-        let mut first_diff = None;
-        for i in 0..SECTOR_BYTES {
-            if backup[i] != bs[i] {
-                first_diff = Some(i);
-                break;
+        let is16 = bpb.fat_type == FatType::Fat16;
+        // FAT16 **没有 FSInfo 也没有备份引导扇区**（规范如此，本仓 ESP 就是这个形状）。
+        // 不去读那两处：读了就是把 FAT32 的自校验强加给一个没有那两格的卷。
+        // FAT32 那条路的三处签名与逐字节比较**一个字没动**，`backup_same` 仍是 true。
+        let (lead, struct_sig, free_clusters, next_free, backup_same) = if is16 {
+            (0u32, 0u32, 0u32, 0u32, false)
+        } else {
+            disk.read_sectors(u64::from(bpb.fsinfo_sector), &mut info)
+                .map_err(FsError::Io)?;
+            let lead = u32_at(&info, 0);
+            let struct_sig = u32_at(&info, OFF_FSINFO_STRUCT);
+            let trail = u16_at(&info, OFF_SIG);
+            if lead != FSINFO_LEAD || struct_sig != FSINFO_STRUCT || trail != 0xAA55 {
+                return Err(FsError::FsinfoSignature { lead, struct_sig, trail });
             }
-        }
-        if let Some(i) = first_diff {
-            return Err(FsError::BackupDiffers { first_diff: i });
-        }
+            let mut backup = [0u8; SECTOR_BYTES];
+            disk.read_sectors(u64::from(bpb.backup_boot_sector), &mut backup)
+                .map_err(FsError::Io)?;
+            let mut first_diff = None;
+            for i in 0..SECTOR_BYTES {
+                if backup[i] != bs[i] {
+                    first_diff = Some(i);
+                    break;
+                }
+            }
+            if let Some(i) = first_diff {
+                return Err(FsError::BackupDiffers { first_diff: i });
+            }
+            (lead, struct_sig, u32_at(&info, OFF_FSINFO_FREE), u32_at(&info, OFF_FSINFO_NEXT), true)
+        };
         let mut name = [0u8; 8];
-        name.copy_from_slice(&bs[OFF_FS_TYPE..OFF_FS_TYPE + 8]);
+        let name_off = if is16 { OFF_FS_TYPE16 } else { OFF_FS_TYPE };
+        name.copy_from_slice(&bs[name_off..name_off + 8]);
         Ok(Volume {
             disk,
             bpb,
-            backup_same: true,
+            backup_same,
             witness: Witness {
                 media: bs[OFF_MEDIA],
-                boot_sig: bs[OFF_BOOT_SIG],
-                drv_num: bs[OFF_DRV_NUM],
+                boot_sig: if is16 { bs[OFF_BOOT_SIG16] } else { bs[OFF_BOOT_SIG] },
+                drv_num: bs[if is16 { OFF_DRV_NUM16 } else { OFF_DRV_NUM }],
                 fs_type_name: name,
                 fsinfo_lead: lead,
                 fsinfo_struct: struct_sig,
-                free_clusters: u32_at(&info, OFF_FSINFO_FREE),
-                next_free: u32_at(&info, OFF_FSINFO_NEXT),
+                free_clusters,
+                next_free,
             },
         })
     }
@@ -383,17 +439,23 @@ impl<'a> Volume<'a> {
         if cluster < MIN_CLUSTER {
             return Err(FsError::BadCluster(cluster));
         }
-        let byte_off = cluster as usize * 4;
-        let lba = self.bpb.reserved_sectors as u64 + (byte_off / SECTOR_BYTES) as u64;
+        let v = &self.bpb;
+        let byte_off = cluster as usize * v.fat_entry_bytes;
+        let lba = v.reserved_sectors as u64 + (byte_off / SECTOR_BYTES) as u64;
         let mut sec = [0u8; SECTOR_BYTES];
         self.disk.read_sectors(lba, &mut sec).map_err(FsError::Io)?;
         let in_sec = byte_off % SECTOR_BYTES;
-        if in_sec + 4 > SECTOR_BYTES {
+        if in_sec + v.fat_entry_bytes > SECTOR_BYTES {
             // 一项跨在两个 FAT 扇区之间。FAT32 里只有 `cluster*4 % 512 > 508` 才会这样，
             // 也就是簇号 ≡ 128 (mod 128) 附近——真卷上会出现，所以这不是"不可能分支"。
+            // FAT16 的项宽是 2、512 整除它，这一支在那一族不可达。
             return Err(FsError::BadCluster(cluster));
         }
-        Ok(u32_at(&sec, in_sec) & FAT32_CLUSTER_MASK)
+        Ok(if v.fat_entry_bytes == FAT16_ENTRY_BYTES {
+            u32::from(u16_at(&sec, in_sec)) & v.cluster_mask
+        } else {
+            u32_at(&sec, in_sec) & v.cluster_mask
+        })
     }
 
     pub fn cluster_to_lba(&self, cluster: u32) -> u64 {
@@ -403,18 +465,35 @@ impl<'a> Volume<'a> {
     /// 在根目录里按 8.3 名字找一项（大小写不敏感）。
     pub fn open(&self, want: &str) -> Result<FileStat, FsError> {
         let v = &self.bpb;
+        let is16 = v.fat_type == FatType::Fat16;
         let mut cluster = v.root_cluster;
         let mut entries_seen: u32 = 0;
         let mut lfn: u32 = 0;
         let mut walked: u32 = 0;
         let mut sector = [0u8; SECTOR_BYTES];
+        // 根在哪由类型决定：FAT32 走根簇链，FAT16 走**固定根目录区**（保留区 + FAT 份数×每份扇区）。
+        // 固定区按扇区流式扫，512 项 × 32 = 16 KiB 也不进堆（堆上限 2048，ADR-018/026）。
+        // 目录项那段解析两族共用，只有"根在哪"与"簇号有没有高半"两处不同。
+        let mut fixed_left = v.root_dir_sectors;
+        let mut fixed_lba = v.reserved_sectors as u64 + v.fat_count as u64 * v.sectors_per_fat as u64;
         loop {
-            if cluster < MIN_CLUSTER || cluster > MAX_GOOD_CLUSTER {
-                return Err(FsError::NoEntry);
-            }
-            for s in 0..v.sectors_per_cluster as u32 {
+            let (lba, nsec) = if is16 {
+                if fixed_left == 0 {
+                    return Err(FsError::NoEntry);
+                }
+                let l = fixed_lba;
+                fixed_lba += 1;
+                fixed_left -= 1;
+                (l, 1u32)
+            } else {
+                if cluster < MIN_CLUSTER || cluster > v.max_good_cluster {
+                    return Err(FsError::NoEntry);
+                }
+                (self.cluster_to_lba(cluster), v.sectors_per_cluster as u32)
+            };
+            for s in 0..nsec {
                 self.disk
-                    .read_sectors(self.cluster_to_lba(cluster) + s as u64, &mut sector)
+                    .read_sectors(lba + s as u64, &mut sector)
                     .map_err(FsError::Io)?;
                 let mut o = 0usize;
                 while o + ENTRY_BYTES <= sector.len() {
@@ -435,10 +514,15 @@ impl<'a> Volume<'a> {
                     if !name_matches(e, want) {
                         continue;
                     }
-                    // 簇号是**两半**拼的。只读低半会在一越过 65,535 簇的卷上把文件指到别处，
+                    // FAT32 的簇号是**两半**拼的。只读低半会在一越过 65,535 簇的卷上把文件指到别处，
                     // 而目录项里的字节数还是对的——本模块最难查的那类错，`fat32-wide` 就是为它造的。
-                    let c = (u16_at(e, OFF_CLUSTER_HI) as u32) << 16 | u16_at(e, OFF_CLUSTER_LO) as u32;
-                    if c < MIN_CLUSTER || c > MAX_GOOD_CLUSTER {
+                    // FAT16 **没有高半**（偏移 20 那两字节是 EA 索引，不是簇号），读了就会把文件指飞。
+                    let c = if is16 {
+                        u32::from(u16_at(e, OFF_CLUSTER_LO))
+                    } else {
+                        (u16_at(e, OFF_CLUSTER_HI) as u32) << 16 | u16_at(e, OFF_CLUSTER_LO) as u32
+                    };
+                    if c < MIN_CLUSTER || c > v.max_good_cluster {
                         return Err(FsError::EntryOutsideData(c));
                     }
                     return Ok(FileStat {
@@ -449,12 +533,15 @@ impl<'a> Volume<'a> {
                     });
                 }
             }
+            if is16 {
+                continue;
+            }
             walked += 1;
             if walked > MAX_CLUSTERS_WALKED {
                 return Err(FsError::ChainTooLong);
             }
             cluster = self.fat_next(cluster)?;
-            if cluster >= EOC_MARKER {
+            if cluster >= v.eoc_marker {
                 return Err(FsError::NoEntry);
             }
         }
@@ -476,7 +563,7 @@ impl<'a> Volume<'a> {
         let mut left = st.size as usize;
         let mut sector = [0u8; SECTOR_BYTES];
         loop {
-            if cluster < MIN_CLUSTER || cluster > MAX_GOOD_CLUSTER {
+            if cluster < MIN_CLUSTER || cluster > v.max_good_cluster {
                 return Err(FsError::BadCluster(cluster));
             }
             let want = core::cmp::min(v.cluster_bytes, left);
@@ -503,7 +590,7 @@ impl<'a> Volume<'a> {
             left -= want;
             let next = self.fat_next(cluster)?;
             w.after_last = next;
-            if next >= EOC_MARKER {
+            if next >= v.eoc_marker {
                 if left != 0 {
                     return Err(FsError::ChainEndsEarly { bytes: w.bytes, size: st.size, cluster, next });
                 }
@@ -598,7 +685,10 @@ impl FileCursor {
     }
 
     fn data_lba(&self, cluster: u32) -> Result<u64, FsError> {
-        if cluster < MIN_CLUSTER || cluster >= 0x0FFF_FFF0
+        // 坏簇/保留标记那一档两族不同：FAT32 从 0x0FFFFFF0 起、FAT16 从 0xFFF8 起。
+        // FAT32 的那个数逐字保留（改成 eoc_marker 会把 [0x0FFFFFF0,0x0FFFFFF7] 这一段放行）。
+        let limit = if self.bpb.fat_type == FatType::Fat16 { FAT16_EOC_MARKER } else { 0x0FFF_FFF0 };
+        if cluster < MIN_CLUSTER || cluster >= limit
             || u64::from(cluster - MIN_CLUSTER) >= self.bpb.clusters
         {
             return Err(FsError::BadCluster(cluster));
@@ -607,13 +697,19 @@ impl FileCursor {
     }
 
     fn next_cluster(&self, disk: &dyn Block, sector: &mut [u8; SECTOR_BYTES]) -> Result<u32, FsError> {
-        let byte_off = u64::from(self.cluster) * 4;
+        let v = &self.bpb;
+        let byte_off = u64::from(self.cluster) * v.fat_entry_bytes as u64;
         let fat_sector = byte_off / SECTOR_BYTES as u64;
-        if fat_sector >= u64::from(self.bpb.sectors_per_fat) {
+        if fat_sector >= u64::from(v.sectors_per_fat) {
             return Err(FsError::BadCluster(self.cluster));
         }
-        disk.read_sectors(u64::from(self.bpb.reserved_sectors) + fat_sector, sector).map_err(FsError::Io)?;
-        Ok(u32_at(sector, (byte_off % SECTOR_BYTES as u64) as usize) & FAT32_CLUSTER_MASK)
+        disk.read_sectors(u64::from(v.reserved_sectors) + fat_sector, sector).map_err(FsError::Io)?;
+        let in_sec = (byte_off % SECTOR_BYTES as u64) as usize;
+        Ok(if v.fat_entry_bytes == FAT16_ENTRY_BYTES {
+            u32::from(u16_at(sector, in_sec)) & v.cluster_mask
+        } else {
+            u32_at(sector, in_sec) & v.cluster_mask
+        })
     }
 
     /// disk 必须仍是打开时的只读卷；Err 时游标不变，dst 中可能已写入的前缀必须丢弃。
@@ -637,7 +733,7 @@ impl FileCursor {
             if cluster_off + take == pending.bpb.cluster_bytes || pending.position == pending.stat.size {
                 let next = pending.next_cluster(disk, &mut sector)?;
                 let at_end = pending.position == pending.stat.size;
-                if next >= EOC_MARKER {
+                if next >= pending.bpb.eoc_marker {
                     if !at_end {
                         return Err(FsError::ChainEndsEarly {
                             bytes: pending.position as usize, size: pending.stat.size, cluster: pending.cluster, next,

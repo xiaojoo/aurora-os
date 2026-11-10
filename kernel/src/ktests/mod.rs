@@ -6,6 +6,8 @@ pub(crate) mod common;
 mod crash;
 mod driver;
 mod elf;
+#[cfg(feature = "fat16-probe")]
+mod fat16;
 #[cfg(feature = "fat32-probe")]
 pub(crate) mod fs;
 #[cfg(feature = "gpt-probe")]
