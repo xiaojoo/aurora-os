@@ -902,3 +902,121 @@ fn t_probe_ring3() -> bool {
 
 #[cfg(feature = "handles")]
 crate::ktest!(KT_PROBE_RING3, t_probe_ring3);
+
+// ---- P7（已解锁部分）：两份**不同**容器同一次启动里同时活着 ----
+//
+// 这条关掉 BACKLOG 79g-3 那笔旧欠账（原文："同一次启动里两份容器共存要等 per-AS 页表；
+// 那时 ⑦ 的'保留数相同'要换成'各自名下的映射条数相加等于总条数'，否则那条判据会退化"）。
+// per-AS 页表已落地（P1/P4/P5），所以前提成立；判据按原文换成"各自名下条数相加"。
+//
+// 为什么此前没测过：P5a 只证过"基址错开 ⇒ **可**共存"，而 `t_elf_load_run` 与 `t_probe_ring3`
+// 是**先后**跑的（各自收干净），`t_probe_ring3` 里那两个探针实例也是先 reap 掉 A 再装 B
+// （同一份 `ET_EXEC` 固定基址不能同时占那段 VA）。**两份不同容器同时活着**这一格今天是空的。
+
+#[cfg(feature = "handles")]
+fn t_two_containers() -> bool {
+    use crate::ktests::common::{HELLO_ELF, PROBE_ELF, drained_or_free};
+    use crate::arch::x86_64::apic;
+    let Some(s) = acpi::summary() else { return false };
+    let Some(m) = s.madt else { return false };
+    if apic::get_or_init(&m).is_err() {
+        crate::log_fatal!("2box: APIC 起不来");
+        return false;
+    }
+    sched::init_boot_task();
+    sched::start_workers();
+    if crate::clock::current().is_none() { crate::calibrate_clock_once(); }
+    if crate::handle::live() != 0 || mm::aspace_count() != 0 {
+        crate::log_fatal!("2box: 前提失效，进来就有残留");
+        return false;
+    }
+    let f0 = mm::free_frames();
+    let va0 = mm::reservation_count();
+    let act0 = sched::stats().2;
+    // 两份**同时**装着：第二次 load 不许因为第一份还活着就失败
+    let lh = match user::load(HELLO_ELF) {
+        Ok(l) => l,
+        Err(e) => { crate::log_fatal!("2box: hello 加载失败 —— {}", user::describe_load(e)); return false; }
+    };
+    let nh = lh.owned.count();
+    let lp = match user::load(PROBE_ELF) {
+        Ok(l) => l,
+        Err(e) => { crate::log_fatal!("2box: probe 在第一份还活着时加载失败 —— {}", user::describe_load(e)); return false; }
+    };
+    let np = lp.owned.count();
+    let apart = lh.data_va != lp.data_va && lh.entry != lp.entry && lh.stack_top != lp.stack_top;
+    let th = match sched::spawn_user(lh.entry, lh.stack_top, 0, lh.owned) {
+        Ok(t) => t,
+        Err(e) => { crate::log_fatal!("2box: hello spawn {:?}", e); return false; }
+    };
+    let tp = match sched::spawn_user(lp.entry, lp.stack_top, 0, lp.owned) {
+        Ok(t) => t,
+        Err(e) => { crate::log_fatal!("2box: probe spawn {:?}", e); return false; }
+    };
+    let tick_in = apic::ticks();
+    let probe = apic::wait_ticks(tick_in, 1, crate::clock::window_cycles(1));
+    let was_running = probe.ticks >= 1;
+    if !was_running { apic::timer_start().ok(); }
+    // 窗口内**只给时间**，不读用户页：`read_at` 要开 AC，而开着 AC 的那几行里不许有中断
+    // （SMAP，与 t_elf_load_run/t_probe_ring3 同一条纪律）。两个程序都很短（各几个 syscall），
+    // 200M 周期（≈60 ms）足够它们跑完写下完成标记。
+    apic::with_interrupts(|| {
+        let t0 = tsc::now();
+        while tsc::now().wrapping_sub(t0) < 200_000_000 {
+            if sched::runs_of(th) >= 2 && sched::runs_of(tp) >= 2 { break; }
+            tsc::spin(20_000);
+        }
+        tsc::spin(2_000_000);
+    });
+    if !was_running { apic::timer_stop().ok(); }
+    // 窗口外才读槽。**hello 的 OFF_FLAG=48 是"内核写、程序读"的命令位，不是完成标记**
+    // （第一版把它当完成标记，恒 false）；hello 跑过并写下的证据是它的 payload 槽
+    // （OFF_PING=8，与 t_elf_load_run 同一组约定）。probe 的 OFF_DONE=48 才是程序自己写的。
+    let hello_done = user::read_at(lh.data_va + 8).unwrap_or(0) != 0;
+    let probe_done = user::read_at(lp.data_va + 48).unwrap_or(0) != 0;
+    // 各读各的：两个魔数不同，且都等于自己那份容器写下的值 ⇒ 谁也没盖掉谁
+    let mh = user::read_at(lh.data_va).unwrap_or(0);
+    let mp = user::read_at(lp.data_va).unwrap_or(0);
+    let hello_magic: u64 = 0xa5a5_5a5a_1234_5678;
+    let own_ok = mh == hello_magic && mp == PROBE_MAGIC && mh != mp;
+    // ⑦ 的替换判据（旧欠账 79g-3 原文要求"各自名下的映射条数相加等于总条数"）。
+    // **落地时的口径要说清**：每项映射恰好归属一个任务，所以"相加等于总数"由构造即成立，
+    // 真正承重的是**每份至少认到自己那份装载 + 一格内核栈**（`spawn_user` 加的），
+    // 加上收场之后全部回基线（证没漏、也没记到别人名下）。
+    // 不能写成"恰好等于装载数+1"：程序自己还会铺映射（probe 在实验格里铺了 2 张），
+    // 那些也合法地记在它自己名下——第一版写死等号就是这么红的（probe 7 而期望 5）。
+    let oh = sched::owned_of(th);
+    let op = sched::owned_of(tp);
+    let sum_ok = oh >= nh + 1 && op >= np + 1;
+    // 两份的生效位各自成立（入口可执行、数据可写），而且是在**对方还活着**的时候读的
+    let eff_ok = mm::effective_flags(lh.entry).is_some_and(|f| f.user && f.executable && !f.writable)
+        && mm::effective_flags(lp.entry).is_some_and(|f| f.user && f.executable && !f.writable)
+        && mm::effective_flags(lh.data_va).is_some_and(|f| f.user && f.writable)
+        && mm::effective_flags(lp.data_va).is_some_and(|f| f.user && f.writable);
+    let ran_ok = sched::runs_of(th) >= 1 && sched::runs_of(tp) >= 1;
+    // 收场：两条都收掉，资源回基线
+    let rel_h = sched::reap_released();
+    let _ = sched::terminate_task(th);
+    let dh = drained_or_free(rel_h, th);
+    let rel_p = sched::reap_released();
+    let _ = sched::terminate_task(tp);
+    let dp = drained_or_free(rel_p, tp);
+    let f1 = mm::free_frames();
+    let va1 = mm::reservation_count();
+    let base_ok = dh && dp && f1 == f0 && va1 == va0 && sched::stats().2 == act0
+        && crate::handle::live() == 0;
+    crate::log_info!(
+        "2box(P7): 同时装=(hello段{} probe段{} 地址互不相同{}) 各读各的=(hello魔数{:#x} probe魔数{:#x} 判据{}) 各自条数=(hello{}>=装载{}+1 probe{}>=装载{}+1) 生效位={} 都跑过=(h{} p{}) 完成标记=(h{} p{}) 收场=(dh{} dp{} free{}->{} va{}->{} active{}->{})",
+        nh, np, apart, mh, mp, own_ok, oh, nh, op, np, eff_ok,
+        sched::runs_of(th) >= 1, sched::runs_of(tp) >= 1, hello_done, probe_done,
+        dh, dp, f0, f1, va0, va1, act0, sched::stats().2);
+    let ok = apart && own_ok && sum_ok && eff_ok && ran_ok && hello_done && probe_done && base_ok;
+    if !ok {
+        crate::log_fatal!(
+            "2box: 判据不成立 互不相同={} 各读各={} 条数相加={} 生效位={} 跑过={} 完成=(h{} p{}) 收场={}",
+            apart, own_ok, sum_ok, eff_ok, ran_ok, hello_done, probe_done, base_ok);
+    }
+    ok
+}
+#[cfg(feature = "handles")]
+ktest!(KT_TWO_CONTAINERS, t_two_containers);

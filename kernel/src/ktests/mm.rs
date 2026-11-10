@@ -2150,10 +2150,29 @@ ktest!(KT_PROCESS_STARTUP, t_process_startup);
 static WAIT_SYS: [core::sync::atomic::AtomicU64; 16] =
     [const { core::sync::atomic::AtomicU64::new(0) }; 16];
 
+/// 等待者的 gidx，给 T 用来**等到它真的阻塞了再收工**（P7 修的一处判据竞态）。
+/// 原来 T 只自旋固定 5M 周期就收工：宿主一忙，T 可能先收工，于是 W 走"条件已成立"的快路径
+/// ——返回值同样正确，但 `信号` 计数不涨，而判据硬要求"必须被信号唤醒" ⇒ **假红**
+/// （实测 raw=[…, 登记9->10, 信号2->2, 醒来已终止1]）。让 T 等 `state_of(W) == Blocked`
+/// 就把顺序钉死了：W 一定已阻塞 ⇒ 唤醒只能来自收工出口那条发布边 ⇒ M37 仍然咬得到。
+#[cfg(feature = "handles")]
+static WAIT_WATCHER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
 /// T：只 spin 一段就收工。它的 `finish_current` 会置进程 signal 并发布等待者。
 #[cfg(feature = "handles")]
 fn wait_sys_exit_thread() -> ! {
-    crate::tsc::spin(5_000_000);
+    // 等到等待者真的阻塞（上限硬：发令丢了也不能永远占着槽）
+    let w = WAIT_WATCHER.load(core::sync::atomic::Ordering::Acquire);
+    if w != u64::MAX {
+        let t0 = crate::tsc::now();
+        while crate::tsc::now().wrapping_sub(t0) < 400_000_000 {
+            if matches!(crate::sched::state_of(w as usize), crate::sched::TaskState::Blocked(_)) {
+                break;
+            }
+            crate::tsc::spin(20_000);
+        }
+    }
+    crate::tsc::spin(1_000_000);
     crate::sched::finish_current();
     loop {
         crate::tsc::spin(2_000);
@@ -2187,6 +2206,9 @@ fn wait_sys_worker() -> ! {
     let hp1 = match handle::grant_proc(owner, p1, g1, RIGHT_READ) { Ok(h) => h, Err(_) => bail(4) };
     // 先登记再 spawn（ADR-073 的顺序），T 收工时那条边才看得到 proc_id
     if proc::proc_attach_thread(p1).is_err() { bail(5) }
+    // **必须在 spawn T 之前**把自己的 gidx 交出去：否则 T 可能先读到哨兵值就跳过等待，
+    // 顺序又变成靠运气（这正是本轮那处假红的成因）
+    WAIT_WATCHER.store(sched::current_id() as u64, core::sync::atomic::Ordering::Release);
     let t1 = match sched::spawn(wait_sys_exit_thread) { Ok(v) => v, Err(_) => bail(6) };
     if !sched::set_proc_id(t1, p1) { bail(7) }
 
@@ -2697,15 +2719,31 @@ fn t_aspace_switch_isolation() -> bool {
     // 那会让"这一次调用真的写了表"变成运气——提前返回把登记一起短路，
     // 停在 a2 时 delta=0 是**空转出来的绿**，量具不能靠运气。
     // SAFETY: our_cr3 是启动建的内核根
-    let _ = unsafe { mm::aspace_switch_kernel(me) };
-    let lock_in = crate::sync::stats().acquires;
-    // SAFETY: pml4_a2 是自建表根且内核半区等价；此刻 IF 状态由本用例负责，本函数不动 IF
-    let wrote_a2 = unsafe { mm::aspace_switch(pml4_a2, me, Some(a2.slot())) };
-    let lock_delta = crate::sync::stats().acquires.wrapping_sub(lock_in);
-    // 位图必须照样登记（不取锁不等于不记账）；这句**在 delta 之后**取 VMM
+    // **量具缺陷修在这里（P7 那轮矩阵第三跑抓到的）**：`sync::stats().acquires` 是
+    // **全局跨 CPU** 计数，别的核在同一瞬间取任何锁都会把增量抬起来 ⇒ 单次测量会间歇假红
+    // （实测 `assw: 判据不成立 … 不换锁=false`，而代码一行没改、ELF 与 46/46 那轮逐字相同）。
+    // 改成**重试至多 8 次、要求至少一次测到增量 0**：窗口极短（一次 CR3 读写 + 一次 fetch_or），
+    // 8 次全被别的核撞上的概率可忽略；而 M15（把 `vmm()` 加回）会让**每一次**都 >=1 ⇒ 仍然红，
+    // 负样本的咬合力不丢。读数里记的是"clean 那次是 0，否则最后一次的非零值"，噪声看得见。
+    let mut lock_delta = usize::MAX;
+    let mut wrote_a2 = false;
+    let mut back_kernel = false;
+    for _ in 0..8 {
+        // SAFETY: our_cr3 是启动建的内核根；先定回去才能保证下一次 aspace_switch 真的写表
+        let _ = unsafe { mm::aspace_switch_kernel(me) };
+        let lock_in = crate::sync::stats().acquires;
+        // SAFETY: pml4_a2 是自建表根且内核半区等价；此刻 IF 状态由本用例负责，本函数不动 IF
+        wrote_a2 = unsafe { mm::aspace_switch(pml4_a2, me, Some(a2.slot())) };
+        let d = crate::sync::stats().acquires.wrapping_sub(lock_in);
+        // SAFETY: 切回启动时建的内核根
+        back_kernel = unsafe { mm::aspace_switch_kernel(me) };
+        lock_delta = d;
+        if d == 0 {
+            break;
+        }
+    }
+    // 位图必须照样登记（不取锁不等于不记账）；这句**在测量之后**取 VMM
     let bm_a2 = mm::aspace_running_on(a2.slot()).unwrap_or(0);
-    // SAFETY: 切回启动时建的内核根
-    let back_kernel = unsafe { mm::aspace_switch_kernel(me) };
     let bit_me = 1u8.checked_shl(me as u32).unwrap_or(0);
     let nolock_ok = wrote_a2 && back_kernel && lock_delta == 0 && bm_a2 & bit_me != 0;
     // 收场：**先把启动任务的 CR3 真的换回内核**，再销毁 AS。
