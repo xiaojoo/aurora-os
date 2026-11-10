@@ -236,3 +236,188 @@ fn t_crash_oops() -> bool {
 #[cfg(feature = "fault-crash-oops")]
 ktest!(KT_CRASH_OOPS, t_crash_oops);
 
+/// 无锁现场记录表（§181，猎间歇挂那一刀的取证量具）自己的判据十一格。
+/// 这张表存在的唯一理由是"下一次挂死时它是唯一的证人"，所以它必须**先被证会咬**：
+/// 只跑一整遍绿的默认构建抓不到它的错——那种跑法里它一次都没被读过。
+/// 1 布局：八个 `FR_*` 下标互不相同、都在界内、数量等于 `FATAL_FIELDS`（重排/漏一格 ⇒ 宿主机解出的是别人的字段）
+/// 2 逐格往返：五个**各不相同**的 magic 按 `FR_*` 写、按 `FR_*` 读，一一对上
+/// 3 `seq` 每写一次恰好 +1（"看着像涨了"不算）
+/// 4 `site=None` 的进度点**不动现场那五格**：后面几步不许把最早那份现场抹成 0
+/// 5 物理地址推导：`record_phys` 保留页内偏移，且 HHDM 别名可译（宿主机 `pmemsave` 用的就是这个数）
+/// 6 分槽不串：动邻居那一槽，本槽一个字段都不变（`other == mine` 时直接红 ⇒ CPU 数退化也是判据）
+/// 6b/6c **步长自洽**：用例按宿主机那个式子（`cpu * FATAL_FIELDS + FR_*`）写，`fatal_snapshot`
+///    按内核自己的 `slot_base` 读——两个式子必须落在同一格，写进去看得见、还原后也一样。
+///    第一版的这一格是**空转的**：只断言"本槽没被邻居的写打扰"，而 `slot_base` 步长改错一格
+///    时它照样绿（实测：注入 `FATAL_FIELDS - 1` 之后整跑 PASS/33）。补上双向对照才咬得住。
+/// 7 每一槽的 `stage` 都必须是已知值（值域守卫：挡住"现场地址被当成 stage"那类脏值；
+///    步长错**不是**它量的，见 6b）
+/// 8 现场还原：本槽放回进来之前的样子。这一格不是礼貌——用例自己填的 vector=0x2a 若留在表里，
+///    下一次真挂死会读出"一个从没发生过的异常"，那是量具自己伪造的现场。
+fn t_fatal_record() -> bool {
+    use crate::arch::x86_64::cpu;
+    use core::sync::atomic::Ordering;
+    // 五个各不相同的 magic：任何一格与另一格写串了都会被读出来（相同值抓不到换位）
+    const M_RIP: u64 = 0x1111_2222_3333_4444;
+    const M_RSP: u64 = 0x5555_6666_7777_8888;
+    const M_CR2: u64 = 0x9999_aaaa_bbbb_cccc;
+    const M_VEC: u64 = 0x2a;
+    const M_ERR: u64 = 0xbe;
+
+    let idx = [
+        crash::FR_SEQ, crash::FR_STAGE, crash::FR_VECTOR, crash::FR_ERR, crash::FR_RIP,
+        crash::FR_RSP, crash::FR_CR2, crash::FR_AUX,
+    ];
+    let (mut distinct, mut in_range) = (true, true);
+    for a in 0..idx.len() {
+        if idx[a] >= crash::FATAL_FIELDS {
+            in_range = false;
+        }
+        for b in a + 1..idx.len() {
+            if idx[a] == idx[b] {
+                distinct = false;
+            }
+        }
+    }
+    let layout_ok = distinct && in_range && idx.len() == crash::FATAL_FIELDS;
+
+    let mine = cpu::self_slot();
+    let before = crash::fatal_snapshot(mine);
+    let site = crash::Site {
+        vector: M_VEC as u32,
+        error_code: M_ERR as u32,
+        cr2: M_CR2,
+        rip: M_RIP,
+        rsp: M_RSP,
+        rbp: 0,
+    };
+    crash::mark_fatal(crash::STAGE_FATAL_ENTER, 0, Some(site));
+    let after = crash::fatal_snapshot(mine);
+    let fields_back = after[crash::FR_VECTOR] == M_VEC
+        && after[crash::FR_ERR] == M_ERR
+        && after[crash::FR_RIP] == M_RIP
+        && after[crash::FR_RSP] == M_RSP
+        && after[crash::FR_CR2] == M_CR2;
+    let stage_written = after[crash::FR_STAGE] == crash::STAGE_FATAL_ENTER;
+    let seq_stepped = after[crash::FR_SEQ] == before[crash::FR_SEQ] + 1;
+
+    // ④ 只推进度点，不许抹现场
+    crash::mark_fatal(crash::STAGE_DUMPSITE_EXIT, 7, None);
+    let step2 = crash::fatal_snapshot(mine);
+    let progress_keeps_site = step2[crash::FR_RIP] == M_RIP
+        && step2[crash::FR_CR2] == M_CR2
+        && step2[crash::FR_AUX] == 7
+        && step2[crash::FR_STAGE] == crash::STAGE_DUMPSITE_EXIT
+        && step2[crash::FR_SEQ] == after[crash::FR_SEQ] + 1;
+
+    // ⑤ 宿主机按这个数去读内存，所以它的错法是"少了页内偏移"与"根本译不出来"
+    let va = core::ptr::addr_of!(crash::FATAL_RECORD) as *const u8 as u64;
+    let phys_ok = crash::record_phys().is_some_and(|p| {
+        p & 0xfff == va & 0xfff && crate::mm::is_mapped(crate::mm::hhdm() + p)
+    });
+
+    // ⑥ 分槽：直接写邻居那一槽（`mark_fatal` 只会写自己那槽，这里要的是"两槽互不影响"）
+    //    下标按**宿主机的方式**算（`cpu * FATAL_FIELDS + FR_*`），读却走内核自己的
+    //    `slot_base`（经 `fatal_snapshot`）。两个式子必须落在同一格，这一格才不是空转：
+    //    实测把 `slot_base` 的步长改成 `FATAL_FIELDS - 1`，下面两行立刻对不上（⑥ 与 ⑥b 同红）。
+    let other = (mine + 1) % cpu::MAX_CPUS;
+    let neighbor = other * crash::FATAL_FIELDS + crash::FR_AUX;
+    let other_old = crash::FATAL_RECORD[neighbor].load(Ordering::Acquire);
+    crash::FATAL_RECORD[neighbor].store(0xfeed, Ordering::Relaxed);
+    let mine_now = crash::fatal_snapshot(mine);
+    let other_now = crash::fatal_snapshot(other);
+    let slots_isolated = other != mine
+        && mine_now[crash::FR_AUX] == 7
+        && mine_now[crash::FR_RIP] == M_RIP
+        && mine_now[crash::FR_SEQ] == step2[crash::FR_SEQ];
+    let stride_agrees = other_now[crash::FR_AUX] == 0xfeed;
+    crash::FATAL_RECORD[neighbor].store(other_old, Ordering::Relaxed);
+    let stride_restored = crash::fatal_snapshot(other)[crash::FR_AUX] == other_old;
+
+    // ⑦ 值域守卫：每一槽的 stage 必须是五个已知值之一。这一格挡的是"脏值"（比如现场地址
+    //    串到了 stage 那一格），**不挡步长**——步长由 ⑥b/⑥c 的双向对照挡（那里有实测记录）。
+    let stages_known = (0..cpu::MAX_CPUS).all(|c| {
+        matches!(
+            crash::fatal_snapshot(c)[crash::FR_STAGE],
+            crash::STAGE_NONE
+                | crash::STAGE_FATAL_ENTER
+                | crash::STAGE_DUMPSITE_ENTER
+                | crash::STAGE_DUMPSITE_EXIT
+                | crash::STAGE_EXIT_FINISH
+        )
+    });
+
+    // ⑧ 本槽还原（逐格写回，再读一遍确认）
+    for i in 0..crash::FATAL_FIELDS {
+        crash::FATAL_RECORD[mine * crash::FATAL_FIELDS + i].store(before[i], Ordering::Relaxed);
+    }
+    let restored = crash::fatal_snapshot(mine) == before;
+
+    crate::log_info!(
+        "fatalrec: 判据 布局={} 五格往返={} stage={} seq涨1={} 进度不抹现场={} 物理={:#x}可译={} 分槽不串={} 步长自洽={} 还原后邻居一致={} 各槽stage已知={} 现场还原={}（本槽 cpu={}，邻居 cpu={}）",
+        layout_ok,
+        fields_back,
+        stage_written,
+        seq_stepped,
+        progress_keeps_site,
+        crash::record_phys().unwrap_or(0),
+        phys_ok,
+        slots_isolated,
+        stride_agrees,
+        stride_restored,
+        stages_known,
+        restored,
+        mine,
+        other
+    );
+    let ok = layout_ok
+        && fields_back
+        && stage_written
+        && seq_stepped
+        && progress_keeps_site
+        && phys_ok
+        && slots_isolated
+        && stride_agrees
+        && stride_restored
+        && stages_known
+        && restored;
+    if !ok {
+        crate::log_fatal!("fatalrec: 无锁现场记录表的判据不成立（上面一行是全部读数）");
+    }
+    ok
+}
+ktest!(KT_FATAL_RECORD, t_fatal_record);
+
+/// 这张表的**端到端取证自查**：只在 `fatal-record-stall` 构建里存在。
+/// 形状是"写一个每格都不同的现场，然后 `cli+hlt` 停住"——宿主机在那一跑超时之后用
+/// `pmemsave` 把整张表读回来，与下面这行串口上的数对账。只有**物理地址推导、字段顺序、
+/// 表本身**三件全对，宿主机才解得出这五个 magic；错任何一件它对不上，而它对不上就是红。
+/// 这一行自己期望 **HANG**：正常收尾等于这条构建根本没停住，那它什么都没测
+/// （与 `t_crash_oops` 的"没故障就是失败"同一形状）。
+#[cfg(feature = "fatal-record-stall")]
+fn t_fatal_record_stall() -> bool {
+    const M_RIP: u64 = 0xfa01_fa02_fa03_fa04;
+    const M_RSP: u64 = 0xfb01_fb02_fb03_fb04;
+    const M_CR2: u64 = 0xfc01_fc02_fc03_fc04;
+    crate::log_info!(
+        "fatalrec: 自查 故意停住 期待宿主机读回 向量=53 错误码=122 rip={:#x} rsp={:#x} cr2={:#x} stage=1",
+        M_RIP,
+        M_RSP,
+        M_CR2
+    );
+    crash::mark_fatal(
+        crash::STAGE_FATAL_ENTER,
+        0,
+        Some(crash::Site {
+            vector: 53,
+            error_code: 122,
+            cr2: M_CR2,
+            rip: M_RIP,
+            rsp: M_RSP,
+            rbp: 0,
+        }),
+    );
+    crate::arch::x86_64::trap::halt_forever()
+}
+#[cfg(feature = "fatal-record-stall")]
+ktest!(KT_FATAL_RECORD_STALL, t_fatal_record_stall);
+

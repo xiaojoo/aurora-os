@@ -1518,6 +1518,83 @@ def check_gpt_bounds() -> list[str]:
     return bad
 
 
+def check_fatal_record() -> list[str]:
+    """无锁现场记录表的**接线对账**：那张表是挂死那一跑唯一的证人，证人不能靠印象。
+
+    核四件事：
+    ① 布局：`crash.rs` 的 `FATAL_FIELDS` 与八个 `FR_*` 下标，必须与本脚本 `FATAL_FIELD_NAMES`
+       的**名字与次序**逐格对上。错了不报"少了字段"，而是整体错位——那比缺一格更贵，
+       所以这一条只能在跑之前用文本核，不能在跑之后用读数核。
+    ② stage 值：内核那五个 `STAGE_*` 与本脚本 `FATAL_STAGE_NAMES` 的键一一对应，不许内核
+       多出一个"宿主机念不出名字"的进度点（念不出来就等于没证据）。
+    ③ 口号：内核打的 `fatalrec: 物理=…` 与 `fatalrec: 自查 …` 两行，必须与本脚本的正则**逐字**
+       对得上。正则与格式串分家时的表现是"读回整段静默跳过"，那是最坏的一种绿。
+    ④ 四个进度点都还在位（致命入口 / 进 dump_site / 落盘返回 / 出口写码前）。少一处不会报错，
+       只会让下一次挂死的证据少一级——那种缺失只有静态对账抓得到。
+    """
+    bad: list[str] = []
+    src = (ROOT / "kernel" / "src" / "crash.rs").read_text(encoding="utf-8")
+    m = re.search(r"pub const FATAL_FIELDS: usize = (\d+);", src)
+    if m is None:
+        return ["crash.rs 里找不到 `pub const FATAL_FIELDS`（改名了？整张对账不成立，不许当成核过了）"]
+    if int(m.group(1)) != len(FATAL_FIELD_NAMES):
+        bad.append(f"crash.rs 说每槽 {m.group(1)} 格，本脚本 FATAL_FIELD_NAMES 有 {len(FATAL_FIELD_NAMES)} 个名字")
+    found: dict[str, int] = {}
+    for name in FATAL_FIELD_NAMES:
+        cm = re.search(rf"pub const FR_{name.upper()}: usize = (\d+);", src)
+        if cm is None:
+            bad.append(f"crash.rs 里没有 `pub const FR_{name.upper()}`（改名或删掉了一格 ⇒ 本脚本那个名字解出来的是别人的字段）")
+            continue
+        found[name] = int(cm.group(1))
+    if len(found) == len(FATAL_FIELD_NAMES):
+        for name, idx in found.items():
+            if idx != FATAL_FIELD_NAMES.index(name):
+                bad.append(f"字段 {name}：内核下标 {idx}，本脚本名字表里它在 {FATAL_FIELD_NAMES.index(name)} ⇒ 顺序分家")
+    # ② stage：内核侧逐个取值，与宿主机念名表比
+    kstages: dict[str, int] = {}
+    for mm2 in re.finditer(r"pub const (STAGE_[A-Z_]+): u64 = (\d+);", src):
+        kstages[mm2.group(1)] = int(mm2.group(2))
+    if not kstages:
+        bad.append("crash.rs 里一个 `STAGE_*` 都没有 ⇒ 宿主机念不出任何进度点")
+    if len(set(kstages.values())) != len(kstages):
+        bad.append(f"内核的 STAGE_* 有重号：{kstages}")
+    for kname, val in sorted(kstages.items(), key=lambda kv: kv[1]):
+        if val not in FATAL_STAGE_NAMES:
+            bad.append(f"内核新增进度点 {kname}={val}，本脚本 FATAL_STAGE_NAMES 没有它 ⇒ 挂死时那一格念不出来")
+    for val in FATAL_STAGE_NAMES:
+        if val not in kstages.values():
+            bad.append(f"本脚本念的 stage={val} 在 crash.rs 里没有对应的 STAGE_* 常量（宿主机在念一个不存在的进度点）")
+    # ③ 口号逐字对账：内核打的格式串 vs 本脚本的正则（各取头部那一段固定文本）
+    boot_fmt = re.search(r'"fatalrec: 物理=\{:#x\} cpu数=\{\} 每cpu字段=\{\} 字节=\{\}"',
+                         (ROOT / "kernel" / "src" / "main.rs").read_text(encoding="utf-8"))
+    if boot_fmt is None:
+        bad.append("main.rs 里没有 `fatalrec: 物理={:#x} cpu数={} 每cpu字段={} 字节={}` 那行（改了格式串没改本脚本的正则 ⇒ 读回静默跳过）")
+    ks = (ROOT / "kernel" / "src" / "ktests" / "crash.rs").read_text(encoding="utf-8")
+    if 'fatalrec: 自查 故意停住 期待宿主机读回 向量=' not in ks:
+        bad.append("ktests/crash.rs 里没有 `fatalrec: 自查 故意停住 期待宿主机读回 向量=` 那行 ⇒ 端到端自查无从对账")
+    # ④ 四个进度点都在各自的调用文件里被真的写出去（删掉一处 = 证据少一级，且不会报错）
+    for stage, file in (
+        ("STAGE_FATAL_ENTER", "main.rs"),
+        ("STAGE_DUMPSITE_ENTER", "crash.rs"),
+        ("STAGE_DUMPSITE_EXIT", "crash.rs"),
+        ("STAGE_EXIT_FINISH", "exit.rs"),
+    ):
+        txt = (ROOT / "kernel" / "src" / file).read_text(encoding="utf-8")
+        if re.search(rf"mark_fatal\(\s*(?:crate::)?(?:crash::)?{stage}\b", txt) is None:
+            bad.append(f"{file} 里没有把 {stage} 真写出去的那次 mark_fatal 调用（进度点被删 ⇒ 下一次挂死的证据少一级）")
+    # 自查那一档必须在 Cargo 里存在，且 ktests 真的按它门控（否则"端到端证过"这句话没载体）
+    feats = (ROOT / "kernel" / "Cargo.toml").read_text(encoding="utf-8")
+    if not re.search(r"^fatal-record-stall = \[\]", feats, re.M):
+        bad.append("Cargo.toml 的 [features] 里没有 fatal-record-stall ⇒ 端到端自查跑不起来")
+    gate = '#[cfg(feature = "fatal-record-stall")]'
+    if ks.count(gate) != 2:
+        bad.append(f'ktests/crash.rs 里 `{gate}` 不是两处（用例与注册各一处），实测 {ks.count(gate)}'
+                   " ⇒ 要么那一档编不出被测物，要么注册没跟着门控（默认构建里多一条会停住的用例）")
+    if "ktest!(KT_FATAL_RECORD," not in ks:
+        bad.append("ktests/crash.rs 里没有注册 KT_FATAL_RECORD ⇒ 默认构建里这张表没有任何用例读过它")
+    return bad
+
+
 def check_fat32_ports() -> list[str]:
     """两处各写死一份口号，就必须有机器对账：内核的 `FAT_PORT_A`/`FAT_PORT_B` 与本脚本的 `FAT_PORTS`。
 
@@ -1570,6 +1647,8 @@ def check_fat32_ports() -> list[str]:
     # 上界常量与宿主机逐字对账（ADR-078 决策 4 末条）。放在这道门禁里而不是新开第 18 道：
     # 它已经是"存储夹具与口号"那一格，GPT 夹具盘的口号/特性/注入反面检查都在上面。
     bad += check_gpt_bounds()
+    # 无锁现场记录表（§181）的接线对账：同一格"存储夹具与口号"，不新开第 18 道门禁。
+    bad += check_fatal_record()
 
     feats = (ROOT / "kernel" / "Cargo.toml").read_text(encoding="utf-8")
     for f in sorted(FAT_FEATURES):
@@ -1868,7 +1947,160 @@ def stall_report(log: str, elapsed: float, budget: int) -> str:
     return "\n".join(out)
 
 
+# ---- 无锁现场记录表的宿主机读回（W4 猎间歇挂，BACKLOG §181）--------------------------
+# 内核 `crash::FATAL_RECORD` 是"每 CPU 八个 u64"的一张表，致命/崩溃出口在碰**串口与块设备
+# 之前**往里写。它存在的理由很具体：抓到的那次挂死，RIP 就落在 `crash::dump_site` 里，
+# 而串口上既没有 `[fatal]` 也没有 `crash:` 那一行——那条路径上两个可疑卡点（行锁、写盘）
+# 恰好都在"把现场说出来"之前，所以现场只能靠内存读回来，不能靠日志。
+# 字段顺序因此是**接口**：下面这份名字表与 `crash.rs` 的 `FR_*` 下标由 `check-fat32-ports`
+# 逐字对账；表自己会不会咬由 `fatal-record-stall` 那一跑端到端证（见 fatal_selfcheck）。
+FATAL_FIELD_NAMES = ["seq", "stage", "vector", "err", "rip", "rsp", "cr2", "aux"]
+FATAL_STAGE_NAMES = {
+    0: "从没进过致命/崩溃出口",
+    1: "致命入口（任何串口写之前）",
+    2: "进 dump_site（走栈/取日志环/写盘之前）",
+    3: "write_crash 返回之后（aux=成功槽号+1，0=没写进去）",
+    4: "exit::finish 写 qemu-exit 之前（aux=Code 原值）",
+}
+
+
+def fatalrec_boot_facts(log: str) -> tuple[int, int, int, int] | None:
+    """从启动那一行 `fatalrec: 物理=… cpu数=… 每cpu字段=… 字节=…` 取出读回所需的四个数。
+
+    这四个数**全部来自内核**，宿主机不写死任何一格：内核改了布局而脚本没跟上时，
+    这里读到的字节数与解码用的字段数会当场不一致（fatalrec_readback 会报出来）。
+    """
+    m = re.search(r"fatalrec: 物理=0x([0-9a-f]+) cpu数=(\d+) 每cpu字段=(\d+) 字节=(\d+)", log)
+    if m is None:
+        return None
+    return int(m.group(1), 16), int(m.group(2)), int(m.group(3)), int(m.group(4))
+
+
+def qmp_pmemsave(port: int, addr: int, size: int, path: Path) -> str:
+    """QMP `pmemsave`：把 guest **物理**内存的一段写进宿主机文件。空串 = 成功，否则是成因。
+
+    用物理地址不是偷懒：`xp`/`pmemsave` 都只认物理地址，而内核那张表住在高半区的虚拟地址里。
+    桥是内核自己搭的——`crash::record_phys()` 走 `mm::phys_of` 推出物理地址并由启动那行说出来。
+    """
+    import json
+    import socket
+
+    req = {"execute": "pmemsave",
+           "arguments": {"val": addr, "size": size, "filename": str(path).replace("\\", "/")}}
+    try:
+        s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    except OSError as e:
+        return "QMP 连不上（port=" + str(port) + "）：" + repr(e)
+    f = s.makefile("rw", encoding="utf-8")
+    try:
+        f.readline()  # greeting
+        f.write(json.dumps({"execute": "qmp_capabilities"}) + "\r\n"); f.flush()
+        f.readline()
+        f.write(json.dumps(req) + "\r\n"); f.flush()
+        while True:
+            line = f.readline()
+            if not line:
+                return "QMP 没有回话（连接断开）"
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "error" in msg:
+                return "pmemsave 被拒：" + json.dumps(msg["error"], ensure_ascii=False)
+            if msg.get("return") is not None:
+                return ""
+    except OSError as e:
+        return "QMP 读取中断：" + repr(e)
+    finally:
+        s.close()
+
+
+def fatalrec_readback(port: int, log: str, build_dir: Path, seq: int) -> tuple[str, list[list[int]]]:
+    """挂死那一跑的现场读回。返回（给人看的文本，逐槽解码）；解码为空 ⇒ 一步都没成。
+
+    防空转是这段的主判据：**任何一步失败都要说出失败在哪一步**，不许返回空表让调用方
+    以为"读回来是全零"。全零与"根本没读到"是两件事——前者是证据，后者是量具坏了。
+    """
+    facts = fatalrec_boot_facts(log)
+    if facts is None:
+        return ("fatalrec: 串口里没有 `fatalrec: 物理=…` 那一行 ⇒ 这一跑的 ELF 里没有这张表"
+                "（旧内核？页表接管之前就挂了？），读回整段跳过", [])
+    phys, cpus, fields, nbytes = facts
+    if fields != len(FATAL_FIELD_NAMES):
+        return (f"fatalrec: 内核说每槽 {fields} 格，本脚本 FATAL_FIELD_NAMES 有 {len(FATAL_FIELD_NAMES)} 个名字"
+                " ⇒ 布局分家，解出来的字段名会整体错位，不读", [])
+    if nbytes != cpus * fields * 8:
+        return (f"fatalrec: 内核说 {nbytes} 字节，按 cpu数{cpus}×字段{fields}×8 应是 {cpus * fields * 8}"
+                " ⇒ 它自己就不自洽，不读", [])
+    # 文件名带跑号：一张矩阵里可能红不止一行，而固定名会让后一次挂死覆盖前一次的证据
+    # （`run-NNN.log` 撞过一次同族的坑，见 BACKLOG 关于 run-001 那条）。
+    blob = build_dir / f"fatalrec-run-{seq:03d}.bin"
+    out = [f"fatalrec: 读回 物理={hex(phys)} cpu数={cpus} 每cpu字段={fields} 字节={nbytes}"]
+    if blob.exists():
+        blob.unlink()
+    err = qmp_pmemsave(port, phys, nbytes, blob)
+    if err:
+        return "\n".join(out) + "\nfatalrec: 读回失败 " + err, []
+    data = blob.read_bytes()
+    if len(data) != nbytes:
+        return "\n".join(out) + f"\nfatalrec: pmemsave 只给出 {len(data)} 字节（要 {nbytes}）", []
+    vals = list(struct.unpack("<" + "Q" * (cpus * fields), data))
+    table = [vals[c * fields:(c + 1) * fields] for c in range(cpus)]
+    out.append("fatalrec: 逐槽（只打非全零的槽；全零 = 那颗 CPU 从没进过致命/崩溃出口）")
+    for c, row in enumerate(table):
+        if not any(row):
+            continue
+        stage = row[FATAL_FIELD_NAMES.index("stage")]
+        cells = " ".join(f"{FATAL_FIELD_NAMES[i]}={row[i]:#x}" for i in range(fields))
+        out.append(f"  cpu{c}: {cells}  => {FATAL_STAGE_NAMES.get(stage, '**未知的 stage**（内核与本脚本分家了）')}")
+    return "\n".join(out), table
+
+
+def fatal_selfcheck(log: str, table: list[list[int]]) -> list[str]:
+    """`fatal-record-stall` 那一跑的**端到端自查**：串口说要读回这五个 magic，内存里就得真有。
+
+    这一格证明的是三件事同时成立：内核算出的物理地址对、字段顺序对、原子写真的落了内存。
+    只在串口上有 `fatalrec: 自查` 那一行时才判——没有就是普通挂死，只留证据不判对错。
+    找法用"哪一槽五个 magic 全对上"，不写死 cpu0：用例在哪颗 CPU 上跑由调度决定。
+    """
+    if "fatalrec: 自查" not in log or not table:
+        return []
+    m = re.search(r"fatalrec: 自查 故意停住 期待宿主机读回 向量=(\d+) 错误码=(\d+) "
+                  r"rip=0x([0-9a-f]+) rsp=0x([0-9a-f]+) cr2=0x([0-9a-f]+) stage=(\d+)", log)
+    if m is None:
+        return ["fatalrec 自查：串口里有 `fatalrec: 自查` 但那一行解析不出来 ⇒ 口号分家，自查不成立"]
+    want = {"vector": int(m.group(1)), "err": int(m.group(2)), "rip": int(m.group(3), 16),
+            "rsp": int(m.group(4), 16), "cr2": int(m.group(5), 16), "stage": int(m.group(6))}
+    hits = []
+    for c, row in enumerate(table):
+        got = dict(zip(FATAL_FIELD_NAMES, row))
+        if all(int(want[k]) == got[k] for k in want):
+            hits.append(c)
+    bad = []
+    if not hits:
+        bad.append("fatalrec 自查：内存里**没有**任何一槽带着串口上那五个 magic ⇒ 表没写进去，"
+                   "或物理地址/字段顺序错了（这一跑的证据不可用）")
+    elif len(hits) > 1:
+        bad.append(f"fatalrec 自查：{len(hits)} 槽（cpu{hits}）同时带着同一份 magic ⇒ 分槽算错了")
+    return bad
+
+
+def qmp_hang_evidence(port: int, log: str, build_dir: Path, seq: int) -> str:
+    """超时那一次的完整取证：寄存器/LAPIC/PIC + 无锁现场表读回 + 自查判据。"""
+    dump = qmp_snapshot(port, ["info registers -a", "info lapic", "info pic"])
+    text, table = fatalrec_readback(port, log, build_dir, seq)
+    bad = fatal_selfcheck(log, table)
+    if bad:
+        text += "\nfatalrec 自查: 红 " + "；".join(bad)
+    elif "fatalrec: 自查" in log:
+        text += "\nfatalrec 自查: 绿（内存里那一槽与串口上那五个 magic 逐格对上）"
+    return dump + "\n" + text + "\n"
+
+
 def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str = "") -> tuple[str, int, str]:
+    # 声明放在函数头：挂死取证要**这一跑的跑号**（读 RUN_SEQ），
+    # 而 Python 要求 `global` 早于同一作用域里对这个名字的任何使用。
+    global RUN_SEQ
     if not QEMU.exists():
         sys.exit(f"QEMU 未就位：{QEMU}")
     # 宿主机侧注入不是特性（见 FAT_HOST_FAULTS 那一段）：它改盘，不改构建。
@@ -1993,9 +2225,16 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
                 proc.communicate(timeout=timeout)
                 rc = proc.returncode
             except subprocess.TimeoutExpired:
-                dump = qmp_snapshot(qmp_port, ["info registers -a", "info lapic", "info pic"])
-                (BUILD / "qmp-hang.txt").write_text(dump, encoding="utf-8")
-                print("   + 挂死现场已存 build/qmp-hang.txt（" + str(len(dump)) + " 字节）")
+                # 取证要在 kill **之前**：进程一死，内存就没了，那张表再也读不回来。
+                early = SERIAL_LOG.read_text(encoding="utf-8", errors="replace") if SERIAL_LOG.exists() else ""
+                # 跑号 = 这一跑稍后要留档的那个号（RUN_SEQ 在下面才自增）：证据与串口同号，
+                # 一张矩阵里挂两行才不会互相覆盖（固定文件名 qmp-hang.txt 就是这个覆盖的形状）。
+                seq = RUN_SEQ + 1
+                dump = qmp_hang_evidence(qmp_port, early, BUILD, seq)
+                name = f"qmp-hang-run-{seq:03d}.txt"
+                (BUILD / name).write_text(dump, encoding="utf-8")
+                print("   + 挂死现场已存 build/" + name + "（" + str(len(dump)) + " 字节）")
+                print("   + " + "\n   + ".join(dump.splitlines()[-6:]))
                 proc.kill()
                 proc.communicate()
                 rc = -1
@@ -2012,7 +2251,6 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
     # 每一跑都留档（P3a 之后补的量具缺口）：矩阵原来只在内存里留着各行的串口原文，
     # 于是"某一行红了"事后无法归因——只能重跑，而重跑往往就绿了（实测两次）。
     # 留档之后，红那一跑的用例名与 fatal 原文都在，不需要靠复现率去猜。
-    global RUN_SEQ
     RUN_SEQ += 1
     keep = BUILD / f"run-{RUN_SEQ:03d}.log"
     keep.write_text(log, encoding="utf-8")

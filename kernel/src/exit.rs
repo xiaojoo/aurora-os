@@ -41,6 +41,9 @@ pub fn finish(code: Code) -> ! {
         // 表现是"盘上安静地没有记录"，那种故障不会有别的尺子报出来。
         crate::crash::ensure_dumped();
     }
+    // 停机的最后一格也记一笔（同样在串口写之前）：看到这一格却没有 `qemu-exit=` 行，
+    // 卡点就在出口的串口写上，而不在崩溃落盘——那两个候选原来只有寄存器能分。
+    crate::crash::mark_fatal(crate::crash::STAGE_EXIT_FINISH, code as u64, None);
     serial::line("exit", format_args!("qemu-exit={}", code.qemu_exit()));
     serial::out8(DEBUGEXIT_PORT, code as u8);
     crate::arch::x86_64::trap::halt_forever()

@@ -16,9 +16,10 @@
 //! 3. 填不出的字段一律留 0 并写明为什么：`process_id`（进程模型还没长出来）、
 //!    `module_id`（异常现场不知道是哪个模块，只有驱动路径能给）、最近日志（要环形日志缓冲）。
 
+use crate::arch::x86_64::cpu::{self_slot, MAX_CPUS};
 use crate::mm;
 use crate::state_store::{self, CrashRecord, KIND_CRASH, MAX_FRAMES};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// `vector = 0` 的约定：**没有异常现场**（`panic` 或内部一致性检查升 L4）。
 /// 真异常那条路会给到真的向量号，所以"0"和"14"分得开，不必再引一个可选类型。
@@ -34,6 +35,9 @@ const LEVEL_L4: u32 = 4;
 static DUMPED: AtomicBool = AtomicBool::new(false);
 
 /// 异常现场里能直接拿到的那几格（由 `trap::TrapFrame` 填，字段名一一对得上）
+/// 转换写在 `main.rs::exit_fatal_from_exception` **一处**：那里已经有 `frame` 的全部字段，
+/// 而把 `Site::of(frame)` 放进本文件要多引一次 `arch/x86_64/trap`——ADR-044 的棘轮按站点数计，
+/// 一个纯搬运的构造函数不值得让 diagnostics->arch 变胖（现场那五格的读法由用例与宿主机对账盯）。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Site {
     pub vector: u32,
@@ -44,9 +48,96 @@ pub struct Site {
     pub rbp: u64,
 }
 
+// ---- 无锁现场记录表（§181，猎间歇挂的取证刀）------------------------------------
+//
+// 为什么已有 `dump_site` 还要另开一张表：抓到的那次挂死，CPU#0 的 RIP 就落在
+// `dump_site` 里面，而串口上既没有 `[fatal]` 也没有 `crash:` 那一行、更没有收尾与退出行。
+// 那条路径上的两个可疑卡点——串口行锁与块设备写——恰好都在"把现场说出来"之前，
+// 所以现场必须落在**碰它们之前**、且只由原子写构成的地方。否则量具自己是嫌疑人。
+//
+// 表在 `.bss`，全 `AtomicU64`：不取锁、不分配、零 `unsafe`（AGENTS 硬约束 6）。
+// 宿主机按启动那一行 `fatalrec: 物理=…` 给出的物理地址 `pmemsave` 读回整张表，
+// 因此**字段顺序是接口**：`tools/aurora.py` 的 `FATAL_FIELD_NAMES` 必须与下面这八个
+// `FR_*` 下标逐字对得上，由 `check-fat32-ports` 门禁核（改成重排 ⇒ 门禁红，不靠人记）。
+pub const FATAL_FIELDS: usize = 8;
+pub const FR_SEQ: usize = 0;
+pub const FR_STAGE: usize = 1;
+pub const FR_VECTOR: usize = 2;
+pub const FR_ERR: usize = 3;
+pub const FR_RIP: usize = 4;
+pub const FR_RSP: usize = 5;
+pub const FR_CR2: usize = 6;
+pub const FR_AUX: usize = 7;
+
+/// 进度点。同一颗 CPU 上按**程序顺序**往前走（写入本身不设单调闸：致命路径不许多出
+/// 一条"可能被拒"的分支，那正是第二次故障的来源）。宿主机读到哪一格，就说明走到了
+/// 那一格的**下一步**之前。
+/// `0` = 这一跑从没进过致命/崩溃出口（大多数正常跑的常态，不是异常）。
+pub const STAGE_NONE: u64 = 0;
+/// 判定为致命、还没打任何日志之前（`exit_fatal_from_exception` 的第一件事）
+pub const STAGE_FATAL_ENTER: u64 = 1;
+/// 进了 `dump_site`，在走栈、取日志环、写盘之前
+pub const STAGE_DUMPSITE_ENTER: u64 = 2;
+/// `write_crash` 返回之后（`aux`：0 = 没写进去，否则 = 成功槽号 + 1）
+pub const STAGE_DUMPSITE_EXIT: u64 = 3;
+/// `exit::finish` 里写 `qemu-exit` 之前（`aux` = 那个 `Code` 的原值）。
+/// 看到这一格却串口上没有退出行 ⇒ 卡在出口的串口写，不在崩溃落盘。
+pub const STAGE_EXIT_FINISH: u64 = 4;
+
+/// 每 CPU 八个字段的一张表。下标 = `cpu * FATAL_FIELDS + FR_*`。
+/// `MAX_CPUS`/`self_slot` 从**一行 use** 来（文件顶部）而不是四处全限定名：ADR-044 的棘轮按
+/// 站点数算，`crate::arch::x86_64::cpu::` 一行就占三个站点（arch、x86_64、cpu 各一次），
+/// 写四遍会把 diagnostics->arch 撑胖，而那条环内边"只许减不许增"。
+pub static FATAL_RECORD: [AtomicU64; MAX_CPUS * FATAL_FIELDS] =
+    [const { AtomicU64::new(0) }; MAX_CPUS * FATAL_FIELDS];
+
+/// 本 CPU 那一槽的基址。越界取模折回表内：致命路径不该再添一条"槽号不对怎么办"的分支，
+/// 那条分支本身就是第二次故障的来源，而槽号越界只可能是 `self_slot` 已经坏了。
+fn slot_base(cpu: usize) -> usize {
+    (cpu % MAX_CPUS) * FATAL_FIELDS
+}
+
+/// 记一次现场。`site` 为 `None` 时只推进 `stage`/`aux`，**不动向量那五格**——
+/// 那五格因此留着本次致命最早的那份现场，后面几步再路过也不会把它擦成 0。
+pub fn mark_fatal(stage: u64, aux: u64, site: Option<Site>) {
+    let b = slot_base(self_slot());
+    FATAL_RECORD[b + FR_SEQ].fetch_add(1, Ordering::Relaxed);
+    if let Some(s) = site {
+        FATAL_RECORD[b + FR_VECTOR].store(u64::from(s.vector), Ordering::Relaxed);
+        FATAL_RECORD[b + FR_ERR].store(u64::from(s.error_code), Ordering::Relaxed);
+        FATAL_RECORD[b + FR_RIP].store(s.rip, Ordering::Relaxed);
+        FATAL_RECORD[b + FR_RSP].store(s.rsp, Ordering::Relaxed);
+        FATAL_RECORD[b + FR_CR2].store(s.cr2, Ordering::Relaxed);
+    }
+    FATAL_RECORD[b + FR_AUX].store(aux, Ordering::Relaxed);
+    // stage 放最后、用 Release：宿主机读到新 stage 时，前面几格在那之前就已经可见。
+    FATAL_RECORD[b + FR_STAGE].store(stage, Ordering::Release);
+}
+
+/// 读回某一槽。用例与宿主机对账走同一个入口，避免出现第二份布局。
+pub fn fatal_snapshot(cpu: usize) -> [u64; FATAL_FIELDS] {
+    let b = slot_base(cpu);
+    let mut out = [0u64; FATAL_FIELDS];
+    for i in 0..FATAL_FIELDS {
+        out[i] = FATAL_RECORD[b + i].load(Ordering::Acquire);
+    }
+    out
+}
+
+/// 这张表在**物理内存**里的地址（宿主机 `pmemsave` 要用它）。
+/// `phys_of` 给的是页基址，所以补上页内偏移；译不出来就返回 `None`，
+/// 由调用方把"没有物理地址"这件事打出来——静默当 0 会比报红更贵。
+pub fn record_phys() -> Option<u64> {
+    let va = core::ptr::addr_of!(FATAL_RECORD) as *const u8 as u64;
+    crate::mm::phys_of(va).map(|page| page + (va & 0xfff))
+}
+
 /// 落一条崩溃摘要。返回写到的槽与 `seq`，判据要用它们。
 /// `cpu` 收 `usize`（槽位的原生形状）而落盘是 u32：槽位数远小于 2^32，收窄放在这一处。
 pub fn dump_site(site: Site, cpu: usize) -> Result<(u8, u64), state_store::StoreError> {
+    // 这一格带 `site`：`dump_site` 的入参就是现场本身，无论调用方是致命出口、
+    // `panic`（向量为约定的 0）还是用例，表里都留下同一份可读回的数。
+    mark_fatal(STAGE_DUMPSITE_ENTER, 0, Some(site));
     DUMPED.store(true, Ordering::Relaxed);
     let mut rec = CrashRecord {
         vector: site.vector,
@@ -66,6 +157,16 @@ pub fn dump_site(site: Site, cpu: usize) -> Result<(u8, u64), state_store::Store
     let mut text = [0u8; state_store::LOG_TEXT_MAX];
     let tail = crate::serial::recent_tail(&mut text);
     let out = state_store::write_crash(&rec);
+    // 落盘回来第一件事记这一格（在打日志之前）：挂死那一次要分辨的正是"卡在写盘里"
+    // 与"写完了却没能说话"。`aux` 用槽号 +1，0 留给"没写进去"。
+    mark_fatal(
+        STAGE_DUMPSITE_EXIT,
+        match &out {
+            Ok((slot, _)) => u64::from(*slot) + 1,
+            Err(_) => 0,
+        },
+        None,
+    );
     match &out {
         Ok((slot, seq)) => {
             crate::log_info!(
@@ -113,21 +214,26 @@ pub fn dump(vector: u8, cpu: usize, rip: u64) -> Result<(u8, u64), state_store::
     dump_site(Site { vector: u32::from(vector), rip, ..Site::default() }, cpu)
 }
 
+/// 一关三判：**8 字节对齐 + 内核半区 + 已映射**。`fp` 与 `next` 判的是同一件事，
+/// 原来两处各写一遍（两遍都带一次 `mm::is_mapped`）。合成一个函数不是省字：
+/// ADR-044 的棘轮按站点数算 diagnostics->memory，这条边只许减不许增，
+/// 而"同一个判据写两处"正是早晚会在其中一处漏掉第三关的形状。
+fn frame_usable(va: u64) -> bool {
+    va & 7 == 0 && va >= KERNEL_HALF && mm::is_mapped(va)
+}
+
 /// 有界地走 `rbp` 链。第 0 帧是出事那条指令自己（`rip`），所以链断了也至少有一帧。
 /// 断链的条件按"能用就行、不能用就停"来写，不去猜编译器的帧布局：帧指针那一侧要
-/// 对齐 + 内核半区 + 已映射三关全过才读；读回来的返回地址换一关判（`is_code`）。
+/// 对齐 + 内核半区 + 已映射三关全过才读（`frame_usable`）；读回来的返回地址换一关判（`is_code`）。
 fn walk_frames(rbp: u64, rip: u64, rec: &mut CrashRecord) {
     rec.frames[0] = rip;
     let mut n = 1usize;
     let mut fp = rbp;
     while n < MAX_FRAMES {
-        if fp & 7 != 0 || fp < KERNEL_HALF {
+        if !frame_usable(fp) {
             break;
         }
-        if !mm::is_mapped(fp) {
-            break;
-        }
-        // SAFETY: 上面两关已经确认这个地址在已映射的内核半区且 8 字节对齐；
+        // SAFETY: 上面那关已经确认这个地址在已映射的内核半区且 8 字节对齐；
         //        这是 L4 出口上的一次有界读，读到的值只进记录、不解引用、不控制流。
         let next = unsafe { (fp as *const u64).read_volatile() };
         // SAFETY: 同上，偏移在同一个已映射的帧内（rbp 指向帧头，+8 不会越出这一页的
@@ -140,7 +246,7 @@ fn walk_frames(rbp: u64, rip: u64, rec: &mut CrashRecord) {
         }
         rec.frames[n] = ret;
         n += 1;
-        if next & 7 != 0 || next < KERNEL_HALF || next <= fp || !mm::is_mapped(next) {
+        if !frame_usable(next) || next <= fp {
             break;
         }
         fp = next;
@@ -161,7 +267,7 @@ fn is_code(va: u64) -> bool {
 /// 已有现场（真异常那条路给了向量号与真 RIP）就不覆盖 —— 一次崩溃只该有一条记录。
 pub fn ensure_dumped() {
     if !DUMPED.swap(true, Ordering::Relaxed) {
-        dump(NO_VECTOR, crate::arch::x86_64::cpu::self_slot(), 0).ok();
+        dump(NO_VECTOR, self_slot(), 0).ok();
     }
 }
 

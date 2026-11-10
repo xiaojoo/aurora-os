@@ -7013,6 +7013,83 @@ FNV 报错一格、判据里有 false ⇒ 各自点名；**改夹具首簇（宿
 
 **读数**：本轮不跑 `check`/矩阵（只取证），`build/` 从 941 MB 起清理了中间 trace；
 工作树无改动（本节提交前）。归档留存：`build/qmp-hang.txt`、`build/run-029.stall.txt`、
-`build/hunt-loop.log`（60 次逐跑判定）。## 文档一致性（V1.3）
+`build/hunt-loop.log`（60 次逐跑判定）。
+
+## 181. 无锁现场记录表 + 宿主机按物理地址读回：崩溃路径的"说到哪一步"变成可读回的证据（ADR-079，2026-11-10，实测）
+
+使用者选定"无锁现场记录 + QMP 读回（推荐）"，并批准改内核故障路径。这一刀是 §180 那条
+"下一步要问的"的落地：**现场必须落在碰串口与块设备之前**，否则量具自己是嫌疑人。
+
+**落地形状**：`crash::FATAL_RECORD` = `MAX_CPUS(8) × 8` 个 `AtomicU64`（512 字节，`.bss`），
+八个下标 `FR_SEQ/STAGE/VECTOR/ERR/RIP/RSP/CR2/AUX`；四个进度点各写在它要排除的那个卡点之前：
+`STAGE_FATAL_ENTER`（`main.rs:102` `exit_fatal_from_exception` 第一件事，在任何串口写之前）、
+`STAGE_DUMPSITE_ENTER`（`crash.rs:144` 进门，在走栈/取日志环/写盘之前，带 `Some(site)`）、
+`STAGE_DUMPSITE_EXIT`（`write_crash` 返回之后，`aux`=成功槽号+1，0=没写进去）、
+`STAGE_EXIT_FINISH`（`exit.rs:44` 写 `qemu-exit` 之前，`aux`=`Code` 原值）。
+**只原子写、不取锁、不分配、零 `unsafe`**（硬约束 6；unsafe 普查不变，`check-unsafe` ok）。
+`site=None` 的进度点**不动现场那五格** ⇒ 最早那份异常现场不会被后面几步抹成 0。
+
+**物理地址这一桥是这一刀的承重墙**：`xp`/`pmemsave` 只认物理地址，而表住在高半区。
+`record_phys()` = `mm::phys_of(首字节) + 页内偏移`，由启动那一行
+`fatalrec: 物理=… cpu数=… 每cpu字段=… 字节=…` 说出来；宿主机**四个数全部读这一行**、
+一格都不写死。为什么不让宿主机自己算：算错偏移的表现是"读到别人的内存"，
+比报红更贵（实测注入见下）。
+
+**两台仪器**：内核自报（串口那行 `fatalrec: 自查`）vs 宿主机读内存（`pmemsave` 512 字节自己解码）。
+产物**带跑号**（`qmp-hang-run-NNN.txt` / `fatalrec-run-NNN.bin`），与串口留档同号——
+固定名 `qmp-hang.txt` 会让一张矩阵里第二次挂死覆盖第一次的证据（这一族坑已经撞过 `run-001.log`）。
+
+**接线对账接进 `check-fat32-ports`（不新开第 18 道门禁，与 GPT 上界常量同一先例）**：
+`check_fatal_record()` 核四件——①八个 `FR_*` 的下标与次序 vs `FATAL_FIELD_NAMES`；
+②内核 `STAGE_*` 值域 vs 宿主机念名表（内核多出一个念不出的进度点 ⇒ 红）；
+③两行口号逐字（格式串 vs 正则）；④四个进度点在各自调用文件里**真的被写出去**
+（删一处不会报错，只会让下一次挂死的证据少一级）。
+
+**读数（全部来自同一份代码状态）**：`check` **17/17**；默认构建 `run` **PASS/33**、
+ktests **81/81**、normal/elf `2ec6b678b3f2`、`fatalrec: 判据` **十一格全 true**、
+物理 `0x197a0a20`；端到端 `run --features fatal-record-stall --timeout 25`（带 QMP）⇒
+**HANG(-1) 25.1s**、elf `ff6858ae6e51`、宿主机读回 cpu0
+`seq=1 stage=1 vector=0x35 err=0x7a rip=0xfa01fa02fa03fa04 rsp=0xfb01fb02fb03fb04 cr2=0xfc01fc02fc03fc04`
+⇒ 脚本判 **自查: 绿**（内存与串口逐格对上），留档 `build/final-stall-{serial,qmp,fatalrec}.*`。
+**判定矩阵带 `AURORA_QEMU_QMP` 跑完整一张：53/53 符合、`MATRIX-EXIT=0`**（连续第二张全绿），
+**本轮没撞到那条间歇挂**（0 次非预期 HANG）⇒ 这一刀交出的是"下一次撞到就有现场"，
+**不宣称已定位间歇挂**。
+
+**两条白捡的负控制（很重要）**：同一张矩阵里那两行**期望就是 HANG** 的注入
+（`fault-if-carriage` run-010、`irq-sticky-pxis` run-041）读回来的表**全零**——
+它们根本没进致命/崩溃出口（前者 CPU#0 `RFL=0x97` IF 还开着，后者是中断风暴）。
+所以"全零"以后是有含义的读数：**卡在崩溃路径之外**；而自查那一跑证明"进了就写得出、宿主机读得回"，
+两件事合起来这张表才不是空转。留档 `build/qmp-hang-run-010.txt` / `-041.txt`。
+
+**证红**：宿主机六道（①`FR_ERR`/`FR_RIP` **真互换** ⇒ 两行红；②删掉 `exit.rs` 那一格进度点 ⇒ 红；
+③把口号 `cpu数=` 改成 `cpus=` ⇒ 红；④内核新增 `STAGE_AFTER_HALT=5` ⇒ 红；
+⑤⑥拆掉 `fatal-record-stall` 的两处 `#[cfg]`（用例侧、注册侧）各 ⇒ 红）。
+内核两道（真跑各自 FAIL/35 且点名）：A `slot_base` 步长改 `FATAL_FIELDS-1` ⇒ `步长自洽=false`；
+B `record_phys` 丢掉页内偏移 ⇒ `物理=0x197a1000可译=false`（真值尾数 `a20`）。六道改完逐字节还原一致。
+
+**我自己这一轮犯的三个错（都是量具/实验自己的错，不是被测物的）**：
+1. **一格判据空转被抓**：注入步长后**整跑 PASS/33**——第一版只断言"本槽没被邻居的写打扰"，
+   而 `slot_base(0)==0` 恰好不受步长影响。补成"用例按宿主机那个式子写、`fatal_snapshot` 按内核
+   自己的 `slot_base` 读"的双向对照才咬住（判据 6b/6c）。这就是 ADR-038 证红第 4 条同族：
+   **注入下不动的判据，先怀疑判据，不要宣布机制安全**。
+2. **变异脚本自己骗自己**：`orig.replace(步1).replace(步2)` 每步都从**原件**出发 ⇒ 第二笔把第一笔顶掉，
+   于是"真互换"那一道一度读出 1 行红、再读成 0 行红。改成**一次写出整块**互换后才是真的两行红。
+   纪律：**多格联动的变异必须一次性构造，不能分两次 replace**。
+3. **长链中途改了一个注释行**：矩阵跑到第 10 行时我给 `crash.rs` 改了一句文档注释——注释也进 DWARF
+   ⇒ ELF 变了 ⇒ 那张矩阵成了两个代码状态的混合。当场 kill 重跑（"一个代码状态一次验证跑"又撞一次）。
+   教训：**取证跑开跑之前先把注释/文案全部定稿**，别指望"只改注释不算改代码"。
+
+**棘轮逼出的一次真瘦身（不是数字游戏）**：`diagnostics->memory` 登记 4 而 `record_phys` 要占一格 ⇒
+把 `walk_frames` 里写了两遍的"对齐 + 内核半区 + 已映射"合成 `frame_usable()`（实测：crash.rs 的
+`mm::` 站点从 5 回到 4）。`diagnostics->arch` 同理靠"一行 `use` 代替四处全限定名"回到 4，
+并因此**放弃** `Site::of(frame)`：一个纯搬运的构造函数不值得让环内边变胖（转换留在 `main.rs` 一处）。
+登记值一个都没放宽。
+
+**仍开着**：①**间歇挂本体没抓到**（本轮 0 次非预期 HANG；探针已在位，下一次撞到就能念出
+"哪个异常 + 停在四个进度点的哪一段"）；②`t_crash` 会在这张表里留下**假现场**（`vector=13/15`
++ 夹具 rip），下一刀要在用例侧做 snapshot/restore（ADR-079 未决 3b）；③三个 AP 同停
+`ffff8000000011d4` 的来路仍未核；④S2b、S3（ADR 号顺延为 **080**）、S4 与 ADR-078 未决 1–6 不变。
+**状态**：ADR-079 = **提议**，升"已采纳"要等它抓到过一次真挂死。
+## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

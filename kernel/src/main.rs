@@ -100,6 +100,20 @@ fn on_panic(info: &PanicInfo) -> ! {
 
 /// 异常里判定为致命的出口：打印现场后给独立退出码（ExceptionFatal=39）。
 pub fn exit_fatal_from_exception(frame: &trap::TrapFrame) -> ! {
+    // 无锁现场记录的第一格：**在任何串口写、任何块设备写之前**。抓到的那次挂死 RIP
+    // 落在 `dump_site` 里而串口上没有 `[fatal]`——那一行有没有出去从此不再是唯一证据。
+    crash::mark_fatal(
+        crash::STAGE_FATAL_ENTER,
+        0,
+        Some(crash::Site {
+            vector: frame.vector as u32,
+            error_code: frame.error_code as u32,
+            cr2: frame.cr2,
+            rip: frame.rip,
+            rsp: frame.rsp,
+            rbp: frame.rbp,
+        }),
+    );
     // P3 的第二条路径：**在打现场之前**取时间。dump_frame 要吐几百字节，而串口是按字节
     // 忙等的，把它算进"终止路径延迟"就等于让日志长度冒充处置成本。
     // 也就是说这里量的是"判定到可以停机"，崩溃现场打印的成本另有一条字节数可以换算。
@@ -229,6 +243,20 @@ fn stage_memory() {
     crate::log_info!("mm: usable memory = {} MiB over {} regions", mm::usable_bytes() / (1024 * 1024), mm::region_count());
     crate::log_info!("mm: bootloader regions held back = {} MiB (AP park area; reclaim is explicit, M3b)", mm::boot_reclaimable_bytes() / (1024 * 1024));
     tsc::stage("mm-takeover");
+
+    // 无锁现场记录表的物理地址，必须在**尽可能早**的地方说出来：宿主机只有拿到它，
+    // 才能在挂死那一跑用 `pmemsave` 把表读回。译不出来就明说"取证只剩寄存器"，
+    // 不许静默——静默的下一次挂会让人以为探针在位。
+    match crash::record_phys() {
+        Some(p) => crate::log_info!(
+            "fatalrec: 物理={:#x} cpu数={} 每cpu字段={} 字节={}",
+            p,
+            cpu::MAX_CPUS,
+            crash::FATAL_FIELDS,
+            cpu::MAX_CPUS * crash::FATAL_FIELDS * 8
+        ),
+        None => crate::log_warn!("fatalrec: 物理=译不出（页表未就绪？）挂死取证只剩寄存器"),
+    }
 
     // ---- Stage2b：内核堆（M2-b）。堆未就绪时 GlobalAlloc 会返回空指针，
     // 所以在任何可能分配的路径之前先把它建起来。
