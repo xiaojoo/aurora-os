@@ -1399,6 +1399,94 @@ def check_fat32_exec(log: str) -> list[str]:
     return bad
 
 
+def check_gpt_bounds() -> list[str]:
+    """ADR-078 决策 4 末条：GPT 的上界常量与宿主机侧逐字对账。
+
+    **核的不是硬相等**：内核 `MAX_ENTRY_BYTES=512` 是"装配缓冲准备接多少"，夹具 `ENTRY_SIZE=128`
+    是"盘上实际多大"，两者本来就不该相等。要核的是三件事：
+      1 夹具几何落在内核的界**之内**（否则正向那一行会红，而红在跑之后不如红在跑之前）；
+      2 内核那条 `MAX_ARRAY_BYTES = MAX_ENTRIES × MAX_ENTRY_BYTES` 的**内部自洽**——
+        正是它让第三道"数组太大"的闸不可达而被删掉（§173），改了它那个论证就不成立；
+      3 **读表那一台与写表那一台对同一个夹具的期望一致**（validate_esp.py vs make_gpt_disk.py），
+        否则对账核的是另一个对象，那种绿比红更贵。
+    符号常量只认已知的那两种写法，写法变了就报红而不是静默算成 0（静默少核一条 = 静默少测一条）。
+    """
+    bad: list[str] = []
+    gpt = (ROOT / "kernel" / "src" / "filesystem" / "gpt.rs").read_text(encoding="utf-8")
+    vfs = (ROOT / "kernel" / "src" / "filesystem" / "vfs.rs").read_text(encoding="utf-8")
+    writer = (ROOT / "tools" / "make_gpt_disk.py").read_text(encoding="utf-8")
+    reader = (ROOT / "tools" / "validate_esp.py").read_text(encoding="utf-8")
+
+    def num(text: str, pat: str, tag: str) -> int | None:
+        m = re.search(pat, text, re.M)
+        if m is None:
+            bad.append(f"{tag}：找不到常量（改名/挪进函数体了？这条对账就不核它了）")
+            return None
+        return int(m.group(1).replace("_", ""), 0)
+
+    sector = num(vfs, r"^pub const SECTOR_BYTES: usize = (\d+);", "内核 SECTOR_BYTES")
+    k_min_hdr = num(gpt, r"^pub const MIN_HEADER_BYTES: u32 = (\d+);", "内核 MIN_HEADER_BYTES")
+    k_min_ent = num(gpt, r"^pub const MIN_ENTRY_BYTES: u32 = (\d+);", "内核 MIN_ENTRY_BYTES")
+    k_max_ent = num(gpt, r"^pub const MAX_ENTRIES: u32 = (\d+);", "内核 MAX_ENTRIES")
+    k_rev = num(gpt, r"^pub const GPT_REVISION: u32 = (0x[0-9a-fA-F_]+);", "内核 GPT_REVISION")
+    w_sector = num(writer, r"^SECTOR = (\d+)", "写表器 SECTOR")
+    w_disk = num(writer, r"^DISK_SECTORS = (\d+)", "写表器 DISK_SECTORS")
+    w_count = num(writer, r"^ENTRY_COUNT = (\d+)", "写表器 ENTRY_COUNT")
+    w_size = num(writer, r"^ENTRY_SIZE = (\d+)", "写表器 ENTRY_SIZE")
+    w_first = num(writer, r"^FIRST_USABLE = (\d+)", "写表器 FIRST_USABLE")
+    r_sector = num(reader, r"^SECTOR = (\d+)", "读表器 SECTOR")
+    r_hdr = num(reader, r'"header_size\(=(\d+)\)"', "读表器 header_size 期望")
+    r_count = num(reader, r'"entry_count\(=(\d+)\)"', "读表器 entry_count 期望")
+    r_size = num(reader, r'"entry_size\(=(\d+)\)"', "读表器 entry_size 期望")
+    r_rev = num(reader, r'"revision\(=(0x[0-9a-fA-F]+)\)"', "读表器 revision 期望")
+    r_first = num(reader, r'"first_usable_lba\(=(\d+)\)"', "读表器 first_usable 期望")
+
+    # 两个符号常量：只认已知写法，写法变了必须报红（否则下面整段静默空转）。
+    k_max_bytes = k_max_array = None
+    m = re.search(r"^pub const MAX_ENTRY_BYTES: usize = ([^;]+);", gpt, re.M)
+    if m is None:
+        bad.append("内核 MAX_ENTRY_BYTES 找不到")
+    elif m.group(1).strip() == "SECTOR_BYTES":
+        k_max_bytes = sector
+    else:
+        bad.append(f"内核 MAX_ENTRY_BYTES 的写法变成了 {m.group(1).strip()!r}（本门禁只认 SECTOR_BYTES）"
+                   "⇒ 装配缓冲与扇区的关系不再被核，改写法要连这里一起改")
+    m = re.search(r"^pub const MAX_ARRAY_BYTES: u32 = ([^;]+);", gpt, re.M)
+    if m is None:
+        bad.append("内核 MAX_ARRAY_BYTES 找不到")
+    elif m.group(1).strip() == "MAX_ENTRIES * MAX_ENTRY_BYTES as u32":
+        if k_max_ent is not None and k_max_bytes is not None:
+            k_max_array = k_max_ent * k_max_bytes
+    else:
+        bad.append(f"内核 MAX_ARRAY_BYTES 的写法变成了 {m.group(1).strip()!r}"
+                   "（本门禁只认 MAX_ENTRIES * MAX_ENTRY_BYTES as u32）⇒ 『第三道闸不可达』那个论证不再被核")
+    if None in (sector, k_min_hdr, k_min_ent, k_max_ent, k_rev, k_max_bytes, k_max_array,
+                w_sector, w_disk, w_count, w_size, w_first, r_sector, r_hdr, r_count, r_size, r_first):
+        return bad + ["有常量没解析出来 ⇒ 上面的界与一致性对账整体不成立（不许当成核过了）"]
+
+    for tag, a, b in (("扇区字节 内核 vs 写表器", sector, w_sector),
+                      ("扇区字节 内核 vs 读表器", sector, r_sector),
+                      ("头最小字节 内核 vs 读表器期望", k_min_hdr, r_hdr),
+                      ("revision 内核 vs 读表器期望", k_rev, r_rev),
+                      ("first_usable 写表器 vs 读表器期望", w_first, r_first),
+                      ("条目数 写表器 vs 读表器期望", w_count, r_count),
+                      ("条目大小 写表器 vs 读表器期望", w_size, r_size),
+                      ("夹具盘字节数 本脚本 vs 写表器", GPT_FIX_BYTES, w_disk * w_sector)):
+        if a != b:
+            bad.append(f"{tag}：{a} != {b}")
+    if not k_min_ent <= w_size <= k_max_bytes:
+        bad.append(f"夹具 ENTRY_SIZE={w_size} 不在内核的界 [{k_min_ent}, {k_max_bytes}] 之内"
+                   "⇒ 正向那一跑会被 EntryTooSmall/EntryTooBig 拒，红在跑之后不如红在这里")
+    if w_count > k_max_ent:
+        bad.append(f"夹具 ENTRY_COUNT={w_count} 超过内核 MAX_ENTRIES={k_max_ent}"
+                   "⇒ 正向那一跑会被 TooManyEntries 拒")
+    if w_count * w_size > k_max_array:
+        bad.append(f"夹具数组 {w_count}×{w_size}={w_count * w_size} 超过内核预算 MAX_ARRAY_BYTES={k_max_array}")
+    if w_first != 34 or w_disk - 34 < w_first:
+        bad.append(f"写表器几何不自洽：FIRST_USABLE={w_first}（规范是 34）、DISK_SECTORS={w_disk}")
+    return bad
+
+
 def check_fat32_ports() -> list[str]:
     """两处各写死一份口号，就必须有机器对账：内核的 `FAT_PORT_A`/`FAT_PORT_B` 与本脚本的 `FAT_PORTS`。
 
@@ -1448,6 +1536,9 @@ def check_fat32_ports() -> list[str]:
             bad.append(f"Cargo.toml 的 [features] 里没有 {f}，本脚本却按它挂 GPT 夹具盘")
     if not (ROOT / "tools" / "make_gpt_disk.py").exists():
         bad.append("缺 tools/make_gpt_disk.py：GPT 夹具盘的配方不在位")
+    # 上界常量与宿主机逐字对账（ADR-078 决策 4 末条）。放在这道门禁里而不是新开第 18 道：
+    # 它已经是"存储夹具与口号"那一格，GPT 夹具盘的口号/特性/注入反面检查都在上面。
+    bad += check_gpt_bounds()
 
     feats = (ROOT / "kernel" / "Cargo.toml").read_text(encoding="utf-8")
     for f in sorted(FAT_FEATURES):
