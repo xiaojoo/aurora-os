@@ -142,6 +142,19 @@ pub fn record_phys() -> Option<u64> {
     crate::mm::phys_of(va).map(|page| page + (va & 0xfff))
 }
 
+/// 取证自查用的"停在写盘之前"（只在 `fatal-record-dump-stall` 这一档编进来）。
+/// 返回类型故意写成 `()` 而不是 `!`：那会让 `dump_site` 后面的代码变成"不可达"，
+/// 于是一句自查注入换来一条 `unreachable_code` 警告——量具不该污染被测物的告警面。
+/// 自旋用 `pause`：§180 那次 QMP 是 `HLT=0` 且四核 IF=0（**在转**，不是在 hlt），
+/// 停机形状与真发现不符，就不配当复现夹具。
+#[cfg(feature = "fatal-record-dump-stall")]
+fn wedge_before_disk_write() {
+    crate::log_info!("dumpsite: 注入 停在写盘之前（这一槽该是 stage=2，永远等不到 stage=3）");
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
 /// 落一条崩溃摘要。返回写到的槽与 `seq`，判据要用它们。
 /// `cpu` 收 `usize`（槽位的原生形状）而落盘是 u32：槽位数远小于 2^32，收窄放在这一处。
 pub fn dump_site(site: Site, cpu: usize) -> Result<(u8, u64), state_store::StoreError> {
@@ -170,6 +183,11 @@ pub fn dump_site(site: Site, cpu: usize) -> Result<(u8, u64), state_store::Store
     // 本身也塞进最近日志里，而那一行的内容记录里已经有了。
     let mut text = [0u8; state_store::LOG_TEXT_MAX];
     let tail = crate::serial::recent_tail(&mut text);
+    // 取证自查（门控，见 Cargo 的 `fatal-record-dump-stall`）：停在**写盘之前**。
+    // 位置就是要害——必须在两个可疑卡点（串口行锁已过、块设备写未开始）之间，宿主机那一跑
+    // 读回来的才是"`stage=2 而永远等不到 stage=3`"这个 §180 现场形状。
+    #[cfg(feature = "fatal-record-dump-stall")]
+    wedge_before_disk_write();
     let out = state_store::write_crash(&rec);
     // 落盘回来第一件事记这一格（在打日志之前）：挂死那一次要分辨的正是"卡在写盘里"
     // 与"写完了却没能说话"。`aux` 用槽号 +1，0 留给"没写进去"。

@@ -101,6 +101,14 @@ fault-crash-oops = []
 # 这一档自己期望 HANG，所以**不进判定矩阵**（一行 120s 的墙钟不能常挂在矩阵里），
 # 由 `tools/aurora.py` 的 `fatal-probe-selfcheck` 入口单独跑；也不进四把尺子。
 fatal-record-stall = []
+# 自查（W4 猎间歇挂，BACKLOG §184 / ADR-079 补记二）：把 §180 抓到的那个形状**做成确定会发生的一次**。
+# 真 `#PF(14)` 由 `fault-crash-oops` 那颗 deliberate 读制造（本档**依赖**它，自己不带 unsafe 现场），
+# 致命入口先把 CPU 给的现场写进无锁表，然后 `dump_site` 停在**写盘之前**自旋 ⇒ 这一跑必挂。
+# 宿主机超时后用 `pmemsave` 读回那张表：念得出 向量=14 与串口 `[fatal]` 同一条的 rip/cr2/err，
+# 且那一槽停在 stage=2（等不到 stage=3）——这才叫"表能在真挂死那一跑被读一次"。
+# 与 `fatal-record-stall` 分开两档：那一档量的是**布局与地址推导**（合成五个 magic），
+# 这一档量的是**真异常现场 + 停在哪个进度点**；两档各自期望 HANG，都不进矩阵也不进 bench。
+fatal-record-dump-stall = ["fault-crash-oops"]
 
 # 负样本（M5-c③）：写命令把扇区数按 1 个编程（内容与回读都按 8 个准备）。
 # 这条**能咬**：8 个扇区里只有第一个是图案 ⇒ 逐字节比对当场不一致。

@@ -1592,6 +1592,26 @@ def check_fatal_record() -> list[str]:
                    " ⇒ 要么那一档编不出被测物，要么注册没跟着门控（默认构建里多一条会停住的用例）")
     if "ktest!(KT_FATAL_RECORD," not in ks:
         bad.append("ktests/crash.rs 里没有注册 KT_FATAL_RECORD ⇒ 默认构建里这张表没有任何用例读过它")
+    # 模式二（`fatal-record-dump-stall`）：把 §180 那个"卡在崩溃路径"做成确定发生的一次。
+    # 这一档的判据形状很脆，四条都要机器盯：口号、注入位置（必须在写盘**之前**）、
+    # 两处 cfg（调用 + 定义）、以及**依赖 fault-crash-oops**——少了依赖就没有真 #PF，
+    # 那一跑会安静地 PASS，于是"表能在真挂死里被读一次"这句话变成绿着的空话。
+    if not re.search(r'^fatal-record-dump-stall = \["fault-crash-oops"\]', feats, re.M):
+        bad.append('Cargo.toml 里没有 `fatal-record-dump-stall = ["fault-crash-oops"]`'
+                   " ⇒ 那一档编不出真 #PF，会安静地 PASS（绿着的空话，比红更贵）")
+    gate2 = '#[cfg(feature = "fatal-record-dump-stall")]'
+    if src.count(gate2) != 2:
+        bad.append(f'crash.rs 里 `{gate2}` 不是两处（调用与定义各一处），实测 {src.count(gate2)}'
+                   " ⇒ 要么注入进不去 dump_site，要么默认构建里多了一条永远转的循环")
+    if DUMP_STALL_MARK not in src:
+        bad.append(f"crash.rs 里没有 `{DUMP_STALL_MARK}` 这个口号 ⇒ 宿主机认不出这一档的模式，自查整段静默跳过")
+    wedge_at = src.find("wedge_before_disk_write();")
+    write_at = src.find("let out = state_store::write_crash(&rec);")
+    if wedge_at < 0 or write_at < 0:
+        bad.append("crash.rs 里找不到 `wedge_before_disk_write();` 或 `let out = state_store::write_crash(&rec);`"
+                   " ⇒ 注入位置无从对账（不许当成核过了）")
+    elif wedge_at > write_at:
+        bad.append("注入点跑到了 `write_crash` **之后** ⇒ 那一跑会等到 stage=3，量不到 §180 那个形状（写盘没回来）")
     return bad
 
 
@@ -2056,19 +2076,56 @@ def fatalrec_readback(port: int, log: str, build_dir: Path, seq: int) -> tuple[s
     return "\n".join(out), table
 
 
-def fatal_selfcheck(log: str, table: list[list[int]]) -> list[str]:
-    """`fatal-record-stall` 那一跑的**端到端自查**：串口说要读回这五个 magic，内存里就得真有。
+DUMP_STALL_MARK = "dumpsite: 注入 停在写盘之前"
 
-    这一格证明的是三件事同时成立：内核算出的物理地址对、字段顺序对、原子写真的落了内存。
-    只在串口上有 `fatalrec: 自查` 那一行时才判——没有就是普通挂死，只留证据不判对错。
-    找法用"哪一槽五个 magic 全对上"，不写死 cpu0：用例在哪颗 CPU 上跑由调度决定。
+
+def fatal_selfcheck(log: str, table: list[list[int]]) -> tuple[list[str], str]:
+    """两种取证自查的判据（都不在矩阵里常挂：两档各自期望 HANG）。返回（红行，绿的那句话）。
+
+    模式一 `fatal-record-stall`：合成五个 magic。证明**内核算出的物理地址对、字段顺序对、
+    原子写真的落了内存**三件事同时成立。找法用"哪一槽五个 magic 全对上"，不写死 cpu0：
+    用例在哪颗 CPU 上跑由调度决定。
+    模式二 `fatal-record-dump-stall`：**真 `#PF(14)`** 的现场（CPU 给的 rip/cr2/err）+
+    "停在写盘之前"这个进度点。证明的是这张表能在**§180 那个形状**里被读一次：
+    串口 `[fatal]` 那条与内存里那一槽逐格一致，且那一槽停在 `stage=2`（等不到 `stage=3`）。
+    这一模式还多一格**串口自洽**：`oops: 故意读 <addr>` 声称的地址必须等于 CPU 报的 `cr2`，
+    不等就说明这次故障不是那次 deliberate 读造成的 ⇒ 实验本身不成立（不许当绿）。
+    两种都不在（普通挂死）⇒ 返回空，只留证据不判对错。
     """
-    if "fatalrec: 自查" not in log or not table:
-        return []
+    if not table:
+        return [], ""
+    if DUMP_STALL_MARK in log:
+        mo = re.search(r"oops: 故意读 (0x[0-9a-f]+)", log)
+        mf = re.search(r"\[fatal\] (?:0x[0-9a-f]+ )?unexpected #PF rip=(0x[0-9a-f]+) "
+                       r"cr2=(0x[0-9a-f]+) err=(0x[0-9a-f]+) cpu_cpl=0", log)
+        if mo is None or mf is None:
+            return ([f"dump-stall 自查：串口里有 `{DUMP_STALL_MARK}` 但 "
+                     f"{'`oops: 故意读` 那一行' if mo is None else '`[fatal] unexpected #PF` 那一行'}"
+                     " 解析不出来 ⇒ 这一跑的证据不可用（不许静默当绿）"], "")
+        want_cr2 = int(mo.group(1), 16)
+        if want_cr2 != int(mf.group(2), 16):
+            return ([f"dump-stall 自查：用例声称读 {hex(want_cr2)}，而 CPU 报的 cr2 是 "
+                     f"{hex(int(mf.group(2), 16))} ⇒ 这次 #PF 不是那次 deliberate 读，实验不成立"], "")
+        want = {"vector": 14, "stage": 2, "rip": int(mf.group(1), 16),
+                "cr2": want_cr2, "err": int(mf.group(3), 16)}
+        hits = [c for c, row in enumerate(table)
+                if all(v == row[FATAL_FIELD_NAMES.index(k)] for k, v in want.items())
+                and row[FATAL_FIELD_NAMES.index("seq")] >= 2]
+        if len(hits) == 1:
+            return ([], f"dump-stall 自查: 绿（真 #PF(14) 的现场由内存读回，与串口 [fatal] 那条"
+                    f"逐格一致：cpu{hits[0]} rip={hex(want['rip'])} cr2={hex(want_cr2)} "
+                    f"err={hex(want['err'])}，且停在 stage=2=进 dump_site、写盘没回来）")
+        detail = "; ".join(f"cpu{c}:{' '.join(FATAL_FIELD_NAMES[i] + '=' + hex(row[i]) for i in range(len(row)))}"
+                           for c, row in enumerate(table) if any(row)) or "全表零"
+        return ([f"dump-stall 自查：内存里对不上串口那条真 #PF 现场（要 vector=14 stage=2 "
+                 f"rip={hex(want['rip'])} cr2={hex(want_cr2)} err={hex(want['err'])}），"
+                 f"命中 {len(hits)} 槽；内存实况={detail}"], "")
+    if "fatalrec: 自查" not in log:
+        return [], ""
     m = re.search(r"fatalrec: 自查 故意停住 期待宿主机读回 向量=(\d+) 错误码=(\d+) "
                   r"rip=0x([0-9a-f]+) rsp=0x([0-9a-f]+) cr2=0x([0-9a-f]+) stage=(\d+)", log)
     if m is None:
-        return ["fatalrec 自查：串口里有 `fatalrec: 自查` 但那一行解析不出来 ⇒ 口号分家，自查不成立"]
+        return ["fatalrec 自查：串口里有 `fatalrec: 自查` 但那一行解析不出来 ⇒ 口号分家，自查不成立"], ""
     want = {"vector": int(m.group(1)), "err": int(m.group(2)), "rip": int(m.group(3), 16),
             "rsp": int(m.group(4), 16), "cr2": int(m.group(5), 16), "stage": int(m.group(6))}
     hits = []
@@ -2076,24 +2133,23 @@ def fatal_selfcheck(log: str, table: list[list[int]]) -> list[str]:
         got = dict(zip(FATAL_FIELD_NAMES, row))
         if all(int(want[k]) == got[k] for k in want):
             hits.append(c)
-    bad = []
     if not hits:
-        bad.append("fatalrec 自查：内存里**没有**任何一槽带着串口上那五个 magic ⇒ 表没写进去，"
-                   "或物理地址/字段顺序错了（这一跑的证据不可用）")
-    elif len(hits) > 1:
-        bad.append(f"fatalrec 自查：{len(hits)} 槽（cpu{hits}）同时带着同一份 magic ⇒ 分槽算错了")
-    return bad
+        return ["fatalrec 自查：内存里**没有**任何一槽带着串口上那五个 magic ⇒ 表没写进去，"
+                "或物理地址/字段顺序错了（这一跑的证据不可用）"], ""
+    if len(hits) > 1:
+        return [f"fatalrec 自查：{len(hits)} 槽（cpu{hits}）同时带着同一份 magic ⇒ 分槽算错了"], ""
+    return [], "fatalrec 自查: 绿（内存里那一槽与串口上那五个 magic 逐格对上）"
 
 
 def qmp_hang_evidence(port: int, log: str, build_dir: Path, seq: int) -> str:
-    """超时那一次的完整取证：寄存器/LAPIC/PIC + 无锁现场表读回 + 自查判据。"""
+    """超时那一次的完整取证：寄存器/LAPIC/PIC + 无锁现场表读回 + 两种自查判据。"""
     dump = qmp_snapshot(port, ["info registers -a", "info lapic", "info pic"])
     text, table = fatalrec_readback(port, log, build_dir, seq)
-    bad = fatal_selfcheck(log, table)
+    bad, green = fatal_selfcheck(log, table)
     if bad:
-        text += "\nfatalrec 自查: 红 " + "；".join(bad)
-    elif "fatalrec: 自查" in log:
-        text += "\nfatalrec 自查: 绿（内存里那一槽与串口上那五个 magic 逐格对上）"
+        text += "\n" + "；".join(bad)
+    elif green:
+        text += "\n" + green
     return dump + "\n" + text + "\n"
 
 
