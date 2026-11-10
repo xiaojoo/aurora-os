@@ -222,7 +222,7 @@ fn child_stub(data_va: u64) -> [u8; 49] {
 /// 装载器序列（ADR-075 决策 1/3/5/8 的**用户态**那一半）：
 /// 11 造进程 → 建四个 VMO（代码桩/栈/StartupInfo/数据）→ 14 用 `rdx = Proc 句柄` 铺进**子 AS**
 /// → 15 建线程（停住）→ 16 转移 + 回填 + 放行。每一步的返回值都写进 `.slots`。
-fn load_child(job_h: u64) {
+fn load_child(job_h: u64, abi: u64) {
     // SAFETY: 以下都是本程序自己的系统调用，号与参数照 ABI 文档（§4.4c）
     unsafe {
         let proc_h = sys4(SYS_PROCESS_CREATE, job_h, 0, 0, 0);
@@ -260,8 +260,10 @@ fn load_child(job_h: u64) {
         // 三个 SELF_* 由内核 grant 并回填（替它填会被 16 号拒）
         let mut hdr = [0u8; 24];
         hdr[0..4].copy_from_slice(&SI_MAGIC.to_le_bytes());
-        hdr[4..6].copy_from_slice(&0u16.to_le_bytes()); // abi_major
-        hdr[6..8].copy_from_slice(&8u16.to_le_bytes()); // abi_minor（与内核同轮声明）
+        // **从 abi_info 的返回值里取**，不写死：内核 bump 一次 minor 就把写死的那份打红
+        // （本轮实测：内核到 9 而探针写死 8 ⇒ 16 号的版本校验拒了整页）
+        hdr[4..6].copy_from_slice(&((abi >> 32) as u16).to_le_bytes());
+        hdr[6..8].copy_from_slice(&((abi >> 16) as u16).to_le_bytes());
         hdr[8..12].copy_from_slice(&1u32.to_le_bytes()); // 我传一条
         let w = sys4(SYS_VMO_WRITE, si, 0, hdr.as_ptr() as u64, hdr.len() as u64);
         let mut d = [0u8; 16];
@@ -380,7 +382,7 @@ pub extern "C" fn _start(mailbox: u64) -> ! {
                 core::hint::spin_loop();
             }
             if job_h != 0 {
-                load_child(job_h);
+                load_child(job_h, abi);
             }
         }
         put(OFF_DONE, 1);

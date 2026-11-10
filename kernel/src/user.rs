@@ -52,7 +52,7 @@ pub const SYS_ASPACE_MAP: u64 = 14;
 /// ABI 版本。minor=4 对应用户态闭环这一段（M4）；minor=5 追加 capability 句柄族（P7）；
 /// minor=6 追加 VMO 三个号（12/13/14）与 `F_VMO` 位（W3 P4b，ADR-074）。号只追加不复用（Q1）。
 pub const ABI_MAJOR: u64 = 0;
-pub const ABI_MINOR: u64 = 8;
+pub const ABI_MINOR: u64 = 9;
 pub const F_FASTPATH: u64 = 1;
 pub const F_SMAP: u64 = 2;
 pub const F_SMEP: u64 = 4;
@@ -137,7 +137,7 @@ pub fn abi_word() -> u64 {
     }
     #[cfg(feature = "handles")]
     {
-        f |= F_HANDLES | F_VMO | F_PROC;
+        f |= F_HANDLES | F_VMO | F_PROC | F_WAIT;
     }
     (ABI_MAJOR << 32) | (ABI_MINOR << 16) | f
 }
@@ -751,7 +751,80 @@ fn sys_process_start(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
         return E_EXHAUSTED;
     }
     0
-}#[cfg(feature = "handles")]
+}/// P6a（ADR-071 决策 1、Q3）：17/19 两个等待号在这份构建里可用。依赖句柄表，
+/// 与 `F_HANDLES` 同一条件、读回真实状态。`F_PROC` 仍只覆盖 11/15/16。
+pub const F_WAIT: u64 = 128;
+/// 17：`rdi` = Proc 句柄（要 `READ`），`rsi` = 时限毫秒（0 = 只查一次不阻塞）→
+/// `rax` = `(observed << 32) | 退出码`；**0 = 超时**（不升 L4，"目标永远不收工"是业务事实）。
+pub const SYS_PROCESS_WAIT: u64 = 17;
+/// 19：`rdi` = 对象句柄，`rsi` = 要等的信号位图（今天只有 bit0 = 已终止），
+/// `rdx` = 时限毫秒 → 与 17 同一个返回形状。它是通用原语，17 是它的薄壳（Q3 裁决）。
+/// **今天只支持 Proc 对象**：Thread 的等待留给后面（设计 §10.6 第 3 条"由用例逼出来再定"），
+/// 拿别的 kind 来等 ⇒ `-4`，不静默当成"等不到"。
+pub const SYS_OBJECT_WAIT: u64 = 19;
+/// 用户侧的信号位：bit0 = 对象已终止。与内核 `SIG_TERMINATED` 不是同一个数，
+/// 这里是 ABI 的稳定位图，内核内部怎么摆布局都不影响它。
+pub const WAIT_TERMINATED: u64 = 1;
+/// 时限上限（毫秒）。**必须有界**（ADR-071 决策 1 继承 ADR-059 决策 3 的口径）：
+/// 无限等待会让"目标永远不收工"变成一次永久挂死，而不是一个可判的超时。
+pub const WAIT_MAX_MS: u64 = 60_000;
+
+/// 毫秒 → TSC 周期。时钟没标定就换算不了 ⇒ `-1`（请求解释不了），不猜一个数。
+#[cfg(feature = "handles")]
+fn wait_cycles(ms: u64) -> Option<u64> {
+    let hz = crate::clock::hz()?;
+    Some(ms.saturating_mul(hz) / 1000)
+}
+
+/// 17/19 共用的实体：等一个进程收工，返回 `(observed << 32) | 退出码`，超时返回 0。
+#[cfg(feature = "handles")]
+fn wait_on_proc(h: crate::handle::Handle, owner: (usize, u32), signals: u64, ms: u64) -> u64 {
+    if signals & !WAIT_TERMINATED != 0 {
+        return E_INVALID; // 不认识的信号位：明确拒，不静默忽略
+    }
+    if ms > WAIT_MAX_MS {
+        return E_INVALID;
+    }
+    let (obj, _) = match crate::handle::resolve(h, owner, crate::handle::RIGHT_READ) {
+        Ok(v) => v,
+        Err(e) => return handle_err(e),
+    };
+    let (pid, pgen) = match obj {
+        crate::handle::ObjRef::Proc { slot, gen } => (slot, gen),
+        _ => return E_DENIED,
+    };
+    if !crate::proc::proc_live(pid, pgen) {
+        return E_BAD_HANDLE;
+    }
+    // 0 = 只查一次：不进等待表，也不阻塞
+    if ms == 0 {
+        return if crate::proc::proc_is_terminated(pid) {
+            (WAIT_TERMINATED << 32) | u64::from(crate::proc::proc_exit_code(pid))
+        } else {
+            0
+        };
+    }
+    let Some(cycles) = wait_cycles(ms) else { return E_INVALID };
+    match crate::sched::wait_for_proc(pid, cycles) {
+        Some(code) => (WAIT_TERMINATED << 32) | u64::from(code),
+        None => 0,
+    }
+}
+
+/// 17：`process_wait` 是 19 的薄壳（Q3）——参数少一个信号位图，默认等"已终止"。
+#[cfg(feature = "handles")]
+fn sys_process_wait(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
+    wait_on_proc(crate::handle::Handle(frame.rdi), owner, WAIT_TERMINATED, frame.rsi)
+}
+
+/// 19：通用对象等待。今天只支持 Proc（见常量注释），其余 kind 明确 `-4`。
+#[cfg(feature = "handles")]
+fn sys_object_wait(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
+    wait_on_proc(crate::handle::Handle(frame.rdi), owner, frame.rsi, frame.rdx)
+}
+#[cfg(feature = "handles")]
 fn sys_file_read(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let want = frame.rdx as usize;
     if want == 0 {
@@ -1265,6 +1338,10 @@ pub fn syscall_dispatch(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> boo
         SYS_THREAD_CREATE => sys_thread_create(frame),
         #[cfg(feature = "handles")]
         SYS_PROCESS_START => sys_process_start(frame),
+        #[cfg(feature = "handles")]
+        SYS_PROCESS_WAIT => sys_process_wait(frame),
+        #[cfg(feature = "handles")]
+        SYS_OBJECT_WAIT => sys_object_wait(frame),
         SYS_POKE_BUF => {
             // 内核 → 用户。写成 `Ok(n)` 而不是布尔：`n != want` 就是"中途被接住的故障"，
             // 程序核对字节时看得见的差异与内核报回的数必须一致（两台仪器不能各说各话）。

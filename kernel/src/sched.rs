@@ -270,6 +270,11 @@ pub fn terminate_task(task: usize) -> bool {
     if dead_proc != crate::proc::NO_PROC {
         crate::proc::proc_thread_exited(dead_proc, 1);
     }
+    // P6a：旁观者终止也算收工（这条路径把槽直接标 Free），等待者同样要收到发布
+    task_wait_signal(TW_TASK, task as u32, 1);
+    if dead_proc != crate::proc::NO_PROC {
+        task_wait_signal(TW_PROC, u32::from(dead_proc), 1);
+    }
     // P7b（欠账⑥）：阻塞着的任务还占着**两份注册**——等待链上的 waiter 与定时器轮里的项。
     // 只改任务槽的话这两份永久留着：槽会被 spawn 复用，而注册认的是槽下标，
     // 于是等待队列 16 格 / 轮 64 格杀够次数就再也等不了（实测 6 次杀 ⇒ 各漏 6 格）。
@@ -1103,6 +1108,12 @@ fn idle_entry() -> ! {
         // 实测：P6b 的用例调了 `apic::wait_ticks`（内部 with_interrupts）之后，
         // BSP 就停在 idle_entry 里 HLT=1 而 RFL=0x7（IF=0），整机静默。
         crate::arch::x86_64::apic::open_cpu_window(cpu);
+        // P6a：有等待者 armed 时**不能 hlt**——用例常常停表跑，没有中断会来叫醒 idle，
+        // 而等待时限只在 task_wake_tick 里检查 ⇒ hlt 睡死就是整机挂死（本轮实测 HANG）。
+        // 这里改成转一圈再查，上限就是那个等待时限；没有等待者时行为与原来逐字相同。
+        if task_wake_tick() {
+            continue;
+        }
         if cpu < crate::arch::x86_64::cpu::MAX_CPUS {
             IDLE_HLT[cpu].fetch_add(1, Ordering::Relaxed);
         }
@@ -1493,25 +1504,230 @@ pub fn wait_for_boot_task(budget_cycles: u64) -> bool {
     true
 }
 
-/// W3 P3（ADR-071 决策 1）：等一个任务收工。有界时限 + yield 推进（不是纯自旋）。
-/// 返回 `true` = 目标已 Done/Free（Condition）；`false` = 超时（TimedOut）。
-/// 调用方必须是**被调度的任务**（boot 上下文是 slot 0，满足）；不持任何锁。
-/// 目标收工后 `proc::proc_is_terminated` 可查退出码（进程级）；
-/// 任务级直接看 `state_of(target)` 是否 Done/Free。
-pub fn wait_for_task(target: usize, deadline_cycles: u64) -> bool {
-    let t0 = crate::tsc::now();
-    loop {
-        let st = state_of(target);
-        if matches!(st, TaskState::Done | TaskState::Free) {
-            return true;
+// ---- P6a（ADR-071 决策 1）：任务/进程收工的等待与唤醒 ----
+//
+// 形状照定时器轮那一套（保留队列号 + 自己的表 + block_current），**不占 `WaitQueue` 的 16×16 槽**：
+// 那些槽是给"用户任务条件变量"用的，把内核等待塞进去会让"队列满"这种业务错误码去承载内核契约违例。
+//
+// **收工出口只发布、不在那里唤醒**：`kill_current` 可能在持着 VMM(20) 的故障路径上被调到，
+// 而 `wake_task` 要取目标 CPU 的 RUNQ(8) ⇒ 20→8 的反向嵌套（per-CPU 等级栈看得见，当场 L4）。
+// 所以出口只做原子写（置 signal + 把等待槽标成"已置信号"），真唤醒放在 `preempt_point` 里
+// **need 闸之后**那一处——与 `wheel_tick` 同一个位置、同一条安全论证：need 只由 tick/resched IPI 立，
+// 而那些只在 IF=1 时被取走 ⇒ 被中断的上下文不可能持着锁。代价是唤醒最多晚一个 tick，如实记。
+
+/// 任务/进程等待的保留队列号（与 `TIMER_QID = u8::MAX` 同一手法：只出现在 token 里）。
+const TASK_QID: u8 = u8::MAX - 1;
+/// 等待者槽数。**上限**，不是 workload 钉出来的（与 `WHEEL_SLOTS` 同一口径）：
+/// 今天 `MAX_PROCESSES = 4`、用例里同时等待的不超过 2 个，取 8 留一倍余量。
+const TASK_WAIT_SLOTS: usize = 8;
+/// 等的是任务槽还是进程。
+const TW_TASK: u8 = 1;
+const TW_PROC: u8 = 2;
+/// 槽状态：0 空 → 1 已占未武装 → 2 已武装 → 3 已置信号待唤醒 → 4 已唤醒（等调用方读走 observed）。
+/// **先写字段、最后用 Release 写 state=2**；唤醒方用 Acquire 读 state ⇒ 看到 2 就一定看得到字段。
+/// 这条顺序是"不丢唤醒"的全部要点：武装在前、查条件在后，
+/// 若信号在武装之前就置好了，调用方那次查条件会看见并直接返回。
+const TW_FREE: u8 = 0;
+const TW_CLAIMED: u8 = 1;
+const TW_ARMED: u8 = 2;
+const TW_SIGNALLED: u8 = 3;
+const TW_WOKEN: u8 = 4;
+
+struct TaskWaiter {
+    state: core::sync::atomic::AtomicU8,
+    kind: core::sync::atomic::AtomicU8,
+    target: core::sync::atomic::AtomicU32,
+    waiter: core::sync::atomic::AtomicU32,
+    seq: core::sync::atomic::AtomicU64,
+    deadline: core::sync::atomic::AtomicU64,
+    observed: core::sync::atomic::AtomicU32,
+}
+
+static TASK_WAITERS: [TaskWaiter; TASK_WAIT_SLOTS] = [const {
+    TaskWaiter {
+        state: core::sync::atomic::AtomicU8::new(TW_FREE),
+        kind: core::sync::atomic::AtomicU8::new(0),
+        target: core::sync::atomic::AtomicU32::new(0),
+        waiter: core::sync::atomic::AtomicU32::new(0),
+        seq: core::sync::atomic::AtomicU64::new(0),
+        deadline: core::sync::atomic::AtomicU64::new(0),
+        observed: core::sync::atomic::AtomicU32::new(0),
+    }
+}; TASK_WAIT_SLOTS];
+
+static TASK_WAKE_PENDING: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static TASK_WAIT_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+/// 观测计数：登记过几次、被信号唤醒几次、超时几次、槽满拒过几次。
+/// 没有这四个数，"等待真的阻塞过"只能指着一句"返回了 true"空谈。
+static TW_REGISTERED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static TW_SIGNALED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static TW_TIMEOUTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static TW_FULL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// 这四个数给用例与 `object_wait` 的判据用（与 `sync::stats()` 同一姿态）。
+pub fn task_wait_stats() -> (u64, u64, u64, u64) {
+    (
+        TW_REGISTERED.load(Ordering::Relaxed),
+        TW_SIGNALED.load(Ordering::Relaxed),
+        TW_TIMEOUTS.load(Ordering::Relaxed),
+        TW_FULL.load(Ordering::Relaxed),
+    )
+}
+
+/// 收工出口调它：**只原子写，不取任何锁、不唤醒**（理由见上面那段）。
+/// `observed` 对任务等待是 1，对进程等待是进程的 signal（`TERMINATED | 退出码`）。
+pub fn task_wait_signal(kind: u8, target: u32, observed: u32) {
+    use core::sync::atomic::Ordering as O;
+    for w in TASK_WAITERS.iter() {
+        if w.state.load(O::Acquire) == TW_ARMED
+            && w.kind.load(O::Relaxed) == kind
+            && w.target.load(O::Relaxed) == target
+        {
+            w.observed.store(observed, O::Relaxed);
+            w.state.store(TW_SIGNALLED, O::Release);
+            TASK_WAKE_PENDING.fetch_add(1, O::AcqRel);
+            TW_SIGNALED.fetch_add(1, O::Relaxed);
         }
-        if crate::tsc::now().wrapping_sub(t0) > deadline_cycles {
+    }
+}
+
+/// 在 `preempt_point` 的 need 闸之后调：把"已置信号"与"已到期"的等待者真唤醒。
+/// 这里可以取 RUNQ（`wake_task` 内部取），因为被中断的上下文不可能持锁（同 `wheel_tick` 的论证）。
+fn task_wake_tick() -> bool {
+    use core::sync::atomic::Ordering as O;
+    if TASK_WAKE_PENDING.load(O::Acquire) == 0 {
+        // 没有信号也要看超时：超时是时间到了，不是谁发布的
+        let now = crate::tsc::now();
+        let mut any = false;
+        for w in TASK_WAITERS.iter() {
+            if w.state.load(O::Acquire) == TW_ARMED && w.deadline.load(O::Relaxed) <= now {
+                any = true;
+                break;
+            }
+        }
+        if !any {
             return false;
         }
-        // yield 推进：让目标有机会被调度、跑完、收工。
-        // 停表时 yield_now 靠自陷 0xF0 换人（ADR-049），不依赖 tick。
-        yield_now();
     }
+    let now = crate::tsc::now();
+    for w in TASK_WAITERS.iter() {
+        let st = w.state.load(O::Acquire);
+        let expired = st == TW_ARMED && w.deadline.load(O::Relaxed) <= now;
+        if st != TW_SIGNALLED && !expired {
+            continue;
+        }
+        if expired {
+            w.observed.store(0, O::Relaxed);
+            TW_TIMEOUTS.fetch_add(1, O::Relaxed);
+        }
+        let gidx = w.waiter.load(O::Relaxed) as usize;
+        let tok = crate::sync::WaitToken { queue: TASK_QID, seq: w.seq.load(O::Relaxed) };
+        // 先标已唤醒再 wake：wake 之后调用方可能立刻跑起来并读 observed/释放槽位
+        w.state.store(TW_WOKEN, O::Release);
+        let _ = wake_task(gidx, tok);
+        if st == TW_SIGNALLED {
+            TASK_WAKE_PENDING.fetch_sub(1, O::AcqRel);
+        }
+    }
+    // 还有 armed 的等待者 ⇒ 调用方（idle）不能 hlt 睡死：停表时没有中断会来叫它，
+    // 而时限要靠这里检查。返回 true 让 idle 改成有界自旋（上限就是那个时限）。
+    TASK_WAITERS.iter().any(|w| w.state.load(O::Acquire) == TW_ARMED)
+}
+
+/// 登记一个等待槽。返回 (槽号, token)；槽满返回 None（调用方必须处理，不静默降级）。
+fn task_wait_register(kind: u8, target: u32, me: usize, deadline: u64) -> Option<(usize, crate::sync::WaitToken)> {
+    use core::sync::atomic::Ordering as O;
+    for (i, w) in TASK_WAITERS.iter().enumerate() {
+        if w.state
+            .compare_exchange(TW_FREE, TW_CLAIMED, O::AcqRel, O::Relaxed)
+            .is_ok()
+        {
+            let seq = TASK_WAIT_SEQ.fetch_add(1, O::Relaxed);
+            w.kind.store(kind, O::Relaxed);
+            w.target.store(target, O::Relaxed);
+            w.waiter.store(me as u32, O::Relaxed);
+            w.seq.store(seq, O::Relaxed);
+            w.deadline.store(deadline, O::Relaxed);
+            w.observed.store(0, O::Relaxed);
+            w.state.store(TW_ARMED, O::Release);
+            TW_REGISTERED.fetch_add(1, O::Relaxed);
+            return Some((i, crate::sync::WaitToken { queue: TASK_QID, seq }));
+        }
+    }
+    TW_FULL.fetch_add(1, O::Relaxed);
+    None
+}
+
+/// 读走结果并交回槽位。`None` = 这一槽不是"已唤醒"状态（不该发生，调用方按超时处理）。
+fn task_wait_take(slot: usize) -> Option<u32> {
+    use core::sync::atomic::Ordering as O;
+    let w = &TASK_WAITERS[slot];
+    let v = w.observed.load(O::Acquire);
+    w.state.store(TW_FREE, O::Release);
+    Some(v)
+}
+
+/// 等一个进程收工（P6a）。返回 `Some(退出码)` 或 `None`（超时/槽满/不是可运行任务）。
+/// **武装在前、查条件在后**，才不会丢唤醒（见 TW_ARMED 那段）：若信号在武装之前就置好了，
+/// 下面那次查条件会看见并直接返回；若之后才置，发布方一定看得到已武装的槽。
+/// 调用者必须是已登记的任务且不持任何锁；时限有界，超时返回 None **不升 L4**
+/// （"目标永远不收工"是业务事实而不是契约违例，ADR-071 决策 1）。
+pub fn wait_for_proc(proc_id: u16, deadline_cycles: u64) -> Option<u32> {
+    let deadline = crate::tsc::now().wrapping_add(deadline_cycles);
+    let me = current_id();
+    let Some((slot, token)) = task_wait_register(TW_PROC, u32::from(proc_id), me, deadline) else {
+        return None;
+    };
+    if crate::proc::proc_is_terminated(proc_id) {
+        let _ = task_wait_take(slot);
+        return Some(crate::proc::proc_exit_code(proc_id));
+    }
+    if !block_current(token) {
+        let _ = task_wait_take(slot);
+        return None;
+    }
+    // 这里没持任何锁（block_current 的守卫已析构），所以可以直接切走（ADR-053 决策 2）
+    yield_now();
+    // 醒来了：observed=0 是超时那条路写的，非 0 才是真收工
+    match task_wait_take(slot) {
+        Some(0) | None => None,
+        Some(_) => Some(crate::proc::proc_exit_code(proc_id)),
+    }
+}
+
+/// 等一条任务收工（P6a 把 P3 的轮询版换成真阻塞）。语义与原来一致：
+/// 目标变成 `Done`/`Free` 返回 true，超时返回 false。**没有任务上下文时退回有界轮询**
+/// （启动早期还没 `init_boot_task` 的调用方今天的形状），不静默假装等过。
+pub fn wait_for_task(target: usize, deadline_cycles: u64) -> bool {
+    let t0 = crate::tsc::now();
+    let deadline = t0.wrapping_add(deadline_cycles);
+    let me = current_id();
+    let installed = me < MAX_TASKS_TOTAL
+        && !matches!(state_of(me), TaskState::Free);
+    if !installed {
+        loop {
+            if matches!(state_of(target), TaskState::Done | TaskState::Free) {
+                return true;
+            }
+            if crate::tsc::now().wrapping_sub(t0) > deadline_cycles {
+                return false;
+            }
+            yield_now();
+        }
+    }
+    let Some((slot, token)) = task_wait_register(TW_TASK, target as u32, me, deadline) else {
+        return false;
+    };
+    if matches!(state_of(target), TaskState::Done | TaskState::Free) {
+        let _ = task_wait_take(slot);
+        return true;
+    }
+    if !block_current(token) {
+        let _ = task_wait_take(slot);
+        return false;
+    }
+    yield_now();
+    !matches!(task_wait_take(slot), Some(0) | None)
 }
 
 /// 把当前任务标成 Done：之后 `pick_next` 不会再选它。
@@ -1529,6 +1745,14 @@ pub fn finish_current() {
         crate::proc::proc_thread_exited(pid, 0);
     }
     my_rq().tasks[slot_of(me)].state = TaskState::Done;
+    // P6a：**先置 signal 再发布等待者**。这里只原子写，真唤醒在抢占点的 need 闸之后做
+    // （收工出口可能在持锁的故障路径上）。M38 实测：把这两句的顺序调换**仍然全绿**——
+    // 因为唤醒是延迟到抢占点的，drain 跑起来时两句都已执行完 ⇒ 顺序在本设计里不可观测。
+    // 所以"先置 signal 再唤醒"是**延迟唤醒设计的结构性后果**，不是一条被测出来的判据（ADR-054 口径）。
+    task_wait_signal(TW_TASK, me as u32, 1);
+    if pid != crate::proc::NO_PROC {
+        task_wait_signal(TW_PROC, u32::from(pid), 1);
+    }
 }
 
 /// **被杀**那条路径的"标结束"：`finish_current` 做的事 + 登记一次待回收。
@@ -1548,6 +1772,11 @@ pub fn kill_current() {
     }
     my_rq().tasks[slot_of(me)].state = TaskState::Done;
     REAP_PENDING[cpu].fetch_add(1, Ordering::AcqRel);
+    // P6a：被杀也算收工，等待者不该只能等超时（同 finish_current 的顺序）
+    task_wait_signal(TW_TASK, me as u32, 1);
+    if pid != crate::proc::NO_PROC {
+        task_wait_signal(TW_PROC, u32::from(pid), 1);
+    }
 }
 
 /// 第 i 个任务登记归属哪个 CPU。用例用它核对 `gidx/cpu_of/slot_of` 这组算术：
@@ -1796,6 +2025,8 @@ pub unsafe fn preempt_point(frame: u64, cpu: usize) {
     // 包括持 VMM(20) 时发生的同步 #PF ⇒ `锁序违规 外层 rank=20 本次 rank=6`（实测 3/3 39）。
     // 仍在取 RUNQ 之前，所以嵌套方向是 TIMER(6) -> RUNQ(8)，与锁序表一致。
     wheel_tick(cpu);
+    // P6a：任务/进程等待的唤醒与超时也在这里做，同一条安全论证（need 闸之后 ⇒ 被中断的上下文不持锁）
+    task_wake_tick();
     let t0 = crate::tsc::now();
     let me = current_of(cpu);
     let mslot = slot_of(me);

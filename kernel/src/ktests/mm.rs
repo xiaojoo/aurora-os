@@ -2097,7 +2097,201 @@ fn t_process_startup() -> bool {
 }
 #[cfg(feature = "handles")]
 ktest!(KT_PROCESS_STARTUP, t_process_startup);
-// ---- ADR-074（W3 P4b）12/13/14 三个号 + 退出时归还 ----
+
+// ---- P6a（ADR-071 决策 1）：19 object_wait / 17 process_wait + 收工唤醒边 ----
+//
+// 形状：**工人 W 真阻塞在 19 号上**，另一条线程 T 收工把它唤醒。
+// 判据要能分辨"被信号唤醒"与"等到超时"——`task_wait_stats()` 的 signaled/timeouts 两个数就是那把尺子。
+
+#[cfg(feature = "handles")]
+static WAIT_SYS: [core::sync::atomic::AtomicU64; 16] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 16];
+
+/// T：只 spin 一段就收工。它的 `finish_current` 会置进程 signal 并发布等待者。
+#[cfg(feature = "handles")]
+fn wait_sys_exit_thread() -> ! {
+    crate::tsc::spin(5_000_000);
+    crate::sched::finish_current();
+    loop {
+        crate::tsc::spin(2_000);
+    }
+}
+
+#[cfg(feature = "handles")]
+fn wait_sys_worker() -> ! {
+    use crate::arch::x86_64::trap::TrapFrame;
+    use crate::handle::{self, Handle, RIGHT_READ};
+    use crate::sched;
+    use crate::user::{
+        self, E_DENIED, E_INVALID, SYS_OBJECT_WAIT, SYS_PROCESS_WAIT, WAIT_TERMINATED, syscall_dispatch,
+    };
+    use crate::{proc, vmo};
+    let put = |i: usize, v: u64| WAIT_SYS[i].store(v, core::sync::atomic::Ordering::Release);
+    let bail = |code: u64| -> ! {
+        put(15, code);
+        sched::finish_current();
+        loop { crate::tsc::spin(1000); }
+    };
+    let Some(owner) = sched::current_identity() else { bail(1) };
+    let mut f = TrapFrame {
+        cr2: 0, r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
+        rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0, vector: 0,
+        error_code: 0, rip: 0, cs: 0, rflags: 0, rsp: 0, ss: 0,
+    };
+    let job = match proc::job_create(None, 4, 64) { Ok(v) => v, Err(_) => bail(2) };
+    let p1 = match proc::proc_create(job) { Ok(v) => v, Err(_) => bail(3) };
+    let g1 = proc::proc_gen(p1).unwrap_or(0);
+    let hp1 = match handle::grant_proc(owner, p1, g1, RIGHT_READ) { Ok(h) => h, Err(_) => bail(4) };
+    // 先登记再 spawn（ADR-073 的顺序），T 收工时那条边才看得到 proc_id
+    if proc::proc_attach_thread(p1).is_err() { bail(5) }
+    let t1 = match sched::spawn(wait_sys_exit_thread) { Ok(v) => v, Err(_) => bail(6) };
+    if !sched::set_proc_id(t1, p1) { bail(7) }
+
+    let st0 = sched::task_wait_stats();
+    put(0, st0.0);
+    put(1, st0.1);
+    put(2, st0.2);
+    // ① 真阻塞等 T 收工（时限给足：2000 ms，远大于 T 那 5M 周期）
+    f.rax = SYS_OBJECT_WAIT;
+    f.rdi = hp1.0;
+    f.rsi = WAIT_TERMINATED;
+    f.rdx = 2000;
+    f.r10 = 0;
+    syscall_dispatch(&mut f);
+    put(3, f.rax);
+    let st1 = sched::task_wait_stats();
+    put(4, st1.0);
+    put(5, st1.1);
+    put(6, st1.2);
+    // 醒来的那一刻进程必须**已经**是终止态（"先置 signal 再唤醒"的可观测后果）
+    put(7, proc::proc_is_terminated(p1) as u64);
+    put(8, proc::proc_exit_code(p1) as u64);
+
+    // ② 17 是 19 的薄壳：同一个已终止的进程，两个号必须给同一个数
+    f.rax = SYS_PROCESS_WAIT;
+    f.rdi = hp1.0;
+    f.rsi = 0; // 0 = 只查一次
+    f.rdx = 0;
+    syscall_dispatch(&mut f);
+    put(9, f.rax);
+
+    // ③ 超时：另造一个**没有线程**的进程（永远不会收工），时限 20 ms
+    let p2 = match proc::proc_create(job) { Ok(v) => v, Err(_) => bail(8) };
+    let g2 = proc::proc_gen(p2).unwrap_or(0);
+    let hp2 = match handle::grant_proc(owner, p2, g2, RIGHT_READ) { Ok(h) => h, Err(_) => bail(9) };
+    let st2 = sched::task_wait_stats();
+    f.rax = SYS_OBJECT_WAIT;
+    f.rdi = hp2.0;
+    f.rsi = WAIT_TERMINATED;
+    f.rdx = 20;
+    syscall_dispatch(&mut f);
+    put(10, f.rax);
+    let st3 = sched::task_wait_stats();
+    put(11, st3.2 - st2.2); // 这一格必须涨：证它真是等超时的，不是立刻返回
+
+    // ④ 三种拒绝：不认识的信号位、超上限的时限、拿非 Proc 对象来等
+    f.rax = SYS_OBJECT_WAIT;
+    f.rdi = hp2.0;
+    f.rsi = 0x8000_0000;
+    f.rdx = 10;
+    syscall_dispatch(&mut f);
+    let bad_sig = f.rax;
+    f.rax = SYS_OBJECT_WAIT;
+    f.rdi = hp2.0;
+    f.rsi = WAIT_TERMINATED;
+    f.rdx = user::WAIT_MAX_MS + 1;
+    syscall_dispatch(&mut f);
+    let bad_ms = f.rax;
+    let vid = match vmo::vmo_create(1) { Ok(v) => v, Err(_) => bail(10) };
+    let hv = match handle::grant_vmo(owner, vid, RIGHT_READ) { Ok(h) => h, Err(_) => bail(11) };
+    vmo::vmo_unref(vid);
+    f.rax = SYS_OBJECT_WAIT;
+    f.rdi = hv.0;
+    f.rsi = WAIT_TERMINATED;
+    f.rdx = 10;
+    syscall_dispatch(&mut f);
+    put(12, bad_sig);
+    put(13, bad_ms);
+    put(14, f.rax);
+    let _ = E_INVALID;
+    let _ = E_DENIED;
+    // 收场：p1 已终止走 reap，p2 没线程走 discard；T 的槽由 reap 交回
+    let _ = sched::terminate_task(t1);
+    let r1 = proc::proc_reap(p1).is_ok();
+    let d2 = proc::proc_discard(p2).is_ok();
+    let jd = proc::job_destroy(job).is_ok();
+    let _ = handle::close(hp1, owner);
+    let _ = handle::close(hp2, owner);
+    let _ = handle::close(hv, owner);
+    let _ = handle::revoke_task(owner.0, owner.1);
+    if !(r1 && d2 && jd) { bail(12) }
+    put(15, 0);
+    sched::finish_current();
+    loop { crate::tsc::spin(1000); }
+}
+
+/// P6a 的证人：19/17 两个号 + "收工先置 signal 再发布"那条边。
+#[cfg(feature = "handles")]
+fn t_object_wait() -> bool {
+    use crate::{handle, proc, sched, vmo};
+    use crate::arch::x86_64::apic;
+    use crate::ktests::common::drain_reap;
+    sched::init_boot_task();
+    sched::start_workers();
+    if crate::clock::current().is_none() { crate::calibrate_clock_once(); }
+    if proc::proc_residual().0 != 0 || proc::job_residual().0 != 0 || handle::live() != 0
+        || vmo::vmo_count() != 0 {
+        crate::log_fatal!("owait: 前提失效，进来就有残留");
+        return false;
+    }
+    let f0 = mm::free_frames();
+    let tick_in = apic::ticks();
+    let probe = apic::wait_ticks(tick_in, 1, crate::clock::window_cycles(1));
+    let was_running = probe.ticks >= 1;
+    if !was_running { apic::timer_start().ok(); }
+    for a in WAIT_SYS.iter() { a.store(0, core::sync::atomic::Ordering::Relaxed); }
+    let g = match sched::spawn(wait_sys_worker) {
+        Ok(v) => v,
+        Err(_) => { crate::log_fatal!("owait: spawn 失败"); return false; }
+    };
+    // 等待要有 tick 才能被唤醒（唤醒在抢占点的 need 闸之后做），所以窗口必须开着
+    let waited = apic::with_interrupts(|| sched::wait_for_task(g, crate::clock::window_cycles(40)));
+    let rel0 = sched::reap_released();
+    let _ = sched::terminate_task(g);
+    let drained = sched::reap_released() > rel0 || drain_reap();
+    if !was_running { apic::timer_stop().ok(); }
+    let r: [u64; 16] = core::array::from_fn(|i| WAIT_SYS[i].load(core::sync::atomic::Ordering::Acquire));
+    if r[15] != 0 {
+        crate::log_fatal!("owait: 工人半路退场 code={} 原始={:?}", r[15], r);
+        return false;
+    }
+    let want = (crate::user::WAIT_TERMINATED << 32) | r[8];
+    // 被信号唤醒（不是超时）：registered 与 signaled 都要涨，timeouts 在这一段不许涨
+    let woke_by_signal = r[4] > r[0] && r[5] > r[1] && r[6] == r[2];
+    let block_ok = r[3] == want && r[7] == 1 && woke_by_signal;
+    let shell_ok = r[9] == want;
+    let timeout_ok = r[10] == 0 && r[11] >= 1;
+    let reject_ok = r[12] == crate::user::E_INVALID && r[13] == crate::user::E_INVALID
+        && r[14] == crate::user::E_DENIED;
+    let st = sched::task_wait_stats();
+    let base_ok = waited && drained && handle::live() == 0 && vmo::vmo_count() == 0
+        && proc::proc_residual().0 == 0 && proc::job_residual().0 == 0
+        && mm::free_frames() == f0 && st.3 == 0;
+    crate::log_info!(
+        "owait(P6a): 阻塞等收工=(ret{:#x} 期望{:#x} 醒来已终止{} 登记{}->{} 信号{}->{} 超时{}->{}) 17薄壳={} 超时=(ret{} timeouts+{}) 三拒=(信号{} 时限{} 非Proc{}) 收场=(等{} drained{} live{} vmo{} free{}->{} 槽满{})",
+        r[3], want, r[7], r[0], r[4], r[1], r[5], r[2], r[6], shell_ok,
+        r[10], r[11], r[12], r[13], r[14], waited, drained, handle::live(), vmo::vmo_count(),
+        f0, mm::free_frames(), st.3);
+    let ok = block_ok && shell_ok && timeout_ok && reject_ok && base_ok;
+    if !ok {
+        crate::log_fatal!(
+            "owait: 判据不成立 阻塞={} 薄壳={} 超时={} 拒绝={} 收场={} 原始={:?}",
+            block_ok, shell_ok, timeout_ok, reject_ok, base_ok, r);
+    }
+    ok
+}
+#[cfg(feature = "handles")]
+ktest!(KT_OBJECT_WAIT, t_object_wait);// ---- ADR-074（W3 P4b）12/13/14 三个号 + 退出时归还 ----
 //
 // 为什么要在**工人任务**里打这三个号而不是在用例上下文里：14 返回的映射挂进的是
 // **当前任务**的资源袋，只有任务退出才由 `release_owned` 在锁外 drop。在用例上下文里打号，
