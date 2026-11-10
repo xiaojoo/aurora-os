@@ -124,6 +124,16 @@ pub fn fatal_snapshot(cpu: usize) -> [u64; FATAL_FIELDS] {
     out
 }
 
+/// 把某一槽原样写回。与 `fatal_snapshot` 配成一对，让"怎么写回"只有一处算术——
+/// 用例自己按 `cpu * FATAL_FIELDS + i` 写回去的话，那一格量的是它抄的那份布局，不是这里的布局。
+/// 分槽与步长的交叉核对在 `t_fatal_record` 的 ⑥/⑥b（那里**故意**用宿主机的算法写、用本模块读）。
+pub fn fatal_restore(cpu: usize, snap: &[u64; FATAL_FIELDS]) {
+    let b = slot_base(cpu);
+    for i in 0..FATAL_FIELDS {
+        FATAL_RECORD[b + i].store(snap[i], Ordering::Relaxed);
+    }
+}
+
 /// 这张表在**物理内存**里的地址（宿主机 `pmemsave` 要用它）。
 /// `phys_of` 给的是页基址，所以补上页内偏移；译不出来就返回 `None`，
 /// 由调用方把"没有物理地址"这件事打出来——静默当 0 会比报红更贵。
@@ -135,9 +145,13 @@ pub fn record_phys() -> Option<u64> {
 /// 落一条崩溃摘要。返回写到的槽与 `seq`，判据要用它们。
 /// `cpu` 收 `usize`（槽位的原生形状）而落盘是 u32：槽位数远小于 2^32，收窄放在这一处。
 pub fn dump_site(site: Site, cpu: usize) -> Result<(u8, u64), state_store::StoreError> {
-    // 这一格带 `site`：`dump_site` 的入参就是现场本身，无论调用方是致命出口、
-    // `panic`（向量为约定的 0）还是用例，表里都留下同一份可读回的数。
-    mark_fatal(STAGE_DUMPSITE_ENTER, 0, Some(site));
+    // 进度点**不带 site**：现场那五格从此只有**一个写者**——致命入口
+    //（`main.rs::exit_fatal_from_exception`，它在任何串口写之前就把向量/错误码/rip/rsp/cr2 写进去了）。
+    // 这里原来再写一遍 `Some(site)`，在真路径上是重复（同一个现场写两次），而 `dump_site` 的
+    // 调用者里有直接喂**合成现场**的用例（`t_crash` 给过向量 13/14/15），于是盘上没崩、
+    // 表里却躺着一个"看着像 #PF(14)"的假现场（BACKLOG §181 未决 3b）。`panic`/`ensure_dumped`
+    // 那一路本来就带 0，去掉之后表里留下的只有**真的进度痕迹**（stage/seq/aux），没有假现场。
+    mark_fatal(STAGE_DUMPSITE_ENTER, 0, None);
     DUMPED.store(true, Ordering::Relaxed);
     let mut rec = CrashRecord {
         vector: site.vector,

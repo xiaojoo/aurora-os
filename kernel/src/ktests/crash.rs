@@ -3,7 +3,7 @@
 use crate::{ahci, crash, serial, state_store};
 use crate::ktest;
 
-/// M6-d/M6-f：§9.7 的崩溃记录走 V2（变长载荷 + 有界栈走 + 最近日志）。判据十五格，逐条只挡一类错法：
+/// M6-d/M6-f：§9.7 的崩溃记录走 V2（变长载荷 + 有界栈走 + 最近日志）。判据十六格，逐条只挡一类错法：
 /// 1 全字段往返：向量/错误码/CPU/RIP/RSP/RBP/CR2/帧数 写下去按同一种类读回来
 /// 2 `rbp` 用不了（这里是 0）⇒ 帧数停在 1，而且不许 panic：走不下去就停，不是编一条链
 /// 3 合成一条三层帧链 ⇒ 帧数 = 4、第一帧就是出事那条指令、后面三帧是我给的返回地址
@@ -182,8 +182,24 @@ fn t_crash() -> bool {
         restored &= ss::write_log(rec.crash_seq, rec.lines, &rec.text[..rec.bytes as usize]).is_ok();
     }
 
+    // ⑯ 无锁现场表里**不许留着本用例的合成 site**。`dump_site` 既是崩溃的收口也是本用例的入口，
+    //   它要把手上的 `Site` 当现场写进表，下一次挂宿主机就读到一个"从没发生过的 #PF(14)"——
+    //   本用例给过 13/14/15 三个向量与两个夹具 rip（`s1`/`s2`/⑩ 的 `dump(15,0,0)`）。
+    //   扫描放在**这里**（自己那几笔调用之后）而不是别的用例里：`.ktests` 的顺序由链接器决定，
+    //   隔着用例查等于赌顺序。配对的负样本（实测）：把 `crash.rs` 里那句
+    //   `mark_fatal(STAGE_DUMPSITE_ENTER, 0, None)` 改回 `Some(site)` ⇒ 这一格当场红。
+    let site_absent = |vector: u64, rip: u64, cr2: u64| {
+        !(0..crate::arch::x86_64::cpu::MAX_CPUS).any(|c| {
+            let row = crash::fatal_snapshot(c);
+            row[crash::FR_VECTOR] == vector && row[crash::FR_RIP] == rip && row[crash::FR_CR2] == cr2
+        })
+    };
+    let site_not_recorded = site_absent(13, 0xffff_8000_1234_0000, 0xdead_0000)
+        && site_absent(14, 0xffff_8000_2222_0000, 0x1000)
+        && site_absent(15, 0, 0);
+
     crate::log_info!(
-        "crash: 判据 引导口={} 全字段往返={} 断链只一帧={} 走三层={} 轮转(seq{}→{} 槽{}→{})={} 配对={} 取最新={} 种类隔离={}/{} 尾帧撕裂退回={} 帧数不自洽退回={} 长度越界退回={} 只降级={} 之后还能读={} 尾行整段={} 装不下就不给={} 行数不符拒={} 截断拒={} 现场还原={}",
+        "crash: 判据 引导口={} 全字段往返={} 断链只一帧={} 走三层={} 轮转(seq{}→{} 槽{}→{})={} 配对={} 取最新={} 种类隔离={}/{} 尾帧撕裂退回={} 帧数不自洽退回={} 长度越界退回={} 只降级={} 之后还能读={} 尾行整段={} 装不下就不给={} 行数不符拒={} 截断拒={} 现场还原={} 现场表无夹具site={}",
         port,
         fields_back,
         single_frame,
@@ -206,12 +222,13 @@ fn t_crash() -> bool {
         no_room_no_line,
         lines_rejected,
         tail_rejected,
-        restored
+        restored,
+        site_not_recorded
     );
     let ok = fields_back && single_frame && walked && stepped && tail_pair && newest_wins && boot_absent
         && v1_still_readable && fell_back && bogus_rejected && huge_rejected && degrade_ok
         && alive_after && tail_whole && no_room_no_line && lines_rejected && tail_rejected
-        && restored;
+        && restored && site_not_recorded;
     if !ok {
         crate::log_fatal!("crash: 崩溃记录判据不成立（上面一行是全部读数）");
     }
@@ -346,10 +363,8 @@ fn t_fatal_record() -> bool {
         )
     });
 
-    // ⑧ 本槽还原（逐格写回，再读一遍确认）
-    for i in 0..crash::FATAL_FIELDS {
-        crash::FATAL_RECORD[mine * crash::FATAL_FIELDS + i].store(before[i], Ordering::Relaxed);
-    }
+    // ⑧ 本槽还原（与 `fatal_snapshot` 配成一对，"怎么写回"只有一处算术；再读一遍确认）
+    crash::fatal_restore(mine, &before);
     let restored = crash::fatal_snapshot(mine) == before;
 
     crate::log_info!(
