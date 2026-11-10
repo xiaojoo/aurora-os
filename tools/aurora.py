@@ -4824,6 +4824,139 @@ def check_probe_elf(log: str) -> list[str]:
     elif first_w != k_data:
         bad.append(f"第一个可写段：宿主机算出 {first_w:#x}，内核报 {k_data:#x}")
     return bad
+
+
+def check_gpt(log: str) -> list[str]:
+    """GPT 分区表的**宿主机侧独立对账**（ADR-078 决策 5，第二台仪器）。
+
+    内核 `filesystem/gpt.rs` 自己报头字段、两个 CRC、覆盖面与 ESP 几何，它的判据比的是
+    "自己算的和自己读的"。这里换一台：`tools/validate_esp.py --report` 从**同一跑的那块整盘镜像**
+    独立重算同样的数（它不 import 内核，也不 import `esp_image` 的写表常量），逐格比。
+    内核绿而对不上 ⇒ 调用方把实际值改判 CONTENT-MISMATCH，与"内核自己红"分得开。
+
+    这台仪器自己也要防空转：解析不出内核那四行、或宿主机只吐出不到 20 个字段，
+    都**直接报红**而不是返回空列表（返回空等于"对上了"，那是最坏的一种假绿）。
+    """
+    bad: list[str] = []
+    mh = re.search(
+        r"gpt: 头 口(\d+) revision=(0x[0-9a-f]+) header_size=(\d+) my_lba=(\d+) "
+        r"alternate_lba=(\d+) first_usable=(\d+) last_usable=(\d+) entry_lba=(\d+) "
+        r"entry_count=(\d+) entry_size=(\d+) header_crc=(0x[0-9a-f]+) array_crc=(0x[0-9a-f]+)", log)
+    mt = re.search(
+        r"gpt: 表 扫过=(\d+) 非空=(\d+) 回调=(\d+) 数组字节=(\d+) 自算CRC=(0x[0-9a-f]+) "
+        r"备份my_lba=(\d+) 备份alternate_lba=(\d+) disk_guid=\[([0-9a-f, ]+)\]", log)
+    me = re.search(
+        r"gpt: ESP 序号=(\d+) first=(\d+) last=(\d+) attrs=(0x[0-9a-f]+) "
+        r"type=\[([0-9a-f, ]+)\] unique=\[([0-9a-f, ]+)\]", log)
+    mg = re.search(
+        r"gpt: 未分派 状态区LBA=(\d+) 签名包LBA=(\d+) 被条目覆盖=\((true|false),(true|false)\) "
+        r"都在可用区间=(true|false) 空隙成立=(true|false)", log)
+    if not (mh and mt and me and mg):
+        miss = [n for n, m in (("头", mh), ("表", mt), ("ESP", me), ("未分派", mg)) if not m]
+        return [f"内核没报齐 GPT 读数（缺 {'/'.join(miss)} 行）⇒ 宿主机对账没有对象，这一行不许当成对上了"]
+    if not IMAGE.exists():
+        return [f"镜像不在：{IMAGE}（这一跑之后被谁 unlink 了？对账必须吃同一跑的盘）"]
+    out = subprocess.run(
+        [sys.executable, str(ROOT / "tools" / "validate_esp.py"), str(IMAGE), "--report"],
+        capture_output=True, text=True, encoding="utf-8", env=env())
+    if out.returncode != 0:
+        return [f"validate_esp.py --report 退出 {out.returncode}：{out.stderr.strip()[:200]}"]
+    host = dict(ln.split("=", 1) for ln in out.stdout.splitlines() if "=" in ln)
+    if len(host) < 20:
+        return [f"宿主机只解析出 {len(host)} 个字段（应当 >= 20）⇒ 这台仪器自己空转了"]
+    # 盘坏掉时宿主机可能根本找不到 ESP（type GUID 被改了一格就没有 esp_* 那几行）。
+    # 这里**必须先点名缺字段再往下比**：直接下标会崩成 KeyError，而崩溃的表现是
+    # 整张判定表挂掉、看起来像被测物坏了（本轮自查就是这么抓到自己的）。
+    required = [
+        "signature", "mbr_sig", "mbr_type", "revision", "header_size", "header_crc",
+        "header_crc_calc", "my_lba", "alternate_lba", "first_usable", "last_usable",
+        "disk_guid", "entry_lba", "entry_count", "entry_size", "array_crc", "array_crc_calc",
+        "array_bytes", "seen", "used", "esp_index", "esp_type", "esp_unique", "esp_first",
+        "esp_last", "esp_attrs", "backup_present", "backup_my_lba", "backup_alternate_lba",
+        "problems",
+    ]
+    missing = [k for k in required if k not in host]
+    if missing:
+        probs = "; ".join(v for k, v in host.items() if k.startswith("problem") and k != "problems")
+        return [f"宿主机报告缺字段 {missing}（它自己发现的问题：{probs or '无'}）"
+                "⇒ 盘坏了或这台仪器坏了，两种都要点名，不许崩成 KeyError"]
+
+    def hexbytes(s: str) -> str:
+        return "".join(re.findall(r"[0-9a-f]{2}", s))
+
+    def eq(tag: str, k, h) -> None:
+        if k != h:
+            bad.append(f"{tag}：内核={k} 宿主机={h}")
+
+    eq("头签名", "EFI PART", host.get("signature"))
+    eq("保护性MBR签名", "true", host.get("mbr_sig"))
+    eq("保护性MBR类型", "0xee", host.get("mbr_type"))
+    eq("revision", int(mh.group(2), 16), int(host["revision"]))
+    for tag, ki, hk in (
+        ("header_size", 3, "header_size"), ("my_lba", 4, "my_lba"),
+        ("alternate_lba", 5, "alternate_lba"), ("first_usable", 6, "first_usable"),
+        ("last_usable", 7, "last_usable"), ("entry_lba", 8, "entry_lba"),
+        ("entry_count", 9, "entry_count"), ("entry_size", 10, "entry_size"),
+    ):
+        eq(tag, int(mh.group(ki)), int(host[hk]))
+    eq("头CRC(盘上写的)", int(mh.group(11), 16), int(host["header_crc"], 16))
+    eq("头CRC(自己算的)", int(mh.group(11), 16), int(host["header_crc_calc"], 16))
+    eq("数组CRC(盘上写的)", int(mh.group(12), 16), int(host["array_crc"], 16))
+    eq("数组CRC(内核流式算的)", int(mt.group(5), 16), int(host["array_crc_calc"], 16))
+    eq("数组字节数", int(mt.group(4)), int(host["array_bytes"]))
+    eq("扫过条目数", int(mt.group(1)), int(host["seen"]))
+    eq("非空条目数", int(mt.group(2)), int(host["used"]))
+    eq("回调次数(独立recount)", int(mt.group(3)), int(host["used"]))
+    eq("disk_guid", hexbytes(mt.group(8)), host["disk_guid"])
+    eq("备份my_lba", int(mt.group(6)), int(host["backup_my_lba"]))
+    eq("备份alternate_lba", int(mt.group(7)), int(host["backup_alternate_lba"]))
+    eq("备份头在位", "true", host.get("backup_present"))
+    eq("ESP序号", int(me.group(1)), int(host["esp_index"]))
+    eq("ESP first_lba", int(me.group(2)), int(host["esp_first"]))
+    eq("ESP last_lba", int(me.group(3)), int(host["esp_last"]))
+    eq("ESP attrs", int(me.group(4), 16), int(host["esp_attrs"], 16))
+    eq("ESP type GUID", hexbytes(me.group(5)), host["esp_type"])
+    eq("ESP unique GUID", hexbytes(me.group(6)), host["esp_unique"])
+    eq("宿主机自己发现的问题数", 0, int(host["problems"]))
+
+    # 未分派那一段：宿主机用**自己的**分区区间与自己的两个 LBA 常数重算覆盖面，
+    # 不信内核报的那两个 LBA（它可能把常数写错，而写错的表现是"空隙成立"照样绿）。
+    sys.path.insert(0, str(ROOT / "tools"))
+    import esp_image  # noqa: E402
+    state_lba, pkg_lba = esp_image.STATE_START_LBA, esp_image.PKG_START_LBA
+    eq("状态区LBA常数", int(mg.group(1)), state_lba)
+    eq("签名包LBA常数", int(mg.group(2)), pkg_lba)
+    ranges = [(int(host[f"part{i}_first"]), int(host[f"part{i}_last"]))
+              for i in range(int(host["used"]))]
+    cov_s = any(a <= state_lba <= b for a, b in ranges)
+    cov_p = any(a <= pkg_lba <= b for a, b in ranges)
+    eq("状态区被条目覆盖", mg.group(3), str(cov_s).lower())
+    eq("签名包被条目覆盖", mg.group(4), str(cov_p).lower())
+    fu, lu = int(host["first_usable"]), int(host["last_usable"])
+    in_ok = fu <= state_lba <= lu and fu <= pkg_lba <= lu
+    eq("两个裸LBA区都在可用区间", mg.group(5), str(in_ok).lower())
+    eq("空隙成立", mg.group(6), str(not cov_s and not cov_p and in_ok).lower())
+
+    # 内核那几行自述判据：宿主机不因为它们绿就放过上面的对账，但它们红了对账也没有意义。
+    for tag, pat in (
+        ("真盘判据", r"gpt: 判据 [^\n]*"),
+        ("CRC向量", r"gpt: CRC向量 [^\n]*"),
+        ("合成盘正向", r"gpt: 合成盘 [^\n]*"),
+        ("查找", r"gpt: 查找 [^\n]*"),
+    ):
+        m = re.search(pat, log)
+        if not m:
+            bad.append(f"内核没报 {tag} 那一行")
+        elif "false" in m.group(0):
+            bad.append(f"{tag} 里有 false：{m.group(0).strip()[:150]}")
+    mn = re.search(r"gpt: 合成判据 [^\n]*点名负样本=(\d+)/(\d+)", log)
+    if not mn:
+        bad.append("内核没报点名负样本的计数")
+    elif mn.group(1) != mn.group(2) or int(mn.group(2)) == 0:
+        bad.append(f"点名负样本={mn.group(1)}/{mn.group(2)}（必须全中且分母非零，否则那批闸是空转）")
+    return bad
+
+
 def do_test(timeout: int) -> int:
     """正向必须 33、负样本必须 35。只跑正向的话，永远分不清“代码没问题”
     和“判定链根本没生效”。"""
@@ -5180,6 +5313,18 @@ def do_test(timeout: int) -> int:
     for x in pb_bad:
         print("    对账:", x)
 
+    print("=== GPT 分区表：内核读回的每个数由 validate_esp.py 独立重算（ADR-078 决策 5，第二台仪器）===")
+    # 内核那侧的 t_gpt 比的是"自己算的和自己读的"，外加一张合成盘把 16 道闸各证红一次。
+    # 这一行换成"和另一台实现"：validate_esp.py 不 import 内核、也不 import esp_image 的写表常量，
+    # 从**同一跑的那块盘**重算头字段、两个 CRC、覆盖面、ESP 几何与备份头，逐格比。
+    # 用 gpt-probe 档跑：解析器与它的用例只在这一档里编译（默认档 ELF 一个字节不动）。
+    IMAGE.unlink(missing_ok=True)
+    gptv, gptrc, gptlog = do_run(["gpt-probe"], timeout)
+    gpt_bad = check_gpt(gptlog)
+    gpt_verdict = gptv if gptv != "PASS" else ("PASS" if not gpt_bad else "CONTENT-MISMATCH")
+    for x in gpt_bad:
+        print("    对账:", x)
+
     print("=== FAT32 只读解析：两块卷挂 AHCI 口 3/4，内核读回的每个数由宿主机再解析一遍 ===")
     # 内核那十三条判据比的是"自己和写死的期望数"，这一行把它们换成"和另一台实现"：
     # 几何 14 格、每个文件 12 格、以及引导盘该崩在哪一道闸。两块卷的角色不重叠——
@@ -5384,6 +5529,9 @@ def do_test(timeout: int) -> int:
         ("P7 句柄ring3读自己镜像", h3_verdict, h3rc, "PASS", 33),
         # P5c-3b：探针夹具的宿主机侧独立对账（§156/§160 欠的那条），判据是"另一台实现算出同样的数"
         ("探针几何与宿主机对账", pb_verdict, pbrc, "PASS", 33),
+        # ADR-078 决策 5 / W4 S1：GPT 的头字段、两个 CRC、覆盖面、ESP 几何与备份头由
+        # validate_esp.py 从同一跑的盘独立重算；内核绿而对不上 ⇒ CONTENT-MISMATCH
+        ("GPT分区表与宿主机对账", gpt_verdict, gptrc, "PASS", 33),
         # P7 第 40 行的证红：owner 改错一格 ⇒ 容器读不到 ⇒ 必须红在 ring3 那格
         ("P7 句柄授错主人必须红", ih_verdict, ihrc, "FAIL", 35),
         # ADR-066 / W2 P4：OOM 被传播（Err）且原页原样 ⇒ 期望 PASS(33)；
@@ -5428,6 +5576,7 @@ def do_test(timeout: int) -> int:
         "FAT32簇号高半抹零必须红": hilog,
         "P7 句柄ring3读自己镜像": h3log,
         "探针几何与宿主机对账": pblog,
+        "GPT分区表与宿主机对账": gptlog,
         "P7 句柄授错主人必须红": ihlog,
         "split OOM原页原样": soomlog,
         "demand-zero四路有真输家": dzlog,

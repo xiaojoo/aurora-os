@@ -6691,6 +6691,65 @@ boot 栈 64 KiB，用例的合成盘 2 KiB + 一份副本也放得下）。条�
 决策 7 的六条改盘负样本（数组 CRC、头 CRC、`0xEE`→`0x0C`、备份头不一致、
 `first_lba` 改一格**并重算两个 CRC**、`entry_count` 超上界）；
 上界常量与宿主机逐字对账的门禁（决策 4 末条）；`check-matrix-wiring`/`check-verdict` 的新行登记。
-S2a/S2b 与 ADR-078 未决 1–6 全部不变（偏移要不要进句柄身份仍要停下来问）。## 文档一致性（V1.3）
+S2a/S2b 与 ADR-078 未决 1–6 全部不变（偏移要不要进句柄身份仍要停下来问）。## 174. W4 S1 决策 5：`validate_esp.py` 接进判定矩阵（46 → 47 行），新仪器自查 19/19 并抓到我自己一处崩溃（ADR-078 补记二，2026-11-10，实测）
+
+接 §173 的骨架，使用者点"继续写 validate_esp.py 的矩阵行"。产物：`tools/validate_esp.py` 加
+`gpt_facts(d)` 与 `--report` 模式、`tools/aurora.py` 加 `check_gpt(log)` 与新行
+**`GPT分区表与宿主机对账`**（`gpt-probe` 档，期望 PASS/33，内核绿而对不上 ⇒ CONTENT-MISMATCH）、
+rows/logs 两块登记、ADR-078 补记二。**内核侧零改动**（`gpt.rs` 与用例一行没动）。
+
+**接线形状与独立性**：`--report` 只打 `key=value`，从整盘字节独立重算头字段、两个 CRC（各自算一遍）、
+覆盖面、ESP 几何、**备份头**（新增：内核要交叉核它，宿主机不读就没有第二份证词）与它自己发现的问题数。
+它仍**不 import 内核、也不 import `esp_image`**；ESP type GUID 作为**规范常数**自己写一份（混合端序）。
+**原有的人读模式逐字未动**（复跑仍打 GPT 头逐字段/LFN/簇链/长度并退出 0）。
+`--report` 发现问题时**仍退出 0**：问题数本身是一个字段，否则"宿主机发现盘坏了"与"宿主机自己挂了"
+会长成同一个退出码。`check_gpt` 吃的是**同一跑的那块盘**（跑完不 unlink），
+逐格比内核那四行读数（头/表/ESP/未分派）加三行自述判据与点名负样本计数。
+
+**防空转三条 + 覆盖面不信内核自述**：解析不出内核那四行 ⇒ 报红并点名缺哪几行；
+宿主机吐出不到 20 个字段 ⇒ 报"这台仪器自己空转了"；必需字段缺失 ⇒ 先点名再往下比。
+覆盖面那一段用 `esp_image.STATE_START_LBA`/`PKG_START_LBA`（已由 `check-state-window`/`check-sig-anchor`
+与内核对账）与**宿主机自己重算的分区区间**判覆盖，再与内核报的比 ⇒ 内核把常数写错也会红。
+
+**新仪器自查 19/19**（`build/selfcheck_gpt.py`：健康跑 0 红、每类错点名红、还原回 0 红）：
+空串口、只缺 ESP 行、ESP first 报错一格、数组 CRC 报错一格、非空条目数报错、回调次数与宿主机不同、
+状态区 LBA 常数写错、谎报空隙成立、自述判据里有 false、点名负样本 15/16、**分母 0/0（空转）**、
+GUID 端序写反；**改盘两格**：①数组翻一字节（不重算 CRC）②改 ESP `first_lba` **并把两个 CRC 都重算**
+⇒ 宿主机 `problems=0`、一切自洽、只有 `first_lba` 与内核读数对不上 ⇒ 点名红。
+第二格正是 ADR-078 验收第 5 条要的形状（"**对账能分辨**"而不是"解析能拒"），在仪器层先证到了。
+
+**自查抓到并修掉我自己这台仪器的一个缺陷（比接线本身更值得记）**：盘坏到宿主机找不到 ESP 时
+（type GUID 被改一格就没有 `esp_*` 那几行），第一版 `check_gpt` 直接 **`KeyError` 崩掉整张判定表**——
+表现看起来像被测物坏了。修法是必需字段先点名（并带上宿主机自己的成因文本）再往下比。
+⇒ 与 ADR-038 证红第 6 条、`validate_esp.py:34-36` 自己记的那次同族：**新仪器必须先被证一次会咬**；
+只跑健康跑发现不了它，因为健康跑那条路径上字段齐全。
+
+**读数**：`check` **17/17**（含 `check-matrix-wiring` 对新行/logs 的对账、`check-verdict`；
+nofloat 命中 0）。判定矩阵 **46/47 符合、`MATRIX-EXIT=1`**，**不写成全绿**：
+- **新行自己绿**：`GPT分区表与宿主机对账: PASS(rc=33) -> 符合`，用时 5.3s、
+  `gpt-probe/elf 26a7d968691c`、归档 `build/run-046.log`（25 行 `gpt:` 读数），
+  矩阵**没打出任何 `对账:` 红行** ⇒ `check_gpt` 在链里也是 0 红，不只是手工自查绿。
+- **唯一红行与本刀无关，已定向复跑归因**：`FAT32④段内字节改了必须红` 拿到 `HANG(rc=-1)`
+  而期望 `FAIL(35)`，**用时恰好 120.0s = 那一行的墙钟预算**。逐行查成因：用例**红得正确且点名**
+  （`elfdisk: 判据 … 字节同=false … ⇒ false`、`t_fat32_exec -> failed`），红之后串口停在
+  `t_handle_kinds -> ok`（序号 `0x8aa`）、**没走到下一个 `t_vmo_syscalls`**，也没有 `ktests: total=`
+  与退出行 ⇒ **判定级停住，不是判据不成立**。同一份 ELF（`fat32-exec/elf 779d6b753f37`）
+  在**同一张矩阵**第 36 行 pristine 跑里 6.8s 就 PASS（`total=95 passed=95`，归档 `run-049.log`）；
+  **定向复跑那一行**（`run --features fat32-exec --host-fault fault-fat32-exec-byte`，同 ELF、
+  同注入点 `fat32-small 偏移 537190 a7 → 5a`）⇒ **FAIL/35、6.5s、`total=95 passed=93 failed=2`**
+  （两处红正是设计好的 `t_fat32_exec` 与 `t_fat32`），归档另存 `build/s1-rerun-38-serial.log`。
+  ⇒ **不连续复现、不归因到代码**；且本刀的 `gpt.rs`/`ktests/gpt.rs` 由 `cfg(feature="gpt-probe")` 门控，
+  **根本不编译进 `fat32-exec` 档**。停住点（`t_handle_kinds` 之后、`t_vmo_syscalls` 之前）与
+  "用时恰好等于预算"这两条事实记下来供下次撞见时对账，**不拿"宿主负载"当解释**（成因已核清到停住点）。
+  这与 P7 那四跑里 injected fat32 行的判定级 HANG 是同一家族。
+- **退出码来路**：取自日志里显式追加的 `MATRIX-EXIT=1`，**不是后台任务通知里的 exit 0**
+  （那是 shell 的退出码；本仓记过这条坑，本轮又撞见一次形状）。
+- 证人保全：矩阵那一跑的 `run-051.log` 留着；定向复跑写的是 `run-001.log`（`do_run` 会覆盖它），
+  已另存 `build/s1-rerun-38-serial.log`；新行的 `run-046.log` 由矩阵自己编号保留。
+
+**仍开着（S1 未完，ADR-078 状态仍为提议）**：决策 7 的六条改盘负样本**还没做成矩阵行**
+（其中两条已在仪器层由自查证到，但"内核 ELF 逐字相同、由宿主机在跑之前改盘"这条链还没接）；
+决策 4 末条的上界常量逐字对账门禁（`MAX_ENTRIES`/`MAX_ENTRY_BYTES`/`MAX_ARRAY_BYTES` 与宿主机）。
+S2a/S2b 与 ADR-078 未决 1–6 不变（偏移要不要进句柄身份仍要停下来问）。## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

@@ -185,6 +185,10 @@ Q2/Q4 是**下一轮**（验签）的口径，本轮先钉住免得届时临时�
   默认构建与现有 46 行逐字不动，新能力各拿自己那一行。
 - **已核实、不再是待核**：`check-fat32-ports` 的 `taken={0,2}` **只禁止 `FAT_PORTS` 占用口 0/2**
   （`aurora.py:1378`），不禁止新用例读口 0 ⇒ 这条路是通的；`validate_esp.py` 的独立性已证（见 §2.3）。
+- **落地进度（2026-11-10）**：`gpt.rs` + `t_gpt` 已交付（BACKLOG §173，16 道闸各证红一次）；
+  **决策 5 的矩阵行已接上**（§174）：`validate_esp.py --report` + `aurora.py::check_gpt` +
+  新行 `GPT分区表与宿主机对账` ⇒ 判定表 **46 → 47 行**，新行在矩阵里 PASS/33 且 0 对账红。
+  **仍开着**：决策 7 的六条改盘负样本做成矩阵行、决策 4 末条的上界常量对账门禁。
 - **风险**：16 KiB 条目数组 vs 2048 堆上限（硬约束 6）；新档的串口量与 P4（硬约束 7）；
   `unsafe impl Sync` 静态缓冲 ⇒ unsafe 普查从 378 上涨、白名单要登记七项；
   新模块要登记进 `module-interfaces.toml` 的 `source_modules`/exports/`test_targets`
