@@ -1146,6 +1146,13 @@ mod tests {
         // 开时钟让它自己退出；`drain_reap` 要靠 tick 把 reap 叫起来，所以时钟到 drain 之后再停。
         // 用例自足（T0.1 顺序暴露）：释放可能在本窗口之前就已完成，窗口里自然看不到增量。
         let released0 = crate::sched::reap_released();
+        // §198：收尾必须**按原样放回**。旧写法无条件 start→stop，于是本用例把表停给了后面所有用例
+        // （实测：96 个用例边界只有 2 次翻转，open→masked 恰好发生在本用例，之后一路 masked 到
+        // t_sleep_until；而 t_sleep_until 靠探测自愈，偶尔失效就是第二终端的前置条件）。
+        // 本用例**需要**表走（drain_reap 靠 tick），所以照样开；只是收尾时还原来时的样子。
+        let tick_in = crate::apic::ticks();
+        let probe = crate::apic::wait_ticks(tick_in, 1, crate::clock::window_cycles(1));
+        let timer_was_running = probe.ticks >= 1;
         crate::apic::timer_start().ok();
         crate::apic::with_interrupts(|| {
             let t0 = crate::tsc::now();
@@ -1159,7 +1166,9 @@ mod tests {
             }
         });
         let drained = crate::drain_reap() || crate::sched::reap_released() > released0;
-        crate::apic::timer_stop().ok();
+        if !timer_was_running {
+            crate::apic::timer_stop().ok();
+        }
         let state = crate::sched::state_of(t);
         let c = counters();
         let live_after = live();

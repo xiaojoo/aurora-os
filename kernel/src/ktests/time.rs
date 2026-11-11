@@ -18,6 +18,10 @@ fn t_timer_ticks_recur() -> bool {
             return false;
         }
     };
+    // §198：收尾按原样放回（与 t_handle_reap 同一律）。本用例需要表走，所以照样开；
+    // 但旧写法无条件 stop，把表停给了后面所有用例（实测边界日志钉到本用例）。
+    let tick_in = apic::ticks();
+    let timer_was_running = apic::wait_ticks(tick_in, 1, clock::window_cycles(1)).ticks >= 1;
     if apic::timer_start().is_err() {
         crate::log_fatal!("timer test: 打不开定时器中断");
         return false;
@@ -67,7 +71,9 @@ fn t_timer_ticks_recur() -> bool {
     crate::log_info!("timer 游标: 段1={:?}..{:?} 段2={:?}..{:?}（PIT latch 计数，None=出格）",
         mk0, mk1, mk2, mk3);
     let _ = st;
-    apic::timer_stop().ok();
+    if !timer_was_running {
+        apic::timer_stop().ok();
+    }
     let after = apic::counts();
     crate::log_info!(
         "timer: ticks {} -> {} (第一段 {} ticks cycles={} 轮数={} 游标={:?}..{:?}) ; after_cli={} (关IF 空转 {} ticks cycles={} 轮数={}) ; 排空={} (+{} cycles={}) ; second_window={} (第二段 {} ticks cycles={} 轮数={})",
@@ -175,6 +181,10 @@ fn t_no_alloc_in_isr() -> bool {
     };
     let t0 = apic::ticks();
     let tries0 = apic::irq_alloc_tries();
+    // §198：收尾按原样放回（同一律）。本用例需要表走，所以照样开；
+    // 但旧写法无条件 stop，把表停给了后面所有用例（实测边界日志钉到本用例）。
+    let tick_in = apic::ticks();
+    let timer_was_running = apic::wait_ticks(tick_in, 1, clock::window_cycles(1)).ticks >= 1;
     if apic::timer_start().is_err() {
         crate::log_fatal!("isr-alloc test: 打不开定时器中断");
         return false;
@@ -183,7 +193,9 @@ fn t_no_alloc_in_isr() -> bool {
     // 因为判据看的是"ISR 里发生过一次分配尝试没有"，多等只是让变异样本更难对齐。
     let w = apic::wait_ticks(t0, 1, clock::window_cycles(1));
     let _ = st;
-    apic::timer_stop().ok();
+    if !timer_was_running {
+        apic::timer_stop().ok();
+    }
     let tries = apic::irq_alloc_tries() - tries0;
     crate::log_info!(
         "isr-alloc guard: ticks_in_window={} alloc_attempts_in_isr={} (窗口={} cycles 轮数={})",

@@ -8078,6 +8078,62 @@ D 支条件：idle 增量全 0 **且** `IDLE_HLT[0]>0` **且** 按向量中断�
 - 仍开着：第二终端、run-038 那条 shootdown 超时（§183 仍未证）、S4、ADR-080 未决 1–5、ADR-078 未决 2–6。
 - 行尾：`Cargo.toml` CRLF 202、`ktests/sched.rs` CRLF 2091、`BACKLOG.md` CRLF，LF-only/CRCR 全 0。
 
+## 198. 第二终端的前置条件钉到**具体用例**：无条件停表是全套件系统性缺陷；本轮修 3 处，边界诊断因接口门禁撤掉（2026-11-11，实测）
+
+### 一、仪器与"一次跑就钉到"的确定性
+
+在每个用例收尾打一次 PIT 的 RTE（门控 `timer-probe-log`）。**96 个边界只有 2 次翻转**
+⇒ 这是**确定性**现象，**不必撞挂**，一次跑就能钉到"最后是谁屏蔽的"。逐轮（每轮一次跑）：
+
+| 跑 | 状态 | open→masked 发生在 |
+|---|---|---|
+| run-169 | 修前 | **`t_handle_reap`**（此后一路 masked 到 `t_sleep_until`） |
+| run-170 | 修 `t_handle_reap` 后 | 该处 open ✓，冒出 **`t_timer_ticks_recur`** |
+| run-171 | 再修 `time.rs` 两处后 | 两处都 open ✓，又冒出 **`t_elf_load_run`** |
+
+⇒ **打地鼠**：§197 普查列的约 12 处无条件停表是**系统性收尾缺陷**，不是一处 bug。
+本轮修 **3 处**（`handle.rs:1103` 的 `t_handle_reap`、`ktests/time.rs` 的 `t_timer_ticks_recur` 与 isr-alloc），
+**前置条件尚未消除**：`t_sleep_until` 进来仍是 masked（run-174 探测 `rte2=0x10020`、`was_running=false`）。
+
+### 二、修法（不改产品语义）
+
+按既有纪律"**收尾按原样放回**"：先探心跳记 `timer_was_running`，照样开表（用例需要 tick 才能 drain），
+收尾**只在 `!was_running` 时**停。产品路径的 `timer_start`/`timer_stop` 语义一个字没动。
+
+### 三、读数
+
+- 默认 run-173 **PASS/33、ktests 81/81**，elf `a7c5011450b4`；`check` **17/17**。
+- 变体 run-175/176 **FAIL/35**，ktests **96/95/35 与修前逐字相同** ⇒ **无回归**。
+- **run-174 撞到第三个间歇**：EXCEPTION(39)，成因
+  `[fatal] L4 mm: shootdown 超时 va=0xffff800020587000 还差 1 个回执` ⇒ 正是 §183/§192 记的那条，
+  **不是新失败模式**；随后 2 跑都回到 FAIL/35。**本轮时序改动（每处探测烧约 15ms）是否抬高了它的率：未证。**
+
+### 四、**边界诊断撤掉了，理由要记**（不是"忘了留"）
+
+先放 `main.rs` ⇒ `check-module-interfaces` 红（`apic::rte_raw` 被 main 在产品路径上引用）；
+补登记 ⇒ `check-interface-change` 红（改 `module-interfaces.toml` 要先有 ADR）；
+挪到 `ktest.rs` harness ⇒ 仍红，还多一条 `testing → arch` 依赖边。
+**为一条临时诊断去登记产品接口 + 写 ADR 不成比例** ⇒ 撤掉，`ktest.rs` 与 `module-interfaces.toml`
+都逐字节回到原样。它已完成任务（钉到 3 处 culprit）。
+**下一步要再用它，必须放在 `ktests/` 侧**——那一侧的 `rte_raw` 引用门禁是过的
+（`t_sleep_until` 的探测日志就在那儿，本轮保留）。
+
+### 五、我自己这一轮两个错
+
+1. **正则把 `Some((…))` 写成单层括号** ⇒ 96 条读数解析成 **0 条**，差点写成"诊断没生效"。
+   靠 `grep -c` 直接数才发现（**又一次"量具自己错了看起来像被测物坏了"**）。
+2. **`ktest.rs` 是 LF 而我按 CRLF 归一** ⇒ 锚点不命中。这次断言当场拦住，没写坏文件。
+
+### 六、没做 / 仍开着 / 下一步
+
+- 剩余约 **9 处**无条件停表未修；第二终端前置条件**未消除**；
+  "自愈偶尔失效"与"开表后又被屏蔽"仍是二选一、**未证**。
+- 仍开着：第二终端、shootdown 那条（§183）、S4、ADR-080 未决 1–5、ADR-078 未决 2–6。
+- **下一步两条**：①把剩余停表点按同一律逐处修（每处一次跑 + 边界读数验证，仪器要先在 `ktests/` 侧重建）；
+  ②或裁决"改为让 `t_sleep_until` 的自愈无条件可靠"——后者要动 apic/timer 语义（ADR-058/068），**需裁决**。
+- 行尾：`handle.rs` CRLF 1206、`ktests/time.rs` CRLF 239、`ktest.rs` **LF 78（原样）**、
+  `module-interfaces.toml` **LF 840（原样）**、`BACKLOG.md` CRLF，CRCR 全 0。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。
