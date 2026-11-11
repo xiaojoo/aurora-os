@@ -50,11 +50,11 @@ expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe
 # 2026-11-07 P7：hello 加了 syscall3（U1 两处）与 ring3 句柄读/close（U5 三处）。
 
 [unsafe-census]
-total = 378
+total = 380
 U1 = 65
 U2 = 101
 U3 = 13
-U4 = 129
+U4 = 131
 U5 = 34
 U6 = 36
 
@@ -149,8 +149,13 @@ U3 = 4
 
 # T0.1（2026-11-07）：用例搬进 kernel/src/ktests/*.rs，main 只剩启动路径的 3 处 U4；
 # 原 U1 3 / U6 18 按实际落点拆到 ktests/sched 与各用例模块。总数与类别合计不变。
+# W4 S3（2026-11-11，ADR-080）+2：产品路径自己那份签名包缓冲 BootPkgCell
+# （`unsafe impl Sync` + 一次 `&mut *…get()`）。57,856 字节比堆上限 2048 大两个数量级，
+# 按外部输入大小分配第一次就走 handle_alloc_error ⇒ 整机 39（ADR-018/026），所以只能静态。
+# 不复用 ktests/sign.rs 那份：它是 sig-check 门控的，正常构建里不存在。
+# 七项论证写在 main.rs 的 SAFETY 注释里（单一访问者、启动编排只调一次、调用点在 AP 释放之前）。
 [modules."main"]
-U4 = 3
+U4 = 5
 
 [modules."mm"]
 U1 = 5

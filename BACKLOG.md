@@ -7611,6 +7611,193 @@ QMP 端口 44601/44602/44603），合计 **162 行、0 次非预期 HANG**。
 
 **仍开着**：间歇挂本体（**未定位**；§189 的形状是四核 idle、IF=1、IRR 空、崩溃表全零，
 提示它该落 A 或 B 支，但**没有一次真挂死被这台仪器读到过**）、S3/S4、ADR-078 未决 2–6。
+
+## 192. W4 S3 落地：验签**进启动决策**，口径"只检测不拒启"（判定表 54 → 57 行，ADR-080，2026-11-11，实测）
+
+按使用者"跑完后继续后面操作、不要再询问"的授权，猎挂记账之后直接做 S3。
+**启动路径第一次真的验签**：`main.rs` 在 `stage_storage_guard_crash()` 之后、`run_ktests_and_finish()`
+之前插入 `stage_signature_check()`，裸 LBA `PKG_START_LBA=67664` 起按 4096 分块读满
+`PKG_BYTES=57856`（15 次块读），再 `sign::check_package(buf, &sign::PK_ANCHOR)`。
+
+**核心决定：无论成败都继续启动**（ADR-080）。读盘失败也只记录并继续——那是设备/存储问题，
+**不是"这份包不可信"的证据**，两种成因不许共用一个处置（所以也不进安全模式、不动 `boot_guard` 计数）。
+日志显式打 `拒启=false`，**不靠"没看到拒启"推断**（日志缺失会被读成"没拒启"）。
+为什么现在不拒启：手册 M9 自己写着那条依赖 ADR-011 正式方案 + §9.5 槽位身份，而本轮实测
+**`docs/adr/` 里没有 ADR-011 的文件**、生产钥匙保管/轮换/吊销一条都没有 ⇒ 现在启用拒启等于每次启动都拒。
+升级路径写进 ADR-080 决策 8：W5 身份/槽位/ADR-011 → W12 生产钥匙到位后拒启正式生效。
+
+**缓冲这一刀的唯一新 unsafe**：57,856 字节比堆上限 2048 大两个数量级，按外部输入大小分配
+第一次就走 `handle_alloc_error` ⇒ 整机 39（ADR-018/026），所以只能静态。
+**产品路径自己一份 `BootPkgCell`**，不复用 `ktests/sign.rs` 那份（它是 `sig-check` 门控、正常构建里不存在）。
+新增 2 处 U4 ⇒ 普查 **378 → 380**、U4 **129 → 131**，白名单与 `unsafe-census.md` 的汇总行/逐处表同步；
+七项论证写在 SAFETY 里，其中"调用点在 AP 释放之前"**可核**：`smp::bringup` 在 `ktests/mm.rs` 里，晚于本阶段。
+`integration → security` 新依赖边与 5 个 `public_api` 符号（`PKG_START_LBA`/`PK_ANCHOR`/`SECTOR_BYTES`/
+`reason`/`reason_arg`）已登记。
+
+**读数**：`check` **17/17**；正常构建 `run` **PASS/33**、ktests **81/81**、elf `13774cf0fdee`，
+`sign-boot: 验签通过 载荷字节=32672 读盘次数=15 包字节=57856 起始LBA=67664 拒启=false`。
+两条改盘负样本都**按预注册命中**且启动仍成功：改魔数（偏移 34643968 `50→af`）⇒ `理由=BadHeader
+附带=4294967295`、**PASS/33**；改载荷一个字节（偏移 34669072 `02→fd`）⇒ `理由=BitMismatch 附带=1`、
+**PASS/33**。包在裸 LBA 状态区、**不是 GPT** ⇒ 固件不会像 S1 那次把它自愈回去。
+
+**反向守卫（"只检测不拒启"不是修辞的证人）**：把实现改成"被拒就 `exit::boot_invalid`"⇒
+同一注入下判定从 PASS(33) 变 **BOOT-INVALID(37)**（elf `4b960f5db575`）⇒ 矩阵那两行必红。
+改完 `cmp` 与备份逐字节相同。**判据自身证红八道**（喂日志给 `check_sign_boot`）：
+正向整行缺失 / `拒启=true` / `读盘次数=0` / 被拒时 `拒启=true` / 理由与期望不符 /
+`BitMismatch` 丢附带数 / `BadHeader` 却带附带数 ⇒ 各自点名红；三个 pristine 输入 0 红。
+
+**我自己这一轮犯的四个错**：
+1. **注入跨跑污染**：包在引导镜像里，而镜像**不像 GPT 夹具那样每跑重造**。第一版没处理 ⇒
+   第一条注入留下的坏魔数变成第二条的"old"，**两条都报 BadHeader**（第二条明明改的是载荷）。
+   修法两件：①`do_run` 在 `ensure_image` **之前**立 `PKG_DIRTY` 旗强制重造 pristine；
+   ②`apply_pkg_host_fault` 的 `old` 必须与**配方**（`PKG_MAGIC[0]` / `package_payload()[16]`）对得上，
+   不符就报"盘不是 pristine"。**第②条正是抓住这次污染的闸**，与 FAT/GPT 那两套"期望来自配方不来自当前盘"同一条纪律。
+2. **`ensure_image` 里赋值 `PKG_DIRTY` 却没声明 `global`** ⇒ 会 UnboundLocalError（`ast.parse` 抓不到，
+   靠读代码抓出来补上）。
+3. **判据对附带数一律要求"有数"** ⇒ `BadHeader` 本来就没有附带数（`reason_arg` 回 `0xFFFFFFFF`），
+   那条会把正向负样本判红。改成**按拒因分**：`BitMismatch/BadLen/PayloadTooLong/SigBadLen` 必须有数，
+   其余必须没有。两个方向各有变异作证。
+4. **门禁连锁**：新调用让 `check-unsafe`（普查汇总）与 `check-module-interfaces`（依赖边 + public_api）
+   同时红。这两条**不是缺陷而是正当后果**，逐个补齐而不是放宽判据。
+
+**矩阵 run-of-record（补）**：**57 行 55 符合 2 不符合，MATRIX-EXIT=1**（`build/matrix-s3.log`，
+`AURORA_QEMU_QMP=44610`，退出码取自日志显式追加那行）。**S3 自己那三行全绿**，各拿自己那一跑的串口：
+run-054 `sign-boot: 验签通过 载荷字节=32672 读盘次数=15 包字节=57856 起始LBA=67664 拒启=false`（81/81）、
+run-055 `理由=BadHeader 附带=4294967295 … 拒启=false`（81/81）、run-056 `理由=BitMismatch 附带=1`（81/81）。
+两条红**都不归因到 S3**：
+①`第一条协议往返与 pcap 对账` 期望 PASS 实到 **EXCEPTION(39)**（run-038，virtio-net，elf `926c5f89c179`，4.4s），
+串口打出的成因是 `[fatal] 0x000001e9 L4 mm: shootdown 超时 va=0xffff80002059b000 还差 1 个回执（上界 20000000 周期）`，
+紧跟在 `t_kill_blocked_cleans_registrations -> ok` 之后 ⇒ 与 §183 那条"同一根因两个终端"的假设同向，**仍未证**；
+②`P7 句柄授错主人必须红` 期望 FAIL 实到 **CONTENT-MISMATCH(rc=-1)**，就是**撞到的那次间歇挂**
+（run-064，`fat32-exec,fault-handle-owner`，elf `4fec73d95293`，**123.4s / 120s 预算**）⇒ 见 §193。
+**这一跑用的是旧仪器**（11 符号、拿 WORK 当第三支），它对 run-064 给的判定是**错的**，§193 记了重写与证红。
+矩阵之后**内核源码一个字没改**：默认构建重跑 run-065 仍是 PASS/33、ktests 81/81、elf `13774cf0fdee`，
+与矩阵里正常那一档逐字同号 ⇒ 这张 run-of-record 对内核仍然成立，变的只有宿主机仪器。**仍开着**：S4（init 真起 ring3，`MAX_TASKS=9` 零余量要重算）、
+ADR-080 未决 1–5（拒启何时启用、ADR-011 正式方案没有文件、Lamport 重复使用、读包失败要不要独立可见性、
+块大小要不要钉成判据）、间歇挂本体、ADR-078 未决 2–6。
+**不宣称"安全启动"**：验签通过 ≠ 安全启动（AGENTS 硬约束 7），本文只是把检测接进了启动路径。
+## 193. 猎挂**撞到了**：run-064 现场全读回、定位到 `t_vmo_syscalls` 门口；判别表第一版拿 WORK 当轴是**接近空转**，已重写（2026-11-11，实测）
+
+使用者裁决"再跑几张矩阵去撞它"+"跑完后继续后面操作不要再询问"。§191 那三轮 162 行没撞到，
+这一轮在 **S3 的整张矩阵里撞到了**（不是专门猎挂跑出来的，是顺带撞上的，来路写清）。
+**本节零内核改动**：改的全是宿主机仪器 `tools/aurora.py`。
+
+### 一、现场读数（run-064，`fat32-exec,fault-handle-owner`，elf `4fec73d95293`，123.4s / 120s 预算）
+
+留档 27 份在 `build/hunt-caught/`（`run-064.log`/`.stall.txt`、`qmp-hang-run-064.txt`、
+`fatalrec-run-064.bin`、`wedge-064-{1,2}-{00..10}.bin`、`wedge-head-064.bin`）。
+
+- **崩溃表读回全零**：物理 `0x19168350`、8 CPU × 8 字段 = 512 字节，逐槽全零
+  ⇒ **没有任何 CPU 进过致命/崩溃/出口路径**。这是该表第四次在真挂死里读到全零（§189/§190/§191 同向）。
+- **wedge 基址 `0x18f9f000`，锚点自检绿**（镜像头 256 字节与 ELF 第一个 PT_LOAD 逐字相同）。
+- **两次采样（隔 3s）增量**：`IRQ_COUNTS[0]` **+301**、`CPU_TICKS[1..3]` **+297/+298/+298**、
+  `EOIS` **+1196**、`TICK_TSC_LAST` **+9,591,548,450**、`IDLE_HLT[0]` **+301**；
+  `RESCHED`/`RESCHED_IPI_RECV`/`RESCHED_MARKS`/`RESCHED_IPI_FAIL`/`CPU_IF` **全冻结**，`CPU_IF=[1,1,1,1,0,0,0,0]`。
+- **寄存器**（符号化用**重建后 sha 逐字相同**的 ELF）：CPU#0 `sched::idle_entry+0xe6`、
+  CPU#1 `smp::ap_worker+0xd8`、CPU#2/#3 `aurora_ap_main+0x2c9`；**四核 HLT=1 且 IF=1**
+  （RFL `0x203`/`0x202`/`0x246`/`0x246`，IF 是 **bit9=0x200**，§189 那次我先读错成 IF=0 已更正过）。
+- **中断控制器**：CPU0 LVTT `masked periodic vec32 initial=10000000 current=8542259`、ISR/IRR 空、
+  `ICR=0xf2`；ioapic **pin2 未屏蔽** vec32 dest0 ⇒ 与 §189 同形：**路由开着、核在睡、BSP 的 tick 照来**。
+- **串口停在** `[test] 0x00000527 t_handle_kinds -> ok`，无 fatal 收尾、无 total、无退出行。
+
+### 二、定位：停点就是 `t_handle_kinds` → `t_vmo_syscalls` 之间（**这条是证出来的，不是推的**）
+
+同一变体单独重跑（run-066，**FAIL/35**，6.4s，elf 同号）跑完 **95** 条 `[test]`；
+挂死那一跑只有 **64** 条，而 **`run-066` 的前 64 个用例名与 `run-064` 逐字相同**（程序比对，True）
+⇒ 停点夹在 `t_handle_kinds`（最后一条 ok）与 `t_vmo_syscalls`（下一条，`ktests/mm.rs:2509`）之间。
+两跑都带同样的 1 条 `[FAIL] t_fat32_exec` + 2 条句柄泄漏收尾 fatal（`t_fat32_exec`/`t_fat32` 各 1 个句柄没关）
+⇒ 那是**注入本身的后果**，不是挂的成因；单独重跑能跑完就是证人。
+
+`t_vmo_syscalls` 的形状（`mm.rs:2509-2567`）：`init_boot_task` → `start_workers` →（可选标定/`timer_start`）
+→ `spawn(vmo_sys_worker)` → `with_interrupts(|| sched::wait_for_task(g, clock::window_cycles(8)))`
+→ `terminate_task` → 10 条判据。**嫌疑落在 `wait_for_task` 那一段**，但**未证**。
+
+### 三、判别表第一版是**接近空转**的：WORK 不是"任务在跑"
+
+旧表第三支写的是"WORK 涨 ⇒ 有任务在跑，不是整机停住"，run-064 就落在这一支，于是仪器给出
+**"有任务在跑"**——**这个判定是错的**，它把真挂死说成了不挂。核语义才发现：
+
+- 全仓 `WORK[..].fetch_add` **只有两处**：`sched.rs:2290`（`bump_current_work`）与 `ktests/sched.rs`；
+  而 `bump_current_work` 的**唯一调用者**是 `smp.rs:521-529` 的 AP 工人循环（走 hook）。
+  ⇒ **WORK 只数 AP 工人与那几条特定 ktest 工人**，别的用例跑着时它照样冻结。
+- run-064 的原始字节实证：非零增量只有 **槽 10/19/28 各 +149**（= CPU1/2/3 的第 1 号槽，AP 工人），
+  而 `WORK[0]=14069`、`WORK[2]=100727`、`WORK[3]=83739` **冻结**——那是**早先用例留下的残值**。
+  拿它当"有没有任务在跑"的轴，等于拿三个 AP 工人的圈数去回答 BSP 上的 boot 任务在不在跑。
+- 顺带核出 `sched.rs:706` 的 `SWITCHES_FOR` **全仓零写点**（死计数器，不可用）；
+  `FlagRow.switches`（`sched.rs:509-519`）是活的但**按布局取数**，这一刀不碰它。
+
+**改法**：WORK 降级为**只报不判**、标签改成"工人圈数WORK"；判别轴换成
+①两本中断账（`IRQ_COUNTS[0]` 数 BSP 的 PIT、`CPU_TICKS[slot]` 数 AP 的本地定时器，**只看一本会把正常跑读成中断停了**）
+②`IDLE_HLT`（**只在 `idle_entry` 里 `task_wake_tick()` 返回 false 之后、hlt 之前自增**，`sched.rs:1134-1142`
+⇒ 它在涨就等于"每圈都没有可唤醒的等待者"）③**直接读** `TASK_ARMED`/`TASK_WAKE_PENDING`
+④等待队列那本账四格 `TW_REGISTERED`/`TW_SIGNALED`/`TW_TIMEOUTS`/`TW_FULL`
+（单写点逐个核过：登记 `sched.rs:1685`、信号 `:1614`、超时 `:1650`、槽满拒 `:1689`）。
+符号表 **11 → 17**。判别表抽成纯函数 `wedge_verdict(deltas, second, moved)`，预注册五支：
+全冻结⇒A（中断源停了）／有量在涨但两本中断账都没动⇒**不在表里，只留证据不下结论**／
+中断涨而没有 CPU 在 idle⇒有任务占着 CPU／idle 在涨而 armed=0 且待唤醒=0⇒**B1**（停住的任务不在等待槽上）／
+有 armed/待唤醒而窗内零超时⇒**B2**（期限没到 or 超时路径没跑，**本仪器不读期限值，今天分不开**）／
+超时在发生而仍不推进⇒**B3**（唤醒/换人那一侧）。
+
+### 四、回放实测的**边界**（不夸大）
+
+留档的 `wedge-064-*.bin` 是**旧 11 符号**表抓的，拿它回放新判别表：
+前三轴算出 `irq_moved=True`、`idle_moved=True` ⇒ **落在 B 支入口**，然后函数要读 `armed等待者` 而那一跑没读它
+⇒ **回放就停在这里**。**B1/B2/B3 对 run-064 那一次仍是未测**。
+（间接推断留档：`IDLE_HLT[0]` 按 tick 速率在涨 ⇒ `task_wake_tick()` 每圈都返回 false；
+而 `window_cycles(8)` ≈ 4.0e8 周期 ≈ **0.125s**（`clock.rs:22-53`，按实测 ~3.2GHz），**比 3s 采样窗短约 24 倍**
+⇒ 领头形状是 `TASK_ARMED==0 && TASK_WAKE_PENDING==0`，即 B1。**这是推断不是测量**，
+因为那两个计数器是抓到之后才加进表的。）
+
+### 五、仪器判别力第一次被证：**三种不同判定**（以前真挂死与 fault-if-carriage 撞在同一支）
+
+| 跑 | 变体 / elf | 用时 | 新表判定 |
+|---|---|---|---|
+| run-067 | `fatal-record-stall` / `c07f142fbc0d` | 48.4s | **A 全冻结** |
+| run-068 | `irq-sticky-pxis` / `af1aad402e36` | 43.4s | 中断在涨而**没有 CPU 在 idle**（`IRQ_COUNTS[1]` **+529088**，idle 冻结） |
+| run-069 | `fault-if-carriage` / `829bc4f2fc6f` | 43.4s | 同上（AP tick **+307/+311/+310**，`IRQ_COUNTS` 冻结，`WORK[2]` **+2764601**，idle 冻结） |
+| run-064 | 真挂死 / `4fec73d95293` | 123.4s | **B 支入口**（回放只定到这里） |
+
+run-068/069 那两支**不再与真挂死同判**，这正是重写买到的东西。
+
+### 六、门禁那一格**自己空转**（量具的又一次自错，形状与 §181/§190 同族）
+
+新加的一格"wedge_verdict 不许再拿 WORK 当判别轴"，变异插进去 **`check` 照样绿、点名=False**。
+成因：`vs.find("def wedge_verdict(")` 命中的**第一处是门禁自己那行字面量**（`aurora.py:1673`），
+不是 2430 行的真函数 ⇒ 切出来的 `vbody` 只有 **30 个字符**（`def wedge_verdict("):vs.find("`），
+判据永远不咬。**修法两件**：①按**行首**正则找定义（`re.search(r"^def wedge_verdict\(", vs, re.M)`）；
+②加**反空转格**：切片里必须真有 `irq_moved` 与 `return`，否则报"切不出函数体 ⇒ 这一格是空转的"。
+**两道变异各自点名红**（插 WORK 注释 ⇒ 红；把正则改成找不到的名字 ⇒ 反空转格红），改完逐字节 sha 还原。
+
+### 七、我自己的错（这一轮五个）
+
+1. **判别轴没核语义就写**（WORK）——与 §181 空转判据、§190 RESCHED 同族，**第三次**。
+   纪律固化：**写任何"X 涨 ⇒ Y"之前，先 grep 出 X 的全部写点并读它们的上下文**。
+2. **门禁切片命中自身字面量**（上一节）⇒ 文本切片类判据**必须自带反空转格**。
+3. **`RUN_SEQ` 是每进程从 0 起数** ⇒ 证红那一跑写了 `run-001.log`，**覆盖掉矩阵正向那一跑的串口留档**
+   （只能从 `matrix-s3.log` 里内嵌的串口找回）。改成 `_run_seq_start()` 扫 `build/run-*.log` 接着数，
+   并加门禁格盯它；之后几跑实测是 065/066/067/068/069，**没再撞号**。
+4. **新加的打印行写了 `b_['armed等待者']`**（`b_` 是循环里的临时列表）⇒ 真挂死那一刻会 TypeError，
+   **正好在取证时崩**。读代码抓出来的，`check` 抓不到。
+5. **抽纯函数时丢了缩进与 `return`**：`ast.parse` **过了**（去缩进的块变成模块级代码），
+   靠"函数体必须以 Return 结尾"这条断言抓出来。另：heredoc 里 `
+` 变成真换行 ⇒ SyntaxError；
+   以及**又一次**拿 `
+` 锚点去改 CRLF 文件（本会话第四次）⇒ 一律按字节改。
+
+### 八、读数与纪律
+
+- `check` **17/17**（每次改动后都跑）；新格全部折进 `check-fat32-ports`，**没开第 18 道**。
+- 默认构建 run-065 **PASS/33、ktests 81/81、elf `13774cf0fdee`**，与矩阵正常那一档同号
+  ⇒ **矩阵之后内核零改动**，§192 那张 run-of-record 对内核仍成立。
+- 矩阵 **57 行 55 符合 2 不符合 MATRIX-EXIT=1**（读数与归因见 §192 末尾）。
+- 行尾：`BACKLOG.md` CRLF、`tools/aurora.py` **CRLF 7463 / LF-only 0 / CRCR 0**；diff 无行尾膨胀。
+- **没做**：没修间歇挂本体（只定位与换仪器）、没读期限值（B2 那两支今天分不开）、
+  没实现 `TASK_ARMED` 的历史留档回放（旧样本里没有那六个符号）、S4 未开工。
+- **仍开着**：间歇挂本体（**已定位到 `t_vmo_syscalls` 门口、形状收窄到 B 支**，B1/B2/B3 未测）、
+  run-038 那条 shootdown 超时（§183 的"同一根因两个终端"仍未证）、S4、ADR-080 未决 1–5、ADR-078 未决 2–6。
+- **下一步要撞的是 B1**：再跑矩阵时仪器已会直接读 armed/待唤醒/等待账，
+  撞到就能把"不在等待槽上"与"期限没到"分开；**不预设它一定是 B1**。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

@@ -220,6 +220,7 @@ extern "C" fn after_switch(_: usize) -> ! {
     stage_acpi_and_pci();
     stage_fault_injections();
     stage_storage_guard_crash();
+    stage_signature_check();
     run_ktests_and_finish()
 }
 
@@ -442,6 +443,65 @@ fn stage_storage_guard_crash() {
     boot_guard::decide();
     // §9.7 的另一半：上一条崩溃在存储就绪之后才读得回来，所以它一定在串口现场之后。
     crash::report_previous();
+}
+
+/// 签名包的缓冲（`sign::PKG_BYTES` = 57,856 字节）比分配器上限（2048）大两个数量级，
+/// 理由与 `ktests/sign.rs` 的 `PkgScratch`、`ktests/elf.rs` 的 `ElfScratch` 同一条：
+/// 按外部输入大小去分配，第一次就走 `handle_alloc_error` ⇒ 整机 39（ADR-018/026）。
+/// **产品路径自己一份**，不复用用例那份——那份是 `sig-check` 门控的，正常构建里根本不存在。
+struct BootPkgCell(UnsafeCell<[u8; sign::PKG_BYTES]>);
+// SAFETY: 指针来源 = 本 static 自己的 UnsafeCell，不是外部传进来的地址；
+//         地址范围 = 这一个数组，可变借用只在 `stage_signature_check` 一次调用内活着、不外泄；
+//         对齐 = [u8; N] 对齐 1，任何切片访问都合法；生命周期 = 整个内核（static，永不释放）；
+//         并发规则 = **单一访问者**：全内核只有 `stage_signature_check` 引用它，而启动编排只调一次；
+//         上下文约束 = BOOT，且调用点在 AP 释放之前（`smp::bringup` 在 ktests/mm.rs 里，晚于本阶段）；
+//         不变量由"启动编排的顺序 + 只此一处引用"保证，两者都能用 grep 与 after_switch 的顺序核。
+unsafe impl Sync for BootPkgCell {}
+static BOOT_PKG_BUF: BootPkgCell = BootPkgCell(UnsafeCell::new([0u8; sign::PKG_BYTES]));
+
+/// Stage3c（W4 S3，ADR-080）：验签**进启动决策**，但口径是**只检测、不拒启**。
+///
+/// 为什么现在只检测：拒启（"验不过 ⇒ BOOT-INVALID(37)"）要等装载侧身份 + A/B 槽位 +
+/// ADR-011 正式方案 + 生产钥匙的保管/轮换/吊销（手册 M9 行自己写着这条依赖）。
+/// 在那些都没有之前启用拒启，等于每次启动都拒。所以这一阶段**无论验签成败都继续启动**，
+/// 把结果与拒因写进日志与读数；`拒启=false` 是显式打出来的，不是靠"没看到拒启"推断。
+/// 读失败也只记录：那是设备/存储的问题，不是"这份包不可信"的证据，两者不许混成一个结论。
+fn stage_signature_check() {
+    const CHUNK: usize = 4096;
+    let port = match ahci::boot_port() {
+        Ok(p) => p,
+        Err(e) => {
+            crate::log_warn!("sign-boot: 找不到引导口 {:?} ⇒ 验签没跑 拒启=false（ADR-080）", e);
+            return;
+        }
+    };
+    // SAFETY: 见 BootPkgCell —— 单一访问者、启动编排只调一次、借用不出本次调用
+    let buf = unsafe { &mut *BOOT_PKG_BUF.0.get() };
+    let mut off = 0usize;
+    let mut reads = 0usize;
+    while off < sign::PKG_BYTES {
+        let n = CHUNK.min(sign::PKG_BYTES - off);
+        let lba = sign::PKG_START_LBA + (off / sign::SECTOR_BYTES) as u64;
+        if let Err(e) = ahci::read_bytes(port, lba, &mut buf[off..off + n]) {
+            crate::log_warn!(
+                "sign-boot: 读包失败 lba={} 长={} 第{}次 {:?} ⇒ 验签没跑完 拒启=false（ADR-080）",
+                lba, n, reads, e
+            );
+            return;
+        }
+        off += n;
+        reads += 1;
+    }
+    match sign::check_package(buf, &sign::PK_ANCHOR) {
+        Ok(n) => crate::log_info!(
+            "sign-boot: 验签通过 载荷字节={} 读盘次数={} 包字节={} 起始LBA={} 拒启=false",
+            n, reads, sign::PKG_BYTES, sign::PKG_START_LBA
+        ),
+        Err(e) => crate::log_warn!(
+            "sign-boot: 验签被拒 理由={} 附带={} 读盘次数={} 包字节={} 起始LBA={} 拒启=false（ADR-080：只检测不拒启）",
+            sign::reason(e), sign::reason_arg(e), reads, sign::PKG_BYTES, sign::PKG_START_LBA
+        ),
+    }
 }
 
 /// Stage4：跑 .ktests、报 P1–P5/P4 读数并交付退出码。

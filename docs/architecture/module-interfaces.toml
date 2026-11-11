@@ -619,8 +619,13 @@ public_api = [
   "sign::PKG_PAYLOAD_BYTES",
   "sign::check_package",
   "sign::digest",
+  "sign::PKG_START_LBA",
+  "sign::PK_ANCHOR",
+  "sign::SECTOR_BYTES",
+  "sign::reason",
+  "sign::reason_arg",
 ]
-allowed_callers = []
+allowed_callers = ["integration"]
 dependencies = []
 forbidden_dependencies = []
 known_violations = []
@@ -765,7 +770,7 @@ public_api = [
   "main::mp_snapshot",
 ]
 allowed_callers = []
-dependencies = ["arch", "boot", "capability", "diagnostics", "driver", "irq", "memory", "pci", "sched", "storage", "sync", "testing", "time"]
+dependencies = ["arch", "boot", "capability", "diagnostics", "driver", "irq", "memory", "pci", "security", "sched", "storage", "sync", "testing", "time"]
 forbidden_dependencies = []
 known_violations = []
 context = ["BOOT", "KERNEL"]

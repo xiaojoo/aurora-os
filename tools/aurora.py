@@ -1657,6 +1657,47 @@ def check_wedge_probe() -> list[str]:
             bad.append(f"wedge 符号 {label}：类型是 {ty}，宽度推不出来 ⇒ 不许猜")
         elif want != width:
             bad.append(f"wedge 符号 {label}：类型 {ty} 该按 {want} 字节解，仪器写的是 {width}")
+    # 判别轴的语义前提必须机器核。这几条都是 §193 踩出来的：
+    # ①`IDLE_HLT` 只有在 `task_wake_tick()` 返回 false 之后才自增，判别表才敢拿它当
+    #   "每圈都没有可唤醒的等待者"。顺序反了这条判据就整个翻面。
+    # ②`WORK` 只被 AP 工人循环与 ktests/sched.rs 那几条工人自增 ⇒ 它不是"任务在跑"，
+    #   判别表里不许出现它（第一版就是拿它当第三支，把真挂死判成了"有任务在跑"）。
+    sched_src = (ROOT / "kernel" / "src" / "sched.rs").read_text(encoding="utf-8")
+    idle = sched_src[sched_src.find("fn idle_entry()"):]
+    idle = idle[:idle.find("\n}")]
+    guard = idle.find("if task_wake_tick()")
+    bump = idle.find("IDLE_HLT[cpu].fetch_add")
+    if guard < 0 or bump < 0 or guard > bump:
+        bad.append("idle_entry 里 task_wake_tick 的闸不在 IDLE_HLT 自增之前 ⇒ wedge 拿 idle_hlt 当判据的前提不成立")
+    vs = (ROOT / "tools" / "aurora.py").read_text(encoding="utf-8")
+    # 必须按**行首**找定义：本函数自己那行就写着这两个字面量，用 find 会命中门禁自身
+    # ⇒ 切出 30 个字符的空片，判据永远不咬（§193 实测：变异插进去 check 照样绿）。
+    mv = re.search(r"^def wedge_verdict\(", vs, re.M)
+    mp = re.search(r"^def wedge_probe\(", vs, re.M)
+    vbody = vs[mv.start():mp.start()] if mv and mp and mp.start() > mv.start() else ""
+    # 反空转：切片里必须真有函数体，否则这一格是"看着在核其实没核"。
+    if "irq_moved" not in vbody or "return" not in vbody:
+        bad.append("切不出 wedge_verdict 的函数体 ⇒ WORK 那条判据是空转的（切片命中了门禁自身的字面量？）")
+    elif "工人圈数WORK" in vbody:
+        bad.append("wedge_verdict 又拿 WORK 当判别轴 ⇒ 它只数 AP 工人与几条 ktest 工人，接近空转（§193）")
+    paths = sorted(str(f.relative_to(ROOT)).replace("\\", "/")
+                   for f in (ROOT / "kernel" / "src").rglob("*.rs")
+                   if re.search(r"WORK\[[^\]]*\]\.fetch_add", f.read_text(encoding="utf-8", errors="replace")))
+    want = ["kernel/src/ktests/sched.rs", "kernel/src/sched.rs"]
+    if paths != want:
+        bad.append(f"WORK 的直接自增点不再是那两处（现在={paths}）⇒ 它的语义变了，wedge 的只报不判要重核")
+    # AP 工人走 hook 不直接写 WORK ⇒ 那一支要单独核，否则这个普查是假的
+    smp = (ROOT / "kernel" / "src" / "arch" / "x86_64" / "smp.rs").read_text(encoding="utf-8")
+    if "bump_current_work)()" not in smp:
+        bad.append("smp.rs 里找不到 bump_current_work 的 hook 调用 ⇒ WORK 的语义普查漏了 AP 工人那一支")
+    # 留档序号必须跨进程接着数：撞号会**覆盖**上一跑的串口与现场（§193 实测丢过一次）。
+    src_all = (ROOT / "tools" / "aurora.py").read_text(encoding="utf-8")
+    if not re.search(r"RUN_SEQ = _run_seq_start\(\)", src_all):
+        bad.append("RUN_SEQ 不再从已有留档接着数 ⇒ 单独跑一次 run 就会覆盖矩阵同号那一跑的现场")
+    labels = {label for _s, label, _w in WEDGE_SYMBOLS}
+    for need in ("armed等待者", "待唤醒发布", "等待登记过", "等待被信号", "等待超时过", "等待槽满拒"):
+        if need not in labels:
+            bad.append(f"wedge 符号表里没有 {need} ⇒ 取证末尾那行会 KeyError，正好在挂死那一刻崩")
     return bad
 
 
@@ -1961,6 +2002,7 @@ def ensure_image(features: list[str]) -> None:
     任一条不成立就重造镜像。
     """
     import hashlib as _hl
+    global PKG_DIRTY
     elf = kernel_binary(features)
     info = BUILD / "image-info.txt"
     want_variant = ",".join(features) if features else "normal"
@@ -1972,8 +2014,14 @@ def ensure_image(features: list[str]) -> None:
             if "=" in line
         )
         fresh = rec.get("variant") == want_variant and rec.get("elf_sha256") == _hl.sha256(elf.read_bytes()).hexdigest()
+    # 改包注入的寿命必须是一跑：包在引导镜像里，而镜像**不像 GPT 夹具那样每跑重造**。
+    # 不强制重造的话下一跑会复用改过的盘 ⇒ 第二条注入读到的是第一条留下的坏魔数，
+    # 两条都报 BadHeader，而第二条明明改的是载荷（**实测撞过这个形状**）。
+    if PKG_DIRTY:
+        fresh = False
     if not fresh:
         do_image(features)
+        PKG_DIRTY = False
 
 
 def force_boot_state(failed: int, seq: int = 200) -> None:
@@ -1995,8 +2043,20 @@ def force_boot_state(failed: int, seq: int = 200) -> None:
     IMAGE.write_bytes(bytes(img))
 
 
-# 每一跑的留档序号（见 do_run 里的 run-NNN.log）
-RUN_SEQ = 0
+# 每一跑的留档序号（见 do_run 里的 run-NNN.log）。
+# **跨进程必须接着数**：原来是进程内从 0 起，于是每次单独 `run` 都写 run-001.log，
+# 把上一张矩阵同号那一跑的留档覆盖掉（§193 实测丢了一次）。取证文件名跟着这个号走，
+# 号一撞现场也跟着撞——而"引数必须连时间/变体一起引"那条纪律只能事后补救，不能防覆盖。
+def _run_seq_start() -> int:
+    n = 0
+    for f in BUILD.glob("run-*.log"):
+        m = re.fullmatch(r"run-(\d+)\.log", f.name)
+        if m:
+            n = max(n, int(m.group(1)))
+    return n
+
+
+RUN_SEQ = _run_seq_start()
 
 
 def qmp_snapshot(port: int, cmds: list[str]) -> str:
@@ -2308,7 +2368,21 @@ WEDGE_SYMBOLS = [
     (("arch", "x86_64", "apic", "TICK_TSC_LAST"), "最后一拍TSC", 8),
     (("arch", "x86_64", "apic", "CPU_IF"), "每CPU_IF牌", 1),
     (("sched", "IDLE_HLT"), "idle_hlt", 8),
-    (("sched", "WORK"), "每任务工作量", 8),
+    # **WORK 不是"任务在跑"的计数**（§193 核出来的）：全仓只有 smp.rs 的 AP 工人循环
+    # 与 ktests/sched.rs 那几条特定工人自增它。别的用例跑着时它照样冻结 ⇒
+    # 拿它当判别轴接近空转。所以只报不判，标签也写明它的真实语义。
+    (("sched", "WORK"), "工人圈数WORK", 8),
+    # 这两个是"有没有 armed 的等待期限"的**直接读数**。第一版靠 idle_hlt 在涨去**推断**
+    # task_wake_tick() 返回 false，那是间接证据；抓到真挂死之后改成直接读（§193）。
+    (("sched", "TASK_ARMED"), "armed等待者", 8),
+    (("sched", "TASK_WAKE_PENDING"), "待唤醒发布", 8),
+    # 等待队列那本账（四个都是单写点的 AtomicU64，语义逐个核过）：
+    # 登记 sched.rs:1685 / 信号 :1614 / 超时 :1650 / 槽满拒 :1689。
+    # 它们直接回答"阻塞的任务到底有没有挂在等待槽上"，比 WORK 硬得多。
+    (("sched", "TW_REGISTERED"), "等待登记过", 8),
+    (("sched", "TW_SIGNALED"), "等待被信号", 8),
+    (("sched", "TW_TIMEOUTS"), "等待超时过", 8),
+    (("sched", "TW_FULL"), "等待槽满拒", 8),
 ]
 
 
@@ -2358,6 +2432,45 @@ class QmpSession:
             self.f.close()
         finally:
             self.s.close()
+
+
+def wedge_verdict(deltas: dict, second: dict, moved: list) -> str:
+    """预注册判别表：两次采样的增量 + 第二次绝对值 ⇒ 一句话结论。
+
+    抽成纯函数是为了能**拿留档的真挂死样本回放**（§193）：间歇挂约 1% 每行，
+    靠再撞一次来证新分支会咬太贵。回放实测的边界要写清：build/hunt-caught/wedge-064-*.bin
+    是**旧 11 符号**表抓的，回放到 B 支入口就停（armed/待唤醒/等待账那六个符号那一跑没读）
+    ⇒ 它只能证前三轴把真挂死判进 B 支，**B1/B2/B3 对那一次仍是未测**。
+
+    **判别轴的选择是核过语义的**（§193 的教训）：
+    * `IRQ_COUNTS[0]` 数 BSP 的 PIT（经 I/O APIC），`CPU_TICKS[slot]` 数 AP 的本地定时器
+      ⇒ "中断来了"必须两本都看，只看一本会把正常跑读成中断停了。
+    * `IDLE_HLT[cpu]` 只在 `idle_entry` 里 `task_wake_tick()` 返回 false 之后、hlt 之前自增
+      （sched.rs:1134-1142）⇒ 它在涨就等于"每圈都没有可唤醒的等待者"。
+    * `WORK` **不是**"任务在跑"：全仓只有 AP 工人循环与 ktests/sched.rs 那几条工人自增它
+      ⇒ 只报不判。第一版拿它当第三支的判据，把真挂死判成了"有任务在跑"。
+    """
+    irq_moved = any(deltas["按向量中断"]) or any(deltas["每CPU本地tick"])
+    idle_moved = any(deltas["idle_hlt"])
+    armed = second["armed等待者"][0]
+    pending = second["待唤醒发布"][0]
+    to_moved = any(deltas["等待超时过"])
+    if not moved:
+        return "两次采样**全冻结** ⇒ 中断根本没来（假设 A：中断源停了）"
+    if not irq_moved:
+        return ("有量在涨但**两本中断账都没动** ⇒ 不是 tick 驱动的推进"
+                "（形状不在预注册表里，只留证据不下结论）")
+    if not idle_moved:
+        return ("中断在涨而**没有任何 CPU 在 idle** ⇒ 有任务占着 CPU（在跑或在关中断自旋）"
+                "⇒ 不是整机停住，要看串口停在哪条用例")
+    if armed == 0 and pending == 0:
+        return ("中断在涨、CPU 在 idle、**没有 armed 等待者也没有待唤醒** ⇒ 停住的任务不在等待槽上"
+                "（假设 B1：没有期限也没有信号目标会叫醒它——Blocked 而没登记，或根本不 Blocked）")
+    if not to_moved:
+        return (f"有 armed/待唤醒（{armed}/{pending}）而采样窗内**零超时** ⇒ 期限还没到，或超时路径没在跑"
+                "（假设 B2：本仪器不读期限值，这两者今天分不开）")
+    return ("超时在发生而用例仍不推进 ⇒ 期限到了却没换成进展"
+            "（假设 B3：唤醒/换人那一侧，要看 wake_task 与 pick_next）")
 
 
 def wedge_probe(port: int, log: str, elf: Path, build_dir: Path, seq: int) -> str:
@@ -2436,23 +2549,16 @@ def wedge_probe(port: int, log: str, elf: Path, build_dir: Path, seq: int) -> st
             moved.append(label)
         out.append(f"  {label:16s} {tag}  一次={va_ if n <= 16 else str(va_[:8]) + '…'}"
                    f"  增量={delta if n <= 16 else str(delta[:8]) + '…'}")
-    # "中断来了"两本都看：PIT 走 IRQ_COUNTS[0]，AP 本地定时器走 CPU_TICKS（语义见上面注释）
-    irq_moved = any(deltas["按向量中断"])
-    apict_moved = any(deltas["每CPU本地tick"])
-    idle_moved = any(deltas["idle_hlt"])
-    work_moved = any(deltas["每任务工作量"])
-    if not moved:
-        verdict = "两次采样**全冻结** ⇒ 中断根本没来（假设 A：中断源停了）"
-    elif (irq_moved or apict_moved or idle_moved) and not work_moved:
-        verdict = ("中断计数（任一向量）/本地 tick/idle 在涨而**没有任何任务在跑** ⇒ 中断来了但没人被调度"
-                   "（假设 B：丢唤醒 / 任务 blocked）")
-    elif work_moved:
-        verdict = "有任务在跑 ⇒ 这不是整机停住，是**某一格在等一个不来的东西**（要看串口停在哪条用例）"
-    else:
-        verdict = "形状不在预注册判别表里 ⇒ 只留证据，不下结论"
+    verdict = wedge_verdict(deltas, b, moved)
     out.append(f"  参考数（只报不判：marks 含自陷，不能拿它与 recv 的差当丢唤醒）"
                f" resched合计={b['resched合计'][0]} IPI取走={b['resched_IPI取走'][0]}"
                f" IPI发失败={b['resched_IPI发失败'][0]} 每CPU标记={b['每CPU重排标记']}")
+    out.append(f"  armed等待者={b['armed等待者'][0]} 待唤醒发布={b['待唤醒发布'][0]}"
+               "（两个都 0 ⇒ 没有 armed 期限，blocked 的任务不会被超时唤醒）")
+    out.append(f"  等待队列账（登记/信号/超时/槽满拒）="
+               f"{b['等待登记过'][0]}/{b['等待被信号'][0]}/{b['等待超时过'][0]}/{b['等待槽满拒'][0]}"
+               f"  增量={deltas['等待登记过'][0]}/{deltas['等待被信号'][0]}"
+               f"/{deltas['等待超时过'][0]}/{deltas['等待槽满拒'][0]}")
     out.append("wedge 判定: " + verdict)
     return "\n".join(out)
 
@@ -2481,13 +2587,18 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
         sys.exit(f"QEMU 未就位：{QEMU}")
     # 宿主机侧注入不是特性（见 FAT_HOST_FAULTS 那一段）：它改盘，不改构建。
     # 两道前置闸都在这里，因为"改了盘却没人读它"与"注入名写错了"都表现为一跑看不出成因的红。
-    if host_fault and host_fault not in FAT_HOST_FAULTS and host_fault not in GPT_HOST_FAULTS:
+    if host_fault and host_fault not in FAT_HOST_FAULTS and host_fault not in GPT_HOST_FAULTS and host_fault not in PKG_HOST_FAULTS:
         sys.exit(f"不认识的宿主机侧注入：{host_fault}"
-                 f"（有的那些：{sorted([*FAT_HOST_FAULTS, *GPT_HOST_FAULTS])}）")
+                 f"（有的那些：{sorted([*FAT_HOST_FAULTS, *GPT_HOST_FAULTS, *PKG_HOST_FAULTS])}）")
     if host_fault in FAT_HOST_FAULTS and not (FAT_DISK_FEATURES & set(features)):
         sys.exit(f"{host_fault} 改的是 FAT32 卷，这一跑却没带任何挂盘的特性 ⇒ 改了也没人读")
     if host_fault in GPT_HOST_FAULTS and not (GPT_FEATURES & set(features)):
         sys.exit(f"{host_fault} 改的是 GPT 夹具盘，这一跑却没带 gpt-probe ⇒ 改了也没人读")
+    # 改包注入必须从**pristine**镜像出发：先立脏旗让 ensure_image 重造，再改。
+    # 否则上一跑留下的翻转会变成这一跑的"old"，两条注入互相顶掉（实测撞过）。
+    if host_fault in PKG_HOST_FAULTS:
+        global PKG_DIRTY
+        PKG_DIRTY = True
     ensure_image(features)
     if SCRATCH_FEATURES & set(features):
         # 第二块盘每次重造：写方向那条判据（写完前后的哈希必须不同）要求目标区
@@ -2525,6 +2636,12 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
             bad = apply_gpt_host_fault(host_fault)
             if bad:
                 sys.exit("GPT 宿主机侧注入不成立：" + " / ".join(bad))
+    # 改包注入（W4 S3）：包在引导镜像的裸 LBA 上，所以它跟着 ensure_image 走、与挂盘特性无关。
+    # 必须在镜像造好之后改，且**不重算任何校验**——拒因要来自签名/形状检查本身。
+    if host_fault in PKG_HOST_FAULTS:
+        bad = apply_pkg_host_fault(host_fault)
+        if bad:
+            sys.exit("改包宿主机侧注入不成立：" + " / ".join(bad))
     SERIAL_LOG.unlink(missing_ok=True)
     code, tpl = ovmf_files()
     # vars 每次从模板重拷：上一次运行写入的 NVRAM 启动项不该影响本次判定（可复现）
@@ -5938,6 +6055,123 @@ def _gpt_seal(b: bytearray, off: int) -> None:
     struct.pack_into("<I", b, off + 16, binascii.crc32(bytes(b[off:off + 92])) & 0xFFFFFFFF)
 
 
+def check_sign_boot(log: str, want_ok: bool, want_reason: str = "") -> list[str]:
+    """启动路径验签那一行的判据（W4 S3，ADR-080）。
+
+    三件事都要在：①那一行存在且前缀对；②通过/被拒与期望一致，被拒时**理由与附带都要点名**；
+    ③`拒启=false` 显式在行里。**第③条是"只检测不拒启"这个决定的证人**：
+    若实现偷偷拒启，判定值会从 PASS 变成 BOOT-INVALID，那一行矩阵自己就红了；
+    而"日志里没写拒启"不算证据（日志缺失会被读成"没拒启"），所以要求它显式打出来。
+    """
+    bad: list[str] = []
+    if want_ok:
+        m = re.search(r"sign-boot: 验签通过 载荷字节=(\d+) 读盘次数=(\d+) 包字节=(\d+) "
+                      r"起始LBA=(\d+) 拒启=(true|false)", log)
+        if m is None:
+            return ["启动日志里没有 `sign-boot: 验签通过 … 拒启=…` 那一行 ⇒ 验签没进启动路径"]
+        if m.group(5) != "false":
+            bad.append(f"sign-boot 拒启={m.group(5)}（ADR-080 决定只检测不拒启）")
+        if int(m.group(2)) < 1:
+            bad.append(f"sign-boot 读盘次数={m.group(2)} ⇒ 没真读盘")
+        return bad
+    m = re.search(r"sign-boot: 验签被拒 理由=(\w+) 附带=(\d+) 读盘次数=(\d+) 包字节=(\d+) "
+                  r"起始LBA=(\d+) 拒启=(true|false)", log)
+    if m is None:
+        return ["改盘之后启动日志里没有 `sign-boot: 验签被拒 理由=… 附带=…` 那一行 ⇒ 注入没咬到或没点名"]
+    if m.group(1) != want_reason:
+        bad.append(f"sign-boot 理由={m.group(1)}，期望 {want_reason}")
+    if m.group(6) != "false":
+        bad.append(f"sign-boot 拒启={m.group(6)}（ADR-080：被拒也必须继续启动）")
+    # 附带数**按拒因分**：BadHeader 本来就没有附带数（`reason_arg` 回 0xFFFFFFFF），
+    # 而 BitMismatch/BadLen/PayloadTooLong 必须带一个。一律要求"有数"会把 BadHeader 判红，
+    # 一律不要求又会让 BitMismatch 丢掉它唯一能定位到第几位的证据（第一版就写错成前者）。
+    carries_arg = want_reason in ("BitMismatch", "BadLen", "PayloadTooLong", "SigBadLen")
+    if carries_arg and m.group(2) == "4294967295":
+        bad.append(f"sign-boot 理由={m.group(1)} 本该带一个附带数，却是 0xFFFFFFFF")
+    if not carries_arg and m.group(2) != "4294967295":
+        bad.append(f"sign-boot 理由={m.group(1)} 不该有附带数，却打了 {m.group(2)}")
+    return bad
+
+
+# 宿主机侧改包注入（W4 S3）。包在**裸 LBA 状态区**、不是 GPT ⇒ 固件不会像 S1 那次把它自愈回去。
+# 期望拒因**预注册**在这里：改魔数 ⇒ BadHeader；改载荷一个字节 ⇒ 摘要变 ⇒ BitMismatch。
+PKG_HOST_FAULTS = {"fault-pkg-header": "BadHeader", "fault-pkg-payload": "BitMismatch"}
+# 注入前的那个字节（给证人核"盘真被改了"）。寿命是一跑，与 GPT 那套同规矩。
+PKG_PRISTINE: dict[str, tuple[int, int]] = {}
+# 上一跑改过包 ⇒ 下一跑 ensure_image 必须重造镜像（否则注入会跨跑污染，见那里的注释）。
+PKG_DIRTY = False
+
+
+def pkg_host_fault_plan(kind: str) -> tuple[int, str]:
+    """返回（整盘镜像里的字节偏移, 期望拒因）。偏移由 esp_image 的常量算，不手写魔数。"""
+    if kind not in PKG_HOST_FAULTS:
+        raise ValueError(f"不认识的改包注入：kind={kind}")
+    sys.path.insert(0, str(ROOT / "tools"))
+    import esp_image  # noqa: E402
+    base = esp_image.PKG_START_LBA * esp_image.SECTOR
+    off = base if kind == "fault-pkg-header" else base + esp_image.PAY_OFF + 16
+    return off, PKG_HOST_FAULTS[kind]
+
+
+def apply_pkg_host_fault(kind: str) -> list[str]:
+    """把注入写到 build/aurora.img 上（在 ensure_image 之后调）。翻转一个字节，不重算任何校验。
+
+    包没有自校验字段可封（签名本身就是校验），所以翻一个字节就足以让它验不过——
+    这正是我们要的：**拒因来自签名/形状检查，而不是来自某个 CRC 闸**。
+    """
+    try:
+        off, _reason = pkg_host_fault_plan(kind)
+    except ValueError as e:
+        return [str(e)]
+    if not IMAGE.exists():
+        return [f"{kind}: 引导镜像不在 {IMAGE}"]
+    b = bytearray(IMAGE.read_bytes())
+    if off >= len(b):
+        return [f"{kind}: 偏移 {off} 超出镜像 {len(b)}"]
+    old = b[off]
+    # **old 必须与配方对得上**，不能信当前盘：盘可能还带着上一跑的注入。
+    # 这一条就是抓"注入跨跑污染"的闸——实测它抓到过（两条注入都报 BadHeader）。
+    sys.path.insert(0, str(ROOT / "tools"))
+    import esp_image  # noqa: E402
+    want_old = (esp_image.PKG_MAGIC[0] if kind == "fault-pkg-header"
+                else esp_image.package_payload()[16])
+    if old != want_old:
+        return [f"{kind}: 偏移 {off} 现值 {old:02x} 与配方 {want_old:02x} 不符 ⇒ 盘不是 pristine"]
+    new = old ^ 0xFF
+    if new == old:
+        return [f"{kind}: 翻了等于没翻 ⇒ 空转"]
+    b[off] = new
+    IMAGE.write_bytes(bytes(b))
+    PKG_PRISTINE[kind] = (off, old)
+    global PKG_DIRTY
+    PKG_DIRTY = True
+    print(f"    宿主机侧注入 {kind}: 引导镜像 偏移{off} {old:02x}→{new:02x}"
+          f"（期望拒因={PKG_HOST_FAULTS[kind]}，启动应当**仍然成功**）")
+    return []
+
+
+def pkg_host_witness(kind: str, log: str) -> list[str]:
+    """证人三件：①盘上那个字节真的改了（不信串口）②日志点名了预注册的拒因
+    ③**引导盘那一半仍绿**（读包不许把别的读者弄坏）。还原放在这里，寿命一跑。"""
+    bad: list[str] = []
+    if kind not in PKG_PRISTINE:
+        return [f"{kind}: 没有注入前的记录 ⇒ 这一跑根本没注入，证人不成立"]
+    off, old = PKG_PRISTINE.pop(kind)
+    cur = IMAGE.read_bytes()
+    if cur[off] == old:
+        bad.append(f"{kind}: 盘上偏移 {off} 又回到原值 {old:02x} ⇒ 注入被谁还原了（固件？重造？）")
+    want = PKG_HOST_FAULTS[kind]
+    bad += check_sign_boot(log, want_ok=False, want_reason=want)
+    head = cur[512:520]
+    if head != b"EFI PART":
+        bad.append(f"{kind}: 引导盘的 GPT 头签名坏了（{head!r}）⇒ 改包波及了别的结构")
+    # 还原：下一跑 ensure_image 本来会重造，但同进程里紧接着的行不该吃到改过的盘
+    b = bytearray(cur)
+    b[off] = old
+    IMAGE.write_bytes(bytes(b))
+    return bad
+
+
 def gpt_fault_image(kind: str) -> bytes:
     """按计划造出"改过之后应当长什么样"的整块盘字节（证人与注入共用这一份计算）。"""
     import binascii
@@ -6733,6 +6967,28 @@ def do_test(timeout: int) -> int:
     for x in esp_bad:
         print("    对账:", x)
 
+    print("=== 启动路径验签：只检测不拒启（W4 S3，ADR-080），正向 + 两条改包负样本 ===")
+    # 三行都期望 PASS(33)：**被拒也必须继续启动**就是这一刀的判定形状。
+    # 若实现偷偷拒启，这两行的判定值会变成 BOOT-INVALID(37) ⇒ 矩阵自己红。
+    IMAGE.unlink(missing_ok=True)
+    sbv, sbrc, sblog = do_run([], timeout)
+    sb_bad = check_sign_boot(sblog, want_ok=True)
+    sb_verdict = sbv if sbv != "PASS" else ("PASS" if not sb_bad else "CONTENT-MISMATCH")
+    for x in sb_bad:
+        print("    对账:", x)
+
+    phv, phrc, phlog = do_run([], timeout, host_fault="fault-pkg-header")
+    ph_bad = pkg_host_witness("fault-pkg-header", phlog)
+    ph_verdict = phv if phv != "PASS" else ("PASS" if not ph_bad else "CONTENT-MISMATCH")
+    for x in ph_bad:
+        print("    对账:", x)
+
+    ppv, pprc, pplog = do_run([], timeout, host_fault="fault-pkg-payload")
+    pp_bad = pkg_host_witness("fault-pkg-payload", pplog)
+    pp_verdict = ppv if ppv != "PASS" else ("PASS" if not pp_bad else "CONTENT-MISMATCH")
+    for x in pp_bad:
+        print("    对账:", x)
+
     print("=== FAT32 只读解析：两块卷挂 AHCI 口 3/4，内核读回的每个数由宿主机再解析一遍 ===")
     # 内核那十三条判据比的是"自己和写死的期望数"，这一行把它们换成"和另一台实现"：
     # 几何 14 格、每个文件 12 格、以及引导盘该崩在哪一道闸。两块卷的角色不重叠——
@@ -6954,6 +7210,9 @@ def do_test(timeout: int) -> int:
         # 比的是"自己和写死的期望数"，这一行换成"和 validate_esp.py 的独立读表"，逐格比
         ("FAT16合成卷与宿主机对账", f16_verdict, f16rc, "PASS", 33),
         ("ESP分区偏移真读文件", esp_verdict, espc, "PASS", 33),
+        ("启动验签通过不拒启", sb_verdict, sbrc, "PASS", 33),
+        ("改包头被拒仍启动", ph_verdict, phrc, "PASS", 33),
+        ("改载荷被拒仍启动", pp_verdict, pprc, "PASS", 33),
         # P7 第 40 行的证红：owner 改错一格 ⇒ 容器读不到 ⇒ 必须红在 ring3 那格
         ("P7 句柄授错主人必须红", ih_verdict, ihrc, "FAIL", 35),
         # ADR-066 / W2 P4：OOM 被传播（Err）且原页原样 ⇒ 期望 PASS(33)；
@@ -7006,6 +7265,9 @@ def do_test(timeout: int) -> int:
         "GPT改first并重算CRC对账红": geflog,
         "FAT16合成卷与宿主机对账": f16log,
         "ESP分区偏移真读文件": esplog,
+        "启动验签通过不拒启": sblog,
+        "改包头被拒仍启动": phlog,
+        "改载荷被拒仍启动": pplog,
         "P7 句柄授错主人必须红": ihlog,
         "split OOM原页原样": soomlog,
         "demand-zero四路有真输家": dzlog,
@@ -7159,7 +7421,7 @@ def main() -> int:
             # --host-fault fault-fat32-exec-byte` 必须与链里那一跑是同一个证人。只给 `run`——
             # 别的子命令收下这个参数却不读它，就是"看着开了其实没开"那种绿。
             p.add_argument("--host-fault", default="",
-                           choices=["", *sorted(FAT_HOST_FAULTS), *sorted(GPT_HOST_FAULTS)])
+                           choices=["", *sorted(FAT_HOST_FAULTS), *sorted(GPT_HOST_FAULTS), *sorted(PKG_HOST_FAULTS)])
     a = ap.parse_args()
     feats = [f for f in a.features.split(",") if f]
     if a.cmd == "build":
