@@ -2570,13 +2570,19 @@ def wedge_verdict(deltas: dict, second: dict, moved: list, dump: str = "") -> st
                 iflag = 1 if rfl & 0x200 else 0
                 hlt = mh.group(1)
                 rip = int(mp.group(1), 16)
-                user = rip >= 0x100000000
+                # 内核在高半区（0xffff…），用户在低半区（0x1_0000_0000）。
+                # §226 回放抓到的 bug：原写 rip >= 0x100000000 把内核地址也当成用户态。
+                user = rip < 0x0000800000000000
                 irr = re.search(r"^IRR\s+(.*)$", dump, re.M)
                 irrs = irr.group(1).strip() if irr else "?"
                 if iflag == 0 and hlt == "0" and user:
                     return (f"BSP **在 ring3 关着中断自旋**（IF=0 HLT=0 RIP={hex(rip)} 用户半区，LAPIC IRR={irrs}）"
                             "⇒ 不是睡死是**取不到中断**：用户态无法自己开 IF，牌=0 被换入就永远不被抢占"
                             "（假设 E：IF 牌为什么是 0，去查 context_load 的 if_open 实参，§218/§219）")
+                if iflag == 0 and hlt == "0" and not user:
+                    return (f"BSP **在内核态关着中断自旋**（IF=0 HLT=0 RIP={hex(rip)} 内核半区，LAPIC IRR={irrs}）"
+                            "⇒ 中断到了 LAPIC 但取不到；候选是 cli-before-spin 的等锁自旋或某段关窗口忙等"
+                            "（假设 E2：符号化这个 RIP 才能定位，**必须同源**，§221/§226）")
                 if iflag == 0 and hlt == "1":
                     return (f"BSP **关着中断睡死**（IF=0 HLT=1 RIP={hex(rip)}，LAPIC IRR={irrs}）"
                             "⇒ hlt 永远醒不来（假设 F：谁在关窗口时进了 hlt，§219）")
