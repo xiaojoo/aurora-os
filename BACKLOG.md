@@ -9560,6 +9560,45 @@ hello 写完信箱就停在自旋里、**不会自己收工**，所以有界等�
 - 之后 **S5 串口 shell**、**S6 framebuffer + PS/2**。
 - 行尾：`main.rs` CRLF、`module-interfaces.toml` LF、ADR-082 **LF**、BACKLOG CRLF。
 
+## 231. S4b 勘察：**发现真实前置依赖——没有"把用户 ELF 装进子 AS"的装载器**；切片要重拆（2026-11-12，只读勘察）
+
+按裁决继续 S4b（产品路径授予句柄、权限只从句柄来）。**勘察后没有动手**，因为发现一个前置缺口。
+
+### 一、勘察到的事实（都已核）
+
+- **`user::load(bytes)` 只往当前 AS 映射**（内部走 `mm::map`，`user.rs:1791`），
+  **没有 `load_into(aslot, …)` 之类的入口**（全仓搜不到）。
+- **连从盘装载的 ELF 也一样**：`t_fat32_exec` 是 `user::load(disk)` + `sched::spawn_user(...)`
+  （`fs.rs:778/795`）⇒ 跑在**boot AS**，不是子进程 AS。
+- **子 AS 那条路只映过桩**：`proc_sys_worker`（`mm.rs:1896-1945`）用
+  `vmo_create` + `grant_vmo` + syscall **14** `aspace_map`（rdx=Proc 句柄别名）
+  往子 AS 映了三页，代码页内容是 **`jmp .`（`0xEB 0xFE`）**，注释明写
+  "本刀不证'子进程读懂了什么'，只证它被放出来跑过"。
+- ⇒ **"把一份真 ELF 装进子进程 AS、且权限只从句柄来"这件事，仓库里还没有任何路径做过。**
+
+### 二、所以 S4b 要重拆成两片
+
+- **S4b-1（前置）**：**面向子 AS 的装载器**。把 ELF 各段写进 VMO，再经
+  `grant_vmo` + `aspace_map`（Proc 句柄别名）铺进子 AS；`Loaded` 要能表达
+  "entry/stack_top 在**那个** AS 里"，而不是当前 AS 的 VA。
+  **这是新能力，不是重构**：要处理段权限（代码 X 不可写、数据 W 不可 X）、
+  `MAX_OWNED` 容量、以及"装载失败时把已建的 VMO/映射退干净"。
+- **S4b-2**：产品路径 `job_create` → `grant_job`（带 CREATE）→ `process_create` →
+  S4b-1 装载 → `thread_create`（停住）→ `process_start` 回填 `StartupInfo` → 放行。
+  判据：**无 CREATE 权限的 Job 句柄必须拒（`E_DENIED`）**，有权限才通。
+
+### 三、为什么不硬做
+
+若跳过 S4b-1 直接做 S4b-2，就只能继续用 `spawn_user` 把 hello 跑在 boot AS，
+那样"权限只从句柄来"**根本没成立**（映射仍是内核直接给的），
+**等于把 S4b 的名字贴在一个没做到事的改动上**。按本仓纪律不干这种事。
+
+### 四、本轮状态与下一步
+
+**只读勘察、零代码改动**；`check` 沿用 §230 的 17/17，默认读数沿用 run-922（PASS/33、81/81）。
+**下一步从 S4b-1 开始**：先做面向子 AS 的装载器，配"段权限生效位"与"失败退干净"两条判据。
+仍开着：S4b-1/S4b-2、S4c（`MAX_TASKS` 余量）、S4a 的负样本欠账、S5 串口 shell、S6 framebuffer+PS/2。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。
