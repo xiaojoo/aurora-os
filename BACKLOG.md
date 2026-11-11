@@ -8762,6 +8762,52 @@ heredoc 里写的 `\b` 经转义后在文件里变成**一个退格字符（0x08
 - 行尾：`heap.rs` LF、`ktests/heap.rs` 按家族、`Cargo.toml` CRLF、`module-interfaces.toml` LF、
   ADR-081 **LF 159**、BACKLOG CRLF，CRCR 全 0。
 
+## 211. 落地 ADR-081 决策 1–3（开窗三条件 + 按锁标志 + 裸 sti）：默认无回归、40 跑 0 次 shootdown 超时，但撞到一个**pin2 未屏蔽却仍无中断**的新形状（2026-11-11，实测）
+
+### 一、改了什么
+
+- `IrqSpinLock` 新增 **`never_taken_in_isr`**；`new()` 默认 **true**，新增 **`new_isr_taken()`** 给
+  **WAITQ/TIMER/RUNQ** 三处（只改 3 个构造点，其余 7 处不动）。
+- `lock()`：`may_open = never_taken_in_isr && INNERMOST[slot] < RANK_TIMER.0`；
+  **每轮自旋开头**裸 `sti`、CAS 成功后**立刻** `cli`（在动 `INNERMOST`/`held_by` 之前）。
+- **比 ADR 原文更强的一点**：原文写"自旋期间开窗"，实现放在**每轮开头** ⇒ 被换人后牌=0
+  也能在下一轮重新开窗 ⇒ **§206 那条"牌=0 残留"被这一招补上**（发生率仍未实测）。
+- 新增两处裸 asm（`open_window_raw`/`close_window_raw`），SAFETY 写明"调用方保证此刻未持任何
+  rank≥6 的锁"，正是条件 2 的作用。
+
+### 二、门禁连锁（都是正当后果，逐个补登记）
+
+`sync U1 2→4`、census `总计 380→382 / U1 65→67`（含两条新逐处行 + 两条旧行号因插行而更正）、
+whitelist 汇总 `total/U1`、环内 **`sync->arch` 14→16**（`core::arch::asm!` 被文本门禁算作 arch 站点）。
+`check-interface-change` 要求伴随 ADR 改动 ⇒ ADR-081 状态更新为**决策 1–4 均已落地**。
+
+### 三、读数
+
+- 默认构建 **PASS/33、ktests 81/81**（run-508，elf `01aa26b426fb`）⇒ **无回归**；`check` **17/17**。
+- **猎挂 40 跑**（`fat32-exec,fault-handle-owner`，`--timeout 30`）：**0 次 shootdown 超时**、
+  0 次锁序违规、0 次重入。**但 40 跑证据弱**：历史率 1–2%，0/40 的概率≈0.55
+  ⇒ **不宣称死锁已关闭**，要按 ADR 的 80–120 跑口径继续。
+
+### 四、**撞到一个新形状（run-521），而且仪器的 D3 文案对它是错的**
+
+- 睡眠探针：`进入1次 tick_in=194 got=0 cycles=100012704 rounds=1753 was_running=0
+  进来 rte2=0x10020 调开表=1 开表Ok=1 调完 rte2=0x20`
+  ⇒ **2 tick 判据正确判出"表没走"、自愈被触发、开表成功**。
+- **挂死时 pin2 = `0x0000000000000020`（未屏蔽！）**，却 `IRQ_COUNTS=[236,0…]` 全冻结、
+  `IDLE_HLT[0]=8` 冻结、AP tick 照涨。停点是 **69 条 `t_frame_refcount_get_put`**，不是 `t_sleep_until`。
+- ⇒ 这**不是**"表被停而没再起"，是**表开着却收不到中断**的新形状，**成因未证**。
+- **仪器 bug 要记**：D3 的文案写"开表成功却仍 masked"，而这一跑 pin2 **未屏蔽**
+  ⇒ 文案与读数矛盾。D3 应当再分"仍 masked"与"已 unmasked 却无中断"两支，**本轮没改**。
+
+### 五、没做 / 仍开着
+
+- **`lock-order.md` 的"是否在中断上下文取"新列还没加**（ADR-081 决策 2 要求它是标志的唯一依据来源）
+  ⇒ 标志与表的一致性门禁也还没做。**这是本轮最大的欠账**。
+- 决策 1–3 的**三条负样本都没做**（去掉条件② ⇒ 锁序违规；VMM 标志填回 false ⇒ 死锁复现；
+  TIMER/RUNQ 标志误填 true ⇒ 重入）；矩阵行未接。
+- 死锁是否关闭**未判定**（需 80–120 跑）；run-521 那个新形状未定性；D3 文案未修。
+- §207 未核准点、§208 未决五条、S4 仍开着。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

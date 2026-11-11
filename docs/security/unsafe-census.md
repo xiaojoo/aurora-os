@@ -1,6 +1,6 @@
 # unsafe 逐处审计表（U1–U6）
 
-总计 380 处。U1 65 · U2 101 · U3 13 · U4 131 · U5 34 · U6 36
+总计 382 处。U1 67 · U2 101 · U3 13 · U4 131 · U5 34 · U6 36
 
 本表由 `tools/aurora.py` 的 `unsafe_sites()` 从源码逐处生成，**不是手写的**。
 机器可读的权威来源是 `docs/security/unsafe-whitelist.toml` 的 `[modules.*]` 段（模块×类别→处数），
@@ -9,7 +9,7 @@
 
 ## 类别
 
-- **U1 架构入口与特殊寄存器** — 65 处，分布在 14 个模块：arch/x86_64/apic、arch/x86_64/cpu、arch/x86_64/smp、arch/x86_64/trap、hw、ktests/sched、mm、sched、serial、sync、tsc、user、user/hello
+- **U1 架构入口与特殊寄存器** — 67 处，分布在 14 个模块：arch/x86_64/apic、arch/x86_64/cpu、arch/x86_64/smp、arch/x86_64/trap、hw、ktests/sched、mm、sched、serial、sync、tsc、user、user/hello
 - **U2 页表、物理内存与 MMIO** — 101 处，分布在 11 个模块：acpi、arch/x86_64/apic、heap、hw、ktests/mm、limine、mm、pci、sched、user、vmo
 - **U3 DMA 与设备共享内存** — 13 处，分布在 2 个模块：driver、limine
 - **U4 并发共享状态与 UnsafeCell** — 131 处，分布在 20 个模块：acpi、ahci、arch/x86_64/apic、arch/x86_64/smp、arch/x86_64/trap、driver、hooks、irq、ktests/elf、ktests/fs、ktests/sign、main、mm、pci、proc、sched、sync、user、virtio、vmo
@@ -705,9 +705,13 @@
   > unsafe { &mut *self.lock.data.get() } } }
 - `kernel/src/sync.rs:329` [{] **U4** fn=`wait_queue`
   > unsafe { self.lock.locked.store(0, Ordering::Release) }; restore_flags(self.flags); }
-- `kernel/src/sync.rs:340` [{] **U1** fn=`save_and_cli`
+- `kernel/src/sync.rs:419` [{] **U1** fn=`save_and_cli`
   > unsafe { core::arch::asm!( "pushfq",
-- `kernel/src/sync.rs:354` [{] **U1** fn=`restore_flags`
+- `kernel/src/sync.rs:438` [{] **U1** fn=`open_window_raw`
+
+- `kernel/src/sync.rs:444` [{] **U1** fn=`close_window_raw`
+
+- `kernel/src/sync.rs:450` [{] **U1** fn=`restore_flags`
   > unsafe { core::arch::asm!("push {r}", "popfq", r = in(reg) f) }; } 
 ### tsc
 

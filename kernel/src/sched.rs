@@ -473,7 +473,7 @@ struct QueueCell {
 // 现在写权归锁，所以这条 unsafe 的凭据换成了锁本身。
 unsafe impl Sync for QueueCell {}
 static RQ: [QueueCell; crate::arch::x86_64::cpu::MAX_CPUS] = [const {
-    QueueCell { lock: crate::sync::IrqSpinLock::new(crate::sync::RANK_RUNQ, ()), data: core::cell::UnsafeCell::new(EMPTY_QUEUE) }
+    QueueCell { lock: crate::sync::IrqSpinLock::new_isr_taken(crate::sync::RANK_RUNQ, ()), data: core::cell::UnsafeCell::new(EMPTY_QUEUE) }
 }; crate::arch::x86_64::cpu::MAX_CPUS];
 
 /// 一条队列的所有权句柄：持有它 = 本 CPU 关着中断独占这条队列。
@@ -1173,7 +1173,7 @@ struct Wheel {
 /// 每 CPU 一个轮，锁与数据同体（`RANK_TIMER`）。`Wheel` 全是普通数据 ⇒ Send ⇒ 锁自动 Sync，
 /// 不需要再包一层 UnsafeCell（比 `RoleCell`/`OpsCell` 少三处 unsafe）。
 static WHEELS: [crate::sync::IrqSpinLock<Wheel>; crate::arch::x86_64::cpu::MAX_CPUS] =
-    [const { crate::sync::IrqSpinLock::new(crate::sync::RANK_TIMER, Wheel {
+    [const { crate::sync::IrqSpinLock::new_isr_taken(crate::sync::RANK_TIMER, Wheel {
         slots: [TimerEntry { used: false, deadline: 0, task: 0,
                  token: crate::sync::WaitToken { queue: TIMER_QID, seq: 0 } }; WHEEL_SLOTS],
         seq: 0, registered: 0, fired: 0,

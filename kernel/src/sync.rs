@@ -180,7 +180,7 @@ pub struct WaitQueue(IrqSpinLock<WaitInner>);
 
 impl WaitQueue {
     pub const fn new() -> Self {
-        WaitQueue(IrqSpinLock::new(RANK_WAITQ, WaitInner {
+        WaitQueue(IrqSpinLock::new_isr_taken(RANK_WAITQ, WaitInner {
             slots: [Waiter { used: false, task: 0, token: WaitToken { queue: 0, seq: 0 }, next: NO_NEXT }; MAX_WAITERS],
             head: NO_NEXT,
             seq: 0,
@@ -364,6 +364,9 @@ pub struct IrqSpinLock<T> {
     locked: AtomicUsize,
     held_by: AtomicU64,
     rank: LockRank,
+    /// ADR-081 决策 2：这把锁**是否从不在中断上下文取**。true 才允许在自旋等它时开窗。
+    /// 唯一依据来源是 `docs/architecture/lock-order.md` 的"是否在中断上下文取"那一列。
+    never_taken_in_isr: bool,
     data: UnsafeCell<T>,
 }
 
@@ -422,6 +425,23 @@ fn save_and_cli() -> u64 {
         );
     }
     f
+}
+
+/// ADR-081 决策 3：自旋等锁期间开窗用的裸 `sti`/`cli`。
+/// **不碰 per-CPU 的 IF 牌**（与 `save_and_cli` 同一姿态）：走 apic 会新增 sync→arch 环内站点、
+/// 撞 ADR-044 棘轮。代价见 ADR-081 决策 3——换人时 `if_patch` 按牌覆盖，所以牌与硬件的不一致
+/// 是瞬态且自愈的；把 `sti` 放在**每轮自旋开头**就能在被换回来（牌=0）后重新开窗。
+#[inline]
+fn open_window_raw() {
+    // SAFETY: 只改 EFLAGS 的 IF 位，不访存、不动栈指针；调用方保证此刻**未持任何 rank>=6 的锁**
+    //         （ADR-081 决策 1 的条件 2），所以中断里取 TIMER(6)/RUNQ(8) 不构成锁序违规。
+    unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+}
+
+#[inline]
+fn close_window_raw() {
+    // SAFETY: 同上，只改 IF 位。CAS 成功后立刻调它，回到"持锁者永不 IF=1"的不变量。
+    unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
 }
 
 #[inline]
@@ -503,8 +523,15 @@ pub fn reentrant_hits() -> usize {
 }
 
 impl<T: Send> IrqSpinLock<T> {
+    /// 任务上下文锁（**默认**）：从不在中断里取 ⇒ 等它时可以开窗（ADR-081 决策 1/2）。
     pub const fn new(rank: LockRank, v: T) -> Self {
-        Self { locked: AtomicUsize::new(0), held_by: AtomicU64::new(UNHELD), rank, data: UnsafeCell::new(v) }
+        Self { locked: AtomicUsize::new(0), held_by: AtomicU64::new(UNHELD), rank, never_taken_in_isr: true, data: UnsafeCell::new(v) }
+    }
+
+    /// **中断上下文也会取的锁**（WAITQ/TIMER/RUNQ）：等它时**不许**开窗，
+    /// 否则自己的 tick 进来再取同一把锁就是自死锁（ADR-081 §205 的推导）。
+    pub const fn new_isr_taken(rank: LockRank, v: T) -> Self {
+        Self { locked: AtomicUsize::new(0), held_by: AtomicU64::new(UNHELD), rank, never_taken_in_isr: false, data: UnsafeCell::new(v) }
     }
 
     pub fn rank(&self) -> LockRank {
@@ -526,7 +553,13 @@ impl<T: Send> IrqSpinLock<T> {
         let slot = crate::arch::x86_64::cpu::self_slot();
         let mut spins = 0u64;
         let t0 = crate::tsc::now();
+        // ADR-081 决策 1：**三条件**——目标锁从不在 ISR 取、此刻最内层等级 < TIMER(6)、只在自旋内开。
+        // 条件 2 是硬约束：持 HEAP(10) 等 VMM 时若开窗，tick 取 TIMER(6) 会撞 `外层 rank=10 本次 rank=6`。
+        let may_open = self.never_taken_in_isr && INNERMOST[slot].load(Ordering::Relaxed) < RANK_TIMER.0;
         loop {
+            if may_open {
+                open_window_raw();
+            }
             if self.locked.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
                 break;
             }
@@ -551,6 +584,10 @@ impl<T: Send> IrqSpinLock<T> {
                 );
                 crate::exit::finish(crate::exit::Code::ExceptionFatal);
             }
+        }
+        if may_open {
+            // CAS 已成功 ⇒ 立刻关回，恢复"持锁者永不 IF=1"。下面才动 INNERMOST/held_by。
+            close_window_raw();
         }
         if spins > 0 {
             // 真的为别人等过一次锁：把这件事记进数字，供用例判断"跨核竞争确实发生过"
