@@ -2450,6 +2450,12 @@ def wedge_verdict(deltas: dict, second: dict, moved: list) -> str:
     * `WORK` **不是**"任务在跑"：全仓只有 AP 工人循环与 ktests/sched.rs 那几条工人自增它
       ⇒ 只报不判。第一版拿它当第三支的判据，把真挂死判成了"有任务在跑"。
     """
+    # 计数下溢必须**最先**判：armed/待唤醒是 usize，双减一次就回绕成 u64::MAX。
+    # §194 实测（run-099 原始字节 = 18446744073709551615）：旧表把 MAX 当成"有 armed"
+    # 判成 B2，而下溢根本不是"有等待者"⇒ 计数器坏了的时候别的支一律不成立。
+    if second["armed等待者"][0] == 2**64 - 1 or second["待唤醒发布"][0] == 2**64 - 1:
+        return ("armed/待唤醒计数**下溢**（读到 u64::MAX）⇒ 唤醒计数被双减，"
+                "先修计数再谈唤醒（假设 C：task_wake_tick 的 load-then-store 与 task_wait_take 的 swap 不互斥，§194）")
     irq_moved = any(deltas["按向量中断"]) or any(deltas["每CPU本地tick"])
     idle_moved = any(deltas["idle_hlt"])
     armed = second["armed等待者"][0]

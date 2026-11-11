@@ -160,6 +160,10 @@ handles = []
 # 负样本（P7 §9 F）：把装载器授予的 owner 改错一格（Task::id ^ 1）。
 # 容器读自己的句柄必须 NotOwner ⇒ 判定链这一行期望 FAIL；证明"授予给谁"不是修辞。
 fault-handle-owner = []
+# §194 负样本：把 wait_for_task 里"查条件之后、block_current 之前"那个窗口故意撑大。
+# 推导见 BACKLOG §194：目标若在窗口里收工，drain 会对着还没 Blocked 的等待者调 wake_task，
+# 失败被 `let _ =` 吞掉 ⇒ 槽已 WOKEN 而 ARMED/PENDING 归零，之后 block_current 永久停住。
+fault-wait-race = []
 
 
 # 负样本（M5-c③）：写命令不置 DW0 的 W 位（真驱动最容易犯的方向错）。

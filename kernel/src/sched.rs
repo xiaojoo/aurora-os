@@ -1837,6 +1837,16 @@ pub fn wait_for_task(target: usize, deadline_cycles: u64) -> bool {
         let _ = task_wait_take(slot);
         return true;
     }
+    // 负样本（§194）：**只撑大窗口，不改任何语义**。这段自旋不持锁、不分配、不动中断牌，
+    // 有界（约 6ms @3.2GHz），正常构建里整段不存在（`#[cfg]` 不是 `cfg!`，产物逐字节不变）。
+    // 预期：目标在窗口里收工 ⇒ 唤醒被提前投递并丢弃 ⇒ 下面 block_current 之后永久停住。
+    #[cfg(feature = "fault-wait-race")]
+    {
+        let t = crate::tsc::now();
+        while crate::tsc::now().wrapping_sub(t) < 20_000_000 {
+            core::hint::spin_loop();
+        }
+    }
     if !block_current(token) {
         let _ = task_wait_take(slot);
         return false;
