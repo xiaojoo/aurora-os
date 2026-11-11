@@ -150,3 +150,13 @@ fn t_grow_reentry_must_escalate() -> bool {
 #[cfg(feature = "fault-grow-reentrant")]
 ktest!(KT_GROW_REENTRY, t_grow_reentry_must_escalate);
 
+/// 故障注入（ADR-081 决策 4）：持 HEAP(10) 再取 GROW(4)，必须被锁序检测认出并升 L4。
+#[cfg(feature = "fault-grow-order")]
+fn t_grow_reverse_nesting_must_escalate() -> bool {
+    crate::log_warn!("fault-grow-order: 按设计反向嵌套 HEAP(10) -> GROW(4)");
+    heap::force_reverse_nesting_for_test();
+    false
+}
+#[cfg(feature = "fault-grow-order")]
+ktest!(KT_GROW_ORDER, t_grow_reverse_nesting_must_escalate);
+

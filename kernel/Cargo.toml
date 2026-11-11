@@ -54,6 +54,9 @@ fault-lock-reentrant = []
 # 负样本（ADR-081 决策 4）：同一上下文重复获取 GROW(4)，必须被 held_by 认出并升 L4。
 fault-grow-reentrant = []
 
+# 负样本（ADR-081 决策 4）：反向嵌套——持 HEAP(10) 再取 GROW(4)，必须被锁序检测认出并升 L4。
+fault-grow-order = []
+
 # 负样本（ADR-021）：把"IF 属于 CPU"改回硬件默认的"任务自己带 IF"。
 # 这条构建用来证明 ADR-021 不是修辞——去掉机制，M3a 记录过的故障形状必须回来。
 fault-if-carriage = []

@@ -358,6 +358,17 @@ pub fn force_reentrant_grow_for_test() {
     crate::exit::finish(crate::exit::Code::Failed);
 }
 
+/// 故障注入（ADR-081 决策 4）：**反向嵌套**——持 HEAP(10) 再取 GROW(4)。
+/// 等级必须严格递增，10 → 4 是违规，`sync` 的 per-CPU 等级栈应当场升 L4。
+/// 这条与重入负样本是两件事：重入测 `held_by`，反向嵌套测 `INNERMOST` 的等级比较。
+#[cfg(feature = "fault-grow-order")]
+pub fn force_reverse_nesting_for_test() {
+    let _h = HEAP.lock();
+    let _g = GROW.lock();
+    crate::log_fatal!("fault-grow-order: 反向嵌套没有被抓住，锁序检测是假的");
+    crate::exit::finish(crate::exit::Code::Failed);
+}
+
 pub struct AuroraGlobal;
 
 unsafe impl GlobalAlloc for AuroraGlobal {

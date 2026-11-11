@@ -126,7 +126,11 @@ BACKLOG §204（根因，实测）、§205（依赖图）、§206（被抢占后
 - **负样本②**：把 VMM 标志填回 false ⇒ §204 死锁应复现。
   `base/acks/me` 点名诊断**已就位（实测，§204 已提交）**，复现时能点名是哪颗 CPU 没回执。
 - **负样本③**：把 TIMER/RUNQ 标志误填 true ⇒ `重入获取 rank=6`/`rank=8` ⇒ L4。
-- **负样本④**：GROW 重入 ⇒ `重入获取 rank=4`；反向嵌套（持 HEAP 取 GROW）⇒ 锁序违规。
+- **负样本④（实测，2026-11-11，BACKLOG §209/§210）**：两条都已落地并各自咬了——
+  `fault-grow-reentrant` ⇒ `[fatal] L4 sync: 重入获取 rank=4 token=0x0` ⇒ **EXCEPTION(39)**（run-504）；
+  `fault-grow-order`（持 HEAP(10) 再取 GROW(4)）⇒ `[fatal] L4 sync: 锁序违规，外层 rank=10 本次 rank=4`
+  ⇒ **EXCEPTION(39)**（run-506）。**两条测的是不同机制**：重入测 `held_by`，反向嵌套测 `INNERMOST` 的等级比较。
+  两者**都还没接进判定矩阵**（目前只能手工 `run --features …`），记为欠账。
 - **门禁**：`lock-order.md` 新列与代码标志**逐把对账** + **反空转格**（一对都没扫到就红）；
   折进既有门禁，**不开第 18 道**。
 - **行为**：猎挂 **80–120 跑**（`fat32-exec,fault-handle-owner`，`--timeout 30`），期望 0 次

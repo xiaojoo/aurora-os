@@ -8742,6 +8742,26 @@ heredoc 里写的 `\b` 经转义后在文件里变成**一个退格字符（0x08
 - 行尾：`heap.rs` **LF 370**、`ktests/heap.rs` 按家族、`sync.rs`/`Cargo.toml` CRLF、
   `lock-order.md` **LF 213**、`module-interfaces.toml` **LF 841**、ADR-081 **LF 155**、BACKLOG CRLF。
 
+## 210. 补上反向嵌套负样本：持 HEAP(10) 取 GROW(4) ⇒ **实测 `锁序违规，外层 rank=10 本次 rank=4`**（2026-11-11，实测）
+
+§209 的欠账之一。ADR-081 验收里的负样本④现在**两条都落地并各自咬了**。
+
+- **新增** `fault-grow-order` 特性 + `heap::force_reverse_nesting_for_test()`（先 `HEAP.lock()` 再 `GROW.lock()`）
+  + `t_grow_reverse_nesting_must_escalate`。
+- **实测**：`run --features fault-grow-order` ⇒ **EXCEPTION(39)**，串口
+  `[warn] fault-grow-order: 按设计反向嵌套 HEAP(10) -> GROW(4)` →
+  `[fatal] L4 sync: 锁序违规，外层 rank=10 本次 rank=4`（run-506，elf `e8eb3de15b61`，3.5s）。
+- **两条负样本测的是不同机制，不能互相替代**：重入（§209）测 `held_by` 的 CPU 令牌；
+  反向嵌套测 `INNERMOST` 的**等级比较**。ADR-081 的负样本④已按实测更新。
+- **门禁连锁两处**：环内 `memory->diagnostics` 站点 **8→9**（注入里的 `log_fatal!`/`log_warn!`）⇒ 登记；
+  `check-interface-change` 要求"改 module-interfaces.toml 必须伴随 ADR 改动"⇒ 把 ADR-081 的负样本④
+  从"计划"更新成"实测"（**这是真实的 ADR 更新，不是为了过门禁而凑改动**）。
+- **读数**：`check` **17/17**；默认构建 **PASS/33、ktests 81/81**（run-507，elf `72414b0a36f5`）⇒ 无回归。
+- **仍欠**：两条负样本**都还没接进判定矩阵**（只能手工跑）；决策 1–3 未落地 ⇒ §204 死锁未关闭；
+  GROW 横跨 ~6ms 不造新死锁未实测；§207 未核准点、§208 未决五条仍开着。
+- 行尾：`heap.rs` LF、`ktests/heap.rs` 按家族、`Cargo.toml` CRLF、`module-interfaces.toml` LF、
+  ADR-081 **LF 159**、BACKLOG CRLF，CRCR 全 0。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。
