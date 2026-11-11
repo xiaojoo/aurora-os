@@ -2522,7 +2522,7 @@ class QmpSession:
             self.s.close()
 
 
-def wedge_verdict(deltas: dict, second: dict, moved: list) -> str:
+def wedge_verdict(deltas: dict, second: dict, moved: list, dump: str = "") -> str:
     """预注册判别表：两次采样的增量 + 第二次绝对值 ⇒ 一句话结论。
 
     抽成纯函数是为了能**拿留档的真挂死样本回放**（§193）：间歇挂约 1% 每行，
@@ -2554,6 +2554,34 @@ def wedge_verdict(deltas: dict, second: dict, moved: list) -> str:
     if not irq_moved:
         return ("有量在涨但**两本中断账都没动** ⇒ 不是 tick 驱动的推进"
                 "（形状不在预注册表里，只留证据不下结论）")
+    # §219：**寄存器分支优先于一切基于计数的推断**。§218 实测教训：IDLE_HLT 冻结只说明
+    # "不在 idle 里循环"，**不说明"在 idle 里睡着"**——run-701 的 BSP 其实在 ring3 关中断自旋。
+    # 寄存器 dump 本来就取回来了，用它分支才是直接证据。
+    if dump:
+        m0 = re.search(r"^CPU#0$", dump, re.M)
+        if m0:
+            blk = dump[m0.start():m0.start() + 900]
+            mr = re.search(r"RFL=(\w+)", blk)
+            mh = re.search(r"HLT=(\d)", blk)
+            mp = re.search(r"RIP=(\w+)", blk)
+            if mr and mh and mp:
+                rfl = int(mr.group(1), 16)
+                iflag = 1 if rfl & 0x200 else 0
+                hlt = mh.group(1)
+                rip = int(mp.group(1), 16)
+                user = rip >= 0x100000000
+                irr = re.search(r"^IRR\s+(.*)$", dump, re.M)
+                irrs = irr.group(1).strip() if irr else "?"
+                if iflag == 0 and hlt == "0" and user:
+                    return (f"BSP **在 ring3 关着中断自旋**（IF=0 HLT=0 RIP={hex(rip)} 用户半区，LAPIC IRR={irrs}）"
+                            "⇒ 不是睡死是**取不到中断**：用户态无法自己开 IF，牌=0 被换入就永远不被抢占"
+                            "（假设 E：IF 牌为什么是 0，去查 context_load 的 if_open 实参，§218/§219）")
+                if iflag == 0 and hlt == "1":
+                    return (f"BSP **关着中断睡死**（IF=0 HLT=1 RIP={hex(rip)}，LAPIC IRR={irrs}）"
+                            "⇒ hlt 永远醒不来（假设 F：谁在关窗口时进了 hlt，§219）")
+                if iflag == 1 and hlt == "1" and irrs not in ("(none)", "?", ""):
+                    return (f"BSP **IF=1 且 HLT=1 而 LAPIC IRR 非空（{irrs}）⇒ 该取却没取**"
+                            "（假设 G：比 IF 更深的一层，RIP=" + hex(rip) + "，§219）")
     # D 支（§196）：IDLE_HLT **冻结但绝对值 > 0** 与"冻结且为 0"是两件事，旧表把它们混成一支。
     # idle_entry 每圈 hlt 前都自增 IDLE_HLT ⇒ 冻结在 1 意味着"进了第一次 hlt 就再没醒过"，
     # 而不是"没有 CPU 在 idle"。run-118/124 实测：IRQ 全冻结 + AP 本地 tick 照涨 + IDLE_HLT[0]=1，
@@ -2588,7 +2616,7 @@ def wedge_verdict(deltas: dict, second: dict, moved: list) -> str:
             "（假设 B3：唤醒/换人那一侧，要看 wake_task 与 pick_next）")
 
 
-def wedge_probe(port: int, log: str, elf: Path, build_dir: Path, seq: int) -> str:
+def wedge_probe(port: int, log: str, elf: Path, build_dir: Path, seq: int, dump: str = "") -> str:
     """挂死时把已有计数器**读两次**（隔 3 秒），判"中断源停了"还是"丢唤醒"。
 
     VA→PA 靠现成锚点：`fatalrec: 物理=` 那行给 FATAL_RECORD 的 PA，符号表给它的 VA，
@@ -2664,7 +2692,7 @@ def wedge_probe(port: int, log: str, elf: Path, build_dir: Path, seq: int) -> st
             moved.append(label)
         out.append(f"  {label:16s} {tag}  一次={va_ if n <= 16 else str(va_[:8]) + '…'}"
                    f"  增量={delta if n <= 16 else str(delta[:8]) + '…'}")
-    verdict = wedge_verdict(deltas, b, moved)
+    verdict = wedge_verdict(deltas, b, moved, dump)
     out.append(f"  参考数（只报不判：marks 含自陷，不能拿它与 recv 的差当丢唤醒）"
                f" resched合计={b['resched合计'][0]} IPI取走={b['resched_IPI取走'][0]}"
                f" IPI发失败={b['resched_IPI发失败'][0]} 每CPU标记={b['每CPU重排标记']}")
@@ -2722,7 +2750,7 @@ def qmp_hang_evidence(port: int, log: str, build_dir: Path, seq: int) -> str:
     # 判别仪器与崩溃表是两件事：表答"有没有进崩溃路径"，这一台答"为什么没人再跑"。
     # 产物路径直接取（**不调 kernel_binary**：那会触发构建，而取证必须在 kill 之前做完）。
     elf = ROOT / "target" / TARGET / "debug" / "aurora-kernel"
-    text += "\n" + wedge_probe(port, log, elf, build_dir, seq)
+    text += "\n" + wedge_probe(port, log, elf, build_dir, seq, dump)
     return dump + "\n" + text + "\n"
 
 
