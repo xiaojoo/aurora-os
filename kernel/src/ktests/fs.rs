@@ -839,6 +839,11 @@ fn t_fat32_exec() -> bool {
             return false;
         }
     };
+    // §199：收尾按原样放回（与 t_handle_reap 同一律）。本用例需要表走，所以照样开；
+    // 旧写法无条件 stop，把表停给了后面所有用例（第二终端的前置条件，BACKLOG §198/§199）。
+    let tick_in = apic::ticks();
+    let timer_was_running =
+        apic::wait_ticks(tick_in, 1, crate::clock::window_cycles(1)).ticks >= 1;
     apic::timer_start().ok();
     let mut rounds = 0u64;
     apic::with_interrupts(|| {
@@ -857,7 +862,9 @@ fn t_fat32_exec() -> bool {
             crate::log_fatal!("elfdisk: 窗口收不了场（启动上下文没回到 CPU）");
         }
     });
-    apic::timer_stop().ok();
+    if !timer_was_running {
+        apic::timer_stop().ok();
+    }
     let magic = user::read_at(loaded.data_va);
     let ping = user::read_at(loaded.data_va + 8);
     let add = user::read_at(loaded.data_va + 16);

@@ -126,6 +126,11 @@ fn t_user_roundtrip() -> bool {
         }
     };
     let bad_top = sched::kstack_top_of(bad);
+    // §199：收尾按原样放回（与 t_handle_reap 同一律）。本用例需要表走，所以照样开；
+    // 旧写法无条件 stop，把表停给了后面所有用例（第二终端的前置条件，BACKLOG §198/§199）。
+    let tick_in = apic::ticks();
+    let timer_was_running =
+        apic::wait_ticks(tick_in, 1, crate::clock::window_cycles(1)).ticks >= 1;
     apic::timer_start().ok();
     // **换入之前**把两条用户任务的异常帧逐格读回来。这条打印不是装饰：
     // iretq 的字段没有类型系统保护，"写进去的值"与"CPU 读到的值"之间唯一的证人就是它。
@@ -171,7 +176,9 @@ fn t_user_roundtrip() -> bool {
             }
         });
     }
-    apic::timer_stop().ok();
+    if !timer_was_running {
+        apic::timer_stop().ok();
+    }
     let slot0 = user::read_slot(user::SLOT_PING);
     let slot1 = user::read_slot(user::SLOT_ADD);
     let slot2 = user::read_slot(user::SLOT_UNKNOWN);
@@ -276,6 +283,11 @@ fn t_task_exit() -> bool {
     let base_released = sched::reap_released();
     sched::init_boot_task();
     sched::start_workers();
+    // §199：收尾按原样放回（与 t_handle_reap 同一律）。本用例需要表走，所以照样开；
+    // 旧写法无条件 stop，把表停给了后面所有用例（第二终端的前置条件，BACKLOG §198/§199）。
+    let tick_in = apic::ticks();
+    let timer_was_running =
+        apic::wait_ticks(tick_in, 1, crate::clock::window_cycles(1)).ticks >= 1;
     apic::timer_start().ok();
 
     // ---- 一轮 = 装载 → 跑 → 结束（mode 决定谁发起结束）→ 回收 → 检查账目
@@ -421,7 +433,9 @@ fn t_task_exit() -> bool {
             }
         }
     }
-    apic::timer_stop().ok();
+    if !timer_was_running {
+        apic::timer_stop().ok();
+    }
     crate::log_info!(
         "exit: 判定 一轮={} 二轮={} 三轮={} 最终 reservations={} live={}",
         one_ok,

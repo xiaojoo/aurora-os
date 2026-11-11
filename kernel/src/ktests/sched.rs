@@ -50,6 +50,12 @@ fn yield_partner() -> ! {
 /// 每个任务的 runs 都要非零。只证明"能进中断"不够——必须证明
 /// "被换下去的任务后来又被换回来并继续跑"，否则轮转是假的。
 fn t_preempt_round_robin() -> bool {
+    #[cfg(feature = "timer-probe-log")]
+    crate::log_info!("rte2-entry: test=t_preempt_round_robin rte2={:?}", apic::rte_raw(2));
+    // §199：收尾按原样放回。**入口**记一次状态，只守卫**最后一个** stop；
+    // 中间那些 stop 是被测语义本身（故意停表的窗口），一个都不动。
+    let timer_was_running =
+        apic::wait_ticks(apic::ticks(), 1, crate::clock::window_cycles(1)).ticks >= 1;
     let Some(s) = acpi::summary() else { return false };
     let Some(m) = s.madt else { return false };
     if apic::get_or_init(&m).is_err() {
@@ -126,7 +132,9 @@ fn t_preempt_round_robin() -> bool {
     // 免得"这一格该给多少"在文件里有两本账。
     let w_pre = apic::wait_ticks(tick_a, 2, clock::window_cycles(2));
     let tick_b = apic::ticks();
-    apic::timer_stop().ok();
+    if !timer_was_running {
+        apic::timer_stop().ok();
+    }
     let boot1 = sched::WORK[0].load(Ordering::Relaxed);
     let (sw1, tk1, active) = sched::stats();
     let (n, mean, min, max) = sched::p1_stats();
@@ -338,6 +346,12 @@ ktest!(KT_CPU_IDS, t_cpu_ids_agree);
 /// 如果换入时没人改写这一位（旧行为），它会一直是 0，窗口里再也没有第二个 tick，
 /// 整条用例直接挂不住——那正是 M3a 记录过的"合成帧写 0x2 就整机卡死"的故障形状。
 fn t_if_belongs_to_cpu() -> bool {
+    #[cfg(feature = "timer-probe-log")]
+    crate::log_info!("rte2-entry: test=t_if_belongs_to_cpu rte2={:?}", apic::rte_raw(2));
+    // §199：收尾按原样放回。**入口**记一次状态，只守卫**最后一个** stop；
+    // 中间那些 stop 是被测语义本身（故意停表的窗口），一个都不动。
+    let timer_was_running =
+        apic::wait_ticks(apic::ticks(), 1, crate::clock::window_cycles(1)).ticks >= 1;
     let Some(s) = acpi::summary() else { return false };
     let Some(m) = s.madt else { return false };
     if apic::get_or_init(&m).is_err() {
@@ -369,7 +383,9 @@ fn t_if_belongs_to_cpu() -> bool {
             crate::log_fatal!("if-rule: 启动上下文没能回到 CPU（窗口收场不了）");
         }
     });
-    apic::timer_stop().ok();
+    if !timer_was_running {
+        apic::timer_stop().ok();
+    }
     let after = sched::frame_rflags_of(slot);
     let if_after = sched::frame_if_bit(slot).unwrap_or(false);
     let runs = sched::runs_of(slot);
@@ -1272,6 +1288,8 @@ fn p6_bsp_noop() {}
 /// （`watchdog.rs` 的既有口径）。所以这里 BSP 与 AP **各测一档**，不是一个数糊过去。
 /// 另外三格：确实由定时器叫醒（返回 true）、`fired` 前进、轮上无残留项。
 fn t_sleep_until() -> bool {
+    #[cfg(feature = "timer-probe-log")]
+    crate::log_info!("rte2-entry: test=t_sleep_until rte2={:?}", apic::rte_raw(2));
     if sched::state_of(0) == sched::TaskState::Free {
         sched::init_boot_task();
     }

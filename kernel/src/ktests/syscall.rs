@@ -76,6 +76,12 @@ fn run_one(flag: u64, calls: u64, tag: &str, expect_end: bool) -> Option<Round> 
 /// 4 ring3 自己写 guard 页 ⇒ 只杀这个任务并且资源回账（这条不经过指针校验，把关人只能是页表+故障归属）。
 /// 顺带守住两条结构性规则：地址分区（`partition_ok`）与落脚页（`tramp_ok`）。
 fn t_user_pointer_checks() -> bool {
+    #[cfg(feature = "timer-probe-log")]
+    crate::log_info!("rte2-entry: test=t_user_pointer_checks rte2={:?}", apic::rte_raw(2));
+    // §199：收尾按原样放回。**入口**记一次状态，只守卫**最后一个** stop；
+    // 中间那些 stop 是被测语义本身（故意停表的窗口），一个都不动。
+    let timer_was_running =
+        apic::wait_ticks(apic::ticks(), 1, crate::clock::window_cycles(1)).ticks >= 1;
     let Some(s) = acpi::summary() else { return false };
     let Some(m) = s.madt else { return false };
     if apic::get_or_init(&m).is_err() {
@@ -173,7 +179,9 @@ fn t_user_pointer_checks() -> bool {
         r2.drained
     );
 
-    apic::timer_stop().ok();
+    if !timer_was_running {
+        apic::timer_stop().ok();
+    }
     let ok = peek_ok_good
         && rejects
         && survived
@@ -203,6 +211,12 @@ ktest!(KT_USER_POINTER, t_user_pointer_checks);
 /// ⑥ 第 2 页没映射要在校验阶段就回 `NotMapped` 且 `COPY_RECOVERED` 不动；
 /// ⑦ 恢复路径本身用 `probe_copy_from` 走一次真故障：恰好搬成 8、计数 +1、AC 关、登记干净。
 fn t_copy_user() -> bool {
+    #[cfg(feature = "timer-probe-log")]
+    crate::log_info!("rte2-entry: test=t_copy_user rte2={:?}", apic::rte_raw(2));
+    // §199：收尾按原样放回。**入口**记一次状态，只守卫**最后一个** stop；
+    // 中间那些 stop 是被测语义本身（故意停表的窗口），一个都不动。
+    let timer_was_running =
+        apic::wait_ticks(apic::ticks(), 1, crate::clock::window_cycles(1)).ticks >= 1;
     let Some(s) = acpi::summary() else { return false };
     let Some(m) = s.madt else { return false };
     if apic::get_or_init(&m).is_err() {
@@ -330,7 +344,9 @@ fn t_copy_user() -> bool {
         sched::state_of(t)
     );
     let cleanup = sched::terminate_task(t);
-    apic::timer_stop().ok();
+    if !timer_was_running {
+        apic::timer_stop().ok();
+    }
     let pages_back = !mm::is_mapped(base) && !mm::is_mapped(stack_top);
     crate::log_info!(
         "copy: 判定 收尾={} 页已回收={} 恢复不重复={}",
@@ -366,6 +382,12 @@ ktest!(KT_COPY_USER, t_copy_user);
 /// M4-4：`syscall`/`sysret` 快路径。判据的原则是**读用户这一侧回来的事实**，
 /// 不读内核里的常数（ADR-025 的"装机参数"表就是靠这一格兑现的）。
 fn t_syscall_fastpath() -> bool {
+    #[cfg(feature = "timer-probe-log")]
+    crate::log_info!("rte2-entry: test=t_syscall_fastpath rte2={:?}", apic::rte_raw(2));
+    // §199：收尾按原样放回。**入口**记一次状态，只守卫**最后一个** stop；
+    // 中间那些 stop 是被测语义本身（故意停表的窗口），一个都不动。
+    let timer_was_running =
+        apic::wait_ticks(apic::ticks(), 1, crate::clock::window_cycles(1)).ticks >= 1;
     let Some(s) = acpi::summary() else { return false };
     let Some(m) = s.madt else { return false };
     if apic::get_or_init(&m).is_err() {
@@ -455,7 +477,9 @@ fn t_syscall_fastpath() -> bool {
         flead
     );
     let cleanup = sched::terminate_task(t);
-    apic::timer_stop().ok();
+    if !timer_was_running {
+        apic::timer_stop().ok();
+    }
     let ok = trap::fastpath_on()
         && efer & 1 != 0
         // 特性位：程序读到的那一位与内核自己读回的 CR4 两位必须讲同一件事（两台仪器）

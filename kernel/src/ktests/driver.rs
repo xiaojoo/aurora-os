@@ -1188,10 +1188,17 @@ fn t_irq_ahci() -> bool {
         let c0 = apic::counts();
         let (disp0, uncl0) = irq::stats();
         // 旗子得有人来取：本地中断窗口要 IF=1，而 tick 是把被挂住的上下文往前推的那只手
+        // §199：收尾按原样放回（与 t_handle_reap 同一律）。本用例需要表走，所以照样开；
+        // 旧写法无条件 stop，把表停给了后面所有用例（第二终端的前置条件，BACKLOG §198/§199）。
+        let tick_in = apic::ticks();
+        let timer_was_running =
+            apic::wait_ticks(tick_in, 1, crate::clock::window_cycles(1)).ticks >= 1;
         let timer = apic::timer_start().is_ok();
         let mut buf = [0u8; 512];
         let r = apic::with_interrupts(|| ahci::read_bytes(num, 1, &mut buf));
-        let _ = apic::timer_stop();
+        if !timer_was_running {
+            let _ = apic::timer_stop();
+        }
         let c1 = apic::counts();
         let (calls1, hits1) = ctx.irq_counts(h).unwrap_or((0, 0));
         let (disp1, uncl1) = irq::stats();
@@ -1322,10 +1329,17 @@ fn t_irq_affinity() -> bool {
     // 后者是 73f 那一格新加的出口——只有前者可用时，"谁在服务"只能从投递分布反推。
     let step = |who: &'static str| -> ([usize; cpu::MAX_CPUS], [usize; cpu::MAX_CPUS]) {
         ahci::irq_counters_reset();
+        // §199：收尾按原样放回（与 t_handle_reap 同一律）。本用例需要表走，所以照样开；
+        // 旧写法无条件 stop，把表停给了后面所有用例（第二终端的前置条件，BACKLOG §198/§199）。
+        let tick_in = apic::ticks();
+        let timer_was_running =
+            apic::wait_ticks(tick_in, 1, crate::clock::window_cycles(1)).ticks >= 1;
         let timer = apic::timer_start().is_ok();
         let mut buf = [0u8; 512];
         let r = apic::with_interrupts(|| ahci::read_bytes(num, 1, &mut buf));
-        let _ = apic::timer_stop();
+        if !timer_was_running {
+            let _ = apic::timer_stop();
+        }
         let now = irq::by_cpu();
         let (race, race_max) = ahci::race_stats();
         let served = ahci::isr_entry_by_cpu();

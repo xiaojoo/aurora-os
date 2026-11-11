@@ -8134,6 +8134,66 @@ D 支条件：idle 增量全 0 **且** `IDLE_HLT[0]>0` **且** 按向量中断�
 - 行尾：`handle.rs` CRLF 1206、`ktests/time.rs` CRLF 239、`ktest.rs` **LF 78（原样）**、
   `module-interfaces.toml` **LF 840（原样）**、`BACKLOG.md` CRLF，CRCR 全 0。
 
+## 199. 修完 13 处收尾停表：入口读数**确定性改善**，但第二终端**没被消除**（20 跑仍 1 挂、与历史率同）——收尾缺陷是真的，**它不是 D 终端的成因**（2026-11-11，实测）
+
+使用者裁决"继续修剩余 9 处"。**普查先更正**：无守卫的 `timer_stop` 是 **26 处**不是 9 处
+（其中 2 处是注释、1 处是产品路径的启动标定 `main.rs:854 calibrate_clock_once`），
+而且**很多是同一用例内部故意停表的被测窗口**（`t_probe_ring3`/`t_copy_user`/`t_syscall_fastpath` 各 3 处、
+`t_watchdog`/`t_preempt_round_robin` 各 2 处）⇒ **不能盲改**，只有**用例出口那一处**该按原样放回。
+
+### 一、修了什么（13 处，一条统一规则）
+
+**入口记一次状态、只守卫最后一个 stop、中间那些故意停表的窗口一个都不动。**
+- 单对 start→stop 的 6 处：`t_irq_ahci`、`t_irq_affinity`、`t_elf_load_run`、`t_fat32_exec`、
+  `t_user_roundtrip`、`t_task_exit`。
+- 多窗口/多出口的 7 处（只守卫最后一个 stop）：`t_probe_ring3`、`t_preempt_round_robin`、
+  `t_if_belongs_to_cpu`、`t_user_pointer_checks`、`t_copy_user`、`t_syscall_fastpath`、`t_watchdog`。
+- 加上 §198 的 3 处，共 **16 处**。产品路径 `timer_start`/`timer_stop` 语义一个字没动。
+
+### 二、**我自己的错：普查漏判 + 盲改造成编译错**
+
+`t_if_window_nested` **本来就有守卫**，变量叫 `running_on_entry`；我的普查只找 `was_running`/`timer_was_running`
+两个名字 ⇒ **漏判成无守卫**，脚本把探针插进了 `if !running_on_entry { … }` 块内 ⇒ `timer_was_running`
+作用域不可见，**编译错 E0425**（编译器抓住的，不是门禁）。已把 `ktests/sched.rs` 那两处编辑**逐字节撤回**。
+**纪律**：普查"有没有守卫"必须按**语义**（入口有没有记状态、出口有没有按它分支）核，
+不能按变量名子串匹配——这与 §193/§196 那条"先核语义再写判据"是同一条。
+
+### 三、仪器重建在 `ktests/` 侧（§198 说的那条路，走通了）
+
+给 8 个候选用例的**入口**打 `rte2`（门控 `timer-probe-log`）。`ktests/*` 引用 `apic::rte_raw`
+门禁是过的（`ktest` harness 与 `main` 不行，会触发接口登记 + ADR）。**正常构建惰性已证**：
+ELF 里 `timer-probe:`/`rte2-entry:`/`wait-race:` 字符串**各 0 次**。
+
+### 四、读数：入口读数确定性改善，但**挂死率没动**
+
+- run-179（带诊断）：8 个候选用例入口**全 open**；`t_sleep_until` 探测
+  `got=1 cycles=22430491 was_running=true rte2=0x20` ⇒ **前置条件在那一跑消除了**（对比 §197 的 25/25 masked）。
+- ktests **96/95/35 与修前逐字相同** ⇒ 无回归；默认 run-180 **PASS/33、ktests 81/81**，elf `6e71a0275f8d`；
+  `check` **17/17**。
+- **猎挂 20 跑（run-181…200，`--timeout 30`）：19 FAIL / 1 HANG**。
+  **run-188 与 run-118 逐字同形**：46 条、最后 `t_q2_workload_slots`、下一条 `t_sleep_until`、
+  **pin2 masked**（`0x10020`）、`IDLE_HLT[0]=1` 冻结、`IRQ_COUNTS=[191,9,0…]` 冻结、
+  AP tick 照涨、`armed=0 待唤醒=0`、等待账 **7/1/0/0** ⇒ 判别表 **D 支**。
+- **1/20 = 5%，与历史率（1/20、1/14）相同 ⇒ 没有任何改善证据**，第二终端**没被消除**。
+
+### 五、结论（这一轮真正的收获，是个阴性结果）
+
+**收尾无条件停表是真的系统性卫生缺陷**（16 处已修，入口读数从"确定性 masked"变成"确定性 open"，
+这是可复现的改善），**但它不是 D 终端的成因**：前置条件在测量那一跑已消除，挂死仍以原率原形状发生。
+⇒ 挂死现场的 masked 状态**另有来源**，或者**自愈那条路本身失效**（`timer_start` 没被调/没生效/之后又被屏蔽）。
+**三者今天分不开，未证。** 不拿"入口读数变好"当成"挂死修好"。
+
+### 六、没做 / 仍开着 / 下一步
+
+- **没修 D 终端**；剩余无守卫停表点（多窗口用例的中间窗口、`main.rs:854` 启动标定）**有意不动**。
+- 仍开着：D 终端、shootdown 那条（§183，run-174 又撞到一次）、S4、ADR-080 未决 1–5、ADR-078 未决 2–6。
+- **下一步（缺的就是这一个测量）**：**带着 `timer-probe-log` 撞到一次挂死**，读那一跑
+  `t_sleep_until` 的探测行——`was_running` 是 true 还是 false、`timer_start` 有没有被调、
+  调完 `rte2` 是什么。这一行就能把"自愈没被触发"与"自愈触发但失效"分开。
+  率约 5%，预算 20–40 跑；诊断已就位且惰性已证。
+- 行尾：7 个改动文件全 CRLF（driver 1677 / elf 1036 / fs 987 / sched 2109 / syscall 510 / user 450 / watchdog 136），
+  LF-only 与 CRCR 全 0；`BACKLOG.md` CRLF。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

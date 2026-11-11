@@ -15,6 +15,12 @@ use crate::ktest;
 /// 7 用例自己停表，所以进来时先量"心跳原本在不在前进"，收尾按进来时的状态放回
 /// 用例每格之间用 TSC 等 30 ms 真实时间（比 10 ms 的定时周期宽三倍）。
 fn t_watchdog() -> bool {
+    #[cfg(feature = "timer-probe-log")]
+    crate::log_info!("rte2-entry: test=t_watchdog rte2={:?}", apic::rte_raw(2));
+    // §199：收尾按原样放回。**入口**记一次状态，只守卫**最后一个** stop；
+    // 中间那些 stop 是被测语义本身（故意停表的窗口），一个都不动。
+    let timer_was_running =
+        apic::wait_ticks(apic::ticks(), 1, crate::clock::window_cycles(1)).ticks >= 1;
     use watchdog as wd;
     // 用例自足（T0.1 顺序暴露）：`timer_start`/`timer_stop` 都要 APIC 已初始化；
     // 否则它们返回 Err 被 `.ok()` 吞掉，下面"停表"那几窗其实没停，报警永远不会来。
@@ -87,7 +93,9 @@ fn t_watchdog() -> bool {
     settle();
     let cleared = wd::sample() == 0;
     if !running_on_entry {
-        apic::timer_stop().ok();
+        if !timer_was_running {
+            apic::timer_stop().ok();
+        }
     }
     let (samples, windows, events, last_mask, actions) = wd::stats();
     let counters = windows >= 1 && events >= 1 && last_mask == 0 && actions == 0;

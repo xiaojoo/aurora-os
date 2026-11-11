@@ -386,6 +386,11 @@ fn t_elf_load_run() -> bool {
             return false;
         }
     };
+    // §199：收尾按原样放回（与 t_handle_reap 同一律）。本用例需要表走，所以照样开；
+    // 旧写法无条件 stop，把表停给了后面所有用例（第二终端的前置条件，BACKLOG §198/§199）。
+    let tick_in = apic::ticks();
+    let timer_was_running =
+        apic::wait_ticks(tick_in, 1, crate::clock::window_cycles(1)).ticks >= 1;
     apic::timer_start().ok();
     // **容量的证人**（M4 欠账第一条的落点）：一个任务名下的映射条数。
     // 按段切块之前它是"页数 + 2"（这份夹具 5 页 ⇒ 7 条）；现在每段按"剩余页数的二进制位数"
@@ -431,7 +436,9 @@ fn t_elf_load_run() -> bool {
             crate::log_fatal!("elfload: 窗口收不了场（启动上下文没回到 CPU）");
         }
     });
-    apic::timer_stop().ok();
+    if !timer_was_running {
+        apic::timer_stop().ok();
+    }
     let magic = user::read_at(loaded.data_va);
     // 偏移 8/16/24/32 是夹具的约定（`user/hello` 的 `OFF_*`）。它们不是内核读出来的，
     // 但**魔数在偏移 0 到位**证明了这一页就是那个结构、且程序的写入落在这里；
@@ -627,6 +634,12 @@ const PROBE_CALLS: u64 = 21;
 
 #[cfg(feature = "handles")]
 fn t_probe_ring3() -> bool {
+    #[cfg(feature = "timer-probe-log")]
+    crate::log_info!("rte2-entry: test=t_probe_ring3 rte2={:?}", apic::rte_raw(2));
+    // §199：收尾按原样放回。**入口**记一次状态，只守卫**最后一个** stop；
+    // 中间那些 stop 是被测语义本身（故意停表的窗口），一个都不动。
+    let timer_was_running =
+        apic::wait_ticks(apic::ticks(), 1, crate::clock::window_cycles(1)).ticks >= 1;
     use crate::ktests::common::PROBE_ELF;
     let Some(s) = acpi::summary() else { return false };
     let Some(m) = s.madt else { return false };
@@ -857,7 +870,9 @@ fn t_probe_ring3() -> bool {
             tsc::spin(20_000);
         }
     });
-    apic::timer_stop().ok();
+    if !timer_was_running {
+        apic::timer_stop().ok();
+    }
     let code_still = child_as
         .and_then(|a| mm::aspace_effective_flags(a, 0x3_0000_0000))
         .is_some_and(|f| f.user && f.executable);
