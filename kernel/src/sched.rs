@@ -980,6 +980,12 @@ pub fn if_loads() -> (usize, usize) {
 
 /// 某个任务当前存的异常帧里 IF 位的状态。None = 这个任务还没有异常帧。
 /// 用例用它把 ADR-021 变成一次读数，而不是我的一句话。
+/// §220：换入点探针（定义见 `preempt_point` 里的写入处）。`#[used]` 防链接器回收
+/// （§216 踩过：无调用者的静态量会被当死代码删掉，宿主机就"符号找不到 ⇒ 整段不读"）。
+#[used]
+static SWITCH_PROBE: [core::sync::atomic::AtomicU64; 5] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 5];
+
 pub fn frame_if_bit(slot_task: usize) -> Option<bool> {
     frame_rflags_of(slot_task).map(|f| f & RFLAGS_IF != 0)
 }
@@ -2347,6 +2353,16 @@ pub unsafe fn preempt_point(frame: u64, cpu: usize) {
     #[cfg(feature = "fault-if-carriage")]
     let if_open = frame_if_bit(next).unwrap_or(false);
     IF_LOADS[usize::from(if_open)].fetch_add(1, Ordering::Relaxed);
+    // §220 **零串口换入探针**：run-701 实测 BSP 在 ring3 关中断自旋（IF=0 HLT=0 RIP 用户半区、
+    // LAPIC IRR=32 已锁存）⇒ 要回答"换入它时牌是几"。只写静态量、串口零加行。
+    // 槽0=最后一次 if_open 1=最后一次换入的 gidx 2=最后一次 cpu 3=牌=0 的换入次数 4=换入总次数
+    SWITCH_PROBE[0].store(u64::from(if_open), Ordering::Relaxed);
+    SWITCH_PROBE[1].store(next as u64, Ordering::Relaxed);
+    SWITCH_PROBE[2].store(cpu as u64, Ordering::Relaxed);
+    if !if_open {
+        SWITCH_PROBE[3].fetch_add(1, Ordering::Relaxed);
+    }
+    SWITCH_PROBE[4].fetch_add(1, Ordering::Relaxed);
     // P1 的 SUM/MIN/MAX 三张表**今天仍是全局一份**。这在本段是成立的，因为
     // `runs_sched` 只有 BSP 为真——AP 跑调度之后，"两个核的切换成本"会被合成一个 min，
     // 那把尺子的含义就变了（与 P3/P5 同一件事，一起 per-CPU 化，见任务 #11 的第 2 步）。

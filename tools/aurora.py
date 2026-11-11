@@ -2471,6 +2471,7 @@ WEDGE_SYMBOLS = [
     # §215 零串口步骤探针（elfload / two_containers 的停点定位）
     (("ktests", "elf", "ELF_PROBE"), "ELF步骤", 8),
     (("ktests", "elf", "FAT32_PROBE"), "FAT32步骤", 8),
+    (("sched", "SWITCH_PROBE"), "换入探针", 8),
 ]
 
 
@@ -2713,6 +2714,10 @@ def wedge_probe(port: int, log: str, elf: Path, build_dir: Path, seq: int, dump:
     fp = b.get("FAT32步骤")
     if fp:
         out.append(f"  FAT32步骤探针 最后步骤={fp[0]} t_fat32_exec进入={fp[1]}")
+    sw = b.get("换入探针")
+    if sw:
+        out.append(f"  换入探针 最后if_open={sw[0]} 最后换入gidx={sw[1]} cpu={sw[2]}"
+                   f" 牌0换入次数={sw[3]} 换入总次数={sw[4]}")
     out.append("wedge 判定: " + verdict)
     return "\n".join(out)
 
