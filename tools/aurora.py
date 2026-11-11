@@ -2691,8 +2691,29 @@ def wedge_probe(port: int, log: str, elf: Path, build_dir: Path, seq: int) -> st
 
 def qmp_hang_evidence(port: int, log: str, build_dir: Path, seq: int) -> str:
     """超时那一次的完整取证：寄存器/LAPIC/PIC + 无锁现场表读回 + 两种自查判据 + 中断源/丢唤醒判别。"""
-    dump = qmp_snapshot(port, ["info registers -a", "info lapic", "info pic"])
+    # §218：投递侧取证。pin2 未屏蔽却 IRQ 冻结 ⇒ 要问"PIT 还在不在走、BSP 的 LAPIC 挡没挡"。
+    # `info pit` 不是所有 QEMU 都有；取不到就明说取不到，**不拿空值冒充读数**。
+    dump = qmp_snapshot(port, ["info registers -a", "info lapic", "info pic", "info pit"])
+    text_extra = []
+    m = re.search(r"APR\s+(0x[0-9a-f]+)\s+TPR\s+(0x[0-9a-f]+).*?PPR\s+(0x[0-9a-f]+)", dump)
+    if m:
+        text_extra.append(f"投递侧 BSP LAPIC: APR={m.group(1)} TPR={m.group(2)} PPR={m.group(3)}"
+                          "（TPR/PPR 的 bit7:4 >= vec32 的 0x2 就会挡住 PIT）")
+    else:
+        text_extra.append("投递侧 BSP LAPIC: **没解析到 APR/TPR/PPR**（info lapic 格式变了？）")
+    isr = re.search(r"^ISR\s+(.*)$", dump, re.M)
+    irr = re.search(r"^IRR\s+(.*)$", dump, re.M)
+    rirr = re.search(r"Remote IRR\s+(.*)", dump)
+    text_extra.append(f"投递侧 ISR={isr.group(1).strip() if isr else '?'} IRR={irr.group(1).strip() if irr else '?'}"
+                      f" ioapic RemoteIRR={rirr.group(1).strip() if rirr else '?'}")
+    pit = dump.split("### info pit")[-1] if "### info pit" in dump else ""
+    if pit and "unknown" not in pit.lower() and "not supported" not in pit.lower() and pit.strip():
+        text_extra.append("投递侧 PIT 原文已取回（见下方 info pit 段）")
+    else:
+        text_extra.append("投递侧 PIT: **这个 QEMU 的 info pit 取不到** ⇒ PIT 计数器状态仍是盲区，"
+                          "要另找路（例如让 AP 的 tick ISR 采样 PIT 端口写进静态量）")
     text, table = fatalrec_readback(port, log, build_dir, seq)
+    text = chr(10).join(text_extra) + chr(10) + text
     bad, green = fatal_selfcheck(log, table)
     if bad:
         text += "\n" + "；".join(bad)
