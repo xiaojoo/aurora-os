@@ -1350,9 +1350,16 @@ fn shootdown_inner(va: u64, mask: Option<u8>) {
             SD_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
             SD_VA.store(0, Ordering::Release);
             // 收不齐回执就归还物理帧 = 允许两个主人同时持有同一块页（§9.2 直接 L4）。
+            // §204 诊断：只说"还差几个"不够——要能点名**是谁**没回执、它当时开没开中断窗口。
+            // 三个数组都在**栈上**（故障路径不分配，AGENTS 硬约束 6）；前缀
+            // "L4 mm: shootdown 超时" 一字不动，宿主机 l4_exit_cascade 的锚仍命中。
+            // 宽度用 SD_ACKS.len() 取，**不新写 arch 路径**：ADR-044 棘轮规定环内
+            // memory->arch 站点只许减不许增，为一条诊断加站点会被当场打红（本轮实测）。
+            let acks_now: [usize; SD_ACKS.len()] =
+                core::array::from_fn(|s2| SD_ACKS[s2].load(Ordering::Acquire));
             crate::log_fatal!(
-                "L4 mm: shootdown 超时 va={:#x} 还差 {} 个回执（每个在线 CPU 各等一次，上界 {} 周期）",
-                va, missing, SHOOTDOWN_DEADLINE_CYCLES
+                "L4 mm: shootdown 超时 va={:#x} 还差 {} 个回执（每个在线 CPU 各等一次，上界 {} 周期）base={:?} acks={:?} me={}",
+                va, missing, SHOOTDOWN_DEADLINE_CYCLES, base, acks_now, me
             );
             crate::exit::finish(crate::exit::Code::ExceptionFatal);
         }
