@@ -2717,7 +2717,8 @@ def wedge_probe(port: int, log: str, elf: Path, build_dir: Path, seq: int, dump:
     sw = b.get("换入探针")
     if sw:
         out.append(f"  换入探针 最后if_open={sw[0]} 最后换入gidx={sw[1]} cpu={sw[2]}"
-                   f" 牌0换入次数={sw[3]} 换入总次数={sw[4]}")
+                   f" 牌0换入次数={sw[3]} 换入总次数={sw[4]}"
+                   f" **最后一次牌0换入: gidx={sw[5]} cpu={sw[6]} 第{sw[7]}次**")
     out.append("wedge 判定: " + verdict)
     return "\n".join(out)
 

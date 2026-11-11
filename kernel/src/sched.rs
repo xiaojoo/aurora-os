@@ -983,8 +983,8 @@ pub fn if_loads() -> (usize, usize) {
 /// §220：换入点探针（定义见 `preempt_point` 里的写入处）。`#[used]` 防链接器回收
 /// （§216 踩过：无调用者的静态量会被当死代码删掉，宿主机就"符号找不到 ⇒ 整段不读"）。
 #[used]
-static SWITCH_PROBE: [core::sync::atomic::AtomicU64; 5] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; 5];
+static SWITCH_PROBE: [core::sync::atomic::AtomicU64; 8] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 8];
 
 pub fn frame_if_bit(slot_task: usize) -> Option<bool> {
     frame_rflags_of(slot_task).map(|f| f & RFLAGS_IF != 0)
@@ -2355,12 +2355,18 @@ pub unsafe fn preempt_point(frame: u64, cpu: usize) {
     IF_LOADS[usize::from(if_open)].fetch_add(1, Ordering::Relaxed);
     // §220 **零串口换入探针**：run-701 实测 BSP 在 ring3 关中断自旋（IF=0 HLT=0 RIP 用户半区、
     // LAPIC IRR=32 已锁存）⇒ 要回答"换入它时牌是几"。只写静态量、串口零加行。
-    // 槽0=最后一次 if_open 1=最后一次换入的 gidx 2=最后一次 cpu 3=牌=0 的换入次数 4=换入总次数
+    // 槽0=最后一次 if_open 1=最后一次换入 gidx 2=最后一次 cpu 3=牌0换入次数 4=换入总次数
+    // 槽5=**最后一次牌0换入的 gidx** 6=**那次的 cpu** 7=**它是第几次牌0换入**（§225）
     SWITCH_PROBE[0].store(u64::from(if_open), Ordering::Relaxed);
     SWITCH_PROBE[1].store(next as u64, Ordering::Relaxed);
     SWITCH_PROBE[2].store(cpu as u64, Ordering::Relaxed);
     if !if_open {
-        SWITCH_PROBE[3].fetch_add(1, Ordering::Relaxed);
+        // §225：只记"最后一次换入"抓不到目标那一刻（run-782 的最后一次是 AP 且 if_open=1）。
+        // 这三槽专门锁存**最后一次牌=0 的换入**：5=gidx 6=cpu 7=它是第几次牌0换入。
+        let n0 = SWITCH_PROBE[3].fetch_add(1, Ordering::Relaxed) + 1;
+        SWITCH_PROBE[5].store(next as u64, Ordering::Relaxed);
+        SWITCH_PROBE[6].store(cpu as u64, Ordering::Relaxed);
+        SWITCH_PROBE[7].store(n0, Ordering::Relaxed);
     }
     SWITCH_PROBE[4].fetch_add(1, Ordering::Relaxed);
     // P1 的 SUM/MIN/MAX 三张表**今天仍是全局一份**。这在本段是成立的，因为
