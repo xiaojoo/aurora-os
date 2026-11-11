@@ -1284,8 +1284,17 @@ fn t_sleep_until() -> bool {
     let tick_in = apic::ticks();
     let probe = apic::wait_ticks(tick_in, 1, clock::window_cycles(1));
     let was_running = probe.ticks >= 1;
+    // §197 诊断（门控）：第二终端现场 pin2 是 masked，而本用例本该自愈。
+    // 这几个数直接回答"探测读到了什么、有没有开表、开完 RTE 是什么样"。
+    #[cfg(feature = "timer-probe-log")]
+    crate::log_info!(
+        "timer-probe: tick_in={} got={} cycles={} rounds={} was_running={} rte2={:?}",
+        tick_in, probe.ticks, probe.cycles, probe.rounds, was_running, apic::rte_raw(2)
+    );
     if !was_running {
-        apic::timer_start().ok();
+        let r = apic::timer_start();
+        #[cfg(feature = "timer-probe-log")]
+        crate::log_info!("timer-probe: 开表结果={:?} rte2={:?}", r, apic::rte_raw(2));
     }
     let (reg0, fired0, _) = sched::timer_stats(cpu::BSP_SLOT);
     let t0 = tsc::now();
