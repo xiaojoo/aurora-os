@@ -569,6 +569,7 @@ static ELF_DISK: ElfDiskScratch = ElfDiskScratch(UnsafeCell::new([0u8; ELF_DISK_
 /// ⑤ 与 ⑥ 是这一格特有的：**"容器对不对"以前只能信内嵌那份字节**，因为输入是我编的；
 /// 现在输入来自一块真盘上的元数据，"目录项撒谎时不许往下装"才第一次成为可判的事。
 fn t_fat32_exec() -> bool {
+    crate::ktests::elf::fat32_probe_enter();
     use filesystem::fat32::{FsError, Volume, EOC_MARKER};
     use filesystem::vfs::{AhciDisk, FileStat};
 
@@ -832,6 +833,7 @@ fn t_fat32_exec() -> bool {
             user::write_at(loaded.data_va + user::ABI_SLOT_HANDLE, h.0);
             user::write_at(loaded.data_va + user::ABI_SLOT_FLAG, user::FLAG_HANDLE);
             crate::log_info!("elfdisk: 授予容器 句柄={:#x} 主人=({},{})", h.0, owner.0, owner.1);
+            crate::ktests::elf::fmark(30);
             h
         }
         None => {
@@ -842,9 +844,11 @@ fn t_fat32_exec() -> bool {
     // §199：收尾按原样放回（与 t_handle_reap 同一律）。本用例需要表走，所以照样开；
     // 旧写法无条件 stop，把表停给了后面所有用例（第二终端的前置条件，BACKLOG §198/§199）。
     let tick_in = apic::ticks();
+    crate::ktests::elf::fmark(31);
     let timer_was_running =
         apic::wait_ticks(tick_in, 2, crate::clock::window_cycles(2)).ticks >= 2;
     apic::timer_start().ok();
+    crate::ktests::elf::fmark(33);
     let mut rounds = 0u64;
     apic::with_interrupts(|| {
         let t0 = tsc::now();
@@ -858,12 +862,16 @@ fn t_fat32_exec() -> bool {
             tsc::spin(20_000);
         }
         tsc::spin(2_000_000);
-        if !sched::wait_for_boot_task(300_000_000) {
+        crate::ktests::elf::fmark(34);
+    let __w = sched::wait_for_boot_task(300_000_000);
+    crate::ktests::elf::fmark(35);
+    if !__w {
             crate::log_fatal!("elfdisk: 窗口收不了场（启动上下文没回到 CPU）");
         }
     });
     if !timer_was_running {
         apic::timer_stop().ok();
+        crate::ktests::elf::fmark(36);
     }
     let magic = user::read_at(loaded.data_va);
     let ping = user::read_at(loaded.data_va + 8);

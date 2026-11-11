@@ -2470,6 +2470,7 @@ WEDGE_SYMBOLS = [
     (("ktests", "sched", "SLEEP_PROBE"), "睡眠探测", 8),
     # §215 零串口步骤探针（elfload / two_containers 的停点定位）
     (("ktests", "elf", "ELF_PROBE"), "ELF步骤", 8),
+    (("ktests", "elf", "FAT32_PROBE"), "FAT32步骤", 8),
 ]
 
 
@@ -2681,6 +2682,9 @@ def wedge_probe(port: int, log: str, elf: Path, build_dir: Path, seq: int) -> st
     ep = b.get("ELF步骤")
     if ep:
         out.append(f"  ELF步骤探针 最后步骤={ep[0]} elf_load进入={ep[1]} two_containers进入={ep[2]} elf_load离开={ep[3]}")
+    fp = b.get("FAT32步骤")
+    if fp:
+        out.append(f"  FAT32步骤探针 最后步骤={fp[0]} t_fat32_exec进入={fp[1]}")
     out.append("wedge 判定: " + verdict)
     return "\n".join(out)
 

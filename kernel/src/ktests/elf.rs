@@ -341,6 +341,22 @@ ktest!(KT_ELF, t_elf_container);
 static ELF_PROBE: [core::sync::atomic::AtomicU64; 4] =
     [const { core::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// §216：`t_fat32_exec` 的步骤探针。**定义放在未门控的 elf.rs**，因为 `ktests::fs` 整个模块
+/// 被 `fat32-probe` 门控 ⇒ 定义放那边会让默认构建里符号不存在，宿主机仪器会"符号找不到 ⇒ 整段不读"。
+/// 槽0=最后步骤号 1=进入次数。步骤：30=授予容器日志后 31=身份查到 33=timer_start 后
+/// 34=进 wait_for_boot_task 前 35=wait 返回后 36=timer_stop 后
+#[used]
+pub(crate) static FAT32_PROBE: [core::sync::atomic::AtomicU64; 2] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 2];
+
+pub(crate) fn fmark(step: u64) {
+    FAT32_PROBE[0].store(step, core::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn fat32_probe_enter() {
+    FAT32_PROBE[1].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
 fn mark(step: u64) {
     ELF_PROBE[0].store(step, core::sync::atomic::Ordering::Relaxed);
 }
