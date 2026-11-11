@@ -21,7 +21,7 @@ fn t_timer_ticks_recur() -> bool {
     // §198：收尾按原样放回（与 t_handle_reap 同一律）。本用例需要表走，所以照样开；
     // 但旧写法无条件 stop，把表停给了后面所有用例（实测边界日志钉到本用例）。
     let tick_in = apic::ticks();
-    let timer_was_running = apic::wait_ticks(tick_in, 1, clock::window_cycles(1)).ticks >= 1;
+    let timer_was_running = apic::wait_ticks(tick_in, 2, clock::window_cycles(2)).ticks >= 2;
     if apic::timer_start().is_err() {
         crate::log_fatal!("timer test: 打不开定时器中断");
         return false;
@@ -184,7 +184,7 @@ fn t_no_alloc_in_isr() -> bool {
     // §198：收尾按原样放回（同一律）。本用例需要表走，所以照样开；
     // 但旧写法无条件 stop，把表停给了后面所有用例（实测边界日志钉到本用例）。
     let tick_in = apic::ticks();
-    let timer_was_running = apic::wait_ticks(tick_in, 1, clock::window_cycles(1)).ticks >= 1;
+    let timer_was_running = apic::wait_ticks(tick_in, 2, clock::window_cycles(2)).ticks >= 2;
     if apic::timer_start().is_err() {
         crate::log_fatal!("isr-alloc test: 打不开定时器中断");
         return false;

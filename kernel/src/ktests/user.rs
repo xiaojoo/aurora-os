@@ -130,7 +130,7 @@ fn t_user_roundtrip() -> bool {
     // 旧写法无条件 stop，把表停给了后面所有用例（第二终端的前置条件，BACKLOG §198/§199）。
     let tick_in = apic::ticks();
     let timer_was_running =
-        apic::wait_ticks(tick_in, 1, crate::clock::window_cycles(1)).ticks >= 1;
+        apic::wait_ticks(tick_in, 2, crate::clock::window_cycles(2)).ticks >= 2;
     apic::timer_start().ok();
     // **换入之前**把两条用户任务的异常帧逐格读回来。这条打印不是装饰：
     // iretq 的字段没有类型系统保护，"写进去的值"与"CPU 读到的值"之间唯一的证人就是它。
@@ -287,7 +287,7 @@ fn t_task_exit() -> bool {
     // 旧写法无条件 stop，把表停给了后面所有用例（第二终端的前置条件，BACKLOG §198/§199）。
     let tick_in = apic::ticks();
     let timer_was_running =
-        apic::wait_ticks(tick_in, 1, crate::clock::window_cycles(1)).ticks >= 1;
+        apic::wait_ticks(tick_in, 2, crate::clock::window_cycles(2)).ticks >= 2;
     apic::timer_start().ok();
 
     // ---- 一轮 = 装载 → 跑 → 结束（mode 决定谁发起结束）→ 回收 → 检查账目

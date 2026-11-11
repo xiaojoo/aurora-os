@@ -18,7 +18,7 @@ fn t_watchdog() -> bool {
     // §199：收尾按原样放回。**入口**记一次状态，只守卫**最后一个** stop；
     // 中间那些 stop 是被测语义本身（故意停表的窗口），一个都不动。
     let timer_was_running =
-        apic::wait_ticks(apic::ticks(), 1, crate::clock::window_cycles(1)).ticks >= 1;
+        apic::wait_ticks(apic::ticks(), 2, crate::clock::window_cycles(2)).ticks >= 2;
     use watchdog as wd;
     // 用例自足（T0.1 顺序暴露）：`timer_start`/`timer_stop` 都要 APIC 已初始化；
     // 否则它们返回 Err 被 `.ok()` 吞掉，下面"停表"那几窗其实没停，报警永远不会来。

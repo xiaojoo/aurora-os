@@ -79,7 +79,7 @@ fn t_user_pointer_checks() -> bool {
     // §199：收尾按原样放回。**入口**记一次状态，只守卫**最后一个** stop；
     // 中间那些 stop 是被测语义本身（故意停表的窗口），一个都不动。
     let timer_was_running =
-        apic::wait_ticks(apic::ticks(), 1, crate::clock::window_cycles(1)).ticks >= 1;
+        apic::wait_ticks(apic::ticks(), 2, crate::clock::window_cycles(2)).ticks >= 2;
     let Some(s) = acpi::summary() else { return false };
     let Some(m) = s.madt else { return false };
     if apic::get_or_init(&m).is_err() {
@@ -212,7 +212,7 @@ fn t_copy_user() -> bool {
     // §199：收尾按原样放回。**入口**记一次状态，只守卫**最后一个** stop；
     // 中间那些 stop 是被测语义本身（故意停表的窗口），一个都不动。
     let timer_was_running =
-        apic::wait_ticks(apic::ticks(), 1, crate::clock::window_cycles(1)).ticks >= 1;
+        apic::wait_ticks(apic::ticks(), 2, crate::clock::window_cycles(2)).ticks >= 2;
     let Some(s) = acpi::summary() else { return false };
     let Some(m) = s.madt else { return false };
     if apic::get_or_init(&m).is_err() {
@@ -381,7 +381,7 @@ fn t_syscall_fastpath() -> bool {
     // §199：收尾按原样放回。**入口**记一次状态，只守卫**最后一个** stop；
     // 中间那些 stop 是被测语义本身（故意停表的窗口），一个都不动。
     let timer_was_running =
-        apic::wait_ticks(apic::ticks(), 1, crate::clock::window_cycles(1)).ticks >= 1;
+        apic::wait_ticks(apic::ticks(), 2, crate::clock::window_cycles(2)).ticks >= 2;
     let Some(s) = acpi::summary() else { return false };
     let Some(m) = s.madt else { return false };
     if apic::get_or_init(&m).is_err() {

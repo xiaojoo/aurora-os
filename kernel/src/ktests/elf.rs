@@ -390,7 +390,7 @@ fn t_elf_load_run() -> bool {
     // 旧写法无条件 stop，把表停给了后面所有用例（第二终端的前置条件，BACKLOG §198/§199）。
     let tick_in = apic::ticks();
     let timer_was_running =
-        apic::wait_ticks(tick_in, 1, crate::clock::window_cycles(1)).ticks >= 1;
+        apic::wait_ticks(tick_in, 2, crate::clock::window_cycles(2)).ticks >= 2;
     apic::timer_start().ok();
     // **容量的证人**（M4 欠账第一条的落点）：一个任务名下的映射条数。
     // 按段切块之前它是"页数 + 2"（这份夹具 5 页 ⇒ 7 条）；现在每段按"剩余页数的二进制位数"
@@ -637,7 +637,7 @@ fn t_probe_ring3() -> bool {
     // §199：收尾按原样放回。**入口**记一次状态，只守卫**最后一个** stop；
     // 中间那些 stop 是被测语义本身（故意停表的窗口），一个都不动。
     let timer_was_running =
-        apic::wait_ticks(apic::ticks(), 1, crate::clock::window_cycles(1)).ticks >= 1;
+        apic::wait_ticks(apic::ticks(), 2, crate::clock::window_cycles(2)).ticks >= 2;
     use crate::ktests::common::PROBE_ELF;
     let Some(s) = acpi::summary() else { return false };
     let Some(m) = s.madt else { return false };
@@ -967,8 +967,8 @@ fn t_two_containers() -> bool {
         Err(e) => { crate::log_fatal!("2box: probe spawn {:?}", e); return false; }
     };
     let tick_in = apic::ticks();
-    let probe = apic::wait_ticks(tick_in, 1, crate::clock::window_cycles(1));
-    let was_running = probe.ticks >= 1;
+    let probe = apic::wait_ticks(tick_in, 2, crate::clock::window_cycles(2));
+    let was_running = probe.ticks >= 2;
     if !was_running { apic::timer_start().ok(); }
     // 窗口内**只给时间**，不读用户页：`read_at` 要开 AC，而开着 AC 的那几行里不许有中断
     // （SMAP，与 t_elf_load_run/t_probe_ring3 同一条纪律）。两个程序都很短（各几个 syscall），

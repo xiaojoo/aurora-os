@@ -53,7 +53,7 @@ fn t_preempt_round_robin() -> bool {
     // §199：收尾按原样放回。**入口**记一次状态，只守卫**最后一个** stop；
     // 中间那些 stop 是被测语义本身（故意停表的窗口），一个都不动。
     let timer_was_running =
-        apic::wait_ticks(apic::ticks(), 1, crate::clock::window_cycles(1)).ticks >= 1;
+        apic::wait_ticks(apic::ticks(), 2, crate::clock::window_cycles(2)).ticks >= 2;
     let Some(s) = acpi::summary() else { return false };
     let Some(m) = s.madt else { return false };
     if apic::get_or_init(&m).is_err() {
@@ -347,7 +347,7 @@ fn t_if_belongs_to_cpu() -> bool {
     // §199：收尾按原样放回。**入口**记一次状态，只守卫**最后一个** stop；
     // 中间那些 stop 是被测语义本身（故意停表的窗口），一个都不动。
     let timer_was_running =
-        apic::wait_ticks(apic::ticks(), 1, crate::clock::window_cycles(1)).ticks >= 1;
+        apic::wait_ticks(apic::ticks(), 2, crate::clock::window_cycles(2)).ticks >= 2;
     let Some(s) = acpi::summary() else { return false };
     let Some(m) = s.madt else { return false };
     if apic::get_or_init(&m).is_err() {
@@ -458,8 +458,8 @@ fn t_if_window_nested() -> bool {
     apic::close_cpu_window(slot);
     // 用例自足：tick 靠表驱动，而 `.ktests` 顺序由链接器定，前面的用例可能把表停了
     // （与 `t_sleep_until` 同一形状）。这个 probe 自己开窗关窗，落在前提之后，不影响判据。
-    let probe = apic::wait_ticks(apic::ticks(), 1, clock::window_cycles(1));
-    let running_on_entry = probe.ticks >= 1;
+    let probe = apic::wait_ticks(apic::ticks(), 2, clock::window_cycles(2));
+    let running_on_entry = probe.ticks >= 2;
     if !running_on_entry {
         apic::timer_start().ok();
     }
@@ -1309,8 +1309,8 @@ fn t_sleep_until() -> bool {
     // 用例自足：轮靠 tick 扫，而 .ktests 顺序由链接器定，前面的用例可能把表停了
     // （实测不保证就直接 HANG 3/3）。先量进来时心跳有没有在走，不在走就开表，收尾按原样放回。
     let tick_in = apic::ticks();
-    let probe = apic::wait_ticks(tick_in, 1, clock::window_cycles(1));
-    let was_running = probe.ticks >= 1;
+    let probe = apic::wait_ticks(tick_in, 2, clock::window_cycles(2));
+    let was_running = probe.ticks >= 2;
     // §201：读数进静态量，**不往串口加行**（理由见 SLEEP_PROBE 头注释）。
     SLEEP_PROBE[0].store(tick_in as u64, Ordering::Relaxed);
     SLEEP_PROBE[1].store(probe.ticks, Ordering::Relaxed);
@@ -1400,8 +1400,8 @@ fn t_wait_timeout() -> bool {
     let d = tick * 2;
     // 用例自足于时钟状态（与 t_sleep_until 同一理由：链接顺序可能让前面的用例停过表）
     let tick_in = apic::ticks();
-    let probe = apic::wait_ticks(tick_in, 1, clock::window_cycles(1));
-    let was_running = probe.ticks >= 1;
+    let probe = apic::wait_ticks(tick_in, 2, clock::window_cycles(2));
+    let was_running = probe.ticks >= 2;
     if !was_running {
         apic::timer_start().ok();
     }
@@ -1486,8 +1486,8 @@ fn t_kill_blocked_cleans_registrations() -> bool {
     // 用例自足于时钟状态（与 t_wait_timeout 同一理由：链接顺序可能让前面的用例停过表）。
     // 收尾要靠在跑的用例被 tick 换回来，表停了那一步就永远等不到。
     let tick_in = apic::ticks();
-    let probe = apic::wait_ticks(tick_in, 1, clock::window_cycles(1));
-    let was_running = probe.ticks >= 1;
+    let probe = apic::wait_ticks(tick_in, 2, clock::window_cycles(2));
+    let was_running = probe.ticks >= 2;
     if !was_running {
         apic::timer_start().ok();
     }
@@ -2041,8 +2041,8 @@ fn t_q2_workload_slots() -> bool {
         crate::calibrate_clock_once();
     }
     let tick_in = apic::ticks();
-    let probe = apic::wait_ticks(tick_in, 1, clock::window_cycles(1));
-    let was_running = probe.ticks >= 1;
+    let probe = apic::wait_ticks(tick_in, 2, clock::window_cycles(2));
+    let was_running = probe.ticks >= 2;
     if !was_running {
         apic::timer_start().ok();
     }

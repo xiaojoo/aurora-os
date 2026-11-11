@@ -818,8 +818,8 @@ fn t_proc_job_wait() -> bool {
         crate::calibrate_clock_once();
     }
     let tick_in = crate::arch::x86_64::apic::ticks();
-    let probe = crate::arch::x86_64::apic::wait_ticks(tick_in, 1, crate::clock::window_cycles(1));
-    let was_running = probe.ticks >= 1;
+    let probe = crate::arch::x86_64::apic::wait_ticks(tick_in, 2, crate::clock::window_cycles(2));
+    let was_running = probe.ticks >= 2;
     if !was_running { crate::arch::x86_64::apic::timer_start().ok(); }
     // wait_ticks 返回时窗口已经关掉（ADR-068）；等待必须开在窗口里，否则换过去之后
     // 再也不会被 tick 抢占回来。
@@ -2084,8 +2084,8 @@ fn t_process_startup() -> bool {
     let va0 = mm::reservation_count();
     let c0 = handle::counters();
     let tick_in = apic::ticks();
-    let probe = apic::wait_ticks(tick_in, 1, crate::clock::window_cycles(1));
-    let was_running = probe.ticks >= 1;
+    let probe = apic::wait_ticks(tick_in, 2, crate::clock::window_cycles(2));
+    let was_running = probe.ticks >= 2;
     if !was_running { apic::timer_start().ok(); }
     for a in PROC_SYS.iter() { a.store(0, core::sync::atomic::Ordering::Relaxed); }
     let g = match sched::spawn(proc_sys_worker) { Ok(v) => v, Err(_) => { crate::log_fatal!("psys: spawn 失败"); return false; } };
@@ -2311,8 +2311,8 @@ fn t_object_wait() -> bool {
     }
     let f0 = mm::free_frames();
     let tick_in = apic::ticks();
-    let probe = apic::wait_ticks(tick_in, 1, crate::clock::window_cycles(1));
-    let was_running = probe.ticks >= 1;
+    let probe = apic::wait_ticks(tick_in, 2, crate::clock::window_cycles(2));
+    let was_running = probe.ticks >= 2;
     if !was_running { apic::timer_start().ok(); }
     for a in WAIT_SYS.iter() { a.store(0, core::sync::atomic::Ordering::Relaxed); }
     let g = match sched::spawn(wait_sys_worker) {
@@ -2517,8 +2517,8 @@ fn t_vmo_syscalls() -> bool {
         crate::calibrate_clock_once();
     }
     let tick_in = crate::arch::x86_64::apic::ticks();
-    let probe = crate::arch::x86_64::apic::wait_ticks(tick_in, 1, crate::clock::window_cycles(1));
-    let was_running = probe.ticks >= 1;
+    let probe = crate::arch::x86_64::apic::wait_ticks(tick_in, 2, crate::clock::window_cycles(2));
+    let was_running = probe.ticks >= 2;
     if !was_running {
         crate::arch::x86_64::apic::timer_start().ok();
     }
@@ -2653,8 +2653,8 @@ fn t_aspace_switch_isolation() -> bool {
         crate::calibrate_clock_once();
     }
     let tick_in = crate::arch::x86_64::apic::ticks();
-    let probe = crate::arch::x86_64::apic::wait_ticks(tick_in, 1, crate::clock::window_cycles(1));
-    let was_running = probe.ticks >= 1;
+    let probe = crate::arch::x86_64::apic::wait_ticks(tick_in, 2, crate::clock::window_cycles(2));
+    let was_running = probe.ticks >= 2;
     if !was_running {
         crate::arch::x86_64::apic::timer_start().ok();
     }

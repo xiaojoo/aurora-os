@@ -1151,8 +1151,8 @@ mod tests {
         // t_sleep_until；而 t_sleep_until 靠探测自愈，偶尔失效就是第二终端的前置条件）。
         // 本用例**需要**表走（drain_reap 靠 tick），所以照样开；只是收尾时还原来时的样子。
         let tick_in = crate::apic::ticks();
-        let probe = crate::apic::wait_ticks(tick_in, 1, crate::clock::window_cycles(1));
-        let timer_was_running = probe.ticks >= 1;
+        let probe = crate::apic::wait_ticks(tick_in, 2, crate::clock::window_cycles(2));
+        let timer_was_running = probe.ticks >= 2;
         crate::apic::timer_start().ok();
         crate::apic::with_interrupts(|| {
             let t0 = crate::tsc::now();

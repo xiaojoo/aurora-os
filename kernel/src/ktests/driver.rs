@@ -1192,7 +1192,7 @@ fn t_irq_ahci() -> bool {
         // 旧写法无条件 stop，把表停给了后面所有用例（第二终端的前置条件，BACKLOG §198/§199）。
         let tick_in = apic::ticks();
         let timer_was_running =
-            apic::wait_ticks(tick_in, 1, crate::clock::window_cycles(1)).ticks >= 1;
+            apic::wait_ticks(tick_in, 2, crate::clock::window_cycles(2)).ticks >= 2;
         let timer = apic::timer_start().is_ok();
         let mut buf = [0u8; 512];
         let r = apic::with_interrupts(|| ahci::read_bytes(num, 1, &mut buf));
@@ -1333,7 +1333,7 @@ fn t_irq_affinity() -> bool {
         // 旧写法无条件 stop，把表停给了后面所有用例（第二终端的前置条件，BACKLOG §198/§199）。
         let tick_in = apic::ticks();
         let timer_was_running =
-            apic::wait_ticks(tick_in, 1, crate::clock::window_cycles(1)).ticks >= 1;
+            apic::wait_ticks(tick_in, 2, crate::clock::window_cycles(2)).ticks >= 2;
         let timer = apic::timer_start().is_ok();
         let mut buf = [0u8; 512];
         let r = apic::with_interrupts(|| ahci::read_bytes(num, 1, &mut buf));
