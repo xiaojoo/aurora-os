@@ -140,3 +140,13 @@ fn t_lock_reentry_must_escalate() -> bool {
 #[cfg(feature = "fault-lock-reentrant")]
 ktest!(KT_LOCK_REENTRY, t_lock_reentry_must_escalate);
 
+/// 故障注入（ADR-081 决策 4）：同一上下文重复获取 GROW(4)，必须被认出并升 L4。
+#[cfg(feature = "fault-grow-reentrant")]
+fn t_grow_reentry_must_escalate() -> bool {
+    crate::log_warn!("fault-grow-reentrant: 按设计重复获取 GROW(4)");
+    heap::force_reentrant_grow_for_test();
+    false
+}
+#[cfg(feature = "fault-grow-reentrant")]
+ktest!(KT_GROW_REENTRY, t_grow_reentry_must_escalate);
+

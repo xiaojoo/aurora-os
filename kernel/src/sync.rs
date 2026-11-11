@@ -34,6 +34,12 @@ pub struct LockRank(pub u8);
 /// 今天真实的嵌套链只有一条，所以这张表的次序不是排版而是调用关系：
 /// `堆(10) -> VMM(20) -> PMM(30) -> 台账(40)`；ACPI(50) 目前只在启动期单独用。
 /// 新增一把锁必须先改 `docs/architecture/lock-order.md`（§7.1 的原文要求）。
+/// 等级 4：堆增长锁（ADR-081 决策 4）。**必须低于 TIMER(6)**，这不是排版而是死锁条件：
+/// 增长要调 `mm::map`(VMM20)，而等 VMM 时若持着 rank>=6 的锁就不能开窗（开窗会让 tick 取
+/// TIMER(6) 撞锁序），于是取不到 shootdown IPI ⇒ 请求方超时升 L4（BACKLOG §204 的根因）。
+/// 持 GROW(4) 等 VMM 时 `INNERMOST=4 < 6` ⇒ 满足 ADR-081 决策 1 的条件 2 ⇒ 可以开窗。
+/// 取锁顺序：GROW(4) → HEAP(10) 读快照 → 放 HEAP → 只持 GROW 调 mm::map → 再取 HEAP 提交。
+pub const RANK_GROW: LockRank = LockRank(4);
 pub const RANK_HEAP: LockRank = LockRank(10);
 /// 每 CPU 运行队列的所有权（ADR-047 决策 2，`sched::RQ`）。
 ///

@@ -8699,6 +8699,49 @@ heredoc 里写的 `\b` 经转义后在文件里变成**一个退格字符（0x08
 
 **只读论证、零代码改动**（读数沿用 §204：默认 PASS/33、check 17/17）。行尾 BACKLOG CRLF。
 
+## 209. 落地 ADR-081 决策 4：**GROW(4) + 堆增长移出 HEAP 临界区**；重入负样本实测升 L4（2026-11-11，实测）
+
+使用者裁决"开始落地方案 (b)"。**只落决策 4**；决策 1–3（开窗三条件/标志/裸 sti）**未落地**
+⇒ **§204 的死锁还没关闭**：GROW 只是让那条路径**满足**开窗条件，本身不开窗。ADR-081 状态已改成
+**采纳（部分落地）**并写明这一点。
+
+### 一、改了什么
+
+- `sync.rs`：新增 **`RANK_GROW = LockRank(4)`**，注释写明"必须低于 TIMER(6)"是死锁条件不是排版。
+- `heap.rs`：`map_more_through` 拆成 **`grow_core(map_next, end, hi) -> (usize, Grow)`**（不碰 `Heap`）
+  + 薄包装（`init()` 用，**故意例外**：启动期单核，ADR-081 决策 5）；新增 `static GROW`；
+  新增 **`grow_and_alloc(ci, cls)`**：`GROW(4) → HEAP(10) 读快照 → 放 HEAP → 只持 GROW 调 grow_core
+  → 再取 HEAP 提交 map_next + bump`。`try_alloc` 的 bump 路径改成"需要增长就放锁走 grow_and_alloc"。
+  **映射后按当前 bump 重算一次 aligned**，不拿旧快照当依据。
+- `lock-order.md`：新增 **GROW(4) 行**（允许内部 HEAP/VMM/PMM/台账），并**更正 HEAP 行**：
+  运行时增长已移出 HEAP，该行保留 VMM/PMM 只因 `init()` 仍在持 HEAP 时增长。
+- **负样本**：`fault-grow-reentrant` 特性 + `heap::force_reentrant_grow_for_test()` +
+  `t_grow_reentry_must_escalate`（与既有 `fault-lock-reentrant` 逐字同型）。
+
+### 二、读数
+
+- **负样本实测咬了**：`run --features fault-grow-reentrant` ⇒ **EXCEPTION(39)**，
+  串口 `[fatal] L4 sync: 重入获取 rank=4 token=0x0`（run-504，elf `e760d5763ceb`）。
+- 默认构建 **PASS/33、ktests 81/81**（run-505，elf `c7e43ccd6277`）⇒ **无回归**。
+- `check` **17/17**。
+
+### 三、**门禁连锁三处，都是正当后果，逐个补登记而不是放宽判据**
+
+1. `public_api 漏登记：sync::RANK_GROW`（被 heap 在产品路径引用）⇒ 登记。
+2. **环内边 `memory->sync` 站点 10 > 登记 9**（ADR-044 棘轮）⇒ 新锁必然多一个 rank 引用，登记 9→10。
+3. **环内边 `memory->diagnostics` 站点 8 > 登记 7** ⇒ 注入里的 `log_fatal!` 多一个站点，登记 7→8。
+**这三处与 §204 那次不同**：§204 是"为一条诊断新增站点"⇒ 撤掉诊断；本次是"新增一把锁"⇒
+站点是**决定的必然代价**，ADR-081 已授权，所以登记而不是撤。
+
+### 四、没做 / 仍开着
+
+- **决策 1–3 未落地** ⇒ 死锁未关闭；**反向嵌套负样本**（持 HEAP 取 GROW ⇒ 锁序违规）**未做**；
+  **矩阵行未接**（`fault-grow-reentrant` 目前只能手工跑，还没进判定表）。
+- **GROW 横跨 ~6ms 不造新死锁**仍只是推导，**未实测**；P1/P2 尺子有没有挪**未测**。
+- §207 那几个未核准点、§208 未决五条仍开着；shootdown 本体、S4 仍开着。
+- 行尾：`heap.rs` **LF 370**、`ktests/heap.rs` 按家族、`sync.rs`/`Cargo.toml` CRLF、
+  `lock-order.md` **LF 213**、`module-interfaces.toml` **LF 841**、ADR-081 **LF 155**、BACKLOG CRLF。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

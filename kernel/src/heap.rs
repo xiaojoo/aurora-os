@@ -96,22 +96,24 @@ enum Grow {
     Out,
 }
 
-fn map_more_through(st: &mut Heap, hi: usize) -> Grow {
-    while st.map_next < hi {
-        let at = st.map_next;
-        if at + CHUNK > st.end {
-            return Grow::Out;
+/// ADR-081 决策 4：增长的**核**不碰 `Heap`，只吃/吐前沿值 ⇒ 调用方可以在**不持 HEAP** 时调它。
+/// GROW 锁保证同一时刻只有一个 CPU 在增长，所以 `map_next` 在核运行期间不会被别人改。
+fn grow_core(mut map_next: usize, end: usize, hi: usize) -> (usize, Grow) {
+    while map_next < hi {
+        let at = map_next;
+        if at + CHUNK > end {
+            return (map_next, Grow::Out);
         }
         let frames = match mm::phys_alloc(0, MOD_HEAP_CORE) {
             Ok(f) => f,
-            Err(_) => return Grow::Out,
+            Err(_) => return (map_next, Grow::Out),
         };
-        let Some(va) = VirtAddr::new(at as u64) else { return Grow::Out };
+        let Some(va) = VirtAddr::new(at as u64) else { return (map_next, Grow::Out) };
         // Mapping 必须活到堆结束为止：forget 交出所有权，物理页就此长期占用（设计上如此）
         match mm::map(va, frames, PageFlags::RW) {
             Ok(m) => {
                 core::mem::forget(m);
-                st.map_next = at + CHUNK;
+                map_next = at + CHUNK;
             }
             // 窗口是自己 reserve 下来的，这里读到 AlreadyMapped 只可能是别的代码
             // 绕过登记表写进了来。继续跑等于同一物理页有两个主人，按 §9.2 升 L4。
@@ -119,10 +121,61 @@ fn map_more_through(st: &mut Heap, hi: usize) -> Grow {
                 crate::log_fatal!("L4: heap window at {:#x} was mapped by someone else", at);
                 crate::exit::finish(crate::exit::Code::ExceptionFatal);
             }
-            Err(_) => return Grow::Out,
+            Err(_) => return (map_next, Grow::Out),
         }
     }
-    Grow::Covered
+    (map_next, Grow::Covered)
+}
+
+/// `init()` 用的薄包装（ADR-081 决策 5：启动期单核、无竞争，**故意**保持持 HEAP 增长）。
+fn map_more_through(st: &mut Heap, hi: usize) -> Grow {
+    let (next, g) = grow_core(st.map_next, st.end, hi);
+    st.map_next = next;
+    g
+}
+
+/// 堆增长锁（ADR-081 决策 4）。**只保护"增长"这件事**，不保护堆状态本身（那是 HEAP）。
+/// 必须**先于 HEAP** 取（4 → 10 严格递增），所以调用方要先放掉 HEAP 再来取它。
+static GROW: IrqSpinLock<()> = IrqSpinLock::new(sync::RANK_GROW, ());
+
+/// 需要增长时的分配路径：GROW(4) → HEAP(10) 读快照 → 放 HEAP → 只持 GROW 映射 → 再取 HEAP 提交+bump。
+/// 进来时**不得持任何锁**（调用方已 drop HEAP）。
+fn grow_and_alloc(ci: usize, cls: usize) -> Option<*mut u8> {
+    let _grow = GROW.lock();
+    let mut g = HEAP.lock();
+    let (mut next, end) = (g.get().map_next, g.get().end);
+    let mut aligned = ((g.get().bump + cls - 1) / cls) * cls;
+    if aligned + cls > end {
+        drop(g);
+        OOM_COUNT.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    if next < aligned + cls {
+        // 放掉 HEAP 再映射：等 VMM 时只持 GROW(4)，满足 ADR-081 决策 1 的条件 2。
+        drop(g);
+        let (n, r) = grow_core(next, end, aligned + cls);
+        next = n;
+        g = HEAP.lock();
+        g.get().map_next = next;
+        if let Grow::Out = r {
+            drop(g);
+            OOM_COUNT.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        // 不拿旧快照当依据：按当前 bump 重算一次（bump 只在持 HEAP 时推进，这里仍重算以保守）。
+        aligned = ((g.get().bump + cls - 1) / cls) * cls;
+        if aligned + cls > g.get().map_next {
+            drop(g);
+            OOM_COUNT.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    }
+    let st = g.get();
+    st.bump = aligned + cls;
+    st.live_slots[ci] += 1;
+    drop(g);
+    bump_counters(cls);
+    Some(aligned as *mut u8)
 }
 
 /// 初始化堆。返回预映射的 chunk 数，供启动日志与 P 基线用。
@@ -240,10 +293,10 @@ pub fn try_alloc(layout: Layout) -> Option<*mut u8> {
         OOM_COUNT.fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    if let Grow::Out = map_more_through(st, aligned + cls) {
+    if st.map_next < aligned + cls {
+        // ADR-081 决策 4：增长移出 HEAP 临界区（GROW 必须先于 HEAP 取，所以先放锁）。
         drop(g);
-        OOM_COUNT.fetch_add(1, Ordering::Relaxed);
-        return None;
+        return grow_and_alloc(ci, cls);
     }
     st.bump = aligned + cls;
     st.live_slots[ci] += 1;
@@ -292,6 +345,16 @@ pub fn force_reentrant_lock_for_test() {
     let _g1 = HEAP.lock();
     let _g2 = HEAP.lock();
     crate::log_fatal!("fault-lock-reentrant: 重入获取没有被抓住，§7.1 的检测是假的");
+    crate::exit::finish(crate::exit::Code::Failed);
+}
+
+/// 故障注入（ADR-081 决策 4）：同一上下文重复获取 GROW(4)。形状与 `force_reentrant_lock_for_test`
+/// 逐字同型——新锁必须自带重入负样本，否则"rank 4 填对了"这句话没有证据可指（硬约束 4）。
+#[cfg(feature = "fault-grow-reentrant")]
+pub fn force_reentrant_grow_for_test() {
+    let _g1 = GROW.lock();
+    let _g2 = GROW.lock();
+    crate::log_fatal!("fault-grow-reentrant: 重入获取没有被抓住，§7.1 的检测是假的");
     crate::exit::finish(crate::exit::Code::Failed);
 }
 

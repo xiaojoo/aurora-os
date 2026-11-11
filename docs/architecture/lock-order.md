@@ -5,10 +5,11 @@
 
 | 锁 | 等级 | 保护的量 | 允许在它内部获取 | 依据（实测的调用关系） |
 | --- | --- | --- | --- | --- |
+| `RANK_GROW` | 4 | 堆**增长**这件事的串行化（`heap::GROW`，不保护堆状态本身） | HEAP(10)、VMM(20)、PMM(30)、台账(40) | **ADR-081 决策 4（2026-11-11，提议→落地）**：增长要调 `mm::map`(VMM20)，而等 VMM 时若持 rank≥6 的锁就不能开窗（开窗会让 tick 取 TIMER(6) 撞锁序）⇒ 取不到 shootdown IPI ⇒ 请求方超时升 L4（BACKLOG §204 根因）。持 GROW(4) 等 VMM 时 `INNERMOST=4 < 6` ⇒ 满足开窗条件。取锁顺序：**GROW(4) → HEAP(10) 读快照 → 放 HEAP → 只持 GROW 调 `mm::map` → 再取 HEAP 提交**。`init()` 是**故意例外**（启动期单核，仍持 HEAP 增长，ADR-081 决策 5） |
 | `RANK_WAITQ` | 5 | `sync::WaitQueue` 的链表头尾、waiter 槽与计数 | RUNQ(8)、HEAP(10)、VMM(20)、PMM(30)、台账(40) | **已落地（ADR-053/P4b，2026-11-08）**：持等待队列锁时叫醒别人即取运行队列锁；实测负样本 `重入获取 rank=5` ⇒ 39、`锁序违规，外层 rank=8 本次 rank=5` ⇒ 39 |
 | `RANK_TIMER` | 6 | 每 CPU 定时器轮的到期项与计数（`sched::WHEELS`） | RUNQ(8)、HEAP(10)、VMM(20)、PMM(30)、台账(40) | **已落地（ADR-058/P6，2026-11-08）**：`wait_while` 持 WAITQ(5) 注册到期项（5→6），tick 扫轮持 TIMER 叫醒要取 RUNQ(8)（6→8）。扫轮**必须在 need 闸之后**，否则持 VMM 时的同步 #PF 会撞 `外层 rank=20 本次 rank=6`（实测 3/3 39） |
 | `RANK_RUNQ` | 8 | 每 CPU 运行队列的所有权（`sched::RQ` 的 `QueueCell.lock`） | HEAP(10)、VMM(20)、PMM(30)、台账(40) | **已落地（ADR-048，2026-11-08）**：`spawn` 在队列锁内要任务栈 ⇒ 向下要页；实测取证跑 `acquires=348877 order_violations=0 reentrant_hits=0 wait_events=2556 wait_timeouts=0`，重入负样本 `L4 sync: 重入获取 rank=8` ⇒ 39 |
-| `RANK_HEAP` | 10 | `heap::Heap` 的光标/自由链表 | VMM(20)、PMM(30)、台账(40) | `try_alloc` → `map_more_through` → `mm::map` → `new_table_frame` → `phys_alloc` → 台账 |
+| `RANK_HEAP` | 10 | `heap::Heap` 的光标/自由链表 | VMM(20)、PMM(30)、台账(40) | **ADR-081 后运行时增长已移出 HEAP**（走 GROW(4)，见上一行）；本行保留 VMM/PMM 是因为 `init()` 仍在持 HEAP 时增长（启动期单核，故意例外）。旧依据 `try_alloc → map_more_through → mm::map` 现在只适用于 `init()` |
 | `RANK_VMM` | 20 | 页表结构与 VA 保留登记表 | PMM(30)、台账(40) | `map`/`alloc_va_range` 内部要新页表页，走 `phys_alloc` |
 | `RANK_PMM` | 30 | 物理帧位图与 `free_frames` 计数 | 台账(40) | `phys_alloc`/`phys_free` 结束时记账 |
 | `RANK_HANDLE` | 35 | 用户句柄表（`kernel/src/handle.rs`，`handles` 特性） | 台账(40) | ADR-007 裁决 E（2026-11-07 批准，同日落地）：第一版对象是只读文件、**不持有页框** ⇒ 表锁内只许调台账、不许调 mm；盘 I/O 在锁外（取票/提交两段）。**P5c-1 起再加一条**：对象**活性判定**也在锁外（`resolve` 取完引用放锁，再判 `mm::aspace_live` ⇒ 那一步要取 VMM(20)）。负样本 M19：把判定留在 35 之内 ⇒ `L4 sync: 锁序违规，外层 rank=35 本次 rank=20` ⇒ EXCEPTION(39) |

@@ -378,6 +378,7 @@ layer = "core"
 source_modules = ["sync"]
 public_api = [
   "sync::IrqSpinLock",
+  "sync::RANK_GROW",
   "sync::RANK_HEAP",
   "sync::RANK_RUNQ",
   "sync::RANK_TIMER",
@@ -815,9 +816,9 @@ known_scc = [
 # P3（ADR-065）：VA 容量改 256 定长，删掉派生公式里的 cpu::MAX_CPUS 引用 ⇒ 67→64（解耦，收紧）。
 "memory->arch" = 64
 "memory->boot" = 8
-"memory->diagnostics" = 7
+"memory->diagnostics" = 8
 "memory->resource" = 2
-"memory->sync" = 9
+"memory->sync" = 10
 "memory->time" = 2
 "pci->arch" = 2
 "pci->memory" = 9
