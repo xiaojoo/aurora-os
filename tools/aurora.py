@@ -1705,6 +1705,28 @@ def check_wedge_probe() -> list[str]:
         bad.append("wedge_verdict 的 D 支（IDLE_HLT 冻结但 >0 ⇒ BSP 睡死）不在 idle 那一支之前 ⇒ 会把睡死读成关中断自旋（§196）")
     elif "按向量中断" not in dline:
         bad.append("D 支的条件没核『按向量中断全冻结』⇒ 会把中断风暴（run-068）误判成 BSP 中断源停了")
+    # §202 的棘轮：探测判据的**两半必须一致**——`wait_ticks(base, N, …)` 与随后用作判据的
+    # `.ticks >= M` 必须 N == M。§202 实测踩过：只把 want 改成 2、比较仍留 >=1，
+    # 等于只拉长窗口没改判据，run-348 照样挂（got=1 rounds=2028 却 was_running=1）。
+    pairs = 0
+    for f in sorted((ROOT / "kernel" / "src").rglob("*.rs")):
+        ls = f.read_text(encoding="utf-8", errors="replace").splitlines()
+        for i, ln in enumerate(ls):
+            mw = re.search(r"wait_ticks\([^,]+,\s*(\d+)\s*,", ln)
+            if not mw:
+                continue
+            for j in range(i, min(i + 7, len(ls))):
+                mg = re.search(r"\.ticks\s*>=\s*(\d+)\b", ls[j])
+                if mg:
+                    pairs += 1
+                    if mw.group(1) != mg.group(1):
+                        bad.append(
+                            f"{f.name}:{j+1} 探测判据两半不一致：wait_ticks want={mw.group(1)} "
+                            f"而 .ticks >= {mg.group(1)} ⇒ 改一半等于没改（§202 run-348 实测）")
+                    break
+    # 反空转：一个判据对都没扫到就说明这条闸没在核东西（正则写错/调用点搬家都会这样）
+    if pairs == 0:
+        bad.append("扫不到任何 wait_ticks 与 .ticks >= N 的判据对 ⇒ §202 那条棘轮是空转的")
     # §195 的等待/唤醒不变量（ADR-073 补记）。这几条都是实测买来的：
     # 旧 drain 是 load-then-store ⇒ 两个 drain 各自减一次 ⇒ ARMED 下溢成 u64::MAX（run-099 原始字节）；
     # 旧 take 只判 ARMED ⇒ SIGNALLED 那一支漏减；旧 drain 把 wake_task 的 false 用 let _ = 吞掉
