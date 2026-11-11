@@ -1694,6 +1694,17 @@ def check_wedge_probe() -> list[str]:
     src_all = (ROOT / "tools" / "aurora.py").read_text(encoding="utf-8")
     if not re.search(r"RUN_SEQ = _run_seq_start\(\)", src_all):
         bad.append("RUN_SEQ 不再从已有留档接着数 ⇒ 单独跑一次 run 就会覆盖矩阵同号那一跑的现场")
+    # D 支（§196）必须在"idle 计数没涨"那一支**之前**：IDLE_HLT 冻结在 >0 是"进了第一次 hlt
+    # 就再没醒过"，冻结在 0 才是"从没进过 idle"。顺序反了就把睡死读成关中断自旋（run-118 实测错判）。
+    di = vbody.find("idle_abs > 0")
+    ii = vbody.find("if not idle_moved:")
+    # 前提只核**条件那一行**：D 支的返回文案里也写着"按向量中断全冻结"，
+    # 拿整段切片去找那个词会被自己的文案喂饱 ⇒ 格子空转（§196 第一版就是这么错的）。
+    dline = next((ln for ln in vbody.splitlines() if "idle_abs > 0" in ln), "")
+    if di < 0 or ii < 0 or di > ii:
+        bad.append("wedge_verdict 的 D 支（IDLE_HLT 冻结但 >0 ⇒ BSP 睡死）不在 idle 那一支之前 ⇒ 会把睡死读成关中断自旋（§196）")
+    elif "按向量中断" not in dline:
+        bad.append("D 支的条件没核『按向量中断全冻结』⇒ 会把中断风暴（run-068）误判成 BSP 中断源停了")
     # §195 的等待/唤醒不变量（ADR-073 补记）。这几条都是实测买来的：
     # 旧 drain 是 load-then-store ⇒ 两个 drain 各自减一次 ⇒ ARMED 下溢成 u64::MAX（run-099 原始字节）；
     # 旧 take 只判 ARMED ⇒ SIGNALLED 那一支漏减；旧 drain 把 wake_task 的 false 用 let _ = 吞掉
@@ -2491,9 +2502,20 @@ def wedge_verdict(deltas: dict, second: dict, moved: list) -> str:
     if not irq_moved:
         return ("有量在涨但**两本中断账都没动** ⇒ 不是 tick 驱动的推进"
                 "（形状不在预注册表里，只留证据不下结论）")
+    # D 支（§196）：IDLE_HLT **冻结但绝对值 > 0** 与"冻结且为 0"是两件事，旧表把它们混成一支。
+    # idle_entry 每圈 hlt 前都自增 IDLE_HLT ⇒ 冻结在 1 意味着"进了第一次 hlt 就再没醒过"，
+    # 而不是"没有 CPU 在 idle"。run-118/124 实测：IRQ 全冻结 + AP 本地 tick 照涨 + IDLE_HLT[0]=1，
+    # 且 ioapic **pin2 masked**（B1 那两次是 unmasked）⇒ BSP 的 PIT 路由被屏蔽，没有任何中断源叫它。
+    # 对照 run-069（fault-if-carriage）：IDLE_HLT[0]=**0** ⇒ BSP 从没进过 idle，那才是关中断自旋。
+    idle_abs = second["idle_hlt"][0]
+    ap_moved = any(deltas["每CPU本地tick"])
+    if not idle_moved and idle_abs > 0 and not any(deltas["按向量中断"]) and ap_moved:
+        return ("BSP 在 idle 的**第一次 hlt 就睡死**（IDLE_HLT 冻结在 " + str(idle_abs) + "）而 AP 的本地 tick 照涨、"
+                "按向量中断全冻结 ⇒ **BSP 的中断源停了**（假设 D：PIT 路由被屏蔽/表被停而没再起，"
+                "去核 ioapic pin2 的 masked 位与 timer_stop 的调用点，§196）")
     if not idle_moved:
-        return ("中断在涨而**没有任何 CPU 在 idle** ⇒ 有任务占着 CPU（在跑或在关中断自旋）"
-                "⇒ 不是整机停住，要看串口停在哪条用例")
+        return ("idle 计数没涨（BSP 的 IDLE_HLT 绝对值=" + str(idle_abs) + "，0 = 从没进过 idle）"
+                "⇒ 有任务占着 CPU（在跑或在关中断自旋），要看串口停在哪条用例")
     if armed == 0 and pending == 0:
         return ("中断在涨、CPU 在 idle、**没有 armed 等待者也没有待唤醒** ⇒ 停住的任务不在等待槽上"
                 "（假设 B1：没有期限也没有信号目标会叫醒它——Blocked 而没登记，或根本不 Blocked）")
