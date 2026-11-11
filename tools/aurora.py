@@ -1694,6 +1694,31 @@ def check_wedge_probe() -> list[str]:
     src_all = (ROOT / "tools" / "aurora.py").read_text(encoding="utf-8")
     if not re.search(r"RUN_SEQ = _run_seq_start\(\)", src_all):
         bad.append("RUN_SEQ 不再从已有留档接着数 ⇒ 单独跑一次 run 就会覆盖矩阵同号那一跑的现场")
+    # §195 的等待/唤醒不变量（ADR-073 补记）。这几条都是实测买来的：
+    # 旧 drain 是 load-then-store ⇒ 两个 drain 各自减一次 ⇒ ARMED 下溢成 u64::MAX（run-099 原始字节）；
+    # 旧 take 只判 ARMED ⇒ SIGNALLED 那一支漏减；旧 drain 把 wake_task 的 false 用 let _ = 吞掉
+    # ⇒ 唤醒提前投递给还没 Blocked 的等待者然后丢弃（run-096/100 的 B1）。
+    sc = (ROOT / "kernel" / "src" / "sched.rs").read_text(encoding="utf-8")
+    if "compare_exchange(st, TW_WOKEN" not in sc:
+        bad.append("drain 不再用 CAS 消费等待槽 ⇒ 两个 drain 会各自减一次计数（§194 实测下溢成 u64::MAX）")
+    if "let _ = wake_task(gidx, tok);" in sc:
+        bad.append("drain 又把 wake_task 的失败吞掉了 ⇒ 提前投递的唤醒会被丢弃（§194 的 B1 成因）")
+    if "TW_WAKE_MISS.fetch_add" not in sc:
+        bad.append("wake 失败不再计数 ⇒ 那条路被走到也看不见（§195 靠它证自救支真的 firing）")
+    if "fn sat_dec(" not in sc or "fetch_update" not in sc:
+        bad.append("饱和减不见了 ⇒ ARMED/PENDING 双减会回绕成 u64::MAX，判别表会把计数坏了读成有等待者")
+    if "TW_SIGNALLED => {" not in sc:
+        bad.append("take 不再处理 SIGNALLED ⇒ 信号已置而调用方自己收走那一支漏减 ARMED/PENDING")
+    # 两个等待入口必须同律：只修 wait_for_task 就是修了一半
+    for fn in ("wait_for_task", "wait_for_proc"):
+        m = re.search(rf"pub fn {fn}\(", sc)
+        if m is None:
+            bad.append(f"sched.rs 里找不到 {fn} ⇒ 这条对账不成立")
+            continue
+        nxt = re.search(r"^pub fn ", sc[m.end():], re.M)
+        body = sc[m.end():m.end() + nxt.start()] if nxt else sc[m.end():]
+        if "wait_slot_already_drained(slot, me, token)" not in body:
+            bad.append(f"{fn} 少了 block_current 之后的再查 ⇒ 两个等待入口不同律（§195 修了一半）")
     labels = {label for _s, label, _w in WEDGE_SYMBOLS}
     for need in ("armed等待者", "待唤醒发布", "等待登记过", "等待被信号", "等待超时过", "等待槽满拒"):
         if need not in labels:

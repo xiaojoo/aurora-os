@@ -1588,6 +1588,51 @@ static TW_REGISTERED: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 static TW_SIGNALED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static TW_TIMEOUTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static TW_FULL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// §195 的三个**违例可见性**计数（不是业务量）：
+/// `TW_WAKE_MISS` = drain 消费了槽但 `wake_task` 失败（等待者那时还没 Blocked）。
+/// 旧代码把这个 false 用 `let _ =` 吞掉，于是唤醒被提前投递然后丢弃 ⇒ 永久停住（§194 测到的 B1）。
+/// `TW_ARMED_FLOOR`/`TW_PENDING_FLOOR` = 饱和减撞到 0 的次数。**正常跑必须恒为 0**；
+/// 非 0 就说明"谁转出 {ARMED,SIGNALLED} 谁减一次"这条不变量被破了，比下溢成 u64::MAX 好查得多。
+static TW_WAKE_MISS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static TW_ARMED_FLOOR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static TW_PENDING_FLOOR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// 饱和减：到 0 就不减并记一次违例。`fetch_sub` 在 usize 上双减会回绕成 u64::MAX（§194 实测），
+/// 那会让判别表把"计数坏了"读成"有等待者"。这里让下溢**不可能**，同时把违例留成可读的数。
+fn sat_dec(c: &core::sync::atomic::AtomicUsize, floor: &core::sync::atomic::AtomicU64) {
+    use core::sync::atomic::Ordering as O;
+    if c.fetch_update(O::AcqRel, O::Relaxed, |v| if v == 0 { None } else { Some(v - 1) }).is_err() {
+        floor.fetch_add(1, O::Relaxed);
+    }
+}
+
+/// 槽状态快照（§195 的 post-block 再查要用）。
+fn task_wait_state(slot: usize) -> u8 {
+    TASK_WAITERS[slot].state.load(Ordering::Acquire)
+}
+
+/// §195：`block_current` 之后**再查一次槽**。返回 true = 槽已被 drain 消费成 WOKEN。
+/// 为什么必须再查：登记与 block_current 之间等待者还是 Running，drain 若在这段窗口里消费了槽，
+/// `wake_task` 会失败（目标不是 Blocked），槽却已经 WOKEN、ARMED/PENDING 已减 ⇒
+/// 之后 block_current 把等待者永久停住。这一支负责**自己把牌翻回来**（ADR-073 补记）。
+fn wait_slot_already_drained(slot: usize, me: usize, token: crate::sync::WaitToken) -> bool {
+    if task_wait_state(slot) != TW_WOKEN {
+        return false;
+    }
+    // 把 block_current 置的 Blocked(token) 翻回 Runnable；若 drain 那次 wake 已成功，
+    // 这里看到的是 Runnable ⇒ 返回 false，是无效操作，不改语义（ADR-053 决策 4）。
+    let _ = wake_task(me, token);
+    true
+}
+
+/// 三个违例计数给用例与宿主机仪器用（与 `task_wait_stats` 同一姿态，不动它的四元组签名）。
+pub fn task_wait_health() -> (u64, u64, u64) {
+    (
+        TW_WAKE_MISS.load(Ordering::Relaxed),
+        TW_ARMED_FLOOR.load(Ordering::Relaxed),
+        TW_PENDING_FLOOR.load(Ordering::Relaxed),
+    )
+}
 
 /// 这四个数给用例与 `object_wait` 的判据用（与 `sync::stats()` 同一姿态）。
 pub fn task_wait_stats() -> (u64, u64, u64, u64) {
@@ -1645,19 +1690,28 @@ fn task_wake_tick() -> bool {
         if st != TW_SIGNALLED && !expired {
             continue;
         }
+        // §195：**CAS 消费**。旧写法是 load-then-store，两个 drain 并发会各自减一次计数
+        // （BSP 的 tick 抢占点与 idle 都调这里）⇒ ARMED 下溢成 u64::MAX（§194 run-099 实测）。
+        // 只有把 st 改成 WOKEN 的那一个才减；CAS 失败说明别人（另一个 drain 或 take）已转出。
+        if w.state.compare_exchange(st, TW_WOKEN, O::AcqRel, O::Relaxed).is_err() {
+            continue;
+        }
         if expired {
+            // 超时那条路 observed 必须是 0。写在 CAS 之后：只有真消费了才动这个槽的字段，
+            // 免得把 0 写进一个已被 take 释放、甚至已被别人重新登记的槽。
             w.observed.store(0, O::Relaxed);
             TW_TIMEOUTS.fetch_add(1, O::Relaxed);
         }
-        // 离开 ARMED（被信号或被超时唤醒）⇒ 计数减一
-        TASK_ARMED.fetch_sub(1, O::AcqRel);
+        sat_dec(&TASK_ARMED, &TW_ARMED_FLOOR);
         let gidx = w.waiter.load(O::Relaxed) as usize;
         let tok = crate::sync::WaitToken { queue: TASK_QID, seq: w.seq.load(O::Relaxed) };
-        // 先标已唤醒再 wake：wake 之后调用方可能立刻跑起来并读 observed/释放槽位
-        w.state.store(TW_WOKEN, O::Release);
-        let _ = wake_task(gidx, tok);
+        // wake 失败**不再吞掉**：记一次违例。等待者可能还没 Blocked（登记与 block_current 之间
+        // 那段窗口），此时槽已 WOKEN 而没人会再叫醒它 ⇒ 由 wait_slot_already_drained 那一支自救。
+        if !wake_task(gidx, tok) {
+            TW_WAKE_MISS.fetch_add(1, O::Relaxed);
+        }
         if st == TW_SIGNALLED {
-            TASK_WAKE_PENDING.fetch_sub(1, O::AcqRel);
+            sat_dec(&TASK_WAKE_PENDING, &TW_PENDING_FLOOR);
         }
     }
     // 还有 armed 的等待者 ⇒ 调用方（idle）不能 hlt 睡死：停表时没有中断会来叫它，
@@ -1695,10 +1749,17 @@ fn task_wait_take(slot: usize) -> Option<u32> {
     use core::sync::atomic::Ordering as O;
     let w = &TASK_WAITERS[slot];
     let v = w.observed.load(O::Acquire);
-    // 只有"还停在 ARMED 就被调用方收走"这一支需要减计数（查条件已成立、没睡成那条路）；
-    // 已经被 drain 标成 WOKEN 的那一支在 drain 里减过了，这里再减就会下溢。
-    if w.state.swap(TW_FREE, O::AcqRel) == TW_ARMED {
-        TASK_ARMED.fetch_sub(1, O::AcqRel);
+    // §195 的不变量：**谁把槽转出 {ARMED,SIGNALLED} 谁减一次**。
+    // ARMED：登记时 +1，这里减。SIGNALLED：信号时 ARMED 没减（它仍算武装）而 PENDING +1，
+    // 所以这一支要减两个——旧写法只判 ARMED，于是"信号已置、调用方查条件成立自己收走"会漏减。
+    // WOKEN：drain 已经减过，这里再减就违例（饱和减把它记成 floor 而不是回绕）。
+    match w.state.swap(TW_FREE, O::AcqRel) {
+        TW_ARMED => sat_dec(&TASK_ARMED, &TW_ARMED_FLOOR),
+        TW_SIGNALLED => {
+            sat_dec(&TASK_ARMED, &TW_ARMED_FLOOR);
+            sat_dec(&TASK_WAKE_PENDING, &TW_PENDING_FLOOR);
+        }
+        _ => {}
     }
     Some(v)
 }
@@ -1721,6 +1782,13 @@ pub fn wait_for_proc(proc_id: u16, deadline_cycles: u64) -> Option<u32> {
     if !block_current(token) {
         let _ = task_wait_take(slot);
         return None;
+    }
+    // §195：同 wait_for_task 那一支（两个等待入口必须同律，否则修了一半）
+    if wait_slot_already_drained(slot, me, token) {
+        return match task_wait_take(slot) {
+            Some(0) | None => None,
+            Some(_) => Some(crate::proc::proc_exit_code(proc_id)),
+        };
     }
     // 这里没持任何锁（block_current 的守卫已析构），所以可以直接切走（ADR-053 决策 2）
     yield_now();
@@ -1842,6 +1910,8 @@ pub fn wait_for_task(target: usize, deadline_cycles: u64) -> bool {
     // 预期：目标在窗口里收工 ⇒ 唤醒被提前投递并丢弃 ⇒ 下面 block_current 之后永久停住。
     #[cfg(feature = "fault-wait-race")]
     {
+        // 窗口入口计数：没有这个数，"注入没挂"可能只是**注入变空转了**（§193 的教训）。
+        crate::log_info!("wait-race: 进入窗口 target={} 槽={}", target, slot);
         let t = crate::tsc::now();
         while crate::tsc::now().wrapping_sub(t) < 20_000_000 {
             core::hint::spin_loop();
@@ -1850,6 +1920,17 @@ pub fn wait_for_task(target: usize, deadline_cycles: u64) -> bool {
     if !block_current(token) {
         let _ = task_wait_take(slot);
         return false;
+    }
+    // §195：槽若已被 drain 消费（唤醒提前投递给了还没 Blocked 的我们），**不能 yield**。
+    if wait_slot_already_drained(slot, me, token) {
+        // 只在注入构建里打：这一支被走到就是"窗口真被碰上且自救成功"的直接证据。
+        // 正常构建里整段不存在 ⇒ 串口量与日志契约一字不动（P4 那把尺子不受影响）。
+        #[cfg(feature = "fault-wait-race")]
+        {
+            let (miss, af, pf) = task_wait_health();
+            crate::log_info!("wait-race: 提前投递的唤醒已自救 miss={} armed_floor={} pending_floor={}", miss, af, pf);
+        }
+        return !matches!(task_wait_take(slot), Some(0) | None);
     }
     yield_now();
     !matches!(task_wait_take(slot), Some(0) | None)

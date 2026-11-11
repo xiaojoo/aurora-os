@@ -218,6 +218,57 @@ Q7 裁的是"进程数 + 页数"两项。**页数要有"进程名下有哪些页
 另外本轮实测还有一次 `free frames` 绝对值随 ELF 体积变化（116262 ↔ 116275）——
 跨轮比这一格只能比"回到自己本轮的基线"，不能比大小（BACKLOG 79g-4 那条口径的具体化）。
 
+## 补记（§195，2026-11-11）：等待槽的**并发消费协议**——决策 7 那句"不丢唤醒"不够
+
+使用者裁决"三处一起修 + 本 ADR 补记"。本补记**不改决策 1–10 的任何一条**，也不改 ADR-053 决策 4
+的世代核对（`wake_task` 仍只在目标确实 `Blocked` 且 token 匹配时转移）；它补的是决策 7 留下的两个空白。
+
+### 决策 7 原话不够在哪
+
+原文写"武装在前、查条件在后，才不会丢唤醒"。这句只挡住了**信号被错过**，没挡住两件事：
+
+1. **唤醒被提前投递然后丢弃**。登记与 `block_current` 之间等待者还是 `Running`。目标若在这段窗口里
+   收工，drain 会消费槽并调 `wake_task`，而那时目标不是 `Blocked` ⇒ 返回 false。旧代码用
+   `let _ =` 把这个 false 吞掉（AGENTS 硬约束 6 禁止的形状），槽却已 `WOKEN`、计数已减 ⇒
+   随后 `block_current` 把等待者**永久**停住：再没有信号会匹配（`task_wait_signal` 只碰 ARMED 槽）。
+2. **计数的减由谁负责没规定**。旧 drain 是 load-then-store，旧 take 只判 ARMED。两者并发会双减，
+   而 `ARMED` 是 `AtomicUsize` ⇒ 回绕成 `u64::MAX`。
+
+### 实测证据（BACKLOG §194/§195，同一份代码状态各自留档）
+
+- run-096（无注入，单独重跑第 27 次撞到）：`armed=0 待唤醒=0`、等待账 11/4/1/0 窗内增量全零、
+  四核 HLT=1 IF=1、崩溃表全零 ⇒ 判别表 B1 支。
+- run-099（带 `fault-wait-race` 注入）：`armed` 的**原始字节** = `18446744073709551615` = `u64::MAX`
+  ⇒ **下溢实测**，不是推导。
+- run-115/117（修后带注入）：`wait-race: 提前投递的唤醒已自救 miss=1 armed_floor=0 pending_floor=0`
+  ⇒ 第 1 条那个窗口**真的被走到且自救成功**，不是"改了就不挂"的空口。
+
+### 新不变量（本补记的决定）
+
+- `TASK_ARMED` 数处于 `{ARMED, SIGNALLED}` 的槽；`TASK_WAKE_PENDING` 数处于 `{SIGNALLED}` 的槽。
+- **谁把槽转出这两个状态，谁减一次**，胜者由原子转移决出：drain 用
+  `compare_exchange(st, TW_WOKEN)`，take 用 `swap(TW_FREE)` 并按返回的前态分派
+  （ARMED 减一个；SIGNALLED 减两个；WOKEN 一个都不减，因为 drain 已减）。
+- 减一律走**饱和减** `sat_dec`：到 0 就不减并记 `TW_ARMED_FLOOR`/`TW_PENDING_FLOOR`。
+  下溢从此不可能，而任何残留违例都留成**可读的数**而不是回绕。正常跑这两个数必须恒为 0。
+- drain 的 `wake_task` 失败**不再吞**：记 `TW_WAKE_MISS`。
+- **两个等待入口同律**：`wait_for_task` 与 `wait_for_proc` 在 `block_current` 之后都再查一次槽，
+  若已 `WOKEN` 就用 `wake_task(me, token)` 把自己翻回 Runnable、直接 take 返回，**不 yield**。
+  只修一个入口就是修了一半，门禁逐个入口核。
+
+### 验收与**未关闭的部分**（不夸大）
+
+- `check` 17/17；六道门禁变异各自点名红（CAS 退回 / 吞错 / 删 miss 计数 / 删饱和减 /
+  take 漏 SIGNALLED / `wait_for_proc` 少再查），改完逐字节还原。
+- 默认构建 **PASS/33、ktests 81/81**（elf `028fcb40a2ef`）。
+- 带注入的会挂变体：修前 **3 跑 2 挂**；修后 **14 跑 1 挂**。
+- **那 1 挂（run-118）是另一种终端，本补记没关闭它**：停在 `t_sleep_until` 门口，
+  `IRQ_COUNTS[0]=191` **冻结**、`IDLE_HLT[0]=1` **冻结**（BSP 根本不在 idle）、`TICK_TSC_LAST` 冻结，
+  而 AP 的 tick 照涨 ⇒ 判别表判"有任务占着 CPU"，与 B1 那支**相反**。
+  它属 §189 那条"中断源停了"的家族，**是否由本修引入未证**。
+- 因此 `fault-wait-race` **暂不接进判定矩阵**：它现在还会间歇挂，接成期望 FAIL 的行会是不稳定行。
+  等第二个终端定性后再接。
+
 ## 迁移与回滚
 
 - `proc.rs` 是纯新增，其余全是三处收工点 + 一处槽位释放 + 收尾扫描四格 + 用例两条。
