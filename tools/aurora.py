@@ -2419,6 +2419,10 @@ WEDGE_SYMBOLS = [
     (("sched", "TW_SIGNALED"), "等待被信号", 8),
     (("sched", "TW_TIMEOUTS"), "等待超时过", 8),
     (("sched", "TW_FULL"), "等待槽满拒", 8),
+    # §201 零串口探针：t_sleep_until 的探测读数（10 槽，含义见 ktests/sched.rs 的 SLEEP_PROBE 头注释）。
+    # 为什么是静态量而不是串口日志：§200 实测带串口诊断 80 跑 0 挂、无诊断 50 跑 2 挂 ⇒
+    # 往串口加行疑似把现象压掉了。静态量让两臂代码相同，扰动只剩几条 store。
+    (("ktests", "sched", "SLEEP_PROBE"), "睡眠探测", 8),
 ]
 
 
@@ -2510,9 +2514,19 @@ def wedge_verdict(deltas: dict, second: dict, moved: list) -> str:
     idle_abs = second["idle_hlt"][0]
     ap_moved = any(deltas["每CPU本地tick"])
     if not idle_moved and idle_abs > 0 and not any(deltas["按向量中断"]) and ap_moved:
-        return ("BSP 在 idle 的**第一次 hlt 就睡死**（IDLE_HLT 冻结在 " + str(idle_abs) + "）而 AP 的本地 tick 照涨、"
-                "按向量中断全冻结 ⇒ **BSP 的中断源停了**（假设 D：PIT 路由被屏蔽/表被停而没再起，"
-                "去核 ioapic pin2 的 masked 位与 timer_stop 的调用点，§196）")
+        head = ("BSP 在 idle 的**第一次 hlt 就睡死**（IDLE_HLT 冻结在 " + str(idle_abs) + "）而 AP 的本地 tick 照涨、"
+                "按向量中断全冻结 ⇒ **BSP 的中断源停了**（假设 D，§196）")
+        sp = second.get("睡眠探测")
+        if not sp:
+            return head + "；这一跑没读到睡眠探针 ⇒ 自愈有没有被触发**未测**"
+        # 槽位：4=was_running 6=有没有调 timer_start 7=是否 Ok 8=调完 rte2 低 DWORD 9=进入次数
+        if sp[6] == 0:
+            return (head + f"；探针：进入{sp[9]}次 was_running={sp[4]} **没调 timer_start** "
+                    "⇒ 探测以为表在走（D1：自愈没被触发，去核 wait_ticks 的 got 与 RTE 的 masked 位）")
+        if sp[7] == 0:
+            return head + f"；探针：调了 timer_start 但**返回 Err**（D2：开表失败，rte2={sp[8]:#x}）"
+        return (head + f"；探针：调了 timer_start 且 Ok、调完 rte2={sp[8]:#x}"
+                "（D3：开表成功却仍 masked ⇒ 之后又被屏蔽，或 unmask 没落到 pin2）")
     if not idle_moved:
         return ("idle 计数没涨（BSP 的 IDLE_HLT 绝对值=" + str(idle_abs) + "，0 = 从没进过 idle）"
                 "⇒ 有任务占着 CPU（在跑或在关中断自旋），要看串口停在哪条用例")
@@ -2612,6 +2626,11 @@ def wedge_probe(port: int, log: str, elf: Path, build_dir: Path, seq: int) -> st
                f"{b['等待登记过'][0]}/{b['等待被信号'][0]}/{b['等待超时过'][0]}/{b['等待槽满拒'][0]}"
                f"  增量={deltas['等待登记过'][0]}/{deltas['等待被信号'][0]}"
                f"/{deltas['等待超时过'][0]}/{deltas['等待槽满拒'][0]}")
+    sp = b.get("睡眠探测")
+    if sp:
+        out.append(f"  睡眠探针（t_sleep_until）进入次数={sp[9]} tick_in={sp[0]} got={sp[1]} cycles={sp[2]}"
+                   f" rounds={sp[3]} was_running={sp[4]} 进来rte2={sp[5]:#x}"
+                   f" 调开表={sp[6]} 开表Ok={sp[7]} 调完rte2={sp[8]:#x}")
     out.append("wedge 判定: " + verdict)
     return "\n".join(out)
 

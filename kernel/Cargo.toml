@@ -164,9 +164,6 @@ fault-handle-owner = []
 # 推导见 BACKLOG §194：目标若在窗口里收工，drain 会对着还没 Blocked 的等待者调 wake_task，
 # 失败被 `let _ =` 吞掉 ⇒ 槽已 WOKEN 而 ARMED/PENDING 归零，之后 block_current 永久停住。
 fault-wait-race = []
-# §197 诊断：把 t_sleep_until 进来时的心跳探测读数打出来（只在门控构建里）。
-# 要回答的是第二终端：pin2 被 masked 时，探测到底读到了什么、有没有开表。
-timer-probe-log = []
 
 
 # 负样本（M5-c③）：写命令不置 DW0 的 W 位（真驱动最容易犯的方向错）。

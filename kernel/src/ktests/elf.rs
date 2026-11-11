@@ -634,8 +634,6 @@ const PROBE_CALLS: u64 = 21;
 
 #[cfg(feature = "handles")]
 fn t_probe_ring3() -> bool {
-    #[cfg(feature = "timer-probe-log")]
-    crate::log_info!("rte2-entry: test=t_probe_ring3 rte2={:?}", apic::rte_raw(2));
     // §199：收尾按原样放回。**入口**记一次状态，只守卫**最后一个** stop；
     // 中间那些 stop 是被测语义本身（故意停表的窗口），一个都不动。
     let timer_was_running =

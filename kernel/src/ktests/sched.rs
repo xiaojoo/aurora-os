@@ -50,8 +50,6 @@ fn yield_partner() -> ! {
 /// 每个任务的 runs 都要非零。只证明"能进中断"不够——必须证明
 /// "被换下去的任务后来又被换回来并继续跑"，否则轮转是假的。
 fn t_preempt_round_robin() -> bool {
-    #[cfg(feature = "timer-probe-log")]
-    crate::log_info!("rte2-entry: test=t_preempt_round_robin rte2={:?}", apic::rte_raw(2));
     // §199：收尾按原样放回。**入口**记一次状态，只守卫**最后一个** stop；
     // 中间那些 stop 是被测语义本身（故意停表的窗口），一个都不动。
     let timer_was_running =
@@ -346,8 +344,6 @@ ktest!(KT_CPU_IDS, t_cpu_ids_agree);
 /// 如果换入时没人改写这一位（旧行为），它会一直是 0，窗口里再也没有第二个 tick，
 /// 整条用例直接挂不住——那正是 M3a 记录过的"合成帧写 0x2 就整机卡死"的故障形状。
 fn t_if_belongs_to_cpu() -> bool {
-    #[cfg(feature = "timer-probe-log")]
-    crate::log_info!("rte2-entry: test=t_if_belongs_to_cpu rte2={:?}", apic::rte_raw(2));
     // §199：收尾按原样放回。**入口**记一次状态，只守卫**最后一个** stop；
     // 中间那些 stop 是被测语义本身（故意停表的窗口），一个都不动。
     let timer_was_running =
@@ -1270,6 +1266,20 @@ static P6_AP_ELAPSED: [core::sync::atomic::AtomicU64; cpu::MAX_CPUS] =
 static P6_AP_OK: [core::sync::atomic::AtomicU64; cpu::MAX_CPUS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; cpu::MAX_CPUS];
 static P6_D: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// §201 **零串口探针**：`t_sleep_until` 的探测读数写在这里，挂死时由宿主机 QMP 读回。
+/// 为什么不用 `log_info!`：§200 实测带串口诊断 80 跑 0 挂、无诊断 50 跑 2 挂（4%），
+/// 往串口加行本身疑似把现象压掉了（Fisher p≈0.146，嫌疑未证）。改成静态量后**两臂代码相同**，
+/// 扰动只剩几条 store，也不必备条件化符号表。槽位含义（宿主机仪器按同一份注释解）：
+/// 0=tick_in 1=got 2=cycles 3=rounds 4=was_running 5=进来时 rte2 低 DWORD
+/// 6=有没有调 timer_start 7=调了是否 Ok 8=调完 rte2 低 DWORD 9=本用例被进入过几次
+/// rte2 读不到时存 u64::MAX（与" masked 位"区分开，不拿 0 冒充读数）。
+static SLEEP_PROBE: [core::sync::atomic::AtomicU64; 10] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 10];
+
+fn rte_lo() -> u64 {
+    apic::rte_raw(2).map_or(u64::MAX, |(lo, _)| u64::from(lo))
+}
+
 
 /// AP 档：在自己的 CPU 上睡同样长，量自己的 elapsed（tick 源是本地 LAPIC，不是 BSP 的 PIT）
 fn p6_ap_sleeper() {
@@ -1288,8 +1298,7 @@ fn p6_bsp_noop() {}
 /// （`watchdog.rs` 的既有口径）。所以这里 BSP 与 AP **各测一档**，不是一个数糊过去。
 /// 另外三格：确实由定时器叫醒（返回 true）、`fired` 前进、轮上无残留项。
 fn t_sleep_until() -> bool {
-    #[cfg(feature = "timer-probe-log")]
-    crate::log_info!("rte2-entry: test=t_sleep_until rte2={:?}", apic::rte_raw(2));
+    SLEEP_PROBE[5].store(rte_lo(), Ordering::Relaxed);
     if sched::state_of(0) == sched::TaskState::Free {
         sched::init_boot_task();
     }
@@ -1302,17 +1311,18 @@ fn t_sleep_until() -> bool {
     let tick_in = apic::ticks();
     let probe = apic::wait_ticks(tick_in, 1, clock::window_cycles(1));
     let was_running = probe.ticks >= 1;
-    // §197 诊断（门控）：第二终端现场 pin2 是 masked，而本用例本该自愈。
-    // 这几个数直接回答"探测读到了什么、有没有开表、开完 RTE 是什么样"。
-    #[cfg(feature = "timer-probe-log")]
-    crate::log_info!(
-        "timer-probe: tick_in={} got={} cycles={} rounds={} was_running={} rte2={:?}",
-        tick_in, probe.ticks, probe.cycles, probe.rounds, was_running, apic::rte_raw(2)
-    );
+    // §201：读数进静态量，**不往串口加行**（理由见 SLEEP_PROBE 头注释）。
+    SLEEP_PROBE[0].store(tick_in as u64, Ordering::Relaxed);
+    SLEEP_PROBE[1].store(probe.ticks, Ordering::Relaxed);
+    SLEEP_PROBE[2].store(probe.cycles, Ordering::Relaxed);
+    SLEEP_PROBE[3].store(probe.rounds, Ordering::Relaxed);
+    SLEEP_PROBE[4].store(u64::from(was_running), Ordering::Relaxed);
+    SLEEP_PROBE[9].fetch_add(1, Ordering::Relaxed);
     if !was_running {
         let r = apic::timer_start();
-        #[cfg(feature = "timer-probe-log")]
-        crate::log_info!("timer-probe: 开表结果={:?} rte2={:?}", r, apic::rte_raw(2));
+        SLEEP_PROBE[6].store(1, Ordering::Relaxed);
+        SLEEP_PROBE[7].store(u64::from(r.is_ok()), Ordering::Relaxed);
+        SLEEP_PROBE[8].store(rte_lo(), Ordering::Relaxed);
     }
     let (reg0, fired0, _) = sched::timer_stats(cpu::BSP_SLOT);
     let t0 = tsc::now();
