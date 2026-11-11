@@ -1708,6 +1708,29 @@ def check_wedge_probe() -> list[str]:
     # §202 的棘轮：探测判据的**两半必须一致**——`wait_ticks(base, N, …)` 与随后用作判据的
     # `.ticks >= M` 必须 N == M。§202 实测踩过：只把 want 改成 2、比较仍留 >=1，
     # 等于只拉长窗口没改判据，run-348 照样挂（got=1 rounds=2028 却 was_running=1）。
+    # ADR-081 决策 2：lock-order.md 的"是否在中断上下文取"那一列是 never_taken_in_isr 的
+    # **唯一依据来源**，表与代码必须逐把一致。填错就是新死锁（§205：对 TIMER/RUNQ 开窗会自死锁）。
+    lo = (ROOT / "docs" / "architecture" / "lock-order.md").read_text(encoding="utf-8")
+    tab = {}
+    for ln in lo.splitlines():
+        m = re.match(r"\| `(RANK_\w+)` \| (\d+) \|", ln)
+        if m:
+            tab[m.group(1)] = "**是**" in ln.rsplit("|", 2)[-2]
+    ctor = {}
+    for f in sorted((ROOT / "kernel" / "src").rglob("*.rs")):
+        for ln in f.read_text(encoding="utf-8", errors="replace").splitlines():
+            m = re.search(r"IrqSpinLock::(new_isr_taken|new)\(\s*(?:crate::sync::|sync::)?(RANK_\w+)", ln)
+            if m:
+                ctor[m.group(2)] = (m.group(1) == "new_isr_taken", f.name)
+    if not tab or not ctor:
+        bad.append("锁序表或构造点一个都没解析出来 ⇒ ADR-081 决策 2 那条对账是空转的")
+    for rk, (isr, fname) in ctor.items():
+        if rk not in tab:
+            bad.append(f"{fname} 用了 {rk} 但锁序表里没有这一行 ⇒ 新锁必须先改表（硬约束 4）")
+        elif tab[rk] != isr:
+            want = "new_isr_taken" if tab[rk] else "new"
+            bad.append(f"{rk} 表里说{'在中断上下文取' if tab[rk] else '不在中断上下文取'}，"
+                       f"代码却用了 {'new_isr_taken' if isr else 'new'} ⇒ 应当用 {want}（ADR-081 决策 2，填错就是新死锁）")
     pairs = 0
     for f in sorted((ROOT / "kernel" / "src").rglob("*.rs")):
         ls = f.read_text(encoding="utf-8", errors="replace").splitlines()
