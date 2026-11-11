@@ -9520,6 +9520,46 @@ USB/xHCI、NVMe、AML/电源、真机 bringup、生产钥匙保管/轮换/吊销
 
 **只读勘察 + 计划，零代码改动**；`check` 沿用 17/17。下一步从 **S4a** 开始动手。
 
+## 230. **S4a 落地：产品启动路径真起 ring3**（ADR-082）——判据是**用户态信箱**不是串口（2026-11-12，实测）
+
+转向功能开发后的**第一片代码**。`main.rs` 新增 `stage_init_user()`，在 ktests 之后、判定之前。
+
+### 一、读数（run-922，elf `c1851dd91436`）
+
+```
+init-user: 产品路径起 ring3 任务=2 entry=0x100000000 栈顶=0x100105ff0 段=3 页=5 等待收工=false
+           信箱 magic=Some(11936045730314344056) ping=Some(33) add=Some(60)
+ktests: total=81 passed=81 failed=0      verdict: PASS      qemu_rc=33
+```
+magic 与 ktest 里 `elfload:` 那行**逐字相同** ⇒ 同一份产物、同一套契约。
+**这是本仓库第一次在产品路径上跑起用户程序**（此前只在 ktest 里）。
+
+### 二、**我第一版把判据写错了（要记）**
+
+第一版判据写成"串口出现 hello 自己的输出"。跑起来**串口什么都没有**，差点误判成失败。
+读 `user/hello` 才发现：**它不打印**，它往自己的数据段写 `magic/ping/add`（`OFF_*` 常量）。
+⇒ **判据改成读信箱**（`user::read_at(data_va + 0/8/16)`）。
+**教训**：定判据前先读被测程序**实际做什么**，不要按"程序应该会打印"想当然。
+
+### 三、`等待收工=false` 是预期
+
+hello 写完信箱就停在自旋里、**不会自己收工**，所以有界等待返回 false 正常。
+判据只看信箱。**本片不 terminate 它**（常驻 init 的雏形）。
+
+### 四、门禁连锁与 ADR
+
+`public_api` 漏登记 4 个（`sched::wait_for_task`、`user::load`、`user::describe_load`、`user::read_at`）
+——它们本来只在 ktest 里用，现在产品路径也引用 ⇒ 登记是正当后果。
+`check-interface-change` 要求伴随 ADR ⇒ 新写 **ADR-082**（产品路径起 ring3 + 信箱判据 + 明确不做 S4b/S4c）。
+`check` **17/17**。
+
+### 五、欠账与下一步
+
+- **本片没有负样本**（ADR-082 已记）：改入口为未映射页应升 L4、改信箱偏移应读回 None。
+- **S4b**：产品路径授予句柄（权限只从句柄来）。**S4c**：`MAX_TASKS=9` 零余量重算。
+- 之后 **S5 串口 shell**、**S6 framebuffer + PS/2**。
+- 行尾：`main.rs` CRLF、`module-interfaces.toml` LF、ADR-082 **LF**、BACKLOG CRLF。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

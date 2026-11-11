@@ -792,6 +792,10 @@ fn run_ktests_and_finish() -> ! {
     let ruler_ok = pr.faults > 0 && pr.min_cycles <= pr.mean_cycles && pr.mean_cycles <= pr.max_cycles;
     crate::log_info!("p3 ruler: samples_ok={} min<=mean<=max={}", pr.faults > 0, pr.min_cycles <= pr.mean_cycles && pr.mean_cycles <= pr.max_cycles);
 
+    // S4a（W5 第一片，BACKLOG §229）：产品路径**真起 ring3**。放在判定之前、ktests 之后，
+    // 这样用例读数不受影响，而 hello 的输出能进同一份串口。
+    stage_init_user();
+
     // 判定必须同时满足：表可用且非空、无失败、异常确实被取到过、且 P3 的量具真的收到过样本
     let clean = !s.table_invalid
         && s.total > 0
@@ -806,6 +810,45 @@ fn run_ktests_and_finish() -> ! {
     exit::finish(exit::Code::Failed)
 }
 
+
+/// S4a（W5 第一片）：产品启动路径装载并跑起第一个用户程序。
+///
+/// **为什么这一片单独存在**：在此之前用户态执行**只在 ktest 里**，产品路径一个用户程序都不跑
+/// （`main.rs` 里搜不到 `spawn_user`）⇒ 没有 init、也就不可能有 shell（BACKLOG §229）。
+/// 本片只做"装载 + 跑起来 + 看到它自己的输出"；**句柄授予留 S4b**（权限只从句柄来）、
+/// **`MAX_TASKS` 余量重算留 S4c**。
+///
+/// 装载产物用与 ktest 同源的嵌入式夹具（`ktests::common::HELLO_ELF`），
+/// 从卷上取 ELF 那条路已在 L3-C 交付，这里不重做。
+fn stage_init_user() {
+    let loaded = match crate::user::load(crate::ktests::common::HELLO_ELF) {
+        Ok(l) => l,
+        Err(e) => {
+            crate::log_warn!("init-user: 装载失败 —— {} ⇒ 产品路径没起用户程序", crate::user::describe_load(e));
+            return;
+        }
+    };
+    let t = match sched::spawn_user(loaded.entry, loaded.stack_top, 0, loaded.owned) {
+        Ok(t) => t,
+        Err(e) => {
+            crate::log_warn!("init-user: spawn_user 失败 {:?} ⇒ 产品路径没起用户程序", e);
+            return;
+        }
+    };
+    // 用户态要靠时间片轮转才跑得到；表若停着就先开（与用例同一律）。
+    apic::timer_start().ok();
+    let done = apic::with_interrupts(|| sched::wait_for_task(t, crate::clock::window_cycles(32)));
+    // **判据是信箱不是串口**：hello 不打印，它往自己的数据段写 magic/ping/add（user/hello 的 OFF_*）。
+    // 所以"产品路径真跑过 ring3"的证据是**这几个槽被用户态写过**，而不是串口出现字符串。
+    // bounded_wait_done=false 是预期的：hello 写完就停在自旋里，不会自己收工。
+    let magic = crate::user::read_at(loaded.data_va);
+    let ping = crate::user::read_at(loaded.data_va + 8);
+    let add = crate::user::read_at(loaded.data_va + 16);
+    crate::log_info!(
+        "init-user: 产品路径起 ring3 任务={} entry={:#x} 栈顶={:#x} 段={} 页={} 等待收工={} 信箱 magic={:?} ping={:?} add={:?}",
+        t, loaded.entry, loaded.stack_top, loaded.segs, loaded.pages, done, magic, ping, add
+    );
+}
 
 /// 用页表本身找一个确定未映射的页：先问 `mm::is_mapped`，不再靠区间算术推断。
 /// 取到即登记，堆窗口之后不可能再拿到同一页。
