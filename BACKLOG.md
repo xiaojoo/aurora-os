@@ -9460,6 +9460,66 @@ ADR-081 的验收把这三条负样本列为"必须能复现"。**现在实测�
 
 本轮**零代码改动**（只跑与记账）；`check` 沿用 §227 的 17/17。
 
+## 229. **转向整体功能开发**（使用者裁决）：先串口 CLI 再图形，测试只做基础；S4 依赖图与切片计划（2026-11-12）
+
+### 一、裁决与口径变更
+
+使用者指出"一直在做测试、整体内核代码没继续完善"，裁决：
+- **转整体功能开发**，入口顺序 **先串口 CLI，再图形终端**。
+- **测试口径改为**：每片只做 `build` + `ktests` + `check` + **1–2 行矩阵**；
+  **不再跑上百次猎挂**；已知间歇挂（~1–2%）**记为已知问题、不阻塞开发**，碰到就记一笔重跑一次。
+- 间歇挂取证**暂停**（任务 #31 关闭）。仪器已就位（21 符号 + 4 个零串口探针 + E/E2/F/G 判别支），
+  将来要查可直接用；未关闭项与阴性结果都在 §218–§228。
+
+### 二、**为什么 CLI/UI 显得远，以及为什么可以提前**
+
+路线图把显示 framebuffer 与输入放在 **M7/M9（W11/W12）**，排在 USB/xHCI、真机、钥匙管理之后。
+**但那是排序选择、不是硬依赖**：
+- **串口 CLI 现在就能做**：串口驱动已有，不需要任何新硬件支持。
+- **图形终端也不需要 USB**：Limine 已给 framebuffer，QEMU 里 **PS/2 键盘**就够，不必等 xHCI。
+⇒ 本波把 CLI/UI 提前，USB/xHCI、NVMe、AML、真机、生产钥匙管理**推后**。
+
+### 三、现状缺口（已核）
+
+**产品启动路径根本不起 ring3**：`main.rs` 里搜不到 `spawn_user`/`enter_ring3`，
+用户态执行**只在 ktest 里**。所以现在没有任何用户程序在跑，也就没有 shell。
+
+### 四、S4 依赖图（已勘察到的 API）
+
+| 能力 | 现成入口 |
+|---|---|
+| 装载用户 ELF | `user::load(bytes) -> Result<Loaded, LoadError>`（`user.rs:1791`） |
+| 授予句柄 | `handle::grant_file/grant_vmo/grant_job/grant_proc/grant_aspace/grant_thread` |
+| 进程/Job 生命周期 | `proc::proc_reap` / `proc_discard` / `job_destroy` |
+| 起线程 | `sched::spawn_user`；syscall **15** `thread_create`（建出来就停住） |
+| 回填并放行 | syscall **16** `process_start` + `StartupInfo`（布局在 `user.rs:88`，ADR-075 决策 3） |
+| 地址空间映射 | syscall **11/14** `aspace_map` |
+| 用户产物 | `user/hello`、`user/probe`（都已是真 ELF） |
+
+**ktest 的端到端序列在 `proc_sys_worker` 里**（`t_process_startup` 只收读数），
+所以 S4 要**把那条序列搬到产品路径**，而不是复用测试的读数壳。
+
+### 五、切片计划（每片独立过基础测试）
+
+- **S4a**：产品路径装载并跑起 `hello`。先用嵌入式 `include_bytes!`（与 ktest 同源），
+  在 `run_ktests_and_finish` **之后**加一个 `stage_init_user()`；跑完不回收（它是常驻 init）。
+  判据：串口出现 hello 自己的输出 + `ktests` 仍 81/81 + 退出码仍 33。
+- **S4b**：**产品路径授予句柄**（权限只从句柄来），把 S4a 里"内核直接给映射"换成句柄授予。
+  判据：无 CREATE 权限时拒（`E_DENIED`），有权限时通；1 行矩阵。
+- **S4c**：`MAX_TASKS = 9` **零余量重算**（init 常驻会占一格，ktest 的 spawn 炸弹判据要跟着改）。
+- **S5**：**串口 shell**（真用户程序）：`help/ls/cat/mem/ps/reboot`；需要串口输入
+  （中断驱动或轮询）+ 一个新用户产物 `user/shell`。
+- **S6**：**framebuffer 终端 + PS/2 键盘**（图形 UI）：字体渲染、滚动、键盘布局。
+
+### 六、明确不做（本波）
+
+USB/xHCI、NVMe、AML/电源、真机 bringup、生产钥匙保管/轮换/吊销、A/B 槽位与拒启
+（那些仍按原路线图排在 W6–W12）。**间歇挂不再深挖。**
+
+### 七、本轮状态
+
+**只读勘察 + 计划，零代码改动**；`check` 沿用 17/17。下一步从 **S4a** 开始动手。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。
