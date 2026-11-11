@@ -332,7 +332,22 @@ fn t_elf_container() -> bool {
 }
 ktest!(KT_ELF, t_elf_container);
 
+/// §215 **零串口步骤探针**：run-555/558 停在 `elfload:` magic 日志之后的逐字相同位置，
+/// 那不是随机停点。这里只写静态量、**不往串口加行**（§200 实测串口诊断会把现象压掉），
+/// 挂死时由宿主机 QMP 读回。槽位：0=最后步骤号 1=进入 t_elf_load_run 次数
+/// 2=进入 t_two_containers 次数 3=离开 t_elf_load_run 次数。
+/// 步骤号：1=elf_load 入口 4=magic 日志之后/read_at 之前 5=read_at 之后 9=elf_load 返回
+///          20=two_containers 入口 29=two_containers 返回
+static ELF_PROBE: [core::sync::atomic::AtomicU64; 4] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 4];
+
+fn mark(step: u64) {
+    ELF_PROBE[0].store(step, core::sync::atomic::Ordering::Relaxed);
+}
+
 fn t_elf_load_run() -> bool {
+    mark(1);
+    ELF_PROBE[1].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let Some(s) = acpi::summary() else { return false };
     let Some(m) = s.madt else { return false };
     if apic::get_or_init(&m).is_err() {
@@ -473,7 +488,9 @@ fn t_elf_load_run() -> bool {
         state,
         !mm::is_mapped(loaded.stack_top - mm::PAGE as u64 - 8)
     );
+    mark(4);
     let loops = user::read_at(loaded.data_va + 40);
+    mark(5);
     // **P7 归因**：`first` = 这个 CPU 第一次被记账的代价，`min` = 同一条路径
     // 连续 30 多次调用里最小的那一次。两者之比就是"冷启动"与"结构成本"的分界读数。
     // 这里刻意只报比值不报结论：判据要能分辨，但"为什么"要另做一次实验才能写。
@@ -928,6 +945,8 @@ crate::ktest!(KT_PROBE_RING3, t_probe_ring3);
 
 #[cfg(feature = "handles")]
 fn t_two_containers() -> bool {
+    mark(20);
+    ELF_PROBE[2].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     use crate::ktests::common::{HELLO_ELF, PROBE_ELF, drained_or_free};
     use crate::arch::x86_64::apic;
     let Some(s) = acpi::summary() else { return false };
