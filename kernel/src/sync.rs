@@ -531,7 +531,13 @@ impl<T: Send> IrqSpinLock<T> {
     /// **中断上下文也会取的锁**（WAITQ/TIMER/RUNQ）：等它时**不许**开窗，
     /// 否则自己的 tick 进来再取同一把锁就是自死锁（ADR-081 §205 的推导）。
     pub const fn new_isr_taken(rank: LockRank, v: T) -> Self {
-        Self { locked: AtomicUsize::new(0), held_by: AtomicU64::new(UNHELD), rank, never_taken_in_isr: false, data: UnsafeCell::new(v) }
+        // 负样本（ADR-081 决策 2）：把 TIMER 误标成"从不在中断里取" ⇒ 等它时开窗会自死锁。
+        // 在构造器里按 rank 做 cfg 二选一，避免去复制多行的数组字面量（那样会破坏语法，本轮踩过）。
+        #[cfg(feature = "fault-timer-marked-taskonly")]
+        let never = rank.0 != RANK_TIMER.0;
+        #[cfg(not(feature = "fault-timer-marked-taskonly"))]
+        let never = false;
+        Self { locked: AtomicUsize::new(0), held_by: AtomicU64::new(UNHELD), rank, never_taken_in_isr: never, data: UnsafeCell::new(v) }
     }
 
     pub fn rank(&self) -> LockRank {
@@ -555,7 +561,11 @@ impl<T: Send> IrqSpinLock<T> {
         let t0 = crate::tsc::now();
         // ADR-081 决策 1：**三条件**——目标锁从不在 ISR 取、此刻最内层等级 < TIMER(6)、只在自旋内开。
         // 条件 2 是硬约束：持 HEAP(10) 等 VMM 时若开窗，tick 取 TIMER(6) 会撞 `外层 rank=10 本次 rank=6`。
+        #[cfg(not(feature = "fault-open-no-rank-guard"))]
         let may_open = self.never_taken_in_isr && INNERMOST[slot].load(Ordering::Relaxed) < RANK_TIMER.0;
+        // 负样本：去掉条件②（等级闸），只留标志。正常构建里这行不存在。
+        #[cfg(feature = "fault-open-no-rank-guard")]
+        let may_open = self.never_taken_in_isr;
         loop {
             if may_open {
                 open_window_raw();

@@ -2515,6 +2515,10 @@ fn unmap_locked(va: VirtAddr, pages: usize) {
 // 状态本体仍住在 `State` 里（`s()` 这套访问已遍布本模块，塞进锁里改动量远大于收益）。
 // 顺序依据 `docs/architecture/lock-order.md`：VMM(20) 之内可以叫 PMM(30)，反过来绝不许可。
 // **先取后放再取下一个**是合法的（依次获取不算嵌套），前提是 `IrqGuard::drop` 会还原等级栈。
+/// 负样本（ADR-081）：把 VMM 标回"中断里也取" ⇒ 等它时不开窗 ⇒ §204 死锁应回来。
+#[cfg(feature = "fault-vmm-no-open")]
+static VMM_LOCK: IrqSpinLock<()> = IrqSpinLock::new_isr_taken(sync::RANK_VMM, ());
+#[cfg(not(feature = "fault-vmm-no-open"))]
 static VMM_LOCK: IrqSpinLock<()> = IrqSpinLock::new(sync::RANK_VMM, ());
 static PMM_LOCK: IrqSpinLock<()> = IrqSpinLock::new(sync::RANK_PMM, ());
 

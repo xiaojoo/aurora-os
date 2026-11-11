@@ -57,6 +57,17 @@ fault-grow-reentrant = []
 # 负样本（ADR-081 决策 4）：反向嵌套——持 HEAP(10) 再取 GROW(4)，必须被锁序检测认出并升 L4。
 fault-grow-order = []
 
+# 负样本（ADR-081 决策 1 条件②）：去掉"最内层等级 < TIMER(6)"这道闸 ⇒ 持 HEAP(10) 等 VMM 时
+# 也开窗，tick 进来取 TIMER(6) 应撞 `锁序违规，外层 rank=10 本次 rank=6`。
+fault-open-no-rank-guard = []
+
+# 负样本（ADR-081 决策 2）：把 TIMER 误标成"从不在中断里取" ⇒ 等 TIMER 时开窗，
+# 自己的 tick 进来再取同一把锁 ⇒ 应撞 `重入获取 rank=6`。
+fault-timer-marked-taskonly = []
+
+# 负样本（ADR-081 决策 1/2）：把 VMM 标回"中断里也取" ⇒ 等 VMM 时不开窗 ⇒ §204 死锁应回来。
+fault-vmm-no-open = []
+
 # 负样本（ADR-021）：把"IF 属于 CPU"改回硬件默认的"任务自己带 IF"。
 # 这条构建用来证明 ADR-021 不是修辞——去掉机制，M3a 记录过的故障形状必须回来。
 fault-if-carriage = []
