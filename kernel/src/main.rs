@@ -232,6 +232,46 @@ extern "C" fn after_switch(_: usize) -> ! {
     run_ktests_and_finish()
 }
 
+/// S6b-2：把 ktests 的结果**真画到屏幕上**，并当场演示一次滚动，然后落冻结契约。
+///
+/// **为什么放在判定之前、而且这一档要配 `resident-init` 一起跑**：冻结标记一旦打完，
+/// 剩下的串口输出只有 `verdict:` 与 `qemu-exit=`（几十字节，几毫秒），宿主机根本来不及
+/// 轮询到标记再发 QMP `screendump`。所以取证跑用 `framebuffer,handles,resident-init`：
+/// 判定之后系统停在那儿等 init（§237 判据①已经证过那一格），宿主机就有了不限时的窗口。
+/// **不用 socket 输入通道**——那条路是 §237 记着的已知坏格子。
+///
+/// 滚动是**真搬像素**（`scroll_up`：正文区逐像素上移一个字符行），不是只改行号。
+/// 判据形状由 `fbcon::Term::fill_body` 的定义决定：正文第 r 行第 c 格是 `'A' + ((r*cols+c) % 26)`；
+/// 滚一行之后，屏幕上的第 r 行应当等于**滚动前的第 r+1 行**。宿主机照这条公式独立复算。
+fn stage_fbcon_tail(total: usize, failed: usize, table_invalid: bool) {
+    let Ok(f) = crate::frame::Frame::init() else {
+        crate::log_warn!("fbcon: tail 阶段拿不到帧缓冲");
+        return;
+    };
+    let Some(term) = crate::fbcon::Term::new(&f) else {
+        crate::log_warn!("fbcon: 几何放不下终端栅格（至少要到 {}x{}）",
+                         crate::fbcon::CELL_W * 8, crate::fbcon::CELL_H * (crate::fbcon::BAND_ROWS + 2));
+        return;
+    };
+    let (cols, rows) = term.dims();
+    let body = term.fill_body(&f);
+
+    let line = crate::fbcon::BAND_TEXT;
+    let drew = term.print_scrolled(&f, &line);
+    crate::log_info!("fbcon: 滚动一次 末行画出格数={}", drew);
+    let (band_row, wrote) = term.freeze_band(&f);
+    let (bx, by) = term.band_origin();
+    crate::log_info!(
+        "fbcon: 栅格 {}x{} 正文行={} 冻结带首行像素=({},{}) 带宽字符={} 文本=\"{}\" 用例 总={} 败={} 表无效={}",
+        cols, rows, body, bx, by, wrote, line, total, failed, table_invalid
+    );
+    let before = f.get(bx, by).unwrap_or(u32::MAX);
+    term.print_line(&f, band_row, "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
+    let after = f.get(bx, by).unwrap_or(u32::MAX);
+    crate::log_info!("fbcon: 冻结后再写无效={}（带首像素 {:#010x} vs {:#010x}）", before == after, before, after);
+    crate::log_info!("fbcon: 已冻结 带首像素=({},{}) 字宽={} 字高={}", bx, by, crate::fbcon::CELL_W, crate::fbcon::CELL_H);
+}
+
 /// S6a：把帧缓冲开起来、报出几何与两处地址、画一张宿主机能独立复算的图案。
 ///
 /// **串口仍然是权威判据通道**：这一段只**新增**日志行，一个既有字节的顺序都不改
@@ -283,32 +323,7 @@ fn stage_framebuffer() {
         bad
     );
 
-    // ---------------- S6b：文本→像素 + 冻结契约 ----------------
-    let Some(term) = fbcon::Term::new(&f) else {
-        crate::log_warn!("fbcon: 几何放不下终端栅格（至少要到 {}x{}）",
-                         fbcon::CELL_W * 8, fbcon::CELL_H * (fbcon::BAND_ROWS + 2));
-        return;
-    };
-    let (cols, rows) = term.dims();
-    let body = term.fill_body(&f);
-    let (band_row, wrote) = term.freeze_band(&f);
-    let (bx, by) = term.band_origin();
-    crate::log_info!(
-        "fbcon: 栅格 {}x{} 正文行={} 冻结带首行像素=({},{}) 带宽字符={} 文本={}",
-        cols, rows, body, bx, by, wrote, fbcon::BAND_TEXT
-    );
-    // 契约的正半句必须现场自证：闸门关上之后再写就是 no-op。
-    // 不比这一格的话，"冻结"只是注释里的一句话。
-    let before = f.get(bx, by).unwrap_or(u32::MAX);
-    term.print_line(&f, band_row, "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
-    let after = f.get(bx, by).unwrap_or(u32::MAX);
-    crate::log_info!(
-        "fbcon: 冻结后再写无效={}（带首像素 {:#010x} vs {:#010x}）",
-        before == after, before, after
-    );
-    // 宿主机以这一行为准去 dump——它出现之后画面就不会再变了
-    crate::log_info!("fbcon: 已冻结 带首像素=({},{}) 字宽={} 字高={}",
-                     bx, by, fbcon::CELL_W, fbcon::CELL_H);
+
 }
 
 /// Stage2a/2b：页表接管后的内存统计与内核堆。
@@ -883,6 +898,9 @@ fn run_ktests_and_finish() -> ! {
     // 这样用例读数不受影响，而 hello 的输出能进同一份串口。
     // S5d：接住 init 的任务号——判定之后要不要等它，由 `park_until_init_exits` 说。
     let init_task = stage_init_user();
+    // S6b-2：把这一跑的用例结果画到屏幕上（画面取证要像素证人，不是串口证人）
+    #[cfg(feature = "framebuffer")]
+    stage_fbcon_tail(s.total as usize, s.failed as usize, s.table_invalid);
 
     // 判定必须同时满足：表可用且非空、无失败、异常确实被取到过、且 P3 的量具真的收到过样本
     let clean = !s.table_invalid

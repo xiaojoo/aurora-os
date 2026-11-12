@@ -145,6 +145,16 @@ impl Frame {
         self.region.write32(off, self.pack(rgb)).map_err(FrameError::Map)
     }
 
+    /// 搬一个**已经打包好的**像素值。滚动必须用它：`put` 收 24 位色再打包，
+    /// 而滚动拿到的是 `get` 读回来的原生值，再打包一次就是二次转换——
+    /// 在 8/8/8 上看不出来，换上窄字段面板就会把自家滚动画糊掉，而且不报错。
+    pub fn put_raw(&self, x: u64, y: u64, packed: u32) -> Result<(), FrameError> {
+        if x >= self.info.width || y >= self.info.height {
+            return Err(FrameError::OutOfBounds { x, y, width: self.info.width, height: self.info.height });
+        }
+        self.region.write32((y * self.info.pitch + x * 4) as usize, packed).map_err(FrameError::Map)
+    }
+
     /// 读回一个像素。**注意这只证明"我们写的字节还在我们映射的窗口里"**，
     /// 不证明设备把它显示出来了——后者由宿主机侧的 PPM 对账负责（第二台仪器）。
     pub fn get(&self, x: u64, y: u64) -> Result<u32, FrameError> {

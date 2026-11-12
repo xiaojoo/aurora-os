@@ -131,6 +131,44 @@ impl Term {
         body
     }
 
+    /// 正文区整体上移**一个字符行**（只搬正文区，冻结带不参与）。
+    ///
+    /// 逐像素搬：`get` 拿原生打包值、`put_raw` 写回去，中间不做任何色彩转换。
+    /// 不"只搬最后几行"糊弄——那会让"滚动了"这件事只有日志证人、没有像素证人。
+    pub fn scroll_up(&self, f: &Frame) -> bool {
+        if Self::frozen() {
+            return false;
+        }
+        let top = 0u64;
+        let bottom = (self.rows - BAND_ROWS) * CELL_H;   // 正文区底边（不含冻结带）
+        for y in top..bottom - CELL_H {
+            for x in 0..self.cols * CELL_W {
+                match f.get(x, y + CELL_H) {
+                    Ok(v) => { if f.put_raw(x, y, v).is_err() { return false; } }
+                    Err(_) => return false,
+                }
+            }
+        }
+        // 腾出来的最后一行刷成背景，否则旧内容会在底部留一层"看起来像上一行"的残影
+        for y in bottom - CELL_H..bottom {
+            for x in 0..self.cols * CELL_W {
+                if f.put_raw(x, y, BG).is_err() { return false; }
+            }
+        }
+        true
+    }
+
+    /// 滚动一行，再把文本画在正文区最后一行。返回画出的字符格数。
+    pub fn print_scrolled(&self, f: &Frame, s: &str) -> usize {
+        if Self::frozen() {
+            return 0;
+        }
+        if !self.scroll_up(f) {
+            return 0;
+        }
+        self.print_line(f, self.rows - BAND_ROWS - 1, s)
+    }
+
     /// 落冻结契约：把 [`BAND_TEXT`] 写进底部带，然后**永久闸门**关上。
     /// 返回 (带首行行号, 实际写出的格数)。调用方必须在串口上打一行"已冻结"给宿主机看。
     pub fn freeze_band(&self, f: &Frame) -> (u64, usize) {
