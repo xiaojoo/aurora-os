@@ -1,4 +1,4 @@
-//! 16550 串口输出：M1 阶段唯一的可观测通道（手册 §4.5）。
+//! 16550 串口收发：启动日志与控制台输入（手册 §4.5）。
 //!
 //! 端口 I/O 属 unsafe；`aurora-kernel` 已整体登记在 `docs/security/unsafe-whitelist.toml`
 //! （垂直切片阶段的临时状态，§2.5 拆 crate 后由 aurora-arch/aurora-hw 承接）。
@@ -143,26 +143,143 @@ pub fn init() {
     READY.store(ok, Ordering::Release);
 }
 
+// BSP ISR 单生产者、一个任务消费者；留一格区分满与空。
+const RX_CAP: usize = 256;
+const RX_ISR_BUDGET: usize = 8;
+static RX_BUDGET_HITS: AtomicUsize = AtomicUsize::new(0);
+static RX_BUF: [AtomicU8; RX_CAP] = [const { AtomicU8::new(0) }; RX_CAP];
+static RX_HEAD: AtomicUsize = AtomicUsize::new(0); // ISR 写
+static RX_TAIL: AtomicUsize = AtomicUsize::new(0); // 读者写
+static RX_DROPPED: AtomicUsize = AtomicUsize::new(0);
+static RX_BYTES: AtomicUsize = AtomicUsize::new(0);
+static RX_IRQS: AtomicUsize = AtomicUsize::new(0);
+static RX_ON: AtomicBool = AtomicBool::new(false);
+const SERIAL_IRQ: u8 = 4;
+
+#[derive(Debug)]
+pub enum RxError {
+    NotReady,
+    WrongContext,
+    Apic(crate::arch::x86_64::apic::ApicError),
+    Irq(crate::irq::IrqError),
+}
+
+fn rx_isr() -> bool {
+    if !RX_ON.load(Ordering::Relaxed) {
+        return false;
+    }
+    // 临时撤下 UART IRQ，预算用尽后重新使能仍能生成下一条边沿。
+    out8(COM1 + R_IER, 0);
+    RX_IRQS.fetch_add(1, Ordering::Relaxed);
+    let mut taken = 0;
+    for _ in 0..RX_ISR_BUDGET {
+        if in8(COM1 + R_LSR) & LSR_DATA == 0 {
+            break;
+        }
+        let b = in8(COM1 + R_DATA);
+        let h = RX_HEAD.load(Ordering::Relaxed);
+        let t = RX_TAIL.load(Ordering::Acquire);
+        if (h + 1) % RX_CAP == t {
+            RX_DROPPED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            RX_BUF[h].store(b, Ordering::Relaxed);
+            RX_HEAD.store((h + 1) % RX_CAP, Ordering::Release);
+            RX_BYTES.fetch_add(1, Ordering::Relaxed);
+        }
+        taken += 1;
+    }
+    if taken == RX_ISR_BUDGET && in8(COM1 + R_LSR) & LSR_DATA != 0 {
+        RX_BUDGET_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+    out8(COM1 + R_IER, 1);
+    taken != 0
+}
+
+pub fn rx_budget_hits() -> usize {
+    RX_BUDGET_HITS.load(Ordering::Relaxed)
+}
+
+pub fn enable_rx(m: &crate::acpi::Madt) -> Result<(), RxError> {
+    use crate::arch::x86_64::{apic, cpu};
+    if apic::in_isr() || cpu::self_slot() != 0 {
+        return Err(RxError::WrongContext);
+    }
+    if RX_ON.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    if !is_ready() {
+        return Err(RxError::NotReady);
+    }
+    apic::get_or_init(m).map_err(RxError::Apic)?;
+    let h = crate::irq::request(crate::mm::MOD_BOOT, rx_isr).map_err(RxError::Irq)?;
+    if let Err(e) = apic::ioapic_route(m, SERIAL_IRQ, h.vector) {
+        crate::irq::release(crate::mm::MOD_BOOT, h).map_err(RxError::Irq)?;
+        return Err(RxError::Apic(e));
+    }
+    RX_ON.store(true, Ordering::Release);
+    out8(COM1 + R_IER, 1);
+    Ok(())
+}
+
+/// 只供一个任务消费者调用；空队列立即返回 None。
+pub fn read_byte() -> Option<u8> {
+    let t = RX_TAIL.load(Ordering::Relaxed);
+    if t == RX_HEAD.load(Ordering::Acquire) {
+        return None;
+    }
+    let b = RX_BUF[t].load(Ordering::Relaxed);
+    RX_TAIL.store((t + 1) % RX_CAP, Ordering::Release);
+    Some(b)
+}
+
+/// 入环字节 / 软件溢出丢弃 / ISR 次数 / 当前排队字节；不含 UART 硬件错误。
+pub fn rx_stats() -> (usize, usize, usize, usize) {
+    let h = RX_HEAD.load(Ordering::Acquire);
+    let t = RX_TAIL.load(Ordering::Relaxed);
+    (
+        RX_BYTES.load(Ordering::Relaxed),
+        RX_DROPPED.load(Ordering::Relaxed),
+        RX_IRQS.load(Ordering::Relaxed),
+        (h + RX_CAP - t) % RX_CAP,
+    )
+}
+
 pub fn is_ready() -> bool {
     READY.load(Ordering::Acquire)
 }
 
-fn putb(b: u8) {
+fn putb(b: u8) -> bool {
     // 环先收：它记的是"内核说了什么"，串口那一头还有"发出去了没有"这一关（下面那个有界等待
     // 超时时会真的丢字节）。两边只在串口丢字节时分叉，而那时判据红的就是真故障。
     ring_push(b);
     if !is_ready() {
-        return;
+        return false;
     }
     // 有界等待：真硬件卡住时不能无限自旋（会撞 §9.6 看门狗，且没有任何输出）
     for _ in 0..1_000_000 {
         if in8(COM1 + R_LSR) & LSR_THRE != 0 {
             out8(COM1 + R_DATA, b);
             BYTES_OUT.fetch_add(1, Ordering::Relaxed);
-            return;
+            return true;
         }
         core::hint::spin_loop();
     }
+    false
+}
+
+pub fn write_bytes(bytes: &[u8]) -> usize {
+    let guard = acquire_line();
+    if !guard.held {
+        return 0;
+    }
+    let mut done = 0;
+    for &b in bytes {
+        if !putb(b) {
+            break;
+        }
+        done += 1;
+    }
+    done
 }
 
 fn putstr(s: &[u8]) {

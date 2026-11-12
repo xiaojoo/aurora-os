@@ -22,10 +22,13 @@ import argparse
 import fnmatch
 import os
 import re
+import socket
 import struct
 import hashlib
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -152,6 +155,31 @@ PROBE_PKG = "aurora-user-probe"
 PROBE_ELF = ROOT / "target" / TARGET / "debug" / "probe"
 PROBE_FIXTURE = ROOT / "kernel" / "fixtures" / "probe.elf"
 PROBE_RUSTFLAGS = "-C link-arg=-Tuser/probe/link.ld -C relocation-model=static -C panic=abort -C opt-level=1"
+# S5c：第三个用户产物（串口 shell）。与 probe 同一条构建纪律，只换链接脚本与包名。
+SHELL_PKG = "aurora-user-shell"
+SHELL_ELF = ROOT / "target" / TARGET / "debug" / "shell"
+SHELL_FIXTURE = ROOT / "kernel" / "fixtures" / "shell.elf"
+SHELL_RUSTFLAGS = "-C link-arg=-Tuser/shell/link.ld -C relocation-model=static -C panic=abort -C opt-level=1"
+
+
+def do_build_shell() -> Path:
+    """S5c：构建串口 shell 并落成夹具。与 do_build_probe 逐条同形（含"只在字节真变了才覆写"）。"""
+    r = subprocess.run(
+        [str(CARGO), "build", "--target", TARGET, "-p", SHELL_PKG],
+        capture_output=True, text=True, cwd=str(ROOT),
+        env={**env(), "RUSTFLAGS": SHELL_RUSTFLAGS},
+    )
+    if r.returncode != 0:
+        sys.exit("shell 构建失败：" + (r.stdout + r.stderr)[-2000:])
+    data = SHELL_ELF.read_bytes()
+    SHELL_FIXTURE.parent.mkdir(exist_ok=True)
+    changed = not SHELL_FIXTURE.exists() or SHELL_FIXTURE.read_bytes() != data
+    if changed:
+        SHELL_FIXTURE.write_bytes(data)
+    import hashlib
+    print(f"shell 程序: {SHELL_FIXTURE.relative_to(ROOT)}  {len(data)} 字节  "
+          f"sha256={hashlib.sha256(data).hexdigest()[:12]} {'（夹具已更新）' if changed else '（与夹具一致）'}")
+    return SHELL_FIXTURE
 
 
 def do_build_probe() -> Path:
@@ -178,6 +206,7 @@ def do_build_probe() -> Path:
 def do_build(features: list[str]) -> Path:
     do_build_user()
     do_build_probe()
+    do_build_shell()
     elf = kernel_binary(features)
     print(f"内核: {elf}  ({elf.stat().st_size} 字节)")
     return elf
@@ -2766,10 +2795,115 @@ def qmp_hang_evidence(port: int, log: str, build_dir: Path, seq: int) -> str:
     return dump + "\n" + text + "\n"
 
 
+SERIAL_RX_SIZES = (16, 300, 32)
+CONSOLE_PAYLOAD = bytes((i * 37 + 53) & 255 for i in range(32))
+
+
+def serial_rx_payload(phase: int) -> bytes:
+    return bytes((i * 37 + phase * 53) & 255 for i in range(SERIAL_RX_SIZES[phase]))
+
+
+def serial_rx_ready(line: str, seen: set[int]) -> int:
+    """只接受协议内的完整 ready 行；调用方在发送/记录成功之后认领该阶段。"""
+    m = re.fullmatch(r"serial-rx: ready phase=([0-2]) bytes=([0-9]+)", line)
+    if not m:
+        raise ValueError(f"ready 格式或 phase 范围错误：{line!r}")
+    phase, size = map(int, m.groups())
+    if size != SERIAL_RX_SIZES[phase]:
+        raise ValueError(f"phase={phase} ready bytes={size}，应为 {SERIAL_RX_SIZES[phase]}")
+    if phase in seen:
+        raise ValueError(f"phase={phase} ready 重复")
+    if phase != len(seen):
+        raise ValueError(f"ready 阶段乱序：phase={phase}，应为 {len(seen)}")
+    return phase
+
+
+def run_serial_rx(cmd: list[str], timeout: int, *, rx_probe: bool,
+                  console_probe: bool) -> tuple[subprocess.CompletedProcess, list[str]]:
+    """单 reader 留存原始串口；S5a/S5b 各自只在完整有效 ready 后发送并记账。"""
+    bad: list[str] = []
+    sent: set[int] = set()
+    console_sent = False
+    with SERIAL_LOG.open("wb") as serial, tempfile.TemporaryFile() as stderr, socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(min(timeout, 5))
+        port = listener.getsockname()[1]
+        cmd = cmd + ["-chardev", f"socket,id=serialrx,host=127.0.0.1,port={port}"]
+        with subprocess.Popen(cmd, cwd=str(ROOT), stdin=subprocess.DEVNULL,
+                              stdout=stderr, stderr=stderr, env=env()) as proc:
+            def read_serial() -> None:
+                nonlocal console_sent
+                pending = b""
+                try:
+                    connection, _ = listener.accept()
+                    with connection:
+                        connection.settimeout(None)
+                        while True:
+                            try:
+                                chunk = connection.recv(4096)
+                            except ConnectionResetError:
+                                # Windows 的 debug-exit 可用 RST 收尾；完整见证与退出码仍由外层核验。
+                                break
+                            if not chunk:
+                                break
+                            serial.write(chunk)
+                            serial.flush()
+                            pending += chunk
+                            while b"\n" in pending:
+                                line, _, pending = pending.partition(b"\n")
+                                line = line.removesuffix(b"\r")
+                                rx_line = re.sub(rb"^\[info\] 0x[0-9a-f]+ ", b"", line)
+                                if rx_probe and rx_line.startswith(b"serial-rx: ready"):
+                                    phase = serial_rx_ready(rx_line.decode("ascii"), sent)
+                                    connection.sendall(serial_rx_payload(phase))
+                                    sent.add(phase)
+                                # console 是用户态原文；不能剥掉内核 prefix 后冒充用户输出。
+                                if console_probe and b"console: ready" in line:
+                                    if line != b"console: ready":
+                                        raise ValueError(f"console ready 格式错误：{line!r}")
+                                    if console_sent:
+                                        raise ValueError("console ready 重复")
+                                    connection.sendall(CONSOLE_PAYLOAD)
+                                    console_sent = True
+                        if rx_probe and b"serial-rx: ready" in pending:
+                            raise ValueError("serial-rx ready 行未以换行结束，未发送")
+                        if console_probe and b"console: ready" in pending:
+                            raise ValueError("console ready 行未以换行结束，未发送")
+                except Exception as e:
+                    bad.append(f"串口夹具读取/发送失败：{e}")
+                    if proc.poll() is None:
+                        proc.kill()
+
+            reader = threading.Thread(target=read_serial, name="serial-rx-reader")
+            reader.start()
+            try:
+                rc = proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                rc = -1
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait()
+                reader.join()
+        stderr.seek(0)
+        result = subprocess.CompletedProcess(cmd, rc, stderr=stderr.read().decode("utf-8", errors="replace"))
+    for phase in range(len(SERIAL_RX_SIZES)):
+        if phase not in sent:
+            bad.append(f"phase={phase} 缺少完整有效 ready 或未成功发送")
+    return result, bad
+
+
 def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str = "") -> tuple[str, int, str]:
     # 声明放在函数头：挂死取证要**这一跑的跑号**（读 RUN_SEQ），
     # 而 Python 要求 `global` 早于同一作用域里对这个名字的任何使用。
     global RUN_SEQ
+    serial_rx = "serial-rx-probe" in features
+    if serial_rx:
+        rx_extra = (extra + " " + os.environ.get("AURORA_QEMU_EXTRA", "")).split()
+        if int(os.environ.get("AURORA_QEMU_QMP") or 0) or any(
+                arg == "-qmp" or arg.startswith("-qmp=") for arg in rx_extra):
+            sys.exit("serial-rx-probe 暂不支持与 QMP 组合；请移除 QMP 参数")
     if not QEMU.exists():
         sys.exit(f"QEMU 未就位：{QEMU}")
     # 宿主机侧注入不是特性（见 FAT_HOST_FAULTS 那一段）：它改盘，不改构建。
@@ -2840,7 +2974,7 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
         "-drive", f"if=pflash,format=raw,readonly=on,file={code}",
         "-drive", f"if=pflash,format=raw,file={vars_run}",
         "-drive", f"format=raw,file={IMAGE}",
-        "-serial", f"file:{SERIAL_LOG}",
+        "-serial", "chardev:serialrx" if serial_rx else f"file:{SERIAL_LOG}",
         # 端口必须与 kernel/src/exit.rs 的 DEBUGEXIT_PORT 一致（check-verdict 机器对账）
         "-device", f"isa-debug-exit,iobase={DEBUGEXIT_IOBASE},iosize=0x04",
         "-display", "none", "-no-reboot", "-monitor", "none",
@@ -2898,7 +3032,11 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
     # 原来这里只回显附加参数，`-drive` 那几项进不了日志——一次"第二块盘没到 HBA"的
     # 红因此无法归因（实测：同一条用例经矩阵与 `run` 两条路给出不同读数，日志里看不出差别）。
     print("   + QEMU 接线:", " ".join(x for x in cmd if x.startswith("-drive") or "qcow2" in x or x == "-M" or "q35" in x))
-    if qmp_port:
+    rx_bad: list[str] = []
+    if serial_rx:
+        r, rx_bad = run_serial_rx(cmd, timeout)
+        rc = r.returncode
+    elif qmp_port:
         with subprocess.Popen(cmd, cwd=str(ROOT), stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, text=True, env=env()) as proc:
             try:
@@ -2959,6 +3097,13 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
             verdict = "CONTENT-MISMATCH"
             for b in bad:
                 print("    内容对账:", b)
+    # 在 do_run 按特性核对，不能靠日志里有没有标记，也不能只在 main/run 对账。
+    if serial_rx:
+        rx_bad += check_serial_rx(log)
+        for b in rx_bad:
+            print("    UART RX 对账:", b)
+        if rx_bad and verdict == "PASS":
+            verdict = "CONTENT-MISMATCH"
     # 「固件用法不对 / 参数不对」只会显示成一个抽象的 NOEMU，这里把 stderr 抖出来
     if verdict in ("NOEMU", "NOBOOT") and r is not None and r.stderr.strip():
         print("--- qemu stderr（截断 600 字）---")
@@ -2984,6 +3129,75 @@ def fnv1a64(data: bytes) -> int:
         h ^= b
         h = (h * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
     return h
+
+
+def check_serial_rx(log: str) -> list[str]:
+    """S5a 第二台仪器：用发送图案重算三阶段长度/丢弃量/FNV，不信内核的 ok。"""
+    bad: list[str] = []
+    ready: set[int] = set()
+    phases: set[int] = set()
+    masked = routes = budgets = 0
+    lines = log.split("\n")
+    if "serial-rx:" in lines[-1]:
+        bad.append("serial-rx 末行不完整")
+    for raw in lines[:-1]:
+        line = re.sub(r"^\[info\] 0x[0-9a-f]+ ", "", raw.removesuffix("\r"))
+        if not line.startswith("serial-rx:"):
+            continue
+        if line.startswith("serial-rx: ready"):
+            try:
+                ready.add(serial_rx_ready(line, ready))
+            except ValueError as e:
+                bad.append(str(e))
+        elif line.startswith("serial-rx: route="):
+            routes += 1
+            m = re.fullmatch(
+                r"serial-rx: route=Some\(\(([0-9]+), ([0-9]+)\)\) incomplete=true unsupported=true "
+                r"idempotent=true reject_vector=true empty=true ok=true", line)
+            if not m or not 0x21 <= int(m.group(1)) <= 0x2f or int(m.group(2)) != 0:
+                bad.append(f"路由或拒绝判据不符：{line}")
+        elif line.startswith("serial-rx: budget_hits="):
+            budgets += 1
+            if not re.fullmatch(r"serial-rx: budget_hits=[1-9][0-9]* ok=true", line):
+                bad.append(f"ISR 预算耗尽路径未覆盖：{line}")
+        elif line.startswith("serial-rx: masked"):
+            masked += 1
+            if line != "serial-rx: masked data=true queued=0 irqs=0 ok=true":
+                bad.append(f"关中断证人不符：{line}")
+        else:
+            m = re.fullmatch(
+                r"serial-rx: phase=([0-2]) read=([0-9]+) accepted=([0-9]+) dropped=([0-9]+) "
+                r"irqs=([0-9]+) queued=([0-9]+) hash=0x([0-9a-fA-F]{16}) ok=(true|false)", line)
+            if not m:
+                bad.append(f"serial-rx 阶段记录格式或 phase 范围错误：{line}")
+                continue
+            phase, count, accepted, dropped, irqs, queued = map(int, m.groups()[:6])
+            if phase in phases:
+                bad.append(f"phase={phase} 结果重复")
+            phases.add(phase)
+            if phase not in ready:
+                bad.append(f"phase={phase} 结果之前缺少有效 ready")
+            payload = serial_rx_payload(phase)
+            n = min(len(payload), 255)  # 阶段 1 不消费：保留前 255 字节，丢尾部 45 字节。
+            got = (count, accepted, dropped, queued)
+            want = (n, n, len(payload) - n, 0)
+            if got != want:
+                bad.append(f"phase={phase} read/accepted/dropped/queued={got}，宿主机期望 {want}")
+            digest = fnv1a64(payload[:n])
+            if int(m.group(7), 16) != digest:
+                bad.append(f"phase={phase} hash=0x{m.group(7)}，宿主机算出 {digest:#018x}")
+            if irqs == 0 or m.group(8) != "true":
+                bad.append(f"phase={phase} irqs={irqs} ok={m.group(8)}，应为 irqs>0 且 ok=true")
+    for phase in range(len(SERIAL_RX_SIZES)):
+        if phase not in ready:
+            bad.append(f"phase={phase} 缺少有效 ready")
+        if phase not in phases:
+            bad.append(f"phase={phase} 缺少结果")
+    if masked != 1:
+        bad.append(f"关中断证人应恰好 1 条，实际 {masked} 条")
+    if routes != 1 or budgets != 1:
+        bad.append(f"路由/预算证人应各 1 条，实际 {routes}/{budgets} 条")
+    return bad
 
 
 def check_disk_content(log: str) -> list[str]:

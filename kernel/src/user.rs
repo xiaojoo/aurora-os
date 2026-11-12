@@ -48,11 +48,15 @@ pub const SYS_VMO_WRITE: u64 = 13;
 /// （那会与装载器的窗口撞）；writable 非 0 ⇒ USER_RW，否则 USER_R。**永远不给 X**，
 /// 所以 W^X 在这一层就不可能被违反。返回的映射挂进当前任务的资源袋，退出时归还。
 pub const SYS_ASPACE_MAP: u64 = 14;
+pub const SYS_CONSOLE_WRITE: u64 = 20;
+pub const SYS_CONSOLE_READ: u64 = 21;
+pub const CONSOLE_MAX: usize = 256;
+pub const F_CONSOLE: u64 = 256;
 
 /// ABI 版本。minor=4 对应用户态闭环这一段（M4）；minor=5 追加 capability 句柄族（P7）；
 /// minor=6 追加 VMO 三个号（12/13/14）与 `F_VMO` 位（W3 P4b，ADR-074）。号只追加不复用（Q1）。
 pub const ABI_MAJOR: u64 = 0;
-pub const ABI_MINOR: u64 = 10;
+pub const ABI_MINOR: u64 = 11;
 pub const F_FASTPATH: u64 = 1;
 pub const F_SMAP: u64 = 2;
 pub const F_SMEP: u64 = 4;
@@ -110,18 +114,17 @@ pub const ROLE_SELF_PROC: u32 = 0;
 pub const ROLE_SELF_ASPACE: u32 = 1;
 pub const ROLE_SELF_THREAD: u32 = 2;
 pub const ROLE_JOB: u32 = 3;
-/// 下面三个今天**一律不填**（Channel/控制台/NS_ROOT 对象都还不存在）：
-/// 按设计 §10.2 的语义"没传的角色就是不存在"，不摆一个没人填的角色槽。
 pub const ROLE_PARENT_CHAN: u32 = 4;
 pub const ROLE_LOG: u32 = 5;
 pub const ROLE_NS_ROOT: u32 = 6;
-/// kind 编号与 `handle::ObjRef` 的六种一一对应（用户侧独立声明同一组数）。
+/// kind 编号与 `handle::ObjRef` 一一对应，用户侧独立声明。
 pub const KIND_FILE: u32 = 1;
 pub const KIND_VMO: u32 = 2;
 pub const KIND_JOB: u32 = 3;
 pub const KIND_PROC: u32 = 4;
 pub const KIND_ASPACE: u32 = 5;
 pub const KIND_THREAD: u32 = 6;
+pub const KIND_CONSOLE: u32 = 7;
 
 /// `(major << 32) | (minor << 16) | features`。位一律**读回真实状态**，不读"我打算开"。
 pub fn abi_word() -> u64 {
@@ -141,7 +144,7 @@ pub fn abi_word() -> u64 {
     }
     #[cfg(feature = "handles")]
     {
-        f |= F_HANDLES | F_VMO | F_PROC | F_WAIT;
+        f |= F_HANDLES | F_VMO | F_PROC | F_WAIT | F_CONSOLE;
     }
     (ABI_MAJOR << 32) | (ABI_MINOR << 16) | f
 }
@@ -430,6 +433,7 @@ fn start_token(gidx: usize, id: u32) -> crate::sync::WaitToken {
 #[cfg(feature = "handles")]
 fn kind_of(o: &crate::handle::ObjRef) -> u32 {
     match o {
+        crate::handle::ObjRef::Console => KIND_CONSOLE,
         crate::handle::ObjRef::File(_) => KIND_FILE,
         crate::handle::ObjRef::Vmo { .. } => KIND_VMO,
         crate::handle::ObjRef::Job { .. } => KIND_JOB,
@@ -879,6 +883,54 @@ fn sys_process_kill(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
         return E_DENIED;
     }
     crate::sched::kill_process_threads(pid) as u64
+}
+
+#[cfg(feature = "handles")]
+fn sys_console_io(frame: &crate::arch::x86_64::trap::TrapFrame, write: bool) -> u64 {
+    use crate::handle::{self, Handle, ObjRef, RIGHT_READ, RIGHT_WRITE};
+    let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
+    let need = if write { RIGHT_WRITE } else { RIGHT_READ };
+    match handle::resolve(Handle(frame.rdi), owner, need) {
+        Ok((ObjRef::Console, _)) => {}
+        Ok(_) => return E_DENIED,
+        Err(e) => return handle_err(e),
+    }
+    let want = frame.rdx as usize;
+    if want > CONSOLE_MAX {
+        return E_TOO_LONG;
+    }
+    if want == 0 {
+        return 0;
+    }
+    let mut buf = [0u8; CONSOLE_MAX];
+    if write {
+        match copy_from_user(frame.rsi, &mut buf[..want]) {
+            Ok(n) if n == want => crate::serial::write_bytes(&buf[..n]) as u64,
+            _ => {
+                BAD_PTRS.fetch_add(1, Ordering::Relaxed);
+                E_FAULT
+            }
+        }
+    } else {
+        // VMM 同时串行化各任务的消费，并保证坏目标指针不会取走输入。
+        let result = mm::with_vmm_lock(|| {
+            validate_range(frame.rsi, want as u64, true)?;
+            let mut n = 0;
+            while n < want {
+                let Some(b) = crate::serial::read_byte() else { break };
+                buf[n] = b;
+                n += 1;
+            }
+            copy_to_user_locked(&buf[..n], frame.rsi).map(|copied| (n, copied))
+        });
+        match result {
+            Ok((taken, copied)) if copied == taken || copied > 0 => copied as u64,
+            _ => {
+                BAD_PTRS.fetch_add(1, Ordering::Relaxed);
+                E_FAULT
+            }
+        }
+    }
 }
 
 #[cfg(feature = "handles")]
@@ -1401,6 +1453,10 @@ pub fn syscall_dispatch(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> boo
         SYS_OBJECT_WAIT => sys_object_wait(frame),
         #[cfg(feature = "handles")]
         SYS_PROCESS_KILL => sys_process_kill(frame),
+        #[cfg(feature = "handles")]
+        SYS_CONSOLE_WRITE => sys_console_io(frame, true),
+        #[cfg(feature = "handles")]
+        SYS_CONSOLE_READ => sys_console_io(frame, false),
         SYS_POKE_BUF => {
             // 内核 → 用户。写成 `Ok(n)` 而不是布尔：`n != want` 就是"中途被接住的故障"，
             // 程序核对字节时看得见的差异与内核报回的数必须一致（两台仪器不能各说各话）。
@@ -1543,7 +1599,7 @@ fn validate_range(va: u64, len: u64, need_write: bool) -> Result<(), PtrError> {
     let pg = mm::PAGE as u64;
     let mut page = va / pg * pg;
     while page < end {
-        let eff = mm::effective_flags(page).ok_or(PtrError::NotMapped)?;
+        let eff = mm::current_effective_flags(page).ok_or(PtrError::NotMapped)?;
         if !eff.user {
             return Err(PtrError::NotSharedWithUser);
         }
@@ -1590,21 +1646,24 @@ pub fn copy_to_user(src: &[u8], va: u64) -> Result<usize, PtrError> {
     if src.len() > COPY_MAX {
         return Err(PtrError::TooLong);
     }
-    mm::with_vmm_lock(|| {
-        validate_range(va, src.len() as u64, true)?;
-        let mut done = 0usize;
-        while done < src.len() {
-            let at = va + done as u64;
-            let room = (mm::PAGE as u64 - at % mm::PAGE as u64) as usize;
-            let want = room.min(src.len() - done);
-            let got = unsafe { ucopy_to(at as *mut u8, src.as_ptr().add(done), want) };
-            done += got;
-            if got < want {
-                break;
-            }
+    mm::with_vmm_lock(|| copy_to_user_locked(src, va))
+}
+
+// 调用方持 VMM；校验与拷贝之间不能让目标映射被撤销。
+fn copy_to_user_locked(src: &[u8], va: u64) -> Result<usize, PtrError> {
+    validate_range(va, src.len() as u64, true)?;
+    let mut done = 0usize;
+    while done < src.len() {
+        let at = va + done as u64;
+        let room = (mm::PAGE as u64 - at % mm::PAGE as u64) as usize;
+        let want = room.min(src.len() - done);
+        let got = unsafe { ucopy_to(at as *mut u8, src.as_ptr().add(done), want) };
+        done += got;
+        if got < want {
+            break;
         }
-        Ok(done)
-    })
+    }
+    Ok(done)
 }
 
 /// `SYS_POKE_BUF` 写进用户缓冲区的模式：`j` 是**这次拷贝内的字节序号**，不是绝对地址。
@@ -1960,7 +2019,10 @@ pub fn load_into(aslot: u8, bytes: &[u8]) -> Result<Loaded, LoadError> {
                     // SAFETY: src 是文件缓冲里刚 checked 的 copy 字节，目标是刚清零那一页内部。
                     unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), fill as *mut u8, copy) };
                 }
-                pas[j as usize] = frame.base().0 + j * mm::PAGE as u64;
+                // `aspace_map_slot` 收的是**帧号**不是物理地址（它自己乘 PAGE，见 mm.rs 的
+                // `f * PAGE`）。传 PA 进去不会报错：叶子会指向 PA*4096 那个不存在的帧，
+                // 而 `frame_get` 还会拿它当下标越界写 FrameInfo 数组（S5c 实测两件事都发生了）。
+                pas[j as usize] = frame.base().0 / mm::PAGE as u64 + j;
             }
             let m = mm::aspace_map_slot(
                 aslot,
@@ -1983,7 +2045,7 @@ pub fn load_into(aslot: u8, bytes: &[u8]) -> Result<Loaded, LoadError> {
     let sf = mm::phys_alloc(0, MOD_USER).map_err(LoadError::Mm)?;
     // SAFETY: HHDM 别名、恰好一页、还没有别的主人（与 load() 里那条同形状）。
     unsafe { core::ptr::write_volatile(sf.base().via_hhdm().0 as *mut u64, 0) };
-    let m = mm::aspace_map_slot(aslot, &[sf.base().0], VirtAddr(stack_va), PageFlags::USER_RW, MOD_USER)
+    let m = mm::aspace_map_slot(aslot, &[sf.base().0 / mm::PAGE as u64], VirtAddr(stack_va), PageFlags::USER_RW, MOD_USER)
         .map_err(LoadError::Mm)?;
     owned.push_asmap(m).map_err(LoadError::Mm)?;
 

@@ -9663,7 +9663,9 @@ StartupInfo 回填都长在 syscall 层；产品路径走同一条 ABI 才是"�
   `init-user(S4b-2): 无CREATE拒=true Proc句柄=327682 子AS=0 段=3 页=5 线程停住=true`
   `start_ret=0 跑过次数=1 等待收工=true si_va=0x250000000`；ktests **89/89**、verdict **PASS(33)**。
   ⇒ **判据①命中**：无 CREATE 权限的 Job 句柄造进程返回 `E_DENIED`；线程建出来是停住的、
-  放行后**真跑过**（runs=1）而且**自己收工了**。
+  放行后**真跑过**（runs=1）。~~而且**自己收工了**~~ ⇒ **这句是错的，见 §236 更正**：
+  `等待收工=true` 当时是**入口 #PF 被杀**，不是干净退出；`wait_for_task` 对"被杀"与"自己 exit"
+  返回同一个 true，所以这个布尔**分不开这两件事**。
 - **默认档 run-924**（elf `a34c006b024b`）：S4a 路径不变，ktests **82/82**、PASS(33)、信箱读数不变。
 
 ### 三、门禁连锁
@@ -9712,6 +9714,189 @@ AGENTS 工作协议明写"**要新增 syscall 号**…停下来问"。S5 至少�
 
 **只读勘察、零代码改动**；`check` 沿用 §233 的 17/17。
 下一步取决于裁决：选裸 syscall 则 S5 可以很快出第一版；选句柄对象则要先扩 handle 种类。
+
+## 235. S5a 串口中断接收完成；S5b 采用 Console 句柄与 20/21 号（2026-11-12，实测）
+
+### 一、裁决与本片边界
+
+使用者选择**控制台句柄**，授权 **20＝console_write、21＝console_read**，分别检查 WRITE/READ；
+不得用裸 syscall 绕过 capability。裁决补入 ADR-082。**这两个号、Console 对象与 shell 尚未实现**，
+本轮只完成前置 S5a，不把驱动接收冒充用户态交互。
+
+会话开始时 `serial.rs`、`apic.rs`、`module-interfaces.toml` 已有未提交 RX 草稿；本片在其上完善，
+未覆盖其它未跟踪文档，未提交或推送。既有 PIT、MSI、EOI 与任务回收语义不变；没有新增 unsafe 或锁。
+
+### 二、实现与判据
+
+- `serial::enable_rx(&Madt)`：BSP 初始化，按 MADT 找 IRQ4 的 GSI/RTE；失败返回具体错误，
+  临时 IRQ 认领在路由失败时撤销。成功重复调用不重配、不重复占槽。
+- `apic::ioapic_route`：只接当前已映射 IOAPIC 的独占、高有效、边沿 ISA 线，目的地用实际 BSP ID；
+  拒绝不完整 MADT、未知极性/触发方式、越界向量及活跃 RTE，写后读回核对。
+- ISR 每次最多搬 **8 字节**，不分配/取锁/打印；先关 UART IER，服务后重新打开。
+  256 格环留一格，**有效容量 255**；满时丢弃新字节并单独计数。读取为空立即返回 None。
+- `t_serial_rx`：非法向量不改 RTE、不完整 MADT 被拒；不支持的路由连续拒绝 16 次仍能正常认领，
+  用来暴露临时槽泄漏；幂等与空队列；真实关 IER→硬件已有数据而软件队列/ISR 仍为零→重新打开后接收。
+- 三批宿主输入 **16/300/32** 字节：分别收 **16/255/32**，软件丢弃 **0/45/0**，
+  ISR **2/38/4** 次，队列均清空；`budget_hits=41`，确实走过“预算耗尽且硬件仍有数据”的续传路径。
+  三批 FNV-1a 分别 `376d9815b73e4735 / b589519536810bd7 / 356430d79d64ea65`，宿主独立算出同值。
+  上述数取自 **run-934**，不混用其它跑。
+
+### 三、量具自身踩坑与修正
+
+宿主夹具最初用 stdio，run-928/929 两跑都少收；首批均只有前 **14/16** 字节，
+按哈希穷举确认缺的是末尾 `06 2b`，不是“所有控制字节都被吞”。
+**同一 ELF `ada9c867d92c`，只把宿主 COM1 后端改为回环 TCP**，run-930 的三批全部正确。
+这把差异定位到宿主后端路径，**没有取证到 QEMU 内部具体丢失机制，不进一步归因**。
+
+run-930 又暴露 Windows `isa-debug-exit` 的 TCP RST 收尾：内核 PASS、完整见证俱在，夹具却把
+`WinError 10054` 当传输失败。改成流结束处理，仍必须通过退出码、阶段齐全、长度/哈希/丢弃数检查；
+缺行、残行、发送失败不能被吞。修后 run-931/934 整体 PASS。
+只在 `serial-rx-probe` 档启用 127.0.0.1 随机端口，默认文件日志接线原样；与 QMP 组合明确拒绝。
+
+### 四、同轮读数与变异证红
+
+| 来路 | ELF 前缀 | 用例/判定 |
+|---|---|---|
+| 改前工作树默认档 run-927 | `90386fe21fe1` | 82/82，PASS(33) |
+| 关闭 ISR 收尾重新使能 run-932 | `2aee7faab386` | FAIL(35)：首批仅 8 字节/1 次 ISR，后两批 0 |
+| 入环字节异或 1，run-933 | `1ebd5fd7c96f` | FAIL(35)：长度仍对，三批哈希与内容均红 |
+| 两条变异均还原，RX run-934 | `ada9c867d92c` | 83/83，PASS(33)，ELF 与首次正确 RX 相同 |
+| handles + RX，run-935 | `574f892dcdfe` | 90/90，PASS(33)，句柄启动与 RX 共存 |
+| 原矩阵 negative-probe，run-936 | `5c2487a266ac` | 82/83，FAIL(35)，仅预期负用例红 |
+| 最终默认档 run-937 | `7b7e766993fc` | 82/82，PASS(33)，init 信箱 magic/ping/add 不变 |
+
+宿主对账器用 run-931 真日志做 **18 条变异**（缺失/重复/乱序 ready、错长度/哈希/丢弃量、
+零中断、关中断证人错误、路由错误、缺失或零预算见证、截断等）全部证红，还原日志后绿。
+脚本与原始结果在 `build/s5a-witness-check.py`、`build/s5a-witness-check.txt`；串口在上述各 `run-*.log`。
+构建通过，最终 `ktests` 注册 **82 条**，`check` **17/17**；基础矩阵抽跑正/负 **2 行符合**。
+`tools/aurora.py` 保持 CRLF（裸 LF=0），Python 编译检查与按 CRLF 口径的 diff 空白检查通过。
+
+接口登记按真实引用补齐 `apic::ioapic_route`、`mm::MOD_BOOT` 与新增依赖；门禁逻辑未放宽。
+本片没有跑完整 `test` 矩阵、bench、长稳或真机；不引用跨轮耗时/串口字节差作性能结论。
+
+### 五、下一片与仍未验证
+
+下一片 **S5b**：Console 对象、READ/WRITE 权限、20/21 号、启动句柄授予与 ring3 正/反向用例；
+然后 **S5c** 真用户 shell。当前 RX 只在探针里启用，**默认产品路径尚未打开接收，也没有交互 shell**。
+目前仅支持单任务消费者；多读者同步、阻塞读/唤醒、UART 硬件错误统计、非当前 IOAPIC/共享线和真机行为仍未验证/未实现。
+S4c、S4a/S4b 的原欠账与 S6 framebuffer/PS2 未动。
+
+## 236. **S5c-2 落地：串口 shell 在产品路径上真交互**——修掉三个真 bug（帧号 / 归属 / 校验树），三条变异各自证红（2026-11-12，实测）
+
+### 一、这一片到底证明了什么
+
+`handles` 档的 init 现在是 `user/shell`，宿主机侧**逐条喂命令、逐条读应答**，6/6 命中：
+
+```text
+Aurora shell (S5c). type 'help'.
+> help
+commands: help | echo <text> | ping | abi | exit
+> echo hi
+hi
+> ping
+ping=5445
+> abi
+abi_info=721399
+> exit
+bye
+```
+
+`等待收工=true`（这一次是**真的自己 exit**）、`qemu_rc=33`、串口 166215 字节。
+这是本仓库第一个在产品路径上**交互式**的用户程序（此前 hello/probe 都是"跑一段就完"）。
+
+取证来路：**独立夹具** `build/s5c-shell-drive.py`（不走 `do_run`，所以**没有 run 号**），
+产物指纹 `handles,console-probe` / elf `d85df51e1007` / shell `d7167bf1d861`，原文留档 `build/shell-drive.log`。
+
+**为什么必须带 `console-probe`**：默认档 `wait_for_task` 只给 32 个窗口
+（`window_cycles(32)` = 5.0e7×32 cycles，本机约 0.5 s），横幅打完紧接着就是 verdict + `debug-exit`，
+命令根本喂不进去。`console-probe` 把窗口放到 1000（约 16 s）。**这一片没有改内核来延长窗口，只选了已有的档。**
+
+**为什么不走 `aurora.py`**：`run_serial_rx` 正被另一路改（S5a/S5b），此刻
+`tools/aurora.py:3037` 的调用点缺两个必填关键字参数（`rx_probe` / `console_probe`），
+且它等的是 `console: ready` 标记 + 32 字节二进制回显载荷，**不是 shell 的命令应答**。
+不去动它，另写一份只做测量的夹具。
+
+### 二、三个真 bug（S4b-2 起就一直在，被"等待收工=true"掩盖）
+
+| # | 症状 | 成因 | 修法 |
+|---|---|---|---|
+| ① | 子进程入口即 `#PF rip=0x100000000 cr2=0 err=0x4` | `load_into` 把**物理地址**当**帧号**传给 `aspace_map_slot`（它自己乘 PAGE，见 mm.rs 的 `f * PAGE`）⇒ 叶子指向 PA×4096 | 两处 `/ mm::PAGE as u64`（段路径 `user.rs:2025`、栈路径 `user.rs:2048`） |
+| ② | 子袋=0，映射挂在创建者栈上 | `load_into` 把 `OwnedSet` **交回调用方**而不自动入袋；`stage_init_user` 没接 ⇒ 函数返回即解映射 | 新增 `OwnedSet::into_current()`，16 号之前归创建者，再由 `adopt_asmaps` 搬进子线程 |
+| ③ | `console_write` 恒 `E_FAULT`，横幅一个字都出不来 | `validate_range` 走 `mm::effective_flags`＝**启动那棵树**（`pml4_phys` 只在 `take_over` 写一次，`aspace_switch` 只动 CR3），而拷贝真正用的是**子 AS 那棵树** | 新增 `mm::current_effective_flags(va)`：读 CR3 后走 `effective_flags_in`，**不取锁**（与 `effective_flags` 同纪律，能在 `with_vmm_lock` 内用） |
+
+①的次生后果**从源码核过**：`frame_get(PA)` → `fi_inc_refcnt` 做的是**无边界检查**的
+`arr.add(f as usize)` ⇒ 拿 PA 当下标越界原子写 FrameInfo 数组。这解释了为什么分配器会把同一帧
+同时发给代码段和栈（run-944 两个叶子都是 `0x85000000`）。
+
+**我自己也踩了一个坑要记**：第一版诊断顺着叶子走 HHDM 去读代码头，**把内核打挂了**
+（run-943，EXCEPTION(39)，`cr2=0xffff800085000000`，而 RAM 只有 512 MiB）。
+那个崩溃本身就是线索——推出来的 PA 在这台机器上不可能存在。改成**只打原值**（叶子表项 + 首帧地址，
+不 deref 任何东西）才拿到①的证据。教训：先问"表项里写了什么"，再决定要不要读它背后的帧。
+
+### 三、变异证红（三条各造一次错、各还原一次）
+
+| 来路 | ELF 前缀 | 变异 | 读数 | 判定 |
+|---|---|---|---|---|
+| run-948 | `68771fbf499c` | ③ 还原成 `effective_flags`（启动树） | **横幅消失**；生效位 / 归创建者=3 / 子袋=5 / 跑过次数=1 全部不变 | PASS(33) |
+| run-949 | `b9facd46e65b` | ① 去掉 `/ mm::PAGE` | **横幅消失**；代码叶子 `0x85000005`（地址位 `0x85000000` = `0x85000`×4096，超出 512 MiB）；`#PF rip=0x100000000 cr2=0 err=0x4`；**`等待收工=true`** | PASS(33) |
+| run-950 | `1e5c8455e875` | ② 去掉 `into_current()` | **横幅仍在**；`归创建者=0 子袋=2`（绿态是 3/5） | PASS(33) |
+| run-951 | `1c9d245c0f1a` | 三条全还原 | 横幅在、`归创建者=3 子袋=5`、ktests **89/89** | PASS(33) |
+| run-953 | `1c9d245c0f1a` | 同上，再跑一遍 | 与 951 **同哈希同读数** ⇒ 还原态可复现 | PASS(33) |
+| run-952 | `de442de3ea38` | 默认档（无 handles） | ktests **82/82**、信箱 `magic=11936045730314344056 ping=33 add=60` 不变 | PASS(33) |
+
+**三条变异都没有把 verdict 打红——这件事必须写清楚，不能拿 PASS 当"没坏"。**
+横幅是**宿主机侧判据**，没有接进判定表；`子袋` 只是日志里的一个数。
+所以这一片的证红是"造错 → 那个判据变红"，**不是"造错 → 矩阵变红"**。
+把横幅/子袋接成 durable 矩阵行仍欠着。
+
+**②的证红口径要说实话**：去掉 `into_current()` 之后横幅**照样出**，因为 `loaded.owned`
+活到 `stage_init_user` 返回为止，而等待发生在函数**内部** ⇒ 解映射发生在等待之后。
+所以②的唯一可观测判据是 **`子袋=5`**（子线程真的拥有那 3 条镜像/栈映射）。
+"init 在 `stage_init_user` 返回之后还活着"这一格**未验证**——内核紧接着就 `debug-exit` 了，
+观测窗口根本不存在。这正是常驻 init 的下一片要解决的事。
+
+**与本轮早先记录的差值不归因**：早先 run-946（首次看到横幅那一跑）记的 ELF 前缀是 `fc2153a8f5db`，
+与还原后的 `1c9d245c0f1a` 不同。三处变异均按原串精确还原、行尾未变、951/953 连跑同哈希
+⇒ 还原态自身可复现；但 946 的产物已被后续构建覆盖（`kernel_path` 各档共用同一路径），
+**无法再核，差值不归因**，不编解释。
+
+### 四、更正 §233
+
+§233 写的"放行后真跑过而且**自己收工了**"**是错的**：当时的 `等待收工=true` 是 bug①造成的
+**入口 #PF 被杀**。`wait_for_task` 对"被杀"与"自己 exit"返回同一个 true，这个布尔**分不开这两件事**。
+run-949 把这一点直接演示了出来（变异态下 `等待收工=true` 而串口上有 `unexpected #PF`）。
+⇒ **判据教训：`等待收工` 不能单独当"干净退出"的证人，必须配串口上的 kill 行一起读。**
+§233 原文已就地标注更正并指向本节。
+
+### 五、门禁与登记
+
+- 新增 `unsafe` 1 处（`mm::current_effective_flags` 里的 CR3 读，U1）⇒ 白名单 `mm U1=6`、
+  census 总计 **405**（U1 75 · U2 104 · U3 13 · U4 131 · U5 46 · U6 36），mm 段 38 行行号 **+17** 并插入新行。
+- `module-interfaces.toml` 补 `mm::current_effective_flags`、`sched::owned_of`、`sched::task_frame`
+  （后两个本来只服务用例，现在产品路径也引用）。`OwnedSet::into_current` 是方法，按既有口径不登记。
+- `check` **17/17**。行尾逐个核过：`user.rs` LF、`main.rs`/`mm.rs`/`sched.rs` CRLF、`BACKLOG.md` CRLF、
+  `module-interfaces.toml` LF，**没有混合**。
+
+### 六、欠账与未验证（不掩盖）
+
+- **shell 是忙等读，不是阻塞读**：`con_read_byte` 返回 None 就 `continue`，没有 yield syscall 可用。
+  它占着一个任务槽空转。阻塞读/唤醒仍是 §235 记的欠账。
+- **没有 durable 矩阵行**：交互判据目前只活在一次性夹具里。`run_serial_rx` 归另一路，
+  等它落地后要把 shell 的一问一答接成矩阵行（并配"喂错命令 → unknown"的负样本）。
+- **`aurora.py:3037` 缺必填参数**（`run_serial_rx(cmd, timeout)` 少 `rx_probe`/`console_probe`）：
+  这是另一路在飞的状态，**本轮只记录不修**（使用者裁决：整棵树一起提交、缺陷只记录不修），
+  免得两路互相覆盖。**实测确认**：`inspect.signature(run_serial_rx).bind([], 0)` 抛
+  `TypeError: missing a required keyword-only argument: 'rx_probe'` ⇒ `run --features serial-rx-probe`
+  会在起 QEMU 之前就崩。**影响面已核**：`serial-rx-probe` 不在判定表里（全仓只在 `do_run` 的特性判定处出现），
+  所以 `build`/`check`/`test`/默认档/handles 档都不受影响；`console-probe` 在 `aurora.py` 里根本没有引用，
+  走的是普通文件日志那条路。**§235 记的 run-934/935/937 是签名改动之前的跑，不能拿来当这条路的现况证人。**
+- **census 逐处行号是旧快照**：本轮只重算了 mm 段与 user/shell 段，其它模块的行号没动。
+  已量到存在漂移（sync 18→20 行、user 43→46 行，来自另一路的串口工作）。
+  `check-unsafe` 只核汇总锚点与 `### 模块` 集合，**不核逐处行号**，所以门禁绿不代表行号对。
+- **`handles` 仍是可选特性**，默认档不走句柄路径、init 仍是 hello。
+- 仍开着：S4c（`MAX_TASKS` 余量，§234 判为不阻塞）、S4a/S4b-1/S4b-2 的独立负样本、
+  常驻 init 在返回后的存活、S6 framebuffer + PS/2。
+- 本轮**没有**跑完整 `test` 矩阵、bench、长稳或真机；不引用跨轮耗时/串口字节差作性能结论。
 
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。

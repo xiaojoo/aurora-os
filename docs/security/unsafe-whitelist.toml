@@ -25,6 +25,11 @@ reason = "第二个用户产物（W3 P5a）：unsafe 需求是 int 0x80 的四�
 scope = "main.rs：sys4 的 int 0x80（rax/rdi/rsi/rdx/r10）· slots_base/src_addr 的 lea（镜像基址在 4 GiB 之上，addr_of! 会退化成 R_X86_64_32S）· put 的原子写（偏移 0..=48）· _start 的读回比对（只读、同页内、先判返回值非负）· panic 与收尾自跳转"
 expires = "P5c 之后若它开始打 11/15/16 或读 StartupInfo，unsafe 面会扩，那时回这条账重登记"
 
+[crate.aurora-user-shell]
+reason = "第三个用户产物（S5c，第一个交互式程序）：unsafe 需求是 int 0x80 的三参入口、读内核交进来的 StartupInfo 那一页（只读、页内、先核魔数与条数上限）、往自己的行缓冲写字节、以及 panic/收尾的自跳转；不碰任何内核对象"
+scope = "main.rs：syscall3 的 int 0x80（rax/rdi/rsi/rdx）· find_console 的 read_unaligned（头 24 字节 + 最多 16 条描述，全在那一页内，先核 SI_MAGIC 与 nhandles 上限）· con_read_byte 往调用方给的 &mut u8 写一字节 · _start 的行缓冲写入与回显 · panic 与两处收尾自跳转"
+expires = "S5c 之后若它开始打别的号或读别的页，unsafe 面会扩，那时回这条账重登记"
+
 [crate.aurora-user-hello]
 reason = "它是产物而不是库：唯一的 unsafe 需求是 `int 0x80` 与一个自跳转，没有任何指针算术、没有内存操作、不碰任何内核对象"
 scope = "main.rs：3 次 int 0x80（inlateout rax + in rdi/rsi）、panic 与收尾各一个 `jmp .` 自跳转"
@@ -50,12 +55,12 @@ expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe
 # 2026-11-07 P7：hello 加了 syscall3（U1 两处）与 ring3 句柄读/close（U5 三处）。
 
 [unsafe-census]
-total = 385
-U1 = 67
+total = 405
+U1 = 75
 U2 = 104
 U3 = 13
 U4 = 131
-U5 = 34
+U5 = 46
 U6 = 36
 
 [modules."acpi"]
@@ -158,7 +163,11 @@ U3 = 4
 U4 = 5
 
 [modules."mm"]
-U1 = 5
+# S5c-2 +1：current_effective_flags 读 CR3（aspace_cr3_read 原语，只动 rax）。
+# 为什么必须读 CR3 而不是用 pml4_phys：后者只在 take_over 写一次，aspace_switch 只动 CR3，
+# 所以子进程跑起来之后"启动那棵树"与"硬件真正在用的树"不是同一张。用户缓冲校验
+# （user::validate_range）要的是后者。不取锁，与 effective_flags 同一纪律，可在 with_vmm_lock 内调用。
+U1 = 6
 # P1a/P1b/P1c（ADR-063）共 7 处 FrameInfo unsafe：引导写入（bootstrap_frame_info）、
 # 读 refcnt（fi_refcnt）、读 owner（fi_owner）、写 used（fi_set_used）、refcnt 加一（fi_inc_refcnt）、
 # refcnt 减一（fi_dec_refcnt）、最终归还毒化（fi_final_free）。指针来自 phys_alloc_locked 分出的
@@ -235,6 +244,19 @@ U1 = 6
 # P5c-3b（ADR-075）+2：轮询内核交进来的邮箱页（只读一个 u64、上限硬）、
 # 以及装载器序列那个调用块（11/12/13/14/15/16 全是本程序自己的号，参数照 §4.4c）。
 U5 = 6
+
+[modules."user/shell"]
+# S5c：第一个交互式用户产物。U1 六处 = syscall3 的 int 0x80 入口与其 unsafe fn 声明、
+# panic 自跳转、_start 里两处收尾自跳转、以及 find_console 的 unsafe fn 声明。
+# 指针来源：StartupInfo 那一页由内核 process_start 校验并映射（user+只读），
+# 首参 si_va 由 set_thread_arg 交进来；行缓冲是本函数栈上的 [u8;128]。
+# 上下文 USER_ENTRY；不变量由 ABI 约定（号 rax、参数 rdi/rsi/rdx、返回 rax）与
+# "先核魔数与条数上限再解引用"保证。生命周期 = 本进程；单任务访问无并发。
+U1 = 7
+# S5c-2 重算：U5 由 13 降到 12。逐处行已按当前源码重列（见 unsafe-census.md 的 user/shell 节）。
+# 差额落在 dispatch/_start 那一带：登记快照早于"忙等 idle 与回显"那一轮改动，
+# 具体是哪一处合并掉的**未归因**——这里只按重算结果登记，不编一个解释。
+U5 = 12
 
 [modules."virtio"]
 U4 = 10

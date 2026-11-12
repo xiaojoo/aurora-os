@@ -1,0 +1,21 @@
+[package]
+name = "aurora-user-shell"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# S5c：第一个**交互式**用户程序（串口 shell）。与 hello/probe 同一条构建纪律：
+# 它不是内核 workspace 的普通成员，要用另一个链接脚本、另一个入口，
+# 永远不该被宿主 `cargo test` 编译；构建入口只有 `python tools/aurora.py`（ADR-016）。
+[[bin]]
+name = "shell"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

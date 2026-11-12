@@ -140,6 +140,8 @@ irq-sticky-pxis = []
 # 宿主机数行的形状（判定矩阵第 31 行）。不进正常构建也不进四把尺子：
 # 常态下一行 ≈130 字节的串口输出会挪动 P2/P4 的绝对数，而这一格要量的是行锁，不是产品热路径。
 serial-atomic-probe = []
+serial-rx-probe = []
+console-probe = ["handles"]
 # 变体（L3-B 亲和性那一步，BACKLOG 73）：把 AHCI 那颗 MSI 的目的地移到一颗上线的 AP 上，
 # 再做一次真读，看投递到底落到哪颗 CPU。判据是两台仪器各数一遍：
 # 内核数 `irq::by_cpu()` 的槽分布，宿主机拿 `-d int` 里 `SP` 的高位分 BSP／非 BSP（BACKLOG 68e 那条）。

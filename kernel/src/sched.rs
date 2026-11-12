@@ -190,6 +190,24 @@ impl OwnedSet {
     pub fn count(&self) -> usize {
         self.n
     }
+
+    /// 把整袋挂到**当前任务**名下，返回挂进去的条数。
+    ///
+    /// 产品启动路径用：`user::load_into` 在任务上下文里铺映射，但它把柄交回调用方而不是
+    /// 直接入袋（用例要能自己丢弃并核账）。调用方若就这么让袋落地，子进程的代码/栈会在
+    /// 函数返回时被解映射——所以先归创建者，再由 16 号的 `adopt_asmaps` 搬进子线程。
+    /// 逐项走 `own_current`，"满了先放 RUNQ 再丢"那条纪律原样保留；中途失败时剩下的项
+    /// 就地丢弃，这与 `push_item` 一样只发生在不持 RUNQ 的装载路径。
+    pub fn into_current(self) -> Result<usize, mm::MmError> {
+        let mut n = 0usize;
+        for it in self.items {
+            if let Some(it) = it {
+                own_current(it)?;
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
 }
 
 /// 每个 CPU 一格：**还有几个槽的资源在等"CPU 挪开它"**。为 0 就等于没有待回收，

@@ -15,6 +15,10 @@ pub(crate) static HELLO_ELF: &[u8] = include_bytes!("../../fixtures/hello.elf");
 /// 与 hello 一样由 `tools/aurora.py build` 现构建、只在字节变了时覆写；**不进签名链**。
 #[cfg(feature = "handles")]
 pub(crate) static PROBE_ELF: &[u8] = include_bytes!("../../fixtures/probe.elf");
+/// 第三个用户产物（S5c）：串口 shell。与前两个同一条构建纪律，**不进签名链**。
+/// 只在 `handles` 档嵌入：控制台句柄要经 `grant_console` 授予，默认档没有这条路。
+#[cfg(feature = "handles")]
+pub(crate) static SHELL_ELF: &[u8] = include_bytes!("../../fixtures/shell.elf");
 
 /// M4-2 第二段：把**真 ELF** 装进用户窗口并跑起来。
 ///

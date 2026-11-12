@@ -17,6 +17,10 @@ crate.aurora-user-hello = "aurora-user-hello"
 # **不进签名链**（2026-11-09 裁决：签名包单载荷、余量只有 96 字节）。
 crate.aurora-user-probe = "aurora-user-probe"
 
+# S5c（BACKLOG §236）：第三个用户产物——**第一个交互式程序**（串口 shell）。
+# 它经 ROLE_LOG 拿到控制台句柄，用 20/21 号读写；命令只用真实存在的 syscall。
+crate.aurora-user-shell = "aurora-user-shell"
+
 # ---------------------------------------------------------------- 许可证策略（§11.2 R10 / ADR-009b）
 #
 # 白名单与"登记过的留空"的唯一来源就在这里，`check-sbom` 直接读这两段。
@@ -35,3 +39,4 @@ license.allow[] = "MPL-2.0"
 license.pending.aurora-kernel = "ADR-009b 未定（发布许可证由安全委员会在 M9 前确定，手册 §11.2/§15.4）"
 license.pending.aurora-user-hello = "同上：它是内核的产物夹具，许可证随内核一起定"
 license.pending.aurora-user-probe = "同上：第二个用户产物夹具（W3 P5a），许可证随内核一起定"
+license.pending.aurora-user-shell = "同上：第三个用户产物（S5c 串口 shell），许可证随内核一起定"

@@ -858,7 +858,7 @@ fn stage_init_user() {
     use crate::user::{
         SYS_ASPACE_MAP, SYS_PROCESS_CREATE, SYS_PROCESS_START, SYS_THREAD_CREATE, syscall_dispatch,
         ABI_MAJOR, ABI_MINOR, SI_MAGIC, SI_OFF_HANDLES, SI_DESC_BYTES, SI_DESC_ROLE, SI_DESC_HANDLE,
-        ROLE_JOB, E_DENIED,
+        ROLE_JOB, ROLE_LOG, E_DENIED,
     };
     use crate::{proc, vmo};
 
@@ -897,22 +897,57 @@ fn stage_init_user() {
         crate::log_warn!("init-user: 进程没有 AS"); return;
     };
     // S4b-1 的装载器：真 ELF 进**子 AS**，映射经 aspace_map_slot（那棵树）。
-    let loaded = match crate::user::load_into(aslot, crate::ktests::common::HELLO_ELF) {
+    // S5c：装的是 shell 而不是 hello——控制台句柄已经在下面按 ROLE_LOG 授予，
+    // 这一档的 init 从此是**交互式**的。默认档（无 handles）仍装 hello、判据仍是信箱，
+    // 因为那条路没有控制台句柄可授，shell 进去只会 exit(1)。
+    let loaded = match crate::user::load_into(aslot, crate::ktests::common::SHELL_ELF) {
         Ok(l) => l,
         Err(e) => { crate::log_warn!("init-user: load_into 失败 {}", crate::user::describe_load(e)); return; }
     };
-    // StartupInfo 页：魔数 + ABI + 一条 ROLE_JOB 转移（把带 CREATE 的 Job 句柄交给子进程）。
+    // 装载器把映射柄**交回调用方**而不是自动入袋（用例要能自己丢弃并核账）。不归创建者，
+    // 这一袋就在本函数返回时落地 ⇒ 子进程的代码/栈被解映射。归了创建者，16 号的
+    // `adopt_asmaps` 才搬得动：它只搬"创建者袋里目标 AS = 子 AS"的那些项。
+    let owned_n = match loaded.owned.into_current() {
+        Ok(n) => n,
+        Err(e) => { crate::log_warn!("init-user: 映射归创建者失败 {:?}", e); return; }
+    };
+    let Some(madt) = acpi::summary().and_then(|s| s.madt) else {
+        crate::log_warn!("init-user: 没有 MADT，控制台未授予"); return;
+    };
+    if let Err(e) = serial::enable_rx(&madt) {
+        crate::log_warn!("init-user: 控制台接收初始化失败 {:?}", e); return;
+    }
+    let console = match handle::grant_console(owner, RIGHT_READ | RIGHT_WRITE | RIGHT_DUP | RIGHT_TRANSFER) {
+        Ok(h) => h, Err(e) => { crate::log_warn!("init-user: 控制台授予失败 {:?}", e); return; }
+    };
+    let foreign = if cfg!(feature = "console-probe") {
+        match handle::grant_console(owner, RIGHT_READ | RIGHT_WRITE) {
+            Ok(h) => h.0, Err(e) => { crate::log_warn!("init-user: 控制台反例句柄失败 {:?}", e); return; }
+        }
+    } else { 0 };
     let si = match vmo::vmo_create(1) { Ok(v) => v, Err(_) => { crate::log_warn!("init-user: si vmo 失败"); return; } };
     let mut hdr = [0u8; SI_OFF_HANDLES];
     hdr[0..4].copy_from_slice(&SI_MAGIC.to_le_bytes());
     hdr[4..6].copy_from_slice(&(ABI_MAJOR as u16).to_le_bytes());
     hdr[6..8].copy_from_slice(&(ABI_MINOR as u16).to_le_bytes());
-    hdr[8..12].copy_from_slice(&1u32.to_le_bytes());
+    hdr[8..12].copy_from_slice(&2u32.to_le_bytes());
+    if cfg!(feature = "console-probe") {
+        hdr[12..16].copy_from_slice(&512u32.to_le_bytes());
+        hdr[16..20].copy_from_slice(&8u32.to_le_bytes());
+    }
     if vmo::vmo_write(si, 0, &hdr) != Ok(hdr.len()) { crate::log_warn!("init-user: si 头写失败"); return; }
     let mut d = [0u8; SI_DESC_BYTES];
     d[SI_DESC_ROLE..SI_DESC_ROLE + 4].copy_from_slice(&ROLE_JOB.to_le_bytes());
     d[SI_DESC_HANDLE..SI_DESC_HANDLE + 8].copy_from_slice(&hj.0.to_le_bytes());
     if vmo::vmo_write(si, SI_OFF_HANDLES, &d) != Ok(SI_DESC_BYTES) { crate::log_warn!("init-user: si 描述写失败"); return; }
+    d[SI_DESC_ROLE..SI_DESC_ROLE + 4].copy_from_slice(&ROLE_LOG.to_le_bytes());
+    d[SI_DESC_HANDLE..SI_DESC_HANDLE + 8].copy_from_slice(&console.0.to_le_bytes());
+    if vmo::vmo_write(si, SI_OFF_HANDLES + SI_DESC_BYTES, &d) != Ok(SI_DESC_BYTES) {
+        crate::log_warn!("init-user: 控制台描述写失败"); return;
+    }
+    if cfg!(feature = "console-probe") && vmo::vmo_write(si, 512, &foreign.to_le_bytes()) != Ok(8) {
+        crate::log_warn!("init-user: 控制台探针参数写失败"); return;
+    }
     let hi = match handle::grant_vmo(owner, si, RIGHT_READ | RIGHT_WRITE | RIGHT_MAP) {
         Ok(h) => h, Err(_) => { crate::log_warn!("init-user: grant_vmo(si) 失败"); return; }
     };
@@ -921,6 +956,17 @@ fn stage_init_user() {
     f.rax = SYS_ASPACE_MAP; f.rdi = hi.0; f.rsi = 0; f.rdx = hp.0; f.r10 = 0x2_5000_0000;
     syscall_dispatch(&mut f);
     let si_va = f.rax;
+    // 生效位是**那棵树**里的真值（不是"我请求了什么"）：代码要 user+X+!W、栈要 user+W、
+    // si 页要 user+!W。S4b-1 只在用例里核过这三格，产品路径这里补上。
+    // **必须在放行之前读**：子进程一旦被杀、AS 被收，这三格就只会读回"没映射"。
+    let bits = |va: u64| match mm::aspace_effective_flags(aslot, va) {
+        Some(f) => (f.user as u8) | ((f.writable as u8) << 1) | ((f.executable as u8) << 2),
+        None => 0xffu8,
+    };
+    crate::log_info!(
+        "init-user(S5c): 生效位 代码={:#x} 栈={:#x} si={:#x}（bit0=user bit1=W bit2=X，0xff=没映射）",
+        bits(loaded.entry), bits(loaded.stack_top & !0xfff), bits(si_va)
+    );
     // 15：建一条**停住**的线程。
     f.rax = SYS_THREAD_CREATE; f.rdi = hp.0; f.rsi = loaded.entry; f.rdx = loaded.stack_top; f.r10 = 0;
     syscall_dispatch(&mut f);
@@ -934,12 +980,25 @@ fn stage_init_user() {
     f.rax = SYS_PROCESS_START; f.rdi = hp.0; f.rsi = ht.0; f.rdx = hi.0; f.r10 = si_va;
     syscall_dispatch(&mut f);
     let started = f.rax;
-    apic::timer_start().ok();
-    let done = apic::with_interrupts(|| sched::wait_for_task(gidx, crate::clock::window_cycles(32)));
-    let runs = sched::runs_of(gidx);
+    // 诊断（S5c）：子进程在入口就 #PF（rip=entry cr2=0 err=4），而三格生效位都对。
+    // 只打**原值**：叶子表项（地址位+标志位）与首帧地址，不 deref 任何东西。
+    // 上一版顺着叶子走 HHDM 读代码头，实测把内核打挂（cr2=HHDM+0x85000000，而 RAM 只有 512 MiB）
+    // ⇒ 先问"表项里到底写了什么"，再决定要不要读它背后的帧。
+    let leaf = |va: u64| mm::aspace_leaf_slot(aslot, mm::VirtAddr(va));
     crate::log_info!(
-        "init-user(S4b-2): 无CREATE拒={} Proc句柄={} 子AS={} 段={} 页={} 线程停住={} start_ret={} 跑过次数={} 等待收工={} si_va={:#x}",
-        denied, hp.0, aslot, loaded.segs, loaded.pages, stopped, started, runs, done, si_va
+        "init-user(S5c): 叶子 代码={:#x?} 栈={:#x?} si={:#x?} 帧址={:#x?}",
+        leaf(loaded.entry), leaf(loaded.stack_top & !0xfff), leaf(si_va), sched::task_frame(gidx)
+    );
+    apic::timer_start().ok();
+    let windows = if cfg!(feature = "console-probe") { 1000 } else { 32 };
+    let done = apic::with_interrupts(|| sched::wait_for_task(gidx, crate::clock::window_cycles(windows)));
+    let runs = sched::runs_of(gidx);
+    // S5c：`等待收工=false` 在这一档是**预期**——shell 是常驻 init，只有收到 `exit` 才收工。
+    // "它真的在跑"这一格由串口上的横幅与提示符作证（宿主机侧读），不靠这个布尔。
+    crate::log_info!(
+        "init-user(S4b-2): 程序=shell 无CREATE拒={} Proc句柄={} 子AS={} 任务AS={} entry={:#x} 栈顶={:#x} 段={} 页={} 归创建者={} 子袋={} 线程停住={} start_ret={} 跑过次数={} 等待收工={} si_va={:#x}",
+        denied, hp.0, aslot, sched::aspace_of(gidx), loaded.entry, loaded.stack_top,
+        loaded.segs, loaded.pages, owned_n, sched::owned_of(gidx), stopped, started, runs, done, si_va
     );
 }
 

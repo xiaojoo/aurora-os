@@ -1,6 +1,6 @@
 # unsafe 逐处审计表（U1–U6）
 
-总计 385 处。U1 67 · U2 104 · U3 13 · U4 131 · U5 34 · U6 36
+总计 405 处。U1 75 · U2 104 · U3 13 · U4 131 · U5 46 · U6 36
 
 本表由 `tools/aurora.py` 的 `unsafe_sites()` 从源码逐处生成，**不是手写的**。
 机器可读的权威来源是 `docs/security/unsafe-whitelist.toml` 的 `[modules.*]` 段（模块×类别→处数），
@@ -9,11 +9,11 @@
 
 ## 类别
 
-- **U1 架构入口与特殊寄存器** — 67 处，分布在 14 个模块：arch/x86_64/apic、arch/x86_64/cpu、arch/x86_64/smp、arch/x86_64/trap、hw、ktests/sched、mm、sched、serial、sync、tsc、user、user/hello
+- **U1 架构入口与特殊寄存器** — 75 处，分布在 15 个模块：arch/x86_64/apic、arch/x86_64/cpu、arch/x86_64/smp、arch/x86_64/trap、hw、ktests/sched、mm、sched、serial、sync、tsc、user、user/hello、user/probe、user/shell
 - **U2 页表、物理内存与 MMIO** — 104 处，分布在 11 个模块：acpi、arch/x86_64/apic、heap、hw、ktests/mm、limine、mm、pci、sched、user、vmo
 - **U3 DMA 与设备共享内存** — 13 处，分布在 2 个模块：driver、limine
 - **U4 并发共享状态与 UnsafeCell** — 131 处，分布在 20 个模块：acpi、ahci、arch/x86_64/apic、arch/x86_64/smp、arch/x86_64/trap、driver、hooks、irq、ktests/elf、ktests/fs、ktests/sign、main、mm、pci、proc、sched、sync、user、virtio、vmo
-- **U5 用户指针与地址空间访问** — 34 处，分布在 3 个模块：user、user/hello、user/probe
+- **U5 用户指针与地址空间访问** — 46 处，分布在 4 个模块：user、user/hello、user/probe、user/shell
 - **U6 诊断路径的有限现场读取** — 36 处，分布在 9 个模块：crash、ktest、ktests/acpi、ktests/crash、ktests/fs、ktests/heap、ktests/mm、ktests/sched、ktests/user
 
 ## 口径
@@ -515,81 +515,83 @@
   > unsafe { let mut table = (s().pml4_phys + hhdm) as *const Page; let mut level = 3u8;
 - `kernel/src/mm.rs:1460` [{] **U2** fn=`effective_flags`
   > unsafe { let mut table = (s().pml4_phys + hhdm) as *const Page; let mut level = 3u8;
-- `kernel/src/mm.rs:1500` [{] **U2** fn=`phys_of`
+- `kernel/src/mm.rs:1481` [{] **U1** fn=`current_effective_flags`
+  > let root = unsafe { aspace_cr3_read() }; effective_flags_in(root, va) } 
+- `kernel/src/mm.rs:1517` [{] **U2** fn=`phys_of`
   > unsafe { let mut table = (s().pml4_phys + hhdm) as *const Page; let mut level = 3u8;
-- `kernel/src/mm.rs:1529` [{] **U2** fn=`leaf_value`
+- `kernel/src/mm.rs:1546` [{] **U2** fn=`leaf_value`
   > unsafe { let mut table = (s().pml4_phys + hhdm) as *const Page; let mut level = 3u8;
-- `kernel/src/mm.rs:1566` [{] **U2** fn=`split_huge`
+- `kernel/src/mm.rs:1583` [{] **U2** fn=`split_huge`
   > let pd_entry: *mut u64 = unsafe { let mut table = (s().pml4_phys + hhdm) as *mut Page; let e3 = &mut (*table).0[idx(block, 3)] as *mut u64;
-- `kernel/src/mm.rs:1587` [{] **U2** fn=`split_huge`
+- `kernel/src/mm.rs:1604` [{] **U2** fn=`split_huge`
   > let old = unsafe { *pd_entry }; if old & P_PRESENT == 0 { return Err(MmError::NotMapped);
-- `kernel/src/mm.rs:1605` [{] **U2** fn=`split_huge`
+- `kernel/src/mm.rs:1622` [{] **U2** fn=`split_huge`
   > unsafe { let pt_page = (pt_phys + hhdm) as *mut Page; for k in 0..512u64 {
-- `kernel/src/mm.rs:1614` [{] **U2** fn=`split_huge`
+- `kernel/src/mm.rs:1631` [{] **U2** fn=`split_huge`
   > unsafe { *pd_entry = new_pd }; tlb_invalidate(block); shootdown_others(block);
-- `kernel/src/mm.rs:1729` [impl] **U4** fn=`map_hole`
+- `kernel/src/mm.rs:1746` [impl] **U4** fn=`map_hole`
   > unsafe impl Sync for AspaceCell {}  static ASPACES: AspaceCell = AspaceCell(UnsafeCell::new(AspaceTable { items: [AS_EMPTY; MAX_ADDR_SPACES] }));
-- `kernel/src/mm.rs:1736` [{] **U4** fn=`aspaces`
+- `kernel/src/mm.rs:1753` [{] **U4** fn=`aspaces`
   > unsafe { &mut *ASPACES.0.get() } } 
-- `kernel/src/mm.rs:1766` [{] **U2** fn=`aspaces`
+- `kernel/src/mm.rs:1783` [{] **U2** fn=`aspaces`
   > unsafe { let mine = (e.pml4 + hhdm) as *const Page; let kernel = (s().pml4_phys + hhdm) as *const Page;
-- `kernel/src/mm.rs:1788` [{] **U2** fn=`aspaces`
+- `kernel/src/mm.rs:1805` [{] **U2** fn=`aspaces`
   > unsafe { let mine = (e.pml4 + hhdm) as *const Page; Some((0..256).filter(|&i| (*mine).0[i] & P_PRESENT != 0).count())
-- `kernel/src/mm.rs:1822` [{] **U2** fn=`aspace_new`
+- `kernel/src/mm.rs:1839` [{] **U2** fn=`aspace_new`
   > unsafe { let mine = (pml4 + hhdm) as *mut Page; core::ptr::write_bytes(mine as *mut u8, 0, PAGE);
-- `kernel/src/mm.rs:1906` [{] **U2** fn=`aspace_leaf`
+- `kernel/src/mm.rs:1923` [{] **U2** fn=`aspace_leaf`
   > let leaf = unsafe { walk_leaf_in(e.pml4, None, va.0, false, false, false)? }; // SAFETY: 上一行返回的是有效表项指针 let v = unsafe { *leaf };
-- `kernel/src/mm.rs:1908` [{] **U2** fn=`aspace_leaf`
+- `kernel/src/mm.rs:1925` [{] **U2** fn=`aspace_leaf`
   > let v = unsafe { *leaf }; if v & P_PRESENT == 0 { None } else { Some(v) } }
-- `kernel/src/mm.rs:1950` [{] **U2** fn=`aspace_leaf`
+- `kernel/src/mm.rs:1967` [{] **U2** fn=`aspace_leaf`
   > if let Some(leaf) = unsafe { walk_leaf_in(self.root, None, a, false, false, false) } { // SAFETY: 上一行返回的是有效表项指针 unsafe { *leaf = 0 };
-- `kernel/src/mm.rs:1952` [{] **U2** fn=`aspace_leaf`
+- `kernel/src/mm.rs:1969` [{] **U2** fn=`aspace_leaf`
   > unsafe { *leaf = 0 }; tlb_invalidate(a); // 清完叶子才等回执，回执收齐之前不还帧（ADR-023/072）。
-- `kernel/src/mm.rs:2014` [{] **U2** fn=`aspace_map`
+- `kernel/src/mm.rs:2031` [{] **U2** fn=`aspace_map`
   > if let Some(leaf) = unsafe { walk_leaf_in(root, None, a, false, false, false) } { // SAFETY: 上一行返回的是有效表项指针 if unsafe { *leaf } & P_PRESENT != 0 {
-- `kernel/src/mm.rs:2016` [{] **U2** fn=`aspace_map`
+- `kernel/src/mm.rs:2033` [{] **U2** fn=`aspace_map`
   > if unsafe { *leaf } & P_PRESENT != 0 { return Err(MmError::AlreadyMapped); }
-- `kernel/src/mm.rs:2035` [{] **U2** fn=`aspace_map`
+- `kernel/src/mm.rs:2052` [{] **U2** fn=`aspace_map`
   > if let Some(leaf) = unsafe { walk_leaf_in(root, None, b, false, false, false) } { // SAFETY: 有效表项指针 unsafe { *leaf = 0 };
-- `kernel/src/mm.rs:2037` [{] **U2** fn=`aspace_map`
+- `kernel/src/mm.rs:2054` [{] **U2** fn=`aspace_map`
   > unsafe { *leaf = 0 }; tlb_invalidate(b); }
-- `kernel/src/mm.rs:2075` [fn] **U1** fn=`aspace_switch`
+- `kernel/src/mm.rs:2092` [fn] **U1** fn=`aspace_switch`
   > pub unsafe fn aspace_switch(pml4: u64, me: usize) -> bool { // SAFETY: 读 CR3 是特权读，调用方在 ring0；原语在上方 global_asm 里，只动 CR3 let cur = unsafe { aspace_cr3_read() };
-- `kernel/src/mm.rs:2077` [{] **U1** fn=`aspace_switch`
+- `kernel/src/mm.rs:2094` [{] **U1** fn=`aspace_switch`
   > let cur = unsafe { aspace_cr3_read() }; if cur == pml4 { return false;
-- `kernel/src/mm.rs:2082` [{] **U1** fn=`aspace_switch`
+- `kernel/src/mm.rs:2099` [{] **U1** fn=`aspace_switch`
   > unsafe { aspace_cr3_write(pml4) }; CR3_WRITES.fetch_add(1, Ordering::Relaxed); // ADR-072：登记"这颗 CPU 曾跑过这个 AS"。只增不减（换走时不摘）。
-- `kernel/src/mm.rs:2103` [fn] **U2** fn=`aspace_switch_kernel`
+- `kernel/src/mm.rs:2120` [fn] **U2** fn=`aspace_switch_kernel`
   > pub unsafe fn aspace_switch_kernel(me: usize) -> bool { // SAFETY: our_cr3 是启动时建的内核表，前提由 take_over 保证 unsafe { aspace_switch(our_cr3(), me) }
-- `kernel/src/mm.rs:2105` [{] **U2** fn=`aspace_switch_kernel`
+- `kernel/src/mm.rs:2122` [{] **U2** fn=`aspace_switch_kernel`
   > unsafe { aspace_switch(our_cr3(), me) } } 
-- `kernel/src/mm.rs:2149` [impl] **U4** fn=`kernel_half_frozen`
+- `kernel/src/mm.rs:2166` [impl] **U4** fn=`kernel_half_frozen`
   > unsafe impl Sync for LazyCell {}  static LAZY: LazyCell = LazyCell(UnsafeCell::new(LazyTable { items: [LAZY_EMPTY; MAX_LAZY_REGIONS] }));
-- `kernel/src/mm.rs:2155` [{] **U4** fn=`lazy_items`
+- `kernel/src/mm.rs:2172` [{] **U4** fn=`lazy_items`
   > unsafe { &mut *LAZY.0.get() } } 
-- `kernel/src/mm.rs:2253` [{] **U2** fn=`demand_zero_try`
+- `kernel/src/mm.rs:2270` [{] **U2** fn=`demand_zero_try`
   > unsafe { core::ptr::write_bytes((p + s().hhdm) as *mut u8, 0, PAGE) }; // 竞争变体（ADR-067 验收⑥的确定性构造）：把"已查未填 → 分配 → 装页"的窗口拉宽， // 让四路竞争者重叠；默认构建不睡，重叠与否由 TCG 现实时序决定。
-- `kernel/src/mm.rs:2430` [{] **U2** fn=`bootstrap_frame_info`
+- `kernel/src/mm.rs:2447` [{] **U2** fn=`bootstrap_frame_info`
   > unsafe { let e = &mut *arr.add(f as usize); e.refcnt = AtomicU32::new(if used { 1 } else { 0 });
-- `kernel/src/mm.rs:2465` [{] **U2** fn=`fi_refcnt`
+- `kernel/src/mm.rs:2482` [{] **U2** fn=`fi_refcnt`
   > unsafe { (*arr.add(f as usize)).refcnt.load(Ordering::Relaxed) } } 
-- `kernel/src/mm.rs:2473` [{] **U2** fn=`fi_owner`
+- `kernel/src/mm.rs:2490` [{] **U2** fn=`fi_owner`
   > unsafe { (*arr.add(f as usize)).owner } } 
-- `kernel/src/mm.rs:2481` [{] **U2** fn=`fi_set_used`
+- `kernel/src/mm.rs:2498` [{] **U2** fn=`fi_set_used`
   > unsafe { let e = &mut *arr.add(f as usize); e.refcnt.store(if used { 1 } else { 0 }, Ordering::Relaxed);
-- `kernel/src/mm.rs:2494` [{] **U2** fn=`fi_inc_refcnt`
+- `kernel/src/mm.rs:2511` [{] **U2** fn=`fi_inc_refcnt`
   > unsafe { (*arr.add(f as usize)).refcnt.fetch_add(1, Ordering::Relaxed); } } 
-- `kernel/src/mm.rs:2502` [{] **U2** fn=`fi_dec_refcnt`
+- `kernel/src/mm.rs:2519` [{] **U2** fn=`fi_dec_refcnt`
   > unsafe { (*arr.add(f as usize)).refcnt.fetch_sub(1, Ordering::Relaxed); } } 
-- `kernel/src/mm.rs:2578` [{] **U2** fn=`frame_put`
+- `kernel/src/mm.rs:2595` [{] **U2** fn=`frame_put`
   > unsafe { core::ptr::write_bytes(ptr, 0, cap) }; Ok(KBuf { frames, ptr, len: bytes }) }
-- `kernel/src/mm.rs:2598` [{] **U2** fn=`frame_put`
+- `kernel/src/mm.rs:2615` [{] **U2** fn=`frame_put`
   > unsafe { core::slice::from_raw_parts(self.ptr, self.len) } } pub fn as_mut_slice(&mut self) -> &mut [u8] {
-- `kernel/src/mm.rs:2602` [{] **U2** fn=`frame_put`
+- `kernel/src/mm.rs:2619` [{] **U2** fn=`frame_put`
   > unsafe { core::slice::from_raw_parts_mut(self.ptr, self.len) } } }
-- `kernel/src/mm.rs:2675` [{] **U2** fn=`fi_final_free`
+- `kernel/src/mm.rs:2692` [{] **U2** fn=`fi_final_free`
   > unsafe { core::ptr::write_volatile((st.hhdm + base + b) as *mut u8, 0xa5) }; } if !ledger_free(owner, 1) {
-- `kernel/src/mm.rs:2723` [{] **U2** fn=`phys_free`
+- `kernel/src/mm.rs:2740` [{] **U2** fn=`phys_free`
   > unsafe { core::ptr::write_volatile((st.hhdm + base.0 + b) as *mut u8, 0xa5) }; } if !ledger_free(owner, n) {
 
 ### pci
@@ -862,6 +864,46 @@
   > let v = unsafe { core::ptr::read_volatile(mailbox as *const u64) }; if v != 0 { job_h = v;
 - `user/probe/src/main.rs:394` [{] **U1** fn=`_start`
   > unsafe { core::arch::asm!("2: jmp 2b", options(nomem, nostack, noreturn)) }; } }
+
+### user/shell
+
+- `user/shell/src/main.rs:59` [{] **U1** fn=`msgs_base`
+
+- `user/shell/src/main.rs:70` [{] **U5** fn=`msg`
+
+- `user/shell/src/main.rs:80` [{] **U1** fn=`panic`
+
+- `user/shell/src/main.rs:86` [fn] **U1** fn=`syscall3`
+
+- `user/shell/src/main.rs:90` [{] **U1** fn=`syscall3`
+
+- `user/shell/src/main.rs:105` [{] **U5** fn=`con_write`
+
+- `user/shell/src/main.rs:110` [{] **U5** fn=`con_read_byte`
+
+- `user/shell/src/main.rs:147` [fn] **U1** fn=`find_console`
+
+- `user/shell/src/main.rs:150` [{] **U5** fn=`find_console`
+
+- `user/shell/src/main.rs:154` [{] **U5** fn=`find_console`
+
+- `user/shell/src/main.rs:157` [{] **U5** fn=`find_console`
+
+- `user/shell/src/main.rs:158` [{] **U5** fn=`find_console`
+
+- `user/shell/src/main.rs:160` [{] **U5** fn=`find_console`
+
+- `user/shell/src/main.rs:213` [{] **U5** fn=`dispatch`
+
+- `user/shell/src/main.rs:218` [{] **U5** fn=`dispatch`
+
+- `user/shell/src/main.rs:237` [{] **U5** fn=`_start`
+
+- `user/shell/src/main.rs:242` [{] **U1** fn=`_start`
+
+- `user/shell/src/main.rs:244` [{] **U1** fn=`_start`
+
+- `user/shell/src/main.rs:269` [{] **U5** fn=`_start`
 
 ### virtio
 

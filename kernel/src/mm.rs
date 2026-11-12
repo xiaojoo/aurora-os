@@ -1465,6 +1465,23 @@ pub fn effective_flags(va: u64) -> Option<EffectiveFlags> {
     effective_flags_in(s().pml4_phys, va)
 }
 
+/// **当前 CR3 那棵树**里某个 VA 的生效位。用户缓冲校验必须用它而不是 `effective_flags`：
+/// 后者走启动那棵树（`pml4_phys` 只在 take_over 写一次，`aspace_switch` 只动 CR3），
+/// 而子进程跑在自己的 AS 里 ⇒ 校验的树与拷贝真正用的树不是同一张。
+/// S5c 实测过后果：shell 的 `console_write` 恒 `E_FAULT`，横幅一个字都出不来。
+/// ADR-070 A4"同一 VA 在两棵树里各自映射"在用户缓冲这条路上由本函数兑现。
+///
+/// 与 `effective_flags` 同一纪律：**不取锁**（所有写者都在 VMM(20) 里），
+/// 所以能在 `with_vmm_lock` 内部调用。
+pub fn current_effective_flags(va: u64) -> Option<EffectiveFlags> {
+    if !is_ready() {
+        return None;
+    }
+    // SAFETY: 只读 CR3（ring0 特权读），不写状态、不取锁；原语只动 rax，不碰栈与标志。
+    let root = unsafe { aspace_cr3_read() };
+    effective_flags_in(root, va)
+}
+
 /// 按**槽号**读另一张 AS 里某个 VA 的生效位（P5c-3：15/16 号要校验 entry 可执行、
 /// 栈页可写、StartupInfo 页**只读**，而那些页都在子 AS 里，不在当前 CR3 上）。
 /// 与 `effective_flags` 共用同一段遍历，差别只有根从哪来。

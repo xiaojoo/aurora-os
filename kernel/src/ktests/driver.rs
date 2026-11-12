@@ -4,6 +4,104 @@ use crate::arch::x86_64::{apic, cpu, smp, trap};
 use crate::{acpi, ahci, boot_guard, driver, hw, irq, mm, pci, resource};
 use crate::ktest;
 
+#[cfg(feature = "serial-rx-probe")]
+fn t_serial_rx() -> bool {
+    use crate::serial;
+    let Some(m) = acpi::summary().and_then(|s| s.madt) else {
+        crate::log_fatal!("serial-rx: MADT 不可用");
+        return false;
+    };
+    if apic::get_or_init(&m).is_err() {
+        return false;
+    }
+    let Some((_, rte)) = acpi::ioapic_for(&m, acpi::gsi_for(&m, 4)) else {
+        return false;
+    };
+    let idle_route = apic::rte_raw(rte);
+    let reject_vector = apic::ioapic_route(&m, 4, 0).is_err()
+        && apic::rte_raw(rte) == idle_route;
+    let mut incomplete = m;
+    incomplete.override_overflow = 1;
+    let reject_incomplete = matches!(serial::enable_rx(&incomplete),
+        Err(serial::RxError::Apic(apic::ApicError::UnsupportedRoute)));
+    let mut unsupported = m;
+    unsupported.n_overrides = 1;
+    unsupported.overrides[0] = acpi::Override {
+        bus: 0, source: 4, gsi: acpi::gsi_for(&m, 4), flags: 0xf,
+    };
+    let rejected_unsupported = (0..16).all(|_| matches!(serial::enable_rx(&unsupported),
+        Err(serial::RxError::Apic(apic::ApicError::UnsupportedRoute))));
+    if let Err(e) = serial::enable_rx(&m) {
+        crate::log_fatal!("serial-rx: 接入失败 {:?}", e);
+        return false;
+    }
+    let route = apic::rte_raw(rte);
+    let idempotent = serial::enable_rx(&m).is_ok() && apic::rte_raw(rte) == route;
+    let routed = match (route, apic::state()) {
+        (Some((lo, hi)), Some(s)) => lo & ((1 << 16) | (1 << 15) | (1 << 13)) == 0
+            && (0x21..=0x2f).contains(&(lo & 0xff)) && hi == s.id << 24,
+        _ => false,
+    };
+    let empty = serial::read_byte().is_none() && serial::rx_stats() == (0, 0, 0, 0);
+    let mut ok = reject_incomplete && rejected_unsupported && idempotent && reject_vector && routed && empty;
+    crate::log_info!("serial-rx: route={:?} incomplete={} unsupported={} idempotent={} reject_vector={} empty={} ok={}",
+        route, reject_incomplete, rejected_unsupported, idempotent, reject_vector, empty, ok);
+    let wait = |ready: &dyn Fn() -> bool| {
+        let start = crate::tsc::now();
+        while !ready() && crate::tsc::now().wrapping_sub(start) < crate::clock::window_cycles(1000) {
+            crate::tsc::spin(50_000);
+        }
+        ready()
+    };
+    for (phase, sent) in [16usize, 300, 32].into_iter().enumerate() {
+        let before = serial::rx_stats();
+        if phase == 0 {
+            serial::out8(0x3f9, 0);
+        }
+        crate::log_info!("serial-rx: ready phase={} bytes={}", phase, sent);
+        if phase == 0 {
+            let data = apic::with_interrupts(|| wait(&|| serial::in8(0x3fd) & 1 != 0));
+            let masked = serial::rx_stats();
+            let quiet = data && masked == before && serial::read_byte().is_none();
+            crate::log_info!("serial-rx: masked data={} queued={} irqs={} ok={}",
+                data, masked.3, masked.2 - before.2, quiet);
+            ok &= quiet;
+            serial::out8(0x3f9, 1);
+        }
+        let arrived = apic::with_interrupts(|| wait(&|| {
+            let now = serial::rx_stats();
+            now.0 - before.0 + now.1 - before.1 >= sent
+        }));
+        let mut data = [0u8; 255];
+        let mut count = 0;
+        while count < data.len() {
+            let Some(b) = serial::read_byte() else { break };
+            data[count] = b;
+            count += 1;
+        }
+        let after = serial::rx_stats();
+        let accepted = after.0 - before.0;
+        let dropped = after.1 - before.1;
+        let irqs = after.2 - before.2;
+        let expected = sent.min(data.len());
+        let content = data[..count].iter().enumerate()
+            .all(|(i, &b)| b == (i * 37 + phase * 53) as u8);
+        let hash = data[..count].iter().fold(0xcbf29ce484222325u64,
+            |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100000001b3));
+        let phase_ok = arrived && count == expected && accepted == expected
+            && dropped == sent - expected && irqs > 0 && content
+            && after.3 == 0 && serial::read_byte().is_none();
+        crate::log_info!("serial-rx: phase={} read={} accepted={} dropped={} irqs={} queued={} hash={:#018x} ok={}",
+            phase, count, accepted, dropped, irqs, after.3, hash, phase_ok);
+        ok &= phase_ok;
+    }
+    let budget_hits = serial::rx_budget_hits();
+    crate::log_info!("serial-rx: budget_hits={} ok={}", budget_hits, budget_hits > 0);
+    ok && budget_hits > 0
+}
+#[cfg(feature = "serial-rx-probe")]
+ktest!(KT_SERIAL_RX, t_serial_rx);
+
 /// M5-a：PCI 配置空间。判据的原则同 §10.3：**能互相独立的两台仪器优先**。
 /// 这里配置读同时走 ECAM 与 CAM 两条硬件路径，两边必须数到同一个数。
 fn t_pci_config() -> bool {

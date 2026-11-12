@@ -59,6 +59,7 @@ public_api = [
   "apic::eoi_self",
   "apic::get_or_init",
   "apic::in_isr",
+  "apic::ioapic_route",
   "apic::interrupts_enabled",
   "apic::is_lapic_mapped",
   "apic::note_alloc_in_isr",
@@ -175,6 +176,7 @@ public_api = [
   "heap::init",
   "mm::MAX_TASKS_SUPPORTED",
   "mm::MOD_TEST",
+  "mm::MOD_BOOT",
   "mm::KBuf",
   "mm::LazyHandle",
   "mm::demand_zero_try",
@@ -241,6 +243,7 @@ public_api = [
   "mm::boot_reclaimable_bytes",
   "mm::boot_stack_range",
   "mm::counters",
+  "mm::current_effective_flags",
   "mm::effective_flags",
   "mm::frame_get",
   "mm::frame_info_size",
@@ -332,6 +335,10 @@ public_api = [
   "sched::wait_for_task",
   "sched::wait_for_proc",
   "sched::adopt_asmaps",
+  # S5c-2：产品路径要核"映射真搬进子线程了"（owned_of）与"首帧落在哪"（task_frame）。
+  # 两者本来只服务用例，现在 main.rs 的 init 也引用 ⇒ 按门禁口径登记。
+  "sched::owned_of",
+  "sched::task_frame",
   "sched::kill_process_threads",
   "sched::current_id",
   "sched::task_wait_stats",
@@ -463,7 +470,7 @@ public_api = [
   "pci::init",
   "hw::MmioRegion",
 ]
-allowed_callers = ["arch", "driver", "integration", "storage"]
+allowed_callers = ["arch", "diagnostics", "driver", "integration", "storage"]
 dependencies = ["arch", "memory", "sync"]
 forbidden_dependencies = ["storage"]
 known_violations = []
@@ -494,7 +501,7 @@ public_api = [
   "irq::request",
   "irq::set_affinity",
 ]
-allowed_callers = ["arch", "driver", "integration", "storage"]
+allowed_callers = ["arch", "diagnostics", "driver", "integration", "storage"]
 dependencies = ["arch", "memory", "sync"]
 forbidden_dependencies = []
 known_violations = []
@@ -583,7 +590,10 @@ public_api = [
   "serial::init",
   "serial::is_ready",
   "serial::line",
+  "serial::enable_rx",
+  "serial::read_byte",
   "serial::line_stats",
+  "serial::write_bytes",
   "serial::out8",
   "serial::recent_tail",
   "serial::ring_total",
@@ -607,7 +617,7 @@ public_api = [
   "state_store::MAX_FRAMES",
 ]
 allowed_callers = ["arch", "boot", "integration", "memory", "sched", "sync", "testing", "time"]
-dependencies = ["arch", "memory", "storage", "sync", "time"]
+dependencies = ["arch", "irq", "memory", "pci", "storage", "sync", "time"]
 forbidden_dependencies = []
 known_violations = []
 context = ["BOOT", "KERNEL", "IRQ_OFF", "ISR_TOP", "PANIC"]
@@ -615,7 +625,7 @@ error_classes = ["B", "D"]
 resource_ownership = "日志环、崩溃摘要、持久状态记录、启动健康状态、看门狗状态、最终停机出口。"
 error_policy = "故障路径不分配、不等可能损坏的锁；持久状态写失败不得再触发不可恢复故障。"
 unsafe_scope = ["serial:U1", "crash:U6"]
-test_targets = ["t_state_store", "t_crash", "t_crash_oops", "t_watchdog", "t_serial_atomic"]
+test_targets = ["t_state_store", "t_crash", "t_crash_oops", "t_watchdog", "t_serial_atomic", "t_serial_rx"]
 status = "部分落地"
 
 [modules."security"]
@@ -691,6 +701,7 @@ public_api = [
   "handle::RIGHT_WRITE",
   "handle::RIGHT_MAP",
   "handle::RIGHT_DUP",
+  "handle::grant_console",
   "handle::live",
   "handle::vmo_of",
   "handle::aspace_of",
@@ -804,13 +815,15 @@ known_scc = [
 "arch->diagnostics" = 19
 "arch->irq" = 2
 "arch->memory" = 21
-"arch->pci" = 4
+"arch->pci" = 6
 "arch->sync" = 8
 "arch->time" = 22
 "boot->diagnostics" = 11
 "boot->sync" = 4
-"diagnostics->arch" = 25
-"diagnostics->memory" = 4
+"diagnostics->arch" = 34
+"diagnostics->irq" = 3
+"diagnostics->memory" = 6
+"diagnostics->pci" = 1
 "diagnostics->storage" = 15
 "diagnostics->sync" = 3
 "diagnostics->time" = 3

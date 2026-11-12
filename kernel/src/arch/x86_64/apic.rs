@@ -72,6 +72,7 @@ pub enum ApicError {
     NoIoApicForGsi,
     /// 映射设备页失败（VA 保留用尽或表项冲突）
     MapFailed,
+    UnsupportedRoute,
 }
 
 /// 交接时读回来的事实，全部进日志。
@@ -430,6 +431,42 @@ pub fn timer_stop() -> Result<(), ApicError> {
     let s = state().ok_or(ApicError::NoLapic)?;
     ioapic_mask(s.timer_rte, true);
     pit_stop();
+    Ok(())
+}
+
+pub fn ioapic_route(m: &Madt, isa_irq: u8, vector: u8) -> Result<(), ApicError> {
+    if m.truncated || m.override_overflow != 0 || m.ioapic_overflow != 0 || m.skipped_entries != 0 {
+        return Err(ApicError::UnsupportedRoute);
+    }
+    let s = state().ok_or(ApicError::NoLapic)?;
+    let gsi = crate::acpi::gsi_for(m, isa_irq);
+    let (which, rte) = crate::acpi::ioapic_for(m, gsi).ok_or(ApicError::NoIoApicForGsi)?;
+    if m.ioapic[which].addr != s.ioapic_phys || u32::from(rte) >= s.irt_entries {
+        return Err(ApicError::NoIoApicForGsi);
+    }
+    // 只接 BSP 上独占、高有效、边沿的 ISA 线，不覆盖活跃路由或解释未知固件标志。
+    if in_isr() || crate::arch::x86_64::cpu::self_slot() != 0
+        || s.id > 255 || rte == s.timer_rte
+        || usize::from(vector) <= crate::arch::x86_64::trap::VEC_IRQ_BASE
+        || usize::from(vector) > crate::arch::x86_64::trap::VEC_IRQ_LAST
+        || m.overrides[..m.n_overrides].iter().any(|o| {
+            o.bus == 0 && o.source == isa_irq && o.flags & !0x5 != 0
+        })
+        || rte_raw(rte).is_none_or(|(lo, _)| lo & (1 << 16) == 0)
+    {
+        return Err(ApicError::UnsupportedRoute);
+    }
+    let reg = (IORTE_BASE + 2 * u64::from(rte)) as u32;
+    let low = u32::from(vector);
+    let high = s.id << 24;
+    ioapic_write(s.ioapic_va, reg, low | (1 << 16));
+    ioapic_write(s.ioapic_va, reg + 1, high);
+    ioapic_write(s.ioapic_va, reg, low);
+    let back = rte_raw(rte).ok_or(ApicError::NoIoApicForGsi)?;
+    if back.0 & !((1 << 12) | (1 << 14)) != low || back.1 != high {
+        ioapic_mask(rte, true);
+        return Err(ApicError::UnsupportedRoute);
+    }
     Ok(())
 }
 
