@@ -146,6 +146,10 @@ console-probe = ["handles"]
 # `debug-exit`。**为什么不并进 handles**：判定表里 `do_run(["handles"])` 那一行（探针 ELF 几何对账）
 # 从不往串口喂命令，init 一常驻它就挂成 HANG(-1)；常驻只在有人喂命令的档里成立。
 resident-init = ["handles"]
+# 变体（W6 S6a，BACKLOG §240）：声明 Limine 的 framebuffer 请求、按 memmap 的物理区间自己开
+# UC 窗口、画一张**宿主机可独立复算**的测试图案。判据两半：核内写后读回（只证窗口自洽）+
+# 宿主机 QMP screendump 取 PPM 采样对账（证设备真显示了）。默认档不编译整个模块。
+framebuffer = []
 # 变体（L3-B 亲和性那一步，BACKLOG 73）：把 AHCI 那颗 MSI 的目的地移到一颗上线的 AP 上，
 # 再做一次真读，看投递到底落到哪颗 CPU。判据是两台仪器各数一遍：
 # 内核数 `irq::by_cpu()` 的槽分布，宿主机拿 `-d int` 里 `SP` 的高位分 BSP／非 BSP（BACKLOG 68e 那条）。

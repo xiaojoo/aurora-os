@@ -55,9 +55,9 @@ expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe
 # 2026-11-07 P7：hello 加了 syscall3（U1 两处）与 ring3 句柄读/close（U5 三处）。
 
 [unsafe-census]
-total = 405
+total = 409
 U1 = 75
-U2 = 104
+U2 = 108
 U3 = 13
 U4 = 131
 U5 = 46
@@ -148,8 +148,14 @@ U4 = 2
 [modules."ktests/user"]
 U6 = 1
 
+# S6a（BACKLOG §240）+4 处 U2：Limine framebuffer 响应是"启动信息里的指针数组"，
+# 读它必须解引用 bootloader 写的裸指针（`*base`、`&*fb`、条目 `as_ref`、`memmap_slice`）。
+# 指针来源：bootloader 在移交控制权之前按协议写好；地址范围：内核 higher-half / HHDM 内；
+# 对齐：协议规定的 repr(C) 结构；生命周期：响应一经提供在内核运行期内稳定（协议未规定失效）；
+# 并发：只在 BSP 启动阶段单线程读一次，之后只读数值副本（FbInfo 不带指针）；
+# 上下文：BOOT/KERNEL，不在 ISR、不持锁；不变量由"先判非空 + 条目数上界 64/4096"保证。
 [modules."limine"]
-U2 = 10
+U2 = 14
 U3 = 4
 
 # T0.1（2026-11-07）：用例搬进 kernel/src/ktests/*.rs，main 只剩启动路径的 3 处 U4；

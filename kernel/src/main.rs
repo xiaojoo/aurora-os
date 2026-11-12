@@ -31,6 +31,8 @@ mod hooks;
 #[cfg(feature = "handles")]
 mod handle;
 mod hw;
+#[cfg(feature = "framebuffer")]
+mod frame;
 mod irq;
 mod exit;
 mod ktest;
@@ -221,7 +223,63 @@ extern "C" fn after_switch(_: usize) -> ! {
     stage_fault_injections();
     stage_storage_guard_crash();
     stage_signature_check();
+    // S6a：帧缓冲开在 ktests **之前**——图案一旦画上就再没人动显存，
+    // 宿主机要在 QEMU 退出之前拿到 screendump，这个位置等于给对账留整个 ktests 阶段的余量。
+    #[cfg(feature = "framebuffer")]
+    stage_framebuffer();
     run_ktests_and_finish()
+}
+
+/// S6a：把帧缓冲开起来、报出几何与两处地址、画一张宿主机能独立复算的图案。
+///
+/// **串口仍然是权威判据通道**：这一段只**新增**日志行，一个既有字节的顺序都不改
+/// （判定表那些行读的仍是串口）。画面本身在这段里不当判据用——它由宿主机侧的
+/// QMP screendump 独立取证（BACKLOG §240），两边各自算同一张图案，不互相抄。
+#[cfg(feature = "framebuffer")]
+fn stage_framebuffer() {
+    use crate::frame::Frame;
+    let f = match Frame::init() {
+        Ok(f) => f,
+        Err(e) => {
+            // 不吞错、也不"没有画面就当没事"：这一档没成立就要在串口上看见具体成因。
+            crate::log_warn!("frame: 帧缓冲不可用 —— {:?}", e);
+            return;
+        }
+    };
+    let (w, h, pitch) = f.geom();
+    let (pa, len, lva, ours) = f.addrs();
+    let (is_hhdm, is_ours, is_mapped_here) = f.limine_relation();
+    crate::log_info!(
+        "frame: 几何 宽={} 高={} pitch={} bpp=32 掩码(尺寸,移位)=红{:?} 绿{:?} 蓝{:?}",
+        w, h, pitch, f.masks()[0], f.masks()[1], f.masks()[2]
+    );
+    // 这一行是本片真正要的那个数：Limine 给的地址与 HHDM+pa、与我们自己映射的 VA 各是什么关系。
+    // 不写死结论——先把它打出来，让"Limine 已给 framebuffer 能直接用"这句话被实测处置。
+    crate::log_info!(
+        "frame: 地址 memmap基址={:#x} 长度={:#x} limine={:#x} 我们的窗口={:#x} limine==HHDM+pa={} limine==我们的窗口={} 在我们页表里映着={}",
+        pa, len, lva, ours, is_hhdm, is_ours, is_mapped_here
+    );
+    if let Err(e) = f.draw_test_pattern() {
+        crate::log_warn!("frame: 画图案失败 —— {:?}", e);
+        return;
+    }
+    // 写后读回：只证明"我们写的字节还在我们映射的窗口里"，**不**证明设备显示出来了。
+    // 比的是 packed 后的原生像素值——拿 24 位期望值直接比 read32 会把量具错读成产品错。
+    let mut bad = 0usize;
+    let pts = f.samples();
+    for (name, x, y, want) in &pts {
+        let exp = f.packed(*want);
+        let got = f.get(*x, *y).unwrap_or(u32::MAX);
+        if got != exp {
+            bad += 1;
+            crate::log_warn!("frame: 采样 {} ({},{}) 读回={:#010x} 期望={:#010x}", name, x, y, got, exp);
+        }
+    }
+    crate::log_info!(
+        "frame: 图案已画 采样点数={} 读回不符点数={} —— 这一行只证窗口自洽，画面真伪由宿主机 screendump 对账",
+        pts.len(),
+        bad
+    );
 }
 
 /// Stage2a/2b：页表接管后的内存统计与内核堆。

@@ -73,6 +73,49 @@ pub struct BootloaderInfoResponse {
     pub version: AtomicPtr<u8>,
 }
 
+// ------------------------------------------------------------------ S6a：framebuffer
+//
+// 逐字取自本仓库固定的 `.tools/limine-protocol/include/limine.h`：
+//   LIMINE_FRAMEBUFFER_REQUEST_ID = { COMMON_MAGIC, 0x9d5827dcd881dd75, 0xa3148604f6fab11b }
+//   struct limine_framebuffer { address(void*), width, height, pitch, bpp, memory_model,
+//                               红绿蓝各 (size, shift), unused[7], edid_size, edid,
+//                               mode_count, modes }          // 末两个是 rev1 的尾字段
+//   struct limine_framebuffer_response { revision, framebuffer_count, framebuffers }
+// `framebuffers` 是 `struct limine_framebuffer **`，与 MemmapResponse.entries 同形，
+// 所以照那张表已经验证过的写法切片。
+#[cfg(feature = "framebuffer")]
+#[repr(C)]
+pub struct Framebuffer {
+    /// bootloader 在它自己页表里建的映射地址。**不当可用指针用**，理由见 framebuffer()。
+    pub address: AtomicPtr<u8>,
+    pub width: u64,
+    pub height: u64,
+    /// 一行占多少**字节**（不是像素）。pitch 与 width*bpp/8 不等时必须按 pitch 走。
+    pub pitch: u64,
+    pub bpp: u16,
+    /// 1 = RGB（`LIMINE_FRAMEBUFFER_RGB`）；其它值本片不支持
+    pub memory_model: u8,
+    pub red_mask_size: u8,
+    pub red_mask_shift: u8,
+    pub green_mask_size: u8,
+    pub green_mask_shift: u8,
+    pub blue_mask_size: u8,
+    pub blue_mask_shift: u8,
+    pub unused: [u8; 7],
+    pub edid_size: u64,
+    pub edid: AtomicPtr<u8>,
+    pub mode_count: u64,
+    pub modes: AtomicPtr<*const u8>,
+}
+
+#[cfg(feature = "framebuffer")]
+#[repr(C)]
+pub struct FramebufferResponse {
+    pub revision: u64,
+    pub framebuffer_count: u64,
+    pub framebuffers: AtomicPtr<*const Framebuffer>,
+}
+
 #[repr(u64)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemmapType {
@@ -169,6 +212,16 @@ static MEMMAP: MemmapRequest = MemmapRequest::new();
 #[used]
 #[link_section = ".requests"]
 static RSDP: RsdpRequest = RsdpRequest::new();
+// S6a：在此之前只登记了 4+1 个请求，`LIMINE_FRAMEBUFFER_REQUEST_ID` **从来没被声明过**
+// ——BACKLOG §229 二里那句"Limine 已给 framebuffer"是未兑现的预期，到本片才成为代码。
+#[cfg(feature = "framebuffer")]
+declare_request!(FramebufferRequest, FramebufferResponse, 0x9d5827dcd881dd75, 0xa3148604f6fab11b);
+
+#[cfg(feature = "framebuffer")]
+#[used]
+#[link_section = ".requests"]
+static FRAMEBUFFER: FramebufferRequest = FramebufferRequest::new();
+
 
 // ------------------------------------------------------------------ MP 特性
 //
@@ -390,4 +443,87 @@ pub fn collect() -> Option<BootInfo<'static>> {
     // SAFETY: 见 memmap_slice
     let mmap_entries = unsafe { memmap_slice(memmap) };
     Some(BootInfo { hhdm_offset: hhdm.offset, mmap_entries, rsdp, bootloader_name, mp })
+}
+
+/// 一份**只有数值**的 framebuffer 摘要（刻意不带指针）。
+#[cfg(feature = "framebuffer")]
+#[derive(Debug, Clone, Copy)]
+pub struct FbInfo {
+    pub count: u64,
+    /// bootloader 给的原样地址：只用来与 memmap 的物理区间**对账**，不解引用。
+    pub limine_address: u64,
+    pub width: u64,
+    pub height: u64,
+    pub pitch: u64,
+    pub bpp: u16,
+    pub memory_model: u8,
+    /// 红、绿、蓝各自的 (size, shift)
+    pub masks: [(u8, u8); 3],
+}
+
+/// 读第 0 个 framebuffer 的几何；一个都没有（或指针为空）返回 None。
+///
+/// **为什么不把 `address` 交出去当指针**：那是 bootloader 在它自己页表里的映射，
+/// 而本内核在 `mm::take_over` 里换掉了 CR3 ⇒ 那个地址在我们的页表里不保证存在。
+/// 可写窗口由 `frame` 模块拿 memmap 里 `MemmapType::Framebuffer` 那段**物理区间**
+/// 经 `mm::map_mmio`（UC、不缓存）自己开；两个地址到底什么关系，由调用方**实测对账**，
+/// 不当公理（这一片就是要把"Limine 给了就能直接用"这句话证真或证伪）。
+#[cfg(feature = "framebuffer")]
+pub fn framebuffer() -> Option<FbInfo> {
+    let r = FRAMEBUFFER.get()?;
+    // 上界 64：count 来自启动信息，是不可信输入；下面只取第 0 条，
+    // 但先把荒谬值挡掉，免得将来有人改成遍历时无界。
+    if r.framebuffer_count == 0 || r.framebuffer_count > 64 {
+        return None;
+    }
+    let base = r.framebuffers.load(Ordering::Relaxed).cast_const();
+    if base.is_null() {
+        return None;
+    }
+    // SAFETY: 上面已判数组指针非空且条目数在界内；数组由 bootloader 在移交控制权前写好
+    let fb: *const Framebuffer = unsafe { *base };
+    if fb.is_null() {
+        return None;
+    }
+    // SAFETY: 上一条已判非空；它指向协议规定的 repr(C) 结构，响应一经提供在内核生命周期内稳定
+    let f = unsafe { &*fb };
+    Some(FbInfo {
+        count: r.framebuffer_count,
+        limine_address: f.address.load(Ordering::Relaxed) as u64,
+        width: f.width,
+        height: f.height,
+        pitch: f.pitch,
+        bpp: f.bpp,
+        memory_model: f.memory_model,
+        masks: [
+            (f.red_mask_size, f.red_mask_shift),
+            (f.green_mask_size, f.green_mask_shift),
+            (f.blue_mask_size, f.blue_mask_shift),
+        ],
+    })
+}
+
+#[cfg(feature = "framebuffer")]
+/// HHDM 偏移；请求没被满足时返回 0（调用方据此判"对账不成立"而不是拿 0 去加）。
+pub fn hhdm_offset() -> u64 {
+    HHDM.get().map_or(0, |h| h.offset)
+}
+
+/// memmap 里 `Framebuffer` 类型的那段物理区间（取第一条）。
+#[cfg(feature = "framebuffer")]
+pub fn framebuffer_memmap() -> Option<(u64, u64)> {
+    let m = MEMMAP.get()?;
+    if m.entry_count == 0 || m.entry_count > 4096 {
+        return None;
+    }
+    // SAFETY: 与 collect() 同一前置（条目数已判在界内），指向协议规定的条目指针数组
+    let entries = unsafe { memmap_slice(m) };
+    for e in entries {
+        // SAFETY: 条目指针由 bootloader 提供；collect() 已经在按同样方式读这张表
+        let Some(e) = (unsafe { e.as_ref() }) else { continue };
+        if MemmapType::from_raw(e.kind) == MemmapType::Framebuffer {
+            return Some((e.base, e.length));
+        }
+    }
+    None
 }

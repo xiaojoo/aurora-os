@@ -10080,6 +10080,91 @@ q2: 判据不成立 cap=true full=true peak=false done=true rollback=true baseli
 `run_serial_rx` 调用点缺必填实参（§236 五）、`t_q2` 峰值判据抖动（本节四）、阻塞读/唤醒、
 S6 framebuffer + PS/2。本轮没有跑完整 `test` 矩阵、bench、长稳或真机。
 
+## 240. **S6a 落地：显示子系统第一刀——帧缓冲按物理区间自己映射，画面第一次有了宿主机侧的像素证人**（2026-11-13，实测）
+
+### 一、先把一条旧账证伪
+
+§229 二写路线依据时说的是"**Limine 已给 framebuffer**"。勘察发现这句话在代码里**不成立**：
+`limine.rs` 只声明了 BOOTLOADER_INFO / HHDM / MEMMAP / RSDP / MP 五个请求，
+`LIMINE_FRAMEBUFFER_REQUEST_ID`（协议头 `.tools/limine-protocol/include/limine.h:158` 里现成摆着）
+**从来没被登记过**，`boot/limine.conf` 也没有任何 `video_mode`。⇒ 本片先把它变成代码，再谈结论。
+
+### 二、这条路线的核心是一个**实测反直觉**的数
+
+声明请求之后（run-973 起，`framebuffer` 档）：
+
+```text
+frame: 几何 宽=1280 高=800 pitch=5120 bpp=32 掩码=红(8,16) 绿(8,8) 蓝(8,0)
+frame: 地址 memmap基址=0x80000000 长度=0x3e8000 limine=0xffff800080000000
+       我们的窗口=0xffff800020560000 limine==HHDM+pa=true  在我们页表里映着=false
+```
+
+**`limine==HHDM+pa=true` 但 `在我们页表里映着=false`**：Limine 给的那个地址数值上就是 HHDM 别名，
+可它在**我们换过 CR3 之后的那棵树里没有映射**（HHDM 只覆盖到 RAM 顶 512 MiB，帧缓冲在 2 GiB）。
+照"Limine 给了就能直接用"去写第一个像素就会 #PF。⇒ 可写窗口必须由
+memmap 里 `MemmapType::Framebuffer` 那段**物理区间**经 `hw::MmioRegion`（`mm::map_mmio`，DEVICE ⇒ UC）自己开。
+`limine::framebuffer()` 因此**只返回纯数值摘要**（`FbInfo`），刻意不把指针交出去。
+
+**这一格是问页表要的答案，不是 deref 试出来的**——§236 记过顺叶子 deref 把内核打挂的现场（run-943）。
+
+### 三、画面判据：内核读回**永远证不了**设备显示了什么
+
+夹具 `build/s6a-screen-dump.py`：QMP `screendump` 取 PPM，按**串口报的几何**独立算采样点、独立解像素，
+另配一格**反空转**（在绿带位置问"是不是红色"必须**不等**，否则"四点全对"可能只是没在比颜色）。
+
+| 观测 | 正常态（run 至判定=PASS） | 变异态（把 `pack()` 通道序反转） |
+|---|---|---|
+| 内核写后读回 | `读回不符点数=0` | `读回不符点数=0`（**仍然绿**） |
+| 宿主机 PPM 采样 | 黑/红/绿/蓝四点逐位相同、尺寸 1280×800 一致 | 下左红 `期望=ff0000 实际=ff00ff`、下右蓝 `期望=0000ff 实际=ff0000` ⇒ **FAIL** |
+
+⇒ 这条负样本不是"造错→变红"的例行公事，它**量出了一条判据的能力边界**：读写共用同一个错公式时，
+核内自证永远通过，只有第二台仪器看得见。变异已撤，撤后复测四点逐位相同。
+
+### 四、顺带修掉一个不会让任何判据变红的真实缺陷
+
+`pack()` 原来没把通道**掩到 8 位**（`channel` 是 `rgb >> k`，高位还留着别的通道）。
+在这块 8/8/8 的屏上"不掩"恰好也得对——每个字段写进去的是原值的高位前缀，OR 起来仍是原值
+（实测四点逐位相同可佐证）；但换 5/6/5 的面板就会串色，而**串色不会让任何判据变红**。已补 `& 0xFF` 并把这段理由写进注释。
+
+### 五、为什么整个特性连"请求"本身都要门控
+
+`#[cfg(feature = "framebuffer")]` 挡住了 limine.rs 里的结构、请求声明、静态与两个访问器。
+理由：请求一旦声明，引导器就**必须**提供帧缓冲 ⇒ 给所有既有变体新增一条"引导可能失败"的依赖，
+而既有变体的启动行为是已实测的结论。**代价与判据口径**：新增约 150 行会移动行号（调试信息与 panic 位置内嵌行号），
+所以**默认档 ELF 哈希必然变化**（HEAD 的 `9162862fca2d` → `72f42837426d`），
+**不能拿哈希当"默认档没变"的证人**。改用的证人是串口日志逐行归一化对比：
+run-971（HEAD）与 run-974（本改动）均 **880 行、内容相同**、`判定=PASS`、ktests 82/82，
+唯一差异是启动状态区在轮换（`槽=2 seq=3` vs `槽=1 seq=2`）——那是既有的轮转槽行为，不是回归。
+⇒ **口径更正**：§236/§237 用的"同哈希复现"只在**没有行号移动**时可用；有行号移动时它必然失效，不要误当成回归。
+
+### 六、结构落点与门禁连锁
+
+- 新文件 `kernel/src/frame.rs`：**零 unsafe**（像素写入全走 `MmioRegion` 的带检查访问器，越界**返回错误不夹边界**）。
+- 新增 unsafe 全集中在"读启动信息"这一层：`limine.rs` 4 处 U2 ⇒ 白名单 `limine U2=14`、
+  普查总计 **409**（U1 75 · U2 108 · U3 13 · U4 131 · U5 46 · U6 36）。
+- `frame` 先挂进 `pci` 逻辑模块**被证明是错的**：它不是 PCI 设备，挂进去会新增 `pci->boot` 边，
+  并把 `pci->memory` 的环内引用从 9 顶到 12（ADR-044 棘轮只许减）⇒ 改为新开 **`display` 逻辑模块**，
+  `dependencies = ["boot","memory","pci"]`、`allowed_callers`/`memory`/`pci` 三处随之补齐。
+- 接口变更登记：`frame::Frame`、`frame::FrameError`（display）与
+  `limine::FbInfo`、`limine::framebuffer`、`limine::framebuffer_memmap`、`limine::hhdm_offset`（boot）。
+- `check` **17/17**。行尾按家族核过：`limine.rs`/`main.rs`/`frame.rs`/`kernel/Cargo.toml`/`BACKLOG`/白名单/普查 **CRLF**，
+  `module-interfaces.toml` 与 **ADR-083** 为 **LF**（我第一版脚本把 `
+` 注进了 module-interfaces，
+  按家族强制规范化才纠正过来——**改文件前先量它是哪个家族**这条又要重申一遍）。
+
+### 七、本片**没有**做 / 仍开着
+
+- **没有字体、没有 fbcon、没有键盘**：画面目前只有一张测试图案。S6b（字体 + 滚动 + 日志镜像）、S6c（PS/2）未开始。
+- **没有 durable 矩阵行**：`framebuffer` 不在判定表里，像素判据目前只活在一次性夹具里。
+- **S6b 的先决问题**：图案一旦被第二次写入就没有"静止可取"的时刻，PPM 会与串口输出抢时间 ⇒
+  要先把"冻结带 / 到此不再镜像"的契约定下来（已记进 ADR-083 未决 1）。
+- **S6c 的取证接线要避开已知坏格子**：QMP `sendkey` 是自然的键盘注入通道，但 §235 记的
+  "serial-rx-probe 与 QMP 组合被拒"与 §237 记的"resident 产物 × socket chardev 间歇挂"都还没解决。
+- 非 8/8/8 面板、非 32bpp、多帧缓冲（`count>1`）一律**明确拒绝**，没有真实硬件实测。
+- 裁决记录：键盘进用户态**复用 21 号 `console_read`**（零新 syscall 号），
+  `console_read` 的输入源语义由"只有串口"变为"串口或键盘"——变更点写在 ADR-083 决策 5。
+- 本轮没有跑完整 `test` 矩阵、bench、长稳或真机。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

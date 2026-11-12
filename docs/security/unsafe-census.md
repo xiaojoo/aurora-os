@@ -1,6 +1,6 @@
 # unsafe 逐处审计表（U1–U6）
 
-总计 405 处。U1 75 · U2 104 · U3 13 · U4 131 · U5 46 · U6 36
+总计 409 处。U1 75 · U2 108 · U3 13 · U4 131 · U5 46 · U6 36
 
 本表由 `tools/aurora.py` 的 `unsafe_sites()` 从源码逐处生成，**不是手写的**。
 机器可读的权威来源是 `docs/security/unsafe-whitelist.toml` 的 `[modules.*]` 段（模块×类别→处数），
@@ -444,6 +444,14 @@
 - `kernel/src/limine.rs:391` [{] **U2** fn=`collect`
   > let mmap_entries = unsafe { memmap_slice(memmap) }; Some(BootInfo { hhdm_offset: hhdm.offset, mmap_entries, rsdp, bootloader_name, mp }) } 
 
+- `kernel/src/limine.rs:484` [{] **U2** fn=`framebuffer`
+  > let fb: *const Framebuffer = unsafe { *base };
+- `kernel/src/limine.rs:489` [{] **U2** fn=`framebuffer`
+  > let f = unsafe { &*fb };
+- `kernel/src/limine.rs:520` [{] **U2** fn=`framebuffer_memmap`
+  > let entries = unsafe { memmap_slice(m) };
+- `kernel/src/limine.rs:523` [{] **U2** fn=`framebuffer_memmap`
+  > let Some(e) = (unsafe { e.as_ref() }) else { continue };
 ### main
 
 - `kernel/src/main.rs:71` [impl] **U4** fn=`—`
