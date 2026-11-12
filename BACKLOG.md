@@ -9679,6 +9679,40 @@ StartupInfo 回填都长在 syscall 层；产品路径走同一条 ABI 才是"�
 - **`handles` 仍是可选特性**，默认档不走句柄路径；把它变成默认是 W5 的后续决定。
 - 仍开着：S4c（`MAX_TASKS` 余量）、S4a/S4b-1/S4b-2 负样本、S5 串口 shell、S6 framebuffer+PS/2。
 
+## 234. S4c 判定为**不阻塞**；S5 勘察：**串口只有输出、syscall 表没有控制台 I/O** ⇒ 要新增 syscall 号，按 AGENTS 停下来问（2026-11-12，只读勘察）
+
+### 一、S4c（`MAX_TASKS` 余量）**不阻塞 S5**
+
+`t_q2_workload_slots`（`ktests/sched.rs:1975`）**已经动态量占用**：
+`slots_used0` = 本 CPU 非 Free 的格数，注释明写"有效容量 = MAX_TASKS − 先占"。
+而 init/shell 都在 **ktests 之后**才起 ⇒ 用例跑的时候没有常驻 init ⇒ **不影响判据**。
+⇒ **S4c 可以推后**，不必先做。（真要常驻 init 与用例共存时再重算。）
+
+### 二、S5（串口 shell）的三个前置缺口（都已核）
+
+1. **串口驱动只有输出**：`serial.rs` 的 pub API 是 `out8/in8/bytes_out/recent_tail/ring_total/
+   init/is_ready/line_stats/line` 等，**没有读字节的入口**；`LSR_DATA = 0x01` 常量在，
+   但没人用它做 RX。⇒ 要加 **RX**（轮询 `LSR.DATA_READY` + 读 RBR，或中断驱动 + 环形缓冲）。
+2. **syscall 表里没有控制台 I/O**：现有号是 1 ping / 3 exit / 4 peek / 5 peek_buf / 6 poke_buf /
+   7 abi_info / 8-9 handle close·dup / 10 file_read / 11 process_create / 12-13 vmo create·write /
+   14 aspace_map / 15 thread_create / 16 process_start / 17 process_wait / 18 process_kill /
+   19 object_wait。**用户程序今天没有任何办法写串口或读输入**。
+3. **没有 shell 产物**：`user/` 下只有 `hello` 与 `probe`。
+
+### 三、**为什么停在这里**
+
+AGENTS 工作协议明写"**要新增 syscall 号**…停下来问"。S5 至少要两个新号
+（控制台写、控制台读），且要定它们的形状：
+- **裸 syscall**（`console_write(buf,len)` / `console_read(buf,len)`）——最快，但绕过 capability；
+- **控制台句柄对象**（`ObjRef::Console`，经 `grant_*` 授予，读写走句柄）——与"权限只从句柄来"一致，
+  但要扩句柄种类与 `StartupInfo` 的 SELF_* 角色。
+**这是设计裁决，不是实现细节**，所以本轮只勘察不动手。
+
+### 四、本轮状态
+
+**只读勘察、零代码改动**；`check` 沿用 §233 的 17/17。
+下一步取决于裁决：选裸 syscall 则 S5 可以很快出第一版；选句柄对象则要先扩 handle 种类。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。
