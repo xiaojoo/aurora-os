@@ -181,12 +181,48 @@ ADR-070 A4"同一 VA 在两棵树里各自映射"由此在用户缓冲这条路�
 - 不动 `run_serial_rx`（另一路在飞）；交互判据暂时只活在一次性夹具里，durable 矩阵行仍欠。
 - 阻塞读/唤醒不做：shell 目前是忙等（没有 yield syscall 可用）。
 
+## 补记（2026-11-12）：S5d —— init 真常驻，停机时机改由 init 决定
+
+### 1. 决策：判定之后**不退出**，等到 init 收工才 `debug-exit`
+
+`resident-init = ["handles"]` 一档新增 `park_until_init_exits()`，位置在 `verdict:` 与
+`exit::finish` 之间。这一档实测（run-954）：横幅在、`verdict: PASS` 在、**`qemu-exit=` 不在**，
+串口停在 `resident-init: 判定已出，等 init（任务=2）收工` 上，宿主超时读到 `HANG(-1)`——
+**这里 `-1` 是"没人喂命令所以不退"的证人，不是失败**。
+
+### 2. 常驻必须是独立一档，不能并进 `handles`
+
+判定表里 `do_run(["handles"])` 那一行（探针 ELF 几何对账）从不往串口喂命令。init 一常驻，
+那一行就变成 HANG(-1) ⇒ "常驻"这个语义只在有人喂的档里成立，所以它要自己的特性名。
+
+### 3. 停机时机用"有界轮询"，不新开无限等待
+
+复用 `wait_for_task(gidx, window_cycles(64))` 循环。理由：`wait_for_task` 每次自己登记、
+每条出口都 `task_wait_take` 取回，循环调用不残留注册；无限等待要动 `sched` 的等待语义
+（硬约束①）。附带好处：轮询对"跨 CPU 收工唤醒只置标志、不发 IPI"天然免疫。
+
+### 4. **日志契约一字未动**
+
+`stage_init_user` 里 32 窗口的"跑过一眼"保留，`等待收工=` 与 `init-user(S4b-2)` 整行
+与 §236 的 run-951 逐字节相同（run-956 实测）。非常驻档的函数体整体不存在（`#[cfg]` 不是 `cfg!`）。
+
+### 5. 这一片**没有证到**的事（不写成已交付）
+
+- **"init 收工 ⇒ 系统停机"完全没有证人**：产品路径里没有任何入口能让 init 在无输入时退出。
+- 判据②（喂到 `exit` 才停机、`verdict < bye < qemu-exit`）**未测到**：四次 socket 夹具尝试
+  全部在 ktests 中途静默，且静默点会移动（`copy:` 收尾区 ×3、`elfload:` 0x156 ×1）。
+  同一夹具下 `handles` 与 `handles,console-probe` 都跑完、同一份 resident 产物换文件后端也跑完
+  ⇒ 坏的是"resident 产物 × socket chardev"这一格的**时序**，按裁决记为已知间歇挂、本轮不追。
+  两条对应变异因此**未做**。
+- 量具已先自检：静默 115 s 期间 reader 活、QEMU 活、连接未关 ⇒ 是内核不说话，不是宿主不收了。
+
 ## 未决
 
 1. **S4b 的句柄授予形状**：init 的句柄由谁授予、`StartupInfo` 怎么回填（ADR-075 决策 3）。
 2. **S4c 的 `MAX_TASKS` 余量**：init 常驻占一格后，ktest 的 spawn 炸弹判据与三本账要重算。
 3. ~~**init 该不该收工**：本片让它常驻自旋；S5 的 shell 才是真正常驻交互程序，届时 hello 要不要换成 shell。~~
-   **已决（S5c-2）**：`handles` 档换成 shell，收到 `exit` 才收工；默认档仍是 hello（没有控制台句柄可授）。
-   仍开：**常驻 init 在 `stage_init_user` 返回之后的存活未验证**——内核紧接着就 `debug-exit`，
-   要让它真常驻，得先决定"判定之后退不退出"，那是下一片的事。
+   **已决（S5c-2 + S5d）**：`handles` 档换成 shell，收到 `exit` 才收工；默认档仍是 hello（没有控制台句柄可授）。
+   S5d 把停机时机交给 init——`resident-init` 档在判定之后 `park_until_init_exits`，实测"不退"这一半（run-954）。
+   仍开：**"init 收工才停机"那一半没有证人**（产品路径没有无输入的退出入口），
+   以及判据②的驱动测量卡在 socket 夹具那一格的已知间歇挂上（见上一节 5）。
 4. **本片没有负样本**（见验收），要补。

@@ -794,7 +794,8 @@ fn run_ktests_and_finish() -> ! {
 
     // S4a（W5 第一片，BACKLOG §229）：产品路径**真起 ring3**。放在判定之前、ktests 之后，
     // 这样用例读数不受影响，而 hello 的输出能进同一份串口。
-    stage_init_user();
+    // S5d：接住 init 的任务号——判定之后要不要等它，由 `park_until_init_exits` 说。
+    let init_task = stage_init_user();
 
     // 判定必须同时满足：表可用且非空、无失败、异常确实被取到过、且 P3 的量具真的收到过样本
     let clean = !s.table_invalid
@@ -804,10 +805,44 @@ fn run_ktests_and_finish() -> ! {
         && ruler_ok;
     if clean {
         crate::log_info!("verdict: PASS");
+        park_until_init_exits(init_task);
         exit::finish(exit::Code::Success);
     }
     crate::log_warn!("verdict: FAIL");
+    park_until_init_exits(init_task);
     exit::finish(exit::Code::Failed)
+}
+
+/// S5d（W5，BACKLOG §237）：`resident-init` 档在判定**打完之后不退出**，一直等到 init 自己收工
+/// 才走 `debug-exit`。判定行的位置一字不动 ⇒ 日志契约不变，改的只有"什么时候停机"。
+///
+/// **为什么是"有界轮询"而不是一个新的无限等待**：`wait_for_task` 每一次自己登记槽、
+/// 每条出口都 `task_wait_take` 取回（sched.rs 里那三条返回路径都是这个形状），
+/// 所以循环调用不残留注册；而无限等待要动 sched 的等待语义——硬约束①不许顺手改的东西。
+/// 顺带一条：轮询对"跨 CPU 的收工唤醒只置标志、不发 IPI"这种情形天然免疫，
+/// init 落在哪颗 CPU 上都能推进。
+///
+/// 非常驻档这个函数体整体不存在（`#[cfg]` 不是 `cfg!`）⇒ 默认档与 `handles` 档产物逐字节不变，
+/// 判定表里 `do_run(["handles"])` 那一行更不会受影响。
+fn park_until_init_exits(init: Option<usize>) {
+    #[cfg(feature = "resident-init")]
+    {
+        let Some(gidx) = init else { return };
+        crate::log_info!("resident-init: 判定已出，等 init（任务={}）收工；没人喂命令就不会退出", gidx);
+        loop {
+            // 每轮 64 窗口（约 1 s）。这中间 init 是唯一还在干的活：它读控制台，
+            // 收到 `exit` 才 SYS_EXIT，于是这里下一轮就看到 Done。
+            let woke = apic::with_interrupts(|| sched::wait_for_task(gidx, crate::clock::window_cycles(64)));
+            if woke {
+                crate::log_info!("resident-init: init 已收工 ⇒ 系统停机");
+                return;
+            }
+        }
+    }
+    #[cfg(not(feature = "resident-init"))]
+    {
+        let _ = init;
+    }
 }
 
 
@@ -821,19 +856,19 @@ fn run_ktests_and_finish() -> ! {
 /// 装载产物用与 ktest 同源的嵌入式夹具（`ktests::common::HELLO_ELF`），
 /// 从卷上取 ELF 那条路已在 L3-C 交付，这里不重做。
 #[cfg(not(feature = "handles"))]
-fn stage_init_user() {
+fn stage_init_user() -> Option<usize> {
     let loaded = match crate::user::load(crate::ktests::common::HELLO_ELF) {
         Ok(l) => l,
         Err(e) => {
             crate::log_warn!("init-user: 装载失败 —— {} ⇒ 产品路径没起用户程序", crate::user::describe_load(e));
-            return;
+            return None;
         }
     };
     let t = match sched::spawn_user(loaded.entry, loaded.stack_top, 0, loaded.owned) {
         Ok(t) => t,
         Err(e) => {
             crate::log_warn!("init-user: spawn_user 失败 {:?} ⇒ 产品路径没起用户程序", e);
-            return;
+            return None;
         }
     };
     // 用户态要靠时间片轮转才跑得到；表若停着就先开（与用例同一律）。
@@ -849,10 +884,12 @@ fn stage_init_user() {
         "init-user: 产品路径起 ring3 任务={} entry={:#x} 栈顶={:#x} 段={} 页={} 等待收工={} 信箱 magic={:?} ping={:?} add={:?}",
         t, loaded.entry, loaded.stack_top, loaded.segs, loaded.pages, done, magic, ping, add
     );
+    // S5d：默认档没有控制台句柄可授，谈不上常驻 ⇒ 交回 None。
+    None
 }
 
 #[cfg(feature = "handles")]
-fn stage_init_user() {
+fn stage_init_user() -> Option<usize> {
     use crate::arch::x86_64::trap::TrapFrame;
     use crate::handle::{self, Handle, RIGHT_CREATE, RIGHT_DUP, RIGHT_MAP, RIGHT_READ, RIGHT_TRANSFER, RIGHT_WRITE};
     use crate::user::{
@@ -864,7 +901,7 @@ fn stage_init_user() {
 
     let Some(owner) = sched::current_identity() else {
         crate::log_warn!("init-user: 启动上下文没有身份 ⇒ 产品路径没起用户程序");
-        return;
+        return None;
     };
     let mut f = TrapFrame {
         cr2: 0, r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
@@ -873,14 +910,14 @@ fn stage_init_user() {
     };
     // 根 Job 由内核持有，只在这里出示。两个句柄：一个**没有 CREATE**（判据用），一个有。
     let job = match proc::job_create(None, 2, 64) { Ok(v) => v, Err(e) => {
-        crate::log_warn!("init-user: job_create 失败 {:?}", e); return;
+        crate::log_warn!("init-user: job_create 失败 {:?}", e); return None;
     } };
     let jgen = proc::job_gen(job).unwrap_or(0);
     let hj_plain = match handle::grant_job(owner, job, jgen, RIGHT_READ | RIGHT_DUP) {
-        Ok(h) => h, Err(_) => { crate::log_warn!("init-user: grant_job(plain) 失败"); return; }
+        Ok(h) => h, Err(_) => { crate::log_warn!("init-user: grant_job(plain) 失败"); return None; }
     };
     let hj = match handle::grant_job(owner, job, jgen, RIGHT_READ | RIGHT_DUP | RIGHT_CREATE | RIGHT_TRANSFER) {
-        Ok(h) => h, Err(_) => { crate::log_warn!("init-user: grant_job(create) 失败"); return; }
+        Ok(h) => h, Err(_) => { crate::log_warn!("init-user: grant_job(create) 失败"); return None; }
     };
     // **判据①：无 CREATE 权限的 Job 句柄必须拒 E_DENIED**（权限只从句柄来）。
     f.rax = SYS_PROCESS_CREATE; f.rdi = hj_plain.0; f.rsi = 0; f.rdx = 0; f.r10 = 0;
@@ -891,10 +928,10 @@ fn stage_init_user() {
     let hp = Handle(f.rax);
     let (pid, pgen) = match handle::resolve(hp, owner, 0) {
         Ok((handle::ObjRef::Proc { slot, gen }, _)) => (slot, gen),
-        _ => { crate::log_warn!("init-user: Proc 句柄解不开 ret={:#x}", f.rax); return; }
+        _ => { crate::log_warn!("init-user: Proc 句柄解不开 ret={:#x}", f.rax); return None; }
     };
     let Some((aslot, _)) = proc::proc_aspace(pid, pgen) else {
-        crate::log_warn!("init-user: 进程没有 AS"); return;
+        crate::log_warn!("init-user: 进程没有 AS"); return None;
     };
     // S4b-1 的装载器：真 ELF 进**子 AS**，映射经 aspace_map_slot（那棵树）。
     // S5c：装的是 shell 而不是 hello——控制台句柄已经在下面按 ROLE_LOG 授予，
@@ -902,30 +939,30 @@ fn stage_init_user() {
     // 因为那条路没有控制台句柄可授，shell 进去只会 exit(1)。
     let loaded = match crate::user::load_into(aslot, crate::ktests::common::SHELL_ELF) {
         Ok(l) => l,
-        Err(e) => { crate::log_warn!("init-user: load_into 失败 {}", crate::user::describe_load(e)); return; }
+        Err(e) => { crate::log_warn!("init-user: load_into 失败 {}", crate::user::describe_load(e)); return None; }
     };
     // 装载器把映射柄**交回调用方**而不是自动入袋（用例要能自己丢弃并核账）。不归创建者，
     // 这一袋就在本函数返回时落地 ⇒ 子进程的代码/栈被解映射。归了创建者，16 号的
     // `adopt_asmaps` 才搬得动：它只搬"创建者袋里目标 AS = 子 AS"的那些项。
     let owned_n = match loaded.owned.into_current() {
         Ok(n) => n,
-        Err(e) => { crate::log_warn!("init-user: 映射归创建者失败 {:?}", e); return; }
+        Err(e) => { crate::log_warn!("init-user: 映射归创建者失败 {:?}", e); return None; }
     };
     let Some(madt) = acpi::summary().and_then(|s| s.madt) else {
-        crate::log_warn!("init-user: 没有 MADT，控制台未授予"); return;
+        crate::log_warn!("init-user: 没有 MADT，控制台未授予"); return None;
     };
     if let Err(e) = serial::enable_rx(&madt) {
-        crate::log_warn!("init-user: 控制台接收初始化失败 {:?}", e); return;
+        crate::log_warn!("init-user: 控制台接收初始化失败 {:?}", e); return None;
     }
     let console = match handle::grant_console(owner, RIGHT_READ | RIGHT_WRITE | RIGHT_DUP | RIGHT_TRANSFER) {
-        Ok(h) => h, Err(e) => { crate::log_warn!("init-user: 控制台授予失败 {:?}", e); return; }
+        Ok(h) => h, Err(e) => { crate::log_warn!("init-user: 控制台授予失败 {:?}", e); return None; }
     };
     let foreign = if cfg!(feature = "console-probe") {
         match handle::grant_console(owner, RIGHT_READ | RIGHT_WRITE) {
-            Ok(h) => h.0, Err(e) => { crate::log_warn!("init-user: 控制台反例句柄失败 {:?}", e); return; }
+            Ok(h) => h.0, Err(e) => { crate::log_warn!("init-user: 控制台反例句柄失败 {:?}", e); return None; }
         }
     } else { 0 };
-    let si = match vmo::vmo_create(1) { Ok(v) => v, Err(_) => { crate::log_warn!("init-user: si vmo 失败"); return; } };
+    let si = match vmo::vmo_create(1) { Ok(v) => v, Err(_) => { crate::log_warn!("init-user: si vmo 失败"); return None; } };
     let mut hdr = [0u8; SI_OFF_HANDLES];
     hdr[0..4].copy_from_slice(&SI_MAGIC.to_le_bytes());
     hdr[4..6].copy_from_slice(&(ABI_MAJOR as u16).to_le_bytes());
@@ -935,21 +972,21 @@ fn stage_init_user() {
         hdr[12..16].copy_from_slice(&512u32.to_le_bytes());
         hdr[16..20].copy_from_slice(&8u32.to_le_bytes());
     }
-    if vmo::vmo_write(si, 0, &hdr) != Ok(hdr.len()) { crate::log_warn!("init-user: si 头写失败"); return; }
+    if vmo::vmo_write(si, 0, &hdr) != Ok(hdr.len()) { crate::log_warn!("init-user: si 头写失败"); return None; }
     let mut d = [0u8; SI_DESC_BYTES];
     d[SI_DESC_ROLE..SI_DESC_ROLE + 4].copy_from_slice(&ROLE_JOB.to_le_bytes());
     d[SI_DESC_HANDLE..SI_DESC_HANDLE + 8].copy_from_slice(&hj.0.to_le_bytes());
-    if vmo::vmo_write(si, SI_OFF_HANDLES, &d) != Ok(SI_DESC_BYTES) { crate::log_warn!("init-user: si 描述写失败"); return; }
+    if vmo::vmo_write(si, SI_OFF_HANDLES, &d) != Ok(SI_DESC_BYTES) { crate::log_warn!("init-user: si 描述写失败"); return None; }
     d[SI_DESC_ROLE..SI_DESC_ROLE + 4].copy_from_slice(&ROLE_LOG.to_le_bytes());
     d[SI_DESC_HANDLE..SI_DESC_HANDLE + 8].copy_from_slice(&console.0.to_le_bytes());
     if vmo::vmo_write(si, SI_OFF_HANDLES + SI_DESC_BYTES, &d) != Ok(SI_DESC_BYTES) {
-        crate::log_warn!("init-user: 控制台描述写失败"); return;
+        crate::log_warn!("init-user: 控制台描述写失败"); return None;
     }
     if cfg!(feature = "console-probe") && vmo::vmo_write(si, 512, &foreign.to_le_bytes()) != Ok(8) {
-        crate::log_warn!("init-user: 控制台探针参数写失败"); return;
+        crate::log_warn!("init-user: 控制台探针参数写失败"); return None;
     }
     let hi = match handle::grant_vmo(owner, si, RIGHT_READ | RIGHT_WRITE | RIGHT_MAP) {
-        Ok(h) => h, Err(_) => { crate::log_warn!("init-user: grant_vmo(si) 失败"); return; }
+        Ok(h) => h, Err(_) => { crate::log_warn!("init-user: grant_vmo(si) 失败"); return None; }
     };
     vmo::vmo_unref(si);
     // si 页也要经 14 号铺进子 AS（rdx = Proc 句柄别名）。
@@ -973,7 +1010,7 @@ fn stage_init_user() {
     let ht = Handle(f.rax);
     let (gidx, _tid) = match handle::resolve(ht, owner, 0) {
         Ok((handle::ObjRef::Thread { gidx, id }, _)) => (gidx, id),
-        _ => { crate::log_warn!("init-user: Thread 句柄解不开 ret={:#x}", f.rax); return; }
+        _ => { crate::log_warn!("init-user: Thread 句柄解不开 ret={:#x}", f.rax); return None; }
     };
     let stopped = matches!(sched::state_of(gidx), sched::TaskState::Blocked(_));
     // 16：回填 StartupInfo 并放行。
@@ -1000,6 +1037,9 @@ fn stage_init_user() {
         denied, hp.0, aslot, sched::aspace_of(gidx), loaded.entry, loaded.stack_top,
         loaded.segs, loaded.pages, owned_n, sched::owned_of(gidx), stopped, started, runs, done, si_va
     );
+
+    // S5d：交回 init 的任务号，让 main 在**判定打完之后**等它收工（BACKLOG §237）。
+    Some(gidx)
 }
 
 /// 用页表本身找一个确定未映射的页：先问 `mm::is_mapped`，不再靠区间算术推断。

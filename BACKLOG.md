@@ -9898,6 +9898,73 @@ run-949 把这一点直接演示了出来（变异态下 `等待收工=true` 而
   常驻 init 在返回后的存活、S6 framebuffer + PS/2。
 - 本轮**没有**跑完整 `test` 矩阵、bench、长稳或真机；不引用跨轮耗时/串口字节差作性能结论。
 
+## 237. S5d：`resident-init` 档落地——判定打完**不退出**、init 收工才停机；判据①实测绿，判据②**没测到**（卡在已知间歇挂这一格）（2026-11-12，实测）
+
+### 一、做了什么
+
+- 新特性 `resident-init = ["handles"]`（`kernel/Cargo.toml`）。**为什么不并进 `handles`**：判定表里
+  `do_run(["handles"])` 那一行（探针 ELF 几何对账，`tools/aurora.py:7301`）从不往串口喂命令，
+  init 一常驻它就挂成 HANG(-1) ⇒ 常驻只在"有人喂"的档里成立，那就必须是单独一档。
+- `stage_init_user()` 两个分支都改成返回 `Option<usize>`（init 的任务号），21 处 `return;` → `return None;`。
+- 新增 `park_until_init_exits()`，位置在 **`verdict:` 之后、`exit::finish` 之前**，只在
+  `resident-init` 下有函数体：`wait_for_task(gidx, window_cycles(64))` 有界轮询直到 init 收工（约 1 s/轮）。
+  **为什么不写一个无限等待**：`wait_for_task` 每次自己登记槽、每条出口都 `task_wait_take` 取回，
+  所以循环调用不残留注册；而无限等待要动 `sched` 的等待语义（硬约束①）。附带好处：
+  轮询对"跨 CPU 的收工唤醒只置标志、不发 IPI"这种情形天然免疫，init 落在哪颗 CPU 都能推进。
+- **`等待收工=` 那一格一字未动**：stage_init_user 里 32 窗口的"跑过一眼"仍然保留。
+  ⇒ 日志契约不变，改的只有"什么时候停机"。
+
+### 二、判据①（判定之后不退出）**实测绿**
+
+run-954（`handles,resident-init`，elf `0ffc39a59bdb`，`run --timeout 20`，文件日志后端）：
+横幅 `Aurora shell (S5c)` 在、`verdict: PASS` 在、**`qemu-exit=` 不在**；串口最后一行是
+`[info] 0x0000037c resident-init: 判定已出，等 init（任务=2）收工；没人喂命令就不会退出`；
+`判定=HANG qemu_rc=-1`（这**正是**"没人喂就不退出"的形状，不是失败），ktests **89/89**。
+⇒ "打完判定还活着"这一格有证人。
+
+### 三、判据②（喂到 `exit` 才停机，且 `verdict < bye < qemu-exit`）**没测到**
+
+`build/s5c-shell-drive.py` 已推广成两档共用：常驻档把就绪标记换成 `resident-init: 判定已出`，
+于是整段交互**按构造**发生在判定之后。四次尝试全部在 ktests 中途静默：
+
+| 采样 | 档位 | 静默点 | 结果 |
+|---|---|---|---|
+| 1 | `handles,resident-init` | `copy: 三条里恢复计数=0` 之后 | 0/6，rc=-1 |
+| 2 | 同上 | 同一行 | 0/6，rc=-1 |
+| 3 | 同上 + `console-probe` | 同一行（序号 0x358） | 0/6，rc=-1 |
+| 4 | 同上，**不喂任何命令只观察** | `0x156 elfload: magic=…` | 115 s 零字节 |
+
+**量具先自检过再下结论**（`build/s5d-rx-watchdog.py`：不喂命令，只报三路状态）。静默 115 s 期间
+`reader活=True qemu活=True`、连接未关、`recv` 只超时不返回空 ⇒ 是**内核侧不说话**，不是宿主不收了。
+这条必须先证：常驻档**本来就不会自己退出**，`rc=-1` 是预期值，所以"退出码 -1"**分不开**
+"内核挂死"与"reader 死了"——只看退码就会把量具的故障读成被测物的故障。
+
+**为什么不归因于常驻逻辑**：`park_until_init_exits` 的函数体在 ktests **之后**才执行，而静默发生在
+ktests **中间**；且第 4 次的静默点从 `copy:` 区跳到了 `elfload:`（0x156），**位置会动**
+⇒ 形状是时序敏感的已知间歇挂，不是某个固定代码缺陷。另两格作对照都是绿的：
+同一 socket 夹具下 `handles`（6/6）与 `handles,console-probe`（6/6）都跑完，
+同一份 resident 产物换成**文件日志后端**（run-954）也跑完。
+⇒ 坏的是"resident 产物 × socket chardev"**这一格的时序**；特性名进 `-C metadata` 会改 crate
+disambiguator 与链接布局（§80a 早记过），这正是能挪动这类竞态落点的自由度。
+按使用者裁决"基础测试 + 间歇挂记为已知"，**本轮不追这条挂**，只把形状与三路对照记全。
+⇒ 判据②与它的两条变异（去掉常驻等待 / 让循环无视 init 死亡）**未做**。
+
+### 四、没有回归
+
+`check` **17/17**；默认档 run-955（elf `9162862fca2d`）ktests **82/82**、信箱
+`magic=11936045730314344056 ping=33 add=60` 不变；`handles` 档 run-956（elf `b5aaf3a01038`）
+ktests **89/89**，`init-user(S4b-2)` 那一行与 §236 的 run-951 **逐字节相同**
+（`等待收工=false 归创建者=3 子袋=5`）⇒ 签名改动与新增函数没有动非常驻档的任何行为。
+
+### 五、仍未验证 / 下一步
+
+- **"init 收工触发停机"这半边完全没有证人**：产品路径里没有任何入口能让 init 在没有输入时退出
+  （`process_kill` 无调用者，shell 只有收到 `exit` 才 `SYS_EXIT`）。要证它，要么给 shell 一条
+  不依赖输入的退出路径，要么等 `run_serial_rx`（另一路在飞）把喂命令接成正式档。
+- **durable 矩阵行**仍欠（同上受阻）。
+- 常驻档"多轮轮询会不会被 idle/抢占饿死"**没测**：本轮只观察到"能一直等下去"。
+- 本轮**没有**跑完整 `test` 矩阵、bench、长稳或真机。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

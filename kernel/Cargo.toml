@@ -142,6 +142,10 @@ irq-sticky-pxis = []
 serial-atomic-probe = []
 serial-rx-probe = []
 console-probe = ["handles"]
+# 变体（W5 S5d，BACKLOG §237）：init 真常驻——verdict 打完**不退出**，等到 init 自己收工才
+# `debug-exit`。**为什么不并进 handles**：判定表里 `do_run(["handles"])` 那一行（探针 ELF 几何对账）
+# 从不往串口喂命令，init 一常驻它就挂成 HANG(-1)；常驻只在有人喂命令的档里成立。
+resident-init = ["handles"]
 # 变体（L3-B 亲和性那一步，BACKLOG 73）：把 AHCI 那颗 MSI 的目的地移到一颗上线的 AP 上，
 # 再做一次真读，看投递到底落到哪颗 CPU。判据是两台仪器各数一遍：
 # 内核数 `irq::by_cpu()` 的槽分布，宿主机拿 `-d int` 里 `SP` 的高位分 BSP／非 BSP（BACKLOG 68e 那条）。
