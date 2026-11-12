@@ -243,6 +243,7 @@ extern "C" fn after_switch(_: usize) -> ! {
 /// 滚动是**真搬像素**（`scroll_up`：正文区逐像素上移一个字符行），不是只改行号。
 /// 判据形状由 `fbcon::Term::fill_body` 的定义决定：正文第 r 行第 c 格是 `'A' + ((r*cols+c) % 26)`；
 /// 滚一行之后，屏幕上的第 r 行应当等于**滚动前的第 r+1 行**。宿主机照这条公式独立复算。
+#[cfg(feature = "framebuffer")]
 fn stage_fbcon_tail(total: usize, failed: usize, table_invalid: bool) {
     let Ok(f) = crate::frame::Frame::init() else {
         crate::log_warn!("fbcon: tail 阶段拿不到帧缓冲");
