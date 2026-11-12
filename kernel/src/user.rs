@@ -885,6 +885,18 @@ fn sys_process_kill(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     crate::sched::kill_process_threads(pid) as u64
 }
 
+/// 键盘字符的读取入口。拆成小函数是为了让上面那条 `or_else` 在没开 `ps2-kbd` 时
+/// 也能编译（此时它恒返回 None，等价于原行为），而调用点不必铺 `cfg!`。
+#[cfg(not(feature = "ps2-kbd"))]
+fn kbd_char() -> Option<u8> {
+    None
+}
+
+#[cfg(feature = "ps2-kbd")]
+fn kbd_char() -> Option<u8> {
+    crate::kbd::read_char()
+}
+
 #[cfg(feature = "handles")]
 fn sys_console_io(frame: &crate::arch::x86_64::trap::TrapFrame, write: bool) -> u64 {
     use crate::handle::{self, Handle, ObjRef, RIGHT_READ, RIGHT_WRITE};
@@ -917,7 +929,12 @@ fn sys_console_io(frame: &crate::arch::x86_64::trap::TrapFrame, write: bool) -> 
             validate_range(frame.rsi, want as u64, true)?;
             let mut n = 0;
             while n < want {
-                let Some(b) = crate::serial::read_byte() else { break };
+                // S6c：控制台输入源从"只有串口"变成"串口或键盘"（裁决记在 ADR-083 决策 5）。
+                // **不新增 syscall**：还是同一个 Console 句柄、同一个 21 号、同一套 READ 权限，
+                // 先取串口环再取键盘环，谁有数据取谁。
+                let Some(b) = crate::serial::read_byte()
+                    .or_else(kbd_char)
+                else { break };
                 buf[n] = b;
                 n += 1;
             }

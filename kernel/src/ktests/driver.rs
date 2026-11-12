@@ -1772,4 +1772,68 @@ fn t_driver_ctx() -> bool {
     ok
 }
 ktest!(KT_DRIVER_CTX, t_driver_ctx);
-
+/// S6c：`kbd::step` 的纯解码判据。六条各对一个负样本靶子，**不碰端口也不碰中断**，
+/// 所以它不需要 QMP 注入配合就能独立变红。
+/// set-1 事实：'h'=0x23（break 0xA3）、'g'=0x22、'i'=0x17、回车=0x1C、右 Ctrl=E0 14
+/// （而 0x14 单独出现是 't'）、F1=0x3A 本片不映射、↑=E0 48 而它的 break 是三拍 E0 F0 48。
+#[cfg(feature = "ps2-kbd")]
+fn t_ps2_kbd_decode() -> bool {
+    use crate::kbd::{self, Code};
+    let (ext1, c1) = kbd::step(false, 0x23);
+    let make_ok = c1 == Code::Char(b'h') && !ext1;
+    let (_, c2) = kbd::step(false, 0xA3);
+    let break_ok = c2 == Code::Break;
+    let (ext3, c3) = kbd::step(false, 0xE0);
+    let (ext4, c4) = kbd::step(ext3, 0x14);
+    let ext_ok = c3 == Code::ExtPrefix && ext3 && c4 == Code::ExtTail && !ext4;
+    // 扩展 break 是**三拍**：E0 → F0 → 真码。F0 那一拍必须还留在扩展态，
+    // 否则真码（0x12 = 'e'）会被当普通 make 解出字符——松开一个键凭空多一个字母。
+    let (e5a, c5a) = kbd::step(false, 0xE0);
+    let (e5b, c5b) = kbd::step(e5a, 0xF0);
+    let (e5c, c5c) = kbd::step(e5b, 0x12);
+    let ext_break_ok =
+        e5a && c5a == Code::ExtPrefix && e5b && c5b == Code::ExtTail && !e5c && c5c == Code::ExtTail;
+    let (_, c6) = kbd::step(false, 0x1C);
+    let enter_ok = c6 == Code::Char(b'\r');
+    let (_, c7) = kbd::step(false, 0x3A);
+    let unmapped_ok = c7 == Code::Unmapped;
+    // 整条序列：按下/松开交替，只该留下 3 个字符
+    let mut ext = false;
+    let mut got = [0u8; 8];
+    let mut n = 0usize;
+    for sc in [0x22u8, 0x17, 0xA2, 0x97, 0x1C, 0x9A] {
+        let (e, c) = kbd::step(ext, sc);
+        ext = e;
+        if let Code::Char(b) = c {
+            if n < got.len() {
+                got[n] = b;
+                n += 1;
+            }
+        }
+    }
+    let seq_ok = n == 3 && got[..3] == b"gi\r"[..];
+    crate::log_info!(
+        "kbd-decode: make={:?} break={:?} 前缀={} 扩展内={:?} 扩展break={:?} 回车={:?} 不映射={:?} 序列={}字符",
+        c1,
+        c2,
+        ext3,
+        c4,
+        c5c,
+        c6,
+        c7,
+        n
+    );
+    let ok = make_ok
+        && break_ok
+        && ext_ok
+        && ext_break_ok
+        && enter_ok
+        && unmapped_ok
+        && seq_ok;
+    if !ok {
+        crate::log_fatal!("kbd-decode: 解码判据不成立（上面一行是全部读数）");
+    }
+    ok
+}
+#[cfg(feature = "ps2-kbd")]
+ktest!(KT_PS2_KBD_DECODE, t_ps2_kbd_decode);

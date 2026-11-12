@@ -10148,7 +10148,7 @@ run-971（HEAD）与 run-974（本改动）均 **880 行、内容相同**、`判
 - 接口变更登记：`frame::Frame`、`frame::FrameError`（display）与
   `limine::FbInfo`、`limine::framebuffer`、`limine::framebuffer_memmap`、`limine::hhdm_offset`（boot）。
 - `check` **17/17**。行尾按家族核过：`limine.rs`/`main.rs`/`frame.rs`/`kernel/Cargo.toml`/`BACKLOG`/白名单/普查 **CRLF**，
-  `module-interfaces.toml` 与 **ADR-083** 为 **LF**（我第一版脚本把 `
+  `module-interfaces.toml` 与 **ADR-083** 为 **LF**（我第一版脚本把 `
 ` 注进了 module-interfaces，
   按家族强制规范化才纠正过来——**改文件前先量它是哪个家族**这条又要重申一遍）。
 
@@ -10468,6 +10468,130 @@ diagnostics.dependencies 不符：源码多 ['display']
 镜像预算与环容量都是写死的 8 行 / 8 KiB，没做过容量敏感性实测；
 S6c 键盘（21 号 `console_read` 复用已裁决）；`framebuffer`/`fbcon-mirror` 都不在判定表 ⇒
 **durable 矩阵行仍欠**；上一行那条判据要成立，得先给"环的行结构"找一个可信的宿主机复现口径。
+本轮没跑完整 `test` 矩阵、bench、长稳或真机。
+
+## 246. **S6c 落地：PS/2 键盘（i8042 + IRQ1 + set-1 解码）并入 21 号 `console_read`，零新 syscall；顺带把 S5d 判据②真驱动起来了**（2026-11-13，实测）
+
+### 一、交付
+
+新 `kernel/src/kbd.rs`（**零 unsafe**，端口读写复用 `serial::in8/out8`）、特性 `ps2-kbd`、
+`main.rs` 的 `stage_keyboard()`（在 `stage_acpi_and_pci()` 之后）、
+`user.rs` 的 21 号读路径改成 `crate::serial::read_byte().or_else(kbd_char)`
+（**先串口环、再键盘环**；`kbd_char()` 在特性关闭时是返回 `None` 的同名适配器，
+`#[cfg]` 加在**定义**上而不是调用点——§242 那条教训这次一开始就照做了，但又在别处重踩，见第五节）。
+用例 `t_ps2_kbd_decode` 纯测解码器，只在 `ps2-kbd` 档存在 ⇒ ktests 默认档 82、handles 档 89、
+ps2-kbd 档 90（实测 run-992/993/994 同一形状）。裁决与负样本口径见 **ADR-084**。
+
+### 二、开启路径：两次读数纠正了两次凭印象的假设
+
+- **run-982**：`kbd: 开启失败 —— PortTimeout`。原因是我按"0xAD 开键盘"写的——**0xAD 是关第一个
+  PS/2 口**，0xAE 才是开；而且本机 QEMU 11.0.1 对 0xAD **根本不回包**，所以等 ACK 一定超时。
+- 换成**读命令字节 0x20**（它的回包就是命令字节原值，读得到也验得了），run-983 读回 **103 = 0x67**，
+  但我把位判错了：写成 `CTR_KBDINT = 0x08`。0x08 是"忽略鼠标"；**Linux i8042.h 的口径是
+  bit0=键盘中断允许(0x01)、bit4=键盘口禁用(0x10)**。0x67 = `ATT1|AUXDIS|IGNKEY|KBDINT` ⇒
+  键盘口本来就是开的、中断本来就是允许的 ⇒ **不需要写命令字节**（没有机器需要它、也没有夹具能让
+  那条写路径变红，就不写没人验证的代码）。
+- **run-984 起绿**：`kbd: 已开 IRQ=1 环容量=64 命令字节=0x67 口开=true 中断允许=true 设备ACK=0xFA 预排=0 字节`。
+  "预排"是发第一条命令前从输出缓冲区排掉的字节数——不排干净，第一拍读到的"命令字节"可能是上电包；
+  本机实测 0，但这个数必须打出来而不是假设。
+- **发第一条命令前先排空 + 只在读到禁用位时报错**（`PortDisabled(u8)` / `IrqDisabled(u8)` 带原值），
+  设备侧只发 0xF4 且必须回 0xFA，否则 `NotAck(实际字节)`。
+
+### 三、端到端：宿主机 `send-key` 打字，串口上看到 shell 的应答
+
+夹具 `build/s6c-kbd-drive.py`（features=`ps2-kbd,resident-init,console-probe`，**文件串口** + QMP）。
+**为什么用键盘而不是喂 socket**：坏的那一格是"常驻产物 × socket chardev"（§237），键盘走
+i8042 + IRQ1，与串口后端无关；串口用文件后端 ⇒ `console_read` 能拿到的输入**只可能来自键盘环**，
+于是"串口上看到 shell 的应答"就是 PS/2 路径通了。
+两条 QMP 方言实测纠正：命令名是 **`send-key`**（`sendkey` 是 HMP 的名字，QMP 回 CommandNotFound）；
+空格的 qcode 是 **`spc`**（`space`/`space_bar` 都回 GenericError）。
+读数（`build/serial-s6c.log`，判定=PASS）：
+
+```
+注入 help 键=5 'commands: help' 命中 / 注入 echo kb7 键=9 'kb7' 命中
+注入 up x2 键=2（无字符期望） / 注入 exit 键=5 'bye' 命中 / 常驻档收工行 = True
+kbd: 字节=45 派发=46 入环=19 丢弃=0 break=18 扩展=4 吞掉=4 不映射=0 排队=0
+账目闭合(字节=入环+丢弃+break+扩展+吞掉+不映射) 对，八格全对，qemu_rc=33
+```
+
+⇒ **S5d 判据②「喂到 exit 才停机」第一次有了驱动测量**：`resident-init: init 已收工 ⇒ 系统停机`
+由宿主机按下回车触发，任务 #45 那半边可以按这条口径收窄（还差"去掉常驻等待/无视 init 死亡"
+两条变异，见第六节）。
+
+### 四、这一轮最贵的量具结论：重复过滤会把解码器的错遮成"看起来全对"
+
+第一版 `kbd_isr()` 自己判了一遍 bit7（`sc & 0x80 != 0 → BREAKS`），解码器 `step()` 里也判一遍。
+注入变异 **N1（把 break 当 make）** 之后：用例红（`break=Char(104)`、`序列=6字符`），
+但**端到端那一跑 `入环` 仍是 19、`break` 仍是 18**——ISR 的重复过滤把字符挡在了环外，
+串口上的账目完全看不出解码器已经错了。**双保险不等于更保险**。
+改法：`step()` 交出的不再只是 `Option<u8>` 而是 `Code ∈ {ExtPrefix, ExtTail, Break, Char, Unmapped}`，
+**ISR 只问 `code`、不再自己判 bit7** ⇒ 每个字节恰好落一格，闭合等式 `字节 = 入环+丢弃+break+扩展+吞掉+不映射`
+成为一条宿主机能复算的判据；同一变异改后在**两个仪器上都红**（run-989 + 夹具 `入环=10 ≠ 19`）。
+另加一格 `吞掉(SWALLOWED)`：扩展序列的后缀字节（`E0 F0 xx` 的 F0 与载荷、`E0 xx` 的载荷）
+要有自己的格子，否则账闭不上——**"缺一个格子"这件事本身只有等式会告诉你**。
+
+三拍与两拍的差别也是实测出来的：本机 QEMU 送 ↑ 是 `E0 48` / `E0 C0`（set-1 风格的扩展 break，
+每按下 2 个前缀 + 2 个后缀 ⇒ `扩展=4 吞掉=4`），**不是** `E0 F0 48`；三拍那一形只有
+`t_ps2_kbd_decode` 覆盖，两边不互相顶替。
+
+### 五、三条负样本各自证红，还原后哈希复现
+
+| 变异 | 注入点 | 用例读数 | 端到端读数 |
+|---|---|---|---|
+| **N1** break 当 make | `CHAR_MAP[(sc & 0x7F)]` | run-989 FAIL(35) `break=Char(104) 序列=6字符` | `入环=10 ≠ 19`、`bye` 未命中、FAIL |
+| **N2** 不置 E0 前缀 | `return (false, ExtPrefix)` | run-990 FAIL(35) `扩展内=Char(116)`(E0 14 解成 't')、`扩展break=Char(101)`(E0 F0 12 解成 'e') | 未跑（用例已咬，且 N2 的症状是"松开修饰键凭空多字母"，用例是它的直接靶） |
+| **N3** 路由到 IRQ12 | `ioapic_route(m, 12, …)` | 用例仍绿（它不碰中断） | `kbd: 已开 … 口开=true 中断允许=true 设备ACK=0xFA` **全对**，但 `派发=0 字节=0 入环=0` ⇒ FAIL |
+
+N3 这一格要说清：**"开启成功"与"收得到键"是两个命题**，只看 `enable()` 的返回值会把前者当后者。
+还原后 run-991/994 **两次复现同一 ELF 哈希 `8e949e725824`**、90/90 PASS；
+`kbd.rs` 是无跟踪的新文件，`git diff` 帮不上忙，所以**还原的证人用的是 ELF 哈希而不是 diff**。
+
+**我自己重踩的一次**：`ktest!` 注册行漏了 `#[cfg(feature = "ps2-kbd")]` ⇒ 默认档与 handles 档
+**编译失败**（`cannot find value t_ps2_kbd_decode`），而 `check` 17/17 全绿——§242 记过的
+"门禁绿 ≠ 能编译"这条在这一轮又咬了一次，而且是同一个形状（特性开关只加在函数上、没加在登记上）。
+**修法与教训都在**：特性化用例必须**函数与 `ktest!` 两行同时加 `#[cfg]`**，且每片跑完要**跑默认档构建**。
+
+### 六、模块登记：棘轮没放宽、环没变大
+
+`kbd` 一开始挂进 `diagnostics`，`check-module-interfaces` 立刻红五条：
+`diagnostics->arch 45>34`、`->irq 7>3`、`->memory 9>6`、`->pci 2>1`、`->sync 4>3`，
+外加一条 `kbd 没有 pub 符号 ring_cap`（写成 `pub const fn` 时，门禁的 `pub` 提取式把 `const`
+当关键字、把 `fn` 当符号名 ⇒ **`pub const fn` 不被登记为函数**；改成 `pub fn` 即对）。
+§245 猜的"单向 ⇒ 零新边"对 **SCC** 成立（确实没报新环），对 **站点数棘轮不成立**。
+结论：**新建 `input` 逻辑模块**（`source_modules = ["kbd"]`，环外单向边，与 `display` 同一形状），
+并给六个被引用模块补 `allowed_callers += input`、给 `sched`/`integration` 补 `dependencies += input`；
+`public_api` 登记产品路径真引用的四个（`kbd::enable/read_char/ring_cap/stats`——`stats` 是因为
+收尾那行读数由 `main.rs` 打，它**是**产品路径；一开始只登了三个，门禁立刻报"漏登记 kbd::stats"），
+`step/enabled/kbd_isr/KbdError` 只服务用例 ⇒ 前者进 `test_targets`。
+改后 `known_scc` 与 `ring_edge_sites` **一行都没动**，check 17/17（含新增 ADR-084 过 interface-change）。
+`docs/architecture/module-dependencies.md` 的实际矩阵顺带补了 `display`/`input` 两行与
+sched/integration 的出边（那张表在 S6b 时漏更新，本轮一并补齐）。
+
+### 七、回归读数
+
+check **17/17**；默认档 run-992 `normal/elf e14059498ccc` ktests **82/82** PASS(33)；
+handles 档 run-993 `f1139f190687` **89/89** PASS(33)；ps2-kbd,handles 档 run-988/991/994
+**8e949e725824**（三次同哈希）**90/90** PASS(33)；
+夹具跑（常驻 + 文件串口 + QMP，`ps2-kbd,resident-init,console-probe`/`3fcbebe5d3ee`）判定=PASS、
+qemu_rc=33。**同一码态连跑两跑**：头一跑判定=FAIL(35)、六格 S6c 判据全绿，红因是
+`t_q2_workload_slots`（`ktests 89/90`）——**就是 §239 记的那条峰值采样判据的低率抖动**，
+不是本片；第二跑同 ELF 全绿。这一对读数是**同来路**（第二跑镜像被判新鲜、没重建），
+所以可以直接当作"抖动而不是回归"的形状证据；样本仍只有两跑，只作方向不作基线。
+**两格新记录的不稳定**：① **run-987 HANG(-1)** —— `ps2-kbd,handles`，同一份源码的 run-988
+同哈希 6.4 s PASS ⇒ 属 §231 那类已知间歇挂，**不归因于本片、不追**（按 §229 裁决）；
+② **run-983 的 `t_irq_ahci` 红** —— 当时 enable 因错误的 bit 判读而失败，而 982（enable 也失败但
+被 0xAD 关过口）绿、984 绿 ⇒ 差异只在 enable 成败这一格，**机制未证不作结论**；
+只记一条结构性观察：**enable 失败的回滚只还了 IRQ 槽，没有还原 IOAPIC 那条 RTE**（串口那条同形，
+一直如此），要不要补是独立一片。
+
+### 八、仍开着
+
+shift/caps/组合键（CHAR_MAP 只有未加修饰的小写与符号）、扩展集解码（只计数不出字符）、
+**键入内容上屏**（fbcon 现在只在 init 窗口结束那一刻画一次屏，键入时画面不动；
+要做先拆 ADR-083 决策 7 的一次性闸门 ⇒ 本轮**没跑成像素证人，`--dump` 明确标为非判据**）、
+`ps2-kbd` 的 **durable 矩阵行**（判据活在一次性夹具里，仍受 `tools/aurora.py:3037`
+`run_serial_rx` 缺两个必填关键字参数那笔旧欠阻碍，另一路在飞）、
+判据②剩下的两条变异（去掉常驻等待 / 循环无视 init 死亡）、阻塞读与唤醒。
 本轮没跑完整 `test` 矩阵、bench、长稳或真机。
 
 ## 文档一致性（V1.3）

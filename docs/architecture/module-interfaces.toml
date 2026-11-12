@@ -157,7 +157,7 @@ public_api = [
   "x86_64::trap",
   "x86_64::smp",
 ]
-allowed_callers = ["diagnostics", "driver", "integration", "irq", "memory", "pci", "sched", "storage", "sync", "time"]
+allowed_callers = ["diagnostics", "driver", "input", "integration", "irq", "memory", "pci", "sched", "storage", "sync", "time"]
 dependencies = ["boot", "diagnostics", "irq", "memory", "pci", "sync", "time"]
 forbidden_dependencies = ["sched"]
 known_violations = []
@@ -275,7 +275,7 @@ public_api = [
   "mm::usable_bytes",
   "mm::with_vmm_lock",
 ]
-allowed_callers = ["arch", "capability", "diagnostics", "display", "driver", "integration", "irq", "pci", "resource", "sched", "storage"]
+allowed_callers = ["arch", "capability", "diagnostics", "display", "driver", "input", "integration", "irq", "pci", "resource", "sched", "storage"]
 dependencies = ["arch", "boot", "diagnostics", "resource", "sync", "time"]
 forbidden_dependencies = ["storage"]
 known_violations = []
@@ -379,7 +379,7 @@ public_api = [
   "user::syscall_dispatch",
 ]
 allowed_callers = ["integration"]
-dependencies = ["arch", "boot", "capability", "diagnostics", "memory", "storage", "sync", "time"]
+dependencies = ["arch", "boot", "capability", "diagnostics", "input", "memory", "storage", "sync", "time"]
 forbidden_dependencies = []
 known_violations = []
 context = ["KERNEL", "IRQ_OFF", "ISR_TOP"]
@@ -413,7 +413,7 @@ public_api = [
   "sync::IrqGuard",
   "sync::RANK_HANDLE",
 ]
-allowed_callers = ["arch", "boot", "capability", "diagnostics", "display", "integration", "irq", "memory", "pci", "resource", "sched", "storage", "time"]
+allowed_callers = ["arch", "boot", "capability", "diagnostics", "display", "input", "integration", "irq", "memory", "pci", "resource", "sched", "storage", "time"]
 dependencies = ["arch", "diagnostics", "time"]
 forbidden_dependencies = []
 known_violations = []
@@ -505,7 +505,7 @@ public_api = [
   "pci::init",
   "hw::MmioRegion",
 ]
-allowed_callers = ["arch", "diagnostics", "display", "driver", "integration", "storage"]
+allowed_callers = ["arch", "diagnostics", "display", "driver", "input", "integration", "storage"]
 dependencies = ["arch", "memory", "sync"]
 forbidden_dependencies = ["storage"]
 known_violations = []
@@ -536,7 +536,7 @@ public_api = [
   "irq::request",
   "irq::set_affinity",
 ]
-allowed_callers = ["arch", "diagnostics", "driver", "integration", "storage"]
+allowed_callers = ["arch", "diagnostics", "driver", "input", "integration", "storage"]
 dependencies = ["arch", "memory", "sync"]
 forbidden_dependencies = []
 known_violations = []
@@ -606,7 +606,7 @@ status = "部分落地"
 module_id = "diagnostics"
 owner = "diagnostics"
 layer = "core"
-source_modules = ["serial", "crash", "state_store", "watchdog", "exit"]
+source_modules = ["crash", "exit", "serial", "state_store", "watchdog"]
 public_api = [
   "serial::mirror_wrapped",
   "serial::mirror_total",
@@ -655,7 +655,7 @@ public_api = [
   "state_store::KIND_CRASH",
   "state_store::MAX_FRAMES",
 ]
-allowed_callers = ["arch", "boot", "display", "integration", "memory", "sched", "sync", "testing", "time"]
+allowed_callers = ["arch", "boot", "display", "input", "integration", "memory", "sched", "sync", "testing", "time"]
 dependencies = ["arch", "irq", "memory", "pci", "storage", "sync", "time"]
 forbidden_dependencies = []
 known_violations = []
@@ -665,6 +665,30 @@ resource_ownership = "日志环、崩溃摘要、持久状态记录、启动健�
 error_policy = "故障路径不分配、不等可能损坏的锁；持久状态写失败不得再触发不可恢复故障。"
 unsafe_scope = ["serial:U1", "crash:U6"]
 test_targets = ["t_state_store", "t_crash", "t_crash_oops", "t_watchdog", "t_serial_atomic", "t_serial_rx"]
+status = "部分落地"
+
+[modules."input"]
+module_id = "input"
+owner = "input"
+layer = "hal"
+source_modules = ["kbd"]
+public_api = [
+  "kbd::enable",
+  "kbd::read_char",
+  "kbd::ring_cap",
+  "kbd::stats",
+]
+allowed_callers = ["integration", "sched"]
+dependencies = ["arch", "diagnostics", "irq", "memory", "pci", "sync"]
+forbidden_dependencies = ["storage", "capability"]
+known_violations = []
+context = ["BOOT", "KERNEL", "ISR_TOP"]
+error_classes = ["A", "B"]
+resource_ownership = "PS/2 键盘的 IRQ1 路由与 64 格字符环（原子头尾，ISR 只搬字节）；端口 0x60/0x64 的独占访问。不拥有串口，也不拥有控制台句柄。"
+error_policy = "ISR/多 CPU 上下文、端口超时、控制器不应答、IRQ 申请失败 → 返回具体错误并在开启失败时回滚已申请的 IRQ 向量；不降级、不吞错。"
+unsafe_scope = []
+test_targets = ["t_ps2_kbd_decode"]
+# S6c：IRQ1 收码 + set-1 解码 + 并入 21 号 console_read 读路径；shift/caps 与扩展码还没做
 status = "部分落地"
 
 [modules."security"]
@@ -829,7 +853,7 @@ public_api = [
   "main::mp_snapshot",
 ]
 allowed_callers = []
-dependencies = ["arch", "boot", "capability", "diagnostics", "driver", "irq", "memory", "pci", "security", "sched", "storage", "sync", "testing", "time", "display"]
+dependencies = ["arch", "boot", "capability", "diagnostics", "driver", "irq", "memory", "pci", "security", "sched", "storage", "sync", "testing", "time", "display", "input"]
 forbidden_dependencies = []
 known_violations = []
 context = ["BOOT", "KERNEL"]

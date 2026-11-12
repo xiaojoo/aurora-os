@@ -32,9 +32,11 @@ mod hooks;
 mod handle;
 mod hw;
 #[cfg(feature = "framebuffer")]
-mod frame;
-#[cfg(feature = "framebuffer")]
+mod frame;
+#[cfg(feature = "framebuffer")]
 mod fbcon;
+#[cfg(feature = "ps2-kbd")]
+mod kbd;
 mod irq;
 mod exit;
 mod ktest;
@@ -222,6 +224,9 @@ extern "C" fn after_switch(_: usize) -> ! {
     stage_cpu_protections();
     stage_probe_addr();
     stage_acpi_and_pci();
+    // S6c：键盘在 ACPI/MADT 之后开（要查 IRQ1 的 GSI），在 ktests 之前（用例可能要用它）
+    #[cfg(feature = "ps2-kbd")]
+    stage_keyboard();
     stage_fault_injections();
     stage_storage_guard_crash();
     stage_signature_check();
@@ -283,6 +288,29 @@ fn stage_fbcon_tail(total: usize, failed: usize, table_invalid: bool) {
     let after = f.get(bx, by).unwrap_or(u32::MAX);
     crate::log_info!("fbcon: 冻结后再写无效={}（带首像素 {:#010x} vs {:#010x}）", before == after, before, after);
     crate::log_info!("fbcon: 已冻结 带首像素=({},{}) 字宽={} 字高={}", bx, by, crate::fbcon::CELL_W, crate::fbcon::CELL_H);
+}
+
+/// S6c：开 PS/2 键盘。失败**必须在串口上看见具体成因**——"键盘不响"和"根本没去开"
+/// 是两种完全不同的现场，合成一句 warn 就把下一次排查的时间花掉了。
+#[cfg(feature = "ps2-kbd")]
+fn stage_keyboard() {
+    let Some(m) = acpi::summary().and_then(|s| s.madt) else {
+        crate::log_warn!("kbd: 没有 MADT，IRQ1 无从路由");
+        return;
+    };
+    match kbd::enable(&m) {
+        Ok(i) => crate::log_info!(
+            "kbd: 已开 IRQ={} 环容量={} 命令字节=0x{:02X} 口开={} 中断允许={} 设备ACK=0x{:02X} 预排={} 字节",
+            1,
+            kbd::ring_cap(),
+            i.cmd_byte,
+            i.kbd_enabled,
+            i.irq_enabled,
+            i.dev_ack,
+            i.preflush
+        ),
+        Err(e) => crate::log_warn!("kbd: 开启失败 —— {:?}", e),
+    }
 }
 
 /// S6a：把帧缓冲开起来、报出几何与两处地址、画一张宿主机能独立复算的图案。
@@ -911,6 +939,24 @@ fn run_ktests_and_finish() -> ! {
     // 这样用例读数不受影响，而 hello 的输出能进同一份串口。
     // S5d：接住 init 的任务号——判定之后要不要等它，由 `park_until_init_exits` 说。
     let init_task = stage_init_user();
+    // S6c：init 的交互窗口结束后报键盘的六本账——**放在这里**是因为窗口之内才是按键时间，
+    // 放到 verdict 之后就只数得到空闲期的包。
+    #[cfg(feature = "ps2-kbd")]
+    {
+        let (bytes, irqs, pushed, dropped, breaks, ext, swallowed, unmapped, queued) = kbd::stats();
+        crate::log_info!(
+            "kbd: 字节={} 派发={} 入环={} 丢弃={} break={} 扩展={} 吞掉={} 不映射={} 排队={}",
+            bytes,
+            irqs,
+            pushed,
+            dropped,
+            breaks,
+            ext,
+            swallowed,
+            unmapped,
+            queued
+        );
+    }
     // S6b-2：把这一跑的用例结果画到屏幕上（画面取证要像素证人，不是串口证人）
     #[cfg(feature = "framebuffer")]
     stage_fbcon_tail(s.total as usize, s.failed as usize, s.table_invalid);

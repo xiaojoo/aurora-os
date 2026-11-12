@@ -37,7 +37,7 @@ Boot / Platform     (boot)
 | boot | diagnostics, sync |
 | arch | boot, diagnostics, irq, memory, pci, sync, time |
 | memory | arch, boot, diagnostics, resource, sync, time |
-| sched | arch, boot, capability, diagnostics, memory, storage, sync, time |
+| sched | arch, boot, capability, diagnostics, input, memory, storage, sync, time |
 | sync | arch, diagnostics, time |
 | driver | arch, irq, memory, pci |
 | pci | arch, memory, sync |
@@ -49,7 +49,9 @@ Boot / Platform     (boot)
 | capability | storage, sync |
 | resource | memory, sync |
 | testing | diagnostics |
-| integration (main) | arch, boot, capability, diagnostics, driver, irq, memory, pci, resource, sched, storage, sync, testing, time |
+| display (S6b) | boot, diagnostics, memory, pci, sync |
+| input (S6c) | arch, diagnostics, irq, memory, pci, sync |
+| integration (main) | arch, boot, capability, diagnostics, display, driver, input, irq, memory, pci, resource, sched, storage, sync, testing, time |
 
 ## 3. 循环依赖基线（实测）
 
