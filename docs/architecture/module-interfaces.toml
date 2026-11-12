@@ -413,7 +413,7 @@ public_api = [
   "sync::IrqGuard",
   "sync::RANK_HANDLE",
 ]
-allowed_callers = ["arch", "boot", "capability", "diagnostics", "integration", "irq", "memory", "pci", "resource", "sched", "storage", "time"]
+allowed_callers = ["arch", "boot", "capability", "diagnostics", "display", "integration", "irq", "memory", "pci", "resource", "sched", "storage", "time"]
 dependencies = ["arch", "diagnostics", "time"]
 forbidden_dependencies = []
 known_violations = []
@@ -432,21 +432,27 @@ status = "部分落地"
 module_id = "display"
 owner = "display"
 layer = "hal"
-source_modules = ["frame"]
+source_modules = ["frame", "fbcon"]
 public_api = [
+  "fbcon::BAND_ROWS",
+  "fbcon::BAND_TEXT",
+  "fbcon::CELL_H",
+  "fbcon::CELL_W",
+  "fbcon::Term",
   "frame::Frame",
   "frame::FrameError",
 ]
 allowed_callers = ["integration"]
-dependencies = ["boot", "memory", "pci"]
+dependencies = ["boot", "memory", "pci", "sync"]
 forbidden_dependencies = ["storage", "capability"]
 known_violations = []
 context = ["BOOT", "KERNEL"]
 error_classes = ["A", "B"]
-resource_ownership = "帧缓冲的 UC 映射窗口（随 Frame drop 解映射并放手 VA 保留）；不拥有物理帧，也不拥有显示设备配置。"
+resource_ownership = "帧缓冲的 UC 映射窗口与终端文本栅格（含一次性冻结闸门）（随 Frame drop 解映射并放手 VA 保留）；不拥有物理帧，也不拥有显示设备配置。"
 error_policy = "没有 framebuffer / 模式不支持 / 几何自相矛盾 / 坐标越界 → 一律返回具体错误，不降级、不夹到边界。"
 unsafe_scope = []
 test_targets = []
+# S6b：正文区一次性写完就落冻结闸门，**滚动与真日志镜像还没做**
 status = "部分落地"
 
 [modules."driver"]

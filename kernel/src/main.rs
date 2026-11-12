@@ -32,7 +32,9 @@ mod hooks;
 mod handle;
 mod hw;
 #[cfg(feature = "framebuffer")]
-mod frame;
+mod frame;
+#[cfg(feature = "framebuffer")]
+mod fbcon;
 mod irq;
 mod exit;
 mod ktest;
@@ -280,6 +282,33 @@ fn stage_framebuffer() {
         pts.len(),
         bad
     );
+
+    // ---------------- S6b：文本→像素 + 冻结契约 ----------------
+    let Some(term) = fbcon::Term::new(&f) else {
+        crate::log_warn!("fbcon: 几何放不下终端栅格（至少要到 {}x{}）",
+                         fbcon::CELL_W * 8, fbcon::CELL_H * (fbcon::BAND_ROWS + 2));
+        return;
+    };
+    let (cols, rows) = term.dims();
+    let body = term.fill_body(&f);
+    let (band_row, wrote) = term.freeze_band(&f);
+    let (bx, by) = term.band_origin();
+    crate::log_info!(
+        "fbcon: 栅格 {}x{} 正文行={} 冻结带首行像素=({},{}) 带宽字符={} 文本={}",
+        cols, rows, body, bx, by, wrote, fbcon::BAND_TEXT
+    );
+    // 契约的正半句必须现场自证：闸门关上之后再写就是 no-op。
+    // 不比这一格的话，"冻结"只是注释里的一句话。
+    let before = f.get(bx, by).unwrap_or(u32::MAX);
+    term.print_line(&f, band_row, "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
+    let after = f.get(bx, by).unwrap_or(u32::MAX);
+    crate::log_info!(
+        "fbcon: 冻结后再写无效={}（带首像素 {:#010x} vs {:#010x}）",
+        before == after, before, after
+    );
+    // 宿主机以这一行为准去 dump——它出现之后画面就不会再变了
+    crate::log_info!("fbcon: 已冻结 带首像素=({},{}) 字宽={} 字高={}",
+                     bx, by, fbcon::CELL_W, fbcon::CELL_H);
 }
 
 /// Stage2a/2b：页表接管后的内存统计与内核堆。
