@@ -196,3 +196,48 @@ impl Term {
         (0, (self.rows - BAND_ROWS) * CELL_H)
     }
 }
+
+// ------------------------------------------------------------------ S6b-3 消费端
+//
+/// 把日志环里**最后 `max_lines` 行**逐行滚动画上去，返回 `(窗口行数, 真画上去的行数)`。
+///
+/// **环住在 `serial`，这里只读** ⇒ 边保持 `display -> diagnostics` 单向，不造新环（§244）。
+/// **不许开 `Vec`**：堆上限 `LARGE_MAX = 2048`，一次 8 KiB 的 `with_capacity` 第一下就走
+/// `handle_alloc_error` ⇒ 整机 39（ADR-018/026）。所以两遍扫描 + 栈上 200 字节行缓冲，
+/// 装满就截断——宁可少画几个字符也要有界。
+pub fn drain_and_draw(term: &Term, f: &Frame, max_lines: usize) -> (usize, usize) {
+    let n = crate::serial::mirror_len();
+    let wrapped = crate::serial::mirror_wrapped();
+    // 第一遍：只数换行，不分配、不画图
+    let mut total = 1usize;
+    for i in 0..n {
+        if crate::serial::mirror_byte(i) == 10 {
+            total += 1;
+        }
+    }
+    let skip = total.saturating_sub(max_lines);
+    let mut line = [0u8; 200];
+    let mut len = 0usize;
+    let mut idx = 0usize;
+    let mut drawn = 0usize;
+    for i in 0..n {
+        let c = crate::serial::mirror_byte(i);
+        if c == 10 {
+            // 绕回处那一段是上一行的残片，不是完整日志行：丢掉它，否则画面上是一条半截日志
+            let fragment = wrapped && idx == 0;
+            if idx >= skip && !fragment {
+                let s = core::str::from_utf8(&line[..len]).unwrap_or("<bad-utf8>");
+                // 空行也占一次滚动，否则"画了 N 行"里的空行会谎报成内容行
+                if term.print_scrolled(f, s) > 0 || len == 0 {
+                    drawn += 1;
+                }
+            }
+            len = 0;
+            idx += 1;
+        } else if len < line.len() {
+            line[len] = c;
+            len += 1;
+        }
+    }
+    (total, drawn)
+}

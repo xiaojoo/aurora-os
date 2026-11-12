@@ -293,8 +293,68 @@ struct Sink;
 impl Write for Sink {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         putstr(s.as_bytes());
+        #[cfg(feature = "framebuffer")]
+        crate::serial::mirror_note(s);
         Ok(())
     }
+}
+
+// ------------------------------------------------------------------ S6b-3 日志镜像的字节环
+//
+// **为什么环住在 `serial`（diagnostics）而不是 `fbcon`（display）**：`fbcon` 自己要用
+// `log_info!` 打日志 ⇒ `display -> diagnostics` 这条边本来就在。若让 serial 反过来调
+// `fbcon::note_bytes`，就凭空造出一个真环——第三次尝试就是这么被 `check-module-interfaces`
+// 的 `known_scc` 基线拦下的（BACKLOG §244）。环放在这里，边保持单向；画图由 `main` 的
+// tail 阶段驱动（integration 两边都允许依赖）。
+//
+// 用 `AtomicU8` 数组而不是 `UnsafeCell`：原子数组自带内部可变性 ⇒ **零新增 unsafe 站点**，
+// 也就不动白名单。
+const MIRROR_BYTES: usize = 8192;
+static MIRROR: [AtomicU8; MIRROR_BYTES] = [const { AtomicU8::new(0) }; MIRROR_BYTES];
+/// 单调写入计数（不回绕）。写入位置 = `MIRROR_POS % MIRROR_BYTES` ⇒ **循环覆写**：
+/// 判据要的是最后几行，而"填满即弃"留下的恰好是最老的字节（§244 实测 `丢弃=29666`，方向相反）。
+static MIRROR_POS: AtomicUsize = AtomicUsize::new(0);
+
+/// 旁挂一段日志正文。由 `Sink::write_str` 调用，**只存字节、绝不画图**：
+/// 画一行是上万次设备写，而调用点持有串口行锁——在锁里做设备写等于把锁的暴露面撑大。
+pub fn mirror_note(s: &str) {
+    for &b in s.as_bytes() {
+        mirror_note_byte(b);
+    }
+}
+
+/// 打一个行尾。换行是 `line()` 用 `putb` 直接写串口的、**不经过 `Sink`**，所以必须单独通知：
+/// 不通知的话环里一个换行都没有，整场启动被当成"一行"，一行也画不出（§244 实测）。
+pub fn mirror_note_break() {
+    mirror_note_byte(10);
+}
+
+fn mirror_note_byte(b: u8) {
+    let i = MIRROR_POS.fetch_add(1, Ordering::Relaxed);
+    MIRROR[i % MIRROR_BYTES].store(b, Ordering::Relaxed);
+}
+
+/// 环里现存多少字节（不超过容量）。
+pub fn mirror_len() -> usize {
+    MIRROR_POS.load(Ordering::Relaxed).min(MIRROR_BYTES)
+}
+
+/// 开机以来旁挂过的总字节数。和 `mirror_len` 一起报才看得出"环绕过没有"。
+pub fn mirror_total() -> usize {
+    MIRROR_POS.load(Ordering::Relaxed)
+}
+
+/// 读现存窗口第 `i` 个字节。**绕回之后窗口逻辑起点不是 0**，偏移在这里算：
+/// 让调用方去猜的表现是画出一条半截日志，而它看起来完全像"镜像对了"。
+pub fn mirror_byte(i: usize) -> u8 {
+    let total = MIRROR_POS.load(Ordering::Relaxed);
+    let start = total - total.min(MIRROR_BYTES);
+    MIRROR[(start + i) % MIRROR_BYTES].load(Ordering::Relaxed)
+}
+
+/// 窗口开头那一截是不是上一行的**残片**（只有环绕过才是）。消费方必须丢掉它。
+pub fn mirror_wrapped() -> bool {
+    MIRROR_POS.load(Ordering::Relaxed) > MIRROR_BYTES
 }
 
 /// 行锁：一次一行。持有者 = CPU 槽号 + 1，`0` = 空闲。
@@ -403,6 +463,11 @@ pub fn line(level: &str, args: fmt::Arguments<'_>) {
     // fmt 不会失败（无分配、Sink 恒返回 Ok），仍不用 expect（§2.5 lint: expect_used=deny）
     let _ = Sink.write_fmt(args);
     putb(b'\n');
+    // 行尾必须单独通知镜像环：换行是这一行直接写串口的、不经过 `Sink`。
+    // 漏了它的表现不是报错，而是环里一个换行都没有、整场启动被当成"一行"，一行也画不出
+    // （§244 实测 `总行数=1 画上=0 丢弃=29666`）。
+    #[cfg(feature = "framebuffer")]
+    crate::serial::mirror_note_break();
 }
 
 macro_rules! hex_impl {

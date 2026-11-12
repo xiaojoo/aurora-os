@@ -435,6 +435,7 @@ layer = "hal"
 source_modules = ["frame", "fbcon"]
 public_api = [
   "fbcon::BAND_ROWS",
+  "fbcon::drain_and_draw",
   "fbcon::BAND_TEXT",
   "fbcon::CELL_H",
   "fbcon::CELL_W",
@@ -443,7 +444,7 @@ public_api = [
   "frame::FrameError",
 ]
 allowed_callers = ["integration"]
-dependencies = ["boot", "memory", "pci", "sync"]
+dependencies = ["boot", "diagnostics", "memory", "pci", "sync"]
 forbidden_dependencies = ["storage", "capability"]
 known_violations = []
 context = ["BOOT", "KERNEL"]
@@ -607,6 +608,10 @@ owner = "diagnostics"
 layer = "core"
 source_modules = ["serial", "crash", "state_store", "watchdog", "exit"]
 public_api = [
+  "serial::mirror_wrapped",
+  "serial::mirror_total",
+  "serial::mirror_len",
+  "serial::mirror_byte",
   "crash::Site",
   "crash::dump_site",
   "crash::ensure_dumped",
@@ -650,7 +655,7 @@ public_api = [
   "state_store::KIND_CRASH",
   "state_store::MAX_FRAMES",
 ]
-allowed_callers = ["arch", "boot", "integration", "memory", "sched", "sync", "testing", "time"]
+allowed_callers = ["arch", "boot", "display", "integration", "memory", "sched", "sync", "testing", "time"]
 dependencies = ["arch", "irq", "memory", "pci", "storage", "sync", "time"]
 forbidden_dependencies = []
 known_violations = []

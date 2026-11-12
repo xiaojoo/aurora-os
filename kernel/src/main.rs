@@ -260,6 +260,18 @@ fn stage_fbcon_tail(total: usize, failed: usize, table_invalid: bool) {
     let line = crate::fbcon::BAND_TEXT;
     let drew = term.print_scrolled(&f, &line);
     crate::log_info!("fbcon: 滚动一次 末行画出格数={}", drew);
+    // S6b-3：把这一跑攒下的日志正文**最后几行**滚动画上去。单独一档 `fbcon-mirror` 是有意的：
+    // 它会继续滚动，会顶掉 §242"滚动恰好一次"那条已提交的像素判据 ⇒ 两个判据必须各自可复现。
+    #[cfg(feature = "fbcon-mirror")]
+    {
+        const MIRROR_LINES: usize = 8;
+        let (total, drawn) = crate::fbcon::drain_and_draw(&term, &f, MIRROR_LINES);
+        crate::log_info!(
+            "fbcon: 镜像 旁挂字节={} 现存字节={} 窗口行数={} 画上={} 预算={} 绕过={}",
+            crate::serial::mirror_total(), crate::serial::mirror_len(),
+            total, drawn, MIRROR_LINES, crate::serial::mirror_wrapped()
+        );
+    }
     let (band_row, wrote) = term.freeze_band(&f);
     let (bx, by) = term.band_origin();
     crate::log_info!(
