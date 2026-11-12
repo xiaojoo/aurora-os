@@ -9965,6 +9965,59 @@ ktests **89/89**，`init-user(S4b-2)` 那一行与 §236 的 run-951 **逐字节
 - 常驻档"多轮轮询会不会被 idle/抢占饿死"**没测**：本轮只观察到"能一直等下去"。
 - 本轮**没有**跑完整 `test` 矩阵、bench、长稳或真机。
 
+## 238. S5d 续：拿到"init 收工 ⇒ 系统停机"的配对证人；判据①补上负样本；**踩到一个会骗人的量具格子——`run` 不一定重造用户产物**（2026-11-12，实测）
+
+### 一、§237 欠的那半边补上了，而且不需要串口输入
+
+M2 = 在 `user/shell` 打完提示符之后立刻 `SYS_EXIT(0)`（测量用变异，跑完就撤；现在 `git diff` 为空）。
+同一份内核、同一档，**唯一变量是 init 死不死**：
+
+- **run-957**（M2，内核 elf `a0e87bfbc248`、夹具 `cebace15a230`）：
+  `verdict: PASS` → `resident-init: 判定已出，等 init（任务=2）收工` →
+  **`resident-init: init 已收工 ⇒ 系统停机`** → `qemu-exit=33`；判定=PASS、用时 6.8 s。
+- **run-959 / run-961**（还原 + 显式 `build`，内核 elf `0ffc39a59bdb`、夹具回 `d7167bf1d861`）：
+  `verdict: PASS` → park 行 → **没有任何退出行**，宿主超时 `HANG(-1)`。
+
+⇒ "init 收工才停机"这一格现在是**配对证人**（两侧只差一个变量），不是单侧观察。
+但要说清它证到什么：**证的是机制，不是交互路径**——"有人在串口上敲 `exit` 也能停机"仍未证（见第四节）。
+
+### 二、判据①补上负样本（M1）
+
+M1 = 注释掉 PASS 分支的 `park_until_init_exits(init_task);`：
+
+- **run-960**（内核 elf `dd3e2b4e7242`）：串口上**一条 `resident-init:` 都没有**，
+  `verdict: PASS` 紧跟 `qemu-exit=33`；而 `init-user(S4b-2)` 那一行**逐字节不变**
+  （`等待收工=false 归创建者=3 子袋=5`）⇒ 红的只有"停机时机"这一格，没有连带伤害。
+- 还原后 run-961 **第三次复现 `0ffc39a59bdb`** ⇒ 还原态可复现，M1/M2 都是按原串精确撤掉的。
+
+### 三、必须记住的量具坑：**改完 `user/*` 直接 `run`，量的可能还是上一轮的夹具**
+
+这里产出了一个**无效读数**（run-958）：shell 源码已还原、`git diff` 为空，跑出来的行为却仍是变异产物
+（`等待收工=true` 且 `init 已收工` 那行在）。机制是逐条从代码核出来的，不是猜：
+
+- `do_run` 只调 `ensure_image`；`ensure_image` 的"新鲜"判据是 `image-info.txt` 里的**变体名 + 内核 ELF 哈希**
+  （`tools/aurora.py:2119-2126`），成立就**跳过** `do_image`（`tools/aurora.py:2132-2134`）。
+- 而重造用户产物的链路是 `do_image → do_build → do_build_shell`（`tools/aurora.py:206-212`、`219`）。
+- 只改 `user/shell` 不改内核 ⇒ 内核 ELF 不变 ⇒ `fresh=True` ⇒ 夹具不刷新 ⇒ cargo 也看不见 fixture 变过
+  ⇒ **循环陈旧**：`include_bytes!("../fixtures/shell.elf")` 指着一份没人负责更新的旧字节。
+- 旁证：`kernel/build.rs` 与根 `build.rs` **都不存在**，所以没有任何构建脚本在暗中刷新它。
+
+⇒ **本轮起的量具口径**：改过任何 `user/*`，判据跑之前必须先 `build`（或 `image`），
+且**两处哈希都对账**——`kernel/fixtures/shell.elf` 要回到 HEAD 的 `d7167bf1d861`，
+`image-info.txt` 的 `elf_sha256` 要回到 `0ffc39a59bdb`。**只看行为或只看退码，会把旧夹具读成新结论。**
+这与 §236 那条"`等待收工` 不能单独当干净退出的证人"是同一族毛病：**证人和被测物不同源，就会串。**
+
+**没有去修 `tools/aurora.py`**：把新鲜判据扩到用户产物指纹是另一片的事（要配它自己的负样本），
+而这个文件正被另一路改（S5a/S5b，`run_serial_rx` 调用点仍缺必填实参，§236 记着）。**记为缺陷，不掩盖。**
+
+### 四、仍未做 / 仍开着
+
+- **判据②的驱动测量**仍未做成：`handles,resident-init` × socket chardev 那一格仍在 ktests 中途静默
+  （§237 三，四条采样静默点会移动）。M2 绕开了它，代价就是上面那句"只证机制、没证交互路径"。
+- `ensure_image` 的用户产物指纹判据（第三节那条缺陷）。
+- durable 矩阵行、`run_serial_rx` 收尾、阻塞读/唤醒、S6 framebuffer + PS/2。
+- 本轮**没有**跑完整 `test` 矩阵、bench、长稳或真机；没有新增 `unsafe`、没有新增锁、没有新增 syscall 号。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。
