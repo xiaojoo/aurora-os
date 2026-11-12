@@ -2113,7 +2113,13 @@ def ensure_image(features: list[str]) -> None:
     """
     import hashlib as _hl
     global PKG_DIRTY
-    elf = kernel_binary(features)
+    # 这里必须走 do_build 而不是 kernel_binary（BACKLOG §238 三那条缺陷的修复）。
+    # kernel_binary 只 cargo 构建内核，而"重造用户产物并刷新夹具"只挂在
+    # do_image → do_build 这条**被判过期才会走**的分支上 ⇒ 只改 user/* 时内核 ELF 不变、
+    # 镜像被判新鲜、夹具停在旧字节，`include_bytes!` 嵌进去的就是没人负责更新的那份
+    # （实测产出过一个"源码已还原、行为却没还原"的无效读数 run-958）。
+    # 一切 fresh 时 do_build 只是几次 cargo no-op（各约 0.02 s），代价远小于判据串了来路。
+    elf = do_build(features)
     info = BUILD / "image-info.txt"
     want_variant = ",".join(features) if features else "normal"
     fresh = IMAGE.exists() and info.exists()

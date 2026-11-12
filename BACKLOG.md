@@ -10018,6 +10018,68 @@ M1 = 注释掉 PASS 分支的 `park_until_init_exits(init_task);`：
 - durable 矩阵行、`run_serial_rx` 收尾、阻塞读/唤醒、S6 framebuffer + PS/2。
 - 本轮**没有**跑完整 `test` 矩阵、bench、长稳或真机；没有新增 `unsafe`、没有新增锁、没有新增 syscall 号。
 
+## 239. S5d 续二：**修掉 §238 那条量具缺陷**（`ensure_image` 不刷新用户产物），正反读数各一；顺带量到 `t_q2` 峰值判据是个先前没记的抖动（2026-11-12，实测）
+
+### 一、修了什么（一行）
+
+`tools/aurora.py:2116` 的 `elf = kernel_binary(features)` → `elf = do_build(features)`。
+理由照 §238 三：`kernel_binary` 只 cargo 构建内核，而"重造用户产物 + 刷新夹具"挂在
+`do_image → do_build` 这条**被判过期才会走**的分支上 ⇒ 只改 `user/*` 时夹具停在旧字节。
+改完之后 `ensure_image` 自己就把用户产物刷成当前源码的产物，再判镜像新不新鲜。
+
+- 副作用：镜像确实过期时 `do_image` 里会再走一次 `do_build`，两次都是 cargo no-op，
+  串口与判定不受影响；代价是 stdout 上 `shell 程序:` 这类行会打两遍 —— **已知 cosmetic，没为它加结构**。
+- 这次动的是 `tools/aurora.py`，但**只在 §238 记死的那一处**，没碰另一路的 `run_serial_rx`。
+
+### 二、正反读数（都取"**不显式跑 build**"这条路径，也就是缺陷原来的作案路径）
+
+先铺状态：run-962 用 `run --features handles` 取基线（夹具 `d7167bf1d861`、elf `b5aaf3a01038`，
+与 §237 的 run-956 同哈希）⇒ 此后镜像被判"新鲜"，正是缺陷会咬的形状。
+
+| 来路 | 做了什么 | 结果 |
+|---|---|---|
+| run-963 | banner `Aurora shell (S5c)` → `Aurora SHELL (S5c)`（**等长**，blob 仍是 161 字节），不跑 build 直接 `run` | `夹具已更新 3c6dd47fbcec`、`elf 1134883c970e`；串口上**只有 `Aurora SHELL`**、原串零命中 ⇒ 修好后 `run` 真的会把新产物带进去 |
+| run-964 | 撤掉变异，同样不跑 build | 夹具回 `d7167bf1d861`；串口 `Aurora shell` 在、`Aurora SHELL` 不在；PASS(33) |
+
+对照 §238 的 run-958（**修复前**同一条序列：源码已还原、行为却仍是变异产物）⇒ 这条缺陷被同一把尺子
+量出了前后差，不是只靠"看起来修好了"。
+
+**第一次把这条证红打歪了，记下来**：我改的是 `shell`→`shem`，少一个字节 ⇒ `*b"…"` 推成 `[u8;160]`
+与声明的 `[u8;161]` 不匹配，cargo 当场 E0308。这个报错本身也算一格证人——
+**修复前 `run` 根本不去编译用户程序，这种错误会静默溜过去**。教训照旧：**变异要等长**，
+否则量的是类型系统而不是判据。
+
+### 三、门禁与回归
+
+`check` **17/17**；`handles` 档 run-963/964 PASS(33)；`handles,resident-init` 档 run-966
+（elf `0ffc39a59bdb`，**同一哈希第四次复现**）仍是 park 行收尾、`HANG(-1)` ⇒ §237/§238 的常驻判据
+没被这次改动动摇。默认档见下一节。
+
+### 四、量到一个**先前没记的抖动**：`t_q2_workload_slots` 的峰值判据
+
+修完之后默认档头一跑 run-965 报 **FAIL(35)**，`ktests 81/82`，红因：
+
+```text
+q2(P3): … active基线=7 active峰值=13 … 全装得下=true …
+q2: 判据不成立 cap=true full=true peak=false done=true rollback=true baseline=true
+```
+
+而 run-955 那一次同一判据读到的是 **`active峰值=14`** 并通过。
+
+- **不是这次改动造成的（结构论证，不靠样本）**：两跑的 `启动产物=normal/elf 9162862fca2d` 是
+  **同一份字节**，而 `ensure_image` 改的全是 QEMU 启动**之前**的宿主机步骤，动不到 guest 时序。
+- **是判据自身的形状**：`全装得下` 依赖"某一瞬间的同时活跃数正好被采到 基线7+新7=14"，
+  这是**峰值采样**判据；采样错过一个任务就落在 13 ⇒ 低率抖动，`peak` 是唯一红的那一格。
+- **抖动率（同 ELF，样本小，只作方向不作基线）**：run-952、955、967–971 共 **7 绿**，run-965 **1 红** ⇒ 约 1/8。
+- **没有去改这条判据**：换成"峰值 ≥ 期望"或"每个任务都被观察到过 active"要重开 ADR-073 那套额度判据，
+  那是独立一片并要自己的负样本。这里只把形状、率与不归因写全。
+
+### 五、仍开着
+
+判据②的驱动测量（resident 产物 × socket chardev 那一格的已知间歇挂，§237 三）、durable 矩阵行、
+`run_serial_rx` 调用点缺必填实参（§236 五）、`t_q2` 峰值判据抖动（本节四）、阻塞读/唤醒、
+S6 framebuffer + PS/2。本轮没有跑完整 `test` 矩阵、bench、长稳或真机。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。
