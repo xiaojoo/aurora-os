@@ -9642,6 +9642,43 @@ load_into: 子AS=0 段=3 页=5 entry=0x100000000 data=0x100002000
   thread_create(停住) → process_start 回填 StartupInfo → 放行`；判据=无 CREATE 权限拒 `E_DENIED`。
 - 仍开着：S4c（`MAX_TASKS` 余量）、S4a/S4b-1 负样本、S5 串口 shell、S6 framebuffer+PS/2。
 
+## 233. **S4b-2 落地：产品路径句柄驱动启动，"权限只从句柄来"实测成立**（2026-11-12，实测）
+
+`stage_init_user()` 按 `handles` 特性二选一：无该特性走 S4a 的 `spawn_user`（默认档不变），
+有该特性走完整句柄序列。
+
+### 一、序列（有 handles 档）
+
+`job_create → grant_job ×2（一个无 CREATE、一个有）→ process_create → load_into（S4b-1）→
+vmo_create 写 StartupInfo（魔数+ABI+一条 ROLE_JOB 转移）→ grant_vmo → 14 号铺 si 页进子 AS →
+15 号 thread_create（停住）→ 16 号 process_start 放行`。
+
+**为什么走 `syscall_dispatch` 而不是直接调内核函数**：15/16 号的权限校验、句柄转移、
+StartupInfo 回填都长在 syscall 层；产品路径走同一条 ABI 才是"权限只从句柄来"的真实证明，
+绕过去等于自己给自己发权限。
+
+### 二、实测读数
+
+- **handles 档 run-925**（elf `870a8db7e866`）：
+  `init-user(S4b-2): 无CREATE拒=true Proc句柄=327682 子AS=0 段=3 页=5 线程停住=true`
+  `start_ret=0 跑过次数=1 等待收工=true si_va=0x250000000`；ktests **89/89**、verdict **PASS(33)**。
+  ⇒ **判据①命中**：无 CREATE 权限的 Job 句柄造进程返回 `E_DENIED`；线程建出来是停住的、
+  放行后**真跑过**（runs=1）而且**自己收工了**。
+- **默认档 run-924**（elf `a34c006b024b`）：S4a 路径不变，ktests **82/82**、PASS(33)、信箱读数不变。
+
+### 三、门禁连锁
+
+`public_api` 漏登记 4 个（`proc::job_create`、`proc::job_gen`、`sched::runs_of`、`user::load_into`）⇒ 登记；
+`check-interface-change` 要求伴随 ADR ⇒ **ADR-082 补记** S4b-1/S4b-2 的决策与实测。`check` **17/17**。
+
+### 四、欠账（不掩盖）
+
+- **信箱判据在子 AS 里读不到**：`user::read_at` 走当前 AS 的 `peek_u64` ⇒ S4b-2 改用
+  `runs_of(gidx) > 0` 作"真跑过"的判据。**AS 感知的 peek 尚未做**，所以"子进程写对了信箱"这一格**没验**。
+- S4b-2 **没有独立负样本**（`E_DENIED` 是内建判据，但"去掉 CREATE 就拒"的变异未做）。
+- **`handles` 仍是可选特性**，默认档不走句柄路径；把它变成默认是 W5 的后续决定。
+- 仍开着：S4c（`MAX_TASKS` 余量）、S4a/S4b-1/S4b-2 负样本、S5 串口 shell、S6 framebuffer+PS/2。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

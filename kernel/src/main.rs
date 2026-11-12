@@ -820,6 +820,7 @@ fn run_ktests_and_finish() -> ! {
 ///
 /// 装载产物用与 ktest 同源的嵌入式夹具（`ktests::common::HELLO_ELF`），
 /// 从卷上取 ELF 那条路已在 L3-C 交付，这里不重做。
+#[cfg(not(feature = "handles"))]
 fn stage_init_user() {
     let loaded = match crate::user::load(crate::ktests::common::HELLO_ELF) {
         Ok(l) => l,
@@ -847,6 +848,98 @@ fn stage_init_user() {
     crate::log_info!(
         "init-user: 产品路径起 ring3 任务={} entry={:#x} 栈顶={:#x} 段={} 页={} 等待收工={} 信箱 magic={:?} ping={:?} add={:?}",
         t, loaded.entry, loaded.stack_top, loaded.segs, loaded.pages, done, magic, ping, add
+    );
+}
+
+#[cfg(feature = "handles")]
+fn stage_init_user() {
+    use crate::arch::x86_64::trap::TrapFrame;
+    use crate::handle::{self, Handle, RIGHT_CREATE, RIGHT_DUP, RIGHT_MAP, RIGHT_READ, RIGHT_TRANSFER, RIGHT_WRITE};
+    use crate::user::{
+        SYS_ASPACE_MAP, SYS_PROCESS_CREATE, SYS_PROCESS_START, SYS_THREAD_CREATE, syscall_dispatch,
+        ABI_MAJOR, ABI_MINOR, SI_MAGIC, SI_OFF_HANDLES, SI_DESC_BYTES, SI_DESC_ROLE, SI_DESC_HANDLE,
+        ROLE_JOB, E_DENIED,
+    };
+    use crate::{proc, vmo};
+
+    let Some(owner) = sched::current_identity() else {
+        crate::log_warn!("init-user: 启动上下文没有身份 ⇒ 产品路径没起用户程序");
+        return;
+    };
+    let mut f = TrapFrame {
+        cr2: 0, r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
+        rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0, vector: 0,
+        error_code: 0, rip: 0, cs: 0, rflags: 0, rsp: 0, ss: 0,
+    };
+    // 根 Job 由内核持有，只在这里出示。两个句柄：一个**没有 CREATE**（判据用），一个有。
+    let job = match proc::job_create(None, 2, 64) { Ok(v) => v, Err(e) => {
+        crate::log_warn!("init-user: job_create 失败 {:?}", e); return;
+    } };
+    let jgen = proc::job_gen(job).unwrap_or(0);
+    let hj_plain = match handle::grant_job(owner, job, jgen, RIGHT_READ | RIGHT_DUP) {
+        Ok(h) => h, Err(_) => { crate::log_warn!("init-user: grant_job(plain) 失败"); return; }
+    };
+    let hj = match handle::grant_job(owner, job, jgen, RIGHT_READ | RIGHT_DUP | RIGHT_CREATE | RIGHT_TRANSFER) {
+        Ok(h) => h, Err(_) => { crate::log_warn!("init-user: grant_job(create) 失败"); return; }
+    };
+    // **判据①：无 CREATE 权限的 Job 句柄必须拒 E_DENIED**（权限只从句柄来）。
+    f.rax = SYS_PROCESS_CREATE; f.rdi = hj_plain.0; f.rsi = 0; f.rdx = 0; f.r10 = 0;
+    syscall_dispatch(&mut f);
+    let denied = f.rax == E_DENIED;
+    f.rax = SYS_PROCESS_CREATE; f.rdi = hj.0;
+    syscall_dispatch(&mut f);
+    let hp = Handle(f.rax);
+    let (pid, pgen) = match handle::resolve(hp, owner, 0) {
+        Ok((handle::ObjRef::Proc { slot, gen }, _)) => (slot, gen),
+        _ => { crate::log_warn!("init-user: Proc 句柄解不开 ret={:#x}", f.rax); return; }
+    };
+    let Some((aslot, _)) = proc::proc_aspace(pid, pgen) else {
+        crate::log_warn!("init-user: 进程没有 AS"); return;
+    };
+    // S4b-1 的装载器：真 ELF 进**子 AS**，映射经 aspace_map_slot（那棵树）。
+    let loaded = match crate::user::load_into(aslot, crate::ktests::common::HELLO_ELF) {
+        Ok(l) => l,
+        Err(e) => { crate::log_warn!("init-user: load_into 失败 {}", crate::user::describe_load(e)); return; }
+    };
+    // StartupInfo 页：魔数 + ABI + 一条 ROLE_JOB 转移（把带 CREATE 的 Job 句柄交给子进程）。
+    let si = match vmo::vmo_create(1) { Ok(v) => v, Err(_) => { crate::log_warn!("init-user: si vmo 失败"); return; } };
+    let mut hdr = [0u8; SI_OFF_HANDLES];
+    hdr[0..4].copy_from_slice(&SI_MAGIC.to_le_bytes());
+    hdr[4..6].copy_from_slice(&(ABI_MAJOR as u16).to_le_bytes());
+    hdr[6..8].copy_from_slice(&(ABI_MINOR as u16).to_le_bytes());
+    hdr[8..12].copy_from_slice(&1u32.to_le_bytes());
+    if vmo::vmo_write(si, 0, &hdr) != Ok(hdr.len()) { crate::log_warn!("init-user: si 头写失败"); return; }
+    let mut d = [0u8; SI_DESC_BYTES];
+    d[SI_DESC_ROLE..SI_DESC_ROLE + 4].copy_from_slice(&ROLE_JOB.to_le_bytes());
+    d[SI_DESC_HANDLE..SI_DESC_HANDLE + 8].copy_from_slice(&hj.0.to_le_bytes());
+    if vmo::vmo_write(si, SI_OFF_HANDLES, &d) != Ok(SI_DESC_BYTES) { crate::log_warn!("init-user: si 描述写失败"); return; }
+    let hi = match handle::grant_vmo(owner, si, RIGHT_READ | RIGHT_WRITE | RIGHT_MAP) {
+        Ok(h) => h, Err(_) => { crate::log_warn!("init-user: grant_vmo(si) 失败"); return; }
+    };
+    vmo::vmo_unref(si);
+    // si 页也要经 14 号铺进子 AS（rdx = Proc 句柄别名）。
+    f.rax = SYS_ASPACE_MAP; f.rdi = hi.0; f.rsi = 0; f.rdx = hp.0; f.r10 = 0x2_5000_0000;
+    syscall_dispatch(&mut f);
+    let si_va = f.rax;
+    // 15：建一条**停住**的线程。
+    f.rax = SYS_THREAD_CREATE; f.rdi = hp.0; f.rsi = loaded.entry; f.rdx = loaded.stack_top; f.r10 = 0;
+    syscall_dispatch(&mut f);
+    let ht = Handle(f.rax);
+    let (gidx, _tid) = match handle::resolve(ht, owner, 0) {
+        Ok((handle::ObjRef::Thread { gidx, id }, _)) => (gidx, id),
+        _ => { crate::log_warn!("init-user: Thread 句柄解不开 ret={:#x}", f.rax); return; }
+    };
+    let stopped = matches!(sched::state_of(gidx), sched::TaskState::Blocked(_));
+    // 16：回填 StartupInfo 并放行。
+    f.rax = SYS_PROCESS_START; f.rdi = hp.0; f.rsi = ht.0; f.rdx = hi.0; f.r10 = si_va;
+    syscall_dispatch(&mut f);
+    let started = f.rax;
+    apic::timer_start().ok();
+    let done = apic::with_interrupts(|| sched::wait_for_task(gidx, crate::clock::window_cycles(32)));
+    let runs = sched::runs_of(gidx);
+    crate::log_info!(
+        "init-user(S4b-2): 无CREATE拒={} Proc句柄={} 子AS={} 段={} 页={} 线程停住={} start_ret={} 跑过次数={} 等待收工={} si_va={:#x}",
+        denied, hp.0, aslot, loaded.segs, loaded.pages, stopped, started, runs, done, si_va
     );
 }
 

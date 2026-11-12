@@ -77,6 +77,40 @@ hello 写完信箱就停在自旋里，**不会自己收工**。所以有界等�
 - 回滚：删掉 `stage_init_user()` 的调用即回到"产品路径不起 ring3"。
 - 不可回滚部分：无。
 
+## 补记（2026-11-12）：S4b-1 与 S4b-2 已落地
+
+### S4b-1：`user::load_into(aslot, bytes)`（实测）
+
+此前 `load()` 只往**当前 AS** 映射，子 AS 只映过 `jmp .` 桩 ⇒ "真 ELF 进子 AS"是缺口（BACKLOG §231）。
+新入口与 `load()` 三点不同：**不做全局 VA 保留**（ADR-070 A4：同一 VA 在两个 AS 里互不影响，
+冲突在那棵树里判）、**逐段走 `mm::aspace_map_slot`**（返回 `AspaceMapping`，`OwnedSet::push_asmap` 收）、
+**栈 VA 从 `USER_MMAP_BASE` 起**（镜像按设计在它下面）。
+用例 `t_load_into_child_as`：生效位对=true、销毁=true、**帧账与 AS 数都回原值**（run-923，ktests 82/82）。
+
+### S4b-2：产品路径**句柄驱动**的启动（实测）
+
+`stage_init_user()` 按 `handles` 特性二选一：
+- **无 `handles`**：保持 S4a 的 `spawn_user` 路径（默认档不变）。
+- **有 `handles`**：`job_create → grant_job`（两个：一个**无 CREATE**、一个有）→
+  `process_create` → `load_into` → `vmo_create` 写 `StartupInfo`（魔数+ABI+一条 `ROLE_JOB` 转移）→
+  `grant_vmo` → 14 号铺 si 页进子 AS → 15 号 `thread_create`（**停住**）→ 16 号 `process_start` 放行。
+
+**判据①（权限只从句柄来）实测命中**：`无CREATE拒=true`（无 CREATE 的 Job 句柄造进程返回 `E_DENIED`）。
+**实测读数**（run-925，`handles` 档，elf `870a8db7e866`）：
+`Proc句柄=327682 子AS=0 段=3 页=5 线程停住=true start_ret=0 跑过次数=1 等待收工=true si_va=0x250000000`；
+ktests **89/89**、verdict **PASS(33)**。默认档 run-924 仍 **82/82 PASS(33)**、S4a 信箱读数不变。
+
+**为什么用 `syscall_dispatch` 而不是直接调内核函数**：15/16 号的权限校验、句柄转移、
+`StartupInfo` 回填都长在 syscall 层；产品路径走同一条 ABI 才是"权限只从句柄来"的真实证明，
+绕过去就等于自己给自己发权限。
+
+### 本补记的欠账
+
+- **信箱判据在子 AS 里读不到**：`user::read_at` 走当前 AS 的 `peek_u64`，
+  所以 S4b-2 改用 `runs_of(gidx) > 0` 作"真跑过"的判据。**AS 感知的 peek 尚未做**。
+- S4b-2 **没有独立负样本**（`E_DENIED` 那条是内建判据，但"把 CREATE 去掉就拒"的变异未做）。
+- `handles` **仍是可选特性**，默认档不走句柄路径；把它变成默认是 W5 的后续决定。
+
 ## 未决
 
 1. **S4b 的句柄授予形状**：init 的句柄由谁授予、`StartupInfo` 怎么回填（ADR-075 决策 3）。
