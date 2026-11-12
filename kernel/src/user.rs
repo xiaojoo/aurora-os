@@ -1894,6 +1894,111 @@ pub fn load(bytes: &[u8]) -> Result<Loaded, LoadError> {
     })
 }
 
+/// S4b-1（ADR-082 后续，BACKLOG §231）：把一份真 ELF 装进**指定的子地址空间**。
+///
+/// **为什么需要它**：`load()` 只往**当前** AS 映射（走 `mm::map`），所以此前所有用户程序
+/// 都跑在 boot AS 里；子 AS 那条路只映过 `jmp .` 桩。"权限只从句柄来"要求真 ELF 进子 AS，
+/// 这个入口就是那个前置（§231 勘察结论）。
+///
+/// 与 `load()` 的三点不同，每点都有理由：
+/// 1. **不做全局 VA 保留**：`reserve_va_at`/`alloc_user_va_range` 查的是**当前 AS** 的映射与
+///    全局登记表，而 ADR-070 A4 明写"同一 VA 在两个 AS 里各自映射互不影响"。
+///    子 AS 的镜像 VA 由 ELF 自己指定，冲突在**那棵树**里判（`aspace_map_slot` 的 `AlreadyMapped`）。
+/// 2. **逐段走 `aspace_map_slot`**：它按槽号核 `used`、在那棵 PML4 里铺叶子，返回 `AspaceMapping`
+///    （不拥有帧，Drop 里 `frame_put`），所以 `OwnedSet` 用 `push_asmap` 收。
+/// 3. **栈 VA 固定从 `USER_MMAP_BASE` 起**：子 AS 没有自己的动态区分配器，
+///    而镜像按设计落在 `[USER_VA_BASE, USER_MMAP_BASE)`，所以动态区第一段不会与镜像撞。
+///    低那一页永不映射当 guard（与 `load()` 同形状）。
+///
+/// 失败不留半截：已铺的映射都在 `owned` 里，调用方丢弃它即逐条 Drop 退还。
+pub fn load_into(aslot: u8, bytes: &[u8]) -> Result<Loaded, LoadError> {
+    let p = elf::parse(bytes).map_err(LoadError::Elf)?;
+    let (image_lo, image_hi, image_pages) = check_image_span(&p)?;
+    let mut data_va = 0u64;
+    let mut owned = crate::sched::OwnedSet::new();
+
+    for seg in p.segments() {
+        if seg.vaddr % mm::PAGE as u64 != 0 {
+            return Err(LoadError::SegmentNotPageAligned { va: seg.vaddr });
+        }
+        let pages = (seg.memsz + (mm::PAGE as u64) - 1) / mm::PAGE as u64;
+        if pages == 0 {
+            continue;
+        }
+        let flags = if seg.executable {
+            PageFlags::USER_RX
+        } else if seg.writable {
+            PageFlags::USER_RW
+        } else {
+            PageFlags::USER_R
+        };
+        let mut k = 0u64;
+        while k < pages {
+            let order = (pages - k).ilog2() as u8;
+            let block = 1u64 << order;
+            let frame = mm::phys_alloc(order, MOD_USER).map_err(LoadError::Mm)?;
+            let block_base = frame.base().via_hhdm().0;
+            let mut pas: [u64; 64] = [0; 64];
+            if block as usize > pas.len() {
+                return Err(LoadError::Mm(mm::MmError::Unsupported));
+            }
+            for j in 0..block {
+                let page_in_seg = k + j;
+                let fill = block_base + j * mm::PAGE as u64;
+                let copy = seg
+                    .filesz
+                    .saturating_sub(page_in_seg * mm::PAGE as u64)
+                    .min(mm::PAGE as u64) as usize;
+                // SAFETY: `fill` 是刚拿到手的连续页框块里第 j 页的 HHDM 别名，恰好一页；
+                // 这块帧除了我们没有别的主人（phys_alloc 刚发出来，还没装叶子）。
+                unsafe { core::ptr::write_bytes(fill as *mut u8, 0, mm::PAGE) };
+                if copy > 0 {
+                    let at = seg.offset + page_in_seg * mm::PAGE as u64;
+                    let src = bytes
+                        .get(at as usize..at as usize + copy)
+                        .ok_or(LoadError::FileSliceGone { at, len: copy })?;
+                    // SAFETY: src 是文件缓冲里刚 checked 的 copy 字节，目标是刚清零那一页内部。
+                    unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), fill as *mut u8, copy) };
+                }
+                pas[j as usize] = frame.base().0 + j * mm::PAGE as u64;
+            }
+            let m = mm::aspace_map_slot(
+                aslot,
+                &pas[..block as usize],
+                VirtAddr(seg.vaddr + k * mm::PAGE as u64),
+                flags,
+                MOD_USER,
+            )
+            .map_err(LoadError::Mm)?;
+            owned.push_asmap(m).map_err(LoadError::Mm)?;
+            k += block;
+        }
+        if seg.writable && data_va == 0 {
+            data_va = seg.vaddr;
+        }
+    }
+
+    // 用户栈：动态区第一段的第二页（第一页当 guard，永不映射）。
+    let stack_va = mm::USER_MMAP_BASE + mm::PAGE as u64;
+    let sf = mm::phys_alloc(0, MOD_USER).map_err(LoadError::Mm)?;
+    // SAFETY: HHDM 别名、恰好一页、还没有别的主人（与 load() 里那条同形状）。
+    unsafe { core::ptr::write_volatile(sf.base().via_hhdm().0 as *mut u64, 0) };
+    let m = mm::aspace_map_slot(aslot, &[sf.base().0], VirtAddr(stack_va), PageFlags::USER_RW, MOD_USER)
+        .map_err(LoadError::Mm)?;
+    owned.push_asmap(m).map_err(LoadError::Mm)?;
+
+    Ok(Loaded {
+        entry: p.entry,
+        data_va,
+        stack_top: stack_va + mm::PAGE as u64 - 16,
+        segs: p.n,
+        pages: image_pages,
+        image_lo,
+        image_hi,
+        owned,
+    })
+}
+
 /// 内核开 SMAP 窗口读用户页里的**任意**一个 VA（`read_slot` 的通用版，
 /// 容器加载出来的程序槽位地址不固定，所以按 VA 而不是按段内偏移）。
 ///

@@ -2781,3 +2781,41 @@ fn t_aspace_switch_isolation() -> bool {
     ok
 }
 ktest!(KT_ASPACE_SWITCH, t_aspace_switch_isolation);
+
+/// S4b-1（BACKLOG §231/§232）：`user::load_into` 把**真 ELF** 装进**子 AS**。
+/// 判据：①子 AS 里代码段生效位 user+X+不可写、数据段 user+W+不可 X、栈 user+W（查的是**那棵树**）
+/// ②丢弃 + 销毁之后**帧账与 AS 数都回到原值**（失败不留半截）。
+fn t_load_into_child_as() -> bool {
+    let f0 = mm::free_frames();
+    let a0 = mm::aspace_count();
+    let (aslot, _gen) = match mm::aspace_new_kernel() {
+        Some(v) => v,
+        None => { crate::log_fatal!("load_into: 建子 AS 失败"); return false; }
+    };
+    let r = crate::user::load_into(aslot, crate::ktests::common::HELLO_ELF);
+    let (ok, segs, pages, entry, data_va) = match &r {
+        Ok(l) => {
+            let code = mm::aspace_effective_flags(aslot, l.entry);
+            let data = mm::aspace_effective_flags(aslot, l.data_va);
+            let stack = mm::aspace_effective_flags(aslot, l.stack_top);
+            let good = code.is_some_and(|f| f.user && f.executable && !f.writable)
+                && data.is_some_and(|f| f.user && f.writable && !f.executable)
+                && stack.is_some_and(|f| f.user && f.writable);
+            (good, l.segs, l.pages, l.entry, l.data_va)
+        }
+        Err(e) => {
+            crate::log_fatal!("load_into: 装载失败 —— {}", crate::user::describe_load(*e));
+            (false, 0, 0, 0, 0)
+        }
+    };
+    drop(r);
+    let destroyed = mm::aspace_destroy(aslot);
+    let frames_back = mm::free_frames() == f0;
+    let as_back = mm::aspace_count() == a0;
+    crate::log_info!(
+        "load_into: 子AS={} 段={} 页={} entry={:#x} data={:#x} 生效位对={} 销毁={} 帧回原值={} AS数回原值={}",
+        aslot, segs, pages, entry, data_va, ok, destroyed, frames_back, as_back
+    );
+    ok && destroyed && frames_back && as_back
+}
+ktest!(KT_LOAD_INTO_CHILD_AS, t_load_into_child_as);

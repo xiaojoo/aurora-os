@@ -1,6 +1,6 @@
 # unsafe 逐处审计表（U1–U6）
 
-总计 382 处。U1 67 · U2 101 · U3 13 · U4 131 · U5 34 · U6 36
+总计 385 处。U1 67 · U2 104 · U3 13 · U4 131 · U5 34 · U6 36
 
 本表由 `tools/aurora.py` 的 `unsafe_sites()` 从源码逐处生成，**不是手写的**。
 机器可读的权威来源是 `docs/security/unsafe-whitelist.toml` 的 `[modules.*]` 段（模块×类别→处数），
@@ -10,7 +10,7 @@
 ## 类别
 
 - **U1 架构入口与特殊寄存器** — 67 处，分布在 14 个模块：arch/x86_64/apic、arch/x86_64/cpu、arch/x86_64/smp、arch/x86_64/trap、hw、ktests/sched、mm、sched、serial、sync、tsc、user、user/hello
-- **U2 页表、物理内存与 MMIO** — 101 处，分布在 11 个模块：acpi、arch/x86_64/apic、heap、hw、ktests/mm、limine、mm、pci、sched、user、vmo
+- **U2 页表、物理内存与 MMIO** — 104 处，分布在 11 个模块：acpi、arch/x86_64/apic、heap、hw、ktests/mm、limine、mm、pci、sched、user、vmo
 - **U3 DMA 与设备共享内存** — 13 处，分布在 2 个模块：driver、limine
 - **U4 并发共享状态与 UnsafeCell** — 131 处，分布在 20 个模块：acpi、ahci、arch/x86_64/apic、arch/x86_64/smp、arch/x86_64/trap、driver、hooks、irq、ktests/elf、ktests/fs、ktests/sign、main、mm、pci、proc、sched、sync、user、virtio、vmo
 - **U5 用户指针与地址空间访问** — 34 处，分布在 3 个模块：user、user/hello、user/probe
@@ -759,6 +759,10 @@
 - `kernel/src/user.rs:1107` [{] **U2** fn=`load`
   > unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), fill as *mut u8, copy) }; } } 
 - `kernel/src/user.rs:1129` [{] **U2** fn=`load`
+
+- `kernel/src/user.rs:1954` [{] **U2** fn=`load_into`
+- `kernel/src/user.rs:1961` [{] **U2** fn=`load_into`
+- `kernel/src/user.rs:1985` [{] **U2** fn=`load_into`
   > unsafe { core::ptr::write_volatile(sf.base().via_hhdm().0 as *mut u64, 0) }; let m = mm::map(VirtAddr(stack_va), sf, PageFlags::USER_RW).map_err(LoadError::Mm)?; owned.push(m).map_err(LoadError::Mm)?; 
 
 ### user/hello

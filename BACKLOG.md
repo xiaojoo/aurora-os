@@ -9599,6 +9599,49 @@ hello 写完信箱就停在自旋里、**不会自己收工**，所以有界等�
 **下一步从 S4b-1 开始**：先做面向子 AS 的装载器，配"段权限生效位"与"失败退干净"两条判据。
 仍开着：S4b-1/S4b-2、S4c（`MAX_TASKS` 余量）、S4a 的负样本欠账、S5 串口 shell、S6 framebuffer+PS/2。
 
+## 232. **S4b-1 落地：`user::load_into(aslot, bytes)`——真 ELF 装进子 AS**（2026-11-12，实测）
+
+§231 勘察出的前置缺口补上了。**这是仓库里第一次把一份真用户 ELF 装进子地址空间**
+（此前子 AS 只映过 `jmp .` 桩）。
+
+### 一、实现要点（与 `load()` 的三点不同，每点都有理由）
+
+1. **不做全局 VA 保留**：`reserve_va_at`/`alloc_user_va_range` 查的是**当前 AS** 与全局登记表，
+   而 ADR-070 A4 明写"同一 VA 在两个 AS 里各自映射互不影响"。子 AS 的冲突在**那棵树**里判
+   （`aspace_map_slot` 的 `AlreadyMapped`）。
+2. **逐段走 `mm::aspace_map_slot`**：按槽号核 `used`、在那棵 PML4 里铺叶子，返回 `AspaceMapping`
+   （不拥有帧，Drop 里 `frame_put`）⇒ `OwnedSet` 用 **`push_asmap`** 收。
+3. **栈 VA 固定从 `USER_MMAP_BASE` 起**：子 AS 没有自己的动态区分配器，而镜像按设计落在
+   `[USER_VA_BASE, USER_MMAP_BASE)` ⇒ 动态区第一段不会与镜像撞；低那一页当 guard 永不映射。
+
+段权限与 `load()` 同一套：代码 `USER_RX`、可写段 `USER_RW`、只读段 `USER_R`。
+失败不留半截：已铺映射都在 `owned` 里，丢弃即逐条 Drop 退还。
+
+### 二、新用例与读数（run-923，elf `c76f3677b36e`）
+
+`t_load_into_child_as`：建子 AS → `load_into(HELLO_ELF)` → 核**那棵树**的生效位 → 丢弃 + 销毁 → 核账。
+```
+load_into: 子AS=0 段=3 页=5 entry=0x100000000 data=0x100002000
+           生效位对=true 销毁=true 帧回原值=true AS数回原值=true
+[test] t_load_into_child_as -> ok      ktests: total=82 passed=82 failed=0      verdict: PASS(33)
+```
+**S4a 的 init-user 仍正常**（信箱 magic/ping/add 不变）⇒ 没打破前一片。
+
+### 三、门禁连锁
+
+新增 3 处 unsafe（HHDM 清零 / 拷贝 / 栈页清零，都带 SAFETY 论证）⇒
+`user U2 5→8`、census `总计 382→385 / U2 101→104` + 三条逐处行、whitelist 汇总同步。
+`check` **17/17**。**又一次踩 CRLF 锚点坑**（whitelist 是 CRLF，第一版用 LF 锚点不命中），
+按字节重修才过——这是本会话第 N 次，纪律仍是"改登记文件一律按字节、先看行尾"。
+
+### 四、欠账与下一步
+
+- **本片没有负样本**：应当验"装进子 AS 后**当前 AS 不受影响**"与"装载失败退干净"。
+  后者已由帧账/AS 数回原值部分覆盖，前者**未验**。
+- **S4b-2**：产品路径 `job_create → grant_job(CREATE) → process_create → load_into →
+  thread_create(停住) → process_start 回填 StartupInfo → 放行`；判据=无 CREATE 权限拒 `E_DENIED`。
+- 仍开着：S4c（`MAX_TASKS` 余量）、S4a/S4b-1 负样本、S5 串口 shell、S6 framebuffer+PS/2。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。
