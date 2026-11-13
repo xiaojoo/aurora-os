@@ -820,13 +820,16 @@ fn tofu(bits: &mut [u32; 32]) {
     }
 }
 
-/// 标题栏占屏幕最上面几行（正文与输入行都从它下面开始）。
+/// 顶部这一行是**标签栏**（不是标题栏）：一个标签页 + 一个 `+`，右侧是窗口按钮。
+/// 标签页只有一个（今天只有一个会话），但布局按"N 个标签 + 是否溢出"写成规则。
 pub const TITLE_ROWS: u64 = 1;
-/// 标题栏上的文字。**只画亮像素**，底色由标题栏自己铺，所以文字与底色是两层。
-pub const TITLE_TEXT: &str = "Aurora OS  —  shell";
-/// 标题栏配色：比正文底色略亮的深灰 + 底部一条更亮的 2px 分隔线（窗框的感觉）。
-const TITLE_BG: u32 = 0x00_2D_2D_2D;
+/// 标签上的标题。
+pub const TAB_LABEL: &str = "Aurora shell";
+/// 标签栏的底色（比正文亮一点）与底部 2px 分隔线（更亮）。
+const TITLE_BG: u32 = 0x00_1E_1E_1E;
 const TITLE_BG_HI: u32 = 0x00_45_45_45;
+/// 选中标签的底色（再亮一级，像 Windows Terminal 的活动页）。
+const TAB_BG: u32 = 0x00_2D_2D_2D;
 
 /// 配色取 Windows Terminal 的默认：近黑底（#0C0C0C）+ 浅灰字（#CCCCCC）。
 /// 纯黑/纯白看着"生"、对比也过强；这一对与测试图案的三条带仍然都不同 ⇒
@@ -951,43 +954,113 @@ impl Term {
         true
     }
 
-    /// 标题栏：整行铺 [`TITLE_BG`]（底部 2px 用更亮的 [`TITLE_BG_HI`] 当分隔线），
-    /// 左端写 [`TITLE_TEXT`]。**这一行不参与正文**：调用方从它下面开始画日志。
-    pub fn title_bar(&self, f: &Frame) {
-        for y in 0..CELL_H {
-            let color = if y + 2 >= CELL_H { TITLE_BG_HI } else { TITLE_BG };
-            for x in 0..self.cols * CELL_W {
+    /// 画一条实心矩形（屏幕像素坐标）。
+    fn rect(&self, f: &Frame, x0: u64, y0: u64, w: u64, h: u64, color: u32) {
+        for y in y0..y0 + h {
+            for x in x0..x0 + w {
                 if f.put(x, y, color).is_err() {
                     return;
                 }
             }
         }
-        let mut c = 1u64;
-        for ch in TITLE_TEXT.chars() {
-            let w = char_cells(ch);
-            if c + w > self.cols {
-                break;
-            }
-            let x0 = c * CELL_W;
-            if let Some(i) = wide_idx(ch) {
-                for r in 0..32u64 {
-                    if !self.ink(f, x0, r * SCALE, FONT_WIDE[i][r as usize], 32) {
-                        return;
-                    }
-                }
-            } else {
-                let k = ch as u32;
-                if (0x20..=0x7E).contains(&k) {
-                    let idx = (k - 0x20) as usize;
-                    for r in 0..32u64 {
-                        if !self.ink(f, x0, r * SCALE, FONT_ASCII[idx][r as usize] as u32, 16) {
+    }
+
+    /// 画一个字符的亮像素（可指定颜色）。表外字符什么都不画。
+    fn ch_ink(&self, f: &Frame, x0: u64, y0: u64, ch: char, color: u32) {
+        if let Some(i) = wide_idx(ch) {
+            for r in 0..32u64 {
+                for c in 0..32u64 {
+                    if FONT_WIDE[i][r as usize] & (1 << (31 - c)) != 0 {
+                        if f.put(x0 + c, y0 + r, color).is_err() {
                             return;
                         }
                     }
                 }
             }
-            c += w;
+        } else {
+            let k = ch as u32;
+            if !(0x20..=0x7E).contains(&k) {
+                return;
+            }
+            let g = FONT_ASCII[(k - 0x20) as usize];
+            for r in 0..32u64 {
+                for c in 0..16u64 {
+                    if g[r as usize] & (1 << (15 - c)) != 0 {
+                        if f.put(x0 + c, y0 + r, color).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
         }
+    }
+
+    /// `×` 形的两点笔画（标签页的关闭按钮、右侧的关闭按钮都用它）。
+    fn cross(&self, f: &Frame, x0: u64, y0: u64, size: u64, color: u32) {
+        for i in 0..size {
+            for t in 0..2u64 {
+                let _ = f.put(x0 + i, y0 + i + t, color);
+                let _ = f.put(x0 + size - 1 - i, y0 + i + t, color);
+            }
+        }
+    }
+
+    /// 标签栏。`n_tabs` 是要显示的标签数：**装不下时**最右端画一个 `»`（折叠成下拉，
+    /// 与 Windows Terminal 同形）。今天只有 1 个会话 ⇒ 那个分支走不到，规则先按布局写好。
+    pub fn tab_bar(&self, f: &Frame, n_tabs: u64) {
+        let w = self.cols * CELL_W;
+        // 1) 整条底色 + 底部 2px 分隔线
+        self.rect(f, 0, 0, w, CELL_H, TITLE_BG);
+        self.rect(f, 0, CELL_H - 2, w, 2, TITLE_BG_HI);
+
+        // 2) 标签：宽 = 两侧留白 + 文字 + 关闭符
+        let label_cells = cells_of(TAB_LABEL);
+        let tab_w = label_cells + 5;                 // 左 2 + 文字 + 右 2 + 关闭 1
+        let strip_l = 1u64;
+        let strip_r = self.cols.saturating_sub(5);   // 右侧三个按钮占 4 格 + 1 格边
+        let fit = if strip_r > strip_l + tab_w { (strip_r - strip_l) / (tab_w + 1) } else { 0 };
+        let shown = n_tabs.min(fit);
+
+        for i in 0..shown {
+            let c0 = strip_l + i * (tab_w + 1);
+            self.rect(f, c0 * CELL_W, 0, tab_w * CELL_W, CELL_H - 2, TAB_BG);
+            let mut c = c0 + 2;
+            for ch in TAB_LABEL.chars() {
+                self.ch_ink(f, c * CELL_W, 0, ch, FG);
+                c += char_cells(ch);
+            }
+            // 标签自己的关闭符
+            self.cross(f, (c + 1) * CELL_W + 5, 12, 6, FG);
+        }
+        // 3) `+`：新标签（标签之后还放得下就画；不是"标签填满才画"）
+        if fit > 0 {
+            let plus_c = strip_l + shown * (tab_w + 1);
+            if plus_c < strip_r {
+                let x = plus_c * CELL_W + 4;
+                self.rect(f, x + 3, 14, 2, 8, FG);
+                self.rect(f, x, 17, 8, 2, FG);
+            }
+        }
+        // 4) 装不下 ⇒ 折叠指示（今天到不了）
+        if n_tabs > fit {
+            let x = strip_r.saturating_sub(1) * CELL_W + 4;
+            for i in 0..5u64 {
+                let _ = f.put(x + 3 + i, 12 + i, FG);
+                let _ = f.put(x + 7 - i, 12 + i, FG);
+            }
+        }
+        // 5) 右侧窗口按钮：最小化 / 最大化 / 关闭
+        let bx = strip_r * CELL_W + 4;
+        // 最小化：一条横杠
+        self.rect(f, bx, 16, 8, 2, FG);
+        // 最大化：空心方框
+        let mx = bx + CELL_W;
+        self.rect(f, mx, 11, 9, 2, FG);
+        self.rect(f, mx, 19, 9, 2, FG);
+        self.rect(f, mx, 11, 2, 10, FG);
+        self.rect(f, mx + 7, 11, 2, 10, FG);
+        // 关闭：×
+        self.cross(f, bx + 2 * CELL_W, 11, 9, FG);
     }
 
     /// 整屏刷成背景色。终端模式开屏第一步：把启动阶段画的测试图案（S6a 的红绿蓝三条带）清掉。
@@ -1129,7 +1202,7 @@ pub fn redraw_window(term: &Term, f: &Frame, max_lines: usize, caret_on: bool) -
     }
     // 版面：**标题栏（TITLE_ROWS 行）→ 日志区 → 输入行（最后一行）**。
     // 不这么分的话内核日志继续往下写，提示符会跑到屏幕中间、并被日志粘住。
-    term.title_bar(f);
+    term.tab_bar(f, 1);
     let top = TITLE_ROWS;
     let log_rows = max_lines.saturating_sub(TITLE_ROWS as usize + 1);
     let skip = total.saturating_sub(log_rows);
