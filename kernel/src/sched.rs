@@ -2367,9 +2367,18 @@ pub unsafe fn preempt_point(frame: u64, cpu: usize) {
     // `fault-if-carriage` 是这条决定的负样本：它改回"任务自己带 IF"（硬件的默认行为），
     // 用来证明这条规则不是修辞——去掉它，M3a 记录过的故障形状必须回来。
     #[cfg(not(feature = "fault-if-carriage"))]
-    let if_open = crate::arch::x86_64::apic::interrupts_enabled(cpu);
+    let mut if_open = crate::arch::x86_64::apic::interrupts_enabled(cpu);
     #[cfg(feature = "fault-if-carriage")]
-    let if_open = frame_if_bit(next).unwrap_or(false);
+    let mut if_open = frame_if_bit(next).unwrap_or(false);
+    // **换入用户任务时强制开窗**（#51 实测的修法）。ADR-021 的规矩是"IF 由本 CPU 的窗口
+    // 决定"，那对**内核**任务成立：它们被换下时留下的是中断帧，恢复时 `iretq` 会把 IF 装回来。
+    // **用户任务没有这个过程**：抢占发生在中断门里（硬件已清 IF），而换进 ring3 之后既没有人
+    // 再 `iretq`、用户态也没有开中断的手段 ⇒ 它带着 IF=0 自旋到永远，整机停摆。
+    // 现场：`framebuffer` 单档 5/5 停在 `init-user:` 之后，QMP 抓到的就是
+    // `CPL=3 RIP=0x100000492（用户半区自旋）RFL=0x46 ⇒ IF=0 HLT=0`（BACKLOG §257）。
+    if rq(cpu).tasks[nslot].user {
+        if_open = true;
+    }
     IF_LOADS[usize::from(if_open)].fetch_add(1, Ordering::Relaxed);
     // §220 **零串口换入探针**：run-701 实测 BSP 在 ring3 关中断自旋（IF=0 HLT=0 RIP 用户半区、
     // LAPIC IRR=32 已锁存）⇒ 要回答"换入它时牌是几"。只写静态量、串口零加行。
