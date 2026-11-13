@@ -250,6 +250,20 @@ extern "C" fn after_switch(_: usize) -> ! {
 /// 滚一行之后，屏幕上的第 r 行应当等于**滚动前的第 r+1 行**。宿主机照这条公式独立复算。
 #[cfg(feature = "framebuffer")]
 fn stage_fbcon_tail(total: usize, failed: usize, table_invalid: bool) {
+    // S6g：`fbcon-live` 是**终端**，不是要取样的测试图案：
+    // 这条路上不画 A..Z 填充图案、也不落冻结闸门，否则画面会在 init 等待窗口结束后
+    // 被一张测试图案盖掉、并且从此再也不刷新（终端就没法用了）。
+    #[cfg(feature = "fbcon-live")]
+    {
+        crate::log_info!("fbcon-live: 终端模式 ⇒ 跳过测试图案与冻结闸门（画面交给实时重画）");
+    }
+    #[cfg(not(feature = "fbcon-live"))]
+    fbcon_test_pattern(total, failed, table_invalid);
+}
+
+/// 取样式的一帧：填充图案 + 演示一次滚动 + 镜像最后几行 + 落冻结闸门（§242/§245 的判据靶子）。
+#[cfg(all(feature = "framebuffer", not(feature = "fbcon-live")))]
+fn fbcon_test_pattern(total: usize, failed: usize, table_invalid: bool) {
     let Ok(f) = crate::frame::Frame::init() else {
         crate::log_warn!("fbcon: tail 阶段拿不到帧缓冲");
         return;
@@ -993,6 +1007,10 @@ fn park_until_init_exits(init: Option<usize>) {
     {
         let Some(gidx) = init else { return };
         crate::log_info!("resident-init: 判定已出，等 init（任务={}）收工；没人喂命令就不会退出", gidx);
+        // S6g：判定之后的常驻期画面**继续刷新**（terminal 的意义就在这里）。
+        // 这里单独开一次映射：stage_init_user 里那一个已经随函数返回 drop 掉了。
+        #[cfg(feature = "fbcon-live")]
+        let live = LiveTerm::open();
         loop {
             // 每轮 64 窗口（约 1 s）。这中间 init 是唯一还在干的活：它读控制台，
             // 收到 `exit` 才 SYS_EXIT，于是这里下一轮就看到 Done。
@@ -1000,6 +1018,10 @@ fn park_until_init_exits(init: Option<usize>) {
             if woke {
                 crate::log_info!("resident-init: init 已收工 ⇒ 系统停机");
                 return;
+            }
+            #[cfg(feature = "fbcon-live")]
+            if let Some(t) = live.as_ref() {
+                t.repaint();
             }
         }
     }
@@ -1210,6 +1232,47 @@ fn stage_init_user() -> Option<usize> {
     Some(gidx)
 }
 
+/// S6g：`fbcon-live` 档的**活终端**——映射只做一次，之后每轮调一次 [`LiveTerm::repaint`]。
+///
+/// 它不落冻结闸门（`freeze_band` 在这条路上根本不会被调用）：冻结契约是为"取一张确定的
+/// 静止画面"服务的，而终端要一直刷新。两个变体因此各自有各自的确定性。
+#[cfg(feature = "fbcon-live")]
+struct LiveTerm {
+    frame: crate::frame::Frame,
+    term: crate::fbcon::Term,
+}
+
+#[cfg(feature = "fbcon-live")]
+impl LiveTerm {
+    fn open() -> Option<Self> {
+        let frame = match crate::frame::Frame::init() {
+            Ok(f) => f,
+            Err(e) => {
+                crate::log_warn!("fbcon-live: 拿不到帧缓冲（{:?}）⇒ 画面不会有内容", e);
+                return None;
+            }
+        };
+        let Some(term) = crate::fbcon::Term::new(&frame) else {
+            crate::log_warn!("fbcon-live: 几何放不下终端栅格 ⇒ 画面不会有内容");
+            return None;
+        };
+        // 这里**不打印**：`open()` 在等待期与常驻期各调用一次，每次打一行只会在画面上多两行噪声。
+        // 几何由 `live_wait_and_redraw` 打一次（那一次还带"每轮窗口"）。
+        // 终端模式开屏先清屏：启动阶段（S6a）画的测试图案会留在下面 2/3 屏上（用户截图里的红绿蓝）。
+        term.clear(&frame);
+        Some(Self { frame, term })
+    }
+
+    fn repaint(&self) {
+        let rows = self.term.body_rows();
+        crate::fbcon::redraw_window(&self.term, &self.frame, rows.min(LIVE_ROWS));
+    }
+}
+
+/// 实时重画的窗口行预算（一行 = 160 格 × 16 行设备写，画满 48 行会把一轮拉长）。
+#[cfg(feature = "fbcon-live")]
+const LIVE_ROWS: usize = 24;
+
 /// S6d：`fbcon-live` 档的"等 init 收工 + 每轮重画一次屏"。
 ///
 /// **为什么不新开等待语义**：用的还是同一个 `wait_for_task`，只是把一发 1000 窗口的上界拆成
@@ -1220,20 +1283,15 @@ fn stage_init_user() -> Option<usize> {
 fn live_wait_and_redraw(gidx: usize, total_windows: u64) -> bool {
     const STEP: u64 = 16;
     let one_shot = |g: usize| apic::with_interrupts(|| sched::wait_for_task(g, crate::clock::window_cycles(total_windows)));
-    let Ok(f) = crate::frame::Frame::init() else {
-        crate::log_warn!("fbcon-live: 拿不到帧缓冲 ⇒ 退回一次性等待（画面不会有键入内容）");
+    let Some(live) = LiveTerm::open() else {
+        crate::log_warn!("fbcon-live: 退回一次性等待（画面不会有键入内容）");
         return one_shot(gidx);
     };
-    let Some(term) = crate::fbcon::Term::new(&f) else {
-        crate::log_warn!("fbcon-live: 几何放不下终端栅格 ⇒ 退回一次性等待");
-        return one_shot(gidx);
-    };
-    let rows = term.body_rows();
-    // 每轮画多少行是**预算**，不是容量：一行是 160 格 × 64 像素的设备写，画满 98 行会把
-    // 一轮拉到上百毫秒，而实时重画的意义只是"取样时刻任意"。24 行足够覆盖一段问答。
-    const LIVE_ROWS: usize = 24;
-    let win = rows.min(LIVE_ROWS);
-    crate::log_info!("fbcon-live: 实时重画已开 正文行={} 窗口行={} 每轮窗口={}", rows, win, STEP);
+    crate::log_info!(
+        "fbcon-live: 活终端 正文行={} 窗口行={} 格={}x{}；实时重画已开 每轮窗口={}",
+        live.term.body_rows(), live.term.body_rows().min(LIVE_ROWS),
+        crate::fbcon::CELL_W, crate::fbcon::CELL_H, STEP
+    );
     let mut left = total_windows;
     let mut rounds = 0usize;
     loop {
@@ -1247,7 +1305,7 @@ fn live_wait_and_redraw(gidx: usize, total_windows: u64) -> bool {
             crate::log_info!("fbcon-live: 轮询={} 收工=init 自己退出", rounds);
             return true;
         }
-        crate::fbcon::redraw_window(&term, &f, win);
+        live.repaint();
     }
     crate::log_info!("fbcon-live: 轮询={} 收工=没有（等待上界到）", rounds);
     false
