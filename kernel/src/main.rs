@@ -1318,7 +1318,8 @@ fn stage_init_user(sid: u8) -> Option<usize> {
 
 /// 第二个会话的任务号（S6q 补记三）：窗口条目上的 `×` 关会话 1 时要用它终止任务。
 /// 0 = 没起（`multisession` 关掉时恒 0）。
-#[cfg(any(feature = "multisession", feature = "wm"))]
+// **不挂 cfg**：`×` 的关闭分支在"没有多会话"的档里也要编得过（它只是不会真终止谁）——
+// S6q 补记三刚踩过：不带 multisession 的那档直接 E0425。
 static SECOND_TASK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// S6g：`fbcon-live` 档的**活终端**——映射只做一次，之后每轮调一次 [`LiveTerm::repaint`]。
