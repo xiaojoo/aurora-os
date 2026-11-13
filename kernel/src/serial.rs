@@ -331,7 +331,55 @@ pub fn mirror_bytes(b: &[u8]) {
     for &x in b {
         mirror_note_byte(x);
     }
+    // 这一行已经闭合（写入了换行）⇒ 影子半行作废：下一条提示符是 shell 自己写的。
+    if b.last() == Some(&10) {
+        SHADOW_LEN.store(0, Ordering::Release);
+    }
 }
+
+
+
+
+/// **行规程**：内核日志永远从新的一行开始，用户的"半行"（提示符 + 正在键入）搬到
+/// [`INPUT_SHADOW`] 里继续显示在屏幕的输入行上。
+///
+/// 为什么要有影子行：shell 只写一次 `> `，之后内核日志不断往下写。只补换行的话，那条提示符
+/// 会被永久挤进日志区，输入行变成空白（实测）；把半行"重放到新行"又依赖环的尾字节语义，
+/// 实测拿不到（诊断里 `mirror-tail` 是空的）。影子行是显式的：**谁收尾、谁保存**一目了然。
+///
+/// **串口一个字节都不改**：这是纯画面语义。
+pub fn mirror_break_if_mid_line() {
+    let n = mirror_len();
+    if n == 0 || mirror_byte(n - 1) == 10 {
+        return;
+    }
+    let mut start = n;
+    while start > 0 && mirror_byte(start - 1) != 10 && n - start < SHADOW_CAP {
+        start -= 1;
+    }
+    let len = n - start;
+    for k in 0..len {
+        SHADOW[k].store(mirror_byte(start + k), Ordering::Relaxed);
+    }
+    SHADOW_LEN.store(len, Ordering::Release);
+    mirror_note_byte(10);
+}
+
+/// 一行里"半行"（没有换行结尾的那段）最多记多少字节给输入行显示。
+pub const SHADOW_CAP: usize = 64;
+
+static SHADOW_LEN: AtomicUsize = AtomicUsize::new(0);
+static SHADOW: [AtomicU8; SHADOW_CAP] = [const { AtomicU8::new(0) }; SHADOW_CAP];
+
+/// 输入行要显示的"影子半行"长度与第 i 个字节（画面侧只读）。
+pub fn input_shadow_len() -> usize {
+    SHADOW_LEN.load(Ordering::Acquire)
+}
+
+pub fn input_shadow_byte(i: usize) -> u8 {
+    SHADOW[i].load(Ordering::Relaxed)
+}
+
 
 /// 打一个行尾。换行是 `line()` 用 `putb` 直接写串口的、**不经过 `Sink`**，所以必须单独通知：
 /// 不通知的话环里一个换行都没有，整场启动被当成"一行"，一行也画不出（§244 实测）。
@@ -464,6 +512,9 @@ pub fn unlock_for_halt() {
 /// 顺序错开，宿主机就少了"整条日志的序号列严格递增"这一把尺子。
 pub fn line(level: &str, args: fmt::Arguments<'_>) {
     let _g = acquire_line();
+    // 行规程：新一条日志开始时，先把镜像里"半行"（用户提示符/键入）收尾 —— 串口不动。
+    #[cfg(feature = "framebuffer")]
+    mirror_break_if_mid_line();
     let seq = TICK.fetch_add(1, Ordering::Relaxed);
     putstr(b"[");
     putstr(level.as_bytes());

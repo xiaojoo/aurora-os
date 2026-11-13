@@ -1063,7 +1063,10 @@ pub fn redraw_window(term: &Term, f: &Frame, max_lines: usize, caret_on: bool) -
             total += 1;
         }
     }
-    let skip = total.saturating_sub(max_lines);
+    // **最后一行是输入行**（提示符与正在键入的字），日志区在它上面：这是"行规程"的画面侧。
+    // 不这么分的话内核日志继续往下写，提示符会跑到屏幕中间、并被日志粘住。
+    let log_rows = max_lines.saturating_sub(1);
+    let skip = total.saturating_sub(log_rows);
     let mut line = [0u8; LINE_BUF];
     let mut len = 0usize;
     let mut idx = 0usize;
@@ -1072,7 +1075,7 @@ pub fn redraw_window(term: &Term, f: &Frame, max_lines: usize, caret_on: bool) -
         let c = crate::serial::mirror_byte(i);
         if c == 10 {
             let fragment = wrapped && idx == 0;
-            if idx >= skip && !fragment && row < max_lines {
+            if idx >= skip && !fragment && row < log_rows {
                 // 合法 UTF-8 直接按字符画；被截断在多字节字符中间时取**合法前缀**
                 // （`valid_up_to`）——只丢掉那半个字，而不是把整行的中文降级成 `?`
                 // （用户截图里那串 `??????` 就是这么来的：200 字节上限切断了长中文行）。
@@ -1104,30 +1107,40 @@ pub fn redraw_window(term: &Term, f: &Frame, max_lines: usize, caret_on: bool) -
             len += 1;
         }
     }
-    // **没有换行结尾的"当前行"也要画**（shell 的 `> ` 与正在键入的字就是这么攒的）：
-    // 只画完整行的话，用户打字时屏幕上什么都不出现 —— 那看起来就是"键盘没反应"
-    // （用户实测反馈）。顺带把光标画在它末尾。
-    let mut caret_col = 0u64;
-    let mut caret_row = row as u64;
-    if len > 0 && (row as usize) < max_lines {
-        let text = match core::str::from_utf8(&line[..len]) {
-            Ok(s) => s,
-            Err(e) => core::str::from_utf8(&line[..e.valid_up_to()]).unwrap_or(""),
-        };
-        term.print_line(f, row as u64, text);
-        caret_col = cells_of(text).min(term.cols.saturating_sub(1));
-        caret_row = row as u64;
-        row += 1;
-    }
-    // 窗口里没被内容占满的行一律刷空：残影像素会被下一帧读成"那行还在"
-    while row < max_lines {
+    // 日志区没被内容占满的行一律刷空：残影像素会被下一帧读成"那行还在"
+    while row < log_rows {
         term.print_line(f, row as u64, "");
         row += 1;
     }
-    if caret_on {
-        term.caret(f, caret_col, caret_row);
+    // **输入行固定在最后一行**：没有换行结尾的那一段（`> ` + 键入）画在这里、光标也在这里。
+    // 于是提示符与光标永远在底部，日志只在它上面滚动。
+    let mut caret_col = 0u64;
+    if log_rows < max_lines {
+        // 输入行 = **影子半行**（日志开始前那条提示符，见 serial::mirror_break_if_mid_line）
+        //        + **当前半行**（`write_bytes` 之后还没换行的那些字节）。
+        let mut text: alloc::string::String = alloc::string::String::new();
+        let sl = crate::serial::input_shadow_len();
+        let mut sbuf = [0u8; crate::serial::SHADOW_CAP];
+        for i in 0..sl {
+            sbuf[i] = crate::serial::input_shadow_byte(i);
+        }
+        text.push_str(match core::str::from_utf8(&sbuf[..sl]) {
+            Ok(t) => t,
+            Err(e) => core::str::from_utf8(&sbuf[..e.valid_up_to()]).unwrap_or(""),
+        });
+        if len > 0 {
+            text.push_str(match core::str::from_utf8(&line[..len]) {
+                Ok(t) => t,
+                Err(e) => core::str::from_utf8(&line[..e.valid_up_to()]).unwrap_or(""),
+            });
+        }
+        term.print_line(f, log_rows as u64, &text);
+        caret_col = cells_of(&text).min(term.cols.saturating_sub(1));
     }
-    row.min(max_lines)
+    if caret_on {
+        term.caret(f, caret_col, log_rows as u64);
+    }
+    max_lines
 }
 
 // ------------------------------------------------------------------ S6b-3 消费端

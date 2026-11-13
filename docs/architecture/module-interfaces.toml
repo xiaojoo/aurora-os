@@ -609,6 +609,9 @@ owner = "diagnostics"
 layer = "core"
 source_modules = ["crash", "exit", "serial", "state_store", "watchdog"]
 public_api = [
+  "serial::input_shadow_byte",
+  "serial::input_shadow_len",
+  "serial::SHADOW_CAP",
   "serial::mirror_wrapped",
   "serial::mirror_total",
   "serial::mirror_len",
