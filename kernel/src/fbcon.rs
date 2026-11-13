@@ -910,7 +910,7 @@ impl Chrome {
     pub fn tabs(self) -> bool {
         !matches!(self, Chrome::Maximized | Chrome::Floating)
     }
-    /// 画不画正文（日志区 + 输入行）
+    /// 画不画正文（正文区 + 尾行）
     pub fn body(self) -> bool {
         !matches!(self, Chrome::Minimized)
     }
@@ -927,6 +927,7 @@ pub enum Hit {
     TabMin(u8),
     Tab(u8),
     NewTab,
+    Layout,
     Min,
     Max,
     Close,
@@ -945,6 +946,7 @@ impl Hit {
             Hit::Tab(1) => "标签1",
             Hit::Tab(_) => "标签N",
             Hit::NewTab => "新建标签",
+            Hit::Layout => "版面切换",
             Hit::Min => "最小化",
             Hit::Max => "最大化",
             Hit::Close => "关闭窗口",
@@ -1051,8 +1053,13 @@ pub fn hit_test(cols: u64, tabs: u64, x_px: u64, y_px: u64, ch: Chrome) -> Hit {
             };
         }
     }
-    if c == lay.plus_col(1) {
+    // S6t：`+` 的列要用**实际画出去的那个 shown**，不是写死的 1——两个标签都在时
+    // `plus_col(1)` 落在第二个标签自己的范围里，被上面那个循环先吃掉，`+` 就点不动了。
+    if c == lay.plus_col(shown) {
         return Hit::NewTab;
+    }
+    if c == lay.plus_col(shown) + 1 {
+        return Hit::Layout;
     }
     if c == lay.strip_r {
         return Hit::Min;
@@ -1606,16 +1613,16 @@ pub fn redraw_window(term: &Term, f: &Frame, max_lines: usize, sid: usize,
             total += 1;
         }
     }
-    // 版面：**标题栏（TITLE_ROWS 行）→ 日志区 → 输入行（最后一行）**。
-    // 不这么分的话内核日志继续往下写，提示符会跑到屏幕中间、并被日志粘住。
-    // 版面：标签栏（可收起）→ 日志区 → 输入行（最后一行）。
-    // 不这么分的话内核日志继续往下写，提示符会跑到屏幕中间、并被日志粘住。
+    // 版面（S6t）：**标签栏（可收起）→ 正文自顶向下 → 尾行紧跟正文**。
+    // 旧版把输入行钉在最后一行，是因为内核日志会一直往下写、提示符会被日志粘住；
+    // 日志退出画面环之后那个理由没了，钉底反而让短会话的提示符悬在屏幕中间。
+    // 写满才滚动：`skip = 总行数 - 可用行`。
     let top = if ch.tabs() { TITLE_ROWS } else { 0 };
-    let log_rows = max_lines.saturating_sub(top as usize + 1);
+    let rows = max_lines.saturating_sub(top as usize);
     if ch.tabs() {
         term.tab_bar(f, tabs, active);
     } else {
-        // 最大化：先整块刷底色（否则上一帧的标签栏会留在第一行）。三个按钮**放到最后画**——
+        // 浮窗/最大化：先整块刷底色（否则上一帧的标签栏会留在第一行）。三个按钮**放到最后画**——
         // 正文从第 0 行开始，先画按钮会被第 0 行的文字整行盖掉（本轮实测：按钮像素 0）。
         for r in 0..max_lines as u64 {
             term.print_line(f, r, "");
@@ -1628,7 +1635,7 @@ pub fn redraw_window(term: &Term, f: &Frame, max_lines: usize, sid: usize,
         }
         return (max_lines, 0, 0);
     }
-    let skip = total.saturating_sub(log_rows);
+    let skip = total.saturating_sub(rows);
     let mut line = [0u8; LINE_BUF];
     let mut len = 0usize;
     let mut idx = 0usize;
@@ -1637,21 +1644,22 @@ pub fn redraw_window(term: &Term, f: &Frame, max_lines: usize, sid: usize,
         let c = crate::serial::mirror_byte_sid(sid, i);
         if c == 10 {
             let fragment = wrapped && idx == 0;
-            if idx >= skip && !fragment && row < log_rows {
+            if idx >= skip && !fragment && row < rows {
                 // 合法 UTF-8 直接按字符画；被截断在多字节字符中间时取**合法前缀**
                 // （`valid_up_to`）——只丢掉那半个字，而不是把整行的中文降级成 `?`
                 // （用户截图里那串 `??????` 就是这么来的：200 字节上限切断了长中文行）。
                 let r = top + row as u64;
-                let drew = match core::str::from_utf8(&line[..len]) {
+                match core::str::from_utf8(&line[..len]) {
                     Ok(s) => term.print_line(f, r, s),
                     Err(e) => {
                         let ok = e.valid_up_to();
                         term.print_line(f, r, core::str::from_utf8(&line[..ok]).unwrap_or(""))
                     }
                 };
-                if drew > 0 || len == 0 {
-                    row += 1;
-                }
+                // 每一行**计入的行**都占一行（`print_line` 对非空串至少画一格，空串也要占，
+                // 否则就没有"空行"了）。尾行定位与 [`redraw_input`] 用同一个口径，
+                // 两边不一致的表现不是报错，是每敲一个键提示符跳一行。
+                row += 1;
             }
             len = 0;
             idx += 1;
@@ -1670,45 +1678,33 @@ pub fn redraw_window(term: &Term, f: &Frame, max_lines: usize, sid: usize,
             len += 1;
         }
     }
-    // 日志区没被内容占满的行一律刷空：残影像素会被下一帧读成"那行还在"
-    while row < log_rows {
-        term.print_line(f, top + row as u64, "");
-        row += 1;
-    }
-    // **输入行固定在最后一行**：没有换行结尾的那一段（`> ` + 键入）画在这里、光标也在这里。
-    // 于是提示符与光标永远在底部，日志只在它上面滚动。
-    let mut caret_col = 0u64;
-    if log_rows < max_lines {
+    // **尾行 = 没有换行结尾的那一段**（提示符 + 正在键入），它紧跟在正文最后一行后面；
+    // 正文写满 `rows` 行时它占最后一行（这就是滚动）。
+    let mut caret = (0u64, 0u64);
+    if rows > 0 {
+        let tail_row = row.min(rows - 1);
         let (text, cc) = input_text(sid, &line[..len], term.cols);
-        term.print_line(f, top + log_rows as u64, &text);
-        caret_col = cc;
+        term.print_line(f, top + tail_row as u64, &text);
+        // 尾行以下没被内容占满的行一律刷空：残影像素会被下一帧读成"那行还在"。
+        let mut blank = tail_row + 1;
+        while blank < rows {
+            term.print_line(f, top + blank as u64, "");
+            blank += 1;
+        }
+        caret = (cc, top + tail_row as u64);
     }
-    // 最大化时最后补上右上角三个按钮（压在第 0 行正文之上，与标签栏那一行同一位置）。
+    // 最大化/浮窗时最后补上右上角三个按钮（压在第 0 行正文之上）。
     if !ch.tabs() && ch.buttons() {
         term.buttons_only(f);
     }
-    if log_rows < max_lines {
-        (max_lines, caret_col, top + log_rows as u64)
-    } else {
-        (max_lines, 0, 0)
-    }
+    (max_lines, caret.0, caret.1)
 }
-
 /// 输入行的正文与光标列（S6q 抽出来，供整窗重画与**只重画输入行**两条路共用）。
 ///
-/// 输入行 = **影子半行**（日志开始前那条提示符，见 `serial::mirror_break_if_mid_line`）
-///        + **当前半行**（`write_bytes` 之后还没换行的那些字节）。
-fn input_text(sid: usize, tail: &[u8], cols: u64) -> (alloc::string::String, u64) {
+/// S6t：影子半行那一档删掉了——环里现在只有会话自己写的字节，最后那一截未闭合的半行
+/// 就是正在输入的那一行，不需要第二个来源。
+fn input_text(_sid: usize, tail: &[u8], cols: u64) -> (alloc::string::String, u64) {
     let mut text: alloc::string::String = alloc::string::String::new();
-    let sl = crate::serial::input_shadow_len_sid(sid);
-    let mut sbuf = [0u8; crate::serial::SHADOW_CAP];
-    for i in 0..sl {
-        sbuf[i] = crate::serial::input_shadow_byte_sid(sid, i);
-    }
-    text.push_str(match core::str::from_utf8(&sbuf[..sl]) {
-        Ok(t) => t,
-        Err(e) => core::str::from_utf8(&sbuf[..e.valid_up_to()]).unwrap_or(""),
-    });
     if !tail.is_empty() {
         text.push_str(match core::str::from_utf8(tail) {
             Ok(t) => t,
@@ -1726,17 +1722,19 @@ fn input_text(sid: usize, tail: &[u8], cols: u64) -> (alloc::string::String, u64
 /// 返回 `(光标列, 行)`。
 pub fn redraw_input(term: &Term, f: &Frame, max_lines: usize, sid: usize, ch: Chrome) -> (u64, u64) {
     let top = if ch.tabs() { TITLE_ROWS } else { 0 };
-    let log_rows = max_lines.saturating_sub(top as usize + 1);
-    if log_rows >= max_lines {
+    let rows = max_lines.saturating_sub(top as usize);
+    if rows == 0 {
         return (0, 0);
     }
     let n = crate::serial::mirror_len_sid(sid);
     let mut line = [0u8; LINE_BUF];
     let mut len = 0usize;
+    let mut nl = 0usize;
     for i in 0..n {
         let c = crate::serial::mirror_byte_sid(sid, i);
         if c == 10 {
             len = 0;
+            nl += 1;
         } else if c == 0x08 || c == 0x7F {
             while len > 0 {
                 len -= 1;
@@ -1749,15 +1747,23 @@ pub fn redraw_input(term: &Term, f: &Frame, max_lines: usize, sid: usize, ch: Ch
             len += 1;
         }
     }
+    // **尾行必须与整窗路径算到同一行**（S6t）：整窗那边是"逐行画、`row` 自增"，
+    // 这里是同一式的闭式解——`skip` 之上的完整行数，扣掉环绕后那段残行，再夹到 `rows`。
+    // 两边不一致的表现不是报错，是每敲一个键提示符跳一行。
+    let skip = (nl + 1).saturating_sub(rows);
+    let mut shown = nl.saturating_sub(skip);
+    if crate::serial::mirror_wrapped_sid(sid) && skip == 0 && shown > 0 {
+        shown -= 1;
+    }
+    let in_row = top + shown.min(rows - 1) as u64;
     let (text, cc) = input_text(sid, &line[..len], term.cols);
-    let in_row = top + log_rows as u64;
     term.print_line(f, in_row, &text);
     (cc, in_row)
 }
 
 // ------------------------------------------------------------------ S6b-3 消费端
 //
-/// 把日志环里**最后 `max_lines` 行**逐行滚动画上去，返回 `(窗口行数, 真画上去的行数)`。
+/// 把会话输出环里**最后 `max_lines` 行**逐行滚动画上去，返回 `(窗口行数, 真画上去的行数)`。
 ///
 /// **环住在 `serial`，这里只读** ⇒ 边保持 `display -> diagnostics` 单向，不造新环（§244）。
 /// **不许开 `Vec`**：堆上限 `LARGE_MAX = 2048`，一次 8 KiB 的 `with_capacity` 第一下就走
@@ -1781,7 +1787,7 @@ pub fn drain_and_draw(term: &Term, f: &Frame, max_lines: usize) -> (usize, usize
     for i in 0..n {
         let c = crate::serial::mirror_byte(i);
         if c == 10 {
-            // 绕回处那一段是上一行的残片，不是完整日志行：丢掉它，否则画面上是一条半截日志
+            // 绕回处那一段是上一行的残片，不是完整的一行：丢掉它，否则画面上是一条半截
             let fragment = wrapped && idx == 0;
             if idx >= skip && !fragment {
                 // 合法 UTF-8 按字符滚动画上（宽字符占 2 格）；非法则逐字节兜底

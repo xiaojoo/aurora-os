@@ -1333,8 +1333,8 @@ struct LiveTerm {
     /// S6q：**上一次整窗重画的判据**。整屏一次是上百万次 UC 设备写（实测一轮里能占到
     /// 上百毫秒），而指针与光标每秒要动好几次；只要这一格没变就**不重画正文**。
     /// (会话号, 该会话环里累计字节, 该会话环里的换行数, 标签数, 活动标签)
-    /// —— 换行数是"整窗 vs 只画输入行"的分水岭。
-    sig: (u8, usize, u64, u64, u64),
+    /// —— 换行数是"整窗 vs 只画输入行"的分水岭；最后一格是版面（S6t：标签条 ⇄ 浮窗）。
+    sig: (u8, usize, u64, u64, u64, bool),
     /// 光标（下划线）**现在**画在哪一格；`None` = 现在是灭的一相。
     caret: Option<(u64, u64)>,
     /// 下一相光标该在哪一格（整窗重画时由 `redraw_window` 交回来）。
@@ -1368,6 +1368,15 @@ struct LiveTerm {
     /// 聚焦窗口 + z 序的签名（变了就要重排遮挡）。
     #[cfg(feature = "wm")]
     zsig: (u8, [usize; crate::serial::SESSIONS]),
+    /// S6t：**版面开关**。false = 标签条 + 单正文（默认，与用户给的截图同构），
+    /// true = 浮窗。默认不再是浮窗——`wm` 档一开就把标签条整条关掉，是用户截图里
+    /// "参考图最显眼的那一条没了"的直接原因。
+    #[cfg(feature = "wm")]
+    float: bool,
+    /// 桌面签名（哪些窗口开着 + 版面）：变了要**重铺桌面**，否则关掉的窗、
+    /// 切走的版面会把旧像素留在屏幕上（它们已经不在任何矩形的负责范围里了）。
+    #[cfg(feature = "wm")]
+    desk: (u64, bool),
 }
 
 #[cfg(feature = "fbcon-live")]
@@ -1390,7 +1399,7 @@ impl LiveTerm {
         term.clear(&frame);
         Some(Self {
             frame, term,
-            sig: (u8::MAX, usize::MAX, u64::MAX, 0, 0),
+            sig: (u8::MAX, usize::MAX, u64::MAX, 0, 0, false),
             caret: None,
             caret_at: None,
             ptr: None,
@@ -1402,8 +1411,11 @@ impl LiveTerm {
             closed: [false; crate::serial::SESSIONS],
             #[cfg(feature = "wm")]
             wins: [
-                crate::fbcon::WinRect { x: 1, y: 1, cols: 56, rows: 14 },
-                crate::fbcon::WinRect { x: 20, y: 8, cols: 56, rows: 14 },
+                // S6t：旧几何 (1,1,56,14) 与 (20,8,56,14) 让下面那扇的标题栏和正文被盖掉
+                // 四分之三，截图里看就是"一条空的灰条"。新几何**两扇标题都看得见**，
+                // 但仍保留一段交叠——s6r 那条"遮挡由 z 序补"的判据要靠它才有证人。
+                crate::fbcon::WinRect { x: 1, y: 1, cols: 70, rows: 11 },
+                crate::fbcon::WinRect { x: 6, y: 7, cols: 70, rows: 11 },
             ],
             #[cfg(feature = "wm")]
             saved: [crate::fbcon::WinRect { x: 0, y: 0, cols: 0, rows: 0 }; crate::serial::SESSIONS],
@@ -1413,6 +1425,10 @@ impl LiveTerm {
             sigw: [(usize::MAX, usize::MAX); crate::serial::SESSIONS],
             #[cfg(feature = "wm")]
             zsig: (u8::MAX, [0; crate::serial::SESSIONS]),
+            #[cfg(feature = "wm")]
+            float: false,
+            #[cfg(feature = "wm")]
+            desk: (u64::MAX, false),
         })
     }
 
@@ -1449,29 +1465,42 @@ impl LiveTerm {
         //   · 什么都没变 ⇒ 一个字都不写。指针与光标不在这两条判据里。
         let total = crate::serial::mirror_total_sid(sid);
         let nl = crate::serial::mirror_newlines_sid(sid);
-        let sig = (sid as u8, total, nl as u64, tabs, active);
-        if sig != self.sig || chrome_changed {
+        // S6t：**版面也进签名**。标签条 ⇄ 浮窗切换时环里的字节一个字没变，不这么写
+        // 就要等下一次内容变化才换版面（实测过的那种"点了没反应"）。
+        #[cfg(feature = "wm")]
+        let lay = self.float;
+        #[cfg(not(feature = "wm"))]
+        let lay = false;
+        let sig = (sid as u8, total, nl as u64, tabs, active, lay);
+        // S6t：**浮窗里"只改 z 序/桌面"的点击不会动内容签名**，只看 `sig` 的话置顶永远
+        // 不生效（实测：点 win0 标题后 base 与 raised 只差 120 个像素=光标与指针，
+        // 而点关闭之后差 38610——因为关闭顺带改了内容）。所以把浮窗的脏判定也接进这一格。
+        #[cfg(feature = "wm")]
+        let need = sig != self.sig || chrome_changed || (self.float && self.wm_pending());
+        #[cfg(not(feature = "wm"))]
+        let need = sig != self.sig || chrome_changed;
+        if need {
             // 先把指针的像素还回去（它盖住的那 77 个像素是上一帧的背景）；
             // 整窗重画也会覆盖它，但**输入行那一路只动一行**——行外的指针必须自己擦。
             self.ptr_erase();
             let incremental = !chrome_changed
                 && self.sig.0 == sid as u8
                 && self.sig.2 == nl as u64
-                && self.sig.1 != usize::MAX;
+                && self.sig.1 != usize::MAX
+                && self.sig.5 == lay;
             #[cfg(feature = "wm")]
-            let (cc, cr) = {
-                let _ = (incremental, tabs, active, chrome, sig, chrome_changed);
+            let (cc, cr) = if self.float {
                 self.wm_frame()
+            } else {
+                // 从浮窗切回来：窗口矩形之外的桌面没人负责，先把旧像素铺掉再画标签条版面。
+                if self.sig.5 {
+                    self.term.clear(&self.frame);
+                    self.desk = (u64::MAX, false);
+                }
+                self.tabbed_frame(incremental, sid, tabs, active, chrome, rows)
             };
             #[cfg(not(feature = "wm"))]
-            let (cc, cr) = if incremental {
-                crate::fbcon::redraw_input(
-                    &self.term, &self.frame, rows.min(LIVE_ROWS), sid, chrome)
-            } else {
-                let (_, cc, cr) = crate::fbcon::redraw_window(
-                    &self.term, &self.frame, rows.min(LIVE_ROWS), sid, tabs, active, chrome);
-                (cc, cr)
-            };
+            let (cc, cr) = self.tabbed_frame(incremental, sid, tabs, active, chrome, rows);
             self.sig = sig;
             self.last_chrome = chrome;
             // 画过的像素一律作废：光标靠下一相重画，指针靠下面 `ptr_track` 重画。
@@ -1505,89 +1534,113 @@ impl LiveTerm {
             // 放在这里而不是只放常驻循环：**等待期也会点**（实测：只在 park 里取，
             // 等待期那几下点击就永远读不到）。
             if let Some((cx, cy)) = crate::mouse::take_click() {
+                // S6t：**版面决定点击归谁**。默认是标签条版面 ⇒ 走 `hit_test` 与那套窗口动作；
+                // 浮窗版面才走 `wm_click`（旧代码在 wm 档无条件走 wm_click，把标签条的动作全废了）。
                 #[cfg(feature = "wm")]
-                {
-                    self.wm_click(cx, cy);
-                }
-                #[cfg(feature = "wm")]
-                let hit = crate::fbcon::Hit::Body;
+                let float = self.float;
                 #[cfg(not(feature = "wm"))]
-                let hit = crate::fbcon::hit_test(
-                    self.term.dims().0, tabs, cx as u64, cy as u64, chrome);
+                let float = false;
+                // 注意 cfg 加在**调用语句**上：`float` 在两个档都存在（非 wm 档恒 false），
+                // 但 `wm_click` 这个方法只在 wm 档有——不加就是 b721070 那个 cfg 洞的形状。
+                #[cfg(feature = "wm")]
+                let on_win = float && self.wm_click(cx, cy);
+                #[cfg(not(feature = "wm"))]
+                let on_win = false;
+                let hit = if on_win {
+                    crate::fbcon::Hit::Body
+                } else {
+                    crate::fbcon::hit_test(
+                        self.term.dims().0, tabs, cx as u64, cy as u64, chrome)
+                };
                 crate::log_info!("mouse: 点击 x={} y={} 命中={}", cx, cy, hit.name());
                 // S6q 补记二：三个窗口按钮**有动作了**——但各自的口径要写清楚：
                 //   · `-` 最小化：正文整块收起（只留标签栏），再点一次恢复；
                 //   · `□` 最大化：收起标签栏、正文从第 0 行开始（多一行），再点一次恢复；
-                //   · `×` 关闭窗口：**整机停机**（本内核没有窗口管理器，"关窗"等价于收工）。
-                //     走的是与 `exit` 命令同一条停机路径（`sched::wait_for_task` 那边会看到 init 收工）。
+                //   · `×` 关闭窗口：关掉那个会话，最后一个也关掉才停机（S6q 补记三裁决）。
                 // 三态互斥且都可逆，所以"点错了"能点回来——不可逆的只有关闭。
-                #[cfg(not(feature = "wm"))]
-                match hit {
-                    crate::fbcon::Hit::Min => {
-                        // 最小化时点标签就能恢复：标签栏一直画着，用户不会被困住。
-                        self.chrome = if self.chrome == crate::fbcon::Chrome::Minimized {
-                            crate::fbcon::Chrome::Normal
-                        } else {
-                            crate::fbcon::Chrome::Minimized
-                        };
-                        crate::log_info!("窗口: 最小化={}", self.chrome == crate::fbcon::Chrome::Minimized);
-                    }
-                    crate::fbcon::Hit::Max => {
-                        self.chrome = if self.chrome == crate::fbcon::Chrome::Maximized {
-                            crate::fbcon::Chrome::Normal
-                        } else {
-                            crate::fbcon::Chrome::Maximized
-                        };
-                        crate::log_info!("窗口: 最大化={}", self.chrome == crate::fbcon::Chrome::Maximized);
-                    }
-                    crate::fbcon::Hit::Close => {
-                        crate::log_info!("窗口: 关闭 ⇒ 系统停机");
-                        crate::exit::finish(crate::exit::Code::Success);
-                    }
-                    // S6q 补记三：**每个窗口条目**自己的 `-` 与 `×`。
-                    crate::fbcon::Hit::TabMin(i) => {
-                        let i = (i as usize).min(crate::serial::SESSIONS - 1);
-                        self.mins[i] = !self.mins[i];
-                        crate::log_info!("窗口: 会话 {} 最小化={}", i, self.mins[i]);
-                    }
-                    crate::fbcon::Hit::TabClose(i) => {
-                        let i = i as usize;
-                        if i == 0 {
-                            // 0 号是 init：关它等于整机收工（与全局 `×` 同一口径）
-                            crate::log_info!("窗口: 关闭会话 0（init）⇒ 系统停机");
+                // S6t：这一套动作在**没被窗口收下**的点击上生效（浮窗里点窗口自带另一套动作）。
+                if !on_win {
+                    match hit {
+                        crate::fbcon::Hit::Min => {
+                            // 最小化时点标签就能恢复：标签栏一直画着，用户不会被困住。
+                            self.chrome = if self.chrome == crate::fbcon::Chrome::Minimized {
+                                crate::fbcon::Chrome::Normal
+                            } else {
+                                crate::fbcon::Chrome::Minimized
+                            };
+                            crate::log_info!("窗口: 最小化={}", self.chrome == crate::fbcon::Chrome::Minimized);
+                        }
+                        crate::fbcon::Hit::Max => {
+                            self.chrome = if self.chrome == crate::fbcon::Chrome::Maximized {
+                                crate::fbcon::Chrome::Normal
+                            } else {
+                                crate::fbcon::Chrome::Maximized
+                            };
+                            crate::log_info!("窗口: 最大化={}", self.chrome == crate::fbcon::Chrome::Maximized);
+                        }
+                        crate::fbcon::Hit::Close => {
+                            crate::log_info!("窗口: 关闭 ⇒ 系统停机");
                             crate::exit::finish(crate::exit::Code::Success);
-                        } else if i < crate::serial::SESSIONS && !self.closed[i] {
-                            // 关掉这个会话的任务，窗口从列表里消失；最后一个也关掉才停机。
-                            // **记账**：内核按任务号终止，返回 false 说明槽已经不在了 ⇒ 如实打出来。
-                            let g = SECOND_TASK.load(Ordering::Relaxed);
-                            let killed = g != 0 && crate::sched::terminate_task(g);
-                            self.closed[i] = true;
-                            crate::log_info!("窗口: 关闭会话 {} 终止任务={} 任务={}", i, killed, g);
-                            if crate::user::active_session() as usize == i {
-                                crate::user::set_active_session(0);
-                            }
-                            if self.closed.iter().filter(|c| **c).count() == crate::serial::SESSIONS {
-                                crate::log_info!("窗口: 全部关闭 ⇒ 系统停机");
+                        }
+                        // S6q 补记三：**每个窗口条目**自己的 `-` 与 `×`。
+                        crate::fbcon::Hit::TabMin(i) => {
+                            let i = (i as usize).min(crate::serial::SESSIONS - 1);
+                            self.mins[i] = !self.mins[i];
+                            crate::log_info!("窗口: 会话 {} 最小化={}", i, self.mins[i]);
+                        }
+                        crate::fbcon::Hit::TabClose(i) => {
+                            let i = i as usize;
+                            if i == 0 {
+                                // 0 号是 init：关它等于整机收工（与全局 `×` 同一口径）
+                                crate::log_info!("窗口: 关闭会话 0（init）⇒ 系统停机");
                                 crate::exit::finish(crate::exit::Code::Success);
+                            } else if i < crate::serial::SESSIONS && !self.closed[i] {
+                                // 关掉这个会话的任务，窗口从列表里消失；最后一个也关掉才停机。
+                                // **记账**：内核按任务号终止，返回 false 说明槽已经不在了 ⇒ 如实打出来。
+                                let g = SECOND_TASK.load(Ordering::Relaxed);
+                                let killed = g != 0 && crate::sched::terminate_task(g);
+                                self.closed[i] = true;
+                                crate::log_info!("窗口: 关闭会话 {} 终止任务={} 任务={}", i, killed, g);
+                                if crate::user::active_session() as usize == i {
+                                    crate::user::set_active_session(0);
+                                }
+                                if self.closed.iter().filter(|c| **c).count() == crate::serial::SESSIONS {
+                                    crate::log_info!("窗口: 全部关闭 ⇒ 系统停机");
+                                    crate::exit::finish(crate::exit::Code::Success);
+                                }
                             }
                         }
-                    }
-                    _ => {}
-                }
-                // S6p：点在标签上就**切会话**；关闭符只记读数（0 号是 init，不能关）
-                #[cfg(feature = "handles")]
-                #[cfg(not(feature = "wm"))]
-                match hit {
-                    crate::fbcon::Hit::Tab(i) => {
-                        // 最小化时点标签 = 恢复正文（否则正文收着、用户只剩一个看不清的条）。
-                        if self.chrome == crate::fbcon::Chrome::Minimized {
-                            self.chrome = crate::fbcon::Chrome::Normal;
-                            crate::log_info!("窗口: 最小化=false（点标签恢复）");
+                        // S6t：标签条上的 `∨` **有动作了**——切换版面（标签条 ⇄ 浮窗）。
+                        // 非 `wm` 档没有浮窗可切，只如实报读数，不假装切了。
+                        crate::fbcon::Hit::Layout => {
+                            #[cfg(feature = "wm")]
+                            {
+                                self.float = !self.float;
+                                // 版面切换时把浮窗侧的两份签名作废：它们只在自己的版面里更新，
+                                // 不作废的话切回去的那一帧 `wm_frame` 会判"没变"而一像素不写。
+                                self.zsig = (u8::MAX, [0; crate::serial::SESSIONS]);
+                                self.sigw = [(usize::MAX, usize::MAX); crate::serial::SESSIONS];
+                                crate::log_info!("版面: 浮窗={}", self.float);
+                            }
+                            #[cfg(not(feature = "wm"))]
+                            crate::log_info!("版面: 本档没有浮窗，切换无效");
                         }
-                        crate::user::set_active_session(i);
-                        crate::log_info!("multisession: 切到会话 {}", i);
+                        _ => {}
                     }
-                    _ => {}
+                    // S6p：点在标签上就**切会话**；关闭符只记读数（0 号是 init，不能关）
+                    #[cfg(feature = "handles")]
+                    match hit {
+                        crate::fbcon::Hit::Tab(i) => {
+                            // 最小化时点标签 = 恢复正文（否则正文收着、用户只剩一个看不清的条）。
+                            if self.chrome == crate::fbcon::Chrome::Minimized {
+                                self.chrome = crate::fbcon::Chrome::Normal;
+                                crate::log_info!("窗口: 最小化=false（点标签恢复）");
+                            }
+                            crate::user::set_active_session(i);
+                            crate::log_info!("multisession: 切到会话 {}", i);
+                        }
+                        _ => {}
+                    }
                 }
             }
             // S6q：**不再每 8 帧打一行统计**。那一行日志本身就会让正文整窗重画一次
@@ -1601,6 +1654,27 @@ impl LiveTerm {
                     n, self.paints.0, self.paints.1, self.paints.2, self.paints.3
                 );
             }
+        }
+    }
+
+    /// **标签条版面**的重画（S6t 起的默认版面，与参考截图同构）：
+    /// 换行数变了 ⇒ 整窗重画；只有尾部半行在长 ⇒ 只重画输入行。
+    /// 浮窗版面（`self.float`）不走这里，它有自己的矩形重画。
+    fn tabbed_frame(
+        &self,
+        incremental: bool,
+        sid: usize,
+        tabs: u64,
+        active: u64,
+        chrome: crate::fbcon::Chrome,
+        rows: usize,
+    ) -> (u64, u64) {
+        if incremental {
+            crate::fbcon::redraw_input(&self.term, &self.frame, rows.min(LIVE_ROWS), sid, chrome)
+        } else {
+            let (_, cc, cr) = crate::fbcon::redraw_window(
+                &self.term, &self.frame, rows.min(LIVE_ROWS), sid, tabs, active, chrome);
+            (cc, cr)
         }
     }
 
@@ -1638,8 +1712,10 @@ impl LiveTerm {
 
     /// **浮窗点击**（S6r）：从最上面一扇往下找，第一个命中的窗口收下这次点击。
     /// 点标题栏/正文 = 置顶 + 聚焦；`-`/`□`/`×` 作用于**那扇窗**。
+    /// 返回 `false` = 没落在任何窗上 ⇒ 调用方按**标签条版面**处理这一击（S6t：
+    /// 浮窗模式下标签条仍然画着，`∨` 必须还能点，否则浮窗就是一扇单向门）。
     #[cfg(feature = "wm")]
-    fn wm_click(&mut self, cx: i32, cy: i32) {
+    fn wm_click(&mut self, cx: i32, cy: i32) -> bool {
         use crate::fbcon::{win_hit, WinHit};
         for k in (0..crate::serial::SESSIONS).rev() {
             let i = self.z[k];
@@ -1695,8 +1771,9 @@ impl LiveTerm {
                 }
                 _ => {}
             }
-            return;
+            return true;
         }
+        false
     }
 
     /// **重画一扇窗 + 补它上面被它破坏的那些**（S6r 的核心口径）：
@@ -1727,25 +1804,63 @@ impl LiveTerm {
 
     /// 一帧的 WM 重画：内容变了才画那一扇（+ 补遮挡）；聚焦/z 变了就整栈重排（两扇，很便宜）。
     #[cfg(feature = "wm")]
-    fn wm_frame(&mut self) -> (u64, u64) {
-        let active = crate::user::active_session() as u8;
-        let zsig = (active, self.z);
-        let mut stack = zsig != self.zsig;
-        if stack {
-            self.zsig = zsig;
+    /// 浮窗版面**要不要画**：z 序、桌面（开着哪些窗 / 在不在浮窗）、任一扇窗的内容，
+    /// 三者之一变了才画。`repaint` 与 `wm_frame` 共用这一份判定——两边各算一遍的话，
+    /// "只改 z 序的置顶"就会在一边算成脏、在另一边算成干净。
+    #[cfg(feature = "wm")]
+    fn wm_pending(&self) -> bool {
+        if (crate::user::active_session() as u8, self.z) != self.zsig {
+            return true;
         }
         for i in 0..crate::serial::SESSIONS {
             if self.closed[i] {
                 continue;
             }
-            let sig = (crate::serial::mirror_total_sid(i), crate::serial::mirror_newlines_sid(i));
-            if sig != self.sigw[i] {
-                stack = true;
+            if (crate::serial::mirror_total_sid(i), crate::serial::mirror_newlines_sid(i))
+                != self.sigw[i]
+            {
+                return true;
             }
         }
-        if !stack {
+        self.wm_desk() != self.desk
+    }
+
+    /// 桌面签名：开着哪些窗（位图）+ 当前是不是浮窗版面。
+    #[cfg(feature = "wm")]
+    fn wm_desk(&self) -> (u64, bool) {
+        let mask: u64 = (0..crate::serial::SESSIONS)
+            .filter(|i| !self.closed[*i])
+            .map(|i| 1u64 << i)
+            .sum();
+        (mask, true)
+    }
+
+    /// 浮窗版面的一帧：桌面（变了就重铺）→ 标签条 → 按 z 序从下往上画每扇窗的矩形。
+    /// cfg 加在**定义**上（不是只加在调用点）——那是 b721070 的教训，这一片又踩了一次：
+    /// 插两个新方法时把原来这行 `#[cfg]` 顶掉了，`fbcon-live` 无 `wm` 的档当场编不过，
+    /// 而 `check` 17 道全是静态门禁，看不见这种跨特性断裂。
+    #[cfg(feature = "wm")]
+    fn wm_frame(&mut self) -> (u64, u64) {
+        let active = crate::user::active_session() as u8;
+        let desk = self.wm_desk();
+        let desk_changed = desk != self.desk;
+        if !self.wm_pending() {
             return (0, 0);
         }
+        self.zsig = (active, self.z);
+        self.desk = desk;
+        // 桌面变了（关窗 / 切进来）⇒ 先重铺：关掉的窗与切走的版面已经不在任何矩形的负责
+        // 范围里，不铺就把旧像素留在屏上。
+        if desk_changed {
+            self.term.clear(&self.frame);
+        }
+        // S6t：**浮窗模式下标签条仍然画着**。旧版把标签条整条收掉，于是浮窗是一扇单向门
+        // ——`∨` 没了，切不回去（实测：第二次点同一格串口只有 `浮窗=true`、没有 `false`）。
+        // 窗口从第 1 格行开始，与标签条那一行不重叠。
+        let open = (0..crate::serial::SESSIONS)
+            .filter(|i| !self.closed[*i])
+            .count() as u64;
+        self.term.tab_bar(&self.frame, open, active as u64);
         // 整栈从最下面一扇开始画；每扇只画自己的矩形 ⇒ 这就是"每扇窗只重画矩形"。
         let mut caret = (0u64, 0u64);
         for k in 0..crate::serial::SESSIONS {
