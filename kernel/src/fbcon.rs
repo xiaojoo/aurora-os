@@ -863,7 +863,9 @@ impl BarLayout {
     pub fn of(cols: u64) -> Self {
         let tab_w = cells_of(TAB_LABEL) + 5; // 左 2 + 文字 + 右 2 + 关闭 1
         let strip_l = 1;
-        let strip_r = cols.saturating_sub(5); // 右侧三个按钮各 1 格 + 1 格边
+        // 右侧三个按钮**贴右边缘**各占一格（截图里最后那个 × 就在窗口右边界上）；
+        // 原来留了 5 格边距，按钮看起来像散落在条中间。
+        let strip_r = cols.saturating_sub(3);
         let fit = if strip_r > strip_l + tab_w {
             (strip_r - strip_l) / (tab_w + 1)
         } else {
@@ -1225,14 +1227,16 @@ impl Term {
             }
         }
         // 5) 右侧窗口按钮：最小化 / 最大化 / 关闭（截图里是细笔画，颜色同标题文字）
-        let bx = strip_r * CELL_W + 4;
-        self.rect(f, bx, 15, 9, 2, TAB_TEXT);
-        let mx = bx + CELL_W;
-        self.rect(f, mx, 11, 9, 2, TAB_TEXT);
-        self.rect(f, mx, 19, 9, 2, TAB_TEXT);
-        self.rect(f, mx, 11, 2, 10, TAB_TEXT);
-        self.rect(f, mx + 7, 11, 2, 10, TAB_TEXT);
-        self.cross(f, bx + 2 * CELL_W, 11, 9, TAB_TEXT);
+        // 三个按钮各占一格、笔画居中（格子 16×32）：最小化 = 一条 10px 横线，
+        // 最大化 = 10×10 空心方框，关闭 = 10×10 的 ×。竖向统一在 y=11..20，
+        // 与截图的细笔画同形；命中区由 `BarLayout::strip_r` 供给（绘制与命中共用一份几何）。
+        let gx = |i: u64| (strip_r + i) * CELL_W + 3;
+        self.rect(f, gx(0), 16, 10, 1, TAB_TEXT);
+        self.rect(f, gx(1), 11, 10, 1, TAB_TEXT);
+        self.rect(f, gx(1), 20, 10, 1, TAB_TEXT);
+        self.rect(f, gx(1), 11, 1, 10, TAB_TEXT);
+        self.rect(f, gx(1) + 9, 11, 1, 10, TAB_TEXT);
+        self.cross(f, gx(2), 11, 10, TAB_TEXT);
     }
 
     /// 鼠标指针：7×11 的**几何箭头**（`#`=填充、`o`=描边），左上角是尖。
