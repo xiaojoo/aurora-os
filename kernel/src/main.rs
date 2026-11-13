@@ -1318,7 +1318,7 @@ fn stage_init_user(sid: u8) -> Option<usize> {
 
 /// 第二个会话的任务号（S6q 补记三）：窗口条目上的 `×` 关会话 1 时要用它终止任务。
 /// 0 = 没起（`multisession` 关掉时恒 0）。
-#[cfg(feature = "multisession")]
+#[cfg(any(feature = "multisession", feature = "wm"))]
 static SECOND_TASK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// S6g：`fbcon-live` 档的**活终端**——映射只做一次，之后每轮调一次 [`LiveTerm::repaint`]。
@@ -1354,6 +1354,19 @@ struct LiveTerm {
     mins: [bool; crate::serial::SESSIONS],
     /// 已经关掉的窗口（`×`）。今天的实现只允许从最高的那个往下关。
     closed: [bool; crate::serial::SESSIONS],
+    /// S6r：浮窗矩形 / z 序（末尾 = 最上面）/ 最大化前的矩形。
+    #[cfg(feature = "wm")]
+    wins: [crate::fbcon::WinRect; crate::serial::SESSIONS],
+    #[cfg(feature = "wm")]
+    saved: [crate::fbcon::WinRect; crate::serial::SESSIONS],
+    #[cfg(feature = "wm")]
+    z: [usize; crate::serial::SESSIONS],
+    /// 每扇窗自己的内容签名 `(累计字节, 换行数)`：**只重画变了的那些矩形**。
+    #[cfg(feature = "wm")]
+    sigw: [(usize, usize); crate::serial::SESSIONS],
+    /// 聚焦窗口 + z 序的签名（变了就要重排遮挡）。
+    #[cfg(feature = "wm")]
+    zsig: (u8, [usize; crate::serial::SESSIONS]),
 }
 
 #[cfg(feature = "fbcon-live")]
@@ -1386,6 +1399,19 @@ impl LiveTerm {
             last_chrome: crate::fbcon::Chrome::Normal,
             mins: [false; crate::serial::SESSIONS],
             closed: [false; crate::serial::SESSIONS],
+            #[cfg(feature = "wm")]
+            wins: [
+                crate::fbcon::WinRect { x: 1, y: 1, cols: 56, rows: 14 },
+                crate::fbcon::WinRect { x: 20, y: 8, cols: 56, rows: 14 },
+            ],
+            #[cfg(feature = "wm")]
+            saved: [crate::fbcon::WinRect { x: 0, y: 0, cols: 0, rows: 0 }; crate::serial::SESSIONS],
+            #[cfg(feature = "wm")]
+            z: [0, 1],
+            #[cfg(feature = "wm")]
+            sigw: [(usize::MAX, usize::MAX); crate::serial::SESSIONS],
+            #[cfg(feature = "wm")]
+            zsig: (u8::MAX, [0; crate::serial::SESSIONS]),
         })
     }
 
@@ -1431,6 +1457,12 @@ impl LiveTerm {
                 && self.sig.0 == sid as u8
                 && self.sig.2 == nl as u64
                 && self.sig.1 != usize::MAX;
+            #[cfg(feature = "wm")]
+            let (cc, cr) = {
+                let _ = (incremental, tabs, active, chrome, sig, chrome_changed);
+                self.wm_frame()
+            };
+            #[cfg(not(feature = "wm"))]
             let (cc, cr) = if incremental {
                 crate::fbcon::redraw_input(
                     &self.term, &self.frame, rows.min(LIVE_ROWS), sid, chrome)
@@ -1472,6 +1504,13 @@ impl LiveTerm {
             // 放在这里而不是只放常驻循环：**等待期也会点**（实测：只在 park 里取，
             // 等待期那几下点击就永远读不到）。
             if let Some((cx, cy)) = crate::mouse::take_click() {
+                #[cfg(feature = "wm")]
+                {
+                    self.wm_click(cx, cy);
+                }
+                #[cfg(feature = "wm")]
+                let hit = crate::fbcon::Hit::Body;
+                #[cfg(not(feature = "wm"))]
                 let hit = crate::fbcon::hit_test(
                     self.term.dims().0, tabs, cx as u64, cy as u64, chrome);
                 crate::log_info!("mouse: 点击 x={} y={} 命中={}", cx, cy, hit.name());
@@ -1481,6 +1520,7 @@ impl LiveTerm {
                 //   · `×` 关闭窗口：**整机停机**（本内核没有窗口管理器，"关窗"等价于收工）。
                 //     走的是与 `exit` 命令同一条停机路径（`sched::wait_for_task` 那边会看到 init 收工）。
                 // 三态互斥且都可逆，所以"点错了"能点回来——不可逆的只有关闭。
+                #[cfg(not(feature = "wm"))]
                 match hit {
                     crate::fbcon::Hit::Min => {
                         // 最小化时点标签就能恢复：标签栏一直画着，用户不会被困住。
@@ -1535,6 +1575,7 @@ impl LiveTerm {
                 }
                 // S6p：点在标签上就**切会话**；关闭符只记读数（0 号是 init，不能关）
                 #[cfg(feature = "handles")]
+                #[cfg(not(feature = "wm"))]
                 match hit {
                     crate::fbcon::Hit::Tab(i) => {
                         // 最小化时点标签 = 恢复正文（否则正文收着、用户只剩一个看不清的条）。
@@ -1560,6 +1601,163 @@ impl LiveTerm {
                 );
             }
         }
+    }
+
+    /// **只重画一扇窗的矩形**（S6r）：标题栏一行 + 正文整块（每行补空格 ⇒ 矩形内是自足的）。
+    /// 返回聚焦窗口的光标 `(列, 行)`（屏幕绝对行），非聚焦窗口返回 `(0,0)`。
+    #[cfg(feature = "wm")]
+    fn paint_win(&mut self, i: usize) -> (u64, u64) {
+        use crate::fbcon::Term;
+        let w = self.wins[i];
+        let focused = crate::user::active_session() as usize == i;
+        if let Some(t) = Term::at(&self.frame, w.x, w.y, w.cols, 1) {
+            let title = if i == 0 { "Aurora shell" } else { "shell 1" };
+            t.paint_title(&self.frame, title, focused);
+        }
+        let mut caret = (0u64, 0u64);
+        if let Some(b) = w.body() {
+            if let Some(t) = Term::at(&self.frame, b.x, b.y, b.cols, b.rows) {
+                if self.mins[i] {
+                    for r in 0..b.rows {
+                        t.print_line(&self.frame, r, "");
+                    }
+                } else {
+                    let (_, cc, cr) = crate::fbcon::redraw_window(
+                        &t, &self.frame, b.rows as usize, i, 0, 0, crate::fbcon::Chrome::Floating);
+                    if focused && cr != 0 {
+                        caret = (cc, b.y + cr);
+                    }
+                }
+            }
+        }
+        self.sigw[i] = (crate::serial::mirror_total_sid(i), crate::serial::mirror_newlines_sid(i));
+        self.paints.0 += 1;
+        caret
+    }
+
+    /// **浮窗点击**（S6r）：从最上面一扇往下找，第一个命中的窗口收下这次点击。
+    /// 点标题栏/正文 = 置顶 + 聚焦；`-`/`□`/`×` 作用于**那扇窗**。
+    #[cfg(feature = "wm")]
+    fn wm_click(&mut self, cx: i32, cy: i32) {
+        use crate::fbcon::{win_hit, WinHit};
+        for k in (0..crate::serial::SESSIONS).rev() {
+            let i = self.z[k];
+            if self.closed[i] {
+                continue;
+            }
+            let hit = win_hit(self.wins[i], cx as u64, cy as u64);
+            if hit == WinHit::None {
+                continue;
+            }
+            // 置顶：把这扇窗挪到 z 数组末尾（z 序变了 ⇒ 下一帧整栈重排）
+            for j in k..crate::serial::SESSIONS - 1 {
+                self.z[j] = self.z[j + 1];
+            }
+            self.z[crate::serial::SESSIONS - 1] = i;
+            if crate::user::active_session() as usize != i {
+                crate::user::set_active_session(i as u8);
+                crate::log_info!("wm: 聚焦窗口 {}", i);
+            }
+            match hit {
+                WinHit::Min => {
+                    if self.mins[i] {
+                        self.wins[i] = self.saved[i];
+                        self.mins[i] = false;
+                    } else {
+                        self.saved[i] = self.wins[i];
+                        self.mins[i] = true;
+                    }
+                    crate::log_info!("wm: 窗口 {} 最小化={}", i, self.mins[i]);
+                }
+                WinHit::Max => {
+                    let (cols, rows) = self.term.dims();
+                    if self.wins[i].cols == cols && self.wins[i].y == 0 {
+                        self.wins[i] = self.saved[i];
+                        crate::log_info!("wm: 窗口 {} 还原", i);
+                    } else {
+                        self.saved[i] = self.wins[i];
+                        self.wins[i] = crate::fbcon::WinRect { x: 0, y: 0, cols, rows };
+                        crate::log_info!("wm: 窗口 {} 最大化", i);
+                    }
+                }
+                WinHit::Close => {
+                    if i == 0 {
+                        crate::log_info!("wm: 关闭会话 0（init）⇒ 系统停机");
+                        crate::exit::finish(crate::exit::Code::Success);
+                    } else {
+                        let g = SECOND_TASK.load(Ordering::Relaxed);
+                        let killed = g != 0 && crate::sched::terminate_task(g);
+                        self.closed[i] = true;
+                        crate::log_info!("wm: 关闭窗口 {} 终止任务={}", i, killed);
+                        crate::user::set_active_session(0);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+    }
+
+    /// **重画一扇窗 + 补它上面被它破坏的那些**（S6r 的核心口径）：
+    /// 只重画矩形是省钱的，但压在这块矩形上的高 z 窗会被写花 ⇒ 按 z 序把它们**再画一遍**
+    /// （画的是整矩形，不是交集——交集的簿记不值那点像素，两扇窗的重画仍然是全屏的零头）。
+    #[cfg(feature = "wm")]
+    fn repaint_stack(&mut self, from: usize) -> (u64, u64) {
+        let mut caret = (0u64, 0u64);
+        let rect = self.wins[from];
+        let mut above = false;
+        for k in 0..crate::serial::SESSIONS {
+            let i = self.z[k];
+            if self.closed[i] {
+                continue;
+            }
+            if i == from {
+                above = true;
+                caret = self.paint_win(i);
+            } else if above && crate::fbcon::WinRect::intersects(&self.wins[i], &rect) {
+                let c = self.paint_win(i);
+                if c != (0, 0) {
+                    caret = c;
+                }
+            }
+        }
+        caret
+    }
+
+    /// 一帧的 WM 重画：内容变了才画那一扇（+ 补遮挡）；聚焦/z 变了就整栈重排（两扇，很便宜）。
+    #[cfg(feature = "wm")]
+    fn wm_frame(&mut self) -> (u64, u64) {
+        let active = crate::user::active_session() as u8;
+        let zsig = (active, self.z);
+        let mut stack = zsig != self.zsig;
+        if stack {
+            self.zsig = zsig;
+        }
+        for i in 0..crate::serial::SESSIONS {
+            if self.closed[i] {
+                continue;
+            }
+            let sig = (crate::serial::mirror_total_sid(i), crate::serial::mirror_newlines_sid(i));
+            if sig != self.sigw[i] {
+                stack = true;
+            }
+        }
+        if !stack {
+            return (0, 0);
+        }
+        // 整栈从最下面一扇开始画；每扇只画自己的矩形 ⇒ 这就是"每扇窗只重画矩形"。
+        let mut caret = (0u64, 0u64);
+        for k in 0..crate::serial::SESSIONS {
+            let i = self.z[k];
+            if self.closed[i] {
+                continue;
+            }
+            let c = self.paint_win(i);
+            if c != (0, 0) {
+                caret = c;
+            }
+        }
+        caret
     }
 
     /// 指针跟随：位置变了才擦旧画新。**保存的背景是"画之前"的像素**（`get` 读回的原生值，

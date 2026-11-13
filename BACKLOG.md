@@ -11365,6 +11365,24 @@ unsafe 白名单与 `lock-order.md` 一行没动。
 
 顺带补字形：新日志里的 `止` 进宽字表（547 条）。回归：`s6f`、`s6q` 全绿、`check` **17/17**。
 
+## 263. **S6r 第二刀：浮动窗口落地——每扇只重画自己的矩形，遮挡按 z 序补**（2026-11-13，实测）
+
+`fbcon::WinRect/WinHit/win_hit` + `Term::paint_title` + `Chrome::Floating`；`wm` 特性
+（= framebuffer + handles + fbcon-live + **multisession**）。`paint_win(i)` 只画那一扇的矩形
+（标题栏一行 + 正文视口），`repaint_stack` 画完之后把 z 序在它上面且**相交**的窗再画一遍；
+重画判据是每扇窗自己的 `(累计字节, 换行数)` + `(聚焦, z 序)`，没变一帧都不写；不再整屏清。
+
+**第一版失败的两个具体原因**：①`Chrome::Floating` 的 `tabs()` 替换没打上（脚本缺断言）⇒
+每扇窗的正文顶上多画了一条 56 格标签条；②`wm` 没带 `multisession` ⇒ 第二个会话没起、
+第二扇窗正文为空（`win1 正文 FG=0`）。修好后 5216。
+
+判据 `build/s6r-wm-check.py`：两扇正文 29805/5216 FG；点 win0 标题 ⇒ `wm: 聚焦窗口 0` 且
+win1 标题条重叠段 #262626=**0**、独占段=**9644**；点 win1 `×` ⇒ `wm: 关闭窗口 1 终止任务=true`
+且其独占区 FG=0 ⇒ **PASS**。负样本：固定画序（忽略 z 序）⇒ 重叠段 18555、那格红、FAIL；
+还原后 ELF `73064519af8a`。`check` 17/17（补登 `fbcon::WinRect/WinHit/win_hit`）。
+
+仍开着：拖动、桌面底色在窗口移动后的恢复、`wm` 不在判定矩阵、`-`/`□` 没有像素判据。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

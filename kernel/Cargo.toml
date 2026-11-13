@@ -161,6 +161,9 @@ ps2-kbd = []
 ps2-mouse = []
 # 变体（W6 S6p）：多会话——起第二个 shell，控制台按会话分环，标签栏可切换。
 multisession = ["handles"]
+
+# S6r：窗口管理器——每个会话一扇可裁剪的浮窗（各自的标题栏与 -□×）。
+wm = ["framebuffer", "handles", "fbcon-live", "multisession"]
 # 变体（W6 S6d，BACKLOG §247）：把 init 那一发长等待拆成有界轮询，每轮把日志环整窗重画一次
 # ⇒ 键入与应答**实时**出现在画面上。它依赖 framebuffer，但**不并进它**：并进会让 §242/§245
 # 那两条"滚动恰好一次 / 冻结之后再写无效"的像素判据失去确定的取样时刻。
