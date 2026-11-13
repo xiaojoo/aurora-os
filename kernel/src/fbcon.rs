@@ -820,6 +820,14 @@ fn tofu(bits: &mut [u32; 32]) {
     }
 }
 
+/// 标题栏占屏幕最上面几行（正文与输入行都从它下面开始）。
+pub const TITLE_ROWS: u64 = 1;
+/// 标题栏上的文字。**只画亮像素**，底色由标题栏自己铺，所以文字与底色是两层。
+pub const TITLE_TEXT: &str = "Aurora OS  —  shell";
+/// 标题栏配色：比正文底色略亮的深灰 + 底部一条更亮的 2px 分隔线（窗框的感觉）。
+const TITLE_BG: u32 = 0x00_2D_2D_2D;
+const TITLE_BG_HI: u32 = 0x00_45_45_45;
+
 /// 配色取 Windows Terminal 的默认：近黑底（#0C0C0C）+ 浅灰字（#CCCCCC）。
 /// 纯黑/纯白看着"生"、对比也过强；这一对与测试图案的三条带仍然都不同 ⇒
 /// "画在带上的字"和"带本身"照样分得开（§240 那条对账不受影响）。
@@ -923,6 +931,62 @@ impl Term {
                     return;
                 }
             }
+        }
+    }
+
+    /// 只写位图里**亮**的像素（背景透明）。标题栏用它把文字叠在自铺的底色上。
+    fn ink(&self, f: &Frame, x0: u64, y0: u64, bits: u32, width_px: usize) -> bool {
+        for c in 0..width_px {
+            if bits & (1 << (width_px - 1 - c)) == 0 {
+                continue;
+            }
+            for dy in 0..SCALE {
+                for dx in 0..SCALE {
+                    if f.put(x0 + c as u64 * SCALE + dx, y0 + dy, FG).is_err() {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// 标题栏：整行铺 [`TITLE_BG`]（底部 2px 用更亮的 [`TITLE_BG_HI`] 当分隔线），
+    /// 左端写 [`TITLE_TEXT`]。**这一行不参与正文**：调用方从它下面开始画日志。
+    pub fn title_bar(&self, f: &Frame) {
+        for y in 0..CELL_H {
+            let color = if y + 2 >= CELL_H { TITLE_BG_HI } else { TITLE_BG };
+            for x in 0..self.cols * CELL_W {
+                if f.put(x, y, color).is_err() {
+                    return;
+                }
+            }
+        }
+        let mut c = 1u64;
+        for ch in TITLE_TEXT.chars() {
+            let w = char_cells(ch);
+            if c + w > self.cols {
+                break;
+            }
+            let x0 = c * CELL_W;
+            if let Some(i) = wide_idx(ch) {
+                for r in 0..32u64 {
+                    if !self.ink(f, x0, r * SCALE, FONT_WIDE[i][r as usize], 32) {
+                        return;
+                    }
+                }
+            } else {
+                let k = ch as u32;
+                if (0x20..=0x7E).contains(&k) {
+                    let idx = (k - 0x20) as usize;
+                    for r in 0..32u64 {
+                        if !self.ink(f, x0, r * SCALE, FONT_ASCII[idx][r as usize] as u32, 16) {
+                            return;
+                        }
+                    }
+                }
+            }
+            c += w;
         }
     }
 
@@ -1063,9 +1127,11 @@ pub fn redraw_window(term: &Term, f: &Frame, max_lines: usize, caret_on: bool) -
             total += 1;
         }
     }
-    // **最后一行是输入行**（提示符与正在键入的字），日志区在它上面：这是"行规程"的画面侧。
+    // 版面：**标题栏（TITLE_ROWS 行）→ 日志区 → 输入行（最后一行）**。
     // 不这么分的话内核日志继续往下写，提示符会跑到屏幕中间、并被日志粘住。
-    let log_rows = max_lines.saturating_sub(1);
+    term.title_bar(f);
+    let top = TITLE_ROWS;
+    let log_rows = max_lines.saturating_sub(TITLE_ROWS as usize + 1);
     let skip = total.saturating_sub(log_rows);
     let mut line = [0u8; LINE_BUF];
     let mut len = 0usize;
@@ -1079,11 +1145,12 @@ pub fn redraw_window(term: &Term, f: &Frame, max_lines: usize, caret_on: bool) -
                 // 合法 UTF-8 直接按字符画；被截断在多字节字符中间时取**合法前缀**
                 // （`valid_up_to`）——只丢掉那半个字，而不是把整行的中文降级成 `?`
                 // （用户截图里那串 `??????` 就是这么来的：200 字节上限切断了长中文行）。
+                let r = top + row as u64;
                 let drew = match core::str::from_utf8(&line[..len]) {
-                    Ok(s) => term.print_line(f, row as u64, s),
+                    Ok(s) => term.print_line(f, r, s),
                     Err(e) => {
                         let ok = e.valid_up_to();
-                        term.print_line(f, row as u64, core::str::from_utf8(&line[..ok]).unwrap_or(""))
+                        term.print_line(f, r, core::str::from_utf8(&line[..ok]).unwrap_or(""))
                     }
                 };
                 if drew > 0 || len == 0 {
@@ -1109,7 +1176,7 @@ pub fn redraw_window(term: &Term, f: &Frame, max_lines: usize, caret_on: bool) -
     }
     // 日志区没被内容占满的行一律刷空：残影像素会被下一帧读成"那行还在"
     while row < log_rows {
-        term.print_line(f, row as u64, "");
+        term.print_line(f, top + row as u64, "");
         row += 1;
     }
     // **输入行固定在最后一行**：没有换行结尾的那一段（`> ` + 键入）画在这里、光标也在这里。
@@ -1134,11 +1201,12 @@ pub fn redraw_window(term: &Term, f: &Frame, max_lines: usize, caret_on: bool) -
                 Err(e) => core::str::from_utf8(&line[..e.valid_up_to()]).unwrap_or(""),
             });
         }
-        term.print_line(f, log_rows as u64, &text);
+        let in_row = top + log_rows as u64;
+        term.print_line(f, in_row, &text);
         caret_col = cells_of(&text).min(term.cols.saturating_sub(1));
     }
     if caret_on {
-        term.caret(f, caret_col, log_rows as u64);
+        term.caret(f, caret_col, top + log_rows as u64);
     }
     max_lines
 }
