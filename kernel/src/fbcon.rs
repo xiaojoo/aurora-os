@@ -796,6 +796,11 @@ fn wide_idx(ch: char) -> Option<usize> {
     WIDE_CP.binary_search(&(ch as u32)).ok()
 }
 
+/// 一段文本占多少格（按字符宽度累加，不含行尾补齐）。
+pub fn cells_of(s: &str) -> u64 {
+    s.chars().map(char_cells).sum()
+}
+
 /// 这个字符占几格。**非 ASCII 一律 2 格**：覆盖集里是汉字与全角符号，
 /// 在中文语境下都按双宽排；ASCII 一列一格。
 pub fn char_cells(ch: char) -> u64 {
@@ -902,6 +907,22 @@ impl Term {
             }
         }
         true
+    }
+
+    /// 画光标：格底三行、半格宽的下划线（像终端里的块状光标，但不会盖住字）。
+    pub fn caret(&self, f: &Frame, col: u64, row: u64) {
+        if Self::frozen() || row >= self.rows || col >= self.cols {
+            return;
+        }
+        let x0 = col * CELL_W;
+        let y0 = row * CELL_H;
+        for yy in (CELL_H - 3)..CELL_H {
+            for x in 0..(CELL_W / 2) {
+                if f.put(x0 + x, y0 + yy, FG).is_err() {
+                    return;
+                }
+            }
+        }
     }
 
     /// 整屏刷成背景色。终端模式开屏第一步：把启动阶段画的测试图案（S6a 的红绿蓝三条带）清掉。
@@ -1072,11 +1093,27 @@ pub fn redraw_window(term: &Term, f: &Frame, max_lines: usize) -> usize {
             len += 1;
         }
     }
+    // **没有换行结尾的"当前行"也要画**（shell 的 `> ` 与正在键入的字就是这么攒的）：
+    // 只画完整行的话，用户打字时屏幕上什么都不出现 —— 那看起来就是"键盘没反应"
+    // （用户实测反馈）。顺带把光标画在它末尾。
+    let mut caret_col = 0u64;
+    let mut caret_row = row as u64;
+    if len > 0 && (row as usize) < max_lines {
+        let text = match core::str::from_utf8(&line[..len]) {
+            Ok(s) => s,
+            Err(e) => core::str::from_utf8(&line[..e.valid_up_to()]).unwrap_or(""),
+        };
+        term.print_line(f, row as u64, text);
+        caret_col = cells_of(text).min(term.cols.saturating_sub(1));
+        caret_row = row as u64;
+        row += 1;
+    }
     // 窗口里没被内容占满的行一律刷空：残影像素会被下一帧读成"那行还在"
     while row < max_lines {
         term.print_line(f, row as u64, "");
         row += 1;
     }
+    term.caret(f, caret_col, caret_row);
     row.min(max_lines)
 }
 
