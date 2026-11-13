@@ -37,6 +37,8 @@ mod frame;
 mod fbcon;
 #[cfg(feature = "ps2-kbd")]
 mod kbd;
+#[cfg(feature = "ps2-mouse")]
+mod mouse;
 mod irq;
 mod exit;
 mod ktest;
@@ -227,6 +229,8 @@ extern "C" fn after_switch(_: usize) -> ! {
     // S6c：键盘在 ACPI/MADT 之后开（要查 IRQ1 的 GSI），在 ktests 之前（用例可能要用它）
     #[cfg(feature = "ps2-kbd")]
     stage_keyboard();
+    #[cfg(feature = "ps2-mouse")]
+    stage_mouse();
     stage_fault_injections();
     stage_storage_guard_crash();
     stage_signature_check();
@@ -324,6 +328,31 @@ fn stage_keyboard() {
             i.preflush
         ),
         Err(e) => crate::log_warn!("kbd: 开启失败 —— {:?}", e),
+    }
+}
+
+/// S6o：开鼠标（i8042 第二口 + IRQ12），并把指针放在屏幕中心。
+#[cfg(feature = "ps2-mouse")]
+fn stage_mouse() {
+    let Some(m) = acpi::summary().and_then(|s| s.madt) else {
+        crate::log_warn!("mouse: 没有 MADT，IRQ12 无从路由");
+        return;
+    };
+    let Some(fb) = crate::limine::framebuffer() else {
+        crate::log_warn!("mouse: 没有帧缓冲信息，指针位置无从限定");
+        return;
+    };
+    match crate::mouse::enable(&m, fb.width as u32, fb.height as u32) {
+        Ok(i) => crate::log_info!(
+            "mouse: 已开 IRQ={} 命令字节=0x{:02X}->0x{:02X} 设备ACK=0x{:02X} 屏幕={}x{}",
+            crate::mouse::MOUSE_IRQ,
+            i.cmd_before,
+            i.cmd_after,
+            i.dev_ack,
+            fb.width,
+            fb.height
+        ),
+        Err(e) => crate::log_warn!("mouse: 开启失败 —— {:?}", e),
     }
 }
 
@@ -1023,7 +1052,7 @@ fn park_until_init_exits(init: Option<usize>) {
         loop {
             // 每轮 64 窗口（约 1 s）。这中间 init 是唯一还在干的活：它读控制台，
             // 收到 `exit` 才 SYS_EXIT，于是这里下一轮就看到 Done。
-            let woke = apic::with_interrupts(|| sched::wait_for_task(gidx, crate::clock::window_cycles(32)));
+            let woke = apic::with_interrupts(|| sched::wait_for_task(gidx, crate::clock::window_cycles(8)));
             if woke {
                 crate::log_info!("resident-init: init 已收工 ⇒ 系统停机");
                 return;
@@ -1032,6 +1061,7 @@ fn park_until_init_exits(init: Option<usize>) {
             if let Some(t) = live.as_ref() {
                 t.repaint();
             }
+            // 点击与统计统一在 `LiveTerm::repaint` 里处理（两个等待循环都会路过它）。
         }
     }
     #[cfg(not(feature = "resident-init"))]
@@ -1274,9 +1304,28 @@ impl LiveTerm {
 
     fn repaint(&self) {
         let rows = self.term.body_rows();
-        // 光标闪烁：每重画一次翻一次（常驻期一轮 32 窗口 ≈ 0.5 s ⇒ 约 0.5 s 亮／0.5 s 灭）。
-        let on = !BLINK.fetch_xor(true, core::sync::atomic::Ordering::Relaxed);
+        // 光标闪烁：每 4 帧翻一次（常驻期一轮 8 窗口 ⇒ 约 0.5 s 亮／0.5 s 灭）。
+        // 轮询变勤是为了鼠标跟手；闪烁节拍因此要按帧数除，而不是每帧都翻。
+        let n = FRAMES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let on = (n / 4) % 2 == 0;
         crate::fbcon::redraw_window(&self.term, &self.frame, rows.min(LIVE_ROWS), on);
+        // 指针画在终端之后：下一帧整屏重画会把它擦掉，不需要"恢复背景"那套簿记。
+        #[cfg(feature = "ps2-mouse")]
+        {
+            let (px, py) = crate::mouse::pos();
+            self.term.draw_pointer(&self.frame, px, py);
+            // 点击的**打印在任务上下文**：`repaint` 只从两个等待循环里调，ISR 走不到这里。
+            // 放在这里而不是只放常驻循环：**等待期也会点**（实测：只在 park 里取，
+            // 等待期那几下点击就永远读不到）。
+            if let Some((cx, cy)) = crate::mouse::take_click() {
+                let hit = crate::fbcon::hit_test(self.term.dims().0, cx as u64, cy as u64);
+                crate::log_info!("mouse: 点击 x={} y={} 命中={}", cx, cy, hit.name());
+            }
+            if n % 8 == 0 {
+                let (pk, bad, clk, idx) = crate::mouse::stats();
+                crate::log_info!("mouse: 统计 包={} 坏同步={} 点击={} 攒包={}", pk, bad, clk, idx);
+            }
+        }
     }
 }
 
@@ -1284,9 +1333,9 @@ impl LiveTerm {
 #[cfg(feature = "fbcon-live")]
 const LIVE_ROWS: usize = 24;
 
-/// 光标当前该不该亮。每重画一次翻一次：常驻期 32 窗口一轮 ⇒ 约 0.5 s 亮 / 0.5 s 灭。
+/// 已经画过多少帧。光标闪烁按帧数除（常驻期一轮 8 窗口），鼠标跟手则靠轮询变勤。
 #[cfg(feature = "fbcon-live")]
-static BLINK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+static FRAMES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// S6d：`fbcon-live` 档的"等 init 收工 + 每轮重画一次屏"。
 ///

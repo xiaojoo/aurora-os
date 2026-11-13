@@ -175,7 +175,14 @@ pub fn kbd_isr() -> bool {
         return false;
     }
     IRQS.fetch_add(1, Ordering::Relaxed);
-    if in8(KBD_CMD) & STS_OBF == 0 {
+    let st = in8(KBD_CMD);
+    if st & STS_OBF == 0 {
+        return false;
+    }
+    // **0x60 是两个设备共用的**：状态位 bit5（0x20）说这个字节来自鼠标口。
+    // 键盘 ISR 只吃 bit5=0 的字节，否则它会把鼠标包当成扫描码吃掉（S6o 实测：
+    // 指针第一下能到 (760,400)、之后就丢包 —— 因为字节被键盘抢走了）。
+    if st & 0x20 != 0 {
         return false;
     }
     let sc = in8(KBD_DATA);

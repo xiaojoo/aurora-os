@@ -831,6 +831,89 @@ const TITLE_BG_HI: u32 = 0x00_45_45_45;
 /// 选中标签的底色（再亮一级，像 Windows Terminal 的活动页）。
 const TAB_BG: u32 = 0x00_2D_2D_2D;
 
+/// 标签栏的几何。**绘制与命中测试共用这一份**——两处各算一遍，点击就会落在画的地方旁边。
+pub struct BarLayout {
+    pub strip_l: u64,
+    pub strip_r: u64,
+    pub tab_w: u64,
+    pub fit: u64,
+}
+
+impl BarLayout {
+    pub fn of(cols: u64) -> Self {
+        let tab_w = cells_of(TAB_LABEL) + 5; // 左 2 + 文字 + 右 2 + 关闭 1
+        let strip_l = 1;
+        let strip_r = cols.saturating_sub(5); // 右侧三个按钮各 1 格 + 1 格边
+        let fit = if strip_r > strip_l + tab_w {
+            (strip_r - strip_l) / (tab_w + 1)
+        } else {
+            0
+        };
+        Self { strip_l, strip_r, tab_w, fit }
+    }
+    pub fn tab_col(&self, i: u64) -> u64 {
+        self.strip_l + i * (self.tab_w + 1)
+    }
+    /// `+` 在哪一列
+    pub fn plus_col(&self, shown: u64) -> u64 {
+        self.strip_l + shown * (self.tab_w + 1)
+    }
+}
+
+/// 点在了哪儿。只有 `Body` 是"终端正文"，其余都是标签栏上的控件。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hit {
+    TabClose,
+    Tab,
+    NewTab,
+    Min,
+    Max,
+    Close,
+    Bar,
+    Body,
+}
+
+impl Hit {
+    pub fn name(self) -> &'static str {
+        match self {
+            Hit::TabClose => "标签关闭",
+            Hit::Tab => "标签",
+            Hit::NewTab => "新建标签",
+            Hit::Min => "最小化",
+            Hit::Max => "最大化",
+            Hit::Close => "关闭窗口",
+            Hit::Bar => "标签栏空白",
+            Hit::Body => "终端正文",
+        }
+    }
+}
+
+/// 屏幕像素坐标 → 命中项。第 0 行是标签栏，其余全是正文。
+pub fn hit_test(cols: u64, x_px: u64, y_px: u64) -> Hit {
+    if y_px >= CELL_H {
+        return Hit::Body;
+    }
+    let c = x_px / CELL_W;
+    let lay = BarLayout::of(cols);
+    if c >= lay.strip_l && c < lay.strip_l + lay.tab_w {
+        // 标签体：最右一列是它自己的关闭符
+        return if c + 1 >= lay.strip_l + lay.tab_w { Hit::TabClose } else { Hit::Tab };
+    }
+    if c == lay.plus_col(1) {
+        return Hit::NewTab;
+    }
+    if c == lay.strip_r {
+        return Hit::Min;
+    }
+    if c == lay.strip_r + 1 {
+        return Hit::Max;
+    }
+    if c == lay.strip_r + 2 {
+        return Hit::Close;
+    }
+    Hit::Bar
+}
+
 /// 配色取 Windows Terminal 的默认：近黑底（#0C0C0C）+ 浅灰字（#CCCCCC）。
 /// 纯黑/纯白看着"生"、对比也过强；这一对与测试图案的三条带仍然都不同 ⇒
 /// "画在带上的字"和"带本身"照样分得开（§240 那条对账不受影响）。
@@ -1013,16 +1096,13 @@ impl Term {
         self.rect(f, 0, 0, w, CELL_H, TITLE_BG);
         self.rect(f, 0, CELL_H - 2, w, 2, TITLE_BG_HI);
 
-        // 2) 标签：宽 = 两侧留白 + 文字 + 关闭符
-        let label_cells = cells_of(TAB_LABEL);
-        let tab_w = label_cells + 5;                 // 左 2 + 文字 + 右 2 + 关闭 1
-        let strip_l = 1u64;
-        let strip_r = self.cols.saturating_sub(5);   // 右侧三个按钮占 4 格 + 1 格边
-        let fit = if strip_r > strip_l + tab_w { (strip_r - strip_l) / (tab_w + 1) } else { 0 };
+        // 2) 标签：几何来自 `BarLayout`（与命中测试同一份）
+        let lay = BarLayout::of(self.cols);
+        let (tab_w, strip_l, strip_r, fit) = (lay.tab_w, lay.strip_l, lay.strip_r, lay.fit);
         let shown = n_tabs.min(fit);
 
         for i in 0..shown {
-            let c0 = strip_l + i * (tab_w + 1);
+            let c0 = lay.tab_col(i);
             self.rect(f, c0 * CELL_W, 0, tab_w * CELL_W, CELL_H - 2, TAB_BG);
             let mut c = c0 + 2;
             for ch in TAB_LABEL.chars() {
@@ -1034,7 +1114,7 @@ impl Term {
         }
         // 3) `+`：新标签（标签之后还放得下就画；不是"标签填满才画"）
         if fit > 0 {
-            let plus_c = strip_l + shown * (tab_w + 1);
+            let plus_c = lay.plus_col(shown);
             if plus_c < strip_r {
                 let x = plus_c * CELL_W + 4;
                 self.rect(f, x + 3, 14, 2, 8, FG);
@@ -1061,6 +1141,41 @@ impl Term {
         self.rect(f, mx + 7, 11, 2, 10, FG);
         // 关闭：×
         self.cross(f, bx + 2 * CELL_W, 11, 9, FG);
+    }
+
+    /// 鼠标指针：7×11 的**几何箭头**（`#`=填充、`o`=描边），左上角是尖。
+    /// 描边用正文底色，使它压在文字上也看得见；越界像素自动跳过。
+    pub fn draw_pointer(&self, f: &Frame, x: i32, y: i32) {
+        const ARROW: [&[u8]; 11] = [
+            b"o......",
+            b"oo.....",
+            b"o#o....",
+            b"o##o...",
+            b"o###o..",
+            b"o####o.",
+            b"o#####o",
+            b"o###ooo",
+            b"o#o#o..",
+            b"oo.o#o.",
+            b"....o#o",
+        ];
+        for (r, row) in ARROW.iter().enumerate() {
+            for (c, &px) in row.iter().enumerate() {
+                let x0 = x + c as i32;
+                let y0 = y + r as i32;
+                if x0 < 0 || y0 < 0 {
+                    continue;
+                }
+                let color = match px {
+                    b'#' => FG,
+                    b'o' => BG,
+                    _ => continue,
+                };
+                if f.put(x0 as u64, y0 as u64, color).is_err() {
+                    return;
+                }
+            }
+        }
     }
 
     /// 整屏刷成背景色。终端模式开屏第一步：把启动阶段画的测试图案（S6a 的红绿蓝三条带）清掉。

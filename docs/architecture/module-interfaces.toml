@@ -436,6 +436,7 @@ source_modules = ["frame", "fbcon"]
 public_api = [
   "fbcon::BAND_ROWS",
   "fbcon::drain_and_draw",
+  "fbcon::hit_test",
   "fbcon::BAND_TEXT",
   "fbcon::CELL_H",
   "fbcon::CELL_W",
@@ -675,11 +676,16 @@ status = "部分落地"
 module_id = "input"
 owner = "input"
 layer = "hal"
-source_modules = ["kbd"]
+source_modules = ["kbd", "mouse"]
 public_api = [
   "kbd::enable",
   "kbd::read_char",
   "kbd::ring_cap",
+  "mouse::MOUSE_IRQ",
+  "mouse::enable",
+  "mouse::pos",
+  "mouse::stats",
+  "mouse::take_click",
   "kbd::stats",
 ]
 allowed_callers = ["integration", "sched"]
