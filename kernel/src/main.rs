@@ -1054,7 +1054,7 @@ fn park_until_init_exits(init: Option<usize>) {
         // S6g：判定之后的常驻期画面**继续刷新**（terminal 的意义就在这里）。
         // 这里单独开一次映射：stage_init_user 里那一个已经随函数返回 drop 掉了。
         #[cfg(feature = "fbcon-live")]
-        let live = LiveTerm::open();
+        let mut live = LiveTerm::open();
         loop {
             // 每轮 64 窗口（约 1 s）。这中间 init 是唯一还在干的活：它读控制台，
             // 收到 `exit` 才 SYS_EXIT，于是这里下一轮就看到 Done。
@@ -1064,7 +1064,7 @@ fn park_until_init_exits(init: Option<usize>) {
                 return;
             }
             #[cfg(feature = "fbcon-live")]
-            if let Some(t) = live.as_ref() {
+            if let Some(t) = live.as_mut() {
                 t.repaint();
             }
             // 点击与统计统一在 `LiveTerm::repaint` 里处理（两个等待循环都会路过它）。
@@ -1322,6 +1322,23 @@ fn stage_init_user(sid: u8) -> Option<usize> {
 struct LiveTerm {
     frame: crate::frame::Frame,
     term: crate::fbcon::Term,
+    /// S6q：**上一次整窗重画的判据**。整屏一次是上百万次 UC 设备写（实测一轮里能占到
+    /// 上百毫秒），而指针与光标每秒要动好几次；只要这一格没变就**不重画正文**。
+    /// (会话号, 该会话环里累计字节, 该会话环里的换行数, 标签数, 活动标签)
+    /// —— 换行数是"整窗 vs 只画输入行"的分水岭。
+    sig: (u8, usize, u64, u64, u64),
+    /// 光标（下划线）**现在**画在哪一格；`None` = 现在是灭的一相。
+    caret: Option<(u64, u64)>,
+    /// 下一相光标该在哪一格（整窗重画时由 `redraw_window` 交回来）。
+    caret_at: Option<(u64, u64)>,
+    /// 指针当前位置（已画在屏上）与它盖住的 7×11 背景。
+    /// **为什么不靠整窗重画擦指针**：那就是"指针跟着整屏一起闪"的来源；
+    /// 保存/恢复 77 个像素是 154 次设备写，比一次重画便宜四个数量级。
+    ptr: Option<(i32, i32)>,
+    ptr_bg: [[u32; 7]; 11],
+    /// 四本账：整窗重画 / 指针重画 / 光标翻转 / 只重画输入行各做了多少次
+    /// （进日志，宿主机可复算"没内容变化时一个字都不写"）。
+    paints: (u32, u32, u32, u32),
 }
 
 #[cfg(feature = "fbcon-live")]
@@ -1342,13 +1359,20 @@ impl LiveTerm {
         // 几何由 `live_wait_and_redraw` 打一次（那一次还带"每轮窗口"）。
         // 终端模式开屏先清屏：启动阶段（S6a）画的测试图案会留在下面 2/3 屏上（用户截图里的红绿蓝）。
         term.clear(&frame);
-        Some(Self { frame, term })
+        Some(Self {
+            frame, term,
+            sig: (u8::MAX, usize::MAX, u64::MAX, 0, 0),
+            caret: None,
+            caret_at: None,
+            ptr: None,
+            ptr_bg: [[0; 7]; 11],
+            paints: (0, 0, 0, 0),
+        })
     }
 
-    fn repaint(&self) {
+    fn repaint(&mut self) {
         let rows = self.term.body_rows();
         // 光标闪烁：每 4 帧翻一次（常驻期一轮 8 窗口 ⇒ 约 0.5 s 亮／0.5 s 灭）。
-        // 轮询变勤是为了鼠标跟手；闪烁节拍因此要按帧数除，而不是每帧都翻。
         let n = FRAMES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let on = (n / 4) % 2 == 0;
         #[cfg(feature = "handles")]
@@ -1359,12 +1383,55 @@ impl LiveTerm {
         );
         #[cfg(not(feature = "handles"))]
         let (sid, tabs, active) = (0usize, 1u64, 0u64);
-        crate::fbcon::redraw_window(&self.term, &self.frame, rows.min(LIVE_ROWS), on, sid, tabs, active);
-        // 指针画在终端之后：下一帧整屏重画会把它擦掉，不需要"恢复背景"那套簿记。
+        // S6q：**只有内容真的变了才画**。两档判据：
+        //   · 换行数变了 / 换会话 / 换标签 ⇒ 整窗重画（正文真的动了）；
+        //   · 只有尾部半行在长（换行数没变）⇒ **只重画输入行**（一个键不再拖整屏）；
+        //   · 什么都没变 ⇒ 一个字都不写。指针与光标不在这两条判据里。
+        let total = crate::serial::mirror_total_sid(sid);
+        let nl = crate::serial::mirror_newlines_sid(sid);
+        let sig = (sid as u8, total, nl as u64, tabs, active);
+        if sig != self.sig {
+            // 先把指针的像素还回去（它盖住的那 77 个像素是上一帧的背景）；
+            // 整窗重画也会覆盖它，但**输入行那一路只动一行**——行外的指针必须自己擦。
+            self.ptr_erase();
+            let incremental = self.sig.0 == sid as u8
+                && self.sig.2 == nl as u64
+                && self.sig.1 != usize::MAX;
+            let (cc, cr) = if incremental {
+                crate::fbcon::redraw_input(&self.term, &self.frame, rows.min(LIVE_ROWS), sid)
+            } else {
+                let (_, cc, cr) = crate::fbcon::redraw_window(
+                    &self.term, &self.frame, rows.min(LIVE_ROWS), sid, tabs, active);
+                (cc, cr)
+            };
+            self.sig = sig;
+            // 画过的像素一律作废：光标靠下一相重画，指针靠下面 `ptr_track` 重画。
+            self.caret = None;
+            self.caret_at = if cr != 0 { Some((cc, cr)) } else { None };
+            if incremental {
+                self.paints.3 += 1;
+            } else {
+                self.paints.0 += 1;
+            }
+        }
+        // 光标：只翻那一格的三行半格宽（24 个像素），不再为一次眨眼重写整屏。
+        match (on, self.caret, self.caret_at) {
+            (true, None, Some((c, r))) => {
+                self.term.caret(&self.frame, c, r);
+                self.caret = Some((c, r));
+                self.paints.2 += 1;
+            }
+            (false, Some((c, r)), _) => {
+                self.term.caret_erase(&self.frame, c, r);
+                self.caret = None;
+                self.paints.2 += 1;
+            }
+            _ => {}
+        }
+        // 指针：位置变了才擦旧画新（保存/恢复 77 个背景像素）。
         #[cfg(feature = "ps2-mouse")]
         {
-            let (px, py) = crate::mouse::pos();
-            self.term.draw_pointer(&self.frame, px, py);
+            self.ptr_track();
             // 点击的**打印在任务上下文**：`repaint` 只从两个等待循环里调，ISR 走不到这里。
             // 放在这里而不是只放常驻循环：**等待期也会点**（实测：只在 park 里取，
             // 等待期那几下点击就永远读不到）。
@@ -1387,9 +1454,54 @@ impl LiveTerm {
                     _ => {}
                 }
             }
-            if n % 8 == 0 {
-                let (pk, bad, clk, idx) = crate::mouse::stats();
-                crate::log_info!("mouse: 统计 包={} 坏同步={} 点击={} 攒包={}", pk, bad, clk, idx);
+            // S6q：**不再每 8 帧打一行统计**。那一行日志本身就会让正文整窗重画一次
+            // （每秒一次、约 94 万次 UC 写）⇒ 用户看到的"鼠标一直在闪"有一半是它造成的。
+            // 读数改在收工那一刻报一次（`鼠标收工` 行），判据仍可复算。
+            if n % 256 == 0 {
+                // S6q：三本账——正文整画 / 指针重画 / 光标翻转各做了多少次。
+                // 判据用它们证明"指针不再跟着整屏重画"（全画数应远小于帧数）。
+                crate::log_info!(
+                    "fbcon-live: 帧={} 整画={} 指针={} 光标={} 行画={}",
+                    n, self.paints.0, self.paints.1, self.paints.2, self.paints.3
+                );
+            }
+        }
+    }
+
+    /// 指针跟随：位置变了才擦旧画新。**保存的背景是"画之前"的像素**（`get` 读回的原生值，
+    /// 用 `put_raw` 原样写回），所以擦除不会做第二次 24→32 位打包（§S6b 的同一教训）。
+    #[cfg(feature = "ps2-mouse")]
+    fn ptr_track(&mut self) {
+        let (px, py) = crate::mouse::pos();
+        if self.ptr == Some((px, py)) {
+            return;
+        }
+        self.ptr_erase();
+        for r in 0..11usize {
+            for c in 0..7usize {
+                let (x, y) = (px + c as i32, py + r as i32);
+                if x < 0 || y < 0 {
+                    continue;
+                }
+                if let Ok(v) = self.frame.get(x as u64, y as u64) {
+                    self.ptr_bg[r][c] = v;
+                }
+            }
+        }
+        self.term.draw_pointer(&self.frame, px, py);
+        self.ptr = Some((px, py));
+        self.paints.1 += 1;
+    }
+
+    fn ptr_erase(&mut self) {
+        let Some((px, py)) = self.ptr.take() else { return };
+        for r in 0..11usize {
+            for c in 0..7usize {
+                let (x, y) = (px + c as i32, py + r as i32);
+                if x < 0 || y < 0 {
+                    continue;
+                }
+                let _ = self.frame.put_raw(x as u64, y as u64, self.ptr_bg[r][c]);
             }
         }
     }
@@ -1413,7 +1525,7 @@ static FRAMES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize
 fn live_wait_and_redraw(gidx: usize, total_windows: u64) -> bool {
     const STEP: u64 = 16;
     let one_shot = |g: usize| apic::with_interrupts(|| sched::wait_for_task(g, crate::clock::window_cycles(total_windows)));
-    let Some(live) = LiveTerm::open() else {
+    let Some(mut live) = LiveTerm::open() else {
         crate::log_warn!("fbcon-live: 退回一次性等待（画面不会有键入内容）");
         return one_shot(gidx);
     };

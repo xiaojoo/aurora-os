@@ -47,6 +47,10 @@ static TAIL: AtomicUsize = AtomicUsize::new(0);
 static ON: AtomicBool = AtomicBool::new(false);
 /// 上一条是不是 `0xE0` 前缀。只在 ISR 里读写，且 ISR 不嵌套同一 IRQ ⇒ 单所有者。
 static EXT: AtomicBool = AtomicBool::new(false);
+/// Ctrl 是否按着（S6q）。左 Ctrl 的 make/break 是 `0x1D`/`0x9D`，
+/// 右 Ctrl 是 `E0 1D`/`E0 9D`——两种都在 `sc` 那一层看得到，所以只看这两个字节。
+/// **只在 ISR 里读写**（同 `EXT`，ISR 不嵌套同一个 IRQ ⇒ 单所有者）。
+static CTRL: AtomicBool = AtomicBool::new(false);
 
 // 八格读数，一格一个成因——"收到了但没解出来"和"根本没收到"必须分得开
 static BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -151,6 +155,18 @@ pub fn step(prev_ext: bool, sc: u8) -> (bool, Code) {
     (false, Code::Char(c))
 }
 
+/// Ctrl + 字母 ⇒ 控制码（`c & 0x1F`；Ctrl+C = `0x03`）。
+///
+/// **只对字母生效**：Ctrl+数字/符号在不同终端里不一致，本片不猜（与 `CHAR_MAP`
+/// "表里没有就不映射"同一条纪律）。Shift 仍然没做（`CHAR_MAP` 只有小写这一套）。
+pub fn apply_ctrl(ctrl: bool, c: u8) -> u8 {
+    if ctrl && c.is_ascii_lowercase() {
+        c & 0x1F
+    } else {
+        c
+    }
+}
+
 /// 往 `port` 发一个字节，再取回对方放在 0x60 的那个字节（命令字节或 ACK）。
 /// 输入缓冲区**非空**不可写（bit1=1 表示还在忙），所以这里判的是 `== 0`，
 /// 不能复用串口那条 `wait_for`——它等的是"某位置位"，方向正好相反。
@@ -187,6 +203,13 @@ pub fn kbd_isr() -> bool {
     }
     let sc = in8(KBD_DATA);
     BYTES.fetch_add(1, Ordering::Relaxed);
+    // Ctrl 的按下/松开（S6q）：这两个字节本身仍按 Unmapped/Break 记账，
+    // 账目一格不动，只是多记一个"修饰键现在按着没"。
+    match sc {
+        0x1D => CTRL.store(true, Ordering::Relaxed),
+        0x9D => CTRL.store(false, Ordering::Relaxed),
+        _ => {}
+    }
     let prev = EXT.load(Ordering::Relaxed);
     let (now_ext, code) = step(prev, sc);
     EXT.store(now_ext, Ordering::Relaxed);
@@ -208,6 +231,9 @@ pub fn kbd_isr() -> bool {
             UNMAPPED.fetch_add(1, Ordering::Relaxed);
         }
         Code::Char(c) => {
+            // S6q：Ctrl 按着就把字母压成控制码（Ctrl+C = 0x03）。账目不变：
+            // 这个字节仍然只落进"入环"这一格，只是入环的**值**是控制码。
+            let c = apply_ctrl(CTRL.load(Ordering::Relaxed), c);
             let h = HEAD.load(Ordering::Relaxed);
             if (h + 1) % RING_CAP == TAIL.load(Ordering::Relaxed) {
                 DROPPED.fetch_add(1, Ordering::Relaxed);   // 环满：丢新键并计数，不覆盖、不等待

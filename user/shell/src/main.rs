@@ -38,7 +38,7 @@ const MAX_STARTUP_HANDLES: usize = 16;
 /// 所有提示串拼成一个静态 blob。**为什么不用字符串字面量**：镜像基址在 4 GiB 之上，
 /// `relocation-model=static` 下字面量地址会退化成 `R_X86_64_32S` 绝对重定位，链接期 out of range
 /// （hello/probe 的模块头都记过这个坑，本轮实测又撞一次）。改成 RIP 相对 lea 取基址 + 常量偏移。
-static MSGS: [u8; 170] = *b"commands: help | echo <text> | ping | abi | exit\x0a\x0aAurora shell (S5c). type 'help'.\x0aAURORA:/ > \x0aline too long, discarded\x0aunknown command:  (try help)\x0aping=abi_info=bye\x0a\x08 \x08";
+static MSGS: [u8; 173] = *b"commands: help | echo <text> | ping | abi | exit\x0a\x0aAurora shell (S5c). type 'help'.\x0aAURORA:/ > \x0aline too long, discarded\x0aunknown command:  (try help)\x0aping=abi_info=bye\x0a\x08 \x08^C\x0a";
 
 const M_HELP: (usize, usize) = (0, 49);
 const M_BANNER: (usize, usize) = (49, 34);
@@ -51,6 +51,8 @@ const M_PING: (usize, usize) = (149, 5);
 const M_ABI: (usize, usize) = (154, 9);
 const M_BYE: (usize, usize) = (163, 4);
 const M_BS: (usize, usize) = (167, 3);
+/// Ctrl+C 的回显串（S6q）。**追加在 blob 末尾**：这样前面那 11 条偏移一个都不用动。
+const M_INT: (usize, usize) = (170, 3);
 
 /// blob 的真实基址（RIP 相对 lea，不产生 32 位绝对重定位）。
 fn msgs_base() -> u64 {
@@ -113,6 +115,26 @@ fn con_read_byte(h: u64, slot: &mut u8) -> Option<u8> {
     } else {
         None
     }
+}
+
+/// Ctrl+C = **行内中断**（S6q）：丢弃已键入的内容、回显 `^C`、重新给提示符。
+///
+/// 口径写清楚：本内核还没有信号与前台进程组，命令也都是瞬间完成的，所以这里"中断"的是
+/// **正在编辑的这一行**，不是某个进程（BACKLOG §261 记着）。
+///
+/// **为什么单独一个 `#[inline(never)]` 的函数**：把这个字节比较塞进 `_start` 里那串
+/// 已有的字节比较（换行/退格/DEL），LLVM 会把整串降成 `switch` + 跳转表，而那张表落在
+/// 4 GiB 之上的 `.rodata`——静态链接下取址是绝对重定位，链接器直接报
+/// `R_X86_64_32S out of range`（本轮实测两次：加比较、加 xor 都一样）。把它关进一个
+/// 只做一次比较的函数里，`_start` 里就只剩一次调用。
+#[inline(never)]
+fn ctrl_c(console: u64, b: u8) -> bool {
+    if b != 0x03 {
+        return false;
+    }
+    con_write(console, msg(M_INT));
+    con_write(console, msg(M_PROMPT));
+    true
 }
 
 /// 把一个小整数按十进制写出去（no_std 里没有格式化器可用，也不引依赖）。
@@ -271,6 +293,11 @@ pub extern "C" fn _start(si_va: u64) -> ! {
             len = 0;
             overflow = false;
             con_write(console, msg(M_PROMPT));
+            continue;
+        }
+        if ctrl_c(console, b) {
+            len = 0;
+            overflow = false;
             continue;
         }
         if b == 0x08 || b == 0x7f {

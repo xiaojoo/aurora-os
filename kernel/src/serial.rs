@@ -457,6 +457,20 @@ pub fn mirror_len_sid(sid: usize) -> usize {
     MIRROR_POS[sid_of(sid)].load(Ordering::Relaxed).min(MIRROR_BYTES)
 }
 
+/// 环里现有多少个换行（S6q 的**增量重画**判据）。换行数没变 ⇒ 正文区一个字都没动，
+/// 只是尾部半行在长 ⇒ 只有输入行需要重画；不这么分，每个键都拖着整屏重写一次。
+pub fn mirror_newlines_sid(sid: usize) -> usize {
+    let sid = sid_of(sid);
+    let n = mirror_len_sid(sid);
+    let mut k = 0usize;
+    for i in 0..n {
+        if mirror_byte_sid(sid, i) == 10 {
+            k += 1;
+        }
+    }
+    k
+}
+
 pub fn mirror_total_sid(sid: usize) -> usize {
     MIRROR_POS[sid_of(sid)].load(Ordering::Relaxed)
 }
