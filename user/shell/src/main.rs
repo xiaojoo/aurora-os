@@ -38,21 +38,23 @@ const MAX_STARTUP_HANDLES: usize = 16;
 /// 所有提示串拼成一个静态 blob。**为什么不用字符串字面量**：镜像基址在 4 GiB 之上，
 /// `relocation-model=static` 下字面量地址会退化成 `R_X86_64_32S` 绝对重定位，链接期 out of range
 /// （hello/probe 的模块头都记过这个坑，本轮实测又撞一次）。改成 RIP 相对 lea 取基址 + 常量偏移。
-static MSGS: [u8; 173] = *b"commands: help | echo <text> | ping | abi | exit\x0a\x0aAurora shell (S5c). type 'help'.\x0aAURORA:/ > \x0aline too long, discarded\x0aunknown command:  (try help)\x0aping=abi_info=bye\x0a\x08 \x08^C\x0a";
+/// S6u：横幅的前导 `\x0a` 去掉了——那是当年为了跟上面的内核日志隔开留的，
+/// ADR-096 之后画面正文只有会话输出，前面什么都没有，那一格就成了纯粹的空行。
+static MSGS: [u8; 172] = *b"commands: help | echo <text> | ping | abi | exit\x0aAurora shell (S5c). type 'help'.\x0aAURORA:/ > \x0aline too long, discarded\x0aunknown command:  (try help)\x0aping=abi_info=bye\x0a\x08 \x08^C\x0a";
 
 const M_HELP: (usize, usize) = (0, 49);
-const M_BANNER: (usize, usize) = (49, 34);
-const M_PROMPT: (usize, usize) = (83, 11);
-const M_NL: (usize, usize) = (94, 1);
-const M_TOOLONG: (usize, usize) = (95, 25);
-const M_UNKNOWN: (usize, usize) = (120, 17);
-const M_TRYHELP: (usize, usize) = (137, 12);
-const M_PING: (usize, usize) = (149, 5);
-const M_ABI: (usize, usize) = (154, 9);
-const M_BYE: (usize, usize) = (163, 4);
-const M_BS: (usize, usize) = (167, 3);
+const M_BANNER: (usize, usize) = (49, 33);
+const M_PROMPT: (usize, usize) = (82, 11);
+const M_NL: (usize, usize) = (93, 1);
+const M_TOOLONG: (usize, usize) = (94, 25);
+const M_UNKNOWN: (usize, usize) = (119, 17);
+const M_TRYHELP: (usize, usize) = (136, 12);
+const M_PING: (usize, usize) = (148, 5);
+const M_ABI: (usize, usize) = (153, 9);
+const M_BYE: (usize, usize) = (162, 4);
+const M_BS: (usize, usize) = (166, 3);
 /// Ctrl+C 的回显串（S6q）。**追加在 blob 末尾**：这样前面那 11 条偏移一个都不用动。
-const M_INT: (usize, usize) = (170, 3);
+const M_INT: (usize, usize) = (169, 3);
 
 /// blob 的真实基址（RIP 相对 lea，不产生 32 位绝对重定位）。
 fn msgs_base() -> u64 {

@@ -1058,16 +1058,23 @@ fn park_until_init_exits(init: Option<usize>) {
         #[cfg(feature = "fbcon-live")]
         let mut live = LiveTerm::open();
         loop {
-            // 每轮 64 窗口（约 1 s）。这中间 init 是唯一还在干的活：它读控制台，
-            // 收到 `exit` 才 SYS_EXIT，于是这里下一轮就看到 Done。
-            let woke = apic::with_interrupts(|| sched::wait_for_task(gidx, crate::clock::window_cycles(8)));
+            // S6u：**一拍 1 窗口（约 16 ms）**，内容签名每 8 拍才算一次。
+            // 拆之前这里是"每轮 8 窗口（约 140 ms）"，而指针只在 repaint 里画 ⇒
+            // 画面上的指针最高约 7 fps——用户量到的"鼠标卡顿"就是这个数，与 QEMU/GTK 无关
+            // （A/B：`-display none` 与 `-display gtk` 的每帧毫秒同一量级，140.1 / 198.3）。
+            let woke = apic::with_interrupts(|| sched::wait_for_task(gidx, crate::clock::window_cycles(1)));
             if woke {
                 crate::log_info!("resident-init: init 已收工 ⇒ 系统停机");
                 return;
             }
             #[cfg(feature = "fbcon-live")]
             if let Some(t) = live.as_mut() {
-                t.repaint();
+                // 拍数从墙上读，而不是自己数循环：提前返回的那些拍没有画面动作。
+                if crate::main_frames() % 8 == 7 {
+                    t.repaint();      // 结尾自带一次 tick()
+                } else {
+                    t.tick();
+                }
             }
             // 点击与统计统一在 `LiveTerm::repaint` 里处理（两个等待循环都会路过它）。
         }
@@ -1432,32 +1439,36 @@ impl LiveTerm {
         })
     }
 
-    fn repaint(&mut self) {
-        let rows = self.term.body_rows();
-        // 光标闪烁：每 4 帧翻一次（常驻期一轮 8 窗口 ⇒ 约 0.5 s 亮／0.5 s 灭）。
-        let n = FRAMES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        let on = (n / 4) % 2 == 0;
+    /// **内容重画**：只在正文真的变了的时候写像素。结尾一定走一次 `tick()`——
+    /// 整窗重画会把指针与光标擦掉，不立刻补就会缺半拍。
+    /// 当前版面四元组：会话号 / 标签数 / 活动标签 / 三态。
+    /// `repaint`（算内容签名）与 `tick`（判点击命中哪一格）**必须共用这一份**：
+    /// 两处各算一遍，命中就会按另一套标签数走。
+    fn layout(&self) -> (usize, u64, u64, crate::fbcon::Chrome) {
         #[cfg(feature = "handles")]
-        let (sid, tabs, active) = (
-            crate::user::active_session() as usize,
-            crate::serial::SESSIONS as u64,
-            crate::user::active_session() as u64,
-        );
+        let sid = crate::user::active_session() as usize;
         #[cfg(not(feature = "handles"))]
-        let (sid, tabs, active) = (0usize, 1u64, 0u64);
-        // S6q 补记三：窗口列表里"没关掉的有几项"与"当前窗口是不是最小化"决定版面。
+        let sid = 0usize;
+        // S6q 补记三：窗口列表里"没关掉的有几项"决定标签条上画几项。
         #[cfg(feature = "handles")]
-        let open = (0..crate::serial::SESSIONS).filter(|i| !self.closed[*i]).count() as u64;
+        let tabs = (0..crate::serial::SESSIONS).filter(|i| !self.closed[*i]).count() as u64;
+        #[cfg(not(feature = "handles"))]
+        let tabs = 1u64;
+        let active = sid as u64;
         #[cfg(feature = "handles")]
         let chrome = if self.mins.get(sid).copied().unwrap_or(false) {
             crate::fbcon::Chrome::Minimized
         } else {
             self.chrome
         };
-        #[cfg(feature = "handles")]
-        let tabs = open;
         #[cfg(not(feature = "handles"))]
         let chrome = self.chrome;
+        (sid, tabs, active, chrome)
+    }
+
+    fn repaint(&mut self) {
+        let rows = self.term.body_rows();
+        let (sid, tabs, active, chrome) = self.layout();
         let chrome_changed = self.chrome != self.last_chrome || chrome != self.last_chrome;
         // S6q：**只有内容真的变了才画**。两档判据：
         //   · 换行数变了 / 换会话 / 换标签 ⇒ 整窗重画（正文真的动了）；
@@ -1512,6 +1523,17 @@ impl LiveTerm {
                 self.paints.0 += 1;
             }
         }
+        self.tick();
+    }
+
+    /// **一次节拍**（S6u）：指针、光标眨眼、点击拾取。这三样都不需要读内容签名——
+    /// `mirror_newlines_sid` 每次要扫完整段环（最多 8 KiB），拿它当指针的节拍就是
+    /// 用约 140 ms 的代价换约 16 ms 的观感。用户说的"鼠标移动卡顿"就是这个数。
+    fn tick(&mut self) {
+        let n = FRAMES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        // 眨眼：每 32 拍翻一次 ⇒ 约 0.5 s 亮／0.5 s 灭，与拆出来之前同速（原来是每 4 个
+        // 约 140 ms 的轮次）。
+        let on = (n / 32) % 2 == 0;
         // 光标：只翻那一格的三行半格宽（24 个像素），不再为一次眨眼重写整屏。
         match (on, self.caret, self.caret_at) {
             (true, None, Some((c, r))) => {
@@ -1546,6 +1568,7 @@ impl LiveTerm {
                 let on_win = float && self.wm_click(cx, cy);
                 #[cfg(not(feature = "wm"))]
                 let on_win = false;
+                let (_, tabs, _, chrome) = self.layout();
                 let hit = if on_win {
                     crate::fbcon::Hit::Body
                 } else {
@@ -1921,7 +1944,18 @@ const LIVE_ROWS: usize = 24;
 
 /// 已经画过多少帧。光标闪烁按帧数除（常驻期一轮 8 窗口），鼠标跟手则靠轮询变勤。
 #[cfg(feature = "fbcon-live")]
+/// S6u：**节拍计数**（一拍 = 一次 `tick()`，常驻循环里约 16 ms）。
+/// 拆之前它是"内容轮次"（约 140 ms 一轮），指针/光标/点击都跟着它 ⇒ 画面上的指针只有约 7 fps。
+/// `fbcon-live: 帧=` 那行日志的**格式一字未动**，变的只是这个计数的单位——读数按
+/// "帧≈16 ms"来读，别再拿它乘 140 ms。
 static FRAMES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// 当前拍数（常驻循环用它决定"这一拍要不要算内容签名"）。
+/// cfg 跟着 `FRAMES` 走：那个静态量只在 `fbcon-live` 档存在。
+#[cfg(feature = "fbcon-live")]
+pub fn main_frames() -> usize {
+    FRAMES.load(core::sync::atomic::Ordering::Relaxed)
+}
 
 /// S6d：`fbcon-live` 档的"等 init 收工 + 每轮重画一次屏"。
 ///
