@@ -318,6 +318,7 @@ public_api = [
   "sched::p1_with_samples",
   "sched::ticks_of",
   "sched::MAX_TASKS_TOTAL",
+  "sched::MAX_TASKS",
   "sched::TaskState",
   "sched::is_user",
   "sched::is_resident",
@@ -365,6 +366,8 @@ public_api = [
   "user::load",
   "user::load_into",
   "user::read_at",
+  "user::active_session",
+  "user::set_active_session",
   "user::SYS_PROCESS_CREATE",
   "user::SYS_THREAD_CREATE",
   "user::SYS_PROCESS_START",
@@ -444,6 +447,7 @@ public_api = [
   "frame::Frame",
   "frame::FrameError",
   "fbcon::redraw_window",
+  "fbcon::Hit",
 ]
 allowed_callers = ["integration"]
 dependencies = ["boot", "diagnostics", "memory", "pci", "sync"]
@@ -638,6 +642,13 @@ public_api = [
   "serial::read_byte",
   "serial::line_stats",
   "serial::write_bytes",
+  "serial::write_bytes_sid",
+  "serial::SESSIONS",
+  "serial::input_shadow_byte_sid",
+  "serial::input_shadow_len_sid",
+  "serial::mirror_byte_sid",
+  "serial::mirror_len_sid",
+  "serial::mirror_wrapped_sid",
   "serial::out8",
   "serial::recent_tail",
   "serial::ring_total",

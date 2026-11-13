@@ -990,7 +990,13 @@ fn run_ktests_and_finish() -> ! {
     // S4a（W5 第一片，BACKLOG §229）：产品路径**真起 ring3**。放在判定之前、ktests 之后，
     // 这样用例读数不受影响，而 hello 的输出能进同一份串口。
     // S5d：接住 init 的任务号——判定之后要不要等它，由 `park_until_init_exits` 说。
-    let init_task = stage_init_user();
+    let init_task = stage_init_user(0);
+    // S6p：第二个会话（多标签）。**只在新特性下起**：既有变体的任务与句柄账一格不动。
+    #[cfg(feature = "multisession")]
+    {
+        let second = stage_init_user(1);
+        crate::log_info!("multisession: 第二个会话 任务={:?}", second);
+    }
     // S6c：init 的交互窗口结束后报键盘的六本账——**放在这里**是因为窗口之内才是按键时间，
     // 放到 verdict 之后就只数得到空闲期的包。
     #[cfg(feature = "ps2-kbd")]
@@ -1081,7 +1087,7 @@ fn park_until_init_exits(init: Option<usize>) {
 /// 装载产物用与 ktest 同源的嵌入式夹具（`ktests::common::HELLO_ELF`），
 /// 从卷上取 ELF 那条路已在 L3-C 交付，这里不重做。
 #[cfg(not(feature = "handles"))]
-fn stage_init_user() -> Option<usize> {
+fn stage_init_user(_sid: u8) -> Option<usize> {
     let loaded = match crate::user::load(crate::ktests::common::HELLO_ELF) {
         Ok(l) => l,
         Err(e) => {
@@ -1113,8 +1119,9 @@ fn stage_init_user() -> Option<usize> {
     None
 }
 
+/// 起一个 shell 会话：`sid` 决定它拿到的控制台句柄属于哪个会话（0 号兼作 init）。
 #[cfg(feature = "handles")]
-fn stage_init_user() -> Option<usize> {
+fn stage_init_user(sid: u8) -> Option<usize> {
     use crate::arch::x86_64::trap::TrapFrame;
     use crate::handle::{self, Handle, RIGHT_CREATE, RIGHT_DUP, RIGHT_MAP, RIGHT_READ, RIGHT_TRANSFER, RIGHT_WRITE};
     use crate::user::{
@@ -1148,6 +1155,10 @@ fn stage_init_user() -> Option<usize> {
     f.rax = SYS_PROCESS_CREATE; f.rdi = hj_plain.0; f.rsi = 0; f.rdx = 0; f.r10 = 0;
     syscall_dispatch(&mut f);
     let denied = f.rax == E_DENIED;
+    // S6p：这条"无 CREATE"句柄只服务上面那一次拒绝，**用完当场还槽**。
+    // 不还的话每个会话都白占一格，而句柄表是全局 16 格（ADR-007）——
+    // 第二个会话在 15 号上就是被这 16 格卡死的（`ret=-6`，而槽、袋、si 都还有空）。
+    let _ = handle::close(hj_plain, owner);
     f.rax = SYS_PROCESS_CREATE; f.rdi = hj.0;
     syscall_dispatch(&mut f);
     let hp = Handle(f.rax);
@@ -1179,11 +1190,13 @@ fn stage_init_user() -> Option<usize> {
     if let Err(e) = serial::enable_rx(&madt) {
         crate::log_warn!("init-user: 控制台接收初始化失败 {:?}", e); return None;
     }
-    let console = match handle::grant_console(owner, RIGHT_READ | RIGHT_WRITE | RIGHT_DUP | RIGHT_TRANSFER) {
+    let console = match handle::grant_console(owner, RIGHT_READ | RIGHT_WRITE | RIGHT_DUP | RIGHT_TRANSFER, sid) {
         Ok(h) => h, Err(e) => { crate::log_warn!("init-user: 控制台授予失败 {:?}", e); return None; }
     };
-    let foreign = if cfg!(feature = "console-probe") {
-        match handle::grant_console(owner, RIGHT_READ | RIGHT_WRITE) {
+    // S6p：控制台反例句柄是**启动路径仪器的**，只发给 init 会话：它只被写进 si 交给
+    // 子进程（今天的 shell 不读那一格），而每发一份都占全局 16 格句柄表的一格。
+    let foreign = if cfg!(feature = "console-probe") && sid == 0 {
+        match handle::grant_console(owner, RIGHT_READ | RIGHT_WRITE, sid) {
             Ok(h) => h.0, Err(e) => { crate::log_warn!("init-user: 控制台反例句柄失败 {:?}", e); return None; }
         }
     } else { 0 };
@@ -1215,7 +1228,11 @@ fn stage_init_user() -> Option<usize> {
     };
     vmo::vmo_unref(si);
     // si 页也要经 14 号铺进子 AS（rdx = Proc 句柄别名）。
-    f.rax = SYS_ASPACE_MAP; f.rdi = hi.0; f.rsi = 0; f.rdx = hp.0; f.r10 = 0x2_5000_0000;
+    // S6p：**每个会话要一个自己的 si VA**——`reserve_va_at` 的登记表不是按 AS 分的
+    // （单地址空间，ADR-070），第一个会话占住 0x2_5000_0000 之后，第二个会话拿同一个
+    // 地址会被当场拒成 -6（实测：`si_va=0xfffffffffffffffa`，而三个生效位一个没读错）。
+    let si_want = 0x2_5000_0000 + (sid as u64) * mm::PAGE as u64;
+    f.rax = SYS_ASPACE_MAP; f.rdi = hi.0; f.rsi = 0; f.rdx = hp.0; f.r10 = si_want;
     syscall_dispatch(&mut f);
     let si_va = f.rax;
     // 生效位是**那棵树**里的真值（不是"我请求了什么"）：代码要 user+X+!W、栈要 user+W、
@@ -1229,7 +1246,23 @@ fn stage_init_user() -> Option<usize> {
         "init-user(S5c): 生效位 代码={:#x} 栈={:#x} si={:#x}（bit0=user bit1=W bit2=X，0xff=没映射）",
         bits(loaded.entry), bits(loaded.stack_top & !0xfff), bits(si_va)
     );
+    // S6p：第二个会话起步时的三道资源墙里，**这道读数管两道**：`si_va` 是不是真地址
+    // （-6 = 地址被拒）与创建者袋还剩几格（`MAX_OWNED = 8`）。句柄表那一道见 15 号前的槽读数。
+    crate::log_info!(
+        "init-user(S4b-2): 会话={} si_va={:#x} 创建者袋={}",
+        sid, si_va, sched::owned_of(owner.0)
+    );
     // 15：建一条**停住**的线程。
+    // S6p：第二个会话在 15 号上失败过一次（ret=-6），而 -6 在 15 号里对应四种不同原因
+    // （`proc_attach_thread` / `spawn_user` 没空槽 / `set_aspace` / `block_task`）。
+    // 槽占用是唯一能从外面读出来的那一格：先报它，再让失败行自己说话。
+    let mut occ = 0u32;
+    for i in 0..sched::MAX_TASKS {
+        if !matches!(sched::state_of(i), sched::TaskState::Free) {
+            occ |= 1 << i;
+        }
+    }
+    crate::log_info!("init-user(S4b-2): 会话={} BSP 槽占用={:#011b}", sid, occ);
     f.rax = SYS_THREAD_CREATE; f.rdi = hp.0; f.rsi = loaded.entry; f.rdx = loaded.stack_top; f.r10 = 0;
     syscall_dispatch(&mut f);
     let ht = Handle(f.rax);
@@ -1262,10 +1295,20 @@ fn stage_init_user() -> Option<usize> {
     // S5c：`等待收工=false` 在这一档是**预期**——shell 是常驻 init，只有收到 `exit` 才收工。
     // "它真的在跑"这一格由串口上的横幅与提示符作证（宿主机侧读），不靠这个布尔。
     crate::log_info!(
-        "init-user(S4b-2): 程序=shell 无CREATE拒={} Proc句柄={} 子AS={} 任务AS={} entry={:#x} 栈顶={:#x} 段={} 页={} 归创建者={} 子袋={} 线程停住={} start_ret={} 跑过次数={} 等待收工={} si_va={:#x}",
+        "init-user(S4b-2): 会话={} 程序=shell 无CREATE拒={} Proc句柄={} 子AS={} 任务AS={} entry={:#x} 栈顶={:#x} 段={} 页={} 归创建者={} 子袋={} 线程停住={} start_ret={} 跑过次数={} 等待收工={} si_va={:#x}",
+        sid,
         denied, hp.0, aslot, sched::aspace_of(gidx), loaded.entry, loaded.stack_top,
         loaded.segs, loaded.pages, owned_n, sched::owned_of(gidx), stopped, started, runs, done, si_va
     );
+
+    // S6p：**创建者手里这两格在放行之后就是死重**——Proc/Thread 句柄只服务 15/16 号，
+    // 之后内核按任务号（`gidx`）等它收工；而 16 号每开一个会话要向子进程补授三格 SELF_*，
+    // 全局句柄表只有 16 格（ADR-007）⇒ 不还这两格，第二个会话的 16 号当场 `-6`（实测）。
+    // `close` 对 Proc/Thread 只清表项（不像 Vmo 会 `vmo_unref`），所以不牵动对象寿命。
+    // **si 的 VMO 句柄 `hi` 不关**：`vmo_unref` 在最后一个引用上会把帧还回去，
+    // 而 si 页正映在子进程 AS 里——关它会把子进程的角色表页变成别人的帧（未证，故不动）。
+    let _ = handle::close(hp, owner);
+    let _ = handle::close(ht, owner);
 
     // S5d：交回 init 的任务号，让 main 在**判定打完之后**等它收工（BACKLOG §237）。
     Some(gidx)
@@ -1308,7 +1351,15 @@ impl LiveTerm {
         // 轮询变勤是为了鼠标跟手；闪烁节拍因此要按帧数除，而不是每帧都翻。
         let n = FRAMES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let on = (n / 4) % 2 == 0;
-        crate::fbcon::redraw_window(&self.term, &self.frame, rows.min(LIVE_ROWS), on);
+        #[cfg(feature = "handles")]
+        let (sid, tabs, active) = (
+            crate::user::active_session() as usize,
+            crate::serial::SESSIONS as u64,
+            crate::user::active_session() as u64,
+        );
+        #[cfg(not(feature = "handles"))]
+        let (sid, tabs, active) = (0usize, 1u64, 0u64);
+        crate::fbcon::redraw_window(&self.term, &self.frame, rows.min(LIVE_ROWS), on, sid, tabs, active);
         // 指针画在终端之后：下一帧整屏重画会把它擦掉，不需要"恢复背景"那套簿记。
         #[cfg(feature = "ps2-mouse")]
         {
@@ -1318,8 +1369,23 @@ impl LiveTerm {
             // 放在这里而不是只放常驻循环：**等待期也会点**（实测：只在 park 里取，
             // 等待期那几下点击就永远读不到）。
             if let Some((cx, cy)) = crate::mouse::take_click() {
-                let hit = crate::fbcon::hit_test(self.term.dims().0, cx as u64, cy as u64);
+                let hit = crate::fbcon::hit_test(self.term.dims().0, tabs, cx as u64, cy as u64);
                 crate::log_info!("mouse: 点击 x={} y={} 命中={}", cx, cy, hit.name());
+                // S6p：点在标签上就**切会话**；关闭符只记读数（0 号是 init，不能关）
+                #[cfg(feature = "handles")]
+                match hit {
+                    crate::fbcon::Hit::Tab(i) => {
+                        crate::user::set_active_session(i);
+                        crate::log_info!("multisession: 切到会话 {}", i);
+                    }
+                    crate::fbcon::Hit::TabClose(0) => {
+                        crate::log_warn!("multisession: 0 号是 init，不能关")
+                    }
+                    crate::fbcon::Hit::TabClose(i) => {
+                        crate::log_info!("multisession: 关闭会话 {}（本片只记读数）", i)
+                    }
+                    _ => {}
+                }
             }
             if n % 8 == 0 {
                 let (pk, bad, clk, idx) = crate::mouse::stats();

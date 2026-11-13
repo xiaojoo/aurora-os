@@ -123,7 +123,8 @@ pub struct FileObj {
 /// 锁内取走引用、放锁之后才 `vmo::vmo_unref`。
 #[derive(Clone, Copy)]
 pub enum ObjRef {
-    Console,
+    /// 控制台，附带**会话号**（S6p：每个会话一个镜像环与一份输入队列）
+    Console(u8),
     File(FileObj),
     Vmo { slot: u8 },
     // ---- P5c-1（ADR-075 决策 4）：四种新 kind。本体各自住在 proc.rs / mm 的 AS 表 / sched 的任务表，
@@ -247,9 +248,9 @@ fn insert(t: &mut Table, owner: (usize, u32), rights: u32, obj: ObjRef) -> Resul
     Ok(Handle::pack(slot as u16, next))
 }
 
-pub fn grant_console(owner: (usize, u32), rights: u32) -> Result<Handle, HErr> {
+pub fn grant_console(owner: (usize, u32), rights: u32, sid: u8) -> Result<Handle, HErr> {
     let mut g = TABLE.lock();
-    insert(g.get(), owner, rights, ObjRef::Console)
+    insert(g.get(), owner, rights, ObjRef::Console(sid))
 }
 
 /// 给一次打开好的文件发句柄（**整盘**）。`cursor` 由调用方先 `mount`/`open_cursor` 得到——

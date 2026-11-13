@@ -11204,6 +11204,74 @@ framebuffer,handles `698bfda5baf0` PASS(33)（四档都不含 `ps2-mouse` ⇒ �
 没有悬停手形、拖拽、双击；指针跟随仍有约 0.12 s 延迟（真跟手要么在 IRQ 里局部更新背景、
 要么上中断驱动的重画节流）；`ps2-mouse` 的 durable 矩阵行。
 
+## 260. **S6p：多会话（第二个 shell 进程 + 标签切换）——三道资源墙全是实测撞出来的**（2026-11-13，实测）
+
+### 一、交付
+
+`ObjRef::Console(u8)` + `grant_console(owner, rights, sid)`（会话号住在句柄里，**零新 syscall**）；
+`serial` 每会话一份镜像环与影子行（`SESSIONS = 2`、`mirror_*_sid`、`write_bytes_sid`，零新增
+unsafe/锁）；21 号只把输入给活动会话（非活动读回 0 字节，shell 本来就是非阻塞轮询）；
+`fbcon` 标签栏多页（活动页铺 `TAB_BG`、非活动铺条底）、`Hit::Tab(u8)/TabClose(u8)`、
+`hit_test(cols, tabs, x, y)`、`redraw_window(…, sid, tabs, active)`；`main` 的
+`stage_init_user(sid)`；特性 `multisession = ["handles"]`；点标签 ⇒ `set_active_session`。
+
+### 二、三道墙（每道都有读数，按撞上的顺序）
+
+1. **si VA 被拒**：第二会话 `si_va=0xfffffffffffffffa`（-6），而三个生效位仍是 `0x5/0x3/0x1`
+   ⇒ 错不在映射。`reserve_va_at` 的登记表**不是按 AS 分的**（单地址空间，ADR-070）⇒
+   第一个会话占住 `0x2_5000_0000` 后，第二个拿同一地址被当场拒。修法：每会话
+   `0x2_5000_0000 + sid * 4 KiB`。
+2. **全局 16 格句柄表**（ADR-007）：第二个会话在 15 号 `ret=-6`（`init-user: Thread 句柄解不开`），
+   而 `创建者袋=4`、`BSP 槽占用=0b000000111`（槽和袋都还有空）。16 号每开一个会话要向子进程
+   补授三格 `SELF_*`，两个会话合计把 16 格用满。三条减法：①"无 CREATE"探针句柄**用完当场 `close`**；
+   ②控制台反例句柄只发 init 会话；③放行后关创建者手里的 Proc/Thread 句柄。**si 的 VMO 句柄
+   不关**：`vmo_unref` 在最后一个引用上把帧还回去，而 si 页正映在子进程 AS 里。
+3. **影子行被日志碎片清掉**：`影0=0`，而 `收尾次数=1 len=11`（收尾那次明明存了提示符）。
+   根因：`Sink::write_fmt` 会把一条日志切成碎片，`{:#x?}` 这类多行打印里有只含 `"\n"` 的碎片，
+   而"末尾换行 ⇒ 作废影子"这条判据被它误触发。修法：**只有控制台写出能动影子**
+   （`mirror_bytes_sid`），日志正文（`mirror_note_sid`）只压字节。这一条在单会话档也是潜在坑
+   （提示符插在多行日志中间时同样会消失），只是这次才被两个会话的时序撞出来。
+
+### 三、判据与负样本
+
+`build/s6p-multisession-check.py`（`framebuffer,fbcon-live,ps2-kbd,ps2-mouse,resident-init,console-probe,multisession`）：
+两个会话 `start_ret=0` 且 `第二个会话 任务=Some(3)`；点 1 号 ⇒ `multisession: 切到会话 1`、
+点回 0 号 ⇒ `切到会话 0`；**画面隔离**：日志区墨点 0 号视图 **63436**、1 号视图 **1581**（差一个量级，
+反空转要求 0 号有内容）；**输入路由**：1 号里键 `z` ⇒ 输入行逐像素等于 `AURORA:/ > z`（0/6144）；
+切回 0 号 ⇒ 等于 `AURORA:/ > `（0/5632），且 z 那一格不是 z（与 z 不符 77、墨点 24 = 光标）⇒ **PASS**。
+
+**负样本**：把 `redraw_window` 的 `sid` 写死成 0（画面不再按会话取环）⇒
+`1 号视图是它自己的（几乎空白）` 与 `1 号输入行逐像素等于提示符+z` 两格红、判定=FAIL；
+还原后 ELF sha 回到 `cd2204bb28ce`（同一变体，逐字节相同）。
+
+### 四、顺带的两件事（都不是本片功能，但都是本片撞出来的）
+
+- **s6o 夹具的 `find_arrow` 出现多处命中**：新日志里的位串（`0b000000111` 之类）拼出了与箭头
+  同一套填充像素 ⇒ 扫描取到的"第一个"命中是文字不是指针，六格判据三红。修法：**返回全部命中 +
+  按连续性挑**（指针是连续移动的那个、文字是静止的），并打印每帧假命中数。**不是产品回归**：
+  修后 +120/-120 的位移仍逐像素可复算、判定 PASS。
+- **s6f 覆盖集这次首次跑红**：缺 14 个字形（`二 击 切 屏 幕 息 攒 新 栏 步 …`）——S6o/S6n 新增的
+  中文日志从未被 s6f 扫过一次（§259 的回归清单里没有 s6f）。`build/_s6l_gen.py` +
+  `build/_s6j_regen.py` 重生成资产与内联表后：宽字 **548/548 唯一**、画面**空心框 0**、s6f 全绿。
+
+### 五、回归与门禁
+
+默认档 `4b0c3807beb6` **82/82**；handles `81e718951614` **89/89**；ps2-kbd,handles
+`ce7a63b04177` **第二跑 90/90**（第一跑红 `t_q2_workload_slots` = §239 那条已知抖动，
+同 ELF 第二跑绿）；framebuffer,handles `256e89e6fd4a` **89/89 PASS(33)**；`check` **17/17**；
+s6f / s6d / s6o / s6b2 / s6b3 全 PASS（判据那一跑的 ELF `9b87e6fb8fbc`；行尾修复后重建同哈希——行尾转换不改产物，§79f）。unsafe 白名单与 `lock-order.md` 一行没动；
+`module-interfaces.toml` 补登 `serial::*_sid`、`serial::SESSIONS`、`user::active_session`、
+`fbcon::Hit`、`sched::MAX_TASKS`（`check-interface-change` 要求先有 ADR-092 才放行）。
+
+### 六、仍开着
+
+1. **第三个会话放不下**：16 格句柄表、创建者袋 8 条、`MAX_JOBS = 4`、每 CPU 任务槽 9 个
+   ——加会话要先做一片容量重算，不能靠"再还两格"。
+2. **关闭标签只记读数**（`TabClose(i)` 打一行日志）：真关要能终止线程、收 Proc/Job，`<+>` 才能真正再起一个。
+3. **两个 shell 都忙等** 21 号（非活动会话每轮一次立刻返回的系统调用）——阻塞读/唤醒仍是欠账。
+4. **串口仍是单一输出流**：两个会话的提示符在串口上会交错（画面已分流，串口没有）。
+5. `multisession` 没有 durable 矩阵行；`SESSIONS` 写死 2；标签栏折叠分支仍走不到。
+
 ## 文档一致性（V1.3）
 - §3.5 的 justfile/sh 需改写为 `tools/aurora.py` 形式（ADR-016）。
 - A.5 的 9 项空白：host 平台、crash dump 解码工具、线程化中断、设备重置协议、可恢复内存错误、中断重映射、Limine 交接状态清单、术语表、swapgs 窗口。**swapgs 窗口这一项已在 M4-4 关闭**（ADR-025 的"兑现"一节：`syscall_entry` 的第一条指令就是 `swapgs`，窗口里不访存、不碰段寄存器；安全前提是本内核零处依赖 `gs:`，一旦破了必须回头补 paranoid entry）。剩下 8 项仍开。

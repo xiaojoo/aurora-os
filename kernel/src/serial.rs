@@ -268,6 +268,11 @@ fn putb(b: u8) -> bool {
 }
 
 pub fn write_bytes(bytes: &[u8]) -> usize {
+    write_bytes_sid(0, bytes)
+}
+
+/// 控制台写出（指定会话）：串口字节流**一字不差**地写出去，镜像只进这个会话的环。
+pub fn write_bytes_sid(sid: usize, bytes: &[u8]) -> usize {
     let guard = acquire_line();
     if !guard.held {
         return 0;
@@ -281,8 +286,9 @@ pub fn write_bytes(bytes: &[u8]) -> usize {
     }
     // S6d：控制台的字节流也进同一个环 ⇒ 画面镜像的是"控制台上真看到的东西"，不只是内核日志。
     // 只旁挂**真写出去的那一截**（`done`），串口因背压少写的字节不该在画面上假装存在。
+    // S6p：进的是**这个会话**的环。
     #[cfg(feature = "framebuffer")]
-    mirror_bytes(&bytes[..done]);
+    mirror_bytes_sid(sid, &bytes[..done]);
     done
 }
 
@@ -314,34 +320,71 @@ impl Write for Sink {
 // 用 `AtomicU8` 数组而不是 `UnsafeCell`：原子数组自带内部可变性 ⇒ **零新增 unsafe 站点**，
 // 也就不动白名单。
 const MIRROR_BYTES: usize = 8192;
-static MIRROR: [AtomicU8; MIRROR_BYTES] = [const { AtomicU8::new(0) }; MIRROR_BYTES];
-/// 单调写入计数（不回绕）。写入位置 = `MIRROR_POS % MIRROR_BYTES` ⇒ **循环覆写**：
+/// 会话数（S6p）：每个会话一个镜像环。今天两个（0 号是内核日志 + 第一个 shell，1 号是第二个 shell）。
+pub const SESSIONS: usize = 2;
+static MIRROR: [[AtomicU8; MIRROR_BYTES]; SESSIONS] =
+    [const { [const { AtomicU8::new(0) }; MIRROR_BYTES] }; SESSIONS];
+/// 每个会话的单调写入计数（不回绕）。写入位置 = `POS[sid] % MIRROR_BYTES` ⇒ **循环覆写**：
 /// 判据要的是最后几行，而"填满即弃"留下的恰好是最老的字节（§244 实测 `丢弃=29666`，方向相反）。
-static MIRROR_POS: AtomicUsize = AtomicUsize::new(0);
+static MIRROR_POS: [AtomicUsize; SESSIONS] = [const { AtomicUsize::new(0) }; SESSIONS];
 
-/// 旁挂一段日志正文。由 `Sink::write_str` 调用，**只存字节、绝不画图**：
-/// 画一行是上万次设备写，而调用点持有串口行锁——在锁里做设备写等于把锁的暴露面撑大。
+fn sid_of(sid: usize) -> usize {
+    if sid < SESSIONS {
+        sid
+    } else {
+        0
+    }
+}
+
+/// 旁挂一段日志正文（0 号会话）。由 `Sink::write_str` 调用，**只存字节、绝不画图**。
 pub fn mirror_note(s: &str) {
-    mirror_bytes(s.as_bytes());
+    mirror_note_sid(0, s);
 }
 
-/// 旁挂一段**字节流**。控制台的写出走这里而不是 `mirror_note`：20 号交来的是一段字节，
-/// 硬转成 `&str` 会把非 UTF-8 的写变成"悄悄少几个字节"，那种丢法没有读数。
+/// 旁挂一段日志正文到指定会话。**不动影子行**：格式化器会把一条日志切成碎片，
+/// 其中会有只含一个换行的碎片（`{:#x?}` 这类多行打印），拿它当"这一行闭合了"的判据
+/// 会把用户刚写的提示符抹掉（§260 实测：影子在 0x3ab 读回 0，而收尾那次明明存了 11 字节）。
+pub fn mirror_note_sid(sid: usize, s: &str) {
+    push_bytes(sid_of(sid), s.as_bytes());
+}
+
+/// 旁挂一段**字节流**到 0 号会话。
 pub fn mirror_bytes(b: &[u8]) {
-    for &x in b {
-        mirror_note_byte(x);
-    }
-    // 这一行已经闭合（写入了换行）⇒ 影子半行作废：下一条提示符是 shell 自己写的。
+    mirror_bytes_sid(0, b);
+}
+
+/// 旁挂一段**字节流**到指定会话。控制台的写出走这里：20 号交来的是一段字节，
+/// 硬转成 `&str` 会把非 UTF-8 的写变成"悄悄少几个字节"，那种丢法没有读数。
+///
+/// **只有控制台写出能闭合一行**：`last == '\n'` 才作废影子。日志正文不走这里
+/// （见 [`mirror_note_sid`]），它没有"一次写出就是一行"的语义。
+pub fn mirror_bytes_sid(sid: usize, b: &[u8]) {
+    let sid = sid_of(sid);
+    push_bytes(sid, b);
+    // 这一行已经闭合（写入了换行）⇒ 本会话的影子半行作废：下一条提示符是 shell 自己写的。
     if b.last() == Some(&10) {
-        SHADOW_LEN.store(0, Ordering::Release);
+        SHADOW_LEN[sid].store(0, Ordering::Release);
     }
 }
 
+fn push_bytes(sid: usize, b: &[u8]) {
+    for &x in b {
+        mirror_note_byte_sid(sid, x);
+    }
+}
 
+/// 打一个行尾到 0 号会话。
+pub fn mirror_note_break() {
+    mirror_note_byte_sid(0, 10);
+}
 
+fn mirror_note_byte_sid(sid: usize, b: u8) {
+    let i = MIRROR_POS[sid].fetch_add(1, Ordering::Relaxed);
+    MIRROR[sid][i % MIRROR_BYTES].store(b, Ordering::Relaxed);
+}
 
-/// **行规程**：内核日志永远从新的一行开始，用户的"半行"（提示符 + 正在键入）搬到
-/// [`INPUT_SHADOW`] 里继续显示在屏幕的输入行上。
+/// **行规程**（0 号会话）：内核日志永远从新的一行开始，用户的"半行"（提示符 + 正在键入）
+/// 搬到 [`SHADOW`] 里继续显示在屏幕的输入行上。
 ///
 /// 为什么要有影子行：shell 只写一次 `> `，之后内核日志不断往下写。只补换行的话，那条提示符
 /// 会被永久挤进日志区，输入行变成空白（实测）；把半行"重放到新行"又依赖环的尾字节语义，
@@ -349,70 +392,84 @@ pub fn mirror_bytes(b: &[u8]) {
 ///
 /// **串口一个字节都不改**：这是纯画面语义。
 pub fn mirror_break_if_mid_line() {
-    let n = mirror_len();
-    if n == 0 || mirror_byte(n - 1) == 10 {
+    mirror_break_if_mid_line_sid(0);
+}
+
+pub fn mirror_break_if_mid_line_sid(sid: usize) {
+    let sid = sid_of(sid);
+    let n = mirror_len_sid(sid);
+    if n == 0 || mirror_byte_sid(sid, n - 1) == 10 {
         return;
     }
     let mut start = n;
-    while start > 0 && mirror_byte(start - 1) != 10 && n - start < SHADOW_CAP {
+    while start > 0 && mirror_byte_sid(sid, start - 1) != 10 && n - start < SHADOW_CAP {
         start -= 1;
     }
     let len = n - start;
     for k in 0..len {
-        SHADOW[k].store(mirror_byte(start + k), Ordering::Relaxed);
+        SHADOW[sid][k].store(mirror_byte_sid(sid, start + k), Ordering::Relaxed);
     }
-    SHADOW_LEN.store(len, Ordering::Release);
-    mirror_note_byte(10);
+    SHADOW_LEN[sid].store(len, Ordering::Release);
+    mirror_note_byte_sid(sid, 10);
 }
 
 /// 一行里"半行"（没有换行结尾的那段）最多记多少字节给输入行显示。
 pub const SHADOW_CAP: usize = 64;
 
-static SHADOW_LEN: AtomicUsize = AtomicUsize::new(0);
-static SHADOW: [AtomicU8; SHADOW_CAP] = [const { AtomicU8::new(0) }; SHADOW_CAP];
+static SHADOW_LEN: [AtomicUsize; SESSIONS] = [const { AtomicUsize::new(0) }; SESSIONS];
+static SHADOW: [[AtomicU8; SHADOW_CAP]; SESSIONS] =
+    [const { [const { AtomicU8::new(0) }; SHADOW_CAP] }; SESSIONS];
 
 /// 输入行要显示的"影子半行"长度与第 i 个字节（画面侧只读）。
 pub fn input_shadow_len() -> usize {
-    SHADOW_LEN.load(Ordering::Acquire)
+    SHADOW_LEN[0].load(Ordering::Acquire)
 }
 
 pub fn input_shadow_byte(i: usize) -> u8 {
-    SHADOW[i].load(Ordering::Relaxed)
+    SHADOW[0][i].load(Ordering::Relaxed)
 }
 
-
-/// 打一个行尾。换行是 `line()` 用 `putb` 直接写串口的、**不经过 `Sink`**，所以必须单独通知：
-/// 不通知的话环里一个换行都没有，整场启动被当成"一行"，一行也画不出（§244 实测）。
-pub fn mirror_note_break() {
-    mirror_note_byte(10);
+pub fn input_shadow_len_sid(sid: usize) -> usize {
+    SHADOW_LEN[sid_of(sid)].load(Ordering::Acquire)
 }
 
-fn mirror_note_byte(b: u8) {
-    let i = MIRROR_POS.fetch_add(1, Ordering::Relaxed);
-    MIRROR[i % MIRROR_BYTES].store(b, Ordering::Relaxed);
+pub fn input_shadow_byte_sid(sid: usize, i: usize) -> u8 {
+    SHADOW[sid_of(sid)][i].load(Ordering::Relaxed)
 }
 
-/// 环里现存多少字节（不超过容量）。
 pub fn mirror_len() -> usize {
-    MIRROR_POS.load(Ordering::Relaxed).min(MIRROR_BYTES)
+    mirror_len_sid(0)
 }
 
-/// 开机以来旁挂过的总字节数。和 `mirror_len` 一起报才看得出"环绕过没有"。
 pub fn mirror_total() -> usize {
-    MIRROR_POS.load(Ordering::Relaxed)
+    mirror_total_sid(0)
 }
 
-/// 读现存窗口第 `i` 个字节。**绕回之后窗口逻辑起点不是 0**，偏移在这里算：
-/// 让调用方去猜的表现是画出一条半截日志，而它看起来完全像"镜像对了"。
 pub fn mirror_byte(i: usize) -> u8 {
-    let total = MIRROR_POS.load(Ordering::Relaxed);
-    let start = total - total.min(MIRROR_BYTES);
-    MIRROR[(start + i) % MIRROR_BYTES].load(Ordering::Relaxed)
+    mirror_byte_sid(0, i)
 }
 
-/// 窗口开头那一截是不是上一行的**残片**（只有环绕过才是）。消费方必须丢掉它。
 pub fn mirror_wrapped() -> bool {
-    MIRROR_POS.load(Ordering::Relaxed) > MIRROR_BYTES
+    mirror_wrapped_sid(0)
+}
+
+pub fn mirror_len_sid(sid: usize) -> usize {
+    MIRROR_POS[sid_of(sid)].load(Ordering::Relaxed).min(MIRROR_BYTES)
+}
+
+pub fn mirror_total_sid(sid: usize) -> usize {
+    MIRROR_POS[sid_of(sid)].load(Ordering::Relaxed)
+}
+
+pub fn mirror_byte_sid(sid: usize, i: usize) -> u8 {
+    let sid = sid_of(sid);
+    let total = MIRROR_POS[sid].load(Ordering::Relaxed);
+    let start = total - total.min(MIRROR_BYTES);
+    MIRROR[sid][(start + i) % MIRROR_BYTES].load(Ordering::Relaxed)
+}
+
+pub fn mirror_wrapped_sid(sid: usize) -> bool {
+    MIRROR_POS[sid_of(sid)].load(Ordering::Relaxed) > MIRROR_BYTES
 }
 
 /// 行锁：一次一行。持有者 = CPU 槽号 + 1，`0` = 空闲。

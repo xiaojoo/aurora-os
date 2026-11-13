@@ -433,7 +433,7 @@ fn start_token(gidx: usize, id: u32) -> crate::sync::WaitToken {
 #[cfg(feature = "handles")]
 fn kind_of(o: &crate::handle::ObjRef) -> u32 {
     match o {
-        crate::handle::ObjRef::Console => KIND_CONSOLE,
+        crate::handle::ObjRef::Console(_) => KIND_CONSOLE,
         crate::handle::ObjRef::File(_) => KIND_FILE,
         crate::handle::ObjRef::Vmo { .. } => KIND_VMO,
         crate::handle::ObjRef::Job { .. } => KIND_JOB,
@@ -897,16 +897,30 @@ fn kbd_char() -> Option<u8> {
     crate::kbd::read_char()
 }
 
+/// 当前活动会话（S6p）。控制台的**输入**只给活动会话；画面也只画活动会话。
+/// 放在这里而不是 fbcon：它是控制台策略 —— 句柄里带的就是会话号。
+static ACTIVE_SESSION: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+pub fn active_session() -> u8 {
+    ACTIVE_SESSION.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// 切会话。越界一律落回 0 号（这是用户点出来的一个坐标，不能 panic）。
+pub fn set_active_session(sid: u8) {
+    let n = crate::serial::SESSIONS as u8;
+    ACTIVE_SESSION.store(if sid < n { sid } else { 0 }, core::sync::atomic::Ordering::Release);
+}
+
 #[cfg(feature = "handles")]
 fn sys_console_io(frame: &crate::arch::x86_64::trap::TrapFrame, write: bool) -> u64 {
     use crate::handle::{self, Handle, ObjRef, RIGHT_READ, RIGHT_WRITE};
     let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
     let need = if write { RIGHT_WRITE } else { RIGHT_READ };
-    match handle::resolve(Handle(frame.rdi), owner, need) {
-        Ok((ObjRef::Console, _)) => {}
+    let sid = match handle::resolve(Handle(frame.rdi), owner, need) {
+        Ok((crate::handle::ObjRef::Console(sid), _)) => sid,
         Ok(_) => return E_DENIED,
         Err(e) => return handle_err(e),
-    }
+    };
     let want = frame.rdx as usize;
     if want > CONSOLE_MAX {
         return E_TOO_LONG;
@@ -917,13 +931,18 @@ fn sys_console_io(frame: &crate::arch::x86_64::trap::TrapFrame, write: bool) -> 
     let mut buf = [0u8; CONSOLE_MAX];
     if write {
         match copy_from_user(frame.rsi, &mut buf[..want]) {
-            Ok(n) if n == want => crate::serial::write_bytes(&buf[..n]) as u64,
+            Ok(n) if n == want => crate::serial::write_bytes_sid(sid as usize, &buf[..n]) as u64,
             _ => {
                 BAD_PTRS.fetch_add(1, Ordering::Relaxed);
                 E_FAULT
             }
         }
     } else {
+        // S6p：**只有活动会话能取输入**（键盘环与串口环是全局的，会话靠这里分流）。
+        // 非活动会话读到的永远是 0 字节 —— shell 本来就是非阻塞轮询，语义不变。
+        if sid != active_session() {
+            return 0;
+        }
         // VMM 同时串行化各任务的消费，并保证坏目标指针不会取走输入。
         let result = mm::with_vmm_lock(|| {
             validate_range(frame.rsi, want as u64, true)?;
