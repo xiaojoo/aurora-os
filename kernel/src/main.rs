@@ -356,6 +356,15 @@ fn stage_framebuffer() {
         "frame: 地址 memmap基址={:#x} 长度={:#x} limine={:#x} 我们的窗口={:#x} limine==HHDM+pa={} limine==我们的窗口={} 在我们页表里映着={}",
         pa, len, lva, ours, is_hhdm, is_ours, is_mapped_here
     );
+    // `fbcon-live` 是**终端**：不画测试图案。它会在开场被终端清屏覆盖，
+    // 但在那之前（ktests 与 init 启动的几秒里）用户看到的就是下面那三条红绿蓝色带
+    // —— 用户两次截图都在问这件事（§250/§251）。取样式变体（framebuffer / fbcon-mirror）照旧画。
+    #[cfg(feature = "fbcon-live")]
+    {
+        crate::log_info!("frame: 终端模式 ⇒ 不画测试图案（几何与地址仍然照报）");
+        return;
+    }
+    #[cfg(not(feature = "fbcon-live"))]
     if let Err(e) = f.draw_test_pattern() {
         crate::log_warn!("frame: 画图案失败 —— {:?}", e);
         return;
@@ -1014,7 +1023,7 @@ fn park_until_init_exits(init: Option<usize>) {
         loop {
             // 每轮 64 窗口（约 1 s）。这中间 init 是唯一还在干的活：它读控制台，
             // 收到 `exit` 才 SYS_EXIT，于是这里下一轮就看到 Done。
-            let woke = apic::with_interrupts(|| sched::wait_for_task(gidx, crate::clock::window_cycles(64)));
+            let woke = apic::with_interrupts(|| sched::wait_for_task(gidx, crate::clock::window_cycles(32)));
             if woke {
                 crate::log_info!("resident-init: init 已收工 ⇒ 系统停机");
                 return;
@@ -1265,13 +1274,19 @@ impl LiveTerm {
 
     fn repaint(&self) {
         let rows = self.term.body_rows();
-        crate::fbcon::redraw_window(&self.term, &self.frame, rows.min(LIVE_ROWS));
+        // 光标闪烁：每重画一次翻一次（常驻期一轮 32 窗口 ≈ 0.5 s ⇒ 约 0.5 s 亮／0.5 s 灭）。
+        let on = !BLINK.fetch_xor(true, core::sync::atomic::Ordering::Relaxed);
+        crate::fbcon::redraw_window(&self.term, &self.frame, rows.min(LIVE_ROWS), on);
     }
 }
 
 /// 实时重画的窗口行预算（一行 = 160 格 × 16 行设备写，画满 48 行会把一轮拉长）。
 #[cfg(feature = "fbcon-live")]
 const LIVE_ROWS: usize = 24;
+
+/// 光标当前该不该亮。每重画一次翻一次：常驻期 32 窗口一轮 ⇒ 约 0.5 s 亮 / 0.5 s 灭。
+#[cfg(feature = "fbcon-live")]
+static BLINK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 
 /// S6d：`fbcon-live` 档的"等 init 收工 + 每轮重画一次屏"。
 ///
