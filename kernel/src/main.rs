@@ -995,6 +995,8 @@ fn run_ktests_and_finish() -> ! {
     #[cfg(feature = "multisession")]
     {
         let second = stage_init_user(1);
+        // S6q 补记三：窗口条目上的 `×` 要能终止这个会话 ⇒ 任务号留一份给 `LiveTerm` 用。
+        SECOND_TASK.store(second.unwrap_or(0), Ordering::Relaxed);
         crate::log_info!("multisession: 第二个会话 任务={:?}", second);
     }
     // S6c：init 的交互窗口结束后报键盘的六本账——**放在这里**是因为窗口之内才是按键时间，
@@ -1314,6 +1316,11 @@ fn stage_init_user(sid: u8) -> Option<usize> {
     Some(gidx)
 }
 
+/// 第二个会话的任务号（S6q 补记三）：窗口条目上的 `×` 关会话 1 时要用它终止任务。
+/// 0 = 没起（`multisession` 关掉时恒 0）。
+#[cfg(feature = "multisession")]
+static SECOND_TASK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 /// S6g：`fbcon-live` 档的**活终端**——映射只做一次，之后每轮调一次 [`LiveTerm::repaint`]。
 ///
 /// 它不落冻结闸门（`freeze_band` 在这条路上根本不会被调用）：冻结契约是为"取一张确定的
@@ -1343,6 +1350,10 @@ struct LiveTerm {
     chrome: crate::fbcon::Chrome,
     /// 上一次画的时候是哪个态（换态必须整窗重画）。
     last_chrome: crate::fbcon::Chrome,
+    /// 每个窗口自己的"最小化"（列表条目上的 `-`，S6q 补记三）：窗口列表里一项一个。
+    mins: [bool; crate::serial::SESSIONS],
+    /// 已经关掉的窗口（`×`）。今天的实现只允许从最高的那个往下关。
+    closed: [bool; crate::serial::SESSIONS],
 }
 
 #[cfg(feature = "fbcon-live")]
@@ -1373,6 +1384,8 @@ impl LiveTerm {
             paints: (0, 0, 0, 0),
             chrome: crate::fbcon::Chrome::Normal,
             last_chrome: crate::fbcon::Chrome::Normal,
+            mins: [false; crate::serial::SESSIONS],
+            closed: [false; crate::serial::SESSIONS],
         })
     }
 
@@ -1389,6 +1402,20 @@ impl LiveTerm {
         );
         #[cfg(not(feature = "handles"))]
         let (sid, tabs, active) = (0usize, 1u64, 0u64);
+        // S6q 补记三：窗口列表里"没关掉的有几项"与"当前窗口是不是最小化"决定版面。
+        #[cfg(feature = "handles")]
+        let open = (0..crate::serial::SESSIONS).filter(|i| !self.closed[*i]).count() as u64;
+        #[cfg(feature = "handles")]
+        let chrome = if self.mins.get(sid).copied().unwrap_or(false) {
+            crate::fbcon::Chrome::Minimized
+        } else {
+            self.chrome
+        };
+        #[cfg(feature = "handles")]
+        let tabs = open;
+        #[cfg(not(feature = "handles"))]
+        let chrome = self.chrome;
+        let chrome_changed = self.chrome != self.last_chrome || chrome != self.last_chrome;
         // S6q：**只有内容真的变了才画**。两档判据：
         //   · 换行数变了 / 换会话 / 换标签 ⇒ 整窗重画（正文真的动了）；
         //   · 只有尾部半行在长（换行数没变）⇒ **只重画输入行**（一个键不再拖整屏）；
@@ -1396,8 +1423,6 @@ impl LiveTerm {
         let total = crate::serial::mirror_total_sid(sid);
         let nl = crate::serial::mirror_newlines_sid(sid);
         let sig = (sid as u8, total, nl as u64, tabs, active);
-        // 窗口三态单列一格：换态必须整窗重画（版面变了，输入行的行号也变了）。
-        let chrome_changed = self.chrome != self.last_chrome;
         if sig != self.sig || chrome_changed {
             // 先把指针的像素还回去（它盖住的那 77 个像素是上一帧的背景）；
             // 整窗重画也会覆盖它，但**输入行那一路只动一行**——行外的指针必须自己擦。
@@ -1408,14 +1433,14 @@ impl LiveTerm {
                 && self.sig.1 != usize::MAX;
             let (cc, cr) = if incremental {
                 crate::fbcon::redraw_input(
-                    &self.term, &self.frame, rows.min(LIVE_ROWS), sid, self.chrome)
+                    &self.term, &self.frame, rows.min(LIVE_ROWS), sid, chrome)
             } else {
                 let (_, cc, cr) = crate::fbcon::redraw_window(
-                    &self.term, &self.frame, rows.min(LIVE_ROWS), sid, tabs, active, self.chrome);
+                    &self.term, &self.frame, rows.min(LIVE_ROWS), sid, tabs, active, chrome);
                 (cc, cr)
             };
             self.sig = sig;
-            self.last_chrome = self.chrome;
+            self.last_chrome = chrome;
             // 画过的像素一律作废：光标靠下一相重画，指针靠下面 `ptr_track` 重画。
             self.caret = None;
             self.caret_at = if cr != 0 { Some((cc, cr)) } else { None };
@@ -1448,7 +1473,7 @@ impl LiveTerm {
             // 等待期那几下点击就永远读不到）。
             if let Some((cx, cy)) = crate::mouse::take_click() {
                 let hit = crate::fbcon::hit_test(
-                    self.term.dims().0, tabs, cx as u64, cy as u64, self.chrome);
+                    self.term.dims().0, tabs, cx as u64, cy as u64, chrome);
                 crate::log_info!("mouse: 点击 x={} y={} 命中={}", cx, cy, hit.name());
                 // S6q 补记二：三个窗口按钮**有动作了**——但各自的口径要写清楚：
                 //   · `-` 最小化：正文整块收起（只留标签栏），再点一次恢复；
@@ -1478,6 +1503,34 @@ impl LiveTerm {
                         crate::log_info!("窗口: 关闭 ⇒ 系统停机");
                         crate::exit::finish(crate::exit::Code::Success);
                     }
+                    // S6q 补记三：**每个窗口条目**自己的 `-` 与 `×`。
+                    crate::fbcon::Hit::TabMin(i) => {
+                        let i = (i as usize).min(crate::serial::SESSIONS - 1);
+                        self.mins[i] = !self.mins[i];
+                        crate::log_info!("窗口: 会话 {} 最小化={}", i, self.mins[i]);
+                    }
+                    crate::fbcon::Hit::TabClose(i) => {
+                        let i = i as usize;
+                        if i == 0 {
+                            // 0 号是 init：关它等于整机收工（与全局 `×` 同一口径）
+                            crate::log_info!("窗口: 关闭会话 0（init）⇒ 系统停机");
+                            crate::exit::finish(crate::exit::Code::Success);
+                        } else if i < crate::serial::SESSIONS && !self.closed[i] {
+                            // 关掉这个会话的任务，窗口从列表里消失；最后一个也关掉才停机。
+                            // **记账**：内核按任务号终止，返回 false 说明槽已经不在了 ⇒ 如实打出来。
+                            let g = SECOND_TASK.load(Ordering::Relaxed);
+                            let killed = g != 0 && crate::sched::terminate_task(g);
+                            self.closed[i] = true;
+                            crate::log_info!("窗口: 关闭会话 {} 终止任务={} 任务={}", i, killed, g);
+                            if crate::user::active_session() as usize == i {
+                                crate::user::set_active_session(0);
+                            }
+                            if self.closed.iter().filter(|c| **c).count() == crate::serial::SESSIONS {
+                                crate::log_info!("窗口: 全部关闭 ⇒ 系统停机");
+                                crate::exit::finish(crate::exit::Code::Success);
+                            }
+                        }
+                    }
                     _ => {}
                 }
                 // S6p：点在标签上就**切会话**；关闭符只记读数（0 号是 init，不能关）
@@ -1491,12 +1544,6 @@ impl LiveTerm {
                         }
                         crate::user::set_active_session(i);
                         crate::log_info!("multisession: 切到会话 {}", i);
-                    }
-                    crate::fbcon::Hit::TabClose(0) => {
-                        crate::log_warn!("multisession: 0 号是 init，不能关")
-                    }
-                    crate::fbcon::Hit::TabClose(i) => {
-                        crate::log_info!("multisession: 关闭会话 {}（本片只记读数）", i)
                     }
                     _ => {}
                 }

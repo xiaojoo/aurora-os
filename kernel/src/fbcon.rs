@@ -912,6 +912,7 @@ impl Chrome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hit {
     TabClose(u8),
+    TabMin(u8),
     Tab(u8),
     NewTab,
     Min,
@@ -925,6 +926,9 @@ impl Hit {
     pub fn name(self) -> &'static str {
         match self {
             Hit::TabClose(_) => "标签关闭",
+            Hit::TabMin(0) => "窗口最小化0",
+            Hit::TabMin(1) => "窗口最小化1",
+            Hit::TabMin(_) => "窗口最小化N",
             Hit::Tab(0) => "标签0",
             Hit::Tab(1) => "标签1",
             Hit::Tab(_) => "标签N",
@@ -965,9 +969,12 @@ pub fn hit_test(cols: u64, tabs: u64, x_px: u64, y_px: u64, ch: Chrome) -> Hit {
     for i in 0..shown {
         let c0 = lay.tab_col(i);
         if c >= c0 && c < c0 + lay.tab_w {
-            // 标签体：最右一列是它自己的关闭符
-            return if c + 1 >= c0 + lay.tab_w {
+            // 每个窗口条目自带 `-`（最小化）与 `×`（关闭）：最右两列
+            let rel = c - c0;
+            return if rel + 1 == lay.tab_w {
                 Hit::TabClose(i as u8)
+            } else if rel + 2 == lay.tab_w {
+                Hit::TabMin(i as u8)
             } else {
                 Hit::Tab(i as u8)
             };
@@ -1243,7 +1250,8 @@ impl Term {
                     c += char_cells(ch);
                 }
             }
-            // 标签自己的关闭符（截图里它就在标签右端，活动/非活动都在）
+            // 每个窗口条目自带 `-` 与 `×`（最右两列；绘制与命中同一份几何）
+            self.rect(f, (c0 + tab_w - 2) * CELL_W + 5, 16, 6, 2, TAB_DIM);
             self.cross(f, (c0 + tab_w - 1) * CELL_W + 5, 12, 6, TAB_DIM);
         }
         // 3) `+` 与它右边那个 `∨`（下拉：今天没有语义，只画）
