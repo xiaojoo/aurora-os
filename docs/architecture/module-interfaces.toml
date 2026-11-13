@@ -449,6 +449,7 @@ public_api = [
   "fbcon::redraw_window",
   "fbcon::redraw_input",
   "fbcon::Hit",
+  "fbcon::Chrome",
 ]
 allowed_callers = ["integration"]
 dependencies = ["boot", "diagnostics", "memory", "pci", "sync"]

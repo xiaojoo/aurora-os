@@ -1339,6 +1339,10 @@ struct LiveTerm {
     /// 四本账：整窗重画 / 指针重画 / 光标翻转 / 只重画输入行各做了多少次
     /// （进日志，宿主机可复算"没内容变化时一个字都不写"）。
     paints: (u32, u32, u32, u32),
+    /// 窗口三态（S6q 补记二）：点 `-`/`□` 改它，正文与标签栏的画法由 `fbcon::Chrome` 决定。
+    chrome: crate::fbcon::Chrome,
+    /// 上一次画的时候是哪个态（换态必须整窗重画）。
+    last_chrome: crate::fbcon::Chrome,
 }
 
 #[cfg(feature = "fbcon-live")]
@@ -1367,6 +1371,8 @@ impl LiveTerm {
             ptr: None,
             ptr_bg: [[0; 7]; 11],
             paints: (0, 0, 0, 0),
+            chrome: crate::fbcon::Chrome::Normal,
+            last_chrome: crate::fbcon::Chrome::Normal,
         })
     }
 
@@ -1390,21 +1396,26 @@ impl LiveTerm {
         let total = crate::serial::mirror_total_sid(sid);
         let nl = crate::serial::mirror_newlines_sid(sid);
         let sig = (sid as u8, total, nl as u64, tabs, active);
-        if sig != self.sig {
+        // 窗口三态单列一格：换态必须整窗重画（版面变了，输入行的行号也变了）。
+        let chrome_changed = self.chrome != self.last_chrome;
+        if sig != self.sig || chrome_changed {
             // 先把指针的像素还回去（它盖住的那 77 个像素是上一帧的背景）；
             // 整窗重画也会覆盖它，但**输入行那一路只动一行**——行外的指针必须自己擦。
             self.ptr_erase();
-            let incremental = self.sig.0 == sid as u8
+            let incremental = !chrome_changed
+                && self.sig.0 == sid as u8
                 && self.sig.2 == nl as u64
                 && self.sig.1 != usize::MAX;
             let (cc, cr) = if incremental {
-                crate::fbcon::redraw_input(&self.term, &self.frame, rows.min(LIVE_ROWS), sid)
+                crate::fbcon::redraw_input(
+                    &self.term, &self.frame, rows.min(LIVE_ROWS), sid, self.chrome)
             } else {
                 let (_, cc, cr) = crate::fbcon::redraw_window(
-                    &self.term, &self.frame, rows.min(LIVE_ROWS), sid, tabs, active);
+                    &self.term, &self.frame, rows.min(LIVE_ROWS), sid, tabs, active, self.chrome);
                 (cc, cr)
             };
             self.sig = sig;
+            self.last_chrome = self.chrome;
             // 画过的像素一律作废：光标靠下一相重画，指针靠下面 `ptr_track` 重画。
             self.caret = None;
             self.caret_at = if cr != 0 { Some((cc, cr)) } else { None };
@@ -1436,12 +1447,48 @@ impl LiveTerm {
             // 放在这里而不是只放常驻循环：**等待期也会点**（实测：只在 park 里取，
             // 等待期那几下点击就永远读不到）。
             if let Some((cx, cy)) = crate::mouse::take_click() {
-                let hit = crate::fbcon::hit_test(self.term.dims().0, tabs, cx as u64, cy as u64);
+                let hit = crate::fbcon::hit_test(
+                    self.term.dims().0, tabs, cx as u64, cy as u64, self.chrome);
                 crate::log_info!("mouse: 点击 x={} y={} 命中={}", cx, cy, hit.name());
+                // S6q 补记二：三个窗口按钮**有动作了**——但各自的口径要写清楚：
+                //   · `-` 最小化：正文整块收起（只留标签栏），再点一次恢复；
+                //   · `□` 最大化：收起标签栏、正文从第 0 行开始（多一行），再点一次恢复；
+                //   · `×` 关闭窗口：**整机停机**（本内核没有窗口管理器，"关窗"等价于收工）。
+                //     走的是与 `exit` 命令同一条停机路径（`sched::wait_for_task` 那边会看到 init 收工）。
+                // 三态互斥且都可逆，所以"点错了"能点回来——不可逆的只有关闭。
+                match hit {
+                    crate::fbcon::Hit::Min => {
+                        // 最小化时点标签就能恢复：标签栏一直画着，用户不会被困住。
+                        self.chrome = if self.chrome == crate::fbcon::Chrome::Minimized {
+                            crate::fbcon::Chrome::Normal
+                        } else {
+                            crate::fbcon::Chrome::Minimized
+                        };
+                        crate::log_info!("窗口: 最小化={}", self.chrome == crate::fbcon::Chrome::Minimized);
+                    }
+                    crate::fbcon::Hit::Max => {
+                        self.chrome = if self.chrome == crate::fbcon::Chrome::Maximized {
+                            crate::fbcon::Chrome::Normal
+                        } else {
+                            crate::fbcon::Chrome::Maximized
+                        };
+                        crate::log_info!("窗口: 最大化={}", self.chrome == crate::fbcon::Chrome::Maximized);
+                    }
+                    crate::fbcon::Hit::Close => {
+                        crate::log_info!("窗口: 关闭 ⇒ 系统停机");
+                        crate::exit::finish(crate::exit::Code::Success);
+                    }
+                    _ => {}
+                }
                 // S6p：点在标签上就**切会话**；关闭符只记读数（0 号是 init，不能关）
                 #[cfg(feature = "handles")]
                 match hit {
                     crate::fbcon::Hit::Tab(i) => {
+                        // 最小化时点标签 = 恢复正文（否则正文收着、用户只剩一个看不清的条）。
+                        if self.chrome == crate::fbcon::Chrome::Minimized {
+                            self.chrome = crate::fbcon::Chrome::Normal;
+                            crate::log_info!("窗口: 最小化=false（点标签恢复）");
+                        }
                         crate::user::set_active_session(i);
                         crate::log_info!("multisession: 切到会话 {}", i);
                     }

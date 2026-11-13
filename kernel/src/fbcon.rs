@@ -882,6 +882,32 @@ impl BarLayout {
     }
 }
 
+/// 窗口的三态（S6q 补记二）。**这不是窗口管理器**：没有宿主窗口可挪，
+/// 所以"最小化/最大化"落在**终端自己的版面**上，行为写死在这里：
+/// - `Normal`：标签栏 + 正文 + 输入行（默认）；
+/// - `Minimized`：只留标签栏，正文整块刷成底色（再点一次 `-` 或点任一标签恢复）；
+/// - `Maximized`：收起标签栏，正文从第 0 行开始（多一行），三个窗口按钮仍画在右上角三格。
+///
+/// **为什么不做"真的放大窗口"**：guest 改不了 QEMU 的窗口尺寸（没有 virtio-gpu 的那种接口），
+/// 假装能改就是硬约束⑦说的夸大。这里只动**我们画得出来的那一块**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Chrome {
+    Normal,
+    Minimized,
+    Maximized,
+}
+
+impl Chrome {
+    /// 画不画标签栏
+    pub fn tabs(self) -> bool {
+        !matches!(self, Chrome::Maximized)
+    }
+    /// 画不画正文（日志区 + 输入行）
+    pub fn body(self) -> bool {
+        !matches!(self, Chrome::Minimized)
+    }
+}
+
 /// 点在了哪儿。只有 `Body` 是"终端正文"，其余都是标签栏上的控件。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hit {
@@ -913,12 +939,28 @@ impl Hit {
 }
 
 /// 屏幕像素坐标 → 命中项。第 0 行是标签栏，其余全是正文。
-pub fn hit_test(cols: u64, tabs: u64, x_px: u64, y_px: u64) -> Hit {
+pub fn hit_test(cols: u64, tabs: u64, x_px: u64, y_px: u64, ch: Chrome) -> Hit {
+    let c = x_px / CELL_W;
+    let lay = BarLayout::of(cols);
+    if !ch.tabs() {
+        // 最大化：右上角三格仍是三个按钮（标签栏没了，按钮不能跟着消失——
+        // 否则 maximize 就变成单向门，没有恢复的办法）。其余全算正文。
+        if y_px < CELL_H {
+            if c == lay.strip_r {
+                return Hit::Min;
+            }
+            if c == lay.strip_r + 1 {
+                return Hit::Max;
+            }
+            if c == lay.strip_r + 2 {
+                return Hit::Close;
+            }
+        }
+        return Hit::Body;
+    }
     if y_px >= CELL_H {
         return Hit::Body;
     }
-    let c = x_px / CELL_W;
-    let lay = BarLayout::of(cols);
     let shown = tabs.min(lay.fit);
     for i in 0..shown {
         let c0 = lay.tab_col(i);
@@ -1226,10 +1268,15 @@ impl Term {
                 let _ = f.put(x + 7 - i, 12 + i, TAB_TEXT);
             }
         }
-        // 5) 右侧窗口按钮：最小化 / 最大化 / 关闭（截图里是细笔画，颜色同标题文字）
-        // 三个按钮各占一格、笔画居中（格子 16×32）：最小化 = 一条 10px 横线，
-        // 最大化 = 10×10 空心方框，关闭 = 10×10 的 ×。竖向统一在 y=11..20，
-        // 与截图的细笔画同形；命中区由 `BarLayout::strip_r` 供给（绘制与命中共用一份几何）。
+        // 5) 右侧三个窗口按钮（绘制在 `win_buttons` 里，最大化时也用它）
+        self.win_buttons(f, strip_r);
+    }
+
+    /// 三个窗口按钮：`-` / `□` / `×`，各占一格、笔画 10px 居中在 y=11..20。
+    ///
+    /// **绘制与命中共用 `BarLayout::strip_r`**：两处各算一遍，点击就会落在画的地方旁边。
+    /// 最大化时标签栏不画，但这三个按钮仍画在右上角（`redraw_window` 会先清屏成底色）。
+    fn win_buttons(&self, f: &Frame, strip_r: u64) {
         let gx = |i: u64| (strip_r + i) * CELL_W + 3;
         self.rect(f, gx(0), 16, 10, 1, TAB_TEXT);
         self.rect(f, gx(1), 11, 10, 1, TAB_TEXT);
@@ -1237,6 +1284,11 @@ impl Term {
         self.rect(f, gx(1), 11, 1, 10, TAB_TEXT);
         self.rect(f, gx(1) + 9, 11, 1, 10, TAB_TEXT);
         self.cross(f, gx(2), 11, 10, TAB_TEXT);
+    }
+
+    /// 只画右上角那三个按钮（最大化：标签栏收起来了，按钮不能跟着消失）。
+    pub fn buttons_only(&self, f: &Frame) {
+        self.win_buttons(f, BarLayout::of(self.cols).strip_r);
     }
 
     /// 鼠标指针：7×11 的**几何箭头**（`#`=填充、`o`=描边），左上角是尖。
@@ -1407,7 +1459,7 @@ impl Term {
 /// 每次眨眼都要重写整屏，画面上看到的就是"指针与文字一起闪"（实测 8 帧里丢 2 帧）。
 /// 现在这里只画正文并把光标位置交回去，闪烁由 `LiveTerm` 在那一格上局部画/擦。
 pub fn redraw_window(term: &Term, f: &Frame, max_lines: usize, sid: usize,
-                     tabs: u64, active: u64) -> (usize, u64, u64) {
+                     tabs: u64, active: u64, ch: Chrome) -> (usize, u64, u64) {
     let n = crate::serial::mirror_len_sid(sid);
     let wrapped = crate::serial::mirror_wrapped_sid(sid);
     let mut total = 1usize;
@@ -1418,9 +1470,26 @@ pub fn redraw_window(term: &Term, f: &Frame, max_lines: usize, sid: usize,
     }
     // 版面：**标题栏（TITLE_ROWS 行）→ 日志区 → 输入行（最后一行）**。
     // 不这么分的话内核日志继续往下写，提示符会跑到屏幕中间、并被日志粘住。
-    term.tab_bar(f, tabs, active);
-    let top = TITLE_ROWS;
-    let log_rows = max_lines.saturating_sub(TITLE_ROWS as usize + 1);
+    // 版面：标签栏（可收起）→ 日志区 → 输入行（最后一行）。
+    // 不这么分的话内核日志继续往下写，提示符会跑到屏幕中间、并被日志粘住。
+    let top = if ch.tabs() { TITLE_ROWS } else { 0 };
+    let log_rows = max_lines.saturating_sub(top as usize + 1);
+    if ch.tabs() {
+        term.tab_bar(f, tabs, active);
+    } else {
+        // 最大化：先整块刷底色（否则上一帧的标签栏会留在第一行）。三个按钮**放到最后画**——
+        // 正文从第 0 行开始，先画按钮会被第 0 行的文字整行盖掉（本轮实测：按钮像素 0）。
+        for r in 0..max_lines as u64 {
+            term.print_line(f, r, "");
+        }
+    }
+    if !ch.body() {
+        // 最小化：正文整块刷成底色，只留标签栏。输入行也不画（光标由调用方按 caret_at=None 收掉）。
+        for r in top..max_lines as u64 {
+            term.print_line(f, r, "");
+        }
+        return (max_lines, 0, 0);
+    }
     let skip = total.saturating_sub(log_rows);
     let mut line = [0u8; LINE_BUF];
     let mut len = 0usize;
@@ -1476,6 +1545,10 @@ pub fn redraw_window(term: &Term, f: &Frame, max_lines: usize, sid: usize,
         term.print_line(f, top + log_rows as u64, &text);
         caret_col = cc;
     }
+    // 最大化时最后补上右上角三个按钮（压在第 0 行正文之上，与标签栏那一行同一位置）。
+    if !ch.tabs() {
+        term.buttons_only(f);
+    }
     if log_rows < max_lines {
         (max_lines, caret_col, top + log_rows as u64)
     } else {
@@ -1513,9 +1586,9 @@ fn input_text(sid: usize, tail: &[u8], cols: u64) -> (alloc::string::String, u64
 /// 为什么值得单开一条路：整窗重画是 23 行 × 80 格 × 512 像素 ≈ 94 万次 UC 设备写，
 /// 每敲一个键就做一次的话，那几十毫秒里指针/光标是被擦掉的（实测 8 帧里能抓到丢帧）。
 /// 返回 `(光标列, 行)`。
-pub fn redraw_input(term: &Term, f: &Frame, max_lines: usize, sid: usize) -> (u64, u64) {
-    let top = TITLE_ROWS;
-    let log_rows = max_lines.saturating_sub(TITLE_ROWS as usize + 1);
+pub fn redraw_input(term: &Term, f: &Frame, max_lines: usize, sid: usize, ch: Chrome) -> (u64, u64) {
+    let top = if ch.tabs() { TITLE_ROWS } else { 0 };
+    let log_rows = max_lines.saturating_sub(top as usize + 1);
     if log_rows >= max_lines {
         return (0, 0);
     }
