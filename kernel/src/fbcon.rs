@@ -75,6 +75,11 @@ impl Term {
         (self.cols, self.rows)
     }
 
+    /// 正文区能放几行（冻结带不算）。实时重画用它来定窗口，不在调用方写死分辨率。
+    pub fn body_rows(&self) -> usize {
+        (self.rows - BAND_ROWS) as usize
+    }
+
     pub fn frozen() -> bool {
         FROZEN.load(Ordering::Acquire)
     }
@@ -195,6 +200,53 @@ impl Term {
     pub fn band_origin(&self) -> (u64, u64) {
         (0, (self.rows - BAND_ROWS) * CELL_H)
     }
+}
+
+// ------------------------------------------------------------------ S6d 实时重画
+//
+/// **整窗重画**：把环里最后 `max_lines` 条完整行直接刷到正文区第 0.. 行，返回**有内容的行数**。
+///
+/// 与 [`drain_and_draw`] 的三点差别，每点都是"可重复调用"要求的：
+/// 1. 不滚动，按行号直写 ⇒ 第 N 次调用与第 1 次调用画的是同一件事，宿主机可以任意时刻取样；
+/// 2. **一个字都不打印**：每轮打一行会把 §245 那套按行序读的判据搅掉（而实时重画一轮都不打才成立）；
+/// 3. 没画到的行也刷成空行：`print_line` 行尾补空格 ⇒ 上一帧更靠下的内容不会留下残影当假证人。
+pub fn redraw_window(term: &Term, f: &Frame, max_lines: usize) -> usize {
+    let n = crate::serial::mirror_len();
+    let wrapped = crate::serial::mirror_wrapped();
+    let mut total = 1usize;
+    for i in 0..n {
+        if crate::serial::mirror_byte(i) == 10 {
+            total += 1;
+        }
+    }
+    let skip = total.saturating_sub(max_lines);
+    let mut line = [0u8; 200];
+    let mut len = 0usize;
+    let mut idx = 0usize;
+    let mut row = 0usize;
+    for i in 0..n {
+        let c = crate::serial::mirror_byte(i);
+        if c == 10 {
+            let fragment = wrapped && idx == 0;
+            if idx >= skip && !fragment && row < max_lines {
+                let s = core::str::from_utf8(&line[..len]).unwrap_or("<bad-utf8>");
+                if term.print_line(f, row as u64, s) > 0 || len == 0 {
+                    row += 1;
+                }
+            }
+            len = 0;
+            idx += 1;
+        } else if len < line.len() {
+            line[len] = c;
+            len += 1;
+        }
+    }
+    // 窗口里没被内容占满的行一律刷空：残影像素会被下一帧读成"那行还在"
+    while row < max_lines {
+        term.print_line(f, row as u64, "");
+        row += 1;
+    }
+    row.min(max_lines)
 }
 
 // ------------------------------------------------------------------ S6b-3 消费端

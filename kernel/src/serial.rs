@@ -279,6 +279,10 @@ pub fn write_bytes(bytes: &[u8]) -> usize {
         }
         done += 1;
     }
+    // S6d：控制台的字节流也进同一个环 ⇒ 画面镜像的是"控制台上真看到的东西"，不只是内核日志。
+    // 只旁挂**真写出去的那一截**（`done`），串口因背压少写的字节不该在画面上假装存在。
+    #[cfg(feature = "framebuffer")]
+    mirror_bytes(&bytes[..done]);
     done
 }
 
@@ -318,8 +322,14 @@ static MIRROR_POS: AtomicUsize = AtomicUsize::new(0);
 /// 旁挂一段日志正文。由 `Sink::write_str` 调用，**只存字节、绝不画图**：
 /// 画一行是上万次设备写，而调用点持有串口行锁——在锁里做设备写等于把锁的暴露面撑大。
 pub fn mirror_note(s: &str) {
-    for &b in s.as_bytes() {
-        mirror_note_byte(b);
+    mirror_bytes(s.as_bytes());
+}
+
+/// 旁挂一段**字节流**。控制台的写出走这里而不是 `mirror_note`：20 号交来的是一段字节，
+/// 硬转成 `&str` 会把非 UTF-8 的写变成"悄悄少几个字节"，那种丢法没有读数。
+pub fn mirror_bytes(b: &[u8]) {
+    for &x in b {
+        mirror_note_byte(x);
     }
 }
 

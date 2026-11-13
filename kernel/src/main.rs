@@ -1192,7 +1192,11 @@ fn stage_init_user() -> Option<usize> {
     );
     apic::timer_start().ok();
     let windows = if cfg!(feature = "console-probe") { 1000 } else { 32 };
+    #[cfg(not(feature = "fbcon-live"))]
     let done = apic::with_interrupts(|| sched::wait_for_task(gidx, crate::clock::window_cycles(windows)));
+    // S6d：要实时上屏就得**边等边画**，所以这一档把那发长等待拆成有界轮询（总上界不变）。
+    #[cfg(feature = "fbcon-live")]
+    let done = live_wait_and_redraw(gidx, windows);
     let runs = sched::runs_of(gidx);
     // S5c：`等待收工=false` 在这一档是**预期**——shell 是常驻 init，只有收到 `exit` 才收工。
     // "它真的在跑"这一格由串口上的横幅与提示符作证（宿主机侧读），不靠这个布尔。
@@ -1204,6 +1208,49 @@ fn stage_init_user() -> Option<usize> {
 
     // S5d：交回 init 的任务号，让 main 在**判定打完之后**等它收工（BACKLOG §237）。
     Some(gidx)
+}
+
+/// S6d：`fbcon-live` 档的"等 init 收工 + 每轮重画一次屏"。
+///
+/// **为什么不新开等待语义**：用的还是同一个 `wait_for_task`，只是把一发 1000 窗口的上界拆成
+/// 62 发 16 窗口 ⇒ 总上界不变、调度语义不变（`park_until_init_exits` 早就在用同一个形状）。
+/// **映射只做一次**：`Frame::init()` 每次都真映射一遍 MMIO 窗口，轮询里反复映射既贵又要碰 VMM 锁。
+/// 拿不到帧缓冲或几何时**退回一次性等待**并在串口上说清楚 ⇒ 特性退化是可见的，不是静默的。
+#[cfg(all(feature = "fbcon-live", feature = "handles"))]
+fn live_wait_and_redraw(gidx: usize, total_windows: u64) -> bool {
+    const STEP: u64 = 16;
+    let one_shot = |g: usize| apic::with_interrupts(|| sched::wait_for_task(g, crate::clock::window_cycles(total_windows)));
+    let Ok(f) = crate::frame::Frame::init() else {
+        crate::log_warn!("fbcon-live: 拿不到帧缓冲 ⇒ 退回一次性等待（画面不会有键入内容）");
+        return one_shot(gidx);
+    };
+    let Some(term) = crate::fbcon::Term::new(&f) else {
+        crate::log_warn!("fbcon-live: 几何放不下终端栅格 ⇒ 退回一次性等待");
+        return one_shot(gidx);
+    };
+    let rows = term.body_rows();
+    // 每轮画多少行是**预算**，不是容量：一行是 160 格 × 64 像素的设备写，画满 98 行会把
+    // 一轮拉到上百毫秒，而实时重画的意义只是"取样时刻任意"。24 行足够覆盖一段问答。
+    const LIVE_ROWS: usize = 24;
+    let win = rows.min(LIVE_ROWS);
+    crate::log_info!("fbcon-live: 实时重画已开 正文行={} 窗口行={} 每轮窗口={}", rows, win, STEP);
+    let mut left = total_windows;
+    let mut rounds = 0usize;
+    loop {
+        let step = if left > STEP { STEP } else { left };
+        if step == 0 {
+            break;
+        }
+        left -= step;
+        rounds += 1;
+        if apic::with_interrupts(|| sched::wait_for_task(gidx, crate::clock::window_cycles(step))) {
+            crate::log_info!("fbcon-live: 轮询={} 收工=init 自己退出", rounds);
+            return true;
+        }
+        crate::fbcon::redraw_window(&term, &f, win);
+    }
+    crate::log_info!("fbcon-live: 轮询={} 收工=没有（等待上界到）", rounds);
+    false
 }
 
 /// 用页表本身找一个确定未映射的页：先问 `mm::is_mapped`，不再靠区间算术推断。

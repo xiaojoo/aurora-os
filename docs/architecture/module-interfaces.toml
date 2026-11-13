@@ -442,6 +442,7 @@ public_api = [
   "fbcon::Term",
   "frame::Frame",
   "frame::FrameError",
+  "fbcon::redraw_window",
 ]
 allowed_callers = ["integration"]
 dependencies = ["boot", "diagnostics", "memory", "pci", "sync"]
