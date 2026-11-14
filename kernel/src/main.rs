@@ -1059,6 +1059,9 @@ fn park_until_init_exits(init: Option<usize>) {
         // 这里单独开一次映射：stage_init_user 里那一个已经随函数返回 drop 掉了。
         #[cfg(feature = "fbcon-live")]
         let mut live = LiveTerm::open();
+        // ADR-098 诊断（**临时**）：上一次重开发生在第几拍（`main_frames()` 是节拍计数）。
+        #[allow(unused_mut)]
+        let mut last_reopen_tick = 0usize;
         loop {
             // S6u：**一拍 1 窗口（约 16 ms）**，内容签名每 8 拍才算一次。
             // 拆之前这里是"每轮 8 窗口（约 140 ms）"，而指针只在 repaint 里画 ⇒
@@ -1066,6 +1069,23 @@ fn park_until_init_exits(init: Option<usize>) {
             // （A/B：`-display none` 与 `-display gtk` 的每帧毫秒同一量级，140.1 / 198.3）。
             let woke = apic::with_interrupts(|| sched::wait_for_task(gidx, crate::clock::window_cycles(1)));
             if woke {
+                // ADR-098 诊断（**临时**）：收工那一刻的三格读数。
+                // `closed` = park 用来区分"被 × 关掉"与"自愿 exit"的那一格；
+                // `距重开` = 距上一次重开过了多少拍（启动等待约 63 拍 ≈ 1 s）。
+                let closed_now = {
+                    #[cfg(feature = "fbcon-live")]
+                    {
+                        live.as_ref().map_or(false, |t| t.closed[0])
+                    }
+                    #[cfg(not(feature = "fbcon-live"))]
+                    {
+                        false
+                    }
+                };
+                crate::log_info!(
+                    "resident-init: 收工读数 closed={} gidx={} 距重开={} 拍",
+                    closed_now, gidx, crate::main_frames().wrapping_sub(last_reopen_tick)
+                );
                 // ADR-098 诊断：`Done` 的来路要看得出是"自愿 exit"还是"故障收工"。
                 // 退出码从**进程记录**里读（此刻任务槽已 Done、进程还没 reap ⇒ 读得到）；
                 // 故障向量只出现在故障路径上，而本次日志里没有 fatal/exception ⇒ 先读退出码即可分。
@@ -1097,6 +1117,7 @@ fn park_until_init_exits(init: Option<usize>) {
                         match stage_init_user(0) {
                             Some(n) => {
                                 gidx = n;
+                                last_reopen_tick = crate::main_frames();
                                 INIT_TASK.store(n, Ordering::Relaxed);
                                 crate::user::set_active_session(0);
                                 continue;

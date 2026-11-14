@@ -12630,3 +12630,42 @@ resident-init: init 已收工 ⇒ 系统停机
 `check` **17/17**；代码保留（si 页归子任务、关闭链、closed 复位提前、S4b-2/3/4、行锁账、站点 warn、
 wait-sample 采样）。九格：1–7 绿、第 8 格红、第 9 格未执行。
 
+
+## 283. **第二次唤醒读到 `closed=false`，而复位只剩"重开之前"一处**（2026-11-14，实测）
+
+### 一、读数
+
+```
+窗口: 关闭会话 0 终止任务=true 任务=2 收尸=true VA放手=0/1
+resident-init: 收工读数 closed=true  gidx=2 距重开=390 拍   ← 第一次关，正常进重开分支
+会话 0 已终止 ⇒ 重开新 shell
+窗口: 关闭会话 0 终止任务=true 任务=2 收尸=true VA放手=0/1   ← 第二次关（落在重开等待里）
+fbcon-live: 轮询=14 收工=init 自己退出
+resident-init: 收工读数 closed=false gidx=2 距重开=0 拍      ← **closed 是 false**
+```
+
+· `距重开=0` ⇒ 重开分支刚做完、下一拍立刻又醒；
+· `closed=false` ⇒ 点击置的那一格**在唤醒前被抹掉了**——可现在复位只剩"重开之前"那一处。
+
+### 二、剩下的候选（都未证，按可疑度）
+
+1. **点击在复位之前被处理**：`repaint → tick` 在 park 上一轮就已经把第二次点击吃掉（`closed=true`、终止任务），
+   紧接着 park 进重开分支、**复位把它抹掉** ⇒ 唤醒时读到 false。时序上要打三个点才分得清；
+2. 点击处理走的是**另一个 `LiveTerm`**（`stage_init_user` 里 `live_wait_and_redraw` 自己 `LiveTerm::open()` 了一个
+   ——若它另开一份，`closed` 就写在另一份上，park 这份永远看不到）。**这一条要先核代码**，因为它能完整解释现象；
+3. 终止与置位不在同一份状态上（`TabClose` 走 `self.closed`，park 读 `live.closed`）。
+
+### 三、下一件（先核代码，再打点）
+
+1. **读代码**：`live_wait_and_redraw` 里的 `let Some(mut live) = LiveTerm::open()` —— 这是**第二份** `LiveTerm`！
+   park 外层也有一份。若点击在那个等待里被 `repaint → tick` 处理，它写的是**等待里那一份**的 `closed`，
+   park 外层那份永远是 false。**这条能一次解释全部现象**（包括为什么第一次关时 `closed=true`——
+   那次点击发生在 park 自己的 `repaint` 里）。
+2. 若第 1 条成立，修法是让"启动等待"与 park 共用同一份 `LiveTerm`（或把点击拾取从等待里拿掉），
+   而不是继续打点。
+
+### 四、状态
+
+`check` **17/17**；`wait-sample`、`收工读数` 两条都是临时诊断（下一刀定型时一并撤或改成正式判据）。
+九格：1–7 绿、第 8 格红、第 9 格未执行。
+
