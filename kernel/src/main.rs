@@ -1406,8 +1406,10 @@ fn stage_init_user(sid: u8) -> Option<usize> {
     // S5c：`等待收工=false` 在这一档是**预期**——shell 是常驻 init，只有收到 `exit` 才收工。
     // "它真的在跑"这一格由串口上的横幅与提示符作证（宿主机侧读），不靠这个布尔。
     crate::log_info!(
-        "init-user(S4b-2): 会话={} 程序=shell 无CREATE拒={} Proc句柄={} 子AS={} 任务AS={} entry={:#x} 栈顶={:#x} 段={} 页={} 归创建者={} 子袋={} 线程停住={} start_ret={} 跑过次数={} 等待收工={} si_va={:#x}",
+        "init-user(S4b-2): 会话={} 任务={} 状态={:?} 程序=shell 无CREATE拒={} Proc句柄={} 子AS={} 任务AS={} entry={:#x} 栈顶={:#x} 段={} 页={} 归创建者={} 子袋={} 线程停住={} start_ret={} 跑过次数={} 等待收工={} si_va={:#x}",
         sid,
+        gidx,
+        sched::state_of(gidx),
         denied, hp.0, aslot, sched::aspace_of(gidx), loaded.entry, loaded.stack_top,
         loaded.segs, loaded.pages, owned_n, sched::owned_of(gidx), stopped, started, runs, done, si_va
     );
