@@ -11848,3 +11848,50 @@ git checkout -- kernel/src/main.rs kernel/src/serial.rs docs/architecture/module
    读到的是 LF 结尾 ⇒ 断言替我拦住了"往一个行尾已经坏了的文件上再写"。
    顺序应该是：**先问 git 这份文件该是什么行尾，再写**。
 
+
+## 268. **#61 普查：会话终止后没人回收——三处，不是一处**（2026-11-14，只读普查，未改代码）
+
+### 一、问题重述（承接 §267 的四条读数）
+
+`×` 关掉 0 号会话后重开，第二次 `si_va` 拿到 **-6**、`BSP 槽占用` 停在 `0b000001011`、
+`创建者袋` 4 → 7。§267 只证明了"没回收"，本节把"谁该还、今天谁没还"落到函数。
+
+### 二、普查表（读代码 + 读 `sys_aspace_map`，未跑新实验）
+
+| 资源 | 谁分配 | 今天谁回收 | 结论 |
+|---|---|---|---|
+| 任务槽 | `spawn` 占槽 | `terminate_task` **当场标 Free** 并清 `proc_id`/`as_slot`/`entries` | 槽本身回了，但**跳过了 `Done` 这条路** |
+| 句柄袋（`owned`） | `grant_*` | `terminate_task` 的 `release_owned` + 锁外 `drop(bag)` | 回了一半：`handle::revoke_task` 只挂在 **reap 扫描**上，而 `terminate_task` 不经过它 |
+| 进程记录 + 子 AS | `proc_create` / `aspace_create` | **`proc_reap`** | **产品路径零调用者**（`grep proc_reap(` 只有 `ktests/*`）⇒ 僵尸进程与它的 AS 永远留着 |
+| 用户页帧 | `aspace_map` 的 `phys_alloc` | 同上，只有 `proc_reap` → `aspace_destroy` → `aspace_release` | 而 `aspace_release` **只还自己建的表页 + 清表项**（它自己的注释写着"P1 的低半区为空"）⇒ 用户帧也不还 |
+| VA 保留 | `reserve_va_at`（**全局表**，不按 AS 分） | 只有错误路径（`user.rs:389/401/413`）与 `lazy_release` | **正常退出/被杀都不释放** ⇒ 第二次同址 `reserve_va_at` 返回 false ⇒ **-6 就来自这里**（`sys_aspace_map` 固定地址分支：`if !mm::reserve_va_at(want, pages) { … }`） |
+
+**三条已证的关键事实**：
+1. `si_va` 不是"AS 里的映射随便占位"，它走的是**全局** `reserve_va_at` ⇒ 只要不显式
+   `release_va`，同一地址第二次必 -6，销毁 AS 也救不回来；
+2. `aspace_release` 对用户半区**不做解映射、不还帧、不还 VA**（注释里就写着只做表页+表项）；
+3. `proc_reap` 在产品路径没有调用者 ⇒ 子 AS 与进程记录从不销毁。
+
+所以"最小一步 = 补一个 `proc_reap`"是**无效的**：它照样不还 VA 保留，-6 一分不动。
+这一点必须先写下来，否则下一刀会照着 §267 里"回收这些资源"那句去补 `proc_reap`，然后量到同样的红。
+
+### 三、三种回收点（要先裁决，因为其中两种会碰 mm 的已测语义）
+
+| 方案 | 形状 | 代价 / 风险 |
+|---|---|---|
+| **A. 让 AS 成为回收点** | 在 `aspace_release` 里遍历用户半区：逐页 `unmap` + `phys_free` + `release_va` | 架构上最干净（映射归 AS 管，不需要 per-session 簿记）；但这是**改 mm 已测语义**（ADR-023/066 那套 unmap 顺序、shootdown、台账都要重新对账）⇒ 必须 ADR-098 |
+| **B. 会话自己记账** | 新 `static SESSION_VA`（每会话一张小表：si / 栈 / 各段），`user::session_destroy(sid)` 逐条 `release_va` + `proc_reap` | 不动 mm 的语义；但要在装载路径逐段登记、新增 `user::` 接口与一张每会话表，且"漏登一段"是新的静默失败面 |
+| **C. 只修 si VA（最小步）** | 只记住 `si_want` 并在重开前 `release_va(si_want)` | 只让 -6 消失；用户帧、AS、段/栈 VA 仍漏，`创建者袋` 仍涨 ⇒ 判据只允许写"第二次 si_va 是真地址"，不许写"会话活着" |
+
+**推荐 B**：不动 mm 的已测语义，回收点与会话生命周期同处（关会话时能拿到 sid），
+而且它天然是把"一个会话占了哪些 VA"变成可复核的读数（登了几段、放了几段可以逐条对账）。
+A 的正确性最干净但风险最大；C 只能换来一条判据，容易让人误以为交付了。
+
+### 四、这一刀动之前的硬前置
+
+· 方案 B 要新增 `user::session_destroy` / `user::session_record_va` 一类接口
+  ⇒ `check-interface-change` 会要求 ADR（ADR-098）；
+· 判据仍用 `build/s6v-close-check.py` 九格，但把"会话活着"那条从"返回 Some"改成
+  **控制台真写字节 + 画面真有正文 + 键入有回显**（§267 已改）；
+· 负样本：把 `release_va` 那一行去掉 ⇒ 第二次 `si_va` 必须回到 -6（今天的形状就是证人）。
+
