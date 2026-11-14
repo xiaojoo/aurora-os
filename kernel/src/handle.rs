@@ -24,7 +24,10 @@ use crate::filesystem::fat32::{FileCursor, FsError};
 use crate::filesystem::vfs::{AhciDisk, Block, Partition, PartitionView};
 use crate::sync::{IrqSpinLock, RANK_HANDLE};
 
-pub const MAX_HANDLES: usize = 16;
+/// S9g（用户裁决 2026-11-15）：全局句柄表 16→64。16 格时每个活 shell 占 ~6-7 格，
+/// 同时只能开 2 个，`+` 撞容量墙。槽号仍走 SLOT_BITS=16 位编码，64 远未越界。
+/// 这是容量裁决（ADR-007 的 16 被用户放宽），si 描述表 MAX_STARTUP_HANDLES 仍 16（ABI 不动）。
+pub const MAX_HANDLES: usize = 64;
 /// 世代只用低 48 位；0 保留（空/从未分配过）。
 pub const GEN_MAX: u64 = (1u64 << 48) - 1;
 const SLOT_BITS: u64 = 16;

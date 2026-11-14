@@ -1,6 +1,6 @@
 # unsafe 逐处审计表（U1–U6）
 
-总计 409 处。U1 75 · U2 108 · U3 13 · U4 131 · U5 46 · U6 36
+总计 414 处。U1 75 · U2 113 · U3 13 · U4 131 · U5 46 · U6 36
 
 本表由 `tools/aurora.py` 的 `unsafe_sites()` 从源码逐处生成，**不是手写的**。
 机器可读的权威来源是 `docs/security/unsafe-whitelist.toml` 的 `[modules.*]` 段（模块×类别→处数），
@@ -267,6 +267,8 @@
   > unsafe { core::ptr::write_volatile((self.base() + off as u64) as *mut u8, v) }; Ok(()) } 
 - `kernel/src/hw.rs:88` [{] **U2** fn=`—`
   > unsafe { core::ptr::write_volatile((self.base() + off as u64) as *mut u32, v) }; Ok(()) } 
+- `kernel/src/hw.rs:103` [{] **U2** fn=`write_slice`
+  > unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), (self.base()+off) as *mut u32, src.len()) } # S9k 双缓冲整行上屏
 - `kernel/src/hw.rs:99` [{] **U1** fn=`outl`
   > unsafe { core::arch::asm!("out dx, eax", in("dx") port, in("eax") v, options(nomem, nostack, preserves_flags)) } 
 - `kernel/src/hw.rs:107` [{] **U1** fn=`inl`
@@ -948,3 +950,13 @@
   > unsafe { core::ptr::copy(src.as_ptr().add(done), (pa + hhdm) as *mut u8, k) }; done += k; }
 - `kernel/src/vmo.rs:270` [{] **U2** fn=`vmo_read`
   > unsafe { core::ptr::copy((pa + hhdm) as *const u8, dst.as_mut_ptr().add(done), k) }; done += k; }
+
+### frame
+- `kernel/src/frame.rs:186` [{] **U2** fn=`put`
+  > unsafe { BACK[self.back_idx(x,y)] = self.pack(rgb) } # S9k 离屏 back buffer
+- `kernel/src/frame.rs:201` [{] **U2** fn=`put_raw`
+  > unsafe { BACK[self.back_idx(x,y)] = packed }
+- `kernel/src/frame.rs:216` [{] **U2** fn=`get`
+  > return Ok(unsafe { BACK[self.back_idx(x,y)] })
+- `kernel/src/frame.rs:119` [{] **U2** fn=`present`
+  > let row = unsafe { &BACK[y*w..(y+1)*w] } # 交 write_slice 一次上屏

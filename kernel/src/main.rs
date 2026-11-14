@@ -1053,77 +1053,109 @@ fn run_ktests_and_finish() -> ! {
 fn park_until_init_exits(init: Option<usize>) {
     #[cfg(feature = "resident-init")]
     {
-        let mut gidx = match init { Some(g) => g, None => return };
-        crate::log_info!("resident-init: 判定已出，等 init（任务={}）收工；没人喂命令就不会退出", gidx);
+        let Some(first) = init else { return };
+        let mut gidx: Option<usize> = Some(first);
+        crate::log_info!(
+            "resident-init: 判定已出，等 init（任务={}）收工；没人喂命令就不会退出",
+            first
+        );
         // S6g：判定之后的常驻期画面**继续刷新**（terminal 的意义就在这里）。
-        // 这里单独开一次映射：stage_init_user 里那一个已经随函数返回 drop 掉了。
         #[cfg(feature = "fbcon-live")]
         let mut live = LiveTerm::open();
         loop {
-            // S6u：**一拍 1 窗口（约 16 ms）**，内容签名每 8 拍才算一次。
-            // 拆之前这里是"每轮 8 窗口（约 140 ms）"，而指针只在 repaint 里画 ⇒
-            // 画面上的指针最高约 7 fps——用户量到的"鼠标卡顿"就是这个数，与 QEMU/GTK 无关
-            // （A/B：`-display none` 与 `-display gtk` 的每帧毫秒同一量级，140.1 / 198.3）。
-            let woke = apic::with_interrupts(|| sched::wait_for_task(gidx, crate::clock::window_cycles(1)));
+            // S6u：一拍 1 窗口（约 16 ms）；内容签名每 8 拍算一次。
+            let mut woke = false;
+            match gidx {
+                Some(g) => {
+                    woke = apic::with_interrupts(|| {
+                        sched::wait_for_task(g, crate::clock::window_cycles(1))
+                    });
+                }
+                None => {
+                    // **一个会话都没有**（用户把标签全关了）：不退出，空转等 `+`/新建。
+                    // 忙等一个窗口而不是 hlt：这里没有可等的任务，睡眠要动 sched 语义。
+                    // **必须开中断自旋**：关着中断自旋时 IRQ1/IRQ12 进不来，
+                    // 键鼠全死、画面停帧（用户实测：关完所有会话后界面卡住）。
+                    apic::with_interrupts(|| {
+                        let t0 = crate::tsc::now();
+                        let span = crate::clock::window_cycles(1);
+                        while crate::tsc::now().wrapping_sub(t0) < span {
+                            core::hint::spin_loop();
+                        }
+                    });
+                }
+            }
             if woke {
-                // ADR-098 诊断：`Done` 的来路要看得出是"自愿 exit"还是"故障收工"。
-                // 退出码从**进程记录**里读（此刻任务槽已 Done、进程还没 reap ⇒ 读得到）；
-                // 故障向量只出现在故障路径上，而本次日志里没有 fatal/exception ⇒ 先读退出码即可分。
-                let pid_now = crate::sched::task_proc_id(gidx);
+                let g = gidx.unwrap_or(0);
+                let pid_now = crate::sched::task_proc_id(g);
                 let code_now = pid_now.map(crate::proc::proc_exit_code);
                 crate::log_info!(
                     "resident-init: 0 号任务收工 任务={} 进程={:?} 退出码={:?}",
-                    gidx, pid_now, code_now
+                    g,
+                    pid_now,
+                    code_now
                 );
-                // ADR-097：`Done` 有**两种来路**——会话自己打 `exit`（自愿 ⇒ 收工），
-                // 或者被 `×` 关掉（只关那一页 ⇒ 重开一个新 shell 继续等）。
-                // 区分它们不新增 syscall、不动 sched 的等待语义（硬约束①）：
-                // 关闭路径会把 `closed[0]` 置上，这里只读那一格。
+                // **用户裁决（2026-11-15）**：`×` = 杀死进程，不自动重开；空出来的会话格
+                // 由 `+` / 面板里的"新建 shell" 再起一个**全新**的 shell（新进程、新 Job、
+                // 新正文）。只有会话**自己 exit**（自愿）才按 ADR-097 收工停机。
+                let mut user_closed = false;
                 #[cfg(feature = "fbcon-live")]
                 {
-                    // **消费一次请求**：两份 LiveTerm 谁处理点击都算数。
-                    let by_user = CLOSE_REQ[0].swap(false, Ordering::AcqRel);
-                    if by_user {
-                        crate::log_info!("会话 0 已终止 ⇒ 重开新 shell");
-                        // 旧正文要清零：不清的话新横幅接在上一会话的输出后面，
-                        // 「新开的会话是空的」这条就没有证人（首行判据也会被旧内容顶掉）。
-                        crate::serial::mirror_reset_sid(0);
-                        match stage_init_user(0) {
-                            Some(n) => {
-                                gidx = n;
-                                INIT_TASK.store(n, Ordering::Relaxed);
-                                crate::user::set_active_session(0);
-                                continue;
-                            }
-                            // 重开失败就如实报数并按**旧语义**收工——空转一扇没有会话的终端
-                            // 比停机更难诊断。哪一道墙挡着由上面那几条读数点名。
-                            None => {
-                                crate::log_warn!("会话 0 重开失败 ⇒ 按旧语义收工（资源墙见关闭那几行）");
-                                return;
-                            }
-                        }
+                    if CLOSE_REQ[0].swap(false, Ordering::AcqRel) {
+                        crate::log_info!("会话 0 已关闭（用户）⇒ 不重开；空转等待新建");
+                        gidx = None;
+                        user_closed = true;
                     }
                 }
-                // ADR-098 诊断：**日志行锁的账**。`timeouts` = 抢不到行锁、这一行被丢的次数；
-                // 它从来没人打印过，而 §278 里"哪一行没出现"的推断正需要它。
-                let ls = crate::serial::line_stats();
-                crate::log_info!(
-                    "resident-init: 行锁账 持有={} 竞争={} 重入={} 超时={}",
-                    ls.holds, ls.contended, ls.nested, ls.timeouts
-                );
-                crate::log_info!("resident-init: init 已收工 ⇒ 系统停机");
-                return;
+                if !user_closed {
+                    let ls = crate::serial::line_stats();
+                    crate::log_info!(
+                        "resident-init: 行锁账 持有={} 竞争={} 重入={} 超时={}",
+                        ls.holds,
+                        ls.contended,
+                        ls.nested,
+                        ls.timeouts
+                    );
+                    crate::log_info!("resident-init: init 已收工 ⇒ 系统停机");
+                    return;
+                }
+            }
+            // **新建请求**（`+` / "新建 shell"）：真正的 spawn 只在这里做。
+            #[cfg(feature = "fbcon-live")]
+            {
+                let req = SPAWN_REQ.swap(0xFF, Ordering::AcqRel);
+                if req != 0xFF {
+                    let slot = req as usize;
+                    crate::serial::mirror_reset_sid(slot);
+                    CLOSE_REQ[slot].store(false, Ordering::Release);
+                    if slot == 0 {
+                        INIT_TASK.store(0, Ordering::Relaxed);
+                    } else {
+                        SECOND_TASK.store(0, Ordering::Relaxed);
+                    }
+                    match stage_init_user(slot as u8) {
+                        Some(n) => {
+                            if slot == 0 {
+                                INIT_TASK.store(n, Ordering::Relaxed);
+                                gidx = Some(n);
+                            } else {
+                                SECOND_TASK.store(n, Ordering::Relaxed);
+                            }
+                            crate::user::set_active_session(slot as u8);
+                            crate::log_info!("新建: 会话 {} 起来了 任务={}", slot, n);
+                        }
+                        None => crate::log_warn!("新建: 会话 {} 失败（资源墙）句柄表={}/16", slot, crate::handle::used()),
+                    }
+                }
             }
             #[cfg(feature = "fbcon-live")]
             if let Some(t) = live.as_mut() {
-                // 拍数从墙上读，而不是自己数循环：提前返回的那些拍没有画面动作。
                 if crate::main_frames() % 8 == 7 {
-                    t.repaint();      // 结尾自带一次 tick()
+                    t.repaint();
                 } else {
                     t.tick();
                 }
             }
-            // 点击与统计统一在 `LiveTerm::repaint` 里处理（两个等待循环都会路过它）。
         }
     }
     #[cfg(not(feature = "resident-init"))]
@@ -1131,7 +1163,6 @@ fn park_until_init_exits(init: Option<usize>) {
         let _ = init;
     }
 }
-
 
 /// S4a（W5 第一片）：产品启动路径装载并跑起第一个用户程序。
 ///
@@ -1189,16 +1220,21 @@ fn stage_init_user(sid: u8) -> Option<usize> {
     // ADR-098 诊断：**失败不许静默**。每个 `return None` 换成一个带站点的宏；
     // 站点号 = 打补丁时该行的行号（日志里能直接回指源码）。只在失败时打一行。
     macro_rules! bail {
-        ($site:literal) => {{
-            crate::log_warn!("init-user: 站点 {} 返回 None（ADR-098 诊断）", $site);
+        ($site:literal, $led:expr, $led_n:expr, $owner:expr) => {{
+            crate::log_warn!("init-user: 站点 {} 返回 None（ADR-098 诊断）句柄表={}", $site, crate::handle::used());
+            for k in 0..$led_n { let _ = handle::close(Handle($led[k]), $owner); }
+            crate::log_warn!("init-user: 站点 {} 清理后句柄表={}", $site, crate::handle::used());
             return None;
         }};
     }
 
     let Some(owner) = sched::current_identity() else {
         crate::log_warn!("init-user: 启动上下文没有身份 ⇒ 产品路径没起用户程序");
-        bail!(1187);
+        crate::log_warn!("init-user: 站点 1187 返回 None（无身份，无已授句柄）");
+        return None;
     };
+    let mut led = [0u64; 8];
+    let mut led_n = 0usize;
     let mut f = TrapFrame {
         cr2: 0, r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
         rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0, vector: 0,
@@ -1206,14 +1242,14 @@ fn stage_init_user(sid: u8) -> Option<usize> {
     };
     // 根 Job 由内核持有，只在这里出示。两个句柄：一个**没有 CREATE**（判据用），一个有。
     let job = match proc::job_create(None, 2, 64) { Ok(v) => v, Err(e) => {
-        crate::log_warn!("init-user: job_create 失败 {:?}", e); bail!(1196);
+        crate::log_warn!("init-user: job_create 失败 {:?}", e); bail!(1196, led, led_n, owner);
     } };
     let jgen = proc::job_gen(job).unwrap_or(0);
     let hj_plain = match handle::grant_job(owner, job, jgen, RIGHT_READ | RIGHT_DUP) {
-        Ok(h) => h, Err(_) => { crate::log_warn!("init-user: grant_job(plain) 失败"); bail!(1200); }
+        Ok(h) => h, Err(_) => { crate::log_warn!("init-user: grant_job(plain) 失败"); bail!(1200, led, led_n, owner); }
     };
     let hj = match handle::grant_job(owner, job, jgen, RIGHT_READ | RIGHT_DUP | RIGHT_CREATE | RIGHT_TRANSFER) {
-        Ok(h) => h, Err(_) => { crate::log_warn!("init-user: grant_job(create) 失败"); bail!(1203); }
+        Ok(h) => h, Err(_) => { crate::log_warn!("init-user: grant_job(create) 失败"); bail!(1203, led, led_n, owner); }
     };
     // **判据①：无 CREATE 权限的 Job 句柄必须拒 E_DENIED**（权限只从句柄来）。
     f.rax = SYS_PROCESS_CREATE; f.rdi = hj_plain.0; f.rsi = 0; f.rdx = 0; f.r10 = 0;
@@ -1223,15 +1259,17 @@ fn stage_init_user(sid: u8) -> Option<usize> {
     // 不还的话每个会话都白占一格，而句柄表是全局 16 格（ADR-007）——
     // 第二个会话在 15 号上就是被这 16 格卡死的（`ret=-6`，而槽、袋、si 都还有空）。
     let _ = handle::close(hj_plain, owner);
+    led[led_n] = hj.0; led_n += 1;
     f.rax = SYS_PROCESS_CREATE; f.rdi = hj.0;
     syscall_dispatch(&mut f);
     let hp = Handle(f.rax);
     let (pid, pgen) = match handle::resolve(hp, owner, 0) {
         Ok((handle::ObjRef::Proc { slot, gen }, _)) => (slot, gen),
-        _ => { crate::log_warn!("init-user: Proc 句柄解不开 ret={:#x}", f.rax); bail!(1218); }
+        _ => { crate::log_warn!("init-user: Proc 句柄解不开 ret={:#x}", f.rax); bail!(1218, led, led_n, owner); }
     };
+    led[led_n] = hp.0; led_n += 1;
     let Some((aslot, _)) = proc::proc_aspace(pid, pgen) else {
-        crate::log_warn!("init-user: 进程没有 AS"); bail!(1221);
+        crate::log_warn!("init-user: 进程没有 AS"); bail!(1221, led, led_n, owner);
     };
     // S4b-1 的装载器：真 ELF 进**子 AS**，映射经 aspace_map_slot（那棵树）。
     // S5c：装的是 shell 而不是 hello——控制台句柄已经在下面按 ROLE_LOG 授予，
@@ -1245,7 +1283,7 @@ fn stage_init_user(sid: u8) -> Option<usize> {
         crate::user::end_session_load();
         match r {
             Ok(l) => l,
-            Err(e) => { crate::log_warn!("init-user: load_into 失败 {}", crate::user::describe_load(e)); bail!(1235); }
+            Err(e) => { crate::log_warn!("init-user: load_into 失败 {}", crate::user::describe_load(e)); bail!(1235, led, led_n, owner); }
         }
     };
     // 装载器把映射柄**交回调用方**而不是自动入袋（用例要能自己丢弃并核账）。不归创建者，
@@ -1253,26 +1291,28 @@ fn stage_init_user(sid: u8) -> Option<usize> {
     // `adopt_asmaps` 才搬得动：它只搬"创建者袋里目标 AS = 子 AS"的那些项。
     let owned_n = match loaded.owned.into_current() {
         Ok(n) => n,
-        Err(e) => { crate::log_warn!("init-user: 映射归创建者失败 {:?}", e); bail!(1243); }
+        Err(e) => { crate::log_warn!("init-user: 映射归创建者失败 {:?}", e); bail!(1243, led, led_n, owner); }
     };
     let Some(madt) = acpi::summary().and_then(|s| s.madt) else {
-        crate::log_warn!("init-user: 没有 MADT，控制台未授予"); bail!(1246);
+        crate::log_warn!("init-user: 没有 MADT，控制台未授予"); bail!(1246, led, led_n, owner);
     };
     if let Err(e) = serial::enable_rx(&madt) {
-        crate::log_warn!("init-user: 控制台接收初始化失败 {:?}", e); bail!(1249);
+        crate::log_warn!("init-user: 控制台接收初始化失败 {:?}", e); bail!(1249, led, led_n, owner);
     }
     let console = match handle::grant_console(owner, RIGHT_READ | RIGHT_WRITE | RIGHT_DUP | RIGHT_TRANSFER, sid) {
-        Ok(h) => h, Err(e) => { crate::log_warn!("init-user: 控制台授予失败 {:?}", e); bail!(1252); }
+        Ok(h) => h, Err(e) => { crate::log_warn!("init-user: 控制台授予失败 {:?}", e); bail!(1252, led, led_n, owner); }
     };
+    led[led_n] = console.0; led_n += 1;
     // S6p：控制台反例句柄是**启动路径仪器的**，只发给 init 会话：它只被写进 si 交给
     // 子进程（今天的 shell 不读那一格），而每发一份都占全局 16 格句柄表的一格。
     let foreign = if cfg!(feature = "console-probe") && sid == 0 {
         // ADR-098 补记三：补 `RIGHT_TRANSFER`，否则写进描述表也转不走（每轮漏一格）。
         match handle::grant_console(owner, RIGHT_READ | RIGHT_WRITE | RIGHT_TRANSFER, sid) {
-            Ok(h) => h.0, Err(e) => { crate::log_warn!("init-user: 控制台反例句柄失败 {:?}", e); bail!(1259); }
+            Ok(h) => h.0, Err(e) => { crate::log_warn!("init-user: 控制台反例句柄失败 {:?}", e); bail!(1259, led, led_n, owner); }
         }
     } else { 0 };
-    let si = match vmo::vmo_create(1) { Ok(v) => v, Err(_) => { crate::log_warn!("init-user: si vmo 失败"); bail!(1262); } };
+    if foreign != 0 { led[led_n] = foreign; led_n += 1; }
+    let si = match vmo::vmo_create(1) { Ok(v) => v, Err(_) => { crate::log_warn!("init-user: si vmo 失败"); bail!(1262, led, led_n, owner); } };
     let mut hdr = [0u8; SI_OFF_HANDLES];
     hdr[0..4].copy_from_slice(&SI_MAGIC.to_le_bytes());
     hdr[4..6].copy_from_slice(&(ABI_MAJOR as u16).to_le_bytes());
@@ -1284,23 +1324,24 @@ fn stage_init_user(sid: u8) -> Option<usize> {
         hdr[12..16].copy_from_slice(&512u32.to_le_bytes());
         hdr[16..20].copy_from_slice(&8u32.to_le_bytes());
     }
-    if vmo::vmo_write(si, 0, &hdr) != Ok(hdr.len()) { crate::log_warn!("init-user: si 头写失败"); bail!(1274); }
+    if vmo::vmo_write(si, 0, &hdr) != Ok(hdr.len()) { crate::log_warn!("init-user: si 头写失败"); bail!(1274, led, led_n, owner); }
     let mut d = [0u8; SI_DESC_BYTES];
     d[SI_DESC_ROLE..SI_DESC_ROLE + 4].copy_from_slice(&ROLE_JOB.to_le_bytes());
     d[SI_DESC_HANDLE..SI_DESC_HANDLE + 8].copy_from_slice(&hj.0.to_le_bytes());
-    if vmo::vmo_write(si, SI_OFF_HANDLES, &d) != Ok(SI_DESC_BYTES) { crate::log_warn!("init-user: si 描述写失败"); bail!(1278); }
+    if vmo::vmo_write(si, SI_OFF_HANDLES, &d) != Ok(SI_DESC_BYTES) { crate::log_warn!("init-user: si 描述写失败"); bail!(1278, led, led_n, owner); }
     d[SI_DESC_ROLE..SI_DESC_ROLE + 4].copy_from_slice(&ROLE_LOG.to_le_bytes());
     d[SI_DESC_HANDLE..SI_DESC_HANDLE + 8].copy_from_slice(&console.0.to_le_bytes());
     if vmo::vmo_write(si, SI_OFF_HANDLES + SI_DESC_BYTES, &d) != Ok(SI_DESC_BYTES) {
-        crate::log_warn!("init-user: 控制台描述写失败"); bail!(1282);
+        crate::log_warn!("init-user: 控制台描述写失败"); bail!(1282, led, led_n, owner);
     }
     if cfg!(feature = "console-probe") && vmo::vmo_write(si, 512, &foreign.to_le_bytes()) != Ok(8) {
-        crate::log_warn!("init-user: 控制台探针参数写失败"); bail!(1285);
+        crate::log_warn!("init-user: 控制台探针参数写失败"); bail!(1285, led, led_n, owner);
     }
     // ADR-098 补记三（裁决：si 页归子任务）：补 `RIGHT_TRANSFER`，才能写进描述表转走。
     let hi = match handle::grant_vmo(owner, si, RIGHT_READ | RIGHT_WRITE | RIGHT_MAP | RIGHT_TRANSFER) {
-        Ok(h) => h, Err(_) => { crate::log_warn!("init-user: grant_vmo(si) 失败"); bail!(1289); }
+        Ok(h) => h, Err(_) => { crate::log_warn!("init-user: grant_vmo(si) 失败"); bail!(1289, led, led_n, owner); }
     };
+    led[led_n] = hi.0; led_n += 1;
     // ADR-098 补记三：把 si 页与探针反例句柄写进描述表 ⇒ 16 号把它们**转移**给子任务，
     // 于是 `revoke_task(child)` 会连带 `vmo_unref`，创建者身上不再每轮留两格。
     {
@@ -1308,13 +1349,13 @@ fn stage_init_user(sid: u8) -> Option<usize> {
         d[SI_DESC_ROLE..SI_DESC_ROLE + 4].copy_from_slice(&ROLE_SI.to_le_bytes());
         d[SI_DESC_HANDLE..SI_DESC_HANDLE + 8].copy_from_slice(&hi.0.to_le_bytes());
         if vmo::vmo_write(si, SI_OFF_HANDLES + 2 * SI_DESC_BYTES, &d) != Ok(SI_DESC_BYTES) {
-            crate::log_warn!("init-user: si 描述写失败（ROLE_SI）"); bail!(1298);
+            crate::log_warn!("init-user: si 描述写失败（ROLE_SI）"); bail!(1298, led, led_n, owner);
         }
         if foreign != 0 {
             d[SI_DESC_ROLE..SI_DESC_ROLE + 4].copy_from_slice(&ROLE_CONSOLE_ECHO.to_le_bytes());
             d[SI_DESC_HANDLE..SI_DESC_HANDLE + 8].copy_from_slice(&foreign.to_le_bytes());
             if vmo::vmo_write(si, SI_OFF_HANDLES + 3 * SI_DESC_BYTES, &d) != Ok(SI_DESC_BYTES) {
-                crate::log_warn!("init-user: si 描述写失败（ROLE_CONSOLE_ECHO）"); bail!(1304);
+                crate::log_warn!("init-user: si 描述写失败（ROLE_CONSOLE_ECHO）"); bail!(1304, led, led_n, owner);
             }
         }
     }
@@ -1368,8 +1409,9 @@ fn stage_init_user(sid: u8) -> Option<usize> {
     let ht = Handle(f.rax);
     let (gidx, _tid) = match handle::resolve(ht, owner, 0) {
         Ok((handle::ObjRef::Thread { gidx, id }, _)) => (gidx, id),
-        _ => { crate::log_warn!("init-user: Thread 句柄解不开 ret={:#x}", f.rax); bail!(1358); }
+        _ => { crate::log_warn!("init-user: Thread 句柄解不开 ret={:#x}", f.rax); bail!(1358, led, led_n, owner); }
     };
+    led[led_n] = ht.0; led_n += 1;
     let stopped = matches!(sched::state_of(gidx), sched::TaskState::Blocked(_));
     // 16：回填 StartupInfo 并放行。
     // ADR-098 诊断：16 号前后的句柄表占格数。`-6` 在这条路上有多个来源
@@ -1384,6 +1426,17 @@ fn stage_init_user(sid: u8) -> Option<usize> {
         "init-user(S4b-3): 会话={} 16号句柄占格={}→{}（上限 {}）start_ret={}",
         sid, hb_before, hb_after, crate::handle::MAX_HANDLES, started
     );
+    // S9d：16 号把 hj/console/hi/foreign 转移给子、asmap 搬进子之后，创建者袋里
+    // 只剩 hp(Proc)/ht(Thread) 两格纯引用。它们后面不再被用（关闭链走 pid/gidx），
+    // 不还就每次 spawn 漏 2 格、约 8 次撞满 16 格墙 ⇒ `+` 失效。成功后当场还。
+    if started == 0 {
+        let _ = handle::close(hp, owner);
+        let _ = handle::close(ht, owner);
+        crate::log_info!(
+            "新建: 会话 {} 起好 创建者还 hp/ht 句柄表={}/{}",
+            sid, handle::used(), handle::MAX_HANDLES
+        );
+    }
     // 诊断（S5c）：子进程在入口就 #PF（rip=entry cr2=0 err=4），而三格生效位都对。
     // 只打**原值**：叶子表项（地址位+标志位）与首帧地址，不 deref 任何东西。
     // 上一版顺着叶子走 HHDM 读代码头，实测把内核打挂（cr2=HHDM+0x85000000，而 RAM 只有 512 MiB）
@@ -1394,7 +1447,17 @@ fn stage_init_user(sid: u8) -> Option<usize> {
         leaf(loaded.entry), leaf(loaded.stack_top & !0xfff), leaf(si_va), sched::task_frame(gidx)
     );
     apic::timer_start().ok();
-    let windows = if cfg!(feature = "console-probe") { 1000 } else { 32 };
+    // S9h：活终端档 spawn 只做"放行后短等"，不长等。shell 是常驻 init（不会收工），
+    // console-probe 的 1000 窗口（≈16s）会把 park 循环堵死 ⇒ 关/加点击都排队等它，
+    // 用户实测"点了很久才反应"。活终端档 4 窗口（≈64ms）足够放行+上屏，随后立即回到
+    // park 主循环处理点击。非活终端档保持原口径（probe 1000 / 默认 32）。
+    let windows = if cfg!(feature = "fbcon-live") {
+        4
+    } else if cfg!(feature = "console-probe") {
+        1000
+    } else {
+        32
+    };
     #[cfg(not(feature = "fbcon-live"))]
     let done = apic::with_interrupts(|| sched::wait_for_task(gidx, crate::clock::window_cycles(windows)));
     // S6d：要实时上屏就得**边等边画**，所以这一档把那发长等待拆成有界轮询（总上界不变）。
@@ -1430,6 +1493,15 @@ fn stage_init_user(sid: u8) -> Option<usize> {
     // 而 si 页正映在子进程 AS 里——关它会把子进程的角色表页变成别人的帧（未证，故不动）。
     let _ = handle::close(hp, owner);
     let _ = handle::close(ht, owner);
+    // S9e：没放行（start_ret!=0）的停住任务不能当活会话存起来，否则僵尸槽 + 反复无效新建。
+    if started != 0 {
+        for k in 0..led_n { let _ = handle::close(Handle(led[k]), owner); }
+        let _ = sched::terminate_task(gidx);
+        let _ = proc::proc_reap(pid);
+        let _ = proc::job_destroy(job);
+        crate::log_warn!("新建: 会话 {} 未放行 start_ret={} 已清理 句柄表={}", sid, started, crate::handle::used());
+        return None;
+    }
 
     // S5d：交回 init 的任务号，让 main 在**判定打完之后**等它收工（BACKLOG §237）。
     Some(gidx)
@@ -1446,10 +1518,40 @@ static SECOND_TASK: core::sync::atomic::AtomicUsize = core::sync::atomic::Atomic
 /// 和 `SECOND_TASK` 一样**不挂 cfg**：关闭分支在没有多会话的档里也要编得过。
 static INIT_TASK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+/// **新建会话请求**（进程级）：`0xFF` = 无；否则是目标会话格。
+/// UI（`+`、下拉里的"新建 shell"）只发请求，真正的 `stage_init_user` 只在 park 里做——
+/// 这样"谁创建进程"只有一处（ADR-099 的同一形状：把决定提升成进程级事实）。
+#[cfg(feature = "fbcon-live")]
+
+static SPAWN_REQ: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0xFF);
+
+/// 发一次"新建"请求：挑一个空闲会话格。两个格都占着 ⇒ 如实报墙，返回 false。
+#[cfg(feature = "fbcon-live")]
+
+fn request_spawn() -> bool {
+    // S9f：连点防抖。已有一个待处理请求时不再排队——否则快速连点会把同一个会话格
+    // 重复 spawn（后一次覆盖前一次的 INIT_TASK，漏掉前一个任务的句柄），实测句柄表因此爬满。
+    if SPAWN_REQ.load(Ordering::Acquire) != 0xFF {
+        crate::log_info!("新建: 已有待处理请求，忽略连点");
+        return false;
+    }
+    let slot = (0..crate::serial::SESSIONS).find(|i| !session_open(*i));
+    match slot {
+        Some(i) => {
+            SPAWN_REQ.store(i as u8, Ordering::Release);
+            crate::log_info!("新建: 请求会话格 {} 句柄表={}/{}", i, crate::handle::used(), crate::handle::MAX_HANDLES);
+            true
+        }
+        None => {
+            crate::log_warn!("新建: 会话格 2 个都占着 ⇒ 撞容量墙，不假装成功");
+            false
+        }
+    }
+}
+
 /// #58：`∨` 下拉的行。**会话在上、动作在下**（用户裁决 2026-11-14）。
 /// 置灰行表示"今天没有动作"——点了要在串口如实报，不假装成功。
 #[cfg(feature = "framebuffer")]
-
 
 /// **会话是否还活着**：以任务表为唯一事实来源（ADR-098 的延伸）。
 /// 为什么不再信 `LiveTerm::closed`：`live_wait_and_redraw` 与 park 各开一份实例，
@@ -1561,13 +1663,17 @@ struct LiveTerm {
 #[cfg(feature = "fbcon-live")]
 impl LiveTerm {
     fn open() -> Option<Self> {
-        let frame = match crate::frame::Frame::init() {
+        let mut frame = match crate::frame::Frame::init() {
             Ok(f) => f,
             Err(e) => {
                 crate::log_warn!("fbcon-live: 拿不到帧缓冲（{:?}）⇒ 画面不会有内容", e);
                 return None;
             }
         };
+        // S9k：活终端开双缓冲——整帧先画进离屏 buffer，tick 末尾一次 present 上屏，
+        // 单缓冲"边画边扫描"的闪烁（加标签/重画整条）由此根治。几何超容量时自动退回直写。
+        let db = frame.enable_double_buffer();
+        crate::log_info!("fbcon-live: 双缓冲={}", db);
         let Some(term) = crate::fbcon::Term::new(&frame) else {
             crate::log_warn!("fbcon-live: 几何放不下终端栅格 ⇒ 画面不会有内容");
             return None;
@@ -1650,26 +1756,8 @@ impl LiveTerm {
                 crate::log_info!("菜单: 本档没有浮窗版面");
             }
             0x11 => {
-                // **新建**：挑一个空闲会话格起一个新 shell；两格都占着就如实报墙。
-                let slot = (0..crate::serial::SESSIONS).find(|i| !session_open(*i));
-                match slot {
-                    Some(i) => {
-                        crate::serial::mirror_reset_sid(i);
-                        match stage_init_user(i as u8) {
-                            Some(t) => {
-                                if i == 0 {
-                                    INIT_TASK.store(t, Ordering::Relaxed);
-                                } else {
-                                    SECOND_TASK.store(t, Ordering::Relaxed);
-                                }
-                                crate::user::set_active_session(i as u8);
-                                crate::log_info!("菜单: 新建会话 {} 任务={} ⇒ 关", i, t);
-                            }
-                            None => crate::log_warn!("菜单: 新建会话 {} 失败（资源墙）", i),
-                        }
-                    }
-                    None => crate::log_warn!("菜单: 新建 shell 撞容量墙（会话格 2 个都占着）"),
-                }
+                // **新建**：只发请求，真正的 spawn 在 park 里（单一所有者）。
+                request_spawn();
             }
             _ => {}
         }
@@ -1712,6 +1800,8 @@ impl LiveTerm {
         let (_, tabs, active, _) = self.layout();
         let open = (0..crate::serial::SESSIONS).filter(|i| !self.closed[*i]).count() as u64;
         self.term.bar_hover(&self.frame, open, active, old, new, self.unread_mask(active));
+        // 条刚被重画 ⇒ 指针保存的旧底作废，否则下一次移动把旧像素贴回 `+`/`∨` 上。
+        self.ptr = None;
     }
 
     /// 只重画标签条那一行。**指针先擦掉**：它盖住的那几十个像素马上就会被重画，
@@ -1721,6 +1811,7 @@ impl LiveTerm {
         self.ptr_erase();
         let open = (0..crate::serial::SESSIONS).filter(|i| !self.closed[*i]).count() as u64;
         self.term.tab_bar(&self.frame, open, active, self.hover, self.unread_mask(active));
+        self.ptr = None;
         if self.menu {
             let (rows, _, nrows) = self.menu_state();
             self.term.menu_panel(&self.frame, open, &rows[..nrows], self.menu_hover);
@@ -1753,11 +1844,15 @@ impl LiveTerm {
         act[n] = 0x10;
         n += 1;
         // "新建 shell"：还有空会话格就可用；两格都占着就置灰并如实报容量墙。
-        let free = (0..crate::serial::SESSIONS).any(|i| !session_open(i));
+        let free_n = (0..crate::serial::SESSIONS).filter(|i| !session_open(*i)).count();
         rows[n] = MenuRow {
             label: "新建 shell",
-            hint: if free { "会话格 2" } else { "16 格句柄表" },
-            dim: !free,
+            hint: match free_n {
+                0 => "已满",
+                1 => "空 1 格",
+                _ => "空 2 格",
+            },
+            dim: free_n == 0,
         };
         act[n] = 0x11;
         n += 1;
@@ -2161,8 +2256,9 @@ impl LiveTerm {
                                 };
                                 let (ok, bad) = crate::user::session_release_va(i as u8);
                                 crate::log_info!(
-                                    "窗口: 关闭会话 {} 终止任务={} 任务={} 收尸={} Job销毁={} VA放手={}/{}",
-                                    i, killed, g, reaped, jd, ok, bad
+                                    "窗口: 关闭会话 {} 终止任务={} 任务={} 收尸={} Job销毁={} VA放手={}/{} 句柄表={}/{}",
+                                    i, killed, g, reaped, jd, ok, bad,
+                                    crate::handle::used(), crate::handle::MAX_HANDLES
                                 );
                                 // 条会被重画覆盖 ⇒ 指针旧底作废（否则移动时把旧 × 贴回来）。
                                 self.ptr = None;
@@ -2173,6 +2269,11 @@ impl LiveTerm {
                         }
                         // S6t：标签条上的 `∨` **有动作了**——切换版面（标签条 ⇄ 浮窗）。
                         // 非 `wm` 档没有浮窗可切，只如实报读数，不假装切了。
+                        crate::fbcon::Hit::NewTab => {
+                            // `+` = 新建一个**全新的** shell（发进程级请求，spawn 在 park 里做）。
+                            crate::log_info!("新建: 点了 +");
+                            request_spawn();
+                        }
                         crate::fbcon::Hit::Layout => {
                             // #58：`∨` 现在是**下拉**（参考图的语义）；浮窗版面搬进面板第 3 行。
                             // 开/关都只动面板那一块（不进签名 ⇒ 不整窗重画，否则会闪）。
@@ -2217,6 +2318,9 @@ impl LiveTerm {
                 );
             }
         }
+        // S9k：双缓冲一次上屏。本 tick 内所有绘制（条/正文/面板/指针）都先落在离屏
+        // buffer，这里整帧搬一次 ⇒ 显示器不会抓到"画了一半"的中间帧（闪烁根治）。
+        self.frame.present();
     }
 
     /// **标签条版面**的重画（S6t 起的默认版面，与参考截图同构）：

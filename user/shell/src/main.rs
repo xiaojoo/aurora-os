@@ -40,11 +40,11 @@ const MAX_STARTUP_HANDLES: usize = 16;
 /// （hello/probe 的模块头都记过这个坑，本轮实测又撞一次）。改成 RIP 相对 lea 取基址 + 常量偏移。
 /// S6u：横幅的前导 `\x0a` 去掉了——那是当年为了跟上面的内核日志隔开留的，
 /// ADR-096 之后画面正文只有会话输出，前面什么都没有，那一格就成了纯粹的空行。
-static MSGS: [u8; 172] = *b"commands: help | echo <text> | ping | abi | exit\x0aAurora shell (S5c). type 'help'.\x0aAURORA:/ > \x0aline too long, discarded\x0aunknown command:  (try help)\x0aping=abi_info=bye\x0a\x08 \x08^C\x0a";
+static MSGS: [u8; 215] = *b"commands: help | echo <text> | ping | abi | exit\x0aAurora shell (S5c). type 'help'.\x0aAURORA:/ > \x0aline too long, discarded\x0aunknown command:  (try help)\x0aping=abi_info=bye\x0a\x08 \x08^C\x0aAurora OS 6.1.0-aurora (tty1)\x0aaurora@os:~$ ";
 
 const M_HELP: (usize, usize) = (0, 49);
-const M_BANNER: (usize, usize) = (49, 33);
-const M_PROMPT: (usize, usize) = (82, 11);
+const M_BANNER: (usize, usize) = (172, 30);
+const M_PROMPT: (usize, usize) = (202, 13);
 const M_NL: (usize, usize) = (93, 1);
 const M_TOOLONG: (usize, usize) = (94, 25);
 const M_UNKNOWN: (usize, usize) = (119, 17);

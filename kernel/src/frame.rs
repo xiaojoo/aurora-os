@@ -52,7 +52,18 @@ pub struct Frame {
     /// Limine 给的 address 在**我们自己的页表**里映着吗。这一格是实测出来的
     /// （`mm::is_mapped` 走的是换过 CR3 之后的那棵树），不是从"那是它的映射"推出来的。
     limine_mapped_in_ours: bool,
+    /// S9k：双缓冲开关。false=直写硬件（启动/用例原口径）；true=画进 back buffer，
+    /// 由 `present()` 一次上屏。只有活终端开启，启动图案与像素对账用例不受影响。
+    db: bool,
+    dirty: core::cell::Cell<bool>,
 }
+
+/// S9k：离屏 back buffer（按 width*height 紧凑排，不含 pitch）。单核 UI 串行绘制，
+/// 绘制只发生在 park 主循环体（不在 IRQ 上下文），故无并发写；present 与绘制同循环串行。
+/// SAFETY: 以 `static mut` 存放是为了 4MB 级 BSS 且不进堆（堆上限 2048）；所有访问集中在
+/// 本文件 put/put_raw/get/present/enable，调用方保证同一时刻只有一个活终端在画。
+static mut BACK: [u32; BACK_MAX] = [0; BACK_MAX];
+const BACK_MAX: usize = 1280 * 800;
 
 impl Frame {
     /// 取启动信息、校验几何、映射窗口。任何一步不成立都**返回错误**，不"先画了再说"。
@@ -84,7 +95,36 @@ impl Frame {
         // **不 deref 那个地址去"试试看"**：§236 记过顺着叶子 deref 把内核打挂的现场
         // （run-943，cr2 落在 RAM 之外）。问页表要答案，不要问硬件。
         let limine_mapped_in_ours = crate::mm::is_mapped(info.limine_address);
-        Ok(Self { region, info, pa, len, limine_is_hhdm, limine_is_ours, limine_mapped_in_ours })
+        Ok(Self { region, info, pa, len, limine_is_hhdm, limine_is_ours, limine_mapped_in_ours, db: false, dirty: core::cell::Cell::new(false) })
+    }
+
+    /// S9k：开启双缓冲。几何超出 back buffer 容量时返回 false（退回直写，不硬画）。
+    pub fn enable_double_buffer(&mut self) -> bool {
+        let n = (self.info.width * self.info.height) as usize;
+        if n > BACK_MAX {
+            return false;
+        }
+        self.db = true;
+        self.dirty.set(true);
+        true
+    }
+
+    /// S9k：把 back buffer 一次上屏。只在有改动时搬，idle 不白搬 4MB。
+    pub fn present(&self) {
+        if !self.db || !self.dirty.get() {
+            return;
+        }
+        let w = self.info.width as usize;
+        for y in 0..self.info.height as usize {
+            let row = unsafe { &BACK[y * w..(y + 1) * w] };
+            let _ = self.region.write_slice(y * self.info.pitch as usize, row);
+        }
+        self.dirty.set(false);
+    }
+
+    #[inline]
+    fn back_idx(&self, x: u64, y: u64) -> usize {
+        (y * self.info.width + x) as usize
     }
 
     pub fn geom(&self) -> (u64, u64, u64) {
@@ -142,6 +182,11 @@ impl Frame {
             return Err(FrameError::OutOfBounds { x, y, width: self.info.width, height: self.info.height });
         }
         let off = (y * self.info.pitch + x * 4) as usize;
+        if self.db {
+            unsafe { BACK[self.back_idx(x, y)] = self.pack(rgb) };
+            self.dirty.set(true);
+            return Ok(());
+        }
         self.region.write32(off, self.pack(rgb)).map_err(FrameError::Map)
     }
 
@@ -151,6 +196,11 @@ impl Frame {
     pub fn put_raw(&self, x: u64, y: u64, packed: u32) -> Result<(), FrameError> {
         if x >= self.info.width || y >= self.info.height {
             return Err(FrameError::OutOfBounds { x, y, width: self.info.width, height: self.info.height });
+        }
+        if self.db {
+            unsafe { BACK[self.back_idx(x, y)] = packed };
+            self.dirty.set(true);
+            return Ok(());
         }
         self.region.write32((y * self.info.pitch + x * 4) as usize, packed).map_err(FrameError::Map)
     }
@@ -162,6 +212,9 @@ impl Frame {
             return Err(FrameError::OutOfBounds { x, y, width: self.info.width, height: self.info.height });
         }
         let off = (y * self.info.pitch + x * 4) as usize;
+        if self.db {
+            return Ok(unsafe { BACK[self.back_idx(x, y)] });
+        }
         self.region.read32(off).map_err(FrameError::Map)
     }
 

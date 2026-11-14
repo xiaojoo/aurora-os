@@ -3301,9 +3301,10 @@ pub fn hit_test(
             // （画与命中同一条规则——否则看不见的 × 也能点，正是要防的误关）。
             let rel = c - c0;
             let x_visible = i as u64 == active || hover == Some(i as u8);
-            // `×` 画在 `tab_end-19`（右边留 10px），落在最后**两格**里 ⇒ 命中也按两格算。
-            // 旧口径只认最后一格：画的地方点不动、点得动的地方没画（实测"× 关不掉"）。
-            return if rel + 2 >= lay.tab_w && x_visible {
+            // `×` 画在 `tab_end-19`、宽 9px，横跨最后**三格**的前两格（rel=tab_w-3..tab_w-2）。
+            // 命中必须与画同源：旧口径 rel+2 只认后两格，画出来的左半 ×（rel=tab_w-3）点不动，
+            // 用户要点好几下才碰巧点中右半（实测"关闭点多次才关闭"）。改 rel+3 覆盖整个画的 ×。
+            return if rel + 3 >= lay.tab_w && x_visible {
                 Hit::TabClose(i as u8)
             } else {
                 Hit::Tab(i as u8)
@@ -3718,86 +3719,88 @@ impl Term {
         let x0 = c0 * CELL_W;
         let tab_w = lay.tab_w;
         let wtab = tab_w * CELL_W;
-        let c0 = lay.tab_col(i);
-        let x0 = c0 * CELL_W;
-        let wtab = tab_w * CELL_W;
-        // 参考图里标签**不顶到条顶**：条 40px、标签 32px、上面留 8px。
-        // 我们是 32px 的条，所以留 4px，标签 28px。圆角只做**顶部**——底部要与正文
-        // 连成一片（参考图里活动页底边没有缝，四角全圆会画出一条条底色）。
-        const TAB_TOP: u64 = 8; // 参考图：条 40、标签 32，上留 8
-        let tab_h = BAR_H - TAB_TOP;
-        if i != active && hover == Some(i as u8) {
-            self.rounded_top_abs(f, x0, TAB_TOP, wtab, tab_h, TAB_HOVER_BG, TITLE_BG);
-        }
-        if i == active {
-            self.rounded_top_abs(f, x0, TAB_TOP, wtab, tab_h, BG, TITLE_BG);
-        }
-        // `>_` 图标（几何画，不依赖字体里有没有这两个字形）。**每个标签都画**——
-        // 只有活动页画的话，非活动页的文字会空出图标那两格、看着像缩进错位。
-        // 图标：参考图 16×16、距标签左缘 10px、垂直居中。
-        let icon = if i == active { TAB_ICON } else { TAB_ICON_DIM };
-        for k in 0..7u64 {
-            let _ = self.put_abs(f, x0 + 10 + k, 17 + k, icon);
-            let _ = self.put_abs(f, x0 + 10 + k, 29 - k, icon);
-        }
-        self.rect_abs(f, x0 + 18, 30, 8, 2, icon);
-        // 图标占前两格，标题从第三格起（图标与标题之间留一格，参考图也是这个呼吸感）
-        let mut c = c0 + 3;
-        // 0 号标签叫 "Aurora shell"，其余叫 "shell N"
-        let mut label = [0u8; 24];
-        let mut n = 0usize;
-        if i == 0 {
-            for ch in TAB_LABEL.chars() {
-                if n < label.len() {
-                    label[n] = ch as u8;
-                    n += 1;
-                }
-            }
-        } else {
-            for ch in "shell ".chars() {
-                if n < label.len() {
-                    label[n] = ch as u8;
-                    n += 1;
-                }
-            }
-            if n < label.len() && i < 10 {
-                label[n] = b'0' + i as u8;
-                n += 1;
-            }
-        }
-        // 标签文字用**界面字号**（半号 8×16），正文仍是 2×；参考图的标签文字就比正文小。
-        // 推进按像素（ASCII 8、宽字 16），否则半号字形配整格推进会变成"字距拉满"。
-        let ink = if i == active { TAB_INK } else { TAB_INK_DIM };
-        if let Ok(lab) = core::str::from_utf8(&label[..n]) {
-            // 底色跟着标签走（活动页是正文色，非活动/悬停是条底/悬停底）。
-            let bg = if i == active {
-                BG
-            } else if hover == Some(i as u8) {
-                TAB_HOVER_BG
-            } else {
-                TITLE_BG
-            };
-            let mut cx = x0 + 38; // 10 内边距 + 16 图标 + 12 间隙（参考图同款）
-            for ch in lab.chars() {
-                self.ch_ink_ui_abs(f, cx, 19, ch, ink, bg);
-                cx += if (ch as u32) < 0x80 { 8 } else { 16 };
-            }
-        }
-        let _ = c;
-        // #58：条目右上角**只有 `×`**，且只在"活动标签"或"指针停在它上面"时画；
-        // 非活动且没悬停时，若这个会话有新输出就画一个**未读圆点**（同样占那一格）。
-        let x_visible = i as u64 == active || hover == Some(i as u8);
-        // 关闭 `×` 的右边距与图标左边距一致（都是 10 px）⇒ `×` 右缘落在 tab_end-10。
-        let xr = (c0 + tab_w) * CELL_W - 19;
-        if x_visible {
-            // 参考图里 `×` 不是贴右边缘：右边还留 ~24px。
-            let ink = if i == active { TAB_INK } else { TAB_INK_DIM };
-            self.cross_abs(f, xr, 19, 9, ink);
-        } else if unread & (1u64 << i) != 0 {
-            // 圆点：6×6 切掉四角（位图里画不出真圆，切角是最接近的形状）。
-            self.rect_abs(f, xr + 2, 21, 4, 6, TAB_TEXT);
-            self.rect_abs(f, xr + 1, 22, 6, 4, TAB_TEXT);
-        }
+        // 参考图里标签**不顶到条顶**：条 40px、标签 32px、上面留 8px。
+        // 我们是 32px 的条，所以留 4px，标签 28px。圆角只做**顶部**——底部要与正文
+        // 连成一片（参考图里活动页底边没有缝，四角全圆会画出一条条底色）。
+        const TAB_TOP: u64 = 8; // 参考图：条 40、标签 32，上留 8
+        let tab_h = BAR_H - TAB_TOP;
+        // S9i：每个标签**自己刷自己的底**（活动=正文色 / 悬停=悬停色 / 其余=条底）。
+        // tab_bar 不再整条先刷底，标签状态变化（活动↔非活动）靠这里自刷覆盖，
+        // 单缓冲下就不会出现"整条空白"的中间帧（加标签闪烁的真因）。
+        let tbg = if i == active {
+            BG
+        } else if hover == Some(i as u8) {
+            TAB_HOVER_BG
+        } else {
+            TITLE_BG
+        };
+        self.rounded_top_abs(f, x0, TAB_TOP, wtab, tab_h, tbg, TITLE_BG);
+        // `>_` 图标（几何画，不依赖字体里有没有这两个字形）。**每个标签都画**——
+        // 只有活动页画的话，非活动页的文字会空出图标那两格、看着像缩进错位。
+        // 图标：参考图 16×16、距标签左缘 10px、垂直居中。
+        let icon = if i == active { TAB_ICON } else { TAB_ICON_DIM };
+        for k in 0..7u64 {
+            let _ = self.put_abs(f, x0 + 10 + k, 17 + k, icon);
+            let _ = self.put_abs(f, x0 + 10 + k, 29 - k, icon);
+        }
+        self.rect_abs(f, x0 + 18, 30, 8, 2, icon);
+        // 图标占前两格，标题从第三格起（图标与标题之间留一格，参考图也是这个呼吸感）
+        let mut c = c0 + 3;
+        // 0 号标签叫 "Aurora shell"，其余叫 "shell N"
+        let mut label = [0u8; 24];
+        let mut n = 0usize;
+        if i == 0 {
+            for ch in TAB_LABEL.chars() {
+                if n < label.len() {
+                    label[n] = ch as u8;
+                    n += 1;
+                }
+            }
+        } else {
+            for ch in "shell ".chars() {
+                if n < label.len() {
+                    label[n] = ch as u8;
+                    n += 1;
+                }
+            }
+            if n < label.len() && i < 10 {
+                label[n] = b'0' + i as u8;
+                n += 1;
+            }
+        }
+        // 标签文字用**界面字号**（半号 8×16），正文仍是 2×；参考图的标签文字就比正文小。
+        // 推进按像素（ASCII 8、宽字 16），否则半号字形配整格推进会变成"字距拉满"。
+        let ink = if i == active { TAB_INK } else { TAB_INK_DIM };
+        if let Ok(lab) = core::str::from_utf8(&label[..n]) {
+            // 底色跟着标签走（活动页是正文色，非活动/悬停是条底/悬停底）。
+            let bg = if i == active {
+                BG
+            } else if hover == Some(i as u8) {
+                TAB_HOVER_BG
+            } else {
+                TITLE_BG
+            };
+            let mut cx = x0 + 38; // 10 内边距 + 16 图标 + 12 间隙（参考图同款）
+            for ch in lab.chars() {
+                self.ch_ink_ui_abs(f, cx, 19, ch, ink, bg);
+                cx += if (ch as u32) < 0x80 { 8 } else { 16 };
+            }
+        }
+        let _ = c;
+        // #58：条目右上角**只有 `×`**，且只在"活动标签"或"指针停在它上面"时画；
+        // 非活动且没悬停时，若这个会话有新输出就画一个**未读圆点**（同样占那一格）。
+        let x_visible = i as u64 == active || hover == Some(i as u8);
+        // 关闭 `×` 的右边距与图标左边距一致（都是 10 px）⇒ `×` 右缘落在 tab_end-10。
+        let xr = (c0 + tab_w) * CELL_W - 19;
+        if x_visible {
+            // 参考图里 `×` 不是贴右边缘：右边还留 ~24px。
+            let ink = if i == active { TAB_INK } else { TAB_INK_DIM };
+            self.cross_abs(f, xr, 19, 9, ink);
+        } else if unread & (1u64 << i) != 0 {
+            // 圆点：6×6 切掉四角（位图里画不出真圆，切角是最接近的形状）。
+            self.rect_abs(f, xr + 2, 21, 4, 6, TAB_TEXT);
+            self.rect_abs(f, xr + 1, 22, 6, 4, TAB_TEXT);
+        }
 
     }
 
@@ -3823,46 +3826,61 @@ impl Term {
                 self.draw_tab_abs(f, &lay, n as u64, active, new, unread);
             }
         }
+        // 抹掉的那块矩形从 `plus_col` 那一列开始 ⇒ `+`/`∨` 跟着没了；hover 重画不经过
+        // 整条 `tab_bar`，所以在这里补回来（关掉最后一个标签后，条上至少还剩两枚可点的图标）。
+        self.plus_chevron(f, &lay, shown);
+    }
+
+    /// `+` 与它右边那个 `∨`。**单独成一个方法**：`tab_col(i)` 恰好等于 `plus_col(i)`，
+    /// 所以 `bar_hover` 抹掉一个标签的那块 240px **正好把这两枚图标一起抹掉**；而 hover
+    /// 重画不经过整条 `tab_bar` ⇒ 之前没人把它们画回来（实测：40px 的条上一个墨点都没有）。
+    fn plus_chevron(&self, f: &Frame, lay: &BarLayout, shown: u64) {
+        if lay.fit == 0 {
+            return;
+        }
+        let plus_c = lay.plus_col(shown);
+        if plus_c + 1 >= lay.strip_r {
+            return;
+        }
+        // 两枚图标相互间隔 10 px、垂直中心 24（与标签里 `×` 同一条线）。
+        let base = plus_c * CELL_W;
+        let px0 = base + 10;
+        self.rect_abs(f, px0 + 5, 18, 2, 12, TAB_TEXT);
+        self.rect_abs(f, px0, 23, 12, 2, TAB_TEXT);
+        self.rect_abs(f, base + 32, 16, 1, 16, MENU_EDGE);
+        let dx = base + 43;
+        for k in 0..6u64 {
+            self.rect_abs(f, dx + k, 21 + k, 2, 1, TAB_DIM);
+            self.rect_abs(f, dx + 11 - k, 21 + k, 2, 1, TAB_DIM);
+            self.rect_abs(f, dx + k, 22 + k, 2, 1, TAB_DIM);
+            self.rect_abs(f, dx + 11 - k, 22 + k, 2, 1, TAB_DIM);
+        }
     }
 
     pub fn tab_bar(&self, f: &Frame, n_tabs: u64, active: u64, hover: Option<u8>, unread: u64) {
         let w = self.cols * CELL_W;
-        // 1) 整条只有一种底色（S6q：去掉了原来那条 2px 分隔线——截图里没有，
-        //    而且活动标签本身就是"挖到正文色"，加一条线会把这块切成两半）。
-        self.rect_abs(f, 0, 0, w, BAR_H, TITLE_BG);
-
         // 2) 标签：几何来自 `BarLayout`（与命中测试同一份）
         let lay = BarLayout::of(self.cols);
         let (tab_w, strip_r, fit) = (lay.tab_w, lay.strip_r, lay.fit);
         let shown = n_tabs.min(fit);
+        // 1) S9i：只清"左缘 + 末标签以右"两条带；标签矩形由 draw_tab_abs 自刷底。
+        //    旧版先整条刷 TITLE_BG 再画标签，单缓冲下显示器会抓到"整条空白"的中间帧
+        //    ⇒ 加/减标签时整条闪一下。现在标签区从不被整体刷白，闪烁消除。
+        let left_end = lay.strip_l * CELL_W;
+        self.rect_abs(f, 0, 0, left_end, BAR_H, TITLE_BG);
+        // 顶缘（标签圆角以上 8px）恒为条底：不整条刷白后这里若不清，会留下上一帧的黑块
+        // （用户实测"多出来一块黑色"）。只刷这 8px 薄带，标签区仍由 draw_tab_abs 自刷。
+        self.rect_abs(f, 0, 0, w, 8, TITLE_BG);
+        let tail_x = lay.tab_col(shown) * CELL_W;
+        if tail_x < w {
+            self.rect_abs(f, tail_x, 0, w - tail_x, BAR_H, TITLE_BG);
+        }
 
         for i in 0..shown {
             self.draw_tab_abs(f, &lay, i, active, hover, unread);
         }
-        // 3) `+` 与它右边那个 `∨`（下拉：今天没有语义，只画）
-        if fit > 0 {
-            let plus_c = lay.plus_col(shown);
-            if plus_c + 1 < strip_r {
-                // 三个图标（未读点、`+`、`∨`）统一：**相互间隔 10 px**、垂直中心 24
-                // （与标签里 `×` 的中心同一条线）。
-                let base = plus_c * CELL_W;
-                // `+`：12×12，2 px 笔画，中心 (base+16, 24)
-                let px0 = base + 10;
-                self.rect_abs(f, px0 + 5, 18, 2, 12, TAB_TEXT);
-                self.rect_abs(f, px0, 23, 12, 2, TAB_TEXT);
-                // 分隔线：`+` 右 10 px
-                self.rect_abs(f, base + 32, 16, 1, 16, MENU_EDGE);
-                // `∨`：8 px 宽、2 px 笔画，中心 (base+47, 24)
-                // `∨`：12 px 宽、2 px 笔画；**底边与 `+` 同一条基线**（都是 29）。
-                let dx = base + 43;
-                for k in 0..6u64 {
-                    self.rect_abs(f, dx + k, 21 + k, 2, 1, TAB_DIM);
-                    self.rect_abs(f, dx + 11 - k, 21 + k, 2, 1, TAB_DIM);
-                    self.rect_abs(f, dx + k, 22 + k, 2, 1, TAB_DIM);
-                    self.rect_abs(f, dx + 11 - k, 22 + k, 2, 1, TAB_DIM);
-                }
-            }
-        }
+        // 3) `+` 与它右边那个 `∨`：单独成方法，因为 `bar_hover` 也必须能补画它们。
+        self.plus_chevron(f, &lay, shown);
         // 4) 装不下 ⇒ 折叠指示（今天到不了）
         if n_tabs > fit {
             let x = strip_r.saturating_sub(1) * CELL_W + 4;

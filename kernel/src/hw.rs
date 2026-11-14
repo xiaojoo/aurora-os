@@ -88,6 +88,23 @@ impl MmioRegion {
         unsafe { core::ptr::write_volatile((self.base() + off as u64) as *mut u32, v) };
         Ok(())
     }
+
+    /// S9k（双缓冲）：把一段**已打包**的像素行一次性搬进窗口。帧缓冲是线性内存语义
+    /// （不是逐寄存器设备），整行 memcpy 比逐像素 volatile 快一个量级，且一次 present
+    /// 只调用它 height 次，把"整帧合成完再上屏"变成可能（单缓冲闪烁的根治）。
+    /// SAFETY: `check` 保证 `off + src.len()*4 <= len`；目标是我们映射的帧缓冲窗口，
+    /// 源是内核私有 back buffer，两者不重叠；调用方（Frame::present）单核串行。
+    pub fn write_slice(&self, off: usize, src: &[u32]) -> Result<(), HwError> {
+        let bytes = src.len().checked_mul(4).ok_or(HwError::OutOfRange)?;
+        self.check(off, 4)?;
+        if off.checked_add(bytes).ok_or(HwError::OutOfRange)? > self.len {
+            return Err(HwError::OutOfRange);
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.as_ptr(), (self.base() + off as u64) as *mut u32, src.len());
+        }
+        Ok(())
+    }
 }
 
 // ------------------------------------------------------------------ 端口 I/O
