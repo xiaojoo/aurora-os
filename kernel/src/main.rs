@@ -1083,6 +1083,13 @@ fn park_until_init_exits(init: Option<usize>) {
                 {
                     let by_user = live.as_mut().map_or(false, |t| t.closed[0]);
                     if by_user {
+                        // 复位必须**在重开之前**：`stage_init_user` 自己的启动等待里有
+                        // `live.repaint()`，点击就在那里被处理。复位放在重开之后的话，
+                        // 等待期间到来的第二次关闭会被这一句抹掉 ⇒ 下一次 Done 被当成
+                        // "自愿收工"⇒ 停机（实测：第二次点击落在第 12~14 轮之间）。
+                        if let Some(t) = live.as_mut() {
+                            t.closed[0] = false;
+                        }
                         crate::log_info!("会话 0 已终止 ⇒ 重开新 shell");
                         // 旧正文要清零：不清的话新横幅接在上一会话的输出后面，
                         // 「新开的会话是空的」这条就没有证人（首行判据也会被旧内容顶掉）。
@@ -1092,9 +1099,6 @@ fn park_until_init_exits(init: Option<usize>) {
                                 gidx = n;
                                 INIT_TASK.store(n, Ordering::Relaxed);
                                 crate::user::set_active_session(0);
-                                if let Some(t) = live.as_mut() {
-                                    t.closed[0] = false;
-                                }
                                 continue;
                             }
                             // 重开失败就如实报数并按**旧语义**收工——空转一扇没有会话的终端
@@ -2126,6 +2130,14 @@ fn live_wait_and_redraw(gidx: usize, total_windows: u64) -> bool {
         }
         left -= step;
         rounds += 1;
+        // ADR-098 诊断（**临时**）：前 8 个样本、每 4 轮一次。
+        // 要分开的是"跑过再变 Free"与"从一开始就 Free、只是 runs 是旧值"。
+        if rounds % 4 == 0 && rounds <= 32 {
+            crate::log_info!(
+                "wait-sample: 轮={} 状态={:?} 跑过={}",
+                rounds, sched::state_of(gidx), sched::runs_of(gidx)
+            );
+        }
         if apic::with_interrupts(|| sched::wait_for_task(gidx, crate::clock::window_cycles(step))) {
             crate::log_info!("fbcon-live: 轮询={} 收工=init 自己退出", rounds);
             return true;
