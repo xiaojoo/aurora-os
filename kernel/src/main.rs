@@ -1181,10 +1181,18 @@ fn stage_init_user(sid: u8) -> Option<usize> {
         ROLE_JOB, ROLE_LOG, ROLE_SI, ROLE_CONSOLE_ECHO, E_DENIED,
     };
     use crate::{proc, vmo};
+    // ADR-098 诊断：**失败不许静默**。每个 `return None` 换成一个带站点的宏；
+    // 站点号 = 打补丁时该行的行号（日志里能直接回指源码）。只在失败时打一行。
+    macro_rules! bail {
+        ($site:literal) => {{
+            crate::log_warn!("init-user: 站点 {} 返回 None（ADR-098 诊断）", $site);
+            return None;
+        }};
+    }
 
     let Some(owner) = sched::current_identity() else {
         crate::log_warn!("init-user: 启动上下文没有身份 ⇒ 产品路径没起用户程序");
-        return None;
+        bail!(1187);
     };
     let mut f = TrapFrame {
         cr2: 0, r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
@@ -1193,14 +1201,14 @@ fn stage_init_user(sid: u8) -> Option<usize> {
     };
     // 根 Job 由内核持有，只在这里出示。两个句柄：一个**没有 CREATE**（判据用），一个有。
     let job = match proc::job_create(None, 2, 64) { Ok(v) => v, Err(e) => {
-        crate::log_warn!("init-user: job_create 失败 {:?}", e); return None;
+        crate::log_warn!("init-user: job_create 失败 {:?}", e); bail!(1196);
     } };
     let jgen = proc::job_gen(job).unwrap_or(0);
     let hj_plain = match handle::grant_job(owner, job, jgen, RIGHT_READ | RIGHT_DUP) {
-        Ok(h) => h, Err(_) => { crate::log_warn!("init-user: grant_job(plain) 失败"); return None; }
+        Ok(h) => h, Err(_) => { crate::log_warn!("init-user: grant_job(plain) 失败"); bail!(1200); }
     };
     let hj = match handle::grant_job(owner, job, jgen, RIGHT_READ | RIGHT_DUP | RIGHT_CREATE | RIGHT_TRANSFER) {
-        Ok(h) => h, Err(_) => { crate::log_warn!("init-user: grant_job(create) 失败"); return None; }
+        Ok(h) => h, Err(_) => { crate::log_warn!("init-user: grant_job(create) 失败"); bail!(1203); }
     };
     // **判据①：无 CREATE 权限的 Job 句柄必须拒 E_DENIED**（权限只从句柄来）。
     f.rax = SYS_PROCESS_CREATE; f.rdi = hj_plain.0; f.rsi = 0; f.rdx = 0; f.r10 = 0;
@@ -1215,10 +1223,10 @@ fn stage_init_user(sid: u8) -> Option<usize> {
     let hp = Handle(f.rax);
     let (pid, pgen) = match handle::resolve(hp, owner, 0) {
         Ok((handle::ObjRef::Proc { slot, gen }, _)) => (slot, gen),
-        _ => { crate::log_warn!("init-user: Proc 句柄解不开 ret={:#x}", f.rax); return None; }
+        _ => { crate::log_warn!("init-user: Proc 句柄解不开 ret={:#x}", f.rax); bail!(1218); }
     };
     let Some((aslot, _)) = proc::proc_aspace(pid, pgen) else {
-        crate::log_warn!("init-user: 进程没有 AS"); return None;
+        crate::log_warn!("init-user: 进程没有 AS"); bail!(1221);
     };
     // S4b-1 的装载器：真 ELF 进**子 AS**，映射经 aspace_map_slot（那棵树）。
     // S5c：装的是 shell 而不是 hello——控制台句柄已经在下面按 ROLE_LOG 授予，
@@ -1232,7 +1240,7 @@ fn stage_init_user(sid: u8) -> Option<usize> {
         crate::user::end_session_load();
         match r {
             Ok(l) => l,
-            Err(e) => { crate::log_warn!("init-user: load_into 失败 {}", crate::user::describe_load(e)); return None; }
+            Err(e) => { crate::log_warn!("init-user: load_into 失败 {}", crate::user::describe_load(e)); bail!(1235); }
         }
     };
     // 装载器把映射柄**交回调用方**而不是自动入袋（用例要能自己丢弃并核账）。不归创建者，
@@ -1240,26 +1248,26 @@ fn stage_init_user(sid: u8) -> Option<usize> {
     // `adopt_asmaps` 才搬得动：它只搬"创建者袋里目标 AS = 子 AS"的那些项。
     let owned_n = match loaded.owned.into_current() {
         Ok(n) => n,
-        Err(e) => { crate::log_warn!("init-user: 映射归创建者失败 {:?}", e); return None; }
+        Err(e) => { crate::log_warn!("init-user: 映射归创建者失败 {:?}", e); bail!(1243); }
     };
     let Some(madt) = acpi::summary().and_then(|s| s.madt) else {
-        crate::log_warn!("init-user: 没有 MADT，控制台未授予"); return None;
+        crate::log_warn!("init-user: 没有 MADT，控制台未授予"); bail!(1246);
     };
     if let Err(e) = serial::enable_rx(&madt) {
-        crate::log_warn!("init-user: 控制台接收初始化失败 {:?}", e); return None;
+        crate::log_warn!("init-user: 控制台接收初始化失败 {:?}", e); bail!(1249);
     }
     let console = match handle::grant_console(owner, RIGHT_READ | RIGHT_WRITE | RIGHT_DUP | RIGHT_TRANSFER, sid) {
-        Ok(h) => h, Err(e) => { crate::log_warn!("init-user: 控制台授予失败 {:?}", e); return None; }
+        Ok(h) => h, Err(e) => { crate::log_warn!("init-user: 控制台授予失败 {:?}", e); bail!(1252); }
     };
     // S6p：控制台反例句柄是**启动路径仪器的**，只发给 init 会话：它只被写进 si 交给
     // 子进程（今天的 shell 不读那一格），而每发一份都占全局 16 格句柄表的一格。
     let foreign = if cfg!(feature = "console-probe") && sid == 0 {
         // ADR-098 补记三：补 `RIGHT_TRANSFER`，否则写进描述表也转不走（每轮漏一格）。
         match handle::grant_console(owner, RIGHT_READ | RIGHT_WRITE | RIGHT_TRANSFER, sid) {
-            Ok(h) => h.0, Err(e) => { crate::log_warn!("init-user: 控制台反例句柄失败 {:?}", e); return None; }
+            Ok(h) => h.0, Err(e) => { crate::log_warn!("init-user: 控制台反例句柄失败 {:?}", e); bail!(1259); }
         }
     } else { 0 };
-    let si = match vmo::vmo_create(1) { Ok(v) => v, Err(_) => { crate::log_warn!("init-user: si vmo 失败"); return None; } };
+    let si = match vmo::vmo_create(1) { Ok(v) => v, Err(_) => { crate::log_warn!("init-user: si vmo 失败"); bail!(1262); } };
     let mut hdr = [0u8; SI_OFF_HANDLES];
     hdr[0..4].copy_from_slice(&SI_MAGIC.to_le_bytes());
     hdr[4..6].copy_from_slice(&(ABI_MAJOR as u16).to_le_bytes());
@@ -1271,22 +1279,22 @@ fn stage_init_user(sid: u8) -> Option<usize> {
         hdr[12..16].copy_from_slice(&512u32.to_le_bytes());
         hdr[16..20].copy_from_slice(&8u32.to_le_bytes());
     }
-    if vmo::vmo_write(si, 0, &hdr) != Ok(hdr.len()) { crate::log_warn!("init-user: si 头写失败"); return None; }
+    if vmo::vmo_write(si, 0, &hdr) != Ok(hdr.len()) { crate::log_warn!("init-user: si 头写失败"); bail!(1274); }
     let mut d = [0u8; SI_DESC_BYTES];
     d[SI_DESC_ROLE..SI_DESC_ROLE + 4].copy_from_slice(&ROLE_JOB.to_le_bytes());
     d[SI_DESC_HANDLE..SI_DESC_HANDLE + 8].copy_from_slice(&hj.0.to_le_bytes());
-    if vmo::vmo_write(si, SI_OFF_HANDLES, &d) != Ok(SI_DESC_BYTES) { crate::log_warn!("init-user: si 描述写失败"); return None; }
+    if vmo::vmo_write(si, SI_OFF_HANDLES, &d) != Ok(SI_DESC_BYTES) { crate::log_warn!("init-user: si 描述写失败"); bail!(1278); }
     d[SI_DESC_ROLE..SI_DESC_ROLE + 4].copy_from_slice(&ROLE_LOG.to_le_bytes());
     d[SI_DESC_HANDLE..SI_DESC_HANDLE + 8].copy_from_slice(&console.0.to_le_bytes());
     if vmo::vmo_write(si, SI_OFF_HANDLES + SI_DESC_BYTES, &d) != Ok(SI_DESC_BYTES) {
-        crate::log_warn!("init-user: 控制台描述写失败"); return None;
+        crate::log_warn!("init-user: 控制台描述写失败"); bail!(1282);
     }
     if cfg!(feature = "console-probe") && vmo::vmo_write(si, 512, &foreign.to_le_bytes()) != Ok(8) {
-        crate::log_warn!("init-user: 控制台探针参数写失败"); return None;
+        crate::log_warn!("init-user: 控制台探针参数写失败"); bail!(1285);
     }
     // ADR-098 补记三（裁决：si 页归子任务）：补 `RIGHT_TRANSFER`，才能写进描述表转走。
     let hi = match handle::grant_vmo(owner, si, RIGHT_READ | RIGHT_WRITE | RIGHT_MAP | RIGHT_TRANSFER) {
-        Ok(h) => h, Err(_) => { crate::log_warn!("init-user: grant_vmo(si) 失败"); return None; }
+        Ok(h) => h, Err(_) => { crate::log_warn!("init-user: grant_vmo(si) 失败"); bail!(1289); }
     };
     // ADR-098 补记三：把 si 页与探针反例句柄写进描述表 ⇒ 16 号把它们**转移**给子任务，
     // 于是 `revoke_task(child)` 会连带 `vmo_unref`，创建者身上不再每轮留两格。
@@ -1295,13 +1303,13 @@ fn stage_init_user(sid: u8) -> Option<usize> {
         d[SI_DESC_ROLE..SI_DESC_ROLE + 4].copy_from_slice(&ROLE_SI.to_le_bytes());
         d[SI_DESC_HANDLE..SI_DESC_HANDLE + 8].copy_from_slice(&hi.0.to_le_bytes());
         if vmo::vmo_write(si, SI_OFF_HANDLES + 2 * SI_DESC_BYTES, &d) != Ok(SI_DESC_BYTES) {
-            crate::log_warn!("init-user: si 描述写失败（ROLE_SI）"); return None;
+            crate::log_warn!("init-user: si 描述写失败（ROLE_SI）"); bail!(1298);
         }
         if foreign != 0 {
             d[SI_DESC_ROLE..SI_DESC_ROLE + 4].copy_from_slice(&ROLE_CONSOLE_ECHO.to_le_bytes());
             d[SI_DESC_HANDLE..SI_DESC_HANDLE + 8].copy_from_slice(&foreign.to_le_bytes());
             if vmo::vmo_write(si, SI_OFF_HANDLES + 3 * SI_DESC_BYTES, &d) != Ok(SI_DESC_BYTES) {
-                crate::log_warn!("init-user: si 描述写失败（ROLE_CONSOLE_ECHO）"); return None;
+                crate::log_warn!("init-user: si 描述写失败（ROLE_CONSOLE_ECHO）"); bail!(1304);
             }
         }
     }
@@ -1355,7 +1363,7 @@ fn stage_init_user(sid: u8) -> Option<usize> {
     let ht = Handle(f.rax);
     let (gidx, _tid) = match handle::resolve(ht, owner, 0) {
         Ok((handle::ObjRef::Thread { gidx, id }, _)) => (gidx, id),
-        _ => { crate::log_warn!("init-user: Thread 句柄解不开 ret={:#x}", f.rax); return None; }
+        _ => { crate::log_warn!("init-user: Thread 句柄解不开 ret={:#x}", f.rax); bail!(1358); }
     };
     let stopped = matches!(sched::state_of(gidx), sched::TaskState::Blocked(_));
     // 16：回填 StartupInfo 并放行。
