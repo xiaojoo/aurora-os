@@ -1466,7 +1466,7 @@ struct LiveTerm {
     /// 上百毫秒），而指针与光标每秒要动好几次；只要这一格没变就**不重画正文**。
     /// (会话号, 该会话环里累计字节, 该会话环里的换行数, 标签数, 活动标签)
     /// —— 换行数是"整窗 vs 只画输入行"的分水岭；最后一格是版面（S6t：标签条 ⇄ 浮窗）。
-    sig: (u8, usize, u64, u64, u64, bool),
+    sig: (u8, usize, u64, u64, u64, bool, Option<u8>),
     /// 光标（下划线）**现在**画在哪一格；`None` = 现在是灭的一相。
     caret: Option<(u64, u64)>,
     /// 下一相光标该在哪一格（整窗重画时由 `redraw_window` 交回来）。
@@ -1505,6 +1505,12 @@ struct LiveTerm {
     /// "参考图最显眼的那一条没了"的直接原因。
     #[cfg(feature = "wm")]
     float: bool,
+    /// #58：指针停在哪一个标签上（`None` = 不在标签条目上）。**画与命中共用这一格**。
+    hover: Option<u8>,
+    /// #58：每个会话"上次被看过时"的累计字节数；与当前值不同且不是活动标签 ⇒ 未读圆点。
+    seen: [usize; crate::serial::SESSIONS],
+    /// 首次观察标记：开机那一屏算"已看过"，不给任何标签点未读。
+    seen_init: bool,
     /// 桌面签名（哪些窗口开着 + 版面 + 移动序号）：变了要**重铺桌面**，否则关掉的窗、
     /// 切走的版面、被挪走的窗都会把旧像素留在屏幕上（它们已经不在任何矩形的负责范围里了）。
     #[cfg(feature = "wm")]
@@ -1540,11 +1546,14 @@ impl LiveTerm {
         term.clear(&frame);
         Some(Self {
             frame, term,
-            sig: (u8::MAX, usize::MAX, u64::MAX, 0, 0, false),
+            sig: (u8::MAX, usize::MAX, u64::MAX, 0, 0, false, None),
             caret: None,
             caret_at: None,
             ptr: None,
             ptr_bg: [[0; 7]; 11],
+            hover: None,
+            seen: [0; crate::serial::SESSIONS],
+            seen_init: false,
             paints: (0, 0, 0, 0),
             chrome: crate::fbcon::Chrome::Normal,
             last_chrome: crate::fbcon::Chrome::Normal,
@@ -1581,6 +1590,20 @@ impl LiveTerm {
 
     /// **内容重画**：只在正文真的变了的时候写像素。结尾一定走一次 `tick()`——
     /// 整窗重画会把指针与光标擦掉，不立刻补就会缺半拍。
+    /// #58：未读位图——"该会话自上次被看过以来有新字节，且它不是当前活动标签"。
+    fn unread_mask(&self, active: u64) -> u64 {
+        let mut m = 0u64;
+        for i in 0..crate::serial::SESSIONS {
+            if i as u64 == active || self.closed[i] {
+                continue;
+            }
+            if crate::serial::mirror_total_sid(i) != self.seen[i] {
+                m |= 1u64 << i;
+            }
+        }
+        m
+    }
+
     /// 当前版面四元组：会话号 / 标签数 / 活动标签 / 三态。
     /// `repaint`（算内容签名）与 `tick`（判点击命中哪一格）**必须共用这一份**：
     /// 两处各算一遍，命中就会按另一套标签数走。
@@ -1622,7 +1645,8 @@ impl LiveTerm {
         let lay = self.float;
         #[cfg(not(feature = "wm"))]
         let lay = false;
-        let sig = (sid as u8, total, nl as u64, tabs, active, lay);
+        // #58：**悬停也进签名**——它只影响标签条那一行，但那一行由整窗重画负责。
+        let sig = (sid as u8, total, nl as u64, tabs, active, lay, self.hover);
         // S6t：**浮窗里"只改 z 序/桌面"的点击不会动内容签名**，只看 `sig` 的话置顶永远
         // 不生效（实测：点 win0 标题后 base 与 raised 只差 120 个像素=光标与指针，
         // 而点关闭之后差 38610——因为关闭顺带改了内容）。所以把浮窗的脏判定也接进这一格。
@@ -1638,7 +1662,8 @@ impl LiveTerm {
                 && self.sig.0 == sid as u8
                 && self.sig.2 == nl as u64
                 && self.sig.1 != usize::MAX
-                && self.sig.5 == lay;
+                && self.sig.5 == lay
+                && self.sig.6 == self.hover;
             #[cfg(feature = "wm")]
             let (cc, cr) = if self.float {
                 self.wm_frame()
@@ -1670,6 +1695,33 @@ impl LiveTerm {
     /// `mirror_newlines_sid` 每次要扫完整段环（最多 8 KiB），拿它当指针的节拍就是
     /// 用约 140 ms 的代价换约 16 ms 的观感。用户说的"鼠标移动卡顿"就是这个数。
     fn tick(&mut self) {
+        // #58：每拍算一次"指针停在哪一个标签上"，并为**当前正在看的会话**记一次已读。
+        // 悬停变化才重画（进签名），没变就一个字都不写。
+        {
+            let (cols, _rows) = self.term.dims();
+            let (px, py) = crate::mouse::pos();
+            let (_, tabs, active, chrome) = self.layout();
+            let hv = match crate::fbcon::hit_test(cols, tabs, px as u64, py as u64, chrome, active, self.hover) {
+                crate::fbcon::Hit::Tab(i) | crate::fbcon::Hit::TabClose(i) => Some(i),
+                _ => None,
+            };
+            if hv != self.hover {
+                self.hover = hv;
+                crate::log_info!("版面: 悬停={:?}", hv);
+            }
+            // **首次观察即视为已读**：开机会话自己的横幅不该变成"未读圆点"
+            // （实测：不这么做 tab1 从开机起就有一个 36 像素的点）。
+            if !self.seen_init {
+                for i in 0..crate::serial::SESSIONS {
+                    self.seen[i] = crate::serial::mirror_total_sid(i);
+                }
+                self.seen_init = true;
+            }
+            let a = active as usize;
+            if a < crate::serial::SESSIONS {
+                self.seen[a] = crate::serial::mirror_total_sid(a);
+            }
+        }
         let n = FRAMES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         // 眨眼：每 32 拍翻一次 ⇒ 约 0.5 s 亮／0.5 s 灭，与拆出来之前同速（原来是每 4 个
         // 约 140 ms 的轮次）。
@@ -1717,7 +1769,8 @@ impl LiveTerm {
                     crate::fbcon::Hit::Body
                 } else {
                     crate::fbcon::hit_test(
-                        self.term.dims().0, tabs, cx as u64, cy as u64, chrome)
+                        self.term.dims().0, tabs, cx as u64, cy as u64, chrome,
+                        crate::user::active_session() as u64, self.hover)
                 };
                 crate::log_info!("mouse: 点击 x={} y={} 命中={}", cx, cy, hit.name());
                 // S6q 补记二：三个窗口按钮**有动作了**——但各自的口径要写清楚：
@@ -1750,11 +1803,6 @@ impl LiveTerm {
                             crate::exit::finish(crate::exit::Code::Success);
                         }
                         // S6q 补记三：**每个窗口条目**自己的 `-` 与 `×`。
-                        crate::fbcon::Hit::TabMin(i) => {
-                            let i = (i as usize).min(crate::serial::SESSIONS - 1);
-                            self.mins[i] = !self.mins[i];
-                            crate::log_info!("窗口: 会话 {} 最小化={}", i, self.mins[i]);
-                        }
                         crate::fbcon::Hit::TabClose(i) => {
                             let i = i as usize;
                             // ADR-097：`×` **只关这个会话**，包括 0 号。停机只剩两条显式路：
@@ -1852,7 +1900,8 @@ impl LiveTerm {
             crate::fbcon::redraw_input(&self.term, &self.frame, rows.min(LIVE_ROWS), sid, chrome)
         } else {
             let (_, cc, cr) = crate::fbcon::redraw_window(
-                &self.term, &self.frame, rows.min(LIVE_ROWS), sid, tabs, active, chrome);
+                &self.term, &self.frame, rows.min(LIVE_ROWS), sid, tabs, active, chrome,
+                self.hover, self.unread_mask(active));
             (cc, cr)
         }
     }
@@ -1877,7 +1926,8 @@ impl LiveTerm {
                     }
                 } else {
                     let (_, cc, cr) = crate::fbcon::redraw_window(
-                        &t, &self.frame, b.rows as usize, i, 0, 0, crate::fbcon::Chrome::Floating);
+                        &t, &self.frame, b.rows as usize, i, 0, 0, crate::fbcon::Chrome::Floating,
+                        None, 0);
                     if focused && cr != 0 {
                         caret = (cc, b.y + cr);
                     }
@@ -2128,7 +2178,7 @@ impl LiveTerm {
         let open = (0..crate::serial::SESSIONS)
             .filter(|i| !self.closed[*i])
             .count() as u64;
-        self.term.tab_bar(&self.frame, open, active as u64);
+        self.term.tab_bar(&self.frame, open, active as u64, self.hover, self.unread_mask(active as u64));
         // 整栈从最下面一扇开始画；每扇只画自己的矩形 ⇒ 这就是"每扇窗只重画矩形"。
         let mut caret = (0u64, 0u64);
         for k in 0..crate::serial::SESSIONS {

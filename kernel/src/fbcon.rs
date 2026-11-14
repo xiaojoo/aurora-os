@@ -924,7 +924,6 @@ impl Chrome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hit {
     TabClose(u8),
-    TabMin(u8),
     Tab(u8),
     NewTab,
     Layout,
@@ -939,9 +938,6 @@ impl Hit {
     pub fn name(self) -> &'static str {
         match self {
             Hit::TabClose(_) => "标签关闭",
-            Hit::TabMin(0) => "窗口最小化0",
-            Hit::TabMin(1) => "窗口最小化1",
-            Hit::TabMin(_) => "窗口最小化N",
             Hit::Tab(0) => "标签0",
             Hit::Tab(1) => "标签1",
             Hit::Tab(_) => "标签N",
@@ -1016,7 +1012,15 @@ pub fn win_hit(w: WinRect, x_px: u64, y_px: u64) -> WinHit {
 }
 
 /// 屏幕像素坐标 → 命中项。第 0 行是标签栏，其余全是正文。
-pub fn hit_test(cols: u64, tabs: u64, x_px: u64, y_px: u64, ch: Chrome) -> Hit {
+pub fn hit_test(
+    cols: u64,
+    tabs: u64,
+    x_px: u64,
+    y_px: u64,
+    ch: Chrome,
+    active: u64,
+    hover: Option<u8>,
+) -> Hit {
     let c = x_px / CELL_W;
     let lay = BarLayout::of(cols);
     if !ch.tabs() {
@@ -1042,12 +1046,12 @@ pub fn hit_test(cols: u64, tabs: u64, x_px: u64, y_px: u64, ch: Chrome) -> Hit {
     for i in 0..shown {
         let c0 = lay.tab_col(i);
         if c >= c0 && c < c0 + lay.tab_w {
-            // 每个窗口条目自带 `-`（最小化）与 `×`（关闭）：最右两列
+            // #58：条目右上角**只保留 `×`**，而且只在"它是活动标签"或"指针停在它上面"时**可点**
+            // （画与命中同一条规则——否则看不见的 × 也能点，正是要防的误关）。
             let rel = c - c0;
-            return if rel + 1 == lay.tab_w {
+            let x_visible = i as u64 == active || hover == Some(i as u8);
+            return if rel + 1 == lay.tab_w && x_visible {
                 Hit::TabClose(i as u8)
-            } else if rel + 2 == lay.tab_w {
-                Hit::TabMin(i as u8)
             } else {
                 Hit::Tab(i as u8)
             };
@@ -1328,7 +1332,7 @@ impl Term {
 
     /// 标签栏。`n_tabs` 是要显示的标签数：**装不下时**最右端画一个 `»`（折叠成下拉，
     /// 与 Windows Terminal 同形）。今天只有 1 个会话 ⇒ 那个分支走不到，规则先按布局写好。
-    pub fn tab_bar(&self, f: &Frame, n_tabs: u64, active: u64) {
+    pub fn tab_bar(&self, f: &Frame, n_tabs: u64, active: u64, hover: Option<u8>, unread: u64) {
         let w = self.cols * CELL_W;
         // 1) 整条只有一种底色（S6q：去掉了原来那条 2px 分隔线——截图里没有，
         //    而且活动标签本身就是"挖到正文色"，加一条线会把这块切成两半）。
@@ -1387,9 +1391,15 @@ impl Term {
                     c += char_cells(ch);
                 }
             }
-            // 每个窗口条目自带 `-` 与 `×`（最右两列；绘制与命中同一份几何）
-            self.rect(f, (c0 + tab_w - 2) * CELL_W + 5, 16, 6, 2, TAB_DIM);
-            self.cross(f, (c0 + tab_w - 1) * CELL_W + 5, 12, 6, TAB_DIM);
+            // #58：条目右上角**只有 `×`**，且只在"活动标签"或"指针停在它上面"时画；
+            // 非活动且没悬停时，若这个会话有新输出就画一个**未读圆点**（同样占那一格）。
+            let x_visible = i as u64 == active || hover == Some(i as u8);
+            let x0 = (c0 + tab_w - 1) * CELL_W;
+            if x_visible {
+                self.cross(f, x0 + 5, 12, 6, TAB_DIM);
+            } else if unread & (1u64 << i) != 0 {
+                self.rect(f, x0 + 5, 13, 6, 6, TAB_TEXT);
+            }
         }
         // 3) `+` 与它右边那个 `∨`（下拉：今天没有语义，只画）
         if fit > 0 {
@@ -1604,7 +1614,8 @@ impl Term {
 /// 每次眨眼都要重写整屏，画面上看到的就是"指针与文字一起闪"（实测 8 帧里丢 2 帧）。
 /// 现在这里只画正文并把光标位置交回去，闪烁由 `LiveTerm` 在那一格上局部画/擦。
 pub fn redraw_window(term: &Term, f: &Frame, max_lines: usize, sid: usize,
-                     tabs: u64, active: u64, ch: Chrome) -> (usize, u64, u64) {
+                     tabs: u64, active: u64, ch: Chrome,
+                     hover: Option<u8>, unread: u64) -> (usize, u64, u64) {
     let n = crate::serial::mirror_len_sid(sid);
     let wrapped = crate::serial::mirror_wrapped_sid(sid);
     let mut total = 1usize;
@@ -1620,7 +1631,7 @@ pub fn redraw_window(term: &Term, f: &Frame, max_lines: usize, sid: usize,
     let top = if ch.tabs() { TITLE_ROWS } else { 0 };
     let rows = max_lines.saturating_sub(top as usize);
     if ch.tabs() {
-        term.tab_bar(f, tabs, active);
+        term.tab_bar(f, tabs, active, hover, unread);
     } else {
         // 浮窗/最大化：先整块刷底色（否则上一帧的标签栏会留在第一行）。三个按钮**放到最后画**——
         // 正文从第 0 行开始，先画按钮会被第 0 行的文字整行盖掉（本轮实测：按钮像素 0）。
