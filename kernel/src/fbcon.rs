@@ -862,6 +862,10 @@ const TAB_DIM: u32 = 0x00_9A_9A_9A;
 const TAB_ICON: u32 = 0x00_A0_BB_E0;
 
 /// 标签栏的几何。**绘制与命中测试共用这一份**——两处各算一遍，点击就会落在画的地方旁边。
+/// #58 pass A：窗口按钮的宽度（格）与字形边长（像素）。**所有绘制与命中都从这里取**。
+pub const BTN_W: u64 = 2;
+pub const GLYPH: u64 = 12;
+
 pub struct BarLayout {
     pub strip_l: u64,
     pub strip_r: u64,
@@ -875,7 +879,8 @@ impl BarLayout {
         let strip_l = 1;
         // 右侧三个按钮**贴右边缘**各占一格（截图里最后那个 × 就在窗口右边界上）；
         // 原来留了 5 格边距，按钮看起来像散落在条中间。
-        let strip_r = cols.saturating_sub(3);
+        // #58 pass A：三个窗口按钮**每枚 2 格**（32 px，贴近参考图 ~40 px 的命中区）。
+        let strip_r = cols.saturating_sub(3 * BTN_W);
         let fit = if strip_r > strip_l + tab_w {
             (strip_r - strip_l) / (tab_w + 1)
         } else {
@@ -885,6 +890,14 @@ impl BarLayout {
     }
     pub fn tab_col(&self, i: u64) -> u64 {
         self.strip_l + i * (self.tab_w + 1)
+    }
+    /// 第 i 个窗口按钮的起始列（i = 0/1/2 = `-`/`□`/`×`）。
+    pub fn btn_col(&self, i: u64) -> u64 {
+        self.strip_r + i * BTN_W
+    }
+    /// 字形盒在 2 格宽里居中时左上角的 x 偏移（像素）。
+    pub fn glyph_x(&self) -> u64 {
+        (BTN_W * CELL_W - GLYPH) / 2
     }
     /// `+` 在哪一列
     pub fn plus_col(&self, shown: u64) -> u64 {
@@ -1003,12 +1016,14 @@ pub fn win_hit(w: WinRect, x_px: u64, y_px: u64) -> WinHit {
     if cy >= w.y + TITLE_ROWS {
         return WinHit::Body;
     }
+    // #58 pass A：标题栏右端三枚按钮各占 **2 格**（与 `win_buttons`/`paint_title` 同一几何）。
     let rel = cx - w.x;
-    if rel + 1 == w.cols {
+    let back = w.cols.saturating_sub(rel);
+    if back <= BTN_W {
         WinHit::Close
-    } else if rel + 2 == w.cols {
+    } else if back <= 2 * BTN_W {
         WinHit::Max
-    } else if rel + 3 == w.cols {
+    } else if back <= 3 * BTN_W {
         WinHit::Min
     } else {
         WinHit::Title
@@ -1031,13 +1046,13 @@ pub fn hit_test(
         // 最大化：右上角三格仍是三个按钮（标签栏没了，按钮不能跟着消失——
         // 否则 maximize 就变成单向门，没有恢复的办法）。其余全算正文。
         if y_px < CELL_H {
-            if c == lay.strip_r {
+            if c >= lay.btn_col(0) && c < lay.btn_col(1) {
                 return Hit::Min;
             }
-            if c == lay.strip_r + 1 {
+            if c >= lay.btn_col(1) && c < lay.btn_col(2) {
                 return Hit::Max;
             }
-            if c == lay.strip_r + 2 {
+            if c >= lay.btn_col(2) {
                 return Hit::Close;
             }
         }
@@ -1069,13 +1084,13 @@ pub fn hit_test(
     if c == lay.plus_col(shown) + 1 {
         return Hit::Layout;
     }
-    if c == lay.strip_r {
+    if c >= lay.btn_col(0) && c < lay.btn_col(1) {
         return Hit::Min;
     }
-    if c == lay.strip_r + 1 {
+    if c >= lay.btn_col(1) && c < lay.btn_col(2) {
         return Hit::Max;
     }
-    if c == lay.strip_r + 2 {
+    if c >= lay.btn_col(2) {
         return Hit::Close;
     }
     Hit::Bar
@@ -1257,13 +1272,17 @@ impl Term {
             self.ch_ink(f, c * CELL_W, 0, ch, ink);
             c += cw;
         }
-        let gx = |i: u64| (self.cols - 3 + i) * CELL_W + 3;
-        self.rect(f, gx(0), 16, 10, 1, ink);
-        self.rect(f, gx(1), 11, 10, 1, ink);
-        self.rect(f, gx(1), 20, 10, 1, ink);
-        self.rect(f, gx(1), 11, 1, 10, ink);
-        self.rect(f, gx(1) + 9, 11, 1, 10, ink);
-        self.cross(f, gx(2), 11, 10, ink);
+        // #58 pass A：与标签条同一份几何（2 格宽、12 px 字形、2 px 笔画）。
+        let lay = BarLayout::of(self.cols);
+        let gx = |i: u64| lay.btn_col(i) * CELL_W + lay.glyph_x();
+        let y0 = (CELL_H - GLYPH) / 2;
+        let (w, t) = (GLYPH, 2u64);
+        self.rect(f, gx(0), y0 + GLYPH / 2 - 1, w, t, ink);
+        self.rect(f, gx(1), y0, w, t, ink);
+        self.rect(f, gx(1), y0 + GLYPH - t, w, t, ink);
+        self.rect(f, gx(1), y0, t, GLYPH, ink);
+        self.rect(f, gx(1) + w - t, y0, t, GLYPH, ink);
+        self.cross(f, gx(2), y0, GLYPH, ink);
     }
 
     /// 只写位图里**亮**的像素（背景透明）。标题栏用它把文字叠在自铺的底色上。
@@ -1436,13 +1455,17 @@ impl Term {
     /// **绘制与命中共用 `BarLayout::strip_r`**：两处各算一遍，点击就会落在画的地方旁边。
     /// 最大化时标签栏不画，但这三个按钮仍画在右上角（`redraw_window` 会先清屏成底色）。
     fn win_buttons(&self, f: &Frame, strip_r: u64) {
-        let gx = |i: u64| (strip_r + i) * CELL_W + 3;
-        self.rect(f, gx(0), 16, 10, 1, TAB_TEXT);
-        self.rect(f, gx(1), 11, 10, 1, TAB_TEXT);
-        self.rect(f, gx(1), 20, 10, 1, TAB_TEXT);
-        self.rect(f, gx(1), 11, 1, 10, TAB_TEXT);
-        self.rect(f, gx(1) + 9, 11, 1, 10, TAB_TEXT);
-        self.cross(f, gx(2), 11, 10, TAB_TEXT);
+        // #58 pass A：2 格宽 + 12 px 字形 + 2 px 笔画（`cross` 本来就是 2 px 粗）。
+        let lay = BarLayout { strip_l: 1, strip_r, tab_w: 0, fit: 0 };
+        let gx = |i: u64| lay.btn_col(i) * CELL_W + lay.glyph_x();
+        let y0 = (CELL_H - GLYPH) / 2;
+        let (w, t) = (GLYPH, 2u64);
+        self.rect(f, gx(0), y0 + GLYPH / 2 - 1, w, t, TAB_TEXT);
+        self.rect(f, gx(1), y0, w, t, TAB_TEXT);
+        self.rect(f, gx(1), y0 + GLYPH - t, w, t, TAB_TEXT);
+        self.rect(f, gx(1), y0, t, GLYPH, TAB_TEXT);
+        self.rect(f, gx(1) + w - t, y0, t, GLYPH, TAB_TEXT);
+        self.cross(f, gx(2), y0, GLYPH, TAB_TEXT);
     }
 
     /// 只画右上角那三个按钮（最大化：标签栏收起来了，按钮不能跟着消失）。
