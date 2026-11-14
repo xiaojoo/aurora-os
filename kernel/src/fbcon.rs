@@ -846,11 +846,15 @@ pub const TITLE_ROWS: u64 = 1;
 pub const TAB_LABEL: &str = "Aurora shell";
 /// 标签条底色：**比正文亮**（截图取样 #333333）。与正文相反方向的对比让活动页
 /// 看起来是"从条上挖下去"的一块——Windows 11 / Windows Terminal 的现行样式。
-const TITLE_BG: u32 = 0x00_33_33_33;
+/// #58 pass B：**层次对齐参考图**——条底是整条最暗的一档，活动标签比它亮一档。
+/// 参考实测：条底 `#0A0A0A` / 活动标签 `#2E2E2E` / 面板 `#2C2C2C`；在我们的灰阶上取
+/// `#1F1F1F` 与 `#2E2E2E`（正文仍是 `#0C0C0C`，所以活动标签与正文之间有一道可见的边界）。
+const TITLE_BG: u32 = 0x00_1F_1F_1F;
 /// 活动标签顶角那两个像素的过渡色（截图里是 #2B2B2B 一带）。
 const TITLE_BG_HI: u32 = 0x00_2B_2B_2B;
 /// 活动标签的底色 **= 正文底色**（"挖掉"效果）。
-const TAB_BG: u32 = 0x00_0C_0C_0C;
+/// 活动标签的底色（比条底亮一档——这是参考图的层次方向，与旧版"挖到正文色"相反）。
+const TAB_ACTIVE_BG: u32 = 0x00_2E_2E_2E;
 /// 标签文字：活动页亮、非活动页暗（截图取样 #E1E1E1 / #9A9A9A）。
 const TAB_TEXT: u32 = 0x00_E1_E1_E1;
 const TAB_DIM: u32 = 0x00_9A_9A_9A;
@@ -1236,7 +1240,7 @@ impl Term {
     pub fn paint_title(&self, f: &Frame, title: &str, focused: bool) {
         let w = self.cols * CELL_W;
         // 不聚焦的标题栏也要**看得出来是一条标题栏**（用正文色就整条隐形了，第一版实测）。
-        let bg = if focused { TITLE_BG } else { 0x00_26_26_26 };
+        let bg = if focused { TAB_ACTIVE_BG } else { 0x00_24_24_24 };
         self.rect(f, 0, 0, w, CELL_H, bg);
         let ink = if focused { TAB_TEXT } else { TAB_DIM };
         for k in 0..5u64 {
@@ -1349,7 +1353,7 @@ impl Term {
             let wtab = tab_w * CELL_W;
             if i == active {
                 // 活动页 = 正文底色的一块，顶部两行左右各切掉一个小角（圆角的近似）
-                self.rect(f, x0, 0, wtab, CELL_H, TAB_BG);
+                self.rect(f, x0, 0, wtab, CELL_H, TAB_ACTIVE_BG);
                 self.rect(f, x0, 0, 6, 1, TITLE_BG);
                 self.rect(f, x0 + wtab - 6, 0, 6, 1, TITLE_BG);
                 self.rect(f, x0, 1, 3, 1, TITLE_BG_HI);
