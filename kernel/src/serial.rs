@@ -355,6 +355,14 @@ pub fn mirror_len() -> usize {
     mirror_len_sid(0)
 }
 
+/// ADR-097：**清空某个会话的画面环**（重开会话时旧正文要归零）。
+/// 只把写位置归 0 就够了——`mirror_len_sid` / `mirror_byte_sid` / `mirror_wrapped_sid`
+/// 全部以 `MIRROR_POS` 为准，所以旧字节读得到也数不着；不用清 8 KiB。
+/// **串口一个字节都不动**：这是纯画面语义。
+pub fn mirror_reset_sid(sid: usize) {
+    MIRROR_POS[sid_of(sid)].store(0, Ordering::Relaxed);
+}
+
 pub fn mirror_total() -> usize {
     mirror_total_sid(0)
 }

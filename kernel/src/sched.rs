@@ -249,6 +249,23 @@ pub fn exit_current(cpu: usize) {
 ///
 /// `terminate_task` 是同一个内部动作的旁观者版本（用例结束一个仍在跑的任务时用），
 /// **不是**给用户态的接口：用户态只有一条 `SYS_EXIT`。
+/// ADR-098：读一个任务名下的进程号。**必须在 `terminate_task` 之前读**——
+/// 它把 `proc_id` 清成 `NO_PROC`（那是"进程归属跟着槽位走"的契约）。
+/// 关会话时要靠这个号把僵尸进程收掉（`proc_reap`），否则子 AS 与页额度永远不回来。
+pub fn task_proc_id(task: usize) -> Option<u16> {
+    if task >= MAX_TASKS_TOTAL {
+        return None;
+    }
+    let cpu = cpu_of(task);
+    let s = rq(cpu);
+    let p = s.tasks[slot_of(task)].proc_id;
+    if p == crate::proc::NO_PROC {
+        None
+    } else {
+        Some(p)
+    }
+}
+
 pub fn terminate_task(task: usize) -> bool {
     if task >= MAX_TASKS_TOTAL {
         return false;

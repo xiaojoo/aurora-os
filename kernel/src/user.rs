@@ -117,6 +117,10 @@ pub const ROLE_JOB: u32 = 3;
 pub const ROLE_PARENT_CHAN: u32 = 4;
 pub const ROLE_LOG: u32 = 5;
 pub const ROLE_NS_ROOT: u32 = 6;
+/// ADR-098 补记三：si 页本身也交给子任务持有（`revoke_task(child)` 才会连带 `vmo_unref`）。
+pub const ROLE_SI: u32 = 7;
+/// ADR-098 补记三：`console-probe` 的反例句柄同样归子任务，免得每轮漏一格。
+pub const ROLE_CONSOLE_ECHO: u32 = 8;
 /// kind 编号与 `handle::ObjRef` 一一对应，用户侧独立声明。
 pub const KIND_FILE: u32 = 1;
 pub const KIND_VMO: u32 = 2;
@@ -1166,6 +1170,29 @@ pub fn session_va_count(sid: u8) -> usize {
         Some(k) => SVA_N[k].load(core::sync::atomic::Ordering::Acquire),
         None => 0,
     }
+}
+
+/// ADR-098：**关会话时把这张表里的保留逐条还回去**。返回 `(放掉, 没放掉)`。
+/// `没放掉 > 0` 时调用方**必须**打进串口：没放掉的保留就是下一次同址装载的 -6，
+/// 而且它是静默的——第二次 `si_va` 报 -6 时看不出是哪一条没放。
+pub fn session_release_va(sid: u8) -> (usize, usize) {
+    let Some(k) = sid_ok(sid) else { return (0, 0) };
+    // 先取走条数再逐条清：这样"表里已经没有它了"与"还没还"两件事分开，
+    // 中途被打断也不会把同一条还两次（`release_va` 对没登记过的基址返回 false）。
+    let n = SVA_N[k]
+        .swap(0, core::sync::atomic::Ordering::AcqRel)
+        .min(SESSION_VA_CAP);
+    let mut ok = 0usize;
+    let mut bad = 0usize;
+    for i in 0..n {
+        let base = SVA[k][i].swap(0, core::sync::atomic::Ordering::Relaxed);
+        if base != 0 && mm::release_va(base) {
+            ok += 1;
+        } else {
+            bad += 1;
+        }
+    }
+    (ok, bad)
 }
 
 pub fn session_va_at(sid: u8, i: usize) -> u64 {

@@ -991,6 +991,8 @@ fn run_ktests_and_finish() -> ! {
     // 这样用例读数不受影响，而 hello 的输出能进同一份串口。
     // S5d：接住 init 的任务号——判定之后要不要等它，由 `park_until_init_exits` 说。
     let init_task = stage_init_user(0);
+    // ADR-097：留一份任务号给关闭路径（`×` 关的是会话，不是整机）。
+    INIT_TASK.store(init_task.unwrap_or(0), core::sync::atomic::Ordering::Relaxed);
     // S6p：第二个会话（多标签）。**只在新特性下起**：既有变体的任务与句柄账一格不动。
     #[cfg(feature = "multisession")]
     {
@@ -1051,7 +1053,7 @@ fn run_ktests_and_finish() -> ! {
 fn park_until_init_exits(init: Option<usize>) {
     #[cfg(feature = "resident-init")]
     {
-        let Some(gidx) = init else { return };
+        let mut gidx = match init { Some(g) => g, None => return };
         crate::log_info!("resident-init: 判定已出，等 init（任务={}）收工；没人喂命令就不会退出", gidx);
         // S6g：判定之后的常驻期画面**继续刷新**（terminal 的意义就在这里）。
         // 这里单独开一次映射：stage_init_user 里那一个已经随函数返回 drop 掉了。
@@ -1064,6 +1066,37 @@ fn park_until_init_exits(init: Option<usize>) {
             // （A/B：`-display none` 与 `-display gtk` 的每帧毫秒同一量级，140.1 / 198.3）。
             let woke = apic::with_interrupts(|| sched::wait_for_task(gidx, crate::clock::window_cycles(1)));
             if woke {
+                // ADR-097：`Done` 有**两种来路**——会话自己打 `exit`（自愿 ⇒ 收工），
+                // 或者被 `×` 关掉（只关那一页 ⇒ 重开一个新 shell 继续等）。
+                // 区分它们不新增 syscall、不动 sched 的等待语义（硬约束①）：
+                // 关闭路径会把 `closed[0]` 置上，这里只读那一格。
+                #[cfg(feature = "fbcon-live")]
+                {
+                    let by_user = live.as_mut().map_or(false, |t| t.closed[0]);
+                    if by_user {
+                        crate::log_info!("会话 0 已终止 ⇒ 重开新 shell");
+                        // 旧正文要清零：不清的话新横幅接在上一会话的输出后面，
+                        // 「新开的会话是空的」这条就没有证人（首行判据也会被旧内容顶掉）。
+                        crate::serial::mirror_reset_sid(0);
+                        match stage_init_user(0) {
+                            Some(n) => {
+                                gidx = n;
+                                INIT_TASK.store(n, Ordering::Relaxed);
+                                crate::user::set_active_session(0);
+                                if let Some(t) = live.as_mut() {
+                                    t.closed[0] = false;
+                                }
+                                continue;
+                            }
+                            // 重开失败就如实报数并按**旧语义**收工——空转一扇没有会话的终端
+                            // 比停机更难诊断。哪一道墙挡着由上面那几条读数点名。
+                            None => {
+                                crate::log_warn!("会话 0 重开失败 ⇒ 按旧语义收工（资源墙见关闭那几行）");
+                                return;
+                            }
+                        }
+                    }
+                }
                 crate::log_info!("resident-init: init 已收工 ⇒ 系统停机");
                 return;
             }
@@ -1136,7 +1169,7 @@ fn stage_init_user(sid: u8) -> Option<usize> {
     use crate::user::{
         SYS_ASPACE_MAP, SYS_PROCESS_CREATE, SYS_PROCESS_START, SYS_THREAD_CREATE, syscall_dispatch,
         ABI_MAJOR, ABI_MINOR, SI_MAGIC, SI_OFF_HANDLES, SI_DESC_BYTES, SI_DESC_ROLE, SI_DESC_HANDLE,
-        ROLE_JOB, ROLE_LOG, E_DENIED,
+        ROLE_JOB, ROLE_LOG, ROLE_SI, ROLE_CONSOLE_ECHO, E_DENIED,
     };
     use crate::{proc, vmo};
 
@@ -1212,7 +1245,8 @@ fn stage_init_user(sid: u8) -> Option<usize> {
     // S6p：控制台反例句柄是**启动路径仪器的**，只发给 init 会话：它只被写进 si 交给
     // 子进程（今天的 shell 不读那一格），而每发一份都占全局 16 格句柄表的一格。
     let foreign = if cfg!(feature = "console-probe") && sid == 0 {
-        match handle::grant_console(owner, RIGHT_READ | RIGHT_WRITE, sid) {
+        // ADR-098 补记三：补 `RIGHT_TRANSFER`，否则写进描述表也转不走（每轮漏一格）。
+        match handle::grant_console(owner, RIGHT_READ | RIGHT_WRITE | RIGHT_TRANSFER, sid) {
             Ok(h) => h.0, Err(e) => { crate::log_warn!("init-user: 控制台反例句柄失败 {:?}", e); return None; }
         }
     } else { 0 };
@@ -1221,7 +1255,9 @@ fn stage_init_user(sid: u8) -> Option<usize> {
     hdr[0..4].copy_from_slice(&SI_MAGIC.to_le_bytes());
     hdr[4..6].copy_from_slice(&(ABI_MAJOR as u16).to_le_bytes());
     hdr[6..8].copy_from_slice(&(ABI_MINOR as u16).to_le_bytes());
-    hdr[8..12].copy_from_slice(&2u32.to_le_bytes());
+    // ADR-098 补记三：描述表 2 条（Job/控制台）+ si 自己 + 探针反例（只 sid 0）。
+    let n_desc: u32 = 2 + 1 + if foreign != 0 { 1 } else { 0 };
+    hdr[8..12].copy_from_slice(&n_desc.to_le_bytes());
     if cfg!(feature = "console-probe") {
         hdr[12..16].copy_from_slice(&512u32.to_le_bytes());
         hdr[16..20].copy_from_slice(&8u32.to_le_bytes());
@@ -1239,9 +1275,27 @@ fn stage_init_user(sid: u8) -> Option<usize> {
     if cfg!(feature = "console-probe") && vmo::vmo_write(si, 512, &foreign.to_le_bytes()) != Ok(8) {
         crate::log_warn!("init-user: 控制台探针参数写失败"); return None;
     }
-    let hi = match handle::grant_vmo(owner, si, RIGHT_READ | RIGHT_WRITE | RIGHT_MAP) {
+    // ADR-098 补记三（裁决：si 页归子任务）：补 `RIGHT_TRANSFER`，才能写进描述表转走。
+    let hi = match handle::grant_vmo(owner, si, RIGHT_READ | RIGHT_WRITE | RIGHT_MAP | RIGHT_TRANSFER) {
         Ok(h) => h, Err(_) => { crate::log_warn!("init-user: grant_vmo(si) 失败"); return None; }
     };
+    // ADR-098 补记三：把 si 页与探针反例句柄写进描述表 ⇒ 16 号把它们**转移**给子任务，
+    // 于是 `revoke_task(child)` 会连带 `vmo_unref`，创建者身上不再每轮留两格。
+    {
+        let mut d = [0u8; SI_DESC_BYTES];
+        d[SI_DESC_ROLE..SI_DESC_ROLE + 4].copy_from_slice(&ROLE_SI.to_le_bytes());
+        d[SI_DESC_HANDLE..SI_DESC_HANDLE + 8].copy_from_slice(&hi.0.to_le_bytes());
+        if vmo::vmo_write(si, SI_OFF_HANDLES + 2 * SI_DESC_BYTES, &d) != Ok(SI_DESC_BYTES) {
+            crate::log_warn!("init-user: si 描述写失败（ROLE_SI）"); return None;
+        }
+        if foreign != 0 {
+            d[SI_DESC_ROLE..SI_DESC_ROLE + 4].copy_from_slice(&ROLE_CONSOLE_ECHO.to_le_bytes());
+            d[SI_DESC_HANDLE..SI_DESC_HANDLE + 8].copy_from_slice(&foreign.to_le_bytes());
+            if vmo::vmo_write(si, SI_OFF_HANDLES + 3 * SI_DESC_BYTES, &d) != Ok(SI_DESC_BYTES) {
+                crate::log_warn!("init-user: si 描述写失败（ROLE_CONSOLE_ECHO）"); return None;
+            }
+        }
+    }
     vmo::vmo_unref(si);
     // si 页也要经 14 号铺进子 AS（rdx = Proc 句柄别名）。
     // S6p：**每个会话要一个自己的 si VA**——`reserve_va_at` 的登记表不是按 AS 分的
@@ -1352,6 +1406,11 @@ fn stage_init_user(sid: u8) -> Option<usize> {
 // **不挂 cfg**：`×` 的关闭分支在"没有多会话"的档里也要编得过（它只是不会真终止谁）——
 // S6q 补记三刚踩过：不带 multisession 的那档直接 E0425。
 static SECOND_TASK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// ADR-097：0 号会话（init shell）的任务号。`×` 要能「只关这一页」就得拿得到它，
+/// 而 `park_until_init_exits` 收到的 `Option<usize>` 在 `LiveTerm` 里看不到。
+/// 和 `SECOND_TASK` 一样**不挂 cfg**：关闭分支在没有多会话的档里也要编得过。
+static INIT_TASK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// S6g：`fbcon-live` 档的**活终端**——映射只做一次，之后每轮调一次 [`LiveTerm::repaint`]。
 ///
@@ -1637,23 +1696,33 @@ impl LiveTerm {
                         }
                         crate::fbcon::Hit::TabClose(i) => {
                             let i = i as usize;
-                            if i == 0 {
-                                // 0 号是 init：关它等于整机收工（与全局 `×` 同一口径）
-                                crate::log_info!("窗口: 关闭会话 0（init）⇒ 系统停机");
-                                crate::exit::finish(crate::exit::Code::Success);
-                            } else if i < crate::serial::SESSIONS && !self.closed[i] {
-                                // 关掉这个会话的任务，窗口从列表里消失；最后一个也关掉才停机。
-                                // **记账**：内核按任务号终止，返回 false 说明槽已经不在了 ⇒ 如实打出来。
-                                let g = SECOND_TASK.load(Ordering::Relaxed);
+                            // ADR-097：`×` **只关这个会话**，包括 0 号。停机只剩两条显式路：
+                            // shell 里打 `exit`，和标签条右上角那三个按钮里的全局 `×`。
+                            // ADR-098：关的同时把这条链走完——读 proc_id（terminate 会清掉它）
+                            // → terminate → **proc_reap**（销毁子 AS）→ **release_va**（放手全局
+                            // VA 保留）。漏掉后两步的表现就是重开时 `si_va=-6` 与 `创建者袋` 涨。
+                            // 重开不在这里做：任务的句柄袋要等 Done 走完才回收，所以归 park。
+                            // 原来那支「全部关闭 ⇒ 系统停机」删掉了：有了重开它不该存在。
+                            if i < crate::serial::SESSIONS && !self.closed[i] {
+                                let g = if i == 0 {
+                                    INIT_TASK.load(Ordering::Relaxed)
+                                } else {
+                                    SECOND_TASK.load(Ordering::Relaxed)
+                                };
+                                let pid = crate::sched::task_proc_id(g);
                                 let killed = g != 0 && crate::sched::terminate_task(g);
                                 self.closed[i] = true;
-                                crate::log_info!("窗口: 关闭会话 {} 终止任务={} 任务={}", i, killed, g);
+                                let reaped = match pid {
+                                    Some(p) => crate::proc::proc_reap(p).is_ok(),
+                                    None => false,
+                                };
+                                let (ok, bad) = crate::user::session_release_va(i as u8);
+                                crate::log_info!(
+                                    "窗口: 关闭会话 {} 终止任务={} 任务={} 收尸={} VA放手={}/{}",
+                                    i, killed, g, reaped, ok, bad
+                                );
                                 if crate::user::active_session() as usize == i {
                                     crate::user::set_active_session(0);
-                                }
-                                if self.closed.iter().filter(|c| **c).count() == crate::serial::SESSIONS {
-                                    crate::log_info!("窗口: 全部关闭 ⇒ 系统停机");
-                                    crate::exit::finish(crate::exit::Code::Success);
                                 }
                             }
                         }
@@ -1805,14 +1874,26 @@ impl LiveTerm {
                     }
                 }
                 WinHit::Close => {
-                    if i == 0 {
-                        crate::log_info!("wm: 关闭会话 0（init）⇒ 系统停机");
-                        crate::exit::finish(crate::exit::Code::Success);
+                    // ADR-097 + ADR-098：与标签条上的 `×` 同一条链（读 proc_id → terminate
+                    // → proc_reap → release_va），只关这一扇对应的会话，不停机。
+                    let g = if i == 0 {
+                        INIT_TASK.load(Ordering::Relaxed)
                     } else {
-                        let g = SECOND_TASK.load(Ordering::Relaxed);
-                        let killed = g != 0 && crate::sched::terminate_task(g);
-                        self.closed[i] = true;
-                        crate::log_info!("wm: 关闭窗口 {} 终止任务={}", i, killed);
+                        SECOND_TASK.load(Ordering::Relaxed)
+                    };
+                    let pid = crate::sched::task_proc_id(g);
+                    let killed = g != 0 && crate::sched::terminate_task(g);
+                    self.closed[i] = true;
+                    let reaped = match pid {
+                        Some(p) => crate::proc::proc_reap(p).is_ok(),
+                        None => false,
+                    };
+                    let (ok, bad) = crate::user::session_release_va(i as u8);
+                    crate::log_info!(
+                        "wm: 关闭窗口 {} 终止任务={} 任务={} 收尸={} VA放手={}/{}",
+                        i, killed, g, reaped, ok, bad
+                    );
+                    if i != 0 {
                         crate::user::set_active_session(0);
                     }
                 }
