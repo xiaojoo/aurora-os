@@ -1793,6 +1793,12 @@ fn t_ps2_kbd_decode() -> bool {
     let (e5c, c5c) = kbd::step(e5b, 0x12);
     let ext_break_ok =
         e5a && c5a == Code::ExtPrefix && e5b && c5b == Code::ExtTail && !e5c && c5c == Code::ExtTail;
+    // #58：方向键走 UI 旁路（`E0 48/50` ⇒ `Ui(0x80/0x81)`），**不进字符环**。
+    let (a1e, a1) = kbd::step(false, 0xE0);
+    let (a1x, a1c) = kbd::step(a1e, 0x48);
+    let (a2e, a2) = kbd::step(false, 0xE0);
+    let (a2x, a2c) = kbd::step(a2e, 0x50);
+    let arrow_ok = a1e && !a1x && a1c == Code::Ui(0x80) && a2e && !a2x && a2c == Code::Ui(0x81);
     let (_, c6) = kbd::step(false, 0x1C);
     let enter_ok = c6 == Code::Char(b'\r');
     let (_, c7) = kbd::step(false, 0x3A);
@@ -1813,12 +1819,14 @@ fn t_ps2_kbd_decode() -> bool {
     }
     let seq_ok = n == 3 && got[..3] == b"gi\r"[..];
     crate::log_info!(
-        "kbd-decode: make={:?} break={:?} 前缀={} 扩展内={:?} 扩展break={:?} 回车={:?} 不映射={:?} 序列={}字符",
+        "kbd-decode: make={:?} break={:?} 前缀={} 扩展内={:?} 扩展break={:?} 方向键={:?}/{:?} 回车={:?} 不映射={:?} 序列={}字符",
         c1,
         c2,
         ext3,
         c4,
         c5c,
+        a1c,
+        a2c,
         c6,
         c7,
         n
@@ -1827,6 +1835,7 @@ fn t_ps2_kbd_decode() -> bool {
         && break_ok
         && ext_ok
         && ext_break_ok
+        && arrow_ok
         && enter_ok
         && unmapped_ok
         && seq_ok;

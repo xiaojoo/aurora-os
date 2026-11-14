@@ -718,6 +718,8 @@ public_api = [
   "mouse::take_click",
   "mouse::buttons",
   "kbd::stats",
+  "kbd::take_ui_key",
+  "kbd::set_ui_capture",
 ]
 allowed_callers = ["integration", "sched"]
 dependencies = ["arch", "diagnostics", "irq", "memory", "pci", "sync"]

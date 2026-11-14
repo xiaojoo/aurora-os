@@ -1448,6 +1448,7 @@ static INIT_TASK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUs
 
 /// #58：`∨` 下拉的行。**会话在上、动作在下**（用户裁决 2026-11-14）。
 /// 置灰行表示"今天没有动作"——点了要在串口如实报，不假装成功。
+#[cfg(feature = "framebuffer")]
 const MENU_ROWS: [crate::fbcon::MenuRow; 4] = [
     crate::fbcon::MenuRow { label: "会话 0", hint: "Ctrl+Shift+1", dim: false },
     crate::fbcon::MenuRow { label: "会话 1", hint: "Ctrl+Shift+2", dim: false },
@@ -1519,6 +1520,9 @@ struct LiveTerm {
     /// #58：`∨` 下拉开着吗、指针停在第几行。
     menu: bool,
     menu_hover: Option<u8>,
+    /// #58：上一次看到的指针位置。**面板的选择在这两种输入间仲裁**：
+    /// 指针挪了 ⇒ 指针赢（悬停）；指针没动 ⇒ 保留键盘选中的那一行。
+    last_ptr: (i32, i32),
     /// #58：每个会话"上次被看过时"的累计字节数；与当前值不同且不是活动标签 ⇒ 未读圆点。
     seen: [usize; crate::serial::SESSIONS],
     /// 首次观察标记：开机那一屏算"已看过"，不给任何标签点未读。
@@ -1566,6 +1570,7 @@ impl LiveTerm {
             hover: None,
             menu: false,
             menu_hover: None,
+            last_ptr: (0, 0),
             seen: [0; crate::serial::SESSIONS],
             seen_init: false,
             paints: (0, 0, 0, 0),
@@ -1611,12 +1616,19 @@ impl LiveTerm {
         self.menu = false;
         self.menu_hover = None;
         match row {
-            Some(0) | Some(1) => {
-                let i = row.unwrap();
-                crate::user::set_active_session(i);
-                crate::log_info!("菜单: 切到会话 {} ⇒ 关", i);
+            Some(r) => self.menu_run(r),
+            None => crate::log_info!("菜单: 点在外面 ⇒ 关"),
+        }
+    }
+
+    /// #58：执行一行（鼠标点击与 Enter 共用）。行号见 `MENU_ROWS`。
+    fn menu_run(&mut self, row: u8) {
+        match row {
+            0 | 1 => {
+                crate::user::set_active_session(row);
+                crate::log_info!("菜单: 切到会话 {} ⇒ 关", row);
             }
-            Some(2) => {
+            2 => {
                 #[cfg(feature = "wm")]
                 {
                     self.float = !self.float;
@@ -1628,10 +1640,38 @@ impl LiveTerm {
                 crate::log_info!("菜单: 本档没有浮窗版面");
             }
             // 置灰行：**如实报是哪道墙**，不假装成功（16 格句柄表在两会话时已 15/16）。
-            Some(3) => {
+            3 => {
                 crate::log_warn!("菜单: 新建 shell 撞容量墙（句柄表 16 格，两会话已占 15）");
             }
-            _ => crate::log_info!("菜单: 点在外面 ⇒ 关"),
+            _ => {}
+        }
+    }
+
+    /// #58：面板开着时键盘归面板（模态）。方向键移动、Enter 执行、Esc 关闭。
+    fn menu_keys(&mut self) {
+        // 键源只认 UI 槽：面板开着时 kbd 把 Esc/Enter **捕获**到这里（不进字符环），
+        // 方向键本来就走这条旁路。串口环是 shell 的单消费者通道，面板不碰。
+        let Some(b) = crate::kbd::take_ui_key() else { return };
+        match b {
+            0x1B => {
+                self.menu = false;
+                self.menu_hover = None;
+                crate::log_info!("菜单: Esc ⇒ 关");
+            }
+            0x0D => {
+                let row = self.menu_hover.unwrap_or(0);
+                self.menu = false;
+                self.menu_hover = None;
+                crate::log_info!("菜单: Enter 行={}", row);
+                self.menu_run(row);
+            }
+            k => {
+                let n = MENU_ROWS.len() as u8;
+                let cur = self.menu_hover.unwrap_or(0);
+                let next = if k == 0x80 { (cur + n - 1) % n } else { (cur + 1) % n };
+                self.menu_hover = Some(next);
+                crate::log_info!("菜单: 行={}", next);
+            }
         }
     }
 
@@ -1747,8 +1787,21 @@ impl LiveTerm {
     /// `mirror_newlines_sid` 每次要扫完整段环（最多 8 KiB），拿它当指针的节拍就是
     /// 用约 140 ms 的代价换约 16 ms 的观感。用户说的"鼠标移动卡顿"就是这个数。
     fn tick(&mut self) {
-        // #58：每拍算一次"指针停在哪一个标签上"，并为**当前正在看的会话**记一次已读。
-        // 悬停变化才重画（进签名），没变就一个字都不写。
+        // #58：面板开着 ⇒ **键盘归面板**（模态）：方向键移动、Enter 执行、Esc 关闭。
+        // 捕获开关每拍同步一次（原子写）：面板关着时 Enter 仍由 shell 取，语义不变。
+        #[cfg(feature = "ps2-kbd")]
+        {
+            crate::kbd::set_ui_capture(self.menu);
+            if self.menu {
+                self.menu_keys();
+            } else {
+                // 面板关着：方向键没有别的用主，**当场丢掉**，否则会在下一次开面板时补跳一格。
+                let _ = crate::kbd::take_ui_key();
+            }
+        }
+        // #58：每拍算一次"指针停在哪一个标签上"。
+        // **只在有鼠标的档里**：`s6d` 那类无 `ps2-mouse` 的构建没有 `crate::mouse`。
+        #[cfg(feature = "ps2-mouse")]
         {
             let (cols, _rows) = self.term.dims();
             let (px, py) = crate::mouse::pos();
@@ -1762,14 +1815,20 @@ impl LiveTerm {
                 crate::log_info!("版面: 悬停={:?}", hv);
             }
             // #58：面板开着时，悬停落在面板的哪一行（面板盖住标签条以下，所以分开算）。
-            if self.menu {
+            // **指针动没动**是它与键盘选中的仲裁：动了指针赢，没动就保留键盘那一行。
+            let moved = (px, py) != self.last_ptr;
+            self.last_ptr = (px, py);
+            if self.menu && moved {
                 let mh = crate::fbcon::menu_hit(cols, MENU_ROWS.len() as u64, px as u64, py as u64);
                 if mh != self.menu_hover {
                     self.menu_hover = mh;
                 }
             }
+        }
+        {
             // **首次观察即视为已读**：开机会话自己的横幅不该变成"未读圆点"
             // （实测：不这么做 tab1 从开机起就有一个 36 像素的点）。
+            let (_, _, active, _) = self.layout();
             if !self.seen_init {
                 for i in 0..crate::serial::SESSIONS {
                     self.seen[i] = crate::serial::mirror_total_sid(i);

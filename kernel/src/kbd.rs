@@ -112,6 +112,26 @@ const CHAR_MAP: [u8; 128] = [
 /// 一个扫描码字节的归类。ISR 的账目**只由它决定**——如果 ISR 自己再看一遍 bit7，
     /// 那"解码器把 break 当 make"这类错就永远不会在环那一侧露出来（本机实测：变异 N1
     /// 注入后 `入环` 仍是 19，因为 ISR 的重复过滤把错误遮住了）。所以这里做成单一证人。
+/// #58：给 UI 的方向键（0x80 = 上、0x81 = 下）。单一槽，`take_ui_key` 取走即清。
+static UI_KEY: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// 面板开着（模态）：Esc / Enter 在这时**归 UI**，不进控制台环。
+/// 由 UI 每拍同步一次（原子写，便宜），所以面板关着时 shell 拿到 Enter 的语义一字不变。
+static CAPTURE: AtomicBool = AtomicBool::new(false);
+
+/// 开/关"Esc、Enter 归 UI"。只切**归属**，不改解码，也不动账目。
+pub fn set_ui_capture(on: bool) {
+    CAPTURE.store(on, Ordering::Relaxed);
+}
+
+/// 取走一个 UI 键（面板开着时每拍看一眼）。
+pub fn take_ui_key() -> Option<u8> {
+    match UI_KEY.swap(0, Ordering::AcqRel) {
+        0 => None,
+        k => Some(k),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Code {
     /// `0xE0` 前缀本身：只置状态，不出字符
@@ -124,6 +144,9 @@ pub enum Code {
     Char(u8),
     /// 表里没有的 make 码：计数，**不猜**
     Unmapped,
+    /// #58：**给 UI 的键**（方向键这类扩展码）。它们不进控制台环——本来就是 `ExtTail`，
+    /// 现在单独留一格，面板开着时由 UI 取走；面板没开时直接丢弃。
+    Ui(u8),
 }
 
 /// 纯解码：给定"上一条是不是 `0xE0` 前缀"与本字节，返回新的前缀状态与本字节的归类。
@@ -140,6 +163,13 @@ pub fn step(prev_ext: bool, sc: u8) -> (bool, Code) {
         return (true, Code::ExtPrefix);
     }
     if prev_ext {
+        // #58：方向键（`E0 48` / `E0 50`）留给 UI；其余扩展码仍按"吃掉"处理。
+        if sc == 0x48 {
+            return (false, Code::Ui(0x80));
+        }
+        if sc == 0x50 {
+            return (false, Code::Ui(0x81));
+        }
         // 扩展序列（方向键、Home 等）：本片不解码，但要数得出来。
         // `0xF0` 是扩展 break 的前缀，后面还有一拍真码，所以这一拍**保持扩展态**；
         // 其余字节吃掉并复位。少了这个区分，`E0 F0 12` 的最后一拍会被当普通 make 解出字符。
@@ -230,10 +260,23 @@ pub fn kbd_isr() -> bool {
             // 表里没有的 make 码（Ctrl、F1-F12、小键盘那些）计数后什么都不做，**不猜**
             UNMAPPED.fetch_add(1, Ordering::Relaxed);
         }
+        Code::Ui(k) => {
+            // 单一槽：UI 每拍取一次；没取走就被下一次覆盖（丢一次方向键无害）。
+            UI_KEY.store(k, Ordering::Release);
+            // 账目：这一字节**没变成字符**，仍记在"吞掉"格 —— 与它从前当 ExtTail 时同格，
+            // 于是分账等式（见 `kbd_isr` 的分账注释）不用改口径。
+            SWALLOWED.fetch_add(1, Ordering::Relaxed);
+        }
         Code::Char(c) => {
             // S6q：Ctrl 按着就把字母压成控制码（Ctrl+C = 0x03）。账目不变：
             // 这个字节仍然只落进"入环"这一格，只是入环的**值**是控制码。
             let c = apply_ctrl(CTRL.load(Ordering::Relaxed), c);
+            if CAPTURE.load(Ordering::Relaxed) && (c == 0x1B || c == 0x0D) {
+                // 模态捕获：Esc / Enter 交给 UI，**不进环**。账目仍记在"吞掉"（没变成字符）。
+                UI_KEY.store(c, Ordering::Release);
+                SWALLOWED.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
             let h = HEAD.load(Ordering::Relaxed);
             if (h + 1) % RING_CAP == TAIL.load(Ordering::Relaxed) {
                 DROPPED.fetch_add(1, Ordering::Relaxed);   // 环满：丢新键并计数，不覆盖、不等待

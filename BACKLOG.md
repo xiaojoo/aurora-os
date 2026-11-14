@@ -12921,3 +12921,37 @@ wm: 铺旧矩形 旧=(5,8,70,11) 视图=true     ← 只铺了**最后一个**
   不是没画（读数 56247 就摆在那里）。
 · 仍开：profile 只有置灰一行、无键盘导航、未读圆点无生产者。
 
+
+## 291. **面板键盘导航（方向键/Enter/Esc）与两处实测纠正**（2026-11-14，实测）
+
+· `kbd` 新增 UI 旁路：`Code::Ui(u8)` + 单槽 `UI_KEY` + `take_ui_key()`；`E0 48/50` ⇒ `Ui(0x80/0x81)`，
+  **不进** 64 格字符环。`Ui` 的字节仍记在"吞掉"格 ⇒ 分账等式
+  `字节 = 入环 + 丢弃 + break + 扩展 + 吞掉 + 不映射` 口径不变（不改日志契约）。
+· Esc/Enter 走 `kbd::set_ui_capture(on)` 模态捕获：捕获期 ISR 把 `0x1B`/`0x0D` 交给 UI 槽、不进环；
+  面板关着时 Enter 仍由 shell 取（提交命令语义不变）。
+· **纠正一（首版设计错）**：第一版从 `kbd::read_char()` 与 shell 抢同一个环 ⇒ 切到会话 1 之后
+  Esc 被 shell 抢走：`Esc 关=False`、面板残留 **56247 px**。改成捕获后八格全绿。
+  串口环更不能用（`serial::read_byte` 注释写明单消费者）。
+· **纠正二（上一片的存量断裂）**：#58 的悬停块无条件引用 `crate::mouse::pos()`，
+  而 `ps2-mouse` 是可选档 ⇒ `s6d` 那档（`fbcon-live,ps2-kbd,resident-init,console-probe`）
+  **编译不过**（E0433）。本片把指针相关整块包进 `#[cfg(feature = "ps2-mouse")]`，s6d 恢复 PASS。
+· 仲裁：新增 `last_ptr`，**指针动了才用悬停覆盖** `menu_hover`，没动就保留键盘选中的行；
+  关面板时清 UI 槽（否则下次开面板先补跳一格）。Enter 与鼠标点击共用 `menu_run(row)`。
+· 读数：`build/s58-keys-check.py` **八格 PASS**——`菜单: 行=1`、`菜单: Enter 行=1`、
+  **`菜单: 切到会话 1 ⇒ 关`**（第 0 行是"切到会话 0"，所以这一格同时证明选中行不是默认值）、
+  `菜单: Esc ⇒ 关`、Esc 后面板色残留 **0**。
+· 变异 **N-k1**（注释掉 `self.menu_keys()`）⇒ 五格红（行=1/Enter 行=1/切会话 1/再开/Esc 关），
+  还原 ⇒ 八格全绿。
+· 回归：`s58-menu` **PASS**（六格）、`s6t` **PASS**（11 格）、`s6q` **PASS**、`s6d` **PASS**（12 格）、
+  `t_ps2_kbd_decode` 补一格"方向键 ⇒ Ui(0x80/0x81)"；`check` **17/17**。
+· 接口面：`kbd::take_ui_key` / `kbd::set_ui_capture` 已登记 `input.public_api`，本片带 ADR-102。
+· 仍开：Ctrl+Shift+1/2 组合键（面板提示里写着但无通道）、Home/End、未读圆点生产者、`wm` 进判定表。
+· **收尾实测（最终源码）**：五个档 0 error（默认 / `framebuffer` / `framebuffer,ps2-kbd` / s6d 档 / wm 档）；
+  `run --features ps2-kbd` ⇒ `kbd-decode: … 方向键=Ui(128)/Ui(129) …`、`ktests: total=83 passed=83`；
+  `test` 整表 **55 符合 / 2 不符合**，两行红都出自 `t_q2_workload_slots`（`peak=false` / `full=false`，
+  已知低率抖动，任务 #46）⇒ **不归因于本片**；s6d 与 s58-keys 在最终源码上各重跑一次 **PASS**。
+· 又一处存量断裂被本片撞出：ADR-101 的 `MENU_ROWS` 无条件引用 `crate::fbcon`，而 `fbcon` 由
+  `framebuffer` 门控 ⇒ **默认档自 ADR-101 起就编不过**（`test` 正向第一跑才暴露）。补了
+  `#[cfg(feature = "framebuffer")]`；键盘块补 `#[cfg(feature = "ps2-kbd")]`。
+· **未验证**：分账等式在"含方向键的一跑"里的端到端读数——`kbd: 字节=…` 只在启动时打印一次
+  （按键之前），这一跑的读数是全零；闭合性今天只有结构证据（`Ui` 记进"吞掉"格）与 ktest。
