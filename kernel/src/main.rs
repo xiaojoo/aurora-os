@@ -1066,6 +1066,15 @@ fn park_until_init_exits(init: Option<usize>) {
             // （A/B：`-display none` 与 `-display gtk` 的每帧毫秒同一量级，140.1 / 198.3）。
             let woke = apic::with_interrupts(|| sched::wait_for_task(gidx, crate::clock::window_cycles(1)));
             if woke {
+                // ADR-098 诊断：`Done` 的来路要看得出是"自愿 exit"还是"故障收工"。
+                // 退出码从**进程记录**里读（此刻任务槽已 Done、进程还没 reap ⇒ 读得到）；
+                // 故障向量只出现在故障路径上，而本次日志里没有 fatal/exception ⇒ 先读退出码即可分。
+                let pid_now = crate::sched::task_proc_id(gidx);
+                let code_now = pid_now.map(crate::proc::proc_exit_code);
+                crate::log_info!(
+                    "resident-init: 0 号任务收工 任务={} 进程={:?} 退出码={:?}",
+                    gidx, pid_now, code_now
+                );
                 // ADR-097：`Done` 有**两种来路**——会话自己打 `exit`（自愿 ⇒ 收工），
                 // 或者被 `×` 关掉（只关那一页 ⇒ 重开一个新 shell 继续等）。
                 // 区分它们不新增 syscall、不动 sched 的等待语义（硬约束①）：
@@ -1387,6 +1396,16 @@ fn stage_init_user(sid: u8) -> Option<usize> {
         denied, hp.0, aslot, sched::aspace_of(gidx), loaded.entry, loaded.stack_top,
         loaded.segs, loaded.pages, owned_n, sched::owned_of(gidx), stopped, started, runs, done, si_va
     );
+    // ADR-098 诊断：启动等待期间就收工的（`等待收工=true`）到底是 `exit(n)` 还是故障，
+    // 由这一格分：进程记录此刻还在（没人 reap），退出码是 `SYS_EXIT` 带下来的那个数。
+    if done {
+        // 用本函数的 `pid`（11 号解出来的那个）：`task_proc_id` 在**自愿退出**路径上已被清空，
+        // 拿不到号就读不出码——第一版就是这么量成 `进程=None 退出码=None` 的。
+        crate::log_info!(
+            "init-user(S4b-4): 会话={} 启动期即收工 任务={} 进程={} 退出码={}",
+            sid, gidx, pid, crate::proc::proc_exit_code(pid)
+        );
+    }
 
     // S6p：**创建者手里这两格在放行之后就是死重**——Proc/Thread 句柄只服务 15/16 号，
     // 之后内核按任务号（`gidx`）等它收工；而 16 号每开一个会话要向子进程补授三格 SELF_*，
