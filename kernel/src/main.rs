@@ -1476,7 +1476,7 @@ struct LiveTerm {
     /// 上百毫秒），而指针与光标每秒要动好几次；只要这一格没变就**不重画正文**。
     /// (会话号, 该会话环里累计字节, 该会话环里的换行数, 标签数, 活动标签)
     /// —— 换行数是"整窗 vs 只画输入行"的分水岭；最后一格是版面（S6t：标签条 ⇄ 浮窗）。
-    sig: (u8, usize, u64, u64, u64, bool, Option<u8>, u16),
+    sig: (u8, usize, u64, u64, u64, bool, bool),
     /// 光标（下划线）**现在**画在哪一格；`None` = 现在是灭的一相。
     caret: Option<(u64, u64)>,
     /// 下一相光标该在哪一格（整窗重画时由 `redraw_window` 交回来）。
@@ -1562,7 +1562,7 @@ impl LiveTerm {
         term.clear(&frame);
         Some(Self {
             frame, term,
-            sig: (u8::MAX, usize::MAX, u64::MAX, 0, 0, false, None, 0),
+            sig: (u8::MAX, usize::MAX, u64::MAX, 0, 0, false, false),
             caret: None,
             caret_at: None,
             ptr: None,
@@ -1612,7 +1612,7 @@ impl LiveTerm {
     /// #58：面板上的一击。行号见 `MENU_ROWS`：0/1 切会话、2 切浮窗版面、3 置灰（如实报墙）。
     fn menu_click(&mut self, cx: i32, cy: i32) {
         let row = crate::fbcon::menu_hit(
-            self.term.dims().0, MENU_ROWS.len() as u64, cx as u64, cy as u64);
+            self.term.dims().0, self.layout().1, MENU_ROWS.len() as u64, cx as u64, cy as u64);
         self.menu = false;
         self.menu_hover = None;
         match row {
@@ -1675,6 +1675,28 @@ impl LiveTerm {
         }
     }
 
+    /// 只重画标签条那一行。**指针先擦掉**：它盖住的那几十个像素马上就会被重画，
+    /// 不擦的话 `ptr_track` 会把旧背景再贴回去（残留一点旧 ×/圆点）。
+    fn bar_only(&mut self, active: u64) {
+        #[cfg(feature = "ps2-mouse")]
+        self.ptr_erase();
+        let open = (0..crate::serial::SESSIONS).filter(|i| !self.closed[*i]).count() as u64;
+        self.term.tab_bar(&self.frame, open, active, self.hover, self.unread_mask(active));
+        if self.menu {
+            let rows = MENU_ROWS;
+            self.term.menu_panel(&self.frame, open, &rows, self.menu_hover);
+        }
+    }
+
+    /// 只重画面板那一块（面板自己不透明，局部重画是安全的）。
+    fn menu_only(&mut self) {
+        #[cfg(feature = "ps2-mouse")]
+        self.ptr_erase();
+        let open = (0..crate::serial::SESSIONS).filter(|i| !self.closed[*i]).count() as u64;
+        let rows = MENU_ROWS;
+        self.term.menu_panel(&self.frame, open, &rows, self.menu_hover);
+    }
+
     /// #58：未读位图——"该会话自上次被看过以来有新字节，且它不是当前活动标签"。
     fn unread_mask(&self, active: u64) -> u64 {
         let mut m = 0u64;
@@ -1730,10 +1752,10 @@ impl LiveTerm {
         let lay = self.float;
         #[cfg(not(feature = "wm"))]
         let lay = false;
-        // #58：**悬停也进签名**——它只影响标签条那一行，但那一行由整窗重画负责。
-        // #58：下拉开合与悬停行也进签名（它只影响那块面板，但由整窗重画负责）。
-        let menu_bits = (self.menu as u16) | ((self.menu_hover.map_or(0, |h| h + 1) as u16) << 1);
-        let sig = (sid as u8, total, nl as u64, tabs, active, lay, self.hover, menu_bits);
+        // **悬停与面板选中行不进签名**：它们只影响标签条那一行 / 面板那一块，
+        // 进签名就等于"指针每跨一格整屏重画一次"——用户实测的闪烁就是这个。
+        // 这两样改由 `tick` 里的局部重画负责；签名里只留"面板开没开"（开/关要动正文那块）。
+        let sig = (sid as u8, total, nl as u64, tabs, active, lay, self.menu);
         // S6t：**浮窗里"只改 z 序/桌面"的点击不会动内容签名**，只看 `sig` 的话置顶永远
         // 不生效（实测：点 win0 标题后 base 与 raised 只差 120 个像素=光标与指针，
         // 而点关闭之后差 38610——因为关闭顺带改了内容）。所以把浮窗的脏判定也接进这一格。
@@ -1750,8 +1772,7 @@ impl LiveTerm {
                 && self.sig.2 == nl as u64
                 && self.sig.1 != usize::MAX
                 && self.sig.5 == lay
-                && self.sig.6 == self.hover
-                && self.sig.7 == menu_bits;
+                && self.sig.6 == self.menu;
             #[cfg(feature = "wm")]
             let (cc, cr) = if self.float {
                 self.wm_frame()
@@ -1767,7 +1788,7 @@ impl LiveTerm {
             let (cc, cr) = self.tabbed_frame(incremental, sid, tabs, active, chrome, rows);
             if self.menu {
                 let rows = MENU_ROWS;
-                self.term.menu_panel(&self.frame, &rows, self.menu_hover);
+                self.term.menu_panel(&self.frame, tabs, &rows, self.menu_hover);
             }
             self.sig = sig;
             self.last_chrome = chrome;
@@ -1813,15 +1834,20 @@ impl LiveTerm {
             if hv != self.hover {
                 self.hover = hv;
                 crate::log_info!("版面: 悬停={:?}", hv);
+                // 只重画标签条那一行（含 `+`/`∨`/窗口按钮），**不整屏重画**——
+                // 悬停进签名会让指针每跨一格就整屏刷一次，那就是"闪烁"。
+                self.bar_only(active);
             }
             // #58：面板开着时，悬停落在面板的哪一行（面板盖住标签条以下，所以分开算）。
             // **指针动没动**是它与键盘选中的仲裁：动了指针赢，没动就保留键盘那一行。
             let moved = (px, py) != self.last_ptr;
             self.last_ptr = (px, py);
             if self.menu && moved {
-                let mh = crate::fbcon::menu_hit(cols, MENU_ROWS.len() as u64, px as u64, py as u64);
+                let mh = crate::fbcon::menu_hit(cols, tabs, MENU_ROWS.len() as u64, px as u64, py as u64);
                 if mh != self.menu_hover {
                     self.menu_hover = mh;
+                    // 面板局部重画（面板自己铺底，下面就是正文，不会漏旧像素）。
+                    self.menu_only();
                 }
             }
         }
