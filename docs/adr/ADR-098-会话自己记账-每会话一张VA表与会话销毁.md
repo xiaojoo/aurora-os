@@ -104,3 +104,11 @@ handle::MAX_HANDLES   16          日志里带上限，免得读数离开源码�
 **偏移 512 那格保持不变**：它写的是"值"，16 号转移之后旧值会 Stale，仍属"被拒"那一类，
 但理由码可能从"权限"变成"世代"——这一条要 `s6p` / `console-probe` 跑过才算数。
 `ROLE_SI` / `ROLE_CONSOLE_ECHO` 对用户态是未知角色，shell 只认 `ROLE_LOG`、其余跳过。
+
+## 补记四（2026-11-14）：关闭请求是进程级事实
+
+`live_wait_and_redraw` 与 park 各开一份 `LiveTerm`，各自的 `closed[]`。启动等待期间来的点击写进
+**等待那份**，park 永远读到 false ⇒ 任务被杀但"用户按的"标记丢了 ⇒ 判成自愿收工。
+裁决：新增 `static CLOSE_REQ: [AtomicBool; SESSIONS]`，两条关闭路径置位，
+park 用 `swap(false)` **消费一次请求**；`self.closed[i]` 降级为纯视图状态。
+九格 `s6v-close-check.py` 全绿（含第二次关、全局 `×`）。

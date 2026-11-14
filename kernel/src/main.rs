@@ -1059,9 +1059,6 @@ fn park_until_init_exits(init: Option<usize>) {
         // 这里单独开一次映射：stage_init_user 里那一个已经随函数返回 drop 掉了。
         #[cfg(feature = "fbcon-live")]
         let mut live = LiveTerm::open();
-        // ADR-098 诊断（**临时**）：上一次重开发生在第几拍（`main_frames()` 是节拍计数）。
-        #[allow(unused_mut)]
-        let mut last_reopen_tick = 0usize;
         loop {
             // S6u：**一拍 1 窗口（约 16 ms）**，内容签名每 8 拍才算一次。
             // 拆之前这里是"每轮 8 窗口（约 140 ms）"，而指针只在 repaint 里画 ⇒
@@ -1069,23 +1066,6 @@ fn park_until_init_exits(init: Option<usize>) {
             // （A/B：`-display none` 与 `-display gtk` 的每帧毫秒同一量级，140.1 / 198.3）。
             let woke = apic::with_interrupts(|| sched::wait_for_task(gidx, crate::clock::window_cycles(1)));
             if woke {
-                // ADR-098 诊断（**临时**）：收工那一刻的三格读数。
-                // `closed` = park 用来区分"被 × 关掉"与"自愿 exit"的那一格；
-                // `距重开` = 距上一次重开过了多少拍（启动等待约 63 拍 ≈ 1 s）。
-                let closed_now = {
-                    #[cfg(feature = "fbcon-live")]
-                    {
-                        live.as_ref().map_or(false, |t| t.closed[0])
-                    }
-                    #[cfg(not(feature = "fbcon-live"))]
-                    {
-                        false
-                    }
-                };
-                crate::log_info!(
-                    "resident-init: 收工读数 closed={} gidx={} 距重开={} 拍",
-                    closed_now, gidx, crate::main_frames().wrapping_sub(last_reopen_tick)
-                );
                 // ADR-098 诊断：`Done` 的来路要看得出是"自愿 exit"还是"故障收工"。
                 // 退出码从**进程记录**里读（此刻任务槽已 Done、进程还没 reap ⇒ 读得到）；
                 // 故障向量只出现在故障路径上，而本次日志里没有 fatal/exception ⇒ 先读退出码即可分。
@@ -1101,15 +1081,9 @@ fn park_until_init_exits(init: Option<usize>) {
                 // 关闭路径会把 `closed[0]` 置上，这里只读那一格。
                 #[cfg(feature = "fbcon-live")]
                 {
-                    let by_user = live.as_mut().map_or(false, |t| t.closed[0]);
+                    // **消费一次请求**：两份 LiveTerm 谁处理点击都算数。
+                    let by_user = CLOSE_REQ[0].swap(false, Ordering::AcqRel);
                     if by_user {
-                        // 复位必须**在重开之前**：`stage_init_user` 自己的启动等待里有
-                        // `live.repaint()`，点击就在那里被处理。复位放在重开之后的话，
-                        // 等待期间到来的第二次关闭会被这一句抹掉 ⇒ 下一次 Done 被当成
-                        // "自愿收工"⇒ 停机（实测：第二次点击落在第 12~14 轮之间）。
-                        if let Some(t) = live.as_mut() {
-                            t.closed[0] = false;
-                        }
                         crate::log_info!("会话 0 已终止 ⇒ 重开新 shell");
                         // 旧正文要清零：不清的话新横幅接在上一会话的输出后面，
                         // 「新开的会话是空的」这条就没有证人（首行判据也会被旧内容顶掉）。
@@ -1117,7 +1091,6 @@ fn park_until_init_exits(init: Option<usize>) {
                         match stage_init_user(0) {
                             Some(n) => {
                                 gidx = n;
-                                last_reopen_tick = crate::main_frames();
                                 INIT_TASK.store(n, Ordering::Relaxed);
                                 crate::user::set_active_session(0);
                                 continue;
@@ -1473,6 +1446,14 @@ static SECOND_TASK: core::sync::atomic::AtomicUsize = core::sync::atomic::Atomic
 /// 和 `SECOND_TASK` 一样**不挂 cfg**：关闭分支在没有多会话的档里也要编得过。
 static INIT_TASK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+/// ADR-098：**关闭请求是进程级事实，不是视图状态**。
+/// 为什么不能继续用 `LiveTerm::closed`：`live_wait_and_redraw` 与 park **各开一份
+/// `LiveTerm`**，启动等待期间来的点击写进等待那份，park 那份永远读到 false
+/// ⇒ 任务被杀、"用户按的"标记丢了 ⇒ park 判成自愿收工（BACKLOG §283）。
+/// 三个写者是两条关闭路径；读+清只有 `park_until_init_exits` 一处（`swap(false)`）。
+static CLOSE_REQ: [core::sync::atomic::AtomicBool; crate::serial::SESSIONS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; crate::serial::SESSIONS];
+
 /// S6g：`fbcon-live` 档的**活终端**——映射只做一次，之后每轮调一次 [`LiveTerm::repaint`]。
 ///
 /// 它不落冻结闸门（`freeze_band` 在这条路上根本不会被调用）：冻结契约是为"取一张确定的
@@ -1772,7 +1753,9 @@ impl LiveTerm {
                                 };
                                 let pid = crate::sched::task_proc_id(g);
                                 let killed = g != 0 && crate::sched::terminate_task(g);
+                                // 视图侧：这一份画面上的标签消失；进程级：记下"用户按的"。
                                 self.closed[i] = true;
+                                CLOSE_REQ[i].store(true, Ordering::Release);
                                 let reaped = match pid {
                                     Some(p) => crate::proc::proc_reap(p).is_ok(),
                                     None => false,
@@ -1945,6 +1928,7 @@ impl LiveTerm {
                     let pid = crate::sched::task_proc_id(g);
                     let killed = g != 0 && crate::sched::terminate_task(g);
                     self.closed[i] = true;
+                    CLOSE_REQ[i].store(true, Ordering::Release);
                     let reaped = match pid {
                         Some(p) => crate::proc::proc_reap(p).is_ok(),
                         None => false,
@@ -2151,14 +2135,6 @@ fn live_wait_and_redraw(gidx: usize, total_windows: u64) -> bool {
         }
         left -= step;
         rounds += 1;
-        // ADR-098 诊断（**临时**）：前 8 个样本、每 4 轮一次。
-        // 要分开的是"跑过再变 Free"与"从一开始就 Free、只是 runs 是旧值"。
-        if rounds % 4 == 0 && rounds <= 32 {
-            crate::log_info!(
-                "wait-sample: 轮={} 状态={:?} 跑过={}",
-                rounds, sched::state_of(gidx), sched::runs_of(gidx)
-            );
-        }
         if apic::with_interrupts(|| sched::wait_for_task(gidx, crate::clock::window_cycles(step))) {
             crate::log_info!("fbcon-live: 轮询={} 收工=init 自己退出", rounds);
             return true;
