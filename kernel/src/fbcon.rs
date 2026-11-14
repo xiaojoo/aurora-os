@@ -871,7 +871,7 @@ pub const TAB_LABEL: &str = "Aurora shell";
 /// #58 pass B：**层次对齐参考图**——条底是整条最暗的一档，活动标签比它亮一档。
 /// 参考实测：条底 `#0A0A0A` / 活动标签 `#2E2E2E` / 面板 `#2C2C2C`；在我们的灰阶上取
 /// `#1F1F1F` 与 `#2E2E2E`（正文仍是 `#0C0C0C`，所以活动标签与正文之间有一道可见的边界）。
-const TITLE_BG: u32 = 0x00_1F_1F_1F;
+const TITLE_BG: u32 = 0x00_33_33_33;
 /// 活动标签顶角那两个像素的过渡色（截图里是 #2B2B2B 一带）。
 const TITLE_BG_HI: u32 = 0x00_2B_2B_2B;
 /// 活动标签的底色 **= 正文底色**（"挖掉"效果）。
@@ -883,7 +883,10 @@ const TAB_DIM: u32 = 0x00_9A_9A_9A;
 /// 标签上那个 `>_` 图标的颜色（PowerShell 图标的浅蓝）。
 const TAB_ICON: u32 = 0x00_A0_BB_E0;
 /// 指针停在非活动标签上时的底色：比条底亮一点点，**不抢活动页**。
-const TAB_HOVER_BG: u32 = 0x00_26_26_26;
+const TAB_HOVER_BG: u32 = 0x00_3A_3A_3A;
+/// 参考图里条底是 `#333333`（不是近黑），标签文字近白、非活动页浅灰。
+const TAB_INK: u32 = 0x00_E8_E8_E8;
+const TAB_INK_DIM: u32 = 0x00_C6_C6_C6;
 /// 非活动标签的 `>_` 图标：同色降一档（不活动页的图标位不再留空）。
 const TAB_ICON_DIM: u32 = 0x00_6E_7C_90;
 
@@ -940,7 +943,12 @@ pub struct BarLayout {
 
 impl BarLayout {
     pub fn of(cols: u64) -> Self {
-        let tab_w = cells_of(TAB_LABEL) + 5; // 左 2 + 文字 + 右 2 + 关闭 1
+        // 标签条用**半号字**之后，"12 个字符"只占 96px；参考图的标签是窄条
+        // （图标 + 文字 + 关闭 + 内边距），不是旧版 17 格的宽条。12 格 = 192px：
+        // 图标 16 + 间距 6 + 文字 96 + 间距 8 + 关闭 16 + 右边距 ≈ 150，仍有余量。
+        const TAB_CELLS: u64 = 12;
+        let _ = TAB_LABEL;
+        let tab_w = TAB_CELLS;
         let strip_l = 1;
         // 右侧三个按钮**贴右边缘**各占一格（截图里最后那个 × 就在窗口右边界上）；
         // 原来留了 5 格边距，按钮看起来像散落在条中间。
@@ -1410,6 +1418,37 @@ impl Term {
         }
     }
 
+    /// **半字号**字形：资产 16×32（ASCII）/ 32×32（宽字），隔行隔列取样画成 8×16 / 16×16。
+    /// 只给标签条与下拉面板（界面字号）；正文一律 `ch_ink`。
+    fn ch_ink_half(&self, f: &Frame, x0: u64, y0: u64, ch: char, color: u32) {
+        if let Some(i) = wide_idx(ch) {
+            for r in (0..32u64).step_by(2) {
+                for c in (0..32u64).step_by(2) {
+                    if FONT_WIDE[i][r as usize] & (1 << (31 - c)) != 0
+                        && !self.put(f, x0 + c / 2, y0 + r / 2, color)
+                    {
+                        return;
+                    }
+                }
+            }
+        } else {
+            let k = ch as u32;
+            if !(0x20..=0x7E).contains(&k) {
+                return;
+            }
+            let g = FONT_ASCII[(k - 0x20) as usize];
+            for r in (0..32u64).step_by(2) {
+                for c in (0..16u64).step_by(2) {
+                    if g[r as usize] & (1 << (15 - c)) != 0
+                        && !self.put(f, x0 + c / 2, y0 + r / 2, color)
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     /// `×` 形的两点笔画（标签页的关闭按钮、右侧的关闭按钮都用它）。
     fn cross(&self, f: &Frame, x0: u64, y0: u64, size: u64, color: u32) {
         for i in 0..size {
@@ -1437,35 +1476,33 @@ impl Term {
             let c0 = lay.tab_col(i);
             let x0 = c0 * CELL_W;
             let wtab = tab_w * CELL_W;
+            // 参考图里标签**不顶到条顶**：条 40px、标签 32px、上面留 8px。
+            // 我们是 32px 的条，所以留 4px，标签 28px。圆角只做**顶部**——底部要与正文
+            // 连成一片（参考图里活动页底边没有缝，四角全圆会画出一条条底色）。
+            const TAB_TOP: u64 = 4;
             if i != active && hover == Some(i as u8) {
-                // 悬停到非活动标签：给一块很轻的底（参考图里指针下的标签会"亮一下"）。
-                self.rect(f, x0, 0, wtab, CELL_H, TAB_HOVER_BG);
+                self.rect(f, x0, TAB_TOP, wtab, CELL_H - TAB_TOP, TAB_HOVER_BG);
             }
             if i == active {
-                // 活动页 = **正文底色**（与终端面板同色），四角都做成 ~18px 圆角：
-                // 逐行把角落切回条底色（整数台阶表，不引 sqrt，表值 = 该行要切掉的列数，
-                // 按四分之一圆 ceil(R-0.5-sqrt(R^2-(R-0.5-dy)^2)) 手算，R=18；非零只到 dy=13，
-                // 顶/底分别占 0..13 与 18..31，中间 14..17 不切 ⇒ 两段不会互相吃）。
-                self.rect(f, x0, 0, wtab, CELL_H, BG);
-                const RC: [u64; 18] = [14, 11, 9, 7, 6, 5, 4, 3, 3, 2, 2, 1, 1, 1, 0, 0, 0, 0];
+                self.rect(f, x0, TAB_TOP, wtab, CELL_H - TAB_TOP, BG);
+                const RC: [u64; 8] = [8, 4, 2, 1, 1, 0, 0, 0];
                 for (dy, cut) in RC.iter().enumerate() {
                     if *cut > 0 {
-                        let d = dy as u64;
-                        self.rect(f, x0, d, *cut, 1, TITLE_BG);
-                        self.rect(f, x0 + wtab - *cut, d, *cut, 1, TITLE_BG);
-                        self.rect(f, x0, CELL_H - 1 - d, *cut, 1, TITLE_BG);
-                        self.rect(f, x0 + wtab - *cut, CELL_H - 1 - d, *cut, 1, TITLE_BG);
+                        let yy = TAB_TOP + dy as u64;
+                        self.rect(f, x0, yy, *cut, 1, TITLE_BG);
+                        self.rect(f, x0 + wtab - *cut, yy, *cut, 1, TITLE_BG);
                     }
                 }
             }
             // `>_` 图标（几何画，不依赖字体里有没有这两个字形）。**每个标签都画**——
             // 只有活动页画的话，非活动页的文字会空出图标那两格、看着像缩进错位。
+            // 图标：参考图里是 ~14px 的 `>_`；我们画 12px 高、14px 宽，垂直居中在标签里。
             let icon = if i == active { TAB_ICON } else { TAB_ICON_DIM };
-            for k in 0..5u64 {
-                let _ = self.put(f, x0 + 10 + k, 9 + k, icon);
-                let _ = self.put(f, x0 + 10 + k, 17 - k, icon);
+            for k in 0..6u64 {
+                let _ = self.put(f, x0 + 9 + k, 10 + k, icon);
+                let _ = self.put(f, x0 + 9 + k, 20 - k, icon);
             }
-            self.rect(f, x0 + 18, 19, 6, 2, icon);
+            self.rect(f, x0 + 16, 22, 8, 2, icon);
             // 图标占前两格，标题从第三格起（图标与标题之间留一格，参考图也是这个呼吸感）
             let mut c = c0 + 3;
             // 0 号标签叫 "Aurora shell"，其余叫 "shell N"
@@ -1490,21 +1527,25 @@ impl Term {
                     n += 1;
                 }
             }
-            let ink = if i == active { TAB_TEXT } else { TAB_DIM };
+            // 标签文字用**界面字号**（半号 8×16），正文仍是 2×；参考图的标签文字就比正文小。
+            // 推进按像素（ASCII 8、宽字 16），否则半号字形配整格推进会变成"字距拉满"。
+            let ink = if i == active { TAB_INK } else { TAB_INK_DIM };
             if let Ok(lab) = core::str::from_utf8(&label[..n]) {
+                let mut cx = c0 * CELL_W + 30;
                 for ch in lab.chars() {
-                    self.ch_ink(f, c * CELL_W, 0, ch, ink);
-                    c += char_cells(ch);
+                    self.ch_ink_half(f, cx, 10, ch, ink);
+                    cx += if (ch as u32) < 0x80 { 8 } else { 16 };
                 }
             }
+            let _ = c;
             // #58：条目右上角**只有 `×`**，且只在"活动标签"或"指针停在它上面"时画；
             // 非活动且没悬停时，若这个会话有新输出就画一个**未读圆点**（同样占那一格）。
             let x_visible = i as u64 == active || hover == Some(i as u8);
             let x0 = (c0 + tab_w - 1) * CELL_W;
             if x_visible {
                 // 活动页的 `×` 用亮色（参考图里当前页的关闭是白的）；悬停到非活动页时留暗色。
-                let ink = if i == active { TAB_TEXT } else { TAB_DIM };
-                self.cross(f, x0 + 5, 12, 6, ink);
+                let ink = if i == active { TAB_INK } else { TAB_INK_DIM };
+                self.cross(f, x0 + 4, 12, 8, ink);
             } else if unread & (1u64 << i) != 0 {
                 // 圆点：6×6 切掉四角（位图里画不出真圆，切角是最接近的形状；
                 // 方块在截图里读起来像"占位符"，不像未读标记）。
@@ -1552,16 +1593,16 @@ impl Term {
             if hover == Some(i as u8) {
                 self.rect(f, x * CELL_W, yy, MENU_W * CELL_W, CELL_H, MENU_BG_HOVER);
             }
-            let ink = if r.dim { TAB_DIM } else { TAB_TEXT };
+            let ink = if r.dim { TAB_DIM } else { TAB_INK };
             let mut c = x + 2;
             for ch in r.label.chars() {
-                self.ch_ink(f, c * CELL_W, yy, ch, ink);
+                self.ch_ink_half(f, c * CELL_W, yy + 8, ch, ink);
                 c += char_cells(ch);
             }
             let hl = cells_of(r.hint);
             let mut hc = (x + MENU_W).saturating_sub(2 + hl);
             for ch in r.hint.chars() {
-                self.ch_ink(f, hc * CELL_W, yy, ch, TAB_DIM);
+                self.ch_ink_half(f, hc * CELL_W, yy + 8, ch, TAB_DIM);
                 hc += char_cells(ch);
             }
         }
