@@ -860,6 +860,8 @@ const TAB_TEXT: u32 = 0x00_E1_E1_E1;
 const TAB_DIM: u32 = 0x00_9A_9A_9A;
 /// 标签上那个 `>_` 图标的颜色（PowerShell 图标的浅蓝）。
 const TAB_ICON: u32 = 0x00_A0_BB_E0;
+/// 非活动标签的 `>_` 图标：同色降一档（不活动页的图标位不再留空）。
+const TAB_ICON_DIM: u32 = 0x00_6E_7C_90;
 
 /// 标签栏的几何。**绘制与命中测试共用这一份**——两处各算一遍，点击就会落在画的地方旁边。
 // ---------------------------------------------------------------- #58：`∨` 下拉
@@ -1404,20 +1406,32 @@ impl Term {
             let x0 = c0 * CELL_W;
             let wtab = tab_w * CELL_W;
             if i == active {
-                // 活动页 = 正文底色的一块，顶部两行左右各切掉一个小角（圆角的近似）
-                self.rect(f, x0, 0, wtab, CELL_H, TAB_ACTIVE_BG);
-                self.rect(f, x0, 0, 6, 1, TITLE_BG);
-                self.rect(f, x0 + wtab - 6, 0, 6, 1, TITLE_BG);
-                self.rect(f, x0, 1, 3, 1, TITLE_BG_HI);
-                self.rect(f, x0 + wtab - 3, 1, 3, 1, TITLE_BG_HI);
-                // `>_` 图标（几何画，不依赖字体里有没有这两个字形）
-                for k in 0..5u64 {
-                    let _ = self.put(f, x0 + 10 + k, 9 + k, TAB_ICON);
-                    let _ = self.put(f, x0 + 10 + k, 17 - k, TAB_ICON);
+                // 活动页 = **正文底色**（与终端面板同色），四角都做成 ~18px 圆角：
+                // 逐行把角落切回条底色（整数台阶表，不引 sqrt，表值 = 该行要切掉的列数，
+                // 按四分之一圆 ceil(R-0.5-sqrt(R^2-(R-0.5-dy)^2)) 手算，R=18；非零只到 dy=13，
+                // 顶/底分别占 0..13 与 18..31，中间 14..17 不切 ⇒ 两段不会互相吃）。
+                self.rect(f, x0, 0, wtab, CELL_H, BG);
+                const RC: [u64; 18] = [14, 11, 9, 7, 6, 5, 4, 3, 3, 2, 2, 1, 1, 1, 0, 0, 0, 0];
+                for (dy, cut) in RC.iter().enumerate() {
+                    if *cut > 0 {
+                        let d = dy as u64;
+                        self.rect(f, x0, d, *cut, 1, TITLE_BG);
+                        self.rect(f, x0 + wtab - *cut, d, *cut, 1, TITLE_BG);
+                        self.rect(f, x0, CELL_H - 1 - d, *cut, 1, TITLE_BG);
+                        self.rect(f, x0 + wtab - *cut, CELL_H - 1 - d, *cut, 1, TITLE_BG);
+                    }
                 }
-                self.rect(f, x0 + 18, 19, 6, 2, TAB_ICON);
             }
-            let mut c = c0 + 2;
+            // `>_` 图标（几何画，不依赖字体里有没有这两个字形）。**每个标签都画**——
+            // 只有活动页画的话，非活动页的文字会空出图标那两格、看着像缩进错位。
+            let icon = if i == active { TAB_ICON } else { TAB_ICON_DIM };
+            for k in 0..5u64 {
+                let _ = self.put(f, x0 + 10 + k, 9 + k, icon);
+                let _ = self.put(f, x0 + 10 + k, 17 - k, icon);
+            }
+            self.rect(f, x0 + 18, 19, 6, 2, icon);
+            // 图标占前两格，标题从第三格起（图标与标题之间留一格，参考图也是这个呼吸感）
+            let mut c = c0 + 3;
             // 0 号标签叫 "Aurora shell"，其余叫 "shell N"
             let mut label = [0u8; 24];
             let mut n = 0usize;
@@ -1454,20 +1468,25 @@ impl Term {
             if x_visible {
                 self.cross(f, x0 + 5, 12, 6, TAB_DIM);
             } else if unread & (1u64 << i) != 0 {
-                self.rect(f, x0 + 5, 13, 6, 6, TAB_TEXT);
+                // 圆点：6×6 切掉四角（位图里画不出真圆，切角是最接近的形状；
+                // 方块在截图里读起来像"占位符"，不像未读标记）。
+                self.rect(f, x0 + 6, 13, 4, 6, TAB_TEXT);
+                self.rect(f, x0 + 5, 14, 6, 4, TAB_TEXT);
             }
         }
         // 3) `+` 与它右边那个 `∨`（下拉：今天没有语义，只画）
         if fit > 0 {
             let plus_c = lay.plus_col(shown);
             if plus_c + 1 < strip_r {
-                let x = plus_c * CELL_W + 4;
-                self.rect(f, x + 3, 13, 2, 8, TAB_TEXT);
-                self.rect(f, x, 16, 8, 2, TAB_TEXT);
-                let dx = (plus_c + 1) * CELL_W + 5;
+                let x = plus_c * CELL_W + 2;
+                self.rect(f, x + 5, 10, 2, 12, TAB_TEXT);
+                self.rect(f, x, 15, 12, 2, TAB_TEXT);
+                let dx = (plus_c + 1) * CELL_W + 6;
                 for k in 0..4u64 {
-                    let _ = self.put(f, dx + k, 15 + k, TAB_DIM);
-                    let _ = self.put(f, dx + 7 - k, 15 + k, TAB_DIM);
+                    self.rect(f, dx + k, 14 + k, 2, 1, TAB_DIM);
+                    self.rect(f, dx + 7 - k, 14 + k, 2, 1, TAB_DIM);
+                    self.rect(f, dx + k, 15 + k, 2, 1, TAB_DIM);
+                    self.rect(f, dx + 7 - k, 15 + k, 2, 1, TAB_DIM);
                 }
             }
         }
