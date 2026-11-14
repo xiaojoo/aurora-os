@@ -1106,6 +1106,13 @@ fn park_until_init_exits(init: Option<usize>) {
                         }
                     }
                 }
+                // ADR-098 诊断：**日志行锁的账**。`timeouts` = 抢不到行锁、这一行被丢的次数；
+                // 它从来没人打印过，而 §278 里"哪一行没出现"的推断正需要它。
+                let ls = crate::serial::line_stats();
+                crate::log_info!(
+                    "resident-init: 行锁账 持有={} 竞争={} 重入={} 超时={}",
+                    ls.holds, ls.contended, ls.nested, ls.timeouts
+                );
                 crate::log_info!("resident-init: init 已收工 ⇒ 系统停机");
                 return;
             }
