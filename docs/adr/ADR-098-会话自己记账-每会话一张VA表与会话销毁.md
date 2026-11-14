@@ -38,6 +38,20 @@ ADR-097 的前置测量（§267）与普查（§268）把"关掉一个会话之�
 5. 新增接口（会触发 `check-interface-change`，故需本 ADR）：
    `user::session_note_va` / `user::session_release_va` / `sched::task_proc_id`。
 
+   第一步（本片已落地，登记进 `docs/architecture/module-interfaces.toml` 的 `user` 组）：
+
+   ```text
+   user::SESSION_VA_CAP        8
+   user::begin_session_load    （sid）  起一个"给这个会话装载"的作用域
+   user::end_session_load      （）     关作用域
+   user::session_note_va       （sid, base）-> bool   返回 false = 表满（调用方必须打读数）
+   user::session_va_count      （sid）-> usize
+   user::session_va_at         （sid, i）-> u64
+   ```
+
+   `session_release_va` 留到第二步：它要在关闭路径上与 `proc_reap` 一起接，单独先落一张
+   能记账的表，才能先把"记了几条"这个读数拿出来对账（先有账，才谈放账）。
+
 ## 必须先核对的一条矛盾（排查记录，不是结论）
 
 `user::Loaded.owned` 的注释写着"任务结束时由 `sched::reap` 释放（**解映射 + 归还页框 + 放手 VA 保留**，

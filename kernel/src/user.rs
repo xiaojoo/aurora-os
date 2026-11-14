@@ -406,6 +406,10 @@ fn sys_aspace_map(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     // 内核自己的 AS 与用例自建的 AS 不属于任何 Job ⇒ 不记。记账在映射成功之后：
     // 额度不够就把这份映射当场丢掉（还没进资源袋，所以直接 drop 是安全的，不持锁），
     // 并把刚登记的 VA 还回去 ⇒ 失败不留半截。
+    // ADR-098：这个 VA 是从**全局**表里占的（动态区/固定地址都算），会话装载作用域里要记账。
+    // **记在这里而不是 `own_current` 之后**：那一步把映射塞进调用者的袋子，而调用者
+    // （park 主任务）永不退出 ⇒ 袋不落地 ⇒ 这条 VA 的 `release_va` 等于永远不执行。
+    let _ = note_va_current(va.0);
     if let Some(s) = as_slot {
         if let Some(job) = crate::proc::job_of_aspace(s) {
             if crate::proc::job_charge_pages(job, m.pages() as u64).is_err() {
@@ -1084,6 +1088,92 @@ pub const SLOT_UNKNOWN: u64 = 0x10;
 const PARK_OFF: u64 = 64;
 /// RFLAGS.IF（bit9）。`park_current` 要按本 CPU 的窗口把它写进返回用户态的那张帧。
 const RFLAGS_IF: u64 = 1 << 9;
+
+// ---------------------------------------------------------------- ADR-098：每会话 VA 表
+//
+// **为什么要这张表**：`si_va` / 各段 / 栈都是 `mm::reserve_va_at` 或者
+// `alloc_user_va_range` 从**全局** VA 保留表里拿的；会话被关掉时没人逐条放手（BACKLOG §268），
+// 于是同一个会话第二次装载在同一个地址上必 -6（实测 `si_va=0xfffffffffffffffa`）。
+// 这张表就是"这个会话占了哪些保留"的唯一记录，关会话时按它逐条 `release_va`。
+//
+// 定长 + 原子量 ⇒ 零新锁、零新 unsafe（与镜像环同一条选型理由）。
+pub const SESSION_VA_CAP: usize = 8;
+/// 没有会话在装载（ktests 的装载走这条）。
+const NO_SESSION: u8 = 0xFF;
+static SVA: [[core::sync::atomic::AtomicU64; SESSION_VA_CAP]; crate::serial::SESSIONS] =
+    [const { [const { core::sync::atomic::AtomicU64::new(0) }; SESSION_VA_CAP] };
+        crate::serial::SESSIONS];
+static SVA_N: [core::sync::atomic::AtomicUsize; crate::serial::SESSIONS] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; crate::serial::SESSIONS];
+/// 当前正在给哪个会话装载。**只有 `stage_init_user` 会起这个作用域**。
+static LOADING_SID: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(NO_SESSION);
+
+fn sid_ok(sid: u8) -> Option<usize> {
+    if (sid as usize) < crate::serial::SESSIONS {
+        Some(sid as usize)
+    } else {
+        None
+    }
+}
+
+/// 记一页保留区。返回 `false` = 表满，**调用方必须把这条打出来**（不静默丢）。
+pub fn session_note_va(sid: u8, base: u64) -> bool {
+    let Some(k) = sid_ok(sid) else { return false };
+    let n = SVA_N[k].load(core::sync::atomic::Ordering::Relaxed);
+    // 重复登记同一个基址不是容量问题：按"已记"返回真（读数里看不出来重复这件事，
+    // 但重复本身就是调用方的错，不该被这里当成表满的假象）。
+    for i in 0..n.min(SESSION_VA_CAP) {
+        if SVA[k][i].load(core::sync::atomic::Ordering::Relaxed) == base {
+            return true;
+        }
+    }
+    if n >= SESSION_VA_CAP {
+        return false;
+    }
+    SVA[k][n].store(base, core::sync::atomic::Ordering::Relaxed);
+    SVA_N[k].store(n + 1, core::sync::atomic::Ordering::Release);
+    true
+}
+
+/// 进入/离开"给会话装载"的作用域（装载器内部按它决定记不记）。
+pub fn begin_session_load(sid: u8) {
+    LOADING_SID.store(sid, core::sync::atomic::Ordering::Release);
+}
+
+pub fn end_session_load() {
+    LOADING_SID.store(NO_SESSION, core::sync::atomic::Ordering::Release);
+}
+
+/// 装载器内部用：在会话作用域里就记账，否则什么都不做（ktests）。
+fn note_va_current(base: u64) -> bool {
+    let sid = LOADING_SID.load(core::sync::atomic::Ordering::Acquire);
+    if sid == NO_SESSION {
+        return true;
+    }
+    let ok = session_note_va(sid, base);
+    if !ok {
+        crate::log_warn!(
+            "session-va: 会话={} 的表满了（CAP={}），{:#x} 没记上 ⇒ 关会话时这一条不会放手",
+            sid, SESSION_VA_CAP, base
+        );
+    }
+    ok
+}
+
+/// 这个会话记了几条、第 i 条是什么（读数用：登了几条/放了几条是这一刀的判据面）。
+pub fn session_va_count(sid: u8) -> usize {
+    match sid_ok(sid) {
+        Some(k) => SVA_N[k].load(core::sync::atomic::Ordering::Acquire),
+        None => 0,
+    }
+}
+
+pub fn session_va_at(sid: u8, i: usize) -> u64 {
+    match sid_ok(sid) {
+        Some(k) if i < SESSION_VA_CAP => SVA[k][i].load(core::sync::atomic::Ordering::Relaxed),
+        _ => 0,
+    }
+}
 
 pub struct UserProg {
     pub code_va: u64,
@@ -1912,6 +2002,8 @@ pub fn load(bytes: &[u8]) -> Result<Loaded, LoadError> {
         if !mm::reserve_va_at(seg.vaddr, pages as usize) {
             return Err(LoadError::VaTaken { va: seg.vaddr });
         }
+        // ADR-098：这一段是从**全局**表里占的，关会话时得有人放手 ⇒ 记账。
+        let _ = note_va_current(seg.vaddr);
         // 权限按容器给**最小的一组**：可执行 → RX，可写 → RW，其余 → 只读。
         // `elf::parse` 已经排除了 W+X，所以这三个分支互斥。
         let flags = if seg.executable {
@@ -1967,6 +2059,8 @@ pub fn load(bytes: &[u8]) -> Result<Loaded, LoadError> {
     // 它和镜像分属两段，所以"动态分配把镜像的位置吃掉"这类事在结构上不会发生
     // （见 `mm::USER_MMAP_BASE`——这一刀就是 M4-3 那次 `VaTaken` 换来的）。
     let swin = mm::alloc_user_va_range(2).ok_or(mm::MmError::OutOfMemory).map_err(LoadError::Mm)?;
+    // ADR-098：栈那两页（guard + 数据）也是全局保留，一起记上。
+    let _ = note_va_current(swin.0);
     if mm::is_mapped(swin.0) {
         return Err(LoadError::VaTaken { va: swin.0 });
     }

@@ -1182,9 +1182,16 @@ fn stage_init_user(sid: u8) -> Option<usize> {
     // S5c：装的是 shell 而不是 hello——控制台句柄已经在下面按 ROLE_LOG 授予，
     // 这一档的 init 从此是**交互式**的。默认档（无 handles）仍装 hello、判据仍是信箱，
     // 因为那条路没有控制台句柄可授，shell 进去只会 exit(1)。
-    let loaded = match crate::user::load_into(aslot, crate::ktests::common::SHELL_ELF) {
-        Ok(l) => l,
-        Err(e) => { crate::log_warn!("init-user: load_into 失败 {}", crate::user::describe_load(e)); return None; }
+    // ADR-098：这一段是"这个会话从全局 VA 表里占的东西"（逐段 + 栈）。
+    // end 放在 match **之前**执行 ⇒ 任何一条 `return None` 都不会把作用域留在打开状态。
+    let loaded = {
+        crate::user::begin_session_load(sid);
+        let r = crate::user::load_into(aslot, crate::ktests::common::SHELL_ELF);
+        crate::user::end_session_load();
+        match r {
+            Ok(l) => l,
+            Err(e) => { crate::log_warn!("init-user: load_into 失败 {}", crate::user::describe_load(e)); return None; }
+        }
     };
     // 装载器把映射柄**交回调用方**而不是自动入袋（用例要能自己丢弃并核账）。不归创建者，
     // 这一袋就在本函数返回时落地 ⇒ 子进程的代码/栈被解映射。归了创建者，16 号的
@@ -1241,8 +1248,11 @@ fn stage_init_user(sid: u8) -> Option<usize> {
     // （单地址空间，ADR-070），第一个会话占住 0x2_5000_0000 之后，第二个会话拿同一个
     // 地址会被当场拒成 -6（实测：`si_va=0xfffffffffffffffa`，而三个生效位一个没读错）。
     let si_want = 0x2_5000_0000 + (sid as u64) * mm::PAGE as u64;
+    // ADR-098：si 那一页也是从全局表里占的（固定地址分支），同样要记上。
+    crate::user::begin_session_load(sid);
     f.rax = SYS_ASPACE_MAP; f.rdi = hi.0; f.rsi = 0; f.rdx = hp.0; f.r10 = si_want;
     syscall_dispatch(&mut f);
+    crate::user::end_session_load();
     let si_va = f.rax;
     // 生效位是**那棵树**里的真值（不是"我请求了什么"）：代码要 user+X+!W、栈要 user+W、
     // si 页要 user+!W。S4b-1 只在用例里核过这三格，产品路径这里补上。
@@ -1257,6 +1267,11 @@ fn stage_init_user(sid: u8) -> Option<usize> {
     );
     // S6p：第二个会话起步时的三道资源墙里，**这道读数管两道**：`si_va` 是不是真地址
     // （-6 = 地址被拒）与创建者袋还剩几格（`MAX_OWNED = 8`）。句柄表那一道见 15 号前的槽读数。
+    crate::log_info!(
+        "session-va: 会话={} 记={} 条（ADR-098：关会话时按这张表逐条 release_va）",
+        sid,
+        crate::user::session_va_count(sid)
+    );
     crate::log_info!(
         "init-user(S4b-2): 会话={} si_va={:#x} 创建者袋={}",
         sid, si_va, sched::owned_of(owner.0)

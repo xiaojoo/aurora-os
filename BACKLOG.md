@@ -11895,3 +11895,88 @@ A 的正确性最干净但风险最大；C 只能换来一条判据，容易让�
   **控制台真写字节 + 画面真有正文 + 键入有回显**（§267 已改）；
 · 负样本：把 `release_va` 那一行去掉 ⇒ 第二次 `si_va` 必须回到 -6（今天的形状就是证人）。
 
+
+## 269. **#61 第一步：`SVA` 每会话 VA 表 + `session_note_va` 落地**（2026-11-14，实测；含一条对我的假设的更正）
+
+### 一、落了什么（ADR-098 第一步）
+
+`kernel/src/user.rs`：
+
+```text
+pub const SESSION_VA_CAP: usize = 8;
+static SVA:  [[AtomicU64; CAP]; SESSIONS]      // 每会话一张定长原子表
+static SVA_N: [AtomicUsize; SESSIONS]
+static LOADING_SID: AtomicU8 = NO_SESSION      // 0xFF = 没在给会话装载（ktests 走这条）
+begin_session_load(sid) / end_session_load()   // 作用域
+session_note_va(sid, base) -> bool             // false = 表满，调用方必须打读数
+session_va_count(sid) / session_va_at(sid, i)  // 读数面
+fn note_va_current(base)                       // 装载器内部用：在作用域里才记
+```
+
+记账点三处，**都钉在真正做保留的那一行后面**：`load()` 的逐段 `reserve_va_at`、
+`load()` 的栈 `alloc_user_va_range(2)`、`sys_aspace_map` 决定 `va` 之后（`own_current` 之前）。
+
+`kernel/src/main.rs`：`stage_init_user` 圈两个作用域——`load_into` 那段、si 映射那段。
+begin/end 夹在**块表达式**里、end 在 `match` 之前执行 ⇒ 任何一条 `return None` 都不会把作用域
+留在打开状态（留在打开状态的话，后面的保留会被记到错的会话头上）。
+读数行：`session-va: 会话={} 记={} 条`。
+
+### 二、更正：shell 这条路上全局 VA 保留**只有 si 一条**
+
+实机读数：
+
+```
+[info] session-va: 会话=0 记=1 条
+[info] session-va: 会话=1 记=1 条
+```
+
+一开始以为"记=1 太少（段 + 栈 + si 该有 4~5 条）"，查出原因是**我上一轮的假设错了**：
+`user.rs` 里有**三个**段循环，shell 走的是 `load_into`（第 2108 行那一处），
+它把段和栈都**固定地址直接映射**（`aspace_map_slot` / `USER_MMAP_BASE`），
+**根本不调 `reserve_va_at`**；调它的是 `load()`（第 1988 行，ktests/hello 那条路）。
+所以对 shell 而言，全局 VA 保留表里真的只有 si 那一条 ⇒ **记=1 是完整的，不是漏记**。
+
+这条更正有实际后果：第二步 `session_release_va` 对 shell 只需放 1 条就能消掉 -6；
+而 `load()` 那条路上的逐段/栈记账是给 ktests 与 hello 用的，不能因为"shell 用不上"就删。
+
+### 三、`创建者袋` 为什么每重开一次涨一袋（机理，非推测）
+
+`sys_aspace_map` 的最后一步是 `crate::sched::own_current(OwnedItem::AsMap(m))`——
+映射归**调用者**的袋子。调用者是 `stage_init_user` 所在的任务，也就是 park 主任务，
+而它永不退出 ⇒ **那个袋子永远不会 Drop** ⇒ si 映射的 `release_va` 永远等不到。
+这正是 `创建者袋` 4 → 7（每关一次 +3）的形状，也是 §268 表里"VA 保留只在错误路径释放"的
+机制解释：不是没人写释放代码，是**所有权在一条永不结束的生命线上**。
+
+### 四、读数
+
+· `check` **17/17**（`check-interface-change` 先拦了一次——ADR-098 是单独提交的，而门禁要求
+  "接口变更与 ADR 改动在同一棵树里"；处置是把符号清单补进 ADR 正文，不是绕开门禁）
+· 四档构建 0 error（默认 / `fbcon-live,ps2-kbd,resident-init,console-probe` /
+  `handles,multisession,framebuffer,fbcon-mirror,fbcon-live` / `wm,ps2-kbd,ps2-mouse,resident-init,console-probe`）
+· `s6t-look-check.py` **PASS**（正文非空行 `[1,2]`、`kb7` 在 (2,16)、锚点行 `[]`）
+· `session-va` 两个会话各 **1 条**
+· 本片没跑 `test` 整表、`bench`、长稳或真机
+
+### 五、下一步（第二步，未做）
+
+`session_release_va(sid) -> (released, failed)` + `sched::task_proc_id(task)` +
+两条关闭路径接成"读 proc_id → terminate → **proc_reap** → release_va"，
+然后拿 `build/s6v-close-check.py` 九格量：两次 `si_va` 都是真地址、`创建者袋` 回到 4、
+`BSP 槽占用` 回到 `0b000000111`；负样本=去掉 `release_va` ⇒ 第二次 `si_va` 回到 -6。
+
+
+### 六、本节自己的工具坑（第三次同族，这次被 `git diff --numstat` 当场抓住）
+
+`kernel/src/user.rs` 是**混排**文件（blob 里 **14 条 CRLF + 2218 条 LF**），
+而我的补丁脚本照惯例"读时归一成 `
+`、写时统一 `
+`" ⇒ 整份文件被转成 CRLF，
+`git diff --numstat` 立刻报 **2311 增 / 2218 删**——那不是改动量，是行尾在骗人。
+处置：`git checkout -- kernel/src/user.rs` 回退，重做一版**不转换行尾**的补丁
+（读 `newline=''`、写 `newline=''`，所有锚点先断言"不含 ``"），补丁前后 `CRLF=14` 不变，
+`git diff --numstat` 变成 **94 增 / 0 删**。
+
+⇒ §267 定的那条规则要扩一句：**"行尾的规范形式问 git"不够，还要问"这个文件是不是混排"**；
+补丁脚本读进来先数一遍 `CRLF/裸LF`，写完再数一遍，两次不一致就回退——这一条比"记住哪个文件是 CRLF"
+可靠，因为混排是我按文件记不住的。
+
