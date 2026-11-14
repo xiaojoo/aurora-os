@@ -1449,12 +1449,26 @@ static INIT_TASK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUs
 /// #58：`∨` 下拉的行。**会话在上、动作在下**（用户裁决 2026-11-14）。
 /// 置灰行表示"今天没有动作"——点了要在串口如实报，不假装成功。
 #[cfg(feature = "framebuffer")]
-const MENU_ROWS: [crate::fbcon::MenuRow; 4] = [
-    crate::fbcon::MenuRow { label: "会话 0", hint: "Ctrl+Shift+1", dim: false },
-    crate::fbcon::MenuRow { label: "会话 1", hint: "Ctrl+Shift+2", dim: false },
-    crate::fbcon::MenuRow { label: "浮窗版面", hint: "", dim: false },
-    crate::fbcon::MenuRow { label: "新建 shell", hint: "16 格句柄表", dim: true },
-];
+
+
+/// **会话是否还活着**：以任务表为唯一事实来源（ADR-098 的延伸）。
+/// 为什么不再信 `LiveTerm::closed`：`live_wait_and_redraw` 与 park 各开一份实例，
+/// 一份记了"关掉"、另一份从 false 起算 ⇒ 画面画着两个标签、命中表却只有一个
+/// （用户实测：所有图标都点不动）。这里两个实例每拍都对齐同一份任务事实。
+fn session_open(i: usize) -> bool {
+    let g = if i == 0 {
+        INIT_TASK.load(Ordering::Relaxed)
+    } else {
+        SECOND_TASK.load(Ordering::Relaxed)
+    };
+    if g == 0 {
+        return false;
+    }
+    !matches!(
+        crate::sched::state_of(g),
+        crate::sched::TaskState::Free | crate::sched::TaskState::Done
+    )
+}
 
 /// ADR-098：**关闭请求是进程级事实，不是视图状态**。
 /// 为什么不能继续用 `LiveTerm::closed`：`live_wait_and_redraw` 与 park **各开一份
@@ -1476,7 +1490,7 @@ struct LiveTerm {
     /// 上百毫秒），而指针与光标每秒要动好几次；只要这一格没变就**不重画正文**。
     /// (会话号, 该会话环里累计字节, 该会话环里的换行数, 标签数, 活动标签)
     /// —— 换行数是"整窗 vs 只画输入行"的分水岭；最后一格是版面（S6t：标签条 ⇄ 浮窗）。
-    sig: (u8, usize, u64, u64, u64, bool, bool),
+    sig: (u8, usize, u64, u64, u64, bool),
     /// 光标（下划线）**现在**画在哪一格；`None` = 现在是灭的一相。
     caret: Option<(u64, u64)>,
     /// 下一相光标该在哪一格（整窗重画时由 `redraw_window` 交回来）。
@@ -1520,6 +1534,8 @@ struct LiveTerm {
     /// #58：`∨` 下拉开着吗、指针停在第几行。
     menu: bool,
     menu_hover: Option<u8>,
+    /// 上一次的"会话开/关"快照：变了要整条重画标签栏、面板开着时还要重画面板。
+    open_state: (bool, bool),
     /// #58：上一次看到的指针位置。**面板的选择在这两种输入间仲裁**：
     /// 指针挪了 ⇒ 指针赢（悬停）；指针没动 ⇒ 保留键盘选中的那一行。
     last_ptr: (i32, i32),
@@ -1562,7 +1578,7 @@ impl LiveTerm {
         term.clear(&frame);
         Some(Self {
             frame, term,
-            sig: (u8::MAX, usize::MAX, u64::MAX, 0, 0, false, false),
+            sig: (u8::MAX, usize::MAX, u64::MAX, 0, 0, false),
             caret: None,
             caret_at: None,
             ptr: None,
@@ -1571,6 +1587,7 @@ impl LiveTerm {
             menu: false,
             menu_hover: None,
             last_ptr: (0, 0),
+            open_state: (true, true),
             seen: [0; crate::serial::SESSIONS],
             seen_init: false,
             paints: (0, 0, 0, 0),
@@ -1609,26 +1626,19 @@ impl LiveTerm {
 
     /// **内容重画**：只在正文真的变了的时候写像素。结尾一定走一次 `tick()`——
     /// 整窗重画会把指针与光标擦掉，不立刻补就会缺半拍。
-    /// #58：面板上的一击。行号见 `MENU_ROWS`：0/1 切会话、2 切浮窗版面、3 置灰（如实报墙）。
-    fn menu_click(&mut self, cx: i32, cy: i32) {
-        let row = crate::fbcon::menu_hit(
-            self.term.dims().0, self.layout().1, MENU_ROWS.len() as u64, cx as u64, cy as u64);
-        self.menu = false;
-        self.menu_hover = None;
-        match row {
-            Some(r) => self.menu_run(r),
-            None => crate::log_info!("菜单: 点在外面 ⇒ 关"),
-        }
-    }
-
-    /// #58：执行一行（鼠标点击与 Enter 共用）。行号见 `MENU_ROWS`。
+    /// 执行一行（鼠标点击与 Enter 共用）。行号按 `menu_state()` 现算的动作表解释。
     fn menu_run(&mut self, row: u8) {
-        match row {
-            0 | 1 => {
-                crate::user::set_active_session(row);
-                crate::log_info!("菜单: 切到会话 {} ⇒ 关", row);
+        let (_, act, n) = self.menu_state();
+        if row as usize >= n {
+            return;
+        }
+        match act[row as usize] {
+            s @ 0..=1 => {
+                let s = s as usize;
+                crate::user::set_active_session(s as u8);
+                crate::log_info!("菜单: 切到会话 {} ⇒ 关", s);
             }
-            2 => {
+            0x10 => {
                 #[cfg(feature = "wm")]
                 {
                     self.float = !self.float;
@@ -1639,9 +1649,27 @@ impl LiveTerm {
                 #[cfg(not(feature = "wm"))]
                 crate::log_info!("菜单: 本档没有浮窗版面");
             }
-            // 置灰行：**如实报是哪道墙**，不假装成功（16 格句柄表在两会话时已 15/16）。
-            3 => {
-                crate::log_warn!("菜单: 新建 shell 撞容量墙（句柄表 16 格，两会话已占 15）");
+            0x11 => {
+                // **新建**：挑一个空闲会话格起一个新 shell；两格都占着就如实报墙。
+                let slot = (0..crate::serial::SESSIONS).find(|i| !session_open(*i));
+                match slot {
+                    Some(i) => {
+                        crate::serial::mirror_reset_sid(i);
+                        match stage_init_user(i as u8) {
+                            Some(t) => {
+                                if i == 0 {
+                                    INIT_TASK.store(t, Ordering::Relaxed);
+                                } else {
+                                    SECOND_TASK.store(t, Ordering::Relaxed);
+                                }
+                                crate::user::set_active_session(i as u8);
+                                crate::log_info!("菜单: 新建会话 {} 任务={} ⇒ 关", i, t);
+                            }
+                            None => crate::log_warn!("菜单: 新建会话 {} 失败（资源墙）", i),
+                        }
+                    }
+                    None => crate::log_warn!("菜单: 新建 shell 撞容量墙（会话格 2 个都占着）"),
+                }
             }
             _ => {}
         }
@@ -1656,23 +1684,34 @@ impl LiveTerm {
             0x1B => {
                 self.menu = false;
                 self.menu_hover = None;
+                self.menu_erase();
                 crate::log_info!("菜单: Esc ⇒ 关");
             }
             0x0D => {
                 let row = self.menu_hover.unwrap_or(0);
                 self.menu = false;
                 self.menu_hover = None;
+                self.menu_erase();
                 crate::log_info!("菜单: Enter 行={}", row);
                 self.menu_run(row);
             }
             k => {
-                let n = MENU_ROWS.len() as u8;
+                let n = self.menu_state().2 as u8;
                 let cur = self.menu_hover.unwrap_or(0);
                 let next = if k == 0x80 { (cur + n - 1) % n } else { (cur + 1) % n };
                 self.menu_hover = Some(next);
                 crate::log_info!("菜单: 行={}", next);
             }
         }
+    }
+
+    /// 悬停变化：只重画受影响的两个标签（在 fbcon 里按标签矩形裁）。
+    fn bar_hover(&mut self, old: Option<u8>, new: Option<u8>) {
+        #[cfg(feature = "ps2-mouse")]
+        self.ptr_erase();
+        let (_, tabs, active, _) = self.layout();
+        let open = (0..crate::serial::SESSIONS).filter(|i| !self.closed[*i]).count() as u64;
+        self.term.bar_hover(&self.frame, open, active, old, new, self.unread_mask(active));
     }
 
     /// 只重画标签条那一行。**指针先擦掉**：它盖住的那几十个像素马上就会被重画，
@@ -1683,8 +1722,101 @@ impl LiveTerm {
         let open = (0..crate::serial::SESSIONS).filter(|i| !self.closed[*i]).count() as u64;
         self.term.tab_bar(&self.frame, open, active, self.hover, self.unread_mask(active));
         if self.menu {
-            let rows = MENU_ROWS;
-            self.term.menu_panel(&self.frame, open, &rows, self.menu_hover);
+            let (rows, _, nrows) = self.menu_state();
+            self.term.menu_panel(&self.frame, open, &rows[..nrows], self.menu_hover);
+        }
+    }
+
+    /// 面板行**每次现算**：会话页关掉后列表要跟着变（用户裁决：
+    /// "下拉弹框里面的 tab 列表要随界面的列表实时更新"）。行号与 `menu_run` 一一对应：
+    /// 0/1 = 会话 0/1（关掉的那页标"（已关）"并置灰，点了会重开），2 = 浮窗版面，3 = 新建 shell。
+    /// 面板行**现算**：只列**活着的会话**（关掉的那页不再出现），后面跟两条动作。
+    /// 返回 `(行, 行对应的动作, 行数)`；`动作` = 0/1 会话号，`0x10` 浮窗版面，`0x11` 新建 shell。
+    /// 行号在**同一次调用**里与绘制/命中一致，所以关掉一页后列表自动变短、行号跟着重排。
+    fn menu_state(&self) -> ([crate::fbcon::MenuRow; crate::fbcon::MENU_MAX_ROWS as usize], [u8; crate::fbcon::MENU_MAX_ROWS as usize], usize) {
+        use crate::fbcon::MenuRow;
+        let mut rows = [MenuRow { label: "", hint: "", dim: false }; crate::fbcon::MENU_MAX_ROWS as usize];
+        let mut act = [0u8; crate::fbcon::MENU_MAX_ROWS as usize];
+        let mut n = 0usize;
+        for i in 0..crate::serial::SESSIONS {
+            if session_open(i) {
+                rows[n] = MenuRow {
+                    label: if i == 0 { "会话 0" } else { "会话 1" },
+                    hint: if i == 0 { "Ctrl+Shift+1" } else { "Ctrl+Shift+2" },
+                    dim: false,
+                };
+                act[n] = i as u8;
+                n += 1;
+            }
+        }
+        rows[n] = MenuRow { label: "浮窗版面", hint: "", dim: false };
+        act[n] = 0x10;
+        n += 1;
+        // "新建 shell"：还有空会话格就可用；两格都占着就置灰并如实报容量墙。
+        let free = (0..crate::serial::SESSIONS).any(|i| !session_open(i));
+        rows[n] = MenuRow {
+            label: "新建 shell",
+            hint: if free { "会话格 2" } else { "16 格句柄表" },
+            dim: !free,
+        };
+        act[n] = 0x11;
+        n += 1;
+        (rows, act, n)
+    }
+
+    /// 收起面板：把**被它盖住的正文行**重画回来（不整窗重画，否则会闪）。
+    fn menu_erase(&mut self) {
+        let cols = self.term.dims().0;
+        let (_, tabs, _, _) = self.layout();
+        let (_, my, n) = crate::fbcon::menu_rect(cols, tabs, self.menu_state().2 as u64);
+        let y1 = my
+            + crate::fbcon::MENU_PAD_T
+            + n * crate::fbcon::MENU_ROW_H
+            + crate::fbcon::MENU_PAD_B;
+        let rows = self.term.body_rows();
+        let r1 = ((y1.saturating_sub(crate::fbcon::BAR_H + crate::fbcon::BODY_PAD))
+            / crate::fbcon::CELL_H)
+            .min(rows.saturating_sub(1) as u64);
+        self.term.clear_gap(&self.frame);
+        // 先**整块清面板矩形**（含 4px 上缝与底部留白），再按列段把正文铺回来。
+        let (mx, my, nn) = crate::fbcon::menu_rect(cols, tabs, self.menu_state().2 as u64);
+        let panel_h = crate::fbcon::MENU_PAD_T
+            + nn * crate::fbcon::MENU_ROW_H
+            + crate::fbcon::MENU_PAD_B;
+        self.term.clear_rect(
+            &self.frame,
+            mx * crate::fbcon::CELL_W,
+            my.saturating_sub(crate::fbcon::MENU_GAP),
+            crate::fbcon::MENU_W * crate::fbcon::CELL_W,
+            panel_h + crate::fbcon::MENU_GAP,
+        );
+        // **只铺回面板覆盖的那几列**（整行重画会让整段文字闪一下）。
+        let (mx, _, _) = crate::fbcon::menu_rect(cols, tabs, self.menu_state().2 as u64);
+        let c0 = mx.saturating_sub(1);
+        let c1 = (mx + crate::fbcon::MENU_W + 1).min(cols);
+        crate::fbcon::redraw_rows_range(
+            &self.term, &self.frame, rows, crate::user::active_session() as usize, 0, r1, c0, c1,
+        );
+        self.caret_at = None;
+        // **指针保存的旧底作废**：那块像素已被上面的重画覆盖，若还拿旧底去"擦旧指针"，
+        // 会在原位置把面板色贴回来（实测：点了选项再动鼠标，出现一小块残留）。
+        self.ptr = None;
+    }
+
+    /// 悬停行变化：只重画旧行与新行。
+    fn menu_rows(&mut self, old: Option<u8>, new: Option<u8>) {
+        #[cfg(feature = "ps2-mouse")]
+        self.ptr_erase();
+        let (_, tabs, _, _) = self.layout();
+        let open = (0..crate::serial::SESSIONS).filter(|i| !self.closed[*i]).count() as u64;
+        let (rows, _, nrows) = self.menu_state();
+        if let Some(o) = old {
+            self.term.menu_row(&self.frame, open, &rows[..nrows], o, new);
+        }
+        if let Some(n) = new {
+            if Some(n) != old {
+                self.term.menu_row(&self.frame, open, &rows[..nrows], n, new);
+            }
         }
     }
 
@@ -1693,8 +1825,8 @@ impl LiveTerm {
         #[cfg(feature = "ps2-mouse")]
         self.ptr_erase();
         let open = (0..crate::serial::SESSIONS).filter(|i| !self.closed[*i]).count() as u64;
-        let rows = MENU_ROWS;
-        self.term.menu_panel(&self.frame, open, &rows, self.menu_hover);
+        let (rows, _, nrows) = self.menu_state();
+        self.term.menu_panel(&self.frame, open, &rows[..nrows], self.menu_hover);
     }
 
     /// #58：未读位图——"该会话自上次被看过以来有新字节，且它不是当前活动标签"。
@@ -1737,6 +1869,7 @@ impl LiveTerm {
     }
 
     fn repaint(&mut self) {
+        self.sync_sessions();
         let rows = self.term.body_rows();
         let (sid, tabs, active, chrome) = self.layout();
         let chrome_changed = self.chrome != self.last_chrome || chrome != self.last_chrome;
@@ -1752,10 +1885,10 @@ impl LiveTerm {
         let lay = self.float;
         #[cfg(not(feature = "wm"))]
         let lay = false;
-        // **悬停与面板选中行不进签名**：它们只影响标签条那一行 / 面板那一块，
-        // 进签名就等于"指针每跨一格整屏重画一次"——用户实测的闪烁就是这个。
-        // 这两样改由 `tick` 里的局部重画负责；签名里只留"面板开没开"（开/关要动正文那块）。
-        let sig = (sid as u8, total, nl as u64, tabs, active, lay, self.menu);
+        // **悬停、面板选中行、面板开没开都不进签名**：它们只影响标签条那一行 / 面板那一块。
+        // 进签名就等于"每动一下整屏重画一次"——用户实测的闪烁就是这个。
+        // 面板开/关改由 `tick` 的局部绘制（`menu_only` / `menu_erase`）负责。
+        let sig = (sid as u8, total, nl as u64, tabs, active, lay);
         // S6t：**浮窗里"只改 z 序/桌面"的点击不会动内容签名**，只看 `sig` 的话置顶永远
         // 不生效（实测：点 win0 标题后 base 与 raised 只差 120 个像素=光标与指针，
         // 而点关闭之后差 38610——因为关闭顺带改了内容）。所以把浮窗的脏判定也接进这一格。
@@ -1771,8 +1904,7 @@ impl LiveTerm {
                 && self.sig.0 == sid as u8
                 && self.sig.2 == nl as u64
                 && self.sig.1 != usize::MAX
-                && self.sig.5 == lay
-                && self.sig.6 == self.menu;
+                && self.sig.5 == lay;
             #[cfg(feature = "wm")]
             let (cc, cr) = if self.float {
                 self.wm_frame()
@@ -1787,8 +1919,8 @@ impl LiveTerm {
             #[cfg(not(feature = "wm"))]
             let (cc, cr) = self.tabbed_frame(incremental, sid, tabs, active, chrome, rows);
             if self.menu {
-                let rows = MENU_ROWS;
-                self.term.menu_panel(&self.frame, tabs, &rows, self.menu_hover);
+                let (rows, _, nrows) = self.menu_state();
+                self.term.menu_panel(&self.frame, tabs, &rows[..nrows], self.menu_hover);
             }
             self.sig = sig;
             self.last_chrome = chrome;
@@ -1807,7 +1939,28 @@ impl LiveTerm {
     /// **一次节拍**（S6u）：指针、光标眨眼、点击拾取。这三样都不需要读内容签名——
     /// `mirror_newlines_sid` 每次要扫完整段环（最多 8 KiB），拿它当指针的节拍就是
     /// 用约 140 ms 的代价换约 16 ms 的观感。用户说的"鼠标移动卡顿"就是这个数。
+    /// 把 `closed[]` 与任务表对齐（单一事实来源）。**repaint 开头也要调**：
+    /// 签名是在 repaint 开头算的，只在 tick 里对齐的话，关掉标签那一拍签名还以为
+    /// 两个都开着 ⇒ 不重画 ⇒ 旧标签/旧悬停底留在屏上（实测）。
+    fn sync_sessions(&mut self) {
+        for i in 0..crate::serial::SESSIONS {
+            self.closed[i] = !session_open(i);
+        }
+    }
+
     fn tick(&mut self) {
+        self.sync_sessions();
+        // 会话开关状态变了 ⇒ **整条标签栏重画**（标签数变了，`+`/`∨` 的位置也跟着变），
+        // 面板开着时连面板一起重画（列表要实时反映"哪一页关了"）。
+        let st = (session_open(0), session_open(1));
+        if st != self.open_state {
+            self.open_state = st;
+            let (_, tabs, active, _) = self.layout();
+            self.bar_only(active);
+            if self.menu {
+                self.menu_only();
+            }
+        }
         // #58：面板开着 ⇒ **键盘归面板**（模态）：方向键移动、Enter 执行、Esc 关闭。
         // 捕获开关每拍同步一次（原子写）：面板关着时 Enter 仍由 shell 取，语义不变。
         #[cfg(feature = "ps2-kbd")]
@@ -1832,22 +1985,23 @@ impl LiveTerm {
                 _ => None,
             };
             if hv != self.hover {
+                let prev = self.hover;
                 self.hover = hv;
                 crate::log_info!("版面: 悬停={:?}", hv);
-                // 只重画标签条那一行（含 `+`/`∨`/窗口按钮），**不整屏重画**——
-                // 悬停进签名会让指针每跨一格就整屏刷一次，那就是"闪烁"。
-                self.bar_only(active);
+                // **只重画离开/进入的那两个标签**：整条重画会让顶部闪一下（用户实测）。
+                self.bar_hover(prev, hv);
             }
             // #58：面板开着时，悬停落在面板的哪一行（面板盖住标签条以下，所以分开算）。
             // **指针动没动**是它与键盘选中的仲裁：动了指针赢，没动就保留键盘那一行。
             let moved = (px, py) != self.last_ptr;
             self.last_ptr = (px, py);
             if self.menu && moved {
-                let mh = crate::fbcon::menu_hit(cols, tabs, MENU_ROWS.len() as u64, px as u64, py as u64);
+                let mh = crate::fbcon::menu_hit(cols, tabs, self.menu_state().2 as u64, px as u64, py as u64);
                 if mh != self.menu_hover {
+                    let prev = self.menu_hover;
                     self.menu_hover = mh;
-                    // 面板局部重画（面板自己铺底，下面就是正文，不会漏旧像素）。
-                    self.menu_only();
+                    // **只重画变化的行**（整块重画会让列表随鼠标移动闪）。
+                    self.menu_rows(prev, mh);
                 }
             }
         }
@@ -1898,9 +2052,36 @@ impl LiveTerm {
             if let Some((cx, cy)) = crate::mouse::take_click() {
                 // #58：面板开着时这一击归面板——点行执行、点外面只关。
                 // **消费掉就不再往下走**：否则关面板的那一下会顺手点到正文/标签。
+                // 先算标签条层面的命中：面板开着时要用它判断"点在外面"落在了什么上。
+                let (_, tabs, _, chrome) = self.layout();
+                let hit_bar = crate::fbcon::hit_test(
+                    self.term.dims().0, tabs, cx as u64, cy as u64, chrome,
+                    crate::user::active_session() as u64, self.hover);
                 if self.menu {
-                    self.menu_click(cx, cy);
-                    return;
+                    let row = crate::fbcon::menu_hit(
+                        self.term.dims().0, tabs, self.menu_state().2 as u64, cx as u64, cy as u64);
+                    if let Some(r) = row {
+                        self.menu = false;
+                        self.menu_hover = None;
+                        self.menu_erase();
+                        self.menu_run(r);
+                        return;
+                    }
+                    // `∨` 自己：只负责"关"，不再往下派发（否则同一次点击会关掉又立刻打开，
+                    // 看起来像没反应）。下一次点它时面板已关 ⇒ 走 `Hit::Layout` 打开。
+                    if matches!(hit_bar, crate::fbcon::Hit::Layout) {
+                        self.menu = false;
+                        self.menu_hover = None;
+                        self.menu_erase();
+                        crate::log_info!("菜单: 点 ∨ ⇒ 关");
+                        return;
+                    }
+                    // **点在外面**：先关，然后把这一击**继续派发**下去（用户裁决：
+                    // 关面板不该吃掉这一击）。
+                    self.menu = false;
+                    self.menu_hover = None;
+                    self.menu_erase();
+                    crate::log_info!("菜单: 点在外面 ⇒ 关，并继续派发");
                 }
                 // S6t：**版面决定点击归谁**。默认是标签条版面 ⇒ 走 `hit_test` 与那套窗口动作；
                 // 浮窗版面才走 `wm_click`（旧代码在 wm 档无条件走 wm_click，把标签条的动作全废了）。
@@ -1914,14 +2095,7 @@ impl LiveTerm {
                 let on_win = float && self.wm_click(cx, cy);
                 #[cfg(not(feature = "wm"))]
                 let on_win = false;
-                let (_, tabs, _, chrome) = self.layout();
-                let hit = if on_win {
-                    crate::fbcon::Hit::Body
-                } else {
-                    crate::fbcon::hit_test(
-                        self.term.dims().0, tabs, cx as u64, cy as u64, chrome,
-                        crate::user::active_session() as u64, self.hover)
-                };
+                let hit = if on_win { crate::fbcon::Hit::Body } else { hit_bar };
                 crate::log_info!("mouse: 点击 x={} y={} 命中={}", cx, cy, hit.name());
                 // S6q 补记二：三个窗口按钮**有动作了**——但各自的口径要写清楚：
                 //   · `-` 最小化：正文整块收起（只留标签栏），再点一次恢复；
@@ -1969,6 +2143,8 @@ impl LiveTerm {
                                     SECOND_TASK.load(Ordering::Relaxed)
                                 };
                                 let pid = crate::sched::task_proc_id(g);
+                                // **收尸之前**把 Job 号记下来：`proc_reap` 会把进程记录清空。
+                                let job = pid.and_then(crate::proc::job_of);
                                 let killed = g != 0 && crate::sched::terminate_task(g);
                                 // 视图侧：这一份画面上的标签消失；进程级：记下"用户按的"。
                                 self.closed[i] = true;
@@ -1977,11 +2153,19 @@ impl LiveTerm {
                                     Some(p) => crate::proc::proc_reap(p).is_ok(),
                                     None => false,
                                 };
+                                // 收尸后销毁 Job：不销毁的话每次重开漏一个槽，
+                                // 第三四次就 `job_create 失败 TableFull`（实测就是这个退出）。
+                                let jd = match job {
+                                    Some(j) => crate::proc::job_destroy(j).is_ok(),
+                                    None => false,
+                                };
                                 let (ok, bad) = crate::user::session_release_va(i as u8);
                                 crate::log_info!(
-                                    "窗口: 关闭会话 {} 终止任务={} 任务={} 收尸={} VA放手={}/{}",
-                                    i, killed, g, reaped, ok, bad
+                                    "窗口: 关闭会话 {} 终止任务={} 任务={} 收尸={} Job销毁={} VA放手={}/{}",
+                                    i, killed, g, reaped, jd, ok, bad
                                 );
+                                // 条会被重画覆盖 ⇒ 指针旧底作废（否则移动时把旧 × 贴回来）。
+                                self.ptr = None;
                                 if crate::user::active_session() as usize == i {
                                     crate::user::set_active_session(0);
                                 }
@@ -1991,8 +2175,16 @@ impl LiveTerm {
                         // 非 `wm` 档没有浮窗可切，只如实报读数，不假装切了。
                         crate::fbcon::Hit::Layout => {
                             // #58：`∨` 现在是**下拉**（参考图的语义）；浮窗版面搬进面板第 3 行。
+                            // 开/关都只动面板那一块（不进签名 ⇒ 不整窗重画，否则会闪）。
                             self.menu = !self.menu;
                             self.menu_hover = None;
+                            if self.menu {
+                                let (rows, _, nrows) = self.menu_state();
+                                let open = (0..crate::serial::SESSIONS)
+                                    .filter(|i| !self.closed[*i])
+                                    .count() as u64;
+                                self.term.menu_panel(&self.frame, open, &rows[..nrows], None);
+                            }
                             crate::log_info!("菜单: 开={}", self.menu);
                         }
                         _ => {}
@@ -2192,6 +2384,7 @@ impl LiveTerm {
                         SECOND_TASK.load(Ordering::Relaxed)
                     };
                     let pid = crate::sched::task_proc_id(g);
+                    let job = pid.and_then(crate::proc::job_of);
                     let killed = g != 0 && crate::sched::terminate_task(g);
                     self.closed[i] = true;
                     CLOSE_REQ[i].store(true, Ordering::Release);
@@ -2199,10 +2392,14 @@ impl LiveTerm {
                         Some(p) => crate::proc::proc_reap(p).is_ok(),
                         None => false,
                     };
+                    let jd = match job {
+                        Some(j) => crate::proc::job_destroy(j).is_ok(),
+                        None => false,
+                    };
                     let (ok, bad) = crate::user::session_release_va(i as u8);
                     crate::log_info!(
-                        "wm: 关闭窗口 {} 终止任务={} 任务={} 收尸={} VA放手={}/{}",
-                        i, killed, g, reaped, ok, bad
+                        "wm: 关闭窗口 {} 终止任务={} 任务={} 收尸={} Job销毁={} VA放手={}/{}",
+                        i, killed, g, reaped, jd, ok, bad
                     );
                     if i != 0 {
                         crate::user::set_active_session(0);

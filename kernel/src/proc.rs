@@ -497,6 +497,21 @@ pub fn job_of_aspace(as_slot: u8) -> Option<u16> {
     })
 }
 
+/// 某个进程挂在哪个 Job 上（收尸前读；`proc_reap` 会把这条记录清掉）。
+/// 关闭会话的链要用它在 `proc_reap` **之前**拿到 Job 号，收尸后再 `job_destroy`
+/// ——否则每关一次就漏一个 Job 槽，第三、四次重开就撞 `TreeFull`（实测：
+/// `job_create 失败 TableFull` 之后按旧语义收工，看起来像"点关闭就退出"）。
+pub fn job_of(proc_id: u16) -> Option<u16> {
+    mm::with_vmm_lock(|| {
+        let s = st();
+        let p = s.procs.get(proc_id as usize)?;
+        if !alive_flag(&p.used) {
+            return None;
+        }
+        Some(p.job)
+    })
+}
+
 /// 销毁一个 Job（名下进程额度必须已清零）。
 pub fn job_destroy(job: u16) -> Result<(), ProcError> {
     mm::with_vmm_lock(|| {

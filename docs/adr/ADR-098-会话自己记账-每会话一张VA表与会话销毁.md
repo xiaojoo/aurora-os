@@ -112,3 +112,18 @@ handle::MAX_HANDLES   16          日志里带上限，免得读数离开源码�
 裁决：新增 `static CLOSE_REQ: [AtomicBool; SESSIONS]`，两条关闭路径置位，
 park 用 `swap(false)` **消费一次请求**；`self.closed[i]` 降级为纯视图状态。
 九格 `s6v-close-check.py` 全绿（含第二次关、全局 `×`）。
+
+## 补记五（2026-11-15，实测）：关闭链补 `job_destroy`——Job 槽才是先撞的那道墙
+
+· 症状：反复点标签的 `×`（或从面板重开）三、四次后，**整个程序退出**（qemu-exit=33，
+  看起来像"正常退出"）。串口末尾是 `init-user: job_create 失败 TableFull` +
+  `站点 1196`，上一行是 `会话 0 重开失败 ⇒ 按旧语义收工`。
+· 成因：关闭链只做了 `terminate_task → proc_reap → session_release_va`。`proc_reap`
+  只把 Job 的 `used_procs` 减一，**从不销毁 Job**；每次重开 `job_create` 又占一个新槽，
+  `MAX_JOBS` 一下就满。
+· 修法：`proc::job_of(proc_id)` 在**收尸之前**读出 Job 号（reap 会清进程记录），
+  收尸成功后 `job_destroy`。标签条 `×` 与浮窗 `×` 两条链都补上，日志加
+  `Job销毁={}` 一格（关闭两行：`窗口: 关闭会话 …` / `wm: 关闭窗口 …`）。
+· 为什么不在 `proc_reap` 里顺手销毁：Job 可能在收尸之后还有别的进程（未来多进程 Job），
+  而且 ktest 里有"建 Job → 收尸 → 显式 job_destroy"的序列，reap 自动销毁会把那条用例
+  变成双重销毁。职责留给**产品关闭链**，读数是显式的。
