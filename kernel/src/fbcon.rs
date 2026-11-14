@@ -862,6 +862,39 @@ const TAB_DIM: u32 = 0x00_9A_9A_9A;
 const TAB_ICON: u32 = 0x00_A0_BB_E0;
 
 /// 标签栏的几何。**绘制与命中测试共用这一份**——两处各算一遍，点击就会落在画的地方旁边。
+// ---------------------------------------------------------------- #58：`∨` 下拉
+/// 面板宽（格）与最多行数；背景比条底亮一档、悬停再亮一档（参考图的面板是 `#2C2C2C`）。
+pub const MENU_W: u64 = 30;
+pub const MENU_MAX_ROWS: u64 = 6;
+pub const MENU_BG: u32 = 0x00_2C_2C_2C;
+pub const MENU_BG_HOVER: u32 = 0x00_3A_3A_3A;
+pub const MENU_EDGE: u32 = 0x00_4A_4A_4A;
+
+/// 面板里的一行：左标签、右提示、是否置灰（置灰 = 今天没有动作，点了要在串口如实报）。
+#[derive(Clone, Copy)]
+pub struct MenuRow {
+    pub label: &'static str,
+    pub hint: &'static str,
+    pub dim: bool,
+}
+
+/// 面板几何（格）：贴着屏幕右边、第 1 格行开始。**绘制与命中都从这里取**。
+pub fn menu_rect(cols: u64, n_rows: u64) -> (u64, u64, u64) {
+    let rows = n_rows.min(MENU_MAX_ROWS);
+    (cols.saturating_sub(MENU_W + 1), 1, rows)
+}
+
+/// 点在一个面板行上？返回行号。
+pub fn menu_hit(cols: u64, n_rows: u64, x_px: u64, y_px: u64) -> Option<u8> {
+    let (mx, my, rows) = menu_rect(cols, n_rows);
+    let cx = x_px / CELL_W;
+    let cy = y_px / CELL_H;
+    if cx < mx || cx >= mx + MENU_W || cy < my || cy >= my + rows {
+        return None;
+    }
+    Some((cy - my) as u8)
+}
+
 /// #58 pass A：窗口按钮的宽度（格）与字形边长（像素）。**所有绘制与命中都从这里取**。
 pub const BTN_W: u64 = 2;
 pub const GLYPH: u64 = 12;
@@ -1448,6 +1481,31 @@ impl Term {
         }
         // 5) 右侧三个窗口按钮（绘制在 `win_buttons` 里，最大化时也用它）
         self.win_buttons(f, strip_r);
+    }
+
+    /// #58：画 `∨` 下拉面板。**整块不透明**（面板下面就是正文），左边缘一道细线分开。
+    pub fn menu_panel(&self, f: &Frame, rows: &[MenuRow], hover: Option<u8>) {
+        let (x, y, n) = menu_rect(self.cols, rows.len() as u64);
+        self.rect(f, x * CELL_W, y * CELL_H, MENU_W * CELL_W, n * CELL_H, MENU_BG);
+        self.rect(f, x * CELL_W, y * CELL_H, 1, n * CELL_H, MENU_EDGE);
+        for (i, r) in rows.iter().take(n as usize).enumerate() {
+            let yy = (y + i as u64) * CELL_H;
+            if hover == Some(i as u8) {
+                self.rect(f, x * CELL_W, yy, MENU_W * CELL_W, CELL_H, MENU_BG_HOVER);
+            }
+            let ink = if r.dim { TAB_DIM } else { TAB_TEXT };
+            let mut c = x + 2;
+            for ch in r.label.chars() {
+                self.ch_ink(f, c * CELL_W, yy, ch, ink);
+                c += char_cells(ch);
+            }
+            let hl = cells_of(r.hint);
+            let mut hc = (x + MENU_W).saturating_sub(2 + hl);
+            for ch in r.hint.chars() {
+                self.ch_ink(f, hc * CELL_W, yy, ch, TAB_DIM);
+                hc += char_cells(ch);
+            }
+        }
     }
 
     /// 三个窗口按钮：`-` / `□` / `×`，各占一格、笔画 10px 居中在 y=11..20。

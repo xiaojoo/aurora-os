@@ -1446,6 +1446,15 @@ static SECOND_TASK: core::sync::atomic::AtomicUsize = core::sync::atomic::Atomic
 /// 和 `SECOND_TASK` 一样**不挂 cfg**：关闭分支在没有多会话的档里也要编得过。
 static INIT_TASK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+/// #58：`∨` 下拉的行。**会话在上、动作在下**（用户裁决 2026-11-14）。
+/// 置灰行表示"今天没有动作"——点了要在串口如实报，不假装成功。
+const MENU_ROWS: [crate::fbcon::MenuRow; 4] = [
+    crate::fbcon::MenuRow { label: "会话 0", hint: "Ctrl+Shift+1", dim: false },
+    crate::fbcon::MenuRow { label: "会话 1", hint: "Ctrl+Shift+2", dim: false },
+    crate::fbcon::MenuRow { label: "浮窗版面", hint: "", dim: false },
+    crate::fbcon::MenuRow { label: "新建 shell", hint: "16 格句柄表", dim: true },
+];
+
 /// ADR-098：**关闭请求是进程级事实，不是视图状态**。
 /// 为什么不能继续用 `LiveTerm::closed`：`live_wait_and_redraw` 与 park **各开一份
 /// `LiveTerm`**，启动等待期间来的点击写进等待那份，park 那份永远读到 false
@@ -1466,7 +1475,7 @@ struct LiveTerm {
     /// 上百毫秒），而指针与光标每秒要动好几次；只要这一格没变就**不重画正文**。
     /// (会话号, 该会话环里累计字节, 该会话环里的换行数, 标签数, 活动标签)
     /// —— 换行数是"整窗 vs 只画输入行"的分水岭；最后一格是版面（S6t：标签条 ⇄ 浮窗）。
-    sig: (u8, usize, u64, u64, u64, bool, Option<u8>),
+    sig: (u8, usize, u64, u64, u64, bool, Option<u8>, u16),
     /// 光标（下划线）**现在**画在哪一格；`None` = 现在是灭的一相。
     caret: Option<(u64, u64)>,
     /// 下一相光标该在哪一格（整窗重画时由 `redraw_window` 交回来）。
@@ -1507,6 +1516,9 @@ struct LiveTerm {
     float: bool,
     /// #58：指针停在哪一个标签上（`None` = 不在标签条目上）。**画与命中共用这一格**。
     hover: Option<u8>,
+    /// #58：`∨` 下拉开着吗、指针停在第几行。
+    menu: bool,
+    menu_hover: Option<u8>,
     /// #58：每个会话"上次被看过时"的累计字节数；与当前值不同且不是活动标签 ⇒ 未读圆点。
     seen: [usize; crate::serial::SESSIONS],
     /// 首次观察标记：开机那一屏算"已看过"，不给任何标签点未读。
@@ -1546,12 +1558,14 @@ impl LiveTerm {
         term.clear(&frame);
         Some(Self {
             frame, term,
-            sig: (u8::MAX, usize::MAX, u64::MAX, 0, 0, false, None),
+            sig: (u8::MAX, usize::MAX, u64::MAX, 0, 0, false, None, 0),
             caret: None,
             caret_at: None,
             ptr: None,
             ptr_bg: [[0; 7]; 11],
             hover: None,
+            menu: false,
+            menu_hover: None,
             seen: [0; crate::serial::SESSIONS],
             seen_init: false,
             paints: (0, 0, 0, 0),
@@ -1590,6 +1604,37 @@ impl LiveTerm {
 
     /// **内容重画**：只在正文真的变了的时候写像素。结尾一定走一次 `tick()`——
     /// 整窗重画会把指针与光标擦掉，不立刻补就会缺半拍。
+    /// #58：面板上的一击。行号见 `MENU_ROWS`：0/1 切会话、2 切浮窗版面、3 置灰（如实报墙）。
+    fn menu_click(&mut self, cx: i32, cy: i32) {
+        let row = crate::fbcon::menu_hit(
+            self.term.dims().0, MENU_ROWS.len() as u64, cx as u64, cy as u64);
+        self.menu = false;
+        self.menu_hover = None;
+        match row {
+            Some(0) | Some(1) => {
+                let i = row.unwrap();
+                crate::user::set_active_session(i);
+                crate::log_info!("菜单: 切到会话 {} ⇒ 关", i);
+            }
+            Some(2) => {
+                #[cfg(feature = "wm")]
+                {
+                    self.float = !self.float;
+                    self.zsig = (u8::MAX, [0; crate::serial::SESSIONS]);
+                    self.sigw = [(usize::MAX, usize::MAX); crate::serial::SESSIONS];
+                    crate::log_info!("菜单: 浮窗版面={} ⇒ 关", self.float);
+                }
+                #[cfg(not(feature = "wm"))]
+                crate::log_info!("菜单: 本档没有浮窗版面");
+            }
+            // 置灰行：**如实报是哪道墙**，不假装成功（16 格句柄表在两会话时已 15/16）。
+            Some(3) => {
+                crate::log_warn!("菜单: 新建 shell 撞容量墙（句柄表 16 格，两会话已占 15）");
+            }
+            _ => crate::log_info!("菜单: 点在外面 ⇒ 关"),
+        }
+    }
+
     /// #58：未读位图——"该会话自上次被看过以来有新字节，且它不是当前活动标签"。
     fn unread_mask(&self, active: u64) -> u64 {
         let mut m = 0u64;
@@ -1646,7 +1691,9 @@ impl LiveTerm {
         #[cfg(not(feature = "wm"))]
         let lay = false;
         // #58：**悬停也进签名**——它只影响标签条那一行，但那一行由整窗重画负责。
-        let sig = (sid as u8, total, nl as u64, tabs, active, lay, self.hover);
+        // #58：下拉开合与悬停行也进签名（它只影响那块面板，但由整窗重画负责）。
+        let menu_bits = (self.menu as u16) | ((self.menu_hover.map_or(0, |h| h + 1) as u16) << 1);
+        let sig = (sid as u8, total, nl as u64, tabs, active, lay, self.hover, menu_bits);
         // S6t：**浮窗里"只改 z 序/桌面"的点击不会动内容签名**，只看 `sig` 的话置顶永远
         // 不生效（实测：点 win0 标题后 base 与 raised 只差 120 个像素=光标与指针，
         // 而点关闭之后差 38610——因为关闭顺带改了内容）。所以把浮窗的脏判定也接进这一格。
@@ -1663,7 +1710,8 @@ impl LiveTerm {
                 && self.sig.2 == nl as u64
                 && self.sig.1 != usize::MAX
                 && self.sig.5 == lay
-                && self.sig.6 == self.hover;
+                && self.sig.6 == self.hover
+                && self.sig.7 == menu_bits;
             #[cfg(feature = "wm")]
             let (cc, cr) = if self.float {
                 self.wm_frame()
@@ -1677,6 +1725,10 @@ impl LiveTerm {
             };
             #[cfg(not(feature = "wm"))]
             let (cc, cr) = self.tabbed_frame(incremental, sid, tabs, active, chrome, rows);
+            if self.menu {
+                let rows = MENU_ROWS;
+                self.term.menu_panel(&self.frame, &rows, self.menu_hover);
+            }
             self.sig = sig;
             self.last_chrome = chrome;
             // 画过的像素一律作废：光标靠下一相重画，指针靠下面 `ptr_track` 重画。
@@ -1708,6 +1760,13 @@ impl LiveTerm {
             if hv != self.hover {
                 self.hover = hv;
                 crate::log_info!("版面: 悬停={:?}", hv);
+            }
+            // #58：面板开着时，悬停落在面板的哪一行（面板盖住标签条以下，所以分开算）。
+            if self.menu {
+                let mh = crate::fbcon::menu_hit(cols, MENU_ROWS.len() as u64, px as u64, py as u64);
+                if mh != self.menu_hover {
+                    self.menu_hover = mh;
+                }
             }
             // **首次观察即视为已读**：开机会话自己的横幅不该变成"未读圆点"
             // （实测：不这么做 tab1 从开机起就有一个 36 像素的点）。
@@ -1752,6 +1811,12 @@ impl LiveTerm {
             // 放在这里而不是只放常驻循环：**等待期也会点**（实测：只在 park 里取，
             // 等待期那几下点击就永远读不到）。
             if let Some((cx, cy)) = crate::mouse::take_click() {
+                // #58：面板开着时这一击归面板——点行执行、点外面只关。
+                // **消费掉就不再往下走**：否则关面板的那一下会顺手点到正文/标签。
+                if self.menu {
+                    self.menu_click(cx, cy);
+                    return;
+                }
                 // S6t：**版面决定点击归谁**。默认是标签条版面 ⇒ 走 `hit_test` 与那套窗口动作；
                 // 浮窗版面才走 `wm_click`（旧代码在 wm 档无条件走 wm_click，把标签条的动作全废了）。
                 #[cfg(feature = "wm")]
@@ -1840,17 +1905,10 @@ impl LiveTerm {
                         // S6t：标签条上的 `∨` **有动作了**——切换版面（标签条 ⇄ 浮窗）。
                         // 非 `wm` 档没有浮窗可切，只如实报读数，不假装切了。
                         crate::fbcon::Hit::Layout => {
-                            #[cfg(feature = "wm")]
-                            {
-                                self.float = !self.float;
-                                // 版面切换时把浮窗侧的两份签名作废：它们只在自己的版面里更新，
-                                // 不作废的话切回去的那一帧 `wm_frame` 会判"没变"而一像素不写。
-                                self.zsig = (u8::MAX, [0; crate::serial::SESSIONS]);
-                                self.sigw = [(usize::MAX, usize::MAX); crate::serial::SESSIONS];
-                                crate::log_info!("版面: 浮窗={}", self.float);
-                            }
-                            #[cfg(not(feature = "wm"))]
-                            crate::log_info!("版面: 本档没有浮窗，切换无效");
+                            // #58：`∨` 现在是**下拉**（参考图的语义）；浮窗版面搬进面板第 3 行。
+                            self.menu = !self.menu;
+                            self.menu_hover = None;
+                            crate::log_info!("菜单: 开={}", self.menu);
                         }
                         _ => {}
                     }
