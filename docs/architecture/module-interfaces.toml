@@ -712,6 +712,7 @@ public_api = [
   "mouse::pos",
   "mouse::stats",
   "mouse::take_click",
+  "mouse::buttons",
   "kbd::stats",
 ]
 allowed_callers = ["integration", "sched"]

@@ -189,6 +189,12 @@ pub fn isr() -> bool {
     true
 }
 
+/// 当前按键字节（bit0 = 左键按下）。**拖动要用"按住"这一格**：
+/// 点击事件只在按下沿发一次，拖动的中间帧只能靠轮询这个状态。
+pub fn buttons() -> u8 {
+    BTNS.load(Ordering::Relaxed)
+}
+
 /// 指针位置与"有没有动过"（画面侧每帧读）。
 pub fn pos() -> (i32, i32) {
     (X.load(Ordering::Relaxed), Y.load(Ordering::Relaxed))

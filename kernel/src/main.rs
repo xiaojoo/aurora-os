@@ -1505,10 +1505,19 @@ struct LiveTerm {
     /// "参考图最显眼的那一条没了"的直接原因。
     #[cfg(feature = "wm")]
     float: bool,
-    /// 桌面签名（哪些窗口开着 + 版面）：变了要**重铺桌面**，否则关掉的窗、
-    /// 切走的版面会把旧像素留在屏幕上（它们已经不在任何矩形的负责范围里了）。
+    /// 桌面签名（哪些窗口开着 + 版面 + 移动序号）：变了要**重铺桌面**，否则关掉的窗、
+    /// 切走的版面、被挪走的窗都会把旧像素留在屏幕上（它们已经不在任何矩形的负责范围里了）。
     #[cfg(feature = "wm")]
-    desk: (u64, bool),
+    desk: (u64, bool, u64),
+    /// 拖动中：`(窗口, 抓取点与窗口原点的列差, 行差)`（格）。
+    #[cfg(feature = "wm")]
+    drag: Option<(usize, u64, u64)>,
+    /// 被挪走的窗口的**旧矩形**：下一次重画先按它把桌面铺回去（残影就出在这一步）。
+    #[cfg(feature = "wm")]
+    old_rects: [Option<crate::fbcon::WinRect>; crate::serial::SESSIONS],
+    /// 移动序号：只进桌面签名，用来把"只挪了位置"与"桌面结构变了"分开。
+    #[cfg(feature = "wm")]
+    mvseq: u64,
 }
 
 #[cfg(feature = "fbcon-live")]
@@ -1560,7 +1569,13 @@ impl LiveTerm {
             #[cfg(feature = "wm")]
             float: false,
             #[cfg(feature = "wm")]
-            desk: (u64::MAX, false),
+            desk: (u64::MAX, false, 0),
+            #[cfg(feature = "wm")]
+            drag: None,
+            #[cfg(feature = "wm")]
+            old_rects: [None; crate::serial::SESSIONS],
+            #[cfg(feature = "wm")]
+            mvseq: 0,
         })
     }
 
@@ -1631,7 +1646,7 @@ impl LiveTerm {
                 // 从浮窗切回来：窗口矩形之外的桌面没人负责，先把旧像素铺掉再画标签条版面。
                 if self.sig.5 {
                     self.term.clear(&self.frame);
-                    self.desk = (u64::MAX, false);
+                    self.desk = (u64::MAX, false, 0);
                 }
                 self.tabbed_frame(incremental, sid, tabs, active, chrome, rows)
             };
@@ -1673,6 +1688,10 @@ impl LiveTerm {
             }
             _ => {}
         }
+        // #57：拖动**必须在这里轮询**——点击事件只在按下沿发一次，
+        // 按住期间的中间帧只有"按键还按着"这一格可读。
+        #[cfg(feature = "wm")]
+        self.drag_step();
         // 指针：位置变了才擦旧画新（保存/恢复 77 个背景像素）。
         #[cfg(feature = "ps2-mouse")]
         {
@@ -1870,6 +1889,49 @@ impl LiveTerm {
         caret
     }
 
+    /// #57：拖动的一拍。键还按着就把窗口挪到"指针格 - 抓取差"（夹在屏幕内）；
+    /// 松开就结束。每次挪动把旧矩形记进 `old_rects`，由 `wm_frame` 负责铺回桌面。
+    #[cfg(feature = "wm")]
+    fn drag_step(&mut self) {
+        let Some((i, gx, gy)) = self.drag else { return };
+        if crate::mouse::buttons() & 0x01 == 0 {
+            self.drag = None;
+            crate::log_info!(
+                "wm: 拖动结束 窗口={} 位置=({},{})",
+                i, self.wins[i].x, self.wins[i].y
+            );
+            return;
+        }
+        let (px, py) = crate::mouse::pos();
+        let (cols, rows) = self.term.dims();
+        let w = self.wins[i];
+        let nx = (px as u64 / crate::fbcon::CELL_W)
+            .saturating_sub(gx)
+            .min(cols.saturating_sub(w.cols));
+        let ny = (py as u64 / crate::fbcon::CELL_H)
+            .saturating_sub(gy)
+            .min(rows.saturating_sub(w.rows));
+        if (nx, ny) == (w.x, w.y) {
+            return;
+        }
+        // **累积并集，不能只存最后一次**：`drag_step` 每拍跑、`repaint` 每 8 拍一次，
+        // 只存一个格子的话中间那几次的旧矩形会被覆盖掉，残影就留在最早那几个位置上
+        // （实测：7 次移动只铺回了最后一个 `(5,8)`）。
+        self.old_rects[i] = Some(match self.old_rects[i] {
+            None => w,
+            Some(o) => {
+                let x0 = o.x.min(w.x);
+                let y0 = o.y.min(w.y);
+                let x1 = (o.x + o.cols).max(w.x + w.cols);
+                let y1 = (o.y + o.rows).max(w.y + w.rows);
+                crate::fbcon::WinRect { x: x0, y: y0, cols: x1 - x0, rows: y1 - y0 }
+            }
+        });
+        self.wins[i] = crate::fbcon::WinRect { x: nx, y: ny, ..w };
+        self.mvseq = self.mvseq.wrapping_add(1);
+        crate::log_info!("wm: 拖动 窗口={} → ({},{})", i, nx, ny);
+    }
+
     /// **浮窗点击**（S6r）：从最上面一扇往下找，第一个命中的窗口收下这次点击。
     /// 点标题栏/正文 = 置顶 + 聚焦；`-`/`□`/`×` 作用于**那扇窗**。
     /// 返回 `false` = 没落在任何窗上 ⇒ 调用方按**标签条版面**处理这一击（S6t：
@@ -1894,6 +1956,17 @@ impl LiveTerm {
             if crate::user::active_session() as usize != i {
                 crate::user::set_active_session(i as u8);
                 crate::log_info!("wm: 聚焦窗口 {}", i);
+            }
+            // #57：按住标题就开始拖。抓取点存成"指针格 - 窗口原点"的差，
+            // 这样拖动时窗口跟着指针走，而不是把标题格吸到指针上。
+            if hit == WinHit::Title {
+                let pc = cx as u64 / crate::fbcon::CELL_W;
+                let pr = cy as u64 / crate::fbcon::CELL_H;
+                self.drag = Some((
+                    i,
+                    pc.saturating_sub(self.wins[i].x),
+                    pr.saturating_sub(self.wins[i].y),
+                ));
             }
             match hit {
                 WinHit::Min => {
@@ -2000,12 +2073,12 @@ impl LiveTerm {
 
     /// 桌面签名：开着哪些窗（位图）+ 当前是不是浮窗版面。
     #[cfg(feature = "wm")]
-    fn wm_desk(&self) -> (u64, bool) {
+    fn wm_desk(&self) -> (u64, bool, u64) {
         let mask: u64 = (0..crate::serial::SESSIONS)
             .filter(|i| !self.closed[*i])
             .map(|i| 1u64 << i)
             .sum();
-        (mask, true)
+        (mask, true, self.mvseq)
     }
 
     /// 浮窗版面的一帧：桌面（变了就重铺）→ 标签条 → 按 z 序从下往上画每扇窗的矩形。
@@ -2016,7 +2089,9 @@ impl LiveTerm {
     fn wm_frame(&mut self) -> (u64, u64) {
         let active = crate::user::active_session() as u8;
         let desk = self.wm_desk();
-        let desk_changed = desk != self.desk;
+        // 结构（开着的窗 / 版面）变了 ⇒ 整屏重铺；**只是挪了位置** ⇒ 只把旧矩形铺回桌面。
+        let desk_changed = desk.0 != self.desk.0 || desk.1 != self.desk.1;
+        let moved = desk.2 != self.desk.2;
         if !self.wm_pending() {
             return (0, 0);
         }
@@ -2026,6 +2101,26 @@ impl LiveTerm {
         // 范围里，不铺就把旧像素留在屏上。
         if desk_changed {
             self.term.clear(&self.frame);
+            // 结构重铺之后旧矩形记录一律作废（整屏已经铺过一遍）。
+            for r in self.old_rects.iter_mut() {
+                *r = None;
+            }
+        } else if moved {
+            // **残影就出在这里**：被挪走的窗已经不在旧矩形上，没人负责那一块 ⇒ 铺回桌面底色。
+            for r in self.old_rects.iter_mut() {
+                if let Some(old) = r.take() {
+                    let hit = crate::fbcon::Term::at(&self.frame, old.x, old.y, old.cols, old.rows);
+                    crate::log_info!(
+                        "wm: 铺旧矩形 旧=({},{},{},{}) 视图={}",
+                        old.x, old.y, old.cols, old.rows, hit.is_some()
+                    );
+                    if let Some(t) = hit {
+                        for row in 0..old.rows {
+                            t.print_line(&self.frame, row, "");
+                        }
+                    }
+                }
+            }
         }
         // S6t：**浮窗模式下标签条仍然画着**。旧版把标签条整条收掉，于是浮窗是一扇单向门
         // ——`∨` 没了，切不回去（实测：第二次点同一格串口只有 `浮窗=true`、没有 `false`）。
