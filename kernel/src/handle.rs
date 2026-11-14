@@ -654,6 +654,13 @@ pub fn read_with(h: Handle, owner: (usize, u32), disk: &dyn Block, dst: &mut [u8
     Ok(n)
 }
 
+/// ADR-098 诊断：句柄表当前占了几格（`MAX_HANDLES = 16`）。
+/// 只读、只取一次表锁；用来把 16 号里的 `-6` 分成"表满"与"表不满"两种——
+/// 这两类的下一步完全不同（前者去查谁没还，后者去查 `transfer` 的权限/世代）。
+pub fn used() -> usize {
+    TABLE.lock().get().live() as usize
+}
+
 /// 任务退出撤销（`reap` 调用）：主人的两格都对上的表项全部清掉。
 /// **两段式**（ADR-074 决策 1）：锁内清槽并把 VMO 槽号抄出来，**放锁之后**逐个 `vmo_unref`。
 /// 文件对象仍然不持帧（设计 §7）；VMO 持帧，所以归还这一步必须发生在 HANDLE 锁之外。

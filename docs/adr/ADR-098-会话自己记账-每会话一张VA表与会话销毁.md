@@ -73,3 +73,19 @@ ADR-097 的前置测量（§267）与普查（§268）把"关掉一个会话之�
 · 正：`session_release_va` 的 `released/failed` 两次都写进串口，`failed == 0`；
 · 负样本：去掉 `session_release_va` 那一行 ⇒ 第二次 `si_va` 回到 -6（今天的形状就是证人）；
 · 回归：正常 `exit` 与全局 `×` 仍 `qemu-exit=33`；`s6p`/`s6q`/`s6r`/`s6t` 不劣化。
+
+## 补记一（2026-11-14）：16 号的 `-6` 需要一个"占格数"读数
+
+ADR-097 的重开在 16 号 `SYS_PROCESS_START` 上返 `start_ret=-6`、`跑过次数=0`（BACKLOG §271）。
+`-6` 在 16 号里有多个来源（`resolve` / `transfer` / `grant_*` / `vmo_read`），
+而**唯一能从外面读出来**的是句柄表占了几格。故新增两个只读符号：
+
+```text
+handle::used()        -> usize    取一次表锁，返回 Table::live()
+handle::MAX_HANDLES   16          日志里带上限，免得读数离开源码就说不清
+```
+
+打点位置：`stage_init_user` 的 16 号前后各读一次，一行输出
+`16号句柄占格={}→{}（上限 {}）start_ret={}`。判据：
+若重开时**前值已等于上限** ⇒ 归因落到"表满"（谁没还）；若前值明显小于上限 ⇒ 去查
+`transfer` 的权限与世代。**在拿到这个读数之前不改 16 号任何分支。**

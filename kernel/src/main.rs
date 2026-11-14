@@ -1296,9 +1296,18 @@ fn stage_init_user(sid: u8) -> Option<usize> {
     };
     let stopped = matches!(sched::state_of(gidx), sched::TaskState::Blocked(_));
     // 16：回填 StartupInfo 并放行。
+    // ADR-098 诊断：16 号前后的句柄表占格数。`-6` 在这条路上有多个来源
+    // （resolve / transfer / grant_* / vmo_read），而**唯一能从外面读出来的**就是占格数；
+    // 两数相等且已满 ⇒ "表满"；两数相等且不满 ⇒ 去查 transfer 的权限与世代。
+    let hb_before = crate::handle::used();
     f.rax = SYS_PROCESS_START; f.rdi = hp.0; f.rsi = ht.0; f.rdx = hi.0; f.r10 = si_va;
     syscall_dispatch(&mut f);
     let started = f.rax;
+    let hb_after = crate::handle::used();
+    crate::log_info!(
+        "init-user(S4b-3): 会话={} 16号句柄占格={}→{}（上限 {}）start_ret={}",
+        sid, hb_before, hb_after, crate::handle::MAX_HANDLES, started
+    );
     // 诊断（S5c）：子进程在入口就 #PF（rip=entry cr2=0 err=4），而三格生效位都对。
     // 只打**原值**：叶子表项（地址位+标志位）与首帧地址，不 deref 任何东西。
     // 上一版顺着叶子走 HHDM 读代码头，实测把内核打挂（cr2=HHDM+0x85000000，而 RAM 只有 512 MiB）

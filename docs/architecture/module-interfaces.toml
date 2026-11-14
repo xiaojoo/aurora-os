@@ -790,6 +790,8 @@ source_modules = ["handle"]
 public_api = [
   "handle::HErr",
   "handle::Handle",
+  "handle::used",
+  "handle::MAX_HANDLES",
   "handle::RIGHT_READ",
   "handle::RIGHT_WRITE",
   "handle::RIGHT_MAP",
