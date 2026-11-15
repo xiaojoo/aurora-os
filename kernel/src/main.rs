@@ -992,13 +992,13 @@ fn run_ktests_and_finish() -> ! {
     // S5d：接住 init 的任务号——判定之后要不要等它，由 `park_until_init_exits` 说。
     let init_task = stage_init_user(0);
     // ADR-097：留一份任务号给关闭路径（`×` 关的是会话，不是整机）。
-    INIT_TASK.store(init_task.unwrap_or(0), core::sync::atomic::Ordering::Relaxed);
+    SESSION_TASK[0].store(init_task.unwrap_or(0), core::sync::atomic::Ordering::Relaxed);
     // S6p：第二个会话（多标签）。**只在新特性下起**：既有变体的任务与句柄账一格不动。
     #[cfg(feature = "multisession")]
     {
         let second = stage_init_user(1);
         // S6q 补记三：窗口条目上的 `×` 要能终止这个会话 ⇒ 任务号留一份给 `LiveTerm` 用。
-        SECOND_TASK.store(second.unwrap_or(0), Ordering::Relaxed);
+        SESSION_TASK[1].store(second.unwrap_or(0), Ordering::Relaxed);
         crate::log_info!("multisession: 第二个会话 任务={:?}", second);
     }
     // S6c：init 的交互窗口结束后报键盘的六本账——**放在这里**是因为窗口之内才是按键时间，
@@ -1128,18 +1128,12 @@ fn park_until_init_exits(init: Option<usize>) {
                     let slot = req as usize;
                     crate::serial::mirror_reset_sid(slot);
                     CLOSE_REQ[slot].store(false, Ordering::Release);
-                    if slot == 0 {
-                        INIT_TASK.store(0, Ordering::Relaxed);
-                    } else {
-                        SECOND_TASK.store(0, Ordering::Relaxed);
-                    }
+                    SESSION_TASK[slot].store(0, Ordering::Relaxed);
                     match stage_init_user(slot as u8) {
                         Some(n) => {
+                            SESSION_TASK[slot].store(n, Ordering::Relaxed);
                             if slot == 0 {
-                                INIT_TASK.store(n, Ordering::Relaxed);
                                 gidx = Some(n);
-                            } else {
-                                SECOND_TASK.store(n, Ordering::Relaxed);
                             }
                             crate::user::set_active_session(slot as u8);
                             crate::log_info!("新建: 会话 {} 起来了 任务={}", slot, n);
@@ -1511,16 +1505,19 @@ fn stage_init_user(sid: u8) -> Option<usize> {
     Some(gidx)
 }
 
-/// 第二个会话的任务号（S6q 补记三）：窗口条目上的 `×` 关会话 1 时要用它终止任务。
-/// 0 = 没起（`multisession` 关掉时恒 0）。
-// **不挂 cfg**：`×` 的关闭分支在"没有多会话"的档里也要编得过（它只是不会真终止谁）——
-// S6q 补记三刚踩过：不带 multisession 的那档直接 E0425。
-static SECOND_TASK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-
-/// ADR-097：0 号会话（init shell）的任务号。`×` 要能「只关这一页」就得拿得到它，
+/// 每个会话槽的 shell 任务号（0 = 该槽没起）。`×`/窗口关闭要能终止对应任务，
 /// 而 `park_until_init_exits` 收到的 `Option<usize>` 在 `LiveTerm` 里看不到。
-/// 和 `SECOND_TASK` 一样**不挂 cfg**：关闭分支在没有多会话的档里也要编得过。
-static INIT_TASK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// **不挂 cfg**：关闭分支在没有多会话的档里也要编得过。
+static SESSION_TASK: [core::sync::atomic::AtomicUsize; crate::serial::SESSIONS] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; crate::serial::SESSIONS];
+
+fn session_task(i: usize) -> usize {
+    if i < crate::serial::SESSIONS {
+        SESSION_TASK[i].load(Ordering::Relaxed)
+    } else {
+        0
+    }
+}
 
 /// **新建会话请求**（进程级）：`0xFF` = 无；否则是目标会话格。
 /// UI（`+`、下拉里的"新建 shell"）只发请求，真正的 `stage_init_user` 只在 park 里做——
@@ -1529,25 +1526,52 @@ static INIT_TASK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUs
 
 static SPAWN_REQ: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0xFF);
 
-/// 发一次"新建"请求：挑一个空闲会话格。两个格都占着 ⇒ 如实报墙，返回 false。
+/// S20 设置页：**整屏模态**，状态放进程级（与 `SPAWN_REQ` 同一形状）——
+/// `live_wait_and_redraw` 与 park 各有一份 `LiveTerm`，页面开关/草稿不能让它们各记一份。
+#[cfg(feature = "fbcon-live")]
+static SET_OPEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "fbcon-live")]
+static SET_PANE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+#[cfg(feature = "fbcon-live")]
+static SET_PENDING: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(2);
+#[cfg(feature = "fbcon-live")]
+static SET_DROP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// 下拉里指针停在哪一项（数值 1..=SESSIONS；0xFF = 没有）。
+#[cfg(feature = "fbcon-live")]
+static SET_HOVER: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0xFF);
+#[cfg(feature = "fbcon-live")]
+static SET_DIRTY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// 关页标记：下一拍整窗重画之前要**整屏刷底色**。终端整窗只画 `LIVE_ROWS`(24) 行，
+/// 而正文区有 37 行；设置页是第一个盖到 24 行以下的全屏页面，不先整屏清，
+/// 关页后页面底部（会话上限行/按钮）会留在离屏缓冲里露出来（用户实测）。
+#[cfg(feature = "fbcon-live")]
+static SET_CLOSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "fbcon-live")]
+fn set_open() -> bool {
+    SET_OPEN.load(Ordering::Acquire)
+}
+
+/// 发一次"新建"请求：挑一个空闲会话格（只在上限内挑）。都占着 ⇒ 如实报墙，返回 false。
 #[cfg(feature = "fbcon-live")]
 
 fn request_spawn() -> bool {
     // S9f：连点防抖。已有一个待处理请求时不再排队——否则快速连点会把同一个会话格
-    // 重复 spawn（后一次覆盖前一次的 INIT_TASK，漏掉前一个任务的句柄），实测句柄表因此爬满。
+    // 重复 spawn（后一次覆盖前一次的任务号，漏掉前一个任务的句柄），实测句柄表因此爬满。
     if SPAWN_REQ.load(Ordering::Acquire) != 0xFF {
         crate::log_info!("新建: 已有待处理请求，忽略连点");
         return false;
     }
-    let slot = (0..crate::serial::SESSIONS).find(|i| !session_open(*i));
+    let limit = crate::serial::session_limit();
+    let slot = (0..limit).find(|i| !session_open(*i));
     match slot {
         Some(i) => {
             SPAWN_REQ.store(i as u8, Ordering::Release);
-            crate::log_info!("新建: 请求会话格 {} 句柄表={}/{}", i, crate::handle::used(), crate::handle::MAX_HANDLES);
+            crate::log_info!("新建: 请求会话格 {}（上限 {}）句柄表={}/{}", i, limit, crate::handle::used(), crate::handle::MAX_HANDLES);
             true
         }
         None => {
-            crate::log_warn!("新建: 会话格 2 个都占着 ⇒ 撞容量墙，不假装成功");
+            crate::log_warn!("新建: 会话格 {} 个都占着 ⇒ 撞容量墙，不假装成功", limit);
             false
         }
     }
@@ -1562,11 +1586,7 @@ fn request_spawn() -> bool {
 /// 一份记了"关掉"、另一份从 false 起算 ⇒ 画面画着两个标签、命中表却只有一个
 /// （用户实测：所有图标都点不动）。这里两个实例每拍都对齐同一份任务事实。
 fn session_open(i: usize) -> bool {
-    let g = if i == 0 {
-        INIT_TASK.load(Ordering::Relaxed)
-    } else {
-        SECOND_TASK.load(Ordering::Relaxed)
-    };
+    let g = session_task(i);
     if g == 0 {
         return false;
     }
@@ -1644,8 +1664,8 @@ struct LiveTerm {
     close_hover: Option<u8>,
     menu: bool,
     menu_hover: Option<u8>,
-    /// 上一次的"会话开/关"快照：变了要整条重画标签栏、面板开着时还要重画面板。
-    open_state: (bool, bool),
+    /// 上一次的"会话开/关"快照（每槽一位）：变了要整条重画标签栏、面板开着时还要重画面板。
+    open_mask: u8,
     /// #58：上一次看到的指针位置。**面板的选择在这两种输入间仲裁**：
     /// 指针挪了 ⇒ 指针赢（悬停）；指针没动 ⇒ 保留键盘选中的那一行。
     last_ptr: (i32, i32),
@@ -1703,7 +1723,7 @@ impl LiveTerm {
             menu: false,
             menu_hover: None,
             last_ptr: (0, 0),
-            open_state: (true, true),
+            open_mask: u8::MAX,
             seen: [0; crate::serial::SESSIONS],
             seen_init: false,
             paints: (0, 0, 0, 0),
@@ -1718,11 +1738,14 @@ impl LiveTerm {
                 // 但仍保留一段交叠——s6r 那条"遮挡由 z 序补"的判据要靠它才有证人。
                 crate::fbcon::WinRect { x: 1, y: 1, cols: 70, rows: 11 },
                 crate::fbcon::WinRect { x: 6, y: 7, cols: 70, rows: 11 },
+                // S20：槽位从 2 个扩到 4 个；2/3 号没有会话（closed 恒 true，不参与绘制）。
+                crate::fbcon::WinRect { x: 0, y: 0, cols: 0, rows: 0 },
+                crate::fbcon::WinRect { x: 0, y: 0, cols: 0, rows: 0 },
             ],
             #[cfg(feature = "wm")]
             saved: [crate::fbcon::WinRect { x: 0, y: 0, cols: 0, rows: 0 }; crate::serial::SESSIONS],
             #[cfg(feature = "wm")]
-            z: [0, 1],
+            z: [0, 1, 2, 3],
             #[cfg(feature = "wm")]
             sigw: [(usize::MAX, usize::MAX); crate::serial::SESSIONS],
             #[cfg(feature = "wm")]
@@ -1769,7 +1792,145 @@ impl LiveTerm {
                 // **新建**：只发请求，真正的 spawn 在 park 里（单一所有者）。
                 request_spawn();
             }
+            0x12 => self.settings_open(),
             _ => {}
+        }
+    }
+
+    // ------------------------------------------------------------ S20：设置页
+    fn set_view(&self) -> crate::fbcon::SetView {
+        crate::fbcon::SetView {
+            pane: SET_PANE.load(Ordering::Relaxed),
+            limit: crate::serial::session_limit() as u8,
+            pending: SET_PENDING.load(Ordering::Relaxed),
+            drop: SET_DROP.load(Ordering::Relaxed),
+            drop_hover: SET_HOVER.load(Ordering::Relaxed),
+            open_n: (0..crate::serial::SESSIONS).filter(|i| session_open(*i)).count() as u8,
+            cpu_n: crate::arch::x86_64::cpu::registered() as u8,
+            abi_major: crate::user::ABI_MAJOR as u8,
+            abi_minor: crate::user::ABI_MINOR as u8,
+        }
+    }
+
+    fn settings_redraw(&mut self) {
+        let v = self.set_view();
+        // 整页覆盖全屏 ⇒ 指针旧底作废，下一次 `ptr_track` 重新存。
+        self.ptr = None;
+        self.term.settings_page(&self.frame, &v);
+    }
+
+    fn settings_open(&mut self) {
+        SET_PENDING.store(crate::serial::session_limit() as u8, Ordering::Relaxed);
+        SET_PANE.store(0, Ordering::Relaxed);
+        SET_DROP.store(false, Ordering::Relaxed);
+        SET_HOVER.store(0xFF, Ordering::Relaxed);
+        SET_OPEN.store(true, Ordering::Release);
+        SET_DIRTY.store(false, Ordering::Release);
+        self.caret = None;
+        self.settings_redraw();
+        crate::log_info!("设置: 打开（当前上限 {}）", crate::serial::session_limit());
+    }
+
+    fn settings_close(&mut self, applied: bool) {
+        if applied {
+            crate::serial::set_session_limit(SET_PENDING.load(Ordering::Acquire) as usize);
+        }
+        SET_OPEN.store(false, Ordering::Release);
+        SET_DROP.store(false, Ordering::Release);
+        SET_HOVER.store(0xFF, Ordering::Release);
+        SET_PENDING.store(crate::serial::session_limit() as u8, Ordering::Relaxed);
+        SET_CLOSED.store(true, Ordering::Release);
+        // 下一拍整窗重画（页面盖掉的正文/标签条全部回来）。
+        self.sig = (u8::MAX, usize::MAX, u64::MAX, 0, 0, false);
+        self.open_mask = u8::MAX;
+        self.caret = None;
+        self.ptr = None;
+        crate::log_info!("设置: 关闭（保存={}）会话上限={}", applied, crate::serial::session_limit());
+    }
+
+    fn settings_click(&mut self, cx: i32, cy: i32) {
+        use crate::fbcon::SetHit;
+        let (w, h, _) = self.frame.geom();
+        let v = self.set_view();
+        let hit = crate::fbcon::settings_hit(w, h, cx as u64, cy as u64, &v);
+        crate::log_info!("设置: 点击 x={} y={} 命中={:?}", cx, cy, hit);
+        match hit {
+            SetHit::Close | SetHit::Discard => self.settings_close(false),
+            SetHit::Side(p) => {
+                SET_PANE.store(p, Ordering::Release);
+                SET_DROP.store(false, Ordering::Release);
+                SET_HOVER.store(0xFF, Ordering::Release);
+                SET_DIRTY.store(true, Ordering::Release);
+            }
+            SetHit::Drop => {
+                SET_DROP.store(!v.drop, Ordering::Release);
+                SET_HOVER.store(0xFF, Ordering::Release);
+                SET_DIRTY.store(true, Ordering::Release);
+            }
+            SetHit::Opt(n) => {
+                SET_PENDING.store(n, Ordering::Release);
+                SET_DROP.store(false, Ordering::Release);
+                SET_HOVER.store(0xFF, Ordering::Release);
+                SET_DIRTY.store(true, Ordering::Release);
+                crate::log_info!("设置: 草稿会话上限={}（未保存）", n);
+            }
+            SetHit::Save => self.settings_close(true),
+            // 点在下拉以外的任何地方：把下拉收起来（用户裁决：点别处要隐藏）。
+            SetHit::None => {
+                if v.drop {
+                    SET_DROP.store(false, Ordering::Release);
+                    SET_HOVER.store(0xFF, Ordering::Release);
+                    SET_DIRTY.store(true, Ordering::Release);
+                    crate::log_info!("设置: 点在下拉外面 ⇒ 收起");
+                }
+            }
+        }
+    }
+
+    /// 设置页开着时的每拍：只做页面自己的事（重画/键指针），终端内容一个字不画。
+    fn settings_tick(&mut self) {
+        if SET_DIRTY.swap(false, Ordering::AcqRel) {
+            self.settings_redraw();
+        }
+        #[cfg(feature = "ps2-kbd")]
+        {
+            crate::kbd::set_ui_capture(true);
+            if let Some(b) = crate::kbd::take_ui_key() {
+                if b == 0x1B {
+                    self.settings_close(false);
+                    return;
+                }
+            }
+        }
+        #[cfg(feature = "ps2-mouse")]
+        {
+            self.ptr_track();
+            if let Some((cx, cy)) = crate::mouse::take_click() {
+                self.settings_click(cx, cy);
+            }
+            if !set_open() {
+                return;
+            }
+            // 下拉开着时算"指针停在哪一项"。变了**只重画列表那一块**：
+            // 整页重画是上百万像素，每次悬停都整页重画会把移动拖慢。
+            let (w, h, _) = self.frame.geom();
+            let (px, py) = crate::mouse::pos();
+            let v = self.set_view();
+            let hv = if v.drop && v.pane == 0 {
+                match crate::fbcon::settings_hit(w, h, px as u64, py as u64, &v) {
+                    crate::fbcon::SetHit::Opt(k) => k,
+                    _ => 0xFF,
+                }
+            } else {
+                0xFF
+            };
+            let old = SET_HOVER.swap(hv, Ordering::AcqRel);
+            if hv != old && v.drop && v.pane == 0 {
+                self.ptr_erase();
+                let v2 = self.set_view();
+                self.term.settings_drop_redraw(&self.frame, &v2);
+                self.ptr = None;
+            }
         }
     }
 
@@ -1829,42 +1990,48 @@ impl LiveTerm {
     }
 
     /// 面板行**每次现算**：会话页关掉后列表要跟着变（用户裁决：
-    /// "下拉弹框里面的 tab 列表要随界面的列表实时更新"）。行号与 `menu_run` 一一对应：
-    /// 0/1 = 会话 0/1（关掉的那页标"（已关）"并置灰，点了会重开），2 = 浮窗版面，3 = 新建 shell。
-    /// 面板行**现算**：只列**活着的会话**（关掉的那页不再出现），后面跟两条动作。
-    /// 返回 `(行, 行对应的动作, 行数)`；`动作` = 0/1 会话号，`0x10` 浮窗版面，`0x11` 新建 shell。
-    /// 行号在**同一次调用**里与绘制/命中一致，所以关掉一页后列表自动变短、行号跟着重排。
+    /// "下拉弹框里面的 tab 列表要随界面的列表实时更新"）。
+    /// 面板行**现算**：只列**活着的会话**（关掉的那页不再出现），后面跟三条动作。
+    /// 返回 `(行, 行对应的动作, 行数)`；`动作` = 会话槽号，`0x10` 浮窗版面，`0x11` 新建 shell，
+    /// `0x12` 设置。行号在**同一次调用**里与绘制/命中一致，关掉一页后列表自动变短、行号跟着重排。
+    /// 会话标签按**压缩位置**编号（与标签条一致）：关掉左边那页后右边自动变成 会话1。
     fn menu_state(&self) -> ([crate::fbcon::MenuRow; crate::fbcon::MENU_MAX_ROWS as usize], [u8; crate::fbcon::MENU_MAX_ROWS as usize], usize) {
         use crate::fbcon::MenuRow;
+        const NAMES: [&str; 4] = ["会话1", "会话2", "会话3", "会话4"];
+        const HINTS: [&str; 4] = ["Ctrl+Shift+1", "Ctrl+Shift+2", "Ctrl+Shift+3", "Ctrl+Shift+4"];
         let mut rows = [MenuRow { label: "", hint: "", dim: false }; crate::fbcon::MENU_MAX_ROWS as usize];
         let mut act = [0u8; crate::fbcon::MENU_MAX_ROWS as usize];
         let mut n = 0usize;
+        let mut pos = 0usize;
         for i in 0..crate::serial::SESSIONS {
             if session_open(i) {
-                rows[n] = MenuRow {
-                    label: if i == 0 { "会话1" } else { "会话2" },
-                    hint: if i == 0 { "Ctrl+Shift+1" } else { "Ctrl+Shift+2" },
-                    dim: false,
-                };
+                let k = pos.min(NAMES.len() - 1);
+                rows[n] = MenuRow { label: NAMES[k], hint: HINTS[k], dim: false };
                 act[n] = i as u8;
                 n += 1;
+                pos += 1;
             }
         }
         rows[n] = MenuRow { label: "浮窗版面", hint: "", dim: false };
         act[n] = 0x10;
         n += 1;
-        // "新建 shell"：还有空会话格就可用；两格都占着就置灰并如实报容量墙。
-        let free_n = (0..crate::serial::SESSIONS).filter(|i| !session_open(*i)).count();
+        // "新建 shell"：上限内还有空格就可用；占满就置灰并如实报容量墙。
+        let limit = crate::serial::session_limit();
+        let free_n = (0..limit).filter(|i| !session_open(*i)).count();
         rows[n] = MenuRow {
             label: "新建 shell",
             hint: match free_n {
                 0 => "已满",
                 1 => "空 1 格",
-                _ => "空 2 格",
+                2 => "空 2 格",
+                _ => "空 3 格",
             },
             dim: free_n == 0,
         };
         act[n] = 0x11;
+        n += 1;
+        rows[n] = MenuRow { label: "设置", hint: "", dim: false };
+        act[n] = 0x12;
         n += 1;
         (rows, act, n)
     }
@@ -1978,6 +2145,15 @@ impl LiveTerm {
 
     fn repaint(&mut self) {
         self.sync_sessions();
+        // 设置页是整屏模态：终端正文/标签条这一拍一个字都不画（画面归页面）。
+        if set_open() {
+            self.tick();
+            return;
+        }
+        // 从设置页回来：终端整窗只画前 24 行，页面盖过的下面 13 行必须先刷底。
+        if SET_CLOSED.swap(false, Ordering::AcqRel) {
+            self.term.clear(&self.frame);
+        }
         let rows = self.term.body_rows();
         let (sid, tabs, active, chrome) = self.layout();
         let chrome_changed = self.chrome != self.last_chrome || chrome != self.last_chrome;
@@ -2059,11 +2235,17 @@ impl LiveTerm {
 
     fn tick(&mut self) {
         self.sync_sessions();
+        // 设置页模态：只走页面自己的路径；终端内容与光标/悬停全部停摆。
+        if set_open() {
+            self.settings_tick();
+            self.frame.present();
+            return;
+        }
         // 会话开关状态变了 ⇒ **整条标签栏重画**（标签数变了，`+`/`∨` 的位置也跟着变），
         // 面板开着时连面板一起重画（列表要实时反映"哪一页关了"）。
-        let st = (session_open(0), session_open(1));
-        if st != self.open_state {
-            self.open_state = st;
+        let st = (0..crate::serial::SESSIONS).filter(|i| session_open(*i)).fold(0u8, |m, i| m | (1u8 << i));
+        if st != self.open_mask {
+            self.open_mask = st;
             let (_, tabs, active, _) = self.layout();
             self.bar_only(active);
             if self.menu {
@@ -2259,11 +2441,7 @@ impl LiveTerm {
                             // 重开不在这里做：任务的句柄袋要等 Done 走完才回收，所以归 park。
                             // 原来那支「全部关闭 ⇒ 系统停机」删掉了：有了重开它不该存在。
                             if i < crate::serial::SESSIONS && !self.closed[i] {
-                                let g = if i == 0 {
-                                    INIT_TASK.load(Ordering::Relaxed)
-                                } else {
-                                    SECOND_TASK.load(Ordering::Relaxed)
-                                };
+                                let g = session_task(i);
                                 let pid = crate::sched::task_proc_id(g);
                                 // **收尸之前**把 Job 号记下来：`proc_reap` 会把进程记录清空。
                                 let job = pid.and_then(crate::proc::job_of);
@@ -2526,11 +2704,7 @@ impl LiveTerm {
                 WinHit::Close => {
                     // ADR-097 + ADR-098：与标签条上的 `×` 同一条链（读 proc_id → terminate
                     // → proc_reap → release_va），只关这一扇对应的会话，不停机。
-                    let g = if i == 0 {
-                        INIT_TASK.load(Ordering::Relaxed)
-                    } else {
-                        SECOND_TASK.load(Ordering::Relaxed)
-                    };
+                    let g = session_task(i);
                     let pid = crate::sched::task_proc_id(g);
                     let job = pid.and_then(crate::proc::job_of);
                     let killed = g != 0 && crate::sched::terminate_task(g);

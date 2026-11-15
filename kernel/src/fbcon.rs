@@ -3036,10 +3036,277 @@ const TAB_ICON_DIM: u32 = 0x00_6E_7C_90;
 // ---------------------------------------------------------------- #58：`∨` 下拉
 /// 面板宽（格）与最多行数；背景比条底亮一档、悬停再亮一档（参考图的面板是 `#2C2C2C`）。
 pub const MENU_W: u64 = 30;
-pub const MENU_MAX_ROWS: u64 = 6;
+/// 4 个会话 + 浮窗版面 + 新建 shell + 设置 = 7 行。
+pub const MENU_MAX_ROWS: u64 = 8;
 pub const MENU_BG: u32 = 0x00_2C_2C_2C;
 pub const MENU_BG_HOVER: u32 = 0x00_3A_3A_3A;
 pub const MENU_EDGE: u32 = 0x00_4A_4A_4A;
+
+// ---------------------------------------------------------------- S20：设置页
+// 独立整屏页（不是浮窗）：左栏分类 + 右栏设置行 + 底部保存/放弃。
+// 配色是新的几档灰，终端本体的配色一个没动。
+pub const SET_SIDEBAR_W: u64 = 300;
+
+/// 设置页标题的**原生 32×32 字形**（Noto Sans SC Medium 30px，4 bit/像素）。
+/// 为什么不是把 16px 字形放大 2×：放大只是把 16px 的边缘灰阶拉成 2×2 的糊边，
+/// 用户实测"字体出现模糊"（BACKLOG §331）。标题只有"启动/关于"两个词，表很小。
+const TITLE_WIDE_CP: [u32; 4] = [0x4E8E, 0x5173, 0x52A8, 0x542F];
+const FONT_TITLE_WIDE: [[u128; 32]; 4] = [
+    // 于
+    [
+        0x00000000000000000000000000000000,
+        0x00000000000000000000000000000000,
+        0x00000000000000000000000000000000,
+        0x00000000000000000000000000000000,
+        0x00000000000000000000000000000000,
+        0x0003FFFFFFFFFFFFFFFFFFFFFF300000,
+        0x0003FFFFFFFFFFFFFFFFFFFFFF300000,
+        0x0002BBBBBBBBBCFFEBBBBBBBBB200000,
+        0x00000000000002FFB000000000000000,
+        0x00000000000002FFB000000000000000,
+        0x00000000000002FFB000000000000000,
+        0x00000000000002FFB000000000000000,
+        0x00000000000002FFB000000000000000,
+        0x00000000000002FFB000000000000000,
+        0x00000000000002FFB000000000000000,
+        0x03FFFFFFFFFFFFFFFFFFFFFFFFFF4000,
+        0x03FFFFFFFFFFFFFFFFFFFFFFFFFF4000,
+        0x03BBBBBBBBBBBCFFEBBBBBBBBBBB3000,
+        0x00000000000002FFB000000000000000,
+        0x00000000000002FFB000000000000000,
+        0x00000000000002FFB000000000000000,
+        0x00000000000002FFB000000000000000,
+        0x00000000000002FFB000000000000000,
+        0x00000000000002FFB000000000000000,
+        0x00000000000002FFB000000000000000,
+        0x00000000000002FFB000000000000000,
+        0x00000000000002FFB000000000000000,
+        0x00000000000004FFB000000000000000,
+        0x00000002DDDDDEFF9000000000000000,
+        0x00000000BFFFFFFE3000000000000000,
+        0x000000006FEEDC930000000000000000,
+        0x00000000000000000000000000000000,
+    ],
+    // 关
+    [
+        0x00000000000000000000000000000000,
+        0x00000000000000000000000000000000,
+        0x00000000000000000000000000000000,
+        0x00000004B300000000004E9400000000,
+        0x0000003FFD0000000000AFFA00000000,
+        0x00000009FF9000000002FFE200000000,
+        0x00000001DFE200000009FF8000000000,
+        0x000000006FFA0000003FFD0000000000,
+        0x000000000DE6000000BFF50000000000,
+        0x0000BBBBBDCBBBBBBBFFEBBBBB400000,
+        0x0000FFFFFFFFFFFFFFFFFFFFFF600000,
+        0x0000FFFFFFFFFFFFFFFFFFFFFF600000,
+        0x00000000000006FFB000000000000000,
+        0x00000000000006FFB000000000000000,
+        0x00000000000006FFB000000000000000,
+        0x00000000000006FFB000000000000000,
+        0x00000000000007FFB000000000000000,
+        0x00DFFFFFFFFFFFFFFFFFFFFFFFFF0000,
+        0x00DFFFFFFFFFFFFFFFFFFFFFFFFF0000,
+        0x00ABBBBBBBBBBFFFFDBBBBBBBBBB0000,
+        0x0000000000006FFFFC00000000000000,
+        0x000000000000DFFFFF80000000000000,
+        0x000000000008FFF6EFF4000000000000,
+        0x00000000006FFFA06FFE500000000000,
+        0x0000000007FFFE100AFFE60000000000,
+        0x00000002BFFFE30001CFFF9100000000,
+        0x0000018EFFFD3000001CFFFE70000000,
+        0x00028EFFFFB100000001BFFFFE940000,
+        0x04CFFFFFD6000000000006EFFFFF8000,
+        0x00CFFFD7000000000000001AEFFC0000,
+        0x001EB500000000000000000017D30000,
+        0x00010000000000000000000000000000,
+    ],
+    // 动
+    [
+        0x00000000000000000000000000000000,
+        0x00000000000000000000000000000000,
+        0x00000000000000000000000000000000,
+        0x00000000000000000007760000000000,
+        0x0000000000000000000EFC0000000000,
+        0x0026666666666610000EFB0000000000,
+        0x004FFFFFFFFFFF30000EFB0000000000,
+        0x004FFFFFFFFFFF30000EFB0000000000,
+        0x0000000000000000000EFB0000000000,
+        0x0000000000000000000EFB0000000000,
+        0x000000000000000CFFFFFFFFFFFF4000,
+        0x000000000000000CFFFFFFFFFFFF3000,
+        0x0277777777777768AAAFFDAAACFF3000,
+        0x04FFFFFFFFFFFFB0002FF80008FF2000,
+        0x04FFFFFFFFFFFFB0003FF60008FF2000,
+        0x000007FF50000000005FF50009FF1000,
+        0x00000BFE10000000006FF40009FF1000,
+        0x00000EFB00045000008FF2000AFF0000,
+        0x00003FF7007FE00000AFE0000BFE0000,
+        0x00008FF3002FF50000DFC0000BFE0000,
+        0x0000CFC0000BFB0002FF90000CFD0000,
+        0x0002FF700005FF2005FF60000DFC0000,
+        0x0007FE100159FF7009FF30000EFB0000,
+        0x000DFC69DFFFFFC01EFD00000FFA0000,
+        0x009FFFFFFFFEDFF27FF800002FF90000,
+        0x00CFFFFEB7302FE5DFE200004FF70000,
+        0x007FD84000000518FFB000007FF50000,
+        0x002300000000005FFF400001CFF30000,
+        0x00000000000002EFFA06FFFFFFD00000,
+        0x00000000000000AFD100EFFFFE400000,
+        0x000000000000000A2000899972000000,
+        0x00000000000000000000000000000000,
+    ],
+    // 启
+    [
+        0x00000000000000000000000000000000,
+        0x00000000000000000000000000000000,
+        0x00000000000000010000000000000000,
+        0x0000000000000AED0000000000000000,
+        0x0000000000000AFF7000000000000000,
+        0x00000000000003FFD000000000000000,
+        0x00000000000000CFF400000000000000,
+        0x00005FFFFFFFFFFFFFFFFFFFFF200000,
+        0x00005FFFFFFFFFFFFFFFFFFFFF200000,
+        0x00005FFC999999999999999DFF200000,
+        0x00005FF70000000000000009FF200000,
+        0x00005FF70000000000000009FF200000,
+        0x00005FF70000000000000009FF200000,
+        0x00005FFB888888888888888CFF200000,
+        0x00005FFFFFFFFFFFFFFFFFFFFF200000,
+        0x00006FFFFFFFFFFFFFFFFFFFFF200000,
+        0x00006FF6000000000000000000000000,
+        0x00007FF5000000000000000000000000,
+        0x00007FF4000000000000000000000000,
+        0x00009FF37FFFFFFFFFFFFFFFFFB00000,
+        0x0000BFF17FFFFFFFFFFFFFFFFFB00000,
+        0x0000DFE07FFA888888888889FFB00000,
+        0x0001EFB07FF3000000000000FFB00000,
+        0x0005FF907FF3000000000000FFB00000,
+        0x0009FF507FF3000000000000FFB00000,
+        0x000DFE107FF3000000000000FFB00000,
+        0x005FFB007FF9777777777778FFB00000,
+        0x00CFF6007FFFFFFFFFFFFFFFFFB00000,
+        0x07FFD0007FFFFFFFFFFFFFFFFFB00000,
+        0x05EF50007FF3000000000000FFB00000,
+        0x004B00007DD3000000000000DDA00000,
+        0x00000000000000000000000000000000,
+    ],
+];
+pub const SET_SIDE_TOP: u64 = 96;
+pub const SET_ROW_TOP: u64 = 136;
+/// 启动页的一行（标签 + 说明两行字）：96 太松，用户要求"每行上下间隙小一点"。
+pub const SET_ROW_H: u64 = 72;
+/// 关于页是一行一条（标签 + 右值），用更紧的行高。
+pub const SET_ABOUT_ROW_H: u64 = 56;
+pub const SET_CTRL_W: u64 = 220;
+pub const SET_CTRL_H: u64 = 40;
+pub const SET_RIGHT: u64 = 64;
+const SET_BG: u32 = 0x00_20_20_20;
+const SET_SIDE: u32 = 0x00_18_18_18;
+const SET_SEL: u32 = 0x00_2C_2C_2C;
+const SET_EDGE: u32 = 0x00_3A_3A_3A;
+const SET_CTRL: u32 = 0x00_2A_2A_2A;
+const SET_TEXT: u32 = 0x00_E8_E8_E8;
+const SET_DIM: u32 = 0x00_93_93_93;
+/// 下拉选项的悬停底：比控件底亮一档（与 `∨` 面板的 hover 条同族）。
+const SET_OPT_HOVER: u32 = 0x00_34_34_34;
+/// 设置页唯一的一处彩色：保存按钮与下拉选中标记（终端本体不用它）。
+const SET_ACCENT: u32 = 0x00_2F_6F_9F;
+
+/// 设置页的一帧状态。**绘制与命中共用**（各算一遍就会点偏）。
+#[derive(Clone, Copy)]
+pub struct SetView {
+    /// 0 = 启动、1 = 关于
+    pub pane: u8,
+    /// 已生效的会话上限
+    pub limit: u8,
+    /// 正在编辑的会话上限（保存前只是草稿）
+    pub pending: u8,
+    /// 会话数下拉开着？
+    pub drop: bool,
+    /// 下拉里指针停在哪一项（数值 1..=SESSIONS；0xFF = 没有）
+    pub drop_hover: u8,
+    /// 当前活着的会话数（只读行要用）
+    pub open_n: u8,
+    pub cpu_n: u8,
+    pub abi_major: u8,
+    pub abi_minor: u8,
+}
+
+/// 设置页上的一次点击落点。`Opt` 带的是选中的数值（1..=SESSIONS）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SetHit {
+    None,
+    Close,
+    Side(u8),
+    Drop,
+    Opt(u8),
+    Save,
+    Discard,
+}
+
+fn set_side_rect(i: u64) -> (u64, u64, u64, u64) {
+    (16, SET_SIDE_TOP + i * 48, SET_SIDEBAR_W - 32, 40)
+}
+
+fn set_ctrl_rect(fb_w: u64, row: u64) -> (u64, u64) {
+    (fb_w.saturating_sub(SET_RIGHT + SET_CTRL_W), SET_ROW_TOP + row * SET_ROW_H + 16)
+}
+
+/// 下拉列表：挂在"最大会话数"那个控件下面。
+fn set_drop_rect(fb_w: u64) -> (u64, u64, u64, u64) {
+    let (x, y) = set_ctrl_rect(fb_w, 0);
+    (x, y + SET_CTRL_H + 6, SET_CTRL_W, crate::serial::SESSIONS as u64 * 40 + 8)
+}
+
+fn set_btn_rects(fb_w: u64, fb_h: u64) -> ((u64, u64, u64, u64), (u64, u64, u64, u64)) {
+    let y = fb_h.saturating_sub(72);
+    let (sw, dw, gap) = (96u64, 152u64, 16u64);
+    let sx = fb_w.saturating_sub(SET_RIGHT + sw);
+    let dx = sx.saturating_sub(gap + dw);
+    ((sx, y, sw, 40), (dx, y, dw, 40))
+}
+
+fn in_rect(r: (u64, u64, u64, u64), x: u64, y: u64) -> bool {
+    x >= r.0 && x < r.0 + r.2 && y >= r.1 && y < r.1 + r.3
+}
+
+/// 设置页命中测试。**与 `settings_page` 共用同一套几何函数**。
+pub fn settings_hit(fb_w: u64, fb_h: u64, x: u64, y: u64, v: &SetView) -> SetHit {
+    if in_rect((fb_w.saturating_sub(72), 8, 48, 48), x, y) {
+        return SetHit::Close;
+    }
+    for i in 0..2u64 {
+        if in_rect(set_side_rect(i), x, y) {
+            return SetHit::Side(i as u8);
+        }
+    }
+    let (save, disc) = set_btn_rects(fb_w, fb_h);
+    if in_rect(save, x, y) {
+        return SetHit::Save;
+    }
+    if in_rect(disc, x, y) {
+        return SetHit::Discard;
+    }
+    // 下拉列表盖在行上面：先判它。
+    if v.drop && v.pane == 0 {
+        let (dx, dy, dw, dh) = set_drop_rect(fb_w);
+        if in_rect((dx, dy, dw, dh), x, y) {
+            let k = (y.saturating_sub(dy + 4)) / 40;
+            if k < crate::serial::SESSIONS as u64 {
+                return SetHit::Opt(k as u8 + 1);
+            }
+        }
+    }
+    if v.pane == 0 {
+        let (cx, cy) = set_ctrl_rect(fb_w, 0);
+        if in_rect((cx, cy, SET_CTRL_W, SET_CTRL_H), x, y) {
+            return SetHit::Drop;
+        }
+    }
+    SetHit::None
+}
 
 /// 面板里的一行：左标签、右提示、是否置灰（置灰 = 今天没有动作，点了要在串口如实报）。
 #[derive(Clone, Copy)]
@@ -4022,6 +4289,221 @@ impl Term {
                 hc += char_cells(ch);
             }
         }
+    }
+
+    // ------------------------------------------------------------ S20：设置页
+    /// 1× 界面字串，返回下一个字符的 x。
+    fn text_ui_abs(&self, f: &Frame, mut x: u64, y: u64, s: &str, fg: u32, bg: u32) -> u64 {
+        for ch in s.chars() {
+            self.ch_ink_ui_abs(f, x, y, ch, fg, bg);
+            x += if (ch as u32) < 0x80 { 8 } else { 16 };
+        }
+        x
+    }
+
+    /// 设置页标题：**原生 32×32 灰阶字形**（不是把 16px 放大 2×——放大只是把 16px 的
+    /// 边缘灰阶拉成 2×2 糊边，用户实测"字体出现模糊"）。表外的字不画。
+    fn text_title_abs(&self, f: &Frame, mut x: u64, y: u64, s: &str, fg: u32, bg: u32) -> u64 {
+        for ch in s.chars() {
+            let k = ch as u32;
+            if let Ok(i) = TITLE_WIDE_CP.binary_search(&k) {
+                let g = FONT_TITLE_WIDE[i];
+                for r in 0..32u64 {
+                    let row = g[r as usize];
+                    for c in 0..32u64 {
+                        let a = ((row >> (124 - 4 * c)) & 0xF) as u32;
+                        if a != 0 {
+                            let _ = self.put_abs(f, x + c, y + r, mix(fg, bg, a));
+                        }
+                    }
+                }
+            }
+            x += 32;
+        }
+        x
+    }
+
+    fn text_ui_width(s: &str) -> u64 {
+        s.chars().map(|ch| if (ch as u32) < 0x80 { 8 } else { 16 }).sum()
+    }
+
+    fn digit_ui(&self, f: &Frame, x: u64, y: u64, n: u64, fg: u32, bg: u32) -> u64 {
+        self.ch_ink_ui_abs(f, x, y, (b'0' + (n.min(9) as u8)) as char, fg, bg);
+        x + 8
+    }
+
+    /// 0..=99 的两位十进制（ABI 次版本现在就是 11，单字符会静默写成 9）。
+    fn number_ui(&self, f: &Frame, mut x: u64, y: u64, n: u64, fg: u32, bg: u32) -> u64 {
+        if n >= 10 {
+            x = self.digit_ui(f, x, y, n / 10, fg, bg);
+        }
+        self.digit_ui(f, x, y, n % 10, fg, bg)
+    }
+
+    /// 右侧对齐的一行值（关于页用）。
+    fn text_ui_right(&self, f: &Frame, right: u64, y: u64, s: &str, fg: u32, bg: u32) {
+        self.text_ui_abs(f, right.saturating_sub(Self::text_ui_width(s)), y, s, fg, bg);
+    }
+
+    /// 灰色控件盒：圆角 + 1px 边 + 左内边距文字 + 右侧 `∨`。
+    fn set_control(&self, f: &Frame, x: u64, y: u64, label: &str) {
+        self.rounded_rect_abs(f, x, y, SET_CTRL_W, SET_CTRL_H, SET_EDGE, SET_BG, 5);
+        self.rounded_rect_abs(f, x + 1, y + 1, SET_CTRL_W - 2, SET_CTRL_H - 2, SET_CTRL, SET_EDGE, 5);
+        let _ = self.text_ui_abs(f, x + 16, y + 12, label, SET_TEXT, SET_CTRL);
+        let cx = x + SET_CTRL_W - 28;
+        let cy = y + 19;
+        for k in 0..5u64 {
+            let _ = self.put_abs(f, cx + k, cy + k, SET_DIM);
+            let _ = self.put_abs(f, cx + 8 - k, cy + k, SET_DIM);
+        }
+    }
+
+    fn set_row_head(&self, f: &Frame, px: u64, row: u64, label: &str, desc: &str) -> u64 {
+        let y = SET_ROW_TOP + row * SET_ROW_H;
+        let _ = self.text_ui_abs(f, px, y + 10, label, SET_TEXT, SET_BG);
+        let _ = self.text_ui_abs(f, px, y + 30, desc, SET_DIM, SET_BG);
+        self.rect_abs(f, px, y + SET_ROW_H - 12, f.geom().0.saturating_sub(SET_RIGHT + px), 1, SET_EDGE);
+        y
+    }
+
+    /// 关于页的一行（单行：标签 + 右值），行高 `SET_ABOUT_ROW_H`（比启动页更紧）。
+    fn set_row_head_about(&self, f: &Frame, px: u64, row: u64, label: &str) -> u64 {
+        let y = SET_ROW_TOP + row * SET_ABOUT_ROW_H;
+        let _ = self.text_ui_abs(f, px, y + 10, label, SET_TEXT, SET_BG);
+        self.rect_abs(f, px, y + SET_ABOUT_ROW_H - 10, f.geom().0.saturating_sub(SET_RIGHT + px), 1, SET_EDGE);
+        y
+    }
+
+    fn settings_start(&self, f: &Frame, v: &SetView, px: u64, w: u64) {
+        // 1) 最大会话数（唯一可编辑项）
+        let _ = self.set_row_head(f, px, 0, "最大会话数", "同时能开几个 shell；重启后回到默认 2");
+        let (cx, cy) = set_ctrl_rect(w, 0);
+        let mut d = [0u8; 1];
+        d[0] = b'0' + v.pending.clamp(1, crate::serial::SESSIONS as u8);
+        if let Ok(s) = core::str::from_utf8(&d) {
+            self.set_control(f, cx, cy, s);
+        }
+        // 2) 当前会话（只读）
+        let y1 = SET_ROW_TOP + SET_ROW_H;
+        let _ = self.text_ui_abs(f, px, y1 + 10, "当前会话", SET_TEXT, SET_BG);
+        let mut x = self.text_ui_abs(f, px, y1 + 30, "已开 ", SET_DIM, SET_BG);
+        x = self.digit_ui(f, x, y1 + 30, v.open_n as u64, SET_DIM, SET_BG);
+        x = self.text_ui_abs(f, x, y1 + 30, " 条（上限 ", SET_DIM, SET_BG);
+        x = self.digit_ui(f, x, y1 + 30, v.limit as u64, SET_DIM, SET_BG);
+        let _ = self.text_ui_abs(f, x, y1 + 30, "）", SET_DIM, SET_BG);
+        self.rect_abs(f, px, y1 + SET_ROW_H - 12, w.saturating_sub(SET_RIGHT + px), 1, SET_EDGE);
+        // 3) 默认配置文件（只读：本机只有 shell 这一个配置）
+        let y2 = SET_ROW_TOP + 2 * SET_ROW_H;
+        let _ = self.text_ui_abs(f, px, y2 + 10, "默认配置文件", SET_TEXT, SET_BG);
+        let _ = self.text_ui_abs(f, px, y2 + 30, "新建 shell 时启动的程序", SET_DIM, SET_BG);
+        self.text_ui_right(f, w.saturating_sub(SET_RIGHT), y2 + 28, "shell", SET_TEXT, SET_BG);
+        self.rect_abs(f, px, y2 + SET_ROW_H - 12, w.saturating_sub(SET_RIGHT + px), 1, SET_EDGE);
+    }
+
+    fn settings_about(&self, f: &Frame, v: &SetView, px: u64, w: u64) {
+        let right = w.saturating_sub(SET_RIGHT);
+        let rows: [(&str, &str); 2] = [("内核", "aurora-kernel"), ("默认配置文件", "shell")];
+        for (i, (k, val)) in rows.iter().enumerate() {
+            let y = self.set_row_head_about(f, px, i as u64, k);
+            self.text_ui_right(f, right, y + 10, val, SET_TEXT, SET_BG);
+        }
+        // ABI 0.x（数值来自 user::ABI_*，不写死；次版本可能是两位数）
+        let y2 = self.set_row_head_about(f, px, 2, "ABI");
+        let dmaj = if v.abi_major >= 10 { 2 } else { 1 };
+        let dmin = if v.abi_minor >= 10 { 2 } else { 1 };
+        let mut x = right.saturating_sub(8 * (dmaj + 1 + dmin));
+        x = self.number_ui(f, x, y2 + 10, v.abi_major as u64, SET_TEXT, SET_BG);
+        x = self.text_ui_abs(f, x, y2 + 10, ".", SET_TEXT, SET_BG);
+        let _ = self.number_ui(f, x, y2 + 10, v.abi_minor as u64, SET_TEXT, SET_BG);
+        // 处理器
+        let y3 = self.set_row_head_about(f, px, 3, "处理器");
+        let mut x = right.saturating_sub(64);
+        x = self.number_ui(f, x, y3 + 10, v.cpu_n as u64, SET_TEXT, SET_BG);
+        let _ = self.text_ui_abs(f, x, y3 + 10, " 个 CPU", SET_TEXT, SET_BG);
+        // 会话上限（1..=4，一位）
+        let y4 = self.set_row_head_about(f, px, 4, "会话上限");
+        let _ = self.digit_ui(f, right.saturating_sub(8), y4 + 10, v.limit as u64, SET_TEXT, SET_BG);
+    }
+
+    /// 整页设置界面。**每次整屏重画**（页面不常变：开页、换页、开合下拉、保存）。
+    pub fn settings_page(&self, f: &Frame, v: &SetView) {
+        let (w, h, _) = f.geom();
+        self.rect_abs(f, 0, 0, w, h, SET_BG);
+        self.rect_abs(f, 0, 0, SET_SIDEBAR_W, h, SET_SIDE);
+        let _ = self.text_ui_abs(f, 24, 28, "设置", SET_TEXT, SET_SIDE);
+        self.rect_abs(f, 16, SET_SIDE_TOP - 12, SET_SIDEBAR_W - 32, 1, SET_EDGE);
+        for i in 0..2u64 {
+            let (x, y, ww, hh) = set_side_rect(i);
+            let sel = v.pane as u64 == i;
+            if sel {
+                self.rounded_rect_abs(f, x, y, ww, hh, SET_SEL, SET_SIDE, 5);
+                self.rect_abs(f, x + 10, y + 10, 3, hh - 20, SET_TEXT);
+            }
+            let (label, ink, bg) = if i == 0 {
+                ("启动", if sel { SET_TEXT } else { SET_DIM }, if sel { SET_SEL } else { SET_SIDE })
+            } else {
+                ("关于", if sel { SET_TEXT } else { SET_DIM }, if sel { SET_SEL } else { SET_SIDE })
+            };
+            let _ = self.text_ui_abs(f, x + 26, y + 12, label, ink, bg);
+        }
+        let px = SET_SIDEBAR_W + 56;
+        match v.pane {
+            1 => {
+                let _ = self.text_title_abs(f, px, 40, "关于", SET_TEXT, SET_BG);
+                self.settings_about(f, v, px, w);
+            }
+            _ => {
+                let _ = self.text_title_abs(f, px, 40, "启动", SET_TEXT, SET_BG);
+                self.settings_start(f, v, px, w);
+            }
+        }
+        // 底部按钮
+        let ((sx, sy, sw, sh), (dx, dy, dw, dh)) = set_btn_rects(w, h);
+        self.rounded_rect_abs(f, dx, dy, dw, dh, SET_EDGE, SET_BG, 5);
+        self.rounded_rect_abs(f, dx + 1, dy + 1, dw - 2, dh - 2, SET_BG, SET_EDGE, 5);
+        let _ = self.text_ui_abs(f, dx + (dw - 64) / 2, dy + 12, "放弃更改", SET_DIM, SET_BG);
+        let can = v.pending != v.limit;
+        let (fill, ink) = if can { (SET_ACCENT, 0x00_F2_F2_F2) } else { (SET_CTRL, SET_DIM) };
+        self.rounded_rect_abs(f, sx, sy, sw, sh, fill, SET_BG, 5);
+        let _ = self.text_ui_abs(f, sx + (sw - 32) / 2, sy + 12, "保存", ink, fill);
+        // 右上角关闭
+        self.cross_abs(f, w.saturating_sub(56), 24, 14, SET_DIM);
+        // 下拉列表最后画（盖住下面的行）
+        if v.drop && v.pane == 0 {
+            self.set_drop_list(f, v);
+        }
+    }
+
+    /// 下拉列表本体：不透明圆角块 + 4 个选项；指针所在项铺悬停底，
+    /// 当前值左侧有一道强调色标记。
+    fn set_drop_list(&self, f: &Frame, v: &SetView) {
+        let (w, _, _) = f.geom();
+        let (x, y, ww, hh) = set_drop_rect(w);
+        self.rounded_rect_abs(f, x, y, ww, hh, SET_EDGE, SET_BG, 5);
+        self.rounded_rect_abs(f, x + 1, y + 1, ww - 2, hh - 2, SET_CTRL, SET_EDGE, 5);
+        for k in 0..crate::serial::SESSIONS as u64 {
+            let val = k as u8 + 1;
+            let yy = y + 4 + k * 40;
+            let bg = if v.drop_hover == val {
+                self.rounded_rect_abs(f, x + 4, yy + 1, ww - 8, 38, SET_OPT_HOVER, SET_CTRL, 4);
+                SET_OPT_HOVER
+            } else {
+                SET_CTRL
+            };
+            if val == v.pending {
+                self.rect_abs(f, x + 8, yy + 12, 3, 16, SET_ACCENT);
+            }
+            self.ch_ink_ui_abs(f, x + 20, yy + 12, (b'0' + val) as char, SET_TEXT, bg);
+        }
+    }
+
+    /// **只重画下拉列表那一块**（指针悬停用）：整页重画是上百万像素，
+    /// 每次挪动都整页重画会把悬停拖慢。列表不透明，先铺回页面底色再画。
+    pub fn settings_drop_redraw(&self, f: &Frame, v: &SetView) {
+        let (w, _, _) = f.geom();
+        let (x, y, ww, hh) = set_drop_rect(w);
+        self.rect_abs(f, x, y, ww, hh, SET_BG);
+        self.set_drop_list(f, v);
     }
 
     /// 三个窗口按钮：`-` / `□` / `×`，各占一格、笔画 10px 居中在 y=11..20。

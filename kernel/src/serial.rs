@@ -321,8 +321,25 @@ impl Write for Sink {
 // 用 `AtomicU8` 数组而不是 `UnsafeCell`：原子数组自带内部可变性 ⇒ **零新增 unsafe 站点**，
 // 也就不动白名单。
 const MIRROR_BYTES: usize = 8192;
-/// 会话数（S6p）：每个会话一个镜像环。今天两个（0 号与 1 号各是一个 shell 会话的输出）。
-pub const SESSIONS: usize = 2;
+/// 会话**槽位**上限（S6p）：每个槽一个镜像环。数组按它开，**不等于同时能开几个**——
+/// 运行期上限见 `session_limit()`（默认 2、设置页可改到 1..=SESSIONS，不持久化）。
+pub const SESSIONS: usize = 4;
+/// 运行期"同时能开几个 shell"。默认 2 保持既有变体的行为；设置页保存后改它。
+/// 只影响**新建**：调小不会关掉已经开着的会话。
+static SESSION_LIMIT: AtomicU8 = AtomicU8::new(2);
+
+pub fn session_limit() -> usize {
+    let n = SESSION_LIMIT.load(Ordering::Relaxed) as usize;
+    if n == 0 || n > SESSIONS {
+        2
+    } else {
+        n
+    }
+}
+
+pub fn set_session_limit(n: usize) {
+    SESSION_LIMIT.store(n.clamp(1, SESSIONS) as u8, Ordering::Release);
+}
 static MIRROR: [[AtomicU8; MIRROR_BYTES]; SESSIONS] =
     [const { [const { AtomicU8::new(0) }; MIRROR_BYTES] }; SESSIONS];
 /// 每个会话的单调写入计数（不回绕）。写入位置 = `POS[sid] % MIRROR_BYTES` ⇒ **循环覆写**：
