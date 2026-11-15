@@ -3067,7 +3067,7 @@ pub fn menu_rect(cols: u64, tabs: u64, n_rows: u64) -> (u64, u64, u64) {
     let shown = tab_shown(tabs).min(lay.fit);
     // 面板锚点压在 `∨` **右侧**：`+`/`∨` 现在按像素画（宽 12/12、间隔 10），
     // 占满 base..base+56 这 7 格；+5 会让面板盖住 `∨`（实测看不到箭头）。
-    let x = lay.plus_col(shown) + 7;
+    let x = lay.plus_col(shown) + 5; // S9q: 左缘与 ∨ 左缘同一条 plus_col+5 格线(px40)
     let x = if x + MENU_W > cols { cols.saturating_sub(MENU_W) } else { x };
     (x.max(1), BAR_H + MENU_GAP, rows)
 }
@@ -3835,7 +3835,7 @@ impl Term {
         self.rect_abs(f, px0 + 5, 18, 2, 12, TAB_TEXT);
         self.rect_abs(f, px0, 23, 12, 2, TAB_TEXT);
         self.rect_abs(f, base + 32, 16, 1, 16, MENU_EDGE);
-        let dx = base + 43;
+        let dx = base + 40; // S9q: ∨ 左缘落到 plus_col+5 格线，与下拉面板左缘对齐
         for k in 0..6u64 {
             self.rect_abs(f, dx + k, 21 + k, 2, 1, TAB_DIM);
             self.rect_abs(f, dx + 11 - k, 21 + k, 2, 1, TAB_DIM);
@@ -3845,7 +3845,9 @@ impl Term {
     }
 
     pub fn tab_bar(&self, f: &Frame, n_tabs: u64, active: u64, hover: Option<u8>, unread: u64) {
-        let w = self.cols * CELL_W;
+        // S9r：条底铺到**帧缓冲实际宽度**，不是 `cols*CELL_W`——活终端 cols=159 时
+        // cols*8=1272，右侧 8px 会留黑缝（用户圈出的空隙）。用 f.geom().0=1280 铺满。
+        let w = f.geom().0;
         // 2) 标签：几何来自 `BarLayout`（与命中测试同一份）
         let lay = BarLayout::of(self.cols);
         let (tab_w, strip_r, fit) = (lay.tab_w, lay.strip_r, lay.fit);
