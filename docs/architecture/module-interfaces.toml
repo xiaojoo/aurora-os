@@ -476,6 +476,8 @@ public_api = [
   "fbcon::CELL_W",
   "fbcon::CELL_H",
   "fbcon::MENU_W",
+  "fbcon::CTRL_NONE",
+  "fbcon::ctrl_of",
   "fbcon::Hit",
   "fbcon::WinRect",
   "fbcon::WinHit",

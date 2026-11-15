@@ -2996,6 +2996,31 @@ const TITLE_BG_HI: u32 = 0x00_2B_2B_2B;
 const TAB_ACTIVE_BG: u32 = 0x00_2E_2E_2E;
 /// 标签文字：活动页亮、非活动页暗（截图取样 #E1E1E1 / #9A9A9A）。
 const TAB_TEXT: u32 = 0x00_E1_E1_E1;
+/// S16：条上控制钮的悬停底色（比条底浅一档的方块）。
+pub const CTRL_NONE: u8 = 0xFF;
+pub const CTRL_HOVER: u32 = 0x00_55_55_55;
+/// Hit 到控制钮 id：0=+ 1=v 2=- 3=square 4=x，其它 NONE。
+/// S18: window-button glyph center x (px) = fb_w - 27 - i*46 (align host titlebar trio).
+pub fn btn_center(fb_w: u64, i: u64) -> u64 { fb_w.saturating_sub(23 + (2 - i) * 46) }
+fn btn_hit(fb_w: u64, x: u64) -> Option<Hit> {
+    for i in 0..3u64 {
+        let c = btn_center(fb_w, i);
+        if x + 23 >= c && x < c + 23 {
+            return Some(match i { 0 => Hit::Min, 1 => Hit::Max, _ => Hit::Close });
+        }
+    }
+    None
+}
+pub fn ctrl_of(hit: Hit) -> u8 {
+    match hit {
+        Hit::NewTab => 0,
+        Hit::Layout => 1,
+        Hit::Min => 2,
+        Hit::Max => 3,
+        Hit::Close => 4,
+        _ => CTRL_NONE,
+    }
+}
 const TAB_DIM: u32 = 0x00_9A_9A_9A;
 /// 标签上那个 `>_` 图标的颜色（PowerShell 图标的浅蓝）。
 const TAB_ICON: u32 = 0x00_A0_BB_E0;
@@ -3295,6 +3320,7 @@ pub fn hit_test(
     ch: Chrome,
     active: u64,
     hover: Option<u8>,
+    fb_w: u64,
 ) -> Hit {
     let c = x_px / CELL_W;
     let lay = BarLayout::of(cols);
@@ -3302,15 +3328,7 @@ pub fn hit_test(
         // 最大化：右上角三格仍是三个按钮（标签栏没了，按钮不能跟着消失——
         // 否则 maximize 就变成单向门，没有恢复的办法）。其余全算正文。
         if y_px < BAR_H {
-            if c >= lay.btn_col(0) && c < lay.btn_col(1) {
-                return Hit::Min;
-            }
-            if c >= lay.btn_col(1) && c < lay.btn_col(2) {
-                return Hit::Max;
-            }
-            if c >= lay.btn_col(2) {
-                return Hit::Close;
-            }
+            if let Some(h) = btn_hit(fb_w, x_px) { return h; }
         }
         return Hit::Body;
     }
@@ -3343,15 +3361,7 @@ pub fn hit_test(
     if c > lay.plus_col(shown) + 3 && c <= lay.plus_col(shown) + 7 {
         return Hit::Layout;
     }
-    if c >= lay.btn_col(0) && c < lay.btn_col(1) {
-        return Hit::Min;
-    }
-    if c >= lay.btn_col(1) && c < lay.btn_col(2) {
-        return Hit::Max;
-    }
-    if c >= lay.btn_col(2) {
-        return Hit::Close;
-    }
+    if let Some(h) = btn_hit(fb_w, x_px) { return h; }
     Hit::Bar
 }
 
@@ -3737,7 +3747,7 @@ impl Term {
     /// 画**一个标签**（悬停/活动底色、图标、标题、×/圆点）。整条重画会让顶部闪一下，
     /// 悬停变化时只重画受影响的那两个。
     fn draw_tab_abs(&self, f: &Frame, lay: &BarLayout, pos: u64, slot: u64, active: u64,
-                    hover: Option<u8>, unread: u64) {
+                    hover: Option<u8>, unread: u64, chover: Option<u8>) {
         let c0 = lay.tab_col(pos);
         let x0 = c0 * CELL_W;
         let tab_w = lay.tab_w;
@@ -3783,6 +3793,9 @@ impl Term {
         let x_visible = is_active || is_hover;
         let xr = (c0 + tab_w) * CELL_W - 19;
         if x_visible {
+            // S17: hover on tab => light square behind the x
+            // S17b: only when pointer is ON the x, same 24x24 as +
+            if chover == Some(slot as u8) { self.rounded_rect_abs(f, xr.saturating_sub(8), 12, 24, 24, CTRL_HOVER, tbg, 4); }
             let ink = if is_active { TAB_INK } else { TAB_INK_DIM };
             self.cross_abs(f, xr, 19, 9, ink);
         } else if unread & (1u64 << slot) != 0 {
@@ -3793,7 +3806,7 @@ impl Term {
 
     /// 悬停变化：**只重画离开和进入的那两个标签**（整条重画会让顶部闪一下）。
     pub fn bar_hover(&self, f: &Frame, n_tabs: u64, active: u64,
-                     old: Option<u8>, new: Option<u8>, unread: u64) {
+                     old: Option<u8>, new: Option<u8>, unread: u64, ctrl: u8, chover: Option<u8>) {
         let lay = BarLayout::of(self.cols);
         let shown = tab_shown(n_tabs).min(lay.fit);
         const TAB_TOP: u64 = 8;
@@ -3803,25 +3816,25 @@ impl Term {
                 let p = pos_of(n_tabs, o as u64);
                 let x0 = lay.tab_col(p) * CELL_W;
                 self.rect_abs(f, x0, TAB_TOP, lay.tab_w * CELL_W, BAR_H - TAB_TOP, TITLE_BG);
-                self.draw_tab_abs(f, &lay, p, o as u64, active, new, unread);
+                self.draw_tab_abs(f, &lay, p, o as u64, active, new, unread, chover);
             }
         }
         // 进入的那个：hover 底会整块盖住，**不再先刷**——先刷一遍再画就是"闪一下"。
         if let Some(n) = new {
             if Some(n) != old && (n_tabs >> n) & 1 == 1 {
                 let p = pos_of(n_tabs, n as u64);
-                self.draw_tab_abs(f, &lay, p, n as u64, active, new, unread);
+                self.draw_tab_abs(f, &lay, p, n as u64, active, new, unread, chover);
             }
         }
         // 抹掉的那块矩形从 `plus_col` 那一列开始 ⇒ `+`/`∨` 跟着没了；hover 重画不经过
         // 整条 `tab_bar`，所以在这里补回来（关掉最后一个标签后，条上至少还剩两枚可点的图标）。
-        self.plus_chevron(f, &lay, shown);
+        self.plus_chevron(f, &lay, shown, ctrl);
     }
 
     /// `+` 与它右边那个 `∨`。**单独成一个方法**：`tab_col(i)` 恰好等于 `plus_col(i)`，
     /// 所以 `bar_hover` 抹掉一个标签的那块 240px **正好把这两枚图标一起抹掉**；而 hover
     /// 重画不经过整条 `tab_bar` ⇒ 之前没人把它们画回来（实测：40px 的条上一个墨点都没有）。
-    fn plus_chevron(&self, f: &Frame, lay: &BarLayout, shown: u64) {
+    fn plus_chevron(&self, f: &Frame, lay: &BarLayout, shown: u64, ctrl: u8) {
         if lay.fit == 0 {
             return;
         }
@@ -3831,10 +3844,13 @@ impl Term {
         }
         // 两枚图标相互间隔 10 px、垂直中心 24（与标签里 `×` 同一条线）。
         let base = plus_c * CELL_W;
-        let px0 = base + 10;
+        let px0 = base + 9;
+        if ctrl == 0 { self.rounded_rect_abs(f, base + 3, 12, 24, 24, CTRL_HOVER, TITLE_BG, 4); }
         self.rect_abs(f, px0 + 5, 18, 2, 12, TAB_TEXT);
         self.rect_abs(f, px0, 23, 12, 2, TAB_TEXT);
-        self.rect_abs(f, base + 32, 16, 1, 16, MENU_EDGE);
+        // S17: separator at base+30 => + right(20)->|(30) gap 9 == |(30)->V(40) gap 9
+        self.rect_abs(f, base + 30, 16, 1, 16, MENU_EDGE);
+        if ctrl == 1 { self.rounded_rect_abs(f, base + 34, 12, 24, 24, CTRL_HOVER, TITLE_BG, 4); }
         let dx = base + 40; // S9q: ∨ 左缘落到 plus_col+5 格线，与下拉面板左缘对齐
         for k in 0..6u64 {
             self.rect_abs(f, dx + k, 21 + k, 2, 1, TAB_DIM);
@@ -3844,7 +3860,7 @@ impl Term {
         }
     }
 
-    pub fn tab_bar(&self, f: &Frame, n_tabs: u64, active: u64, hover: Option<u8>, unread: u64) {
+    pub fn tab_bar(&self, f: &Frame, n_tabs: u64, active: u64, hover: Option<u8>, unread: u64, ctrl: u8, chover: Option<u8>) {
         // S9r：条底铺到**帧缓冲实际宽度**，不是 `cols*CELL_W`——活终端 cols=159 时
         // cols*8=1272，右侧 8px 会留黑缝（用户圈出的空隙）。用 f.geom().0=1280 铺满。
         let w = f.geom().0;
@@ -3867,10 +3883,10 @@ impl Term {
 
         for pos in 0..shown {
             let slot = slot_at(n_tabs, pos);
-            self.draw_tab_abs(f, &lay, pos, slot, active, hover, unread);
+            self.draw_tab_abs(f, &lay, pos, slot, active, hover, unread, chover);
         }
         // 3) `+` 与它右边那个 `∨`：单独成方法，因为 `bar_hover` 也必须能补画它们。
-        self.plus_chevron(f, &lay, shown);
+        self.plus_chevron(f, &lay, shown, ctrl);
         // 4) 装不下 ⇒ 折叠指示（今天到不了）
         if n_tabs > fit {
             let x = strip_r.saturating_sub(1) * CELL_W + 4;
@@ -3880,7 +3896,13 @@ impl Term {
             }
         }
         // 5) 右侧三个窗口按钮（绘制在 `win_buttons` 里，最大化时也用它）
-        self.win_buttons(f, strip_r);
+        let fb_w = f.geom().0;
+        for i in 0..3u64 {
+            if ctrl == (2 + i) as u8 {
+                self.rounded_rect_abs(f, btn_center(fb_w, i).saturating_sub(14), 6, 28, 28, CTRL_HOVER, TITLE_BG, 4);
+            }
+        }
+        self.win_buttons(f);
     }
 
     /// 只重画面板的**一行**（悬停在一行之间移动时用；整块重画会让列表闪一下）。
@@ -3971,10 +3993,10 @@ impl Term {
     ///
     /// **绘制与命中共用 `BarLayout::strip_r`**：两处各算一遍，点击就会落在画的地方旁边。
     /// 最大化时标签栏不画，但这三个按钮仍画在右上角（`redraw_window` 会先清屏成底色）。
-    fn win_buttons(&self, f: &Frame, strip_r: u64) {
-        // #58 pass A：2 格宽 + 12 px 字形 + 2 px 笔画（`cross` 本来就是 2 px 粗）。
-        let lay = BarLayout { strip_l: 1, strip_r, tab_w: 0, fit: 0 };
-        let gx = |i: u64| lay.btn_col(i) * CELL_W + lay.glyph_x();
+    fn win_buttons(&self, f: &Frame) {
+        // S18: pixel positions from framebuffer right edge (pitch 46, x 27px from right)
+        let fb_w = f.geom().0;
+        let gx = |i: u64| btn_center(fb_w, i).saturating_sub(GLYPH / 2);
         let y0 = (BAR_H - GLYPH) / 2;
         let (w, t) = (GLYPH, 2u64);
         self.rect_abs(f, gx(0), y0 + GLYPH / 2 - 1, w, t, TAB_TEXT);
@@ -3987,40 +4009,47 @@ impl Term {
 
     /// 只画右上角那三个按钮（最大化：标签栏收起来了，按钮不能跟着消失）。
     pub fn buttons_only(&self, f: &Frame) {
-        self.win_buttons(f, BarLayout::of(self.cols).strip_r);
+        self.win_buttons(f);
     }
 
     /// 鼠标指针：7×11 的**几何箭头**（`#`=填充、`o`=描边），左上角是尖。
     /// 描边用正文底色，使它压在文字上也看得见；越界像素自动跳过。
     pub fn draw_pointer(&self, f: &Frame, x: i32, y: i32) {
-        const ARROW: [&[u8]; 11] = [
-            b"o......",
-            b"oo.....",
-            b"o#o....",
-            b"o##o...",
-            b"o###o..",
-            b"o####o.",
-            b"o#####o",
-            b"o###ooo",
-            b"o#o#o..",
-            b"oo.o#o.",
-            b"....o#o",
+        // S11：抗锯齿指针。每个像素带覆盖率(0..f)，与底层像素线性混合——边缘不再是硬台阶。
+        // 覆盖表由用户参考图(28×46)逐像素提取(R 通道 0..255 → 0..f)，形状不变。
+        const ARROW: [&str; 16] = [
+            "9100000000",
+            "ea10000000",
+            "efb1000000",
+            "fffb100000",
+            "ffffc10000",
+            "fffffc1000",
+            "ffffffc200",
+            "fffffffc20",
+            "ffffffffc2",
+            "ffffffddd9",
+            "fffefd2001",
+            "ff928c0000",
+            "fa101c8000",
+            "810009c000",
+            "000001a700",
+            "0000008d10",
         ];
         for (r, row) in ARROW.iter().enumerate() {
-            for (c, &px) in row.iter().enumerate() {
-                let x0 = x + c as i32;
-                let y0 = y + r as i32;
-                if x0 < 0 || y0 < 0 {
-                    continue;
-                }
-                let color = match px {
-                    b'#' => FG,
-                    b'o' => BG,
+            for (c, ch) in row.bytes().enumerate() {
+                let a = match ch {
+                    b'0'..=b'9' => (ch - b'0') as u32,
+                    b'a'..=b'f' => (ch - b'a' + 10) as u32,
                     _ => continue,
                 };
-                if f.put(x0 as u64, y0 as u64, color).is_err() {
-                    return;
-                }
+                if a == 0 { continue; }
+                let x0 = x + c as i32;
+                let y0 = y + r as i32;
+                // S14：超出屏幕右/下边要**跳过**而不是 return：
+                // return 会把剩下的像素全丢，且边缘残留拿不到擦。
+                let (fw, fh, _) = f.geom();
+                if x0 < 0 || y0 < 0 || (x0 as u64) >= fw || (y0 as u64) >= fh { continue; }
+                if f.put_mix(x0 as u64, y0 as u64, 0x00_FF_FF_FF, a).is_err() { return; }
             }
         }
     }
@@ -4188,7 +4217,7 @@ impl Term {
 /// 现在这里只画正文并把光标位置交回去，闪烁由 `LiveTerm` 在那一格上局部画/擦。
 pub fn redraw_window(term: &Term, f: &Frame, max_lines: usize, sid: usize,
                      tabs: u64, active: u64, ch: Chrome,
-                     hover: Option<u8>, unread: u64) -> (usize, u64, u64) {
+                     hover: Option<u8>, unread: u64, ctrl: u8, chover: Option<u8>) -> (usize, u64, u64) {
     let n = crate::serial::mirror_len_sid(sid);
     let wrapped = crate::serial::mirror_wrapped_sid(sid);
     let mut total = 1usize;
@@ -4206,7 +4235,7 @@ pub fn redraw_window(term: &Term, f: &Frame, max_lines: usize, sid: usize,
     let rows = max_lines.saturating_sub(top as usize);
     if ch.tabs() {
         term.clear_gap(f);
-        term.tab_bar(f, tabs, active, hover, unread);
+        term.tab_bar(f, tabs, active, hover, unread, ctrl, chover);
     } else {
         // 浮窗/最大化：先整块刷底色（否则上一帧的标签栏会留在第一行）。三个按钮**放到最后画**——
         // 正文从第 0 行开始，先画按钮会被第 0 行的文字整行盖掉（本轮实测：按钮像素 0）。

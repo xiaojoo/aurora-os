@@ -220,7 +220,22 @@ impl Frame {
         }
         self.region.write32((y * self.info.pitch + x * 4) as usize, packed).map_err(FrameError::Map)
     }
-
+    /// S11：把 `rgb` 按覆盖率 `a15`(0..15) 混进**当前像素**，用于抗锯齿的指针边缘。
+    pub fn put_mix(&self, x: u64, y: u64, rgb: u32, a15: u32) -> Result<(), FrameError> {
+        if a15 == 0 { return Ok(()); }
+        if a15 >= 15 { return self.put(x, y, rgb); }
+        let p = self.get(x, y)?;
+        let ch = [(rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF];
+        let mut out = 0u32;
+        for (i, &(size, shift)) in self.info.masks.iter().enumerate() {
+            if size == 0 || shift >= 32 { continue; }
+            let mask = (1u32 << size.min(31)) - 1;
+            let c = (p >> shift) & mask;
+            let m = if size == 8 { (c * (15 - a15) + ch[i] * a15) / 15 } else { c };
+            out |= (m & mask) << shift;
+        }
+        self.put_raw(x, y, out)
+    }
     /// 读回一个像素。**注意这只证明"我们写的字节还在我们映射的窗口里"**，
     /// 不证明设备把它显示出来了——后者由宿主机侧的 PPM 对账负责（第二台仪器）。
     pub fn get(&self, x: u64, y: u64) -> Result<u32, FrameError> {

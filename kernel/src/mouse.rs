@@ -129,6 +129,11 @@ pub fn decode(p0: u8, p1: u8, p2: u8) -> Option<(i32, i32, u8)> {
     Some((dx, -dy_raw, p0 & 0x07))
 }
 
+// 指针点阵尺寸（与 fbcon::draw_pointer 的 ARROW 10×16 保持一致）。
+// S15：指针限制在**全身进屏**的范围内，不再半截在右/下边 ⇒ 不再留一条 1px 垂直残影。
+const PTR_W: u32 = 10;
+const PTR_H: u32 = 16;
+
 fn clamp(v: i32, hi: u32) -> i32 {
     if v < 0 {
         0
@@ -173,8 +178,9 @@ pub fn isr() -> bool {
     if w == 0 || h == 0 {
         return true;
     }
-    let nx = clamp(X.load(Ordering::Relaxed) + dx, w);
-    let ny = clamp(Y.load(Ordering::Relaxed) + dy, h);
+    // 保证整个指针在屏内：最大坐标 = w-PTR_W / h-PTR_H。
+    let nx = clamp(X.load(Ordering::Relaxed) + dx, w.saturating_sub(PTR_W - 1));
+    let ny = clamp(Y.load(Ordering::Relaxed) + dy, h.saturating_sub(PTR_H - 1));
     X.store(nx, Ordering::Relaxed);
     Y.store(ny, Ordering::Relaxed);
     MOVED.store(true, Ordering::Relaxed);

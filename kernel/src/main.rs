@@ -1605,7 +1605,7 @@ struct LiveTerm {
     /// **为什么不靠整窗重画擦指针**：那就是"指针跟着整屏一起闪"的来源；
     /// 保存/恢复 77 个像素是 154 次设备写，比一次重画便宜四个数量级。
     ptr: Option<(i32, i32)>,
-    ptr_bg: [[u32; 7]; 11],
+    ptr_bg: [[u32; 10]; 16],
     /// 四本账：整窗重画 / 指针重画 / 光标翻转 / 只重画输入行各做了多少次
     /// （进日志，宿主机可复算"没内容变化时一个字都不写"）。
     paints: (u32, u32, u32, u32),
@@ -1638,6 +1638,10 @@ struct LiveTerm {
     /// #58：指针停在哪一个标签上（`None` = 不在标签条目上）。**画与命中共用这一格**。
     hover: Option<u8>,
     /// #58：`∨` 下拉开着吗、指针停在第几行。
+    /// S16: 条上控制钮的悬停 id（0=+ 1=v 2=- 3=方 4=x）
+    ctrl_hover: u8,
+    /// S17b: slot whose tab x is under the pointer (None = not on any x)
+    close_hover: Option<u8>,
     menu: bool,
     menu_hover: Option<u8>,
     /// 上一次的"会话开/关"快照：变了要整条重画标签栏、面板开着时还要重画面板。
@@ -1692,8 +1696,10 @@ impl LiveTerm {
             caret: None,
             caret_at: None,
             ptr: None,
-            ptr_bg: [[0; 7]; 11],
+            ptr_bg: [[0; 10]; 16],
             hover: None,
+            ctrl_hover: crate::fbcon::CTRL_NONE,
+            close_hover: None,
             menu: false,
             menu_hover: None,
             last_ptr: (0, 0),
@@ -1803,7 +1809,7 @@ impl LiveTerm {
         self.ptr_erase();
         let (_, tabs, active, _) = self.layout();
         let open = (0..crate::serial::SESSIONS).filter(|i| !self.closed[*i]).fold(0u64, |m, i| m | (1u64 << i));
-        self.term.bar_hover(&self.frame, open, active, old, new, self.unread_mask(active));
+        self.term.bar_hover(&self.frame, open, active, old, new, self.unread_mask(active), self.ctrl_hover, self.close_hover);
         // 条刚被重画 ⇒ 指针保存的旧底作废，否则下一次移动把旧像素贴回 `+`/`∨` 上。
         self.ptr = None;
     }
@@ -1814,7 +1820,7 @@ impl LiveTerm {
         #[cfg(feature = "ps2-mouse")]
         self.ptr_erase();
         let open = (0..crate::serial::SESSIONS).filter(|i| !self.closed[*i]).fold(0u64, |m, i| m | (1u64 << i));
-        self.term.tab_bar(&self.frame, open, active, self.hover, self.unread_mask(active));
+        self.term.tab_bar(&self.frame, open, active, self.hover, self.unread_mask(active), self.ctrl_hover, self.close_hover);
         self.ptr = None;
         if self.menu {
             let (rows, _, nrows) = self.menu_state();
@@ -1865,6 +1871,9 @@ impl LiveTerm {
 
     /// 收起面板：把**被它盖住的正文行**重画回来（不整窗重画，否则会闪）。
     fn menu_erase(&mut self) {
+        // S12：先把指针 restore 回来再重画面板——否则指针在条里时，面板重画不覆盖条，残影留着。
+        #[cfg(feature = "ps2-mouse")]
+        self.ptr_erase();
         let cols = self.term.dims().0;
         let (_, tabs, _, _) = self.layout();
         let (_, my, n) = crate::fbcon::menu_rect(cols, tabs, self.menu_state().2 as u64);
@@ -1899,7 +1908,7 @@ impl LiveTerm {
         self.caret_at = None;
         // **指针保存的旧底作废**：那块像素已被上面的重画覆盖，若还拿旧底去"擦旧指针"，
         // 会在原位置把面板色贴回来（实测：点了选项再动鼠标，出现一小块残留）。
-        self.ptr = None;
+        // 指针已在开头 erase，这里不再 ptr=None（否则会把条里的指针像素留成残影）
     }
 
     /// 悬停行变化：只重画旧行与新行。
@@ -2080,7 +2089,8 @@ impl LiveTerm {
             let (cols, _rows) = self.term.dims();
             let (px, py) = crate::mouse::pos();
             let (_, tabs, active, chrome) = self.layout();
-            let hv = match crate::fbcon::hit_test(cols, tabs, px as u64, py as u64, chrome, active, self.hover) {
+            let hit = crate::fbcon::hit_test(cols, tabs, px as u64, py as u64, chrome, active, self.hover, self.frame.geom().0);
+            let hv = match hit {
                 crate::fbcon::Hit::Tab(i) | crate::fbcon::Hit::TabClose(i) => Some(i),
                 _ => None,
             };
@@ -2090,6 +2100,18 @@ impl LiveTerm {
                 crate::log_info!("版面: 悬停={:?}", hv);
                 // **只重画离开/进入的那两个标签**：整条重画会让顶部闪一下（用户实测）。
                 self.bar_hover(prev, hv);
+            }
+            // S16: ctrl hover change => repaint whole bar with hover bg
+            let cid = crate::fbcon::ctrl_of(hit);
+            if cid != self.ctrl_hover {
+                self.ctrl_hover = cid;
+                self.bar_only(active);
+            }
+            // S17b: x square only when pointer is ON the x
+            let chv = match hit { crate::fbcon::Hit::TabClose(i) => Some(i), _ => None };
+            if chv != self.close_hover {
+                self.close_hover = chv;
+                self.bar_only(active);
             }
             // #58：面板开着时，悬停落在面板的哪一行（面板盖住标签条以下，所以分开算）。
             // **指针动没动**是它与键盘选中的仲裁：动了指针赢，没动就保留键盘那一行。
@@ -2156,7 +2178,7 @@ impl LiveTerm {
                 let (_, tabs, _, chrome) = self.layout();
                 let hit_bar = crate::fbcon::hit_test(
                     self.term.dims().0, tabs, cx as u64, cy as u64, chrome,
-                    crate::user::active_session() as u64, self.hover);
+                    crate::user::active_session() as u64, self.hover, self.frame.geom().0);
                 if self.menu {
                     let row = crate::fbcon::menu_hit(
                         self.term.dims().0, tabs, self.menu_state().2 as u64, cx as u64, cy as u64);
@@ -2294,10 +2316,17 @@ impl LiveTerm {
                             self.menu = !self.menu;
                             self.menu_hover = None;
                             if self.menu {
+                                // S13：先把指针 restore 回来，再用面板覆上；否则指针挪走时把
+                                // 面板前的旧底（黑底）贴回来 ⇒ 面板上一块被黑色盖住。
+                                #[cfg(feature = "ps2-mouse")]
+                                self.ptr_erase();
                                 let (rows, _, nrows) = self.menu_state();
                                 let open = (0..crate::serial::SESSIONS)
                                     .filter(|i| !self.closed[*i]).fold(0u64, |m, i| m | (1u64 << i));
                                 self.term.menu_panel(&self.frame, open, &rows[..nrows], None);
+                            } else {
+                                // 点 ∨ 收起 ⇒ 也要把面板撤掉（否则面板一直留在屏上）。
+                                self.menu_erase();
                             }
                             crate::log_info!("菜单: 开={}", self.menu);
                         }
@@ -2355,7 +2384,7 @@ impl LiveTerm {
         } else {
             let (_, cc, cr) = crate::fbcon::redraw_window(
                 &self.term, &self.frame, rows.min(LIVE_ROWS), sid, tabs, active, chrome,
-                self.hover, self.unread_mask(active));
+                self.hover, self.unread_mask(active), self.ctrl_hover, self.close_hover);
             (cc, cr)
         }
     }
@@ -2381,7 +2410,7 @@ impl LiveTerm {
                 } else {
                     let (_, cc, cr) = crate::fbcon::redraw_window(
                         &t, &self.frame, b.rows as usize, i, 0, 0, crate::fbcon::Chrome::Floating,
-                        None, 0);
+                        None, 0, crate::fbcon::CTRL_NONE, None);
                     if focused && cr != 0 {
                         caret = (cc, b.y + cr);
                     }
@@ -2636,7 +2665,7 @@ impl LiveTerm {
         // 窗口从第 1 格行开始，与标签条那一行不重叠。
         let open = (0..crate::serial::SESSIONS)
             .filter(|i| !self.closed[*i]).fold(0u64, |m, i| m | (1u64 << i));
-        self.term.tab_bar(&self.frame, open, active as u64, self.hover, self.unread_mask(active as u64));
+        self.term.tab_bar(&self.frame, open, active as u64, self.hover, self.unread_mask(active as u64), self.ctrl_hover, self.close_hover);
         // 整栈从最下面一扇开始画；每扇只画自己的矩形 ⇒ 这就是"每扇窗只重画矩形"。
         let mut caret = (0u64, 0u64);
         for k in 0..crate::serial::SESSIONS {
@@ -2661,10 +2690,11 @@ impl LiveTerm {
             return;
         }
         self.ptr_erase();
-        for r in 0..11usize {
-            for c in 0..7usize {
+        let (fw, fh, _) = self.frame.geom();
+        for r in 0..16usize {
+            for c in 0..10usize {
                 let (x, y) = (px + c as i32, py + r as i32);
-                if x < 0 || y < 0 {
+                if x < 0 || y < 0 || (x as u64) >= fw || (y as u64) >= fh {
                     continue;
                 }
                 if let Ok(v) = self.frame.get(x as u64, y as u64) {
@@ -2679,10 +2709,11 @@ impl LiveTerm {
 
     fn ptr_erase(&mut self) {
         let Some((px, py)) = self.ptr.take() else { return };
-        for r in 0..11usize {
-            for c in 0..7usize {
+        let (fw, fh, _) = self.frame.geom();
+        for r in 0..16usize {
+            for c in 0..10usize {
                 let (x, y) = (px + c as i32, py + r as i32);
-                if x < 0 || y < 0 {
+                if x < 0 || y < 0 || (x as u64) >= fw || (y as u64) >= fh {
                     continue;
                 }
                 let _ = self.frame.put_raw(x as u64, y as u64, self.ptr_bg[r][c]);
