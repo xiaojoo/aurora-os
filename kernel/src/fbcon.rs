@@ -3563,10 +3563,10 @@ impl Term {
     /// 是为了不把二维表做成动态索引（内核里表都是常量）。
     fn rounded_rect_abs(&self, f: &Frame, x0: u64, y0: u64, w: u64, h: u64,
                         inside: u32, outside: u32, corner: u64) {
-        let (r, table): (u64, fn(u64, u64) -> u32) = if corner == 4 {
-            (4, |dy, dx| CORNER_AA4[dy as usize][dx as usize] as u32)
-        } else {
-            (5, |dy, dx| CORNER_AA5[dy as usize][dx as usize] as u32)
+        let (r, table): (u64, fn(u64, u64) -> u32) = match corner {
+            8 => (8, |dy, dx| CORNER_AA[dy as usize][dx as usize] as u32),
+            4 => (4, |dy, dx| CORNER_AA4[dy as usize][dx as usize] as u32),
+            _ => (5, |dy, dx| CORNER_AA5[dy as usize][dx as usize] as u32),
         };
         self.rect_abs(f, x0 + r, y0, w - 2 * r, h, inside);
         self.rect_abs(f, x0, y0 + r, r, h - 2 * r, inside);
@@ -3608,19 +3608,7 @@ impl Term {
     }
 
     /// 顶部圆角的填充：角区 8×8 用覆盖率表混合，下面与中间是纯色。
-    fn rounded_top_abs(&self, f: &Frame, x0: u64, y0: u64, w: u64, h: u64, inside: u32, outside: u32) {
-        const R: u64 = 8;
-        self.rect_abs(f, x0, y0 + R, w, h - R, inside);
-        for dy in 0..R {
-            self.rect_abs(f, x0 + R, y0 + dy, w - 2 * R, 1, inside);
-            for dx in 0..R {
-                let a = CORNER_AA[dy as usize][dx as usize] as u32;
-                let c = mix(inside, outside, a);
-                let _ = self.put_abs(f, x0 + dx, y0 + dy, c);
-                let _ = self.put_abs(f, x0 + w - 1 - dx, y0 + dy, c);
-            }
-        }
-    }
+
 
     fn ch_ink_ui_abs(&self, f: &Frame, x0: u64, y0: u64, ch: char, fg: u32, bg: u32) {
         let k = ch as u32;
@@ -3746,6 +3734,20 @@ impl Term {
     /// 与 Windows Terminal 同形）。今天只有 1 个会话 ⇒ 那个分支走不到，规则先按布局写好。
     /// 画**一个标签**（悬停/活动底色、图标、标题、×/圆点）。整条重画会让顶部闪一下，
     /// 悬停变化时只重画受影响的那两个。
+    /// Top-only rounded fill (bar above); bottom stays flush to the body.
+    fn rounded_top_abs(&self, f: &Frame, x0: u64, y0: u64, w: u64, h: u64, inside: u32, outside: u32) {
+        const R: u64 = 8;
+        self.rect_abs(f, x0, y0 + R, w, h - R, inside);
+        for dy in 0..R {
+            self.rect_abs(f, x0 + R, y0 + dy, w - 2 * R, 1, inside);
+            for dx in 0..R {
+                let a = CORNER_AA[dy as usize][dx as usize] as u32;
+                let c = mix(inside, outside, a);
+                let _ = self.put_abs(f, x0 + dx, y0 + dy, c);
+                let _ = self.put_abs(f, x0 + w - 1 - dx, y0 + dy, c);
+            }
+        }
+    }
     fn draw_tab_abs(&self, f: &Frame, lay: &BarLayout, pos: u64, slot: u64, active: u64,
                     hover: Option<u8>, unread: u64, chover: Option<u8>) {
         let c0 = lay.tab_col(pos);
@@ -3759,6 +3761,9 @@ impl Term {
         // 每个标签自刷底（活动=正文色 / 悬停=悬停色 / 其余=条底）；状态变化靠自刷覆盖，
         // 单缓冲下不会出现"整条空白"的中间帧。
         let tbg = if is_active { BG } else if is_hover { TAB_HOVER_BG } else { TITLE_BG };
+        // S19b: top corners rounded, bottom flush to body. The selected tab's bottom
+        // fillets are NOT drawn here — a neighbour tab painted after this one would
+        // cover them; `tab_fillets_abs` runs after the whole strip (tab_bar/bar_hover).
         self.rounded_top_abs(f, x0, TAB_TOP, wtab, tab_h, tbg, TITLE_BG);
         let icon = if is_active { TAB_ICON } else { TAB_ICON_DIM };
         for k in 0..7u64 {
@@ -3804,6 +3809,22 @@ impl Term {
         }
     }
 
+    /// 选中标签的底角：一条**两端相切**的弧——上端相切于标签的竖直侧边、下端相切于
+    /// 内容区顶线，灰条的底边顺着这条弧拐上去（WT 的两个圆窝）。先前那版把
+    /// 四分之一圆**锚在标签底角**上，弧两头都与直线成直角 ⇒ 看着是个突出去的圆点。
+    /// 覆盖率 = 圆外部分（圆心在块的左上角）；混到**底下像素**上（条底/邻居标签/悬停底）。
+    fn tab_fillets_abs(&self, f: &Frame, x0: u64, wtab: u64) {
+        const FR: u64 = 5;
+        for dy in 0..FR {
+            for dx in 0..FR {
+                let a = 15 - CORNER_AA5[(FR - 1 - dy) as usize][(FR - 1 - dx) as usize] as u32;
+                let ar = 15 - CORNER_AA5[(FR - 1 - dy) as usize][dx as usize] as u32;
+                let _ = f.put_mix(x0.saturating_sub(FR) + dx, BAR_H - FR + dy, BG, a);
+                let _ = f.put_mix(x0 + wtab + dx, BAR_H - FR + dy, BG, ar);
+            }
+        }
+    }
+
     /// 悬停变化：**只重画离开和进入的那两个标签**（整条重画会让顶部闪一下）。
     pub fn bar_hover(&self, f: &Frame, n_tabs: u64, active: u64,
                      old: Option<u8>, new: Option<u8>, unread: u64, ctrl: u8, chover: Option<u8>) {
@@ -3824,6 +3845,13 @@ impl Term {
             if Some(n) != old && (n_tabs >> n) & 1 == 1 {
                 let p = pos_of(n_tabs, n as u64);
                 self.draw_tab_abs(f, &lay, p, n as u64, active, new, unread, chover);
+            }
+        }
+        // 悬停重画可能把选中标签的底角圆脚盖掉（邻居整块刷底），补一遍。
+        if active < 64 && (n_tabs >> active) & 1 == 1 {
+            let ap = pos_of(n_tabs, active);
+            if ap < shown {
+                self.tab_fillets_abs(f, lay.tab_col(ap) * CELL_W, lay.tab_w * CELL_W);
             }
         }
         // 抹掉的那块矩形从 `plus_col` 那一列开始 ⇒ `+`/`∨` 跟着没了；hover 重画不经过
@@ -3884,6 +3912,13 @@ impl Term {
         for pos in 0..shown {
             let slot = slot_at(n_tabs, pos);
             self.draw_tab_abs(f, &lay, pos, slot, active, hover, unread, chover);
+        }
+        // 选中标签的底角圆脚画在**整条之后**：右边邻居的矩形会盖住它。
+        if active < 64 && (n_tabs >> active) & 1 == 1 {
+            let ap = pos_of(n_tabs, active);
+            if ap < shown {
+                self.tab_fillets_abs(f, lay.tab_col(ap) * CELL_W, tab_w * CELL_W);
+            }
         }
         // 3) `+` 与它右边那个 `∨`：单独成方法，因为 `bar_hover` 也必须能补画它们。
         self.plus_chevron(f, &lay, shown, ctrl);
