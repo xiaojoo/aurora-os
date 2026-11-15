@@ -1,6 +1,6 @@
 # unsafe 逐处审计表（U1–U6）
 
-总计 414 处。U1 75 · U2 113 · U3 13 · U4 131 · U5 46 · U6 36
+总计 415 处。U1 75 · U2 114 · U3 13 · U4 131 · U5 46 · U6 36
 
 本表由 `tools/aurora.py` 的 `unsafe_sites()` 从源码逐处生成，**不是手写的**。
 机器可读的权威来源是 `docs/security/unsafe-whitelist.toml` 的 `[modules.*]` 段（模块×类别→处数），
@@ -958,5 +958,7 @@
   > unsafe { BACK[self.back_idx(x,y)] = packed }
 - `kernel/src/frame.rs:216` [{] **U2** fn=`get`
   > return Ok(unsafe { BACK[self.back_idx(x,y)] })
+- `kernel/src/frame.rs:109` [{] **U2** fn=`enable_double_buffer`
+  > unsafe { ROW_DIRTY.iter_mut().for_each(|d| *d = true) } # S9o 首帧全脏
 - `kernel/src/frame.rs:119` [{] **U2** fn=`present`
   > let row = unsafe { &BACK[y*w..(y+1)*w] } # 交 write_slice 一次上屏

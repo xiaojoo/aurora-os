@@ -13254,3 +13254,69 @@ wm: 铺旧矩形 旧=(5,8,70,11) 视图=true     ← 只铺了**最后一个**
 · **读数**：串口 `fbcon-live: 双缓冲=true`；`s9j-bar-check` 加标签+悬停后顶缘黑像素=0、条带渲染正确 PASS；
   三档 check 0 error、门禁 17/17；重启窗口 PID 6044。
 · **残留**：像素夹具未对齐；`ktests`/`test` 未跑；关全卡死、respawn 单控制台存活未定性。
+## 309. S9l：关最后一个 tab 正文同步清空；新建 tab 正常；标签名改 会话1/会话2
+
+· **用户三诉求**：① 最后一个 tab 删掉后正文区也要关（清空），不能留旧内容；② 重新新建 shell
+  窗口时 tab 正常显示；③ tab 名称改 **会话1 / 会话2**。
+· **真因①**：关最后一枚时 tabs 1→0 但 sid/换行数不变 ⇒ 走**增量** `redraw_input`（只画输入行），
+  不清正文 ⇒ 旧内容残留。修：`tabbed_frame` 增量条件加 `tabs != 0`；`redraw_window` 增加
+  `ch.tabs() && tabs==0 ⇒ 清正文返回`（只限标签条版面，浮窗 paint_win 传 tabs=0 是活窗不清）。
+· **③**：`draw_tab_abs` 标签名改 "会话"+(i+1)（UTF-8 前缀+序号，宽字16/ASCII8 推进）；
+  下拉行同步改 会话1/会话2。
+· **读数**：`build/s9l-tab-check.py` 关全后正文墨点=0、再 + 新建后正文有提示符（>10）且 tab=会话1，PASS；
+  三档 check 0 error、门禁 17/17；重启窗口 PID 6612。
+· 残留：像素夹具未对齐（标签名/清空口径变了）；`ktests`/`test` 未跑；关全卡死、respawn 单控制台存活未定性。
+## 310. S9m：关最后一枚 ⇒ 自动新建全新 shell（用户澄清"删除了重新打开一个全新的"）
+
+· **用户澄清**：S9l 只清空了正文但留空 bar，用户要的是"最后一个删掉后重新打开一个**全新的**
+  shell、tab 正常显示"。且反馈"最后一个删除不了"（空 bar 无 tab 可点，观感像删不掉）。
+· **一刀**：`TabClose` 里关完后若 `(0..SESSIONS).all(closed)` ⇒ `request_spawn()` 起全新进程
+  （新 Job/新 mirror），tab 正常显示 会话1。非最后一枚仍只杀不重开（S9 裁决不变）。
+· **正文刷新真因**：会话数变化但 sid/换行数不变时走增量 `redraw_input`，漏掉新横幅/清空。
+  修：增量条件加 `self.sig.3 == tabs`；并在 `TabClose` 与 park spawn 成功后**作废内容签名**
+  （sig 置 MAX）强制下一拍整窗重画。
+· **读数**：`build/s9m-auto-check.py` 关最后一枚后自动新建=True、新正文有全新提示符 PASS；
+  截图 tab=会话1 + 新横幅/提示符；三档 check 0 error、门禁 17/17；重启窗口 PID 21928。
+· 残留：像素夹具未对齐；`ktests`/`test` 未跑；respawn 单控制台存活未定性。
+## 311. S9n：序号错乱+删除失效真因——标签用"压缩位置"当身份；改为"位置=会话槽号"
+
+· **真因**：标签按压缩序号 0..count 画，且把该序号同时当名字(会话N)、活动判定、× 关闭目标。
+  但会话住在稀疏槽 0/1：关掉 0 号后，1 号被画在位置0 ⇒ 名字变 会话1、× 发"关0号"(已关)⇒
+  删除失效、新建序号错乱（用户实测）。
+· **一刀**：`open`/`tabs` 参数语义从"个数"改为**会话槽位掩码**（bit s=会话 s 活）。
+  fbcon 新增 `tab_shown(open)=最高活槽+1`（定 +/∨/面板锚点）；`tab_bar`/`hit_test`/`bar_hover`
+  只画/命中活槽且 **i=槽号=位置**（关掉槽留空不压缩）；`draw_tab_abs` 名字=会话(i+1)、× 关 i。
+  main.rs 7 处 `.count()` 改 `.fold(掩码)`；layout/bar_only/bar_hover/menu/wm 全传掩码。
+· **读数**：`build/s9n-slot-check.py` 关会话1(slot0)=True、剩下 会话2 的 × 关 slot1 生效=True、
+  关最后一枚自动新建=True，PASS；截图关 0 号后剩 会话2（位置1，左留空）；三档 0 error、门禁 17/17；
+  重启窗口 PID 21964。
+· **取舍**：不压缩位置（关 0 号后 1 号留在原位、左侧留空），换取序号/删除绝对正确；若要不留空
+  需"压缩位置+槽号映射"的更大重构，未做。
+· 残留：像素夹具未对齐；`ktests`/`test` 未跑。
+## 312. S9o：虚拟机点击卡顿——present 整帧 4MB 搬 MMIO 改"只搬脏行"
+
+· **用户问**"虚拟机上点击有些卡顿"。真因：S9k 双缓冲 `present()` 每 tick 把整帧 1280×800×4=4MB
+  `copy_nonoverlapping` 进帧缓冲窗口；QEMU（Windows 无 KVM，TCG 软件模拟）下 MMIO 写很慢，
+  每 tick 全帧搬占用主循环 ⇒ 输入处理被拖慢 ⇒ 点击卡顿。指针每 tick 重画又使 dirty 恒真。
+· **一刀**：行级脏标 `ROW_DIRTY[800]`；put/put_raw 置脏行；`present()` 只搬脏行（指针/输入行
+  只脏十几行，整条重画脏 40 行），开销降一个量级；idle 不搬。首帧 enable 全脏保证完整上屏。
+· **unsafe**：frame 合并后 5 处 U2（+enable 1）；whitelist total 414→415/U2 113→114、frame U2 4→5；
+  census.md 同步。check-unsafe 通过、门禁 17/17。
+· **读数**：`s9n-slot-check` 行级脏标下渲染/删除/自动新建仍 PASS；三档 0 error；重启窗口 PID 31924。
+· **说明**：QEMU Windows 用 TCG 无硬件加速，仍有基线慢；行级脏标去掉最大头。若仍卡可再降 tick 频率
+  或只脏指针行，未做。
+· 残留：像素夹具未对齐；`ktests`/`test` 未跑。
+## 313. S9p：标签压缩左移 + 顺序改名（关左后右边变 会话1），删除仍按真槽
+
+· **用户诉求**：关掉左边的 tab，右边要**左移补位**，且 **会话2 变成 会话1**（顺序号）。
+· **关键区分**：**位置/名字按压缩序**（关左后剩余左移、重编号为 会话1），但**身份（活动/关闭/悬停/
+  未读）按真会话槽号**。二者用 `slot_at(open,pos)` / `pos_of(open,slot)` 互转。
+  `open`=会话槽位掩码；`tab_shown`=popcount（+ / ∨ / 面板锚点跟压缩后末尾）。
+· **改动**（fbcon）：`draw_tab_abs(pos,slot,...)` 名字=会话(pos+1)、身份=slot；`tab_bar`/`hit_test`
+  按 pos 迭代、slot 定身份；`bar_hover` 用 pos_of 定位擦除；`menu_rect` 锚点用 popcount；
+  `redraw_window` 加 tabs==0 清正文。main.rs 早已传掩码，无需再改。
+· **事故与修复**：一次按索引切片误把 `menu_rect` 当 `hit_test`，切掉约 260 行导致 fbcon 编译崩；
+  已 `git checkout HEAD -- fbcon.rs` 还原（HEAD 含 S9i/j/k）后用 Edit 逐函数重贴，构建恢复。
+· **读数**：`build/s9p-compact-check.py` 关会话1(slot0)=True、剩余左移显示 会话1、其 × 关 slot1
+  生效=True、关最后一枚自动新建=True，PASS；三档 0 error、门禁 17/17；重启窗口 PID 6408。
+· 残留：像素夹具未对齐；`ktests`/`test` 未跑。

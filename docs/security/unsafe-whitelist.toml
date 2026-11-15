@@ -55,9 +55,9 @@ expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe
 # 2026-11-07 P7：hello 加了 syscall3（U1 两处）与 ring3 句柄读/close（U5 三处）。
 
 [unsafe-census]
-total = 414
+total = 415
 U1 = 75
-U2 = 113
+U2 = 114
 U3 = 13
 U4 = 131
 U5 = 46
@@ -106,10 +106,10 @@ U1 = 2
 U2 = 7
 
 [modules."frame"]
-# S9k（双缓冲）4 处 U2：离屏 back buffer（static mut [u32;1280*800]，BSS 不进堆）的
+# S9k/S9o（双缓冲+行级脏标）5 处 U2：离屏 back buffer（static mut [u32;1280*800]，BSS 不进堆）的
 # put/put_raw/get/present 访问。单核 UI 串行绘制（park 主循环体，非 IRQ 上下文），
 # 同一时刻只有一个活终端开启 db；几何超容量自动退回直写。分类按操作实质归 U2。
-U2 = 4
+U2 = 5
 
 [modules."irq"]
 U4 = 9

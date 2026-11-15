@@ -64,6 +64,9 @@ pub struct Frame {
 /// 本文件 put/put_raw/get/present/enable，调用方保证同一时刻只有一个活终端在画。
 static mut BACK: [u32; BACK_MAX] = [0; BACK_MAX];
 const BACK_MAX: usize = 1280 * 800;
+/// S9o：行级脏标记。present 只搬**改过的行**，不再整帧 4MB——QEMU 软件 MMIO 下整帧搬
+/// 是点击卡顿的主因（每 tick 全帧 copy）。指针/输入行只脏十几行，开销降一个量级。
+static mut ROW_DIRTY: [bool; 800] = [false; 800];
 
 impl Frame {
     /// 取启动信息、校验几何、映射窗口。任何一步不成立都**返回错误**，不"先画了再说"。
@@ -106,18 +109,25 @@ impl Frame {
         }
         self.db = true;
         self.dirty.set(true);
+        unsafe { ROW_DIRTY.iter_mut().for_each(|d| *d = true) };
         true
     }
 
-    /// S9k：把 back buffer 一次上屏。只在有改动时搬，idle 不白搬 4MB。
+    /// S9k/S9o：把 back buffer 上屏，**只搬脏行**。idle 不搬；指针/输入行只脏十几行，
+    /// 避免 QEMU 软件 MMIO 下整帧 4MB copy 造成的点击卡顿。
     pub fn present(&self) {
         if !self.db || !self.dirty.get() {
             return;
         }
         let w = self.info.width as usize;
         for y in 0..self.info.height as usize {
-            let row = unsafe { &BACK[y * w..(y + 1) * w] };
-            let _ = self.region.write_slice(y * self.info.pitch as usize, row);
+            unsafe {
+                if ROW_DIRTY[y] {
+                    let row = &BACK[y * w..(y + 1) * w];
+                    let _ = self.region.write_slice(y * self.info.pitch as usize, row);
+                    ROW_DIRTY[y] = false;
+                }
+            }
         }
         self.dirty.set(false);
     }
@@ -183,7 +193,10 @@ impl Frame {
         }
         let off = (y * self.info.pitch + x * 4) as usize;
         if self.db {
-            unsafe { BACK[self.back_idx(x, y)] = self.pack(rgb) };
+            unsafe {
+                BACK[self.back_idx(x, y)] = self.pack(rgb);
+                ROW_DIRTY[y as usize] = true;
+            }
             self.dirty.set(true);
             return Ok(());
         }
@@ -198,7 +211,10 @@ impl Frame {
             return Err(FrameError::OutOfBounds { x, y, width: self.info.width, height: self.info.height });
         }
         if self.db {
-            unsafe { BACK[self.back_idx(x, y)] = packed };
+            unsafe {
+                BACK[self.back_idx(x, y)] = packed;
+                ROW_DIRTY[y as usize] = true;
+            }
             self.dirty.set(true);
             return Ok(());
         }

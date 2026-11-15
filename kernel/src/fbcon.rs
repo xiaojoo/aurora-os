@@ -3037,10 +3037,34 @@ pub const MENU_GAP: u64 = 4;
 pub const MENU_PAD_T: u64 = 4;
 pub const MENU_PAD_X: u64 = 6;
 
+/// S9p：`open` 是**会话槽位掩码**（bit s = 会话 s 活着）。
+/// 位置**压缩**（关掉左边，右边左移），名字按位置 1 起（右边自动变 会话1）；
+/// 身份仍用槽号（`slot_at`/`pos_of` 互转）——活动/关闭/悬停都按槽号，删除不会指错。
+pub fn tab_shown(open: u64) -> u64 {
+    open.count_ones() as u64
+}
+/// 第 pos 个活槽的槽号（pos 从 0 起）。
+fn slot_at(open: u64, pos: u64) -> u64 {
+    let mut seen = 0u64;
+    for s in 0..64u64 {
+        if (open >> s) & 1 == 1 {
+            if seen == pos {
+                return s;
+            }
+            seen += 1;
+        }
+    }
+    0
+}
+/// 槽 slot 压缩后的第几位。
+fn pos_of(open: u64, slot: u64) -> u64 {
+    (open & ((1u64 << slot).wrapping_sub(1))).count_ones() as u64
+}
+
 pub fn menu_rect(cols: u64, tabs: u64, n_rows: u64) -> (u64, u64, u64) {
     let rows = n_rows.min(MENU_MAX_ROWS);
     let lay = BarLayout::of(cols);
-    let shown = tabs.min(lay.fit);
+    let shown = tab_shown(tabs).min(lay.fit);
     // 面板锚点压在 `∨` **右侧**：`+`/`∨` 现在按像素画（宽 12/12、间隔 10），
     // 占满 base..base+56 这 7 格；+5 会让面板盖住 `∨`（实测看不到箭头）。
     let x = lay.plus_col(shown) + 7;
@@ -3293,21 +3317,20 @@ pub fn hit_test(
     if y_px >= BAR_H {
         return Hit::Body;
     }
-    let shown = tabs.min(lay.fit);
-    for i in 0..shown {
-        let c0 = lay.tab_col(i);
+    let shown = tab_shown(tabs).min(lay.fit);
+    for pos in 0..shown {
+        let c0 = lay.tab_col(pos);
         if c >= c0 && c < c0 + lay.tab_w {
-            // #58：条目右上角**只保留 `×`**，而且只在"它是活动标签"或"指针停在它上面"时**可点**
-            // （画与命中同一条规则——否则看不见的 × 也能点，正是要防的误关）。
+            let slot = slot_at(tabs, pos);
+            let x_visible = slot == active || hover == Some(slot as u8);
+            // `×` 画在 `tab_end-19`、宽 9px，横跨最后三格前两格（rel=tab_w-3..-2）。
+            // 命中必须与画同源：rel+3 覆盖整个画的 ×（否则左半点不动，要按好几下）。
+            // 身份用槽号 slot：位置压缩（左边删了右边左移），关闭/活动认的是真槽。
             let rel = c - c0;
-            let x_visible = i as u64 == active || hover == Some(i as u8);
-            // `×` 画在 `tab_end-19`、宽 9px，横跨最后**三格**的前两格（rel=tab_w-3..tab_w-2）。
-            // 命中必须与画同源：旧口径 rel+2 只认后两格，画出来的左半 ×（rel=tab_w-3）点不动，
-            // 用户要点好几下才碰巧点中右半（实测"关闭点多次才关闭"）。改 rel+3 覆盖整个画的 ×。
             return if rel + 3 >= lay.tab_w && x_visible {
-                Hit::TabClose(i as u8)
+                Hit::TabClose(slot as u8)
             } else {
-                Hit::Tab(i as u8)
+                Hit::Tab(slot as u8)
             };
         }
     }
@@ -3713,117 +3736,81 @@ impl Term {
     /// 与 Windows Terminal 同形）。今天只有 1 个会话 ⇒ 那个分支走不到，规则先按布局写好。
     /// 画**一个标签**（悬停/活动底色、图标、标题、×/圆点）。整条重画会让顶部闪一下，
     /// 悬停变化时只重画受影响的那两个。
-    fn draw_tab_abs(&self, f: &Frame, lay: &BarLayout, i: u64, active: u64,
+    fn draw_tab_abs(&self, f: &Frame, lay: &BarLayout, pos: u64, slot: u64, active: u64,
                     hover: Option<u8>, unread: u64) {
-        let c0 = lay.tab_col(i);
+        let c0 = lay.tab_col(pos);
         let x0 = c0 * CELL_W;
         let tab_w = lay.tab_w;
         let wtab = tab_w * CELL_W;
-        // 参考图里标签**不顶到条顶**：条 40px、标签 32px、上面留 8px。
-        // 我们是 32px 的条，所以留 4px，标签 28px。圆角只做**顶部**——底部要与正文
-        // 连成一片（参考图里活动页底边没有缝，四角全圆会画出一条条底色）。
-        const TAB_TOP: u64 = 8; // 参考图：条 40、标签 32，上留 8
+        const TAB_TOP: u64 = 8;
         let tab_h = BAR_H - TAB_TOP;
-        // S9i：每个标签**自己刷自己的底**（活动=正文色 / 悬停=悬停色 / 其余=条底）。
-        // tab_bar 不再整条先刷底，标签状态变化（活动↔非活动）靠这里自刷覆盖，
-        // 单缓冲下就不会出现"整条空白"的中间帧（加标签闪烁的真因）。
-        let tbg = if i == active {
-            BG
-        } else if hover == Some(i as u8) {
-            TAB_HOVER_BG
-        } else {
-            TITLE_BG
-        };
+        let is_active = slot == active;
+        let is_hover = hover == Some(slot as u8);
+        // 每个标签自刷底（活动=正文色 / 悬停=悬停色 / 其余=条底）；状态变化靠自刷覆盖，
+        // 单缓冲下不会出现"整条空白"的中间帧。
+        let tbg = if is_active { BG } else if is_hover { TAB_HOVER_BG } else { TITLE_BG };
         self.rounded_top_abs(f, x0, TAB_TOP, wtab, tab_h, tbg, TITLE_BG);
-        // `>_` 图标（几何画，不依赖字体里有没有这两个字形）。**每个标签都画**——
-        // 只有活动页画的话，非活动页的文字会空出图标那两格、看着像缩进错位。
-        // 图标：参考图 16×16、距标签左缘 10px、垂直居中。
-        let icon = if i == active { TAB_ICON } else { TAB_ICON_DIM };
+        let icon = if is_active { TAB_ICON } else { TAB_ICON_DIM };
         for k in 0..7u64 {
             let _ = self.put_abs(f, x0 + 10 + k, 17 + k, icon);
             let _ = self.put_abs(f, x0 + 10 + k, 29 - k, icon);
         }
         self.rect_abs(f, x0 + 18, 30, 8, 2, icon);
-        // 图标占前两格，标题从第三格起（图标与标题之间留一格，参考图也是这个呼吸感）
-        let mut c = c0 + 3;
-        // 0 号标签叫 "Aurora shell"，其余叫 "shell N"
+        // 名字按**压缩位置** 1 起：关掉左边后，右边自动变 会话1（用户裁决）。
+        // 身份仍用槽号 slot（活动/关闭/悬停都按 slot），删除不会指错。
+        const HUIHUA: &[u8] = &[0xE4, 0xBC, 0x9A, 0xE8, 0xAF, 0x9D]; // 会话
         let mut label = [0u8; 24];
         let mut n = 0usize;
-        if i == 0 {
-            for ch in TAB_LABEL.chars() {
-                if n < label.len() {
-                    label[n] = ch as u8;
-                    n += 1;
-                }
-            }
-        } else {
-            for ch in "shell ".chars() {
-                if n < label.len() {
-                    label[n] = ch as u8;
-                    n += 1;
-                }
-            }
-            if n < label.len() && i < 10 {
-                label[n] = b'0' + i as u8;
+        for &b in HUIHUA {
+            if n < label.len() {
+                label[n] = b;
                 n += 1;
             }
         }
-        // 标签文字用**界面字号**（半号 8×16），正文仍是 2×；参考图的标签文字就比正文小。
-        // 推进按像素（ASCII 8、宽字 16），否则半号字形配整格推进会变成"字距拉满"。
-        let ink = if i == active { TAB_INK } else { TAB_INK_DIM };
+        if n < label.len() && pos < 9 {
+            label[n] = b'1' + pos as u8;
+            n += 1;
+        }
+        let ink = if is_active { TAB_INK } else { TAB_INK_DIM };
         if let Ok(lab) = core::str::from_utf8(&label[..n]) {
-            // 底色跟着标签走（活动页是正文色，非活动/悬停是条底/悬停底）。
-            let bg = if i == active {
-                BG
-            } else if hover == Some(i as u8) {
-                TAB_HOVER_BG
-            } else {
-                TITLE_BG
-            };
-            let mut cx = x0 + 38; // 10 内边距 + 16 图标 + 12 间隙（参考图同款）
+            let bg = if is_active { BG } else if is_hover { TAB_HOVER_BG } else { TITLE_BG };
+            let mut cx = x0 + 38;
             for ch in lab.chars() {
                 self.ch_ink_ui_abs(f, cx, 19, ch, ink, bg);
                 cx += if (ch as u32) < 0x80 { 8 } else { 16 };
             }
         }
-        let _ = c;
-        // #58：条目右上角**只有 `×`**，且只在"活动标签"或"指针停在它上面"时画；
-        // 非活动且没悬停时，若这个会话有新输出就画一个**未读圆点**（同样占那一格）。
-        let x_visible = i as u64 == active || hover == Some(i as u8);
-        // 关闭 `×` 的右边距与图标左边距一致（都是 10 px）⇒ `×` 右缘落在 tab_end-10。
+        let x_visible = is_active || is_hover;
         let xr = (c0 + tab_w) * CELL_W - 19;
         if x_visible {
-            // 参考图里 `×` 不是贴右边缘：右边还留 ~24px。
-            let ink = if i == active { TAB_INK } else { TAB_INK_DIM };
+            let ink = if is_active { TAB_INK } else { TAB_INK_DIM };
             self.cross_abs(f, xr, 19, 9, ink);
-        } else if unread & (1u64 << i) != 0 {
-            // 圆点：6×6 切掉四角（位图里画不出真圆，切角是最接近的形状）。
+        } else if unread & (1u64 << slot) != 0 {
             self.rect_abs(f, xr + 2, 21, 4, 6, TAB_TEXT);
             self.rect_abs(f, xr + 1, 22, 6, 4, TAB_TEXT);
         }
-
     }
 
     /// 悬停变化：**只重画离开和进入的那两个标签**（整条重画会让顶部闪一下）。
     pub fn bar_hover(&self, f: &Frame, n_tabs: u64, active: u64,
                      old: Option<u8>, new: Option<u8>, unread: u64) {
         let lay = BarLayout::of(self.cols);
-        let shown = n_tabs.min(lay.fit);
+        let shown = tab_shown(n_tabs).min(lay.fit);
         const TAB_TOP: u64 = 8;
-        // 离开的那个：整块刷回条底（它不再有 hover 底，必须清）。
-        // **哪怕这个标签已经被关掉**也要清——旧悬停底留在那里，看起来就像标签还在
-        // （实测：关掉 1 号标签后，它那块 `#3A3A3A` 一直留着）。
+        // 离开的那个：按它**当前压缩位置**整块刷回条底再重画（位置是压缩后的）。
         if let Some(o) = old {
-            let x0 = lay.tab_col(o as u64) * CELL_W;
-            self.rect_abs(f, x0, TAB_TOP, lay.tab_w * CELL_W, BAR_H - TAB_TOP, TITLE_BG);
-            if (o as u64) < shown {
-                self.draw_tab_abs(f, &lay, o as u64, active, new, unread);
+            if (n_tabs >> o) & 1 == 1 {
+                let p = pos_of(n_tabs, o as u64);
+                let x0 = lay.tab_col(p) * CELL_W;
+                self.rect_abs(f, x0, TAB_TOP, lay.tab_w * CELL_W, BAR_H - TAB_TOP, TITLE_BG);
+                self.draw_tab_abs(f, &lay, p, o as u64, active, new, unread);
             }
         }
-        // 进入的那个：它的 hover 底会整块盖住，**不再先刷**——先刷一遍再画就是"闪一下"。
+        // 进入的那个：hover 底会整块盖住，**不再先刷**——先刷一遍再画就是"闪一下"。
         if let Some(n) = new {
-            if Some(n) != old && (n as u64) < shown {
-                self.draw_tab_abs(f, &lay, n as u64, active, new, unread);
+            if Some(n) != old && (n_tabs >> n) & 1 == 1 {
+                let p = pos_of(n_tabs, n as u64);
+                self.draw_tab_abs(f, &lay, p, n as u64, active, new, unread);
             }
         }
         // 抹掉的那块矩形从 `plus_col` 那一列开始 ⇒ `+`/`∨` 跟着没了；hover 重画不经过
@@ -3862,7 +3849,7 @@ impl Term {
         // 2) 标签：几何来自 `BarLayout`（与命中测试同一份）
         let lay = BarLayout::of(self.cols);
         let (tab_w, strip_r, fit) = (lay.tab_w, lay.strip_r, lay.fit);
-        let shown = n_tabs.min(fit);
+        let shown = tab_shown(n_tabs).min(fit);
         // 1) S9i：只清"左缘 + 末标签以右"两条带；标签矩形由 draw_tab_abs 自刷底。
         //    旧版先整条刷 TITLE_BG 再画标签，单缓冲下显示器会抓到"整条空白"的中间帧
         //    ⇒ 加/减标签时整条闪一下。现在标签区从不被整体刷白，闪烁消除。
@@ -3876,8 +3863,9 @@ impl Term {
             self.rect_abs(f, tail_x, 0, w - tail_x, BAR_H, TITLE_BG);
         }
 
-        for i in 0..shown {
-            self.draw_tab_abs(f, &lay, i, active, hover, unread);
+        for pos in 0..shown {
+            let slot = slot_at(n_tabs, pos);
+            self.draw_tab_abs(f, &lay, pos, slot, active, hover, unread);
         }
         // 3) `+` 与它右边那个 `∨`：单独成方法，因为 `bar_hover` 也必须能补画它们。
         self.plus_chevron(f, &lay, shown);
@@ -4226,6 +4214,14 @@ pub fn redraw_window(term: &Term, f: &Frame, max_lines: usize, sid: usize,
     }
     if !ch.body() {
         // 最小化：正文整块刷成底色，只留标签栏。输入行也不画（光标由调用方按 caret_at=None 收掉）。
+        for r in top..max_lines as u64 {
+            term.print_line(f, r, "");
+        }
+        return (max_lines, 0, 0);
+    }
+    // S9m：标签条版面下没有活会话（tabs 掩码=0）⇒ 正文清空，不留已死会话旧内容。
+    // 只限 ch.tabs()：浮窗版面 paint_win 也传 0 但那是活窗正文，不能清。
+    if ch.tabs() && tabs == 0 {
         for r in top..max_lines as u64 {
             term.print_line(f, r, "");
         }

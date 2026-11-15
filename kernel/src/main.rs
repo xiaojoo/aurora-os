@@ -1143,6 +1143,10 @@ fn park_until_init_exits(init: Option<usize>) {
                             }
                             crate::user::set_active_session(slot as u8);
                             crate::log_info!("新建: 会话 {} 起来了 任务={}", slot, n);
+                            // 新会话正文必须整窗重画一次（增量路径会漏掉新横幅）。
+                            if let Some(t) = live.as_mut() {
+                                t.sig = (u8::MAX, usize::MAX, u64::MAX, 0, 0, false);
+                            }
                         }
                         None => crate::log_warn!("新建: 会话 {} 失败（资源墙）句柄表={}/16", slot, crate::handle::used()),
                     }
@@ -1798,7 +1802,7 @@ impl LiveTerm {
         #[cfg(feature = "ps2-mouse")]
         self.ptr_erase();
         let (_, tabs, active, _) = self.layout();
-        let open = (0..crate::serial::SESSIONS).filter(|i| !self.closed[*i]).count() as u64;
+        let open = (0..crate::serial::SESSIONS).filter(|i| !self.closed[*i]).fold(0u64, |m, i| m | (1u64 << i));
         self.term.bar_hover(&self.frame, open, active, old, new, self.unread_mask(active));
         // 条刚被重画 ⇒ 指针保存的旧底作废，否则下一次移动把旧像素贴回 `+`/`∨` 上。
         self.ptr = None;
@@ -1809,7 +1813,7 @@ impl LiveTerm {
     fn bar_only(&mut self, active: u64) {
         #[cfg(feature = "ps2-mouse")]
         self.ptr_erase();
-        let open = (0..crate::serial::SESSIONS).filter(|i| !self.closed[*i]).count() as u64;
+        let open = (0..crate::serial::SESSIONS).filter(|i| !self.closed[*i]).fold(0u64, |m, i| m | (1u64 << i));
         self.term.tab_bar(&self.frame, open, active, self.hover, self.unread_mask(active));
         self.ptr = None;
         if self.menu {
@@ -1832,7 +1836,7 @@ impl LiveTerm {
         for i in 0..crate::serial::SESSIONS {
             if session_open(i) {
                 rows[n] = MenuRow {
-                    label: if i == 0 { "会话 0" } else { "会话 1" },
+                    label: if i == 0 { "会话1" } else { "会话2" },
                     hint: if i == 0 { "Ctrl+Shift+1" } else { "Ctrl+Shift+2" },
                     dim: false,
                 };
@@ -1903,7 +1907,7 @@ impl LiveTerm {
         #[cfg(feature = "ps2-mouse")]
         self.ptr_erase();
         let (_, tabs, _, _) = self.layout();
-        let open = (0..crate::serial::SESSIONS).filter(|i| !self.closed[*i]).count() as u64;
+        let open = (0..crate::serial::SESSIONS).filter(|i| !self.closed[*i]).fold(0u64, |m, i| m | (1u64 << i));
         let (rows, _, nrows) = self.menu_state();
         if let Some(o) = old {
             self.term.menu_row(&self.frame, open, &rows[..nrows], o, new);
@@ -1919,7 +1923,7 @@ impl LiveTerm {
     fn menu_only(&mut self) {
         #[cfg(feature = "ps2-mouse")]
         self.ptr_erase();
-        let open = (0..crate::serial::SESSIONS).filter(|i| !self.closed[*i]).count() as u64;
+        let open = (0..crate::serial::SESSIONS).filter(|i| !self.closed[*i]).fold(0u64, |m, i| m | (1u64 << i));
         let (rows, _, nrows) = self.menu_state();
         self.term.menu_panel(&self.frame, open, &rows[..nrows], self.menu_hover);
     }
@@ -1948,7 +1952,7 @@ impl LiveTerm {
         let sid = 0usize;
         // S6q 补记三：窗口列表里"没关掉的有几项"决定标签条上画几项。
         #[cfg(feature = "handles")]
-        let tabs = (0..crate::serial::SESSIONS).filter(|i| !self.closed[*i]).count() as u64;
+        let tabs = (0..crate::serial::SESSIONS).filter(|i| !self.closed[*i]).fold(0u64, |m, i| m | (1u64 << i));
         #[cfg(not(feature = "handles"))]
         let tabs = 1u64;
         let active = sid as u64;
@@ -1999,6 +2003,7 @@ impl LiveTerm {
                 && self.sig.0 == sid as u8
                 && self.sig.2 == nl as u64
                 && self.sig.1 != usize::MAX
+                && self.sig.3 == tabs
                 && self.sig.5 == lay;
             #[cfg(feature = "wm")]
             let (cc, cr) = if self.float {
@@ -2265,6 +2270,15 @@ impl LiveTerm {
                                 if crate::user::active_session() as usize == i {
                                     crate::user::set_active_session(0);
                                 }
+                                // S9m（用户裁决）：关掉**最后一枚** ⇒ 立刻起一个**全新** shell，
+                                // 内容区随 spawn 的 mirror_reset 清空、tab 正常显示 会话1，
+                                // 而不是留一条空 bar（用户："删除了重新打开一个全新的"）。
+                                if (0..crate::serial::SESSIONS).all(|k| self.closed[k]) {
+                                    crate::log_info!("窗口: 最后一枚已关 ⇒ 自动新建全新 shell");
+                                    request_spawn();
+                                }
+                                // 会话生命周期变化 ⇒ 作废内容签名，下一拍整窗重画（清/显正文）。
+                                self.sig = (u8::MAX, usize::MAX, u64::MAX, 0, 0, false);
                             }
                         }
                         // S6t：标签条上的 `∨` **有动作了**——切换版面（标签条 ⇄ 浮窗）。
@@ -2282,8 +2296,7 @@ impl LiveTerm {
                             if self.menu {
                                 let (rows, _, nrows) = self.menu_state();
                                 let open = (0..crate::serial::SESSIONS)
-                                    .filter(|i| !self.closed[*i])
-                                    .count() as u64;
+                                    .filter(|i| !self.closed[*i]).fold(0u64, |m, i| m | (1u64 << i));
                                 self.term.menu_panel(&self.frame, open, &rows[..nrows], None);
                             }
                             crate::log_info!("菜单: 开={}", self.menu);
@@ -2335,7 +2348,9 @@ impl LiveTerm {
         chrome: crate::fbcon::Chrome,
         rows: usize,
     ) -> (u64, u64) {
-        if incremental {
+        // S9l：tabs==0（最后一个标签关掉）必须走整窗重画清空正文；增量路径只画输入行，
+        // 会留下已死会话的旧内容（用户实测"tab 删了内容还在"）。
+        if incremental && tabs != 0 {
             crate::fbcon::redraw_input(&self.term, &self.frame, rows.min(LIVE_ROWS), sid, chrome)
         } else {
             let (_, cc, cr) = crate::fbcon::redraw_window(
@@ -2620,8 +2635,7 @@ impl LiveTerm {
         // ——`∨` 没了，切不回去（实测：第二次点同一格串口只有 `浮窗=true`、没有 `false`）。
         // 窗口从第 1 格行开始，与标签条那一行不重叠。
         let open = (0..crate::serial::SESSIONS)
-            .filter(|i| !self.closed[*i])
-            .count() as u64;
+            .filter(|i| !self.closed[*i]).fold(0u64, |m, i| m | (1u64 << i));
         self.term.tab_bar(&self.frame, open, active as u64, self.hover, self.unread_mask(active as u64));
         // 整栈从最下面一扇开始画；每扇只画自己的矩形 ⇒ 这就是"每扇窗只重画矩形"。
         let mut caret = (0u64, 0u64);
