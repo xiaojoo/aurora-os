@@ -158,13 +158,18 @@ fn t_fat32() -> bool {
         hi: u16,
         lo: u16,
     }
+    // 两卷里的 HELLO.ELF 是 `kernel/fixtures/hello.elf` 的副本（70c73f3 换新后两卷都重打过）。
+    // 大小直接从嵌入的那份派生，不再手抄一个数：手抄的 32_672 在换卷后就地过期，
+    // 而那条红看起来像解析器坏了（BACKLOG §361）。卷上那份的真值由宿主机 `check_fat32`
+    // 逐字段独立量（`fat32_host_volume`），不是这里自己与自己一致。
+    let hello_size = HELLO_ELF.len() as u32;
     let want_a = [
-        Want { name: "HELLO.ELF", size: 32_672, cluster: 3, seen: 1, hi: 0, lo: 3 },
+        Want { name: "HELLO.ELF", size: hello_size, cluster: 3, seen: 1, hi: 0, lo: 3 },
         Want { name: "NOTES", size: 1_000, cluster: 65, seen: 2, hi: 0, lo: 65 },
         Want { name: "SMALL.BIN", size: 100, cluster: 67, seen: 3, hi: 0, lo: 67 },
     ];
     let want_b = [
-        Want { name: "HELLO.ELF", size: 32_672, cluster: 67_587, seen: 2, hi: 1, lo: 2_051 },
+        Want { name: "HELLO.ELF", size: hello_size, cluster: 67_587, seen: 2, hi: 1, lo: 2_051 },
         Want { name: "NOTES", size: 1_000, cluster: 67_649, seen: 3, hi: 1, lo: 2_113 },
         Want { name: "SMALL.BIN", size: 100, cluster: 67_651, seen: 4, hi: 1, lo: 2_115 },
     ];

@@ -14495,3 +14495,101 @@ ls .tools/qemu/qemu-system-x86_64.exe     # 这一步必须能列出
 3. 计数仍是全局一份（等 `Block` 有身份/分桶）。
 4. 整链矩阵未跑：树里混着别人的 `shell.elf` 在途改动，按 §357/§358 那种成分不纯的树，
    矩阵读数不归因。
+## 361. 修掉 §356/§357 留下的那条既有红：`Want.size` 手抄的 32_672（2026-11-16）
+
+- 宿主机第二台仪器先量（`tools/aurora.py` 的 `fat32_host_volume` 直接解压两块 `.img.zz` 再解析）：
+  两卷的 `HELLO.ELF` 都是 `size=17288 first=3/67587 seen=1/2 clusters=34 tail=392`，
+  与 70c73f3 换新后的 `hello.elf`（17,288）一致；`ktests/fs.rs` 的 `Want` 表却还写着 32_672
+  ⇒ 该到 64 簇/416 尾。这就是 run-2791…2817 那条 `目录对=false 链对=false` 的全部成因。
+- 改法不是把 32_672 手抄成 17_288，而是 `let hello_size = HELLO_ELF.len() as u32;` 两卷共用：
+  这个数本来就有唯一来源（嵌入的那份产物），再抄一遍就是第三个副本——它已经烂过一次。
+  卷上那份的真值仍由宿主机 `check_fat32` 逐字段独立量，不是"自己与自己一致"。
+- 变异证红：`HELLO_ELF.len() as u32 - 1` ⇒ `该到尾格=391`、`目录对/链对=false`、`ktests 85/86`；
+  还原后 86/86。
+- 读数：`run --features fat32-probe` = **PASS(33)**、ktests **86/86**（ELF `f4d5ef1d8fa9`，
+  run-2819 与还原后的 run-2821 同 sha）；`run --features fat32-exec` = **PASS(33)**、ktests **97/97**
+  （`a3d0d58a0a87`，含 `elfdisk` 判据全 true）。`check` 17/17。
+- 整链矩阵**仍未重跑**：树里还有别人的 `kernel/fixtures/shell.elf` 在途改动；按 §357/§358，
+  成分不纯的树不产生可归因的矩阵读数。
+## 362. 写方向的判定行：宿主机解析跑完的可写卷（ADR-111 决策 3，2026-11-16）
+
+- 新增判定行 `FS写方向与可写卷对账`（`do_run(["fs-rw"])` + `check_fs_rw_image`）。这台仪器不看
+  内核那两行"自己读回"，只用 `fat32_host_volume` 解析**跑完之后**的 `build/fat32-rw.img`：
+  LOG.TXT 的 `[4,8)`（23 号那格）与 `[8,12)`（`t_fs_rw_write` 那格）各是注入值、其余 56 字节
+  与配方逐字节相同，DATA.BIN 整份未动；任何一处不符点名到首个不同字节。
+- 仪器证红：跑完后把 LOG.TXT 第 20 字节翻一位 ⇒ `首个不同字节=20 盘上[16:24]=7295b8e3f9294c77
+  期望=7295b8e306294c77`，`mutant caught=True`；随后 `ensure_fat_rw()` 还原，改过的盘不留给下一跑。
+- 行按**自己的那条路**跑过：PASS(33)、ktests **99/99**、宿主机 ok（ELF `ad2a4bfc6a0c`，run-2824）。
+  `check` **17/17**（`check-matrix-wiring` 已把新行与它的日志变量纳入对账）。
+- 同轮撞上 `fs-open-ring3` 的老偶发：run-2823 与 run-2824 **同一个 ELF**，前者 `探针槽=0x0` 全零、
+  后者逐格有值 ⇒ 环境形状，**不归因**；今天两次（2814/2823），同一份源码两个方向都出现过。
+  它现在同时挂两行（FS-03 ring3 与写方向），所以"这行偶尔红"的处置仍然是重跑，不是改断言。
+- 整链矩阵仍未跑：HEAD 的 `kernel/fixtures/shell.elf`（40,904）与工作区现构建的（9,120）不同，
+  按 §357/§358 不在成分不纯的树上出矩阵读数。
+
+## 359. 纯净树读数（verify/fs-write @ 70c73f3）：58 / 3，`check` 16/17（2026-11-16）
+
+`H:/aurora-os-verify`（树上只有 `70c73f3` 的改动，workbuddy 的在途 WIP 不在里面）：
+
+- `check` = **16/17**（哪一道红要先看 `build/check-verify.txt`）；
+- 判定表 61 行 = **58 符合 / 3 不符合**：
+```
+FAT32两卷与宿主机对账 : FAIL(rc=35) 期望 PASS
+FAT32读出的镜像装上并跑通: FAIL(rc=35) 期望 PASS
+P7 句柄ring3读自己镜像: HANG(rc=-1) 期望 PASS
+FS-03文件ABI与多级真卷对账: PASS(rc=33) -> 符合      ← 混入树里那条红消失了
+```
+- **结论**：三条不符合全在"从盘上取 `hello.elf` 来跑"这一族；`FS-03` 那行在纯净树上转绿，
+  说明它此前是混入树的连带红（§357 的判断在这条上成立）。
+- **最可能的成因**：补卷把盘上 hello.elf 换成 17,288 字节之后，`ktests/fs.rs` 里那一批
+  **按旧 ELF 钉死的常数**（大小/摘要/几何/走链簇数）没有跟着重钉。这正是 workbuddy 影响面里
+  "elf sha 全变需重钉"那一条；我上一轮只看到 ④ 转绿就写了"补卷起作用"，**只对了一半**。
+- `P7` 那条是 **HANG**，不是 FAIL——按本仓口径先当"可能是环境形状"，但同一族另两条是 FAIL，
+  所以**不能**整族都记不归因；下一步先看 `P7` 那一跑的串口停在哪。
+
+**我这一轮的判断要说清**：`70c73f3` 现在**仍不可合并**——纯净树都没全绿，没到谈合并的地步。
+下一刀是"把 `ktests/fs.rs` 里与盘上 ELF 有关的常数按新的 17,288 字节重钉"，然后重跑这一跑。
+## 363. 修掉门禁的短名误检：`core::arch|sync|time` 被当成到 crate 同名模块的边（2026-11-16）
+
+- 成因：`check-module-interfaces` 数边时用 `\b<short>::`，而 `sync`/`arch`/`time` 同时是
+  crate 模块名与 `core::*` 的路径段。于是 `use core::sync::atomic::…`、`core::arch::asm`、
+  `core::time` 全被算成对 crate 同名模块的引用。最直接的证据：`storage->sync` 原先登记的
+  **12 站全部**是 ahci 1 + virtio 11 的 `core::sync`——那条"依赖"在源码里根本不存在。
+- 修法：只排除 `std::`/`core::`/`alloc::` 三个外部前缀（`(?<!core::)(?<!std::)(?<!alloc::)`），
+  `crate::`/`super::`/裸短名照数。真实边一个不少——变异证过：往 `mm.rs` 加一行
+  `use crate::sync::RANK_HANDLE as _;` ⇒ `memory->sync 8 > 登记 7` 当场红；还原后 17/17。
+- 按实测重钉（不是放宽，是**收紧**）：
+  - `dependencies` 删误检：boot/irq/storage/diagnostics/display/input/time 各去 `sync`，
+    pci 去 `arch,sync`；`arch.allowed_callers` 去 `pci`；`sync.allowed_callers` 去
+    boot/diagnostics/display/input/irq/pci/storage/time。
+  - 环基线：7 条边（boot->sync、diagnostics->sync、irq->sync、pci->arch、pci->sync、
+    storage->sync、time->sync）整条删除；7 条站点数收紧（arch->sync 8→3、diagnostics->arch
+    34→32、memory->arch 64→61、memory->sync 11→7、resource->sync 3→2、sync->arch 16→12、
+    time->arch 3→1）。现表 **41 条边 / 422 个站点**（旧表头 46/449 是误检图上的数）。
+- `docs/architecture/module-dependencies.md` 第 2 节按 TOML 重新生成（顺带修掉两处旧漂移：
+  capability 缺 `memory`、diagnostics 缺 `pci`）；第 7 节"最小割 12 条边/90 站点"标成旧图口径
+  （新的双向组由 11 降到 8，**精确最小割未重算**）。
+- 门禁读数：`check` **17/17**。本轮只动量具与登记表，未动产品代码（mm.rs 的变异已还原、
+  `git diff --numstat` 无该文件）。
+## 364. 块设备/VFS 的盘失败统一 `-7`（EIO）；分区洞未能合入（2026-11-16）
+
+- 裁决：`HErr::Io(_)` 从旧的 `-2` 改成 `-7`。旧口径的理由（"避免 10 号旧调用方返回集合变宽"）
+  在仓里没有证据支撑：没有任何一格钉 `-2`（`E_FAULT` 只被坏指针用）。
+- 实现：`user::handle_err` 的 `Io` 臂 → `E_IO`；`handle_err` 升 `pub(crate)`，只为让用例吃**同一张表**。
+- 取证（句柄层，刻意的）：授一个空分区区间（`Partition{base:0,last:0}`）的 VfsFile ⇒
+  `handle::read` 在翻译前被 `PartitionView` 拒 ⇒ `HErr::Io(BeyondPartition)` ⇒ 同一张表给 `-7`。
+  串口 `fs-rw-23: … 坏指针=-2 盘失败=-7 … 关后活=0`。变异（`E_IO`→`E_FAULT`）⇒ `盘失败=-2`、该格红；
+  还原后 **fs-rw 99/99**（ELF `05a78d854538`）。
+- 同轮读数：`fs-open` 连跑 **3/3 PASS 97/97**（`299b60dfaff5`）、默认档 PASS(33)（`110f6ed4d243`）、
+  `handles` PASS(33)（`e4eb01cc61e7`）、`fat32-exec` PASS(33)（`23ef0296a8b1`）、`check` **17/17**。
+
+**新开的欠账（不要顺手补）**：`sys_file_read`/`sys_file_write` 拿到票后**没有**按
+`ticket.partition()` 包 `PartitionView`。今天所有 VfsFile 的 `part=None`，所以读不到症状；一旦有
+分区内的文件句柄，syscall 会绕过区间判据读到分区外——那看起来是"读成功了"。
+本轮试过补它（对 `None` 运行期完全等价）：
+- 带包装：`fs-open` **同一个 ELF 连续 6 次**红在 `t_fs_open_ring3`（探针槽全零、46 条
+  `读用户页被拒 … 页表链没走完`）；
+- 把 `part` 固定成 `None`：一次绿；撤回包装：**3/3 连绿**（`299b60dfaff5`）。
+所以这不是"语义等价"能拍板的洞，而是一个布局/栈敏感的下游（与 §335/§355 同族：探针在
+kernel 栈/地址窗口上的脆弱）。下一刀先定位它：用同一段包装 + `USER_KSTACK_PAGES` 加一页 /
+或不改包装只挪一个无副作用的局部量，看红是否跟着"布局"走；定位之前不把包装合入。

@@ -34,7 +34,7 @@ public_api = [
   "limine::release_mp_cpu",
 ]
 allowed_callers = ["arch", "display", "integration", "memory", "sched", "storage"]
-dependencies = ["diagnostics", "sync"]
+dependencies = ["diagnostics"]
 forbidden_dependencies = []
 known_violations = []
 context = ["BOOT", "KERNEL"]
@@ -157,7 +157,7 @@ public_api = [
   "x86_64::trap",
   "x86_64::smp",
 ]
-allowed_callers = ["diagnostics", "driver", "input", "integration", "irq", "memory", "pci", "sched", "storage", "sync", "time"]
+allowed_callers = ["diagnostics", "driver", "input", "integration", "irq", "memory", "sched", "storage", "sync", "time"]
 dependencies = ["boot", "diagnostics", "irq", "memory", "pci", "sync", "time"]
 forbidden_dependencies = ["sched"]
 known_violations = []
@@ -431,7 +431,7 @@ public_api = [
   "sync::IrqGuard",
   "sync::RANK_HANDLE",
 ]
-allowed_callers = ["arch", "boot", "capability", "diagnostics", "display", "input", "integration", "irq", "memory", "pci", "resource", "sched", "storage", "time"]
+allowed_callers = ["arch", "capability", "integration", "memory", "resource", "sched"]
 dependencies = ["arch", "diagnostics", "time"]
 forbidden_dependencies = []
 known_violations = []
@@ -490,7 +490,7 @@ public_api = [
   "fbcon::Chrome",
 ]
 allowed_callers = ["integration"]
-dependencies = ["boot", "diagnostics", "memory", "pci", "sync"]
+dependencies = ["boot", "diagnostics", "memory", "pci"]
 forbidden_dependencies = ["storage", "capability"]
 known_violations = []
 context = ["BOOT", "KERNEL"]
@@ -552,7 +552,7 @@ public_api = [
   "hw::MmioRegion",
 ]
 allowed_callers = ["arch", "diagnostics", "display", "driver", "input", "integration", "storage"]
-dependencies = ["arch", "memory", "sync"]
+dependencies = ["memory"]
 forbidden_dependencies = ["storage"]
 known_violations = []
 context = ["BOOT", "KERNEL"]
@@ -583,7 +583,7 @@ public_api = [
   "irq::set_affinity",
 ]
 allowed_callers = ["arch", "diagnostics", "driver", "input", "integration", "storage"]
-dependencies = ["arch", "memory", "sync"]
+dependencies = ["arch", "memory"]
 forbidden_dependencies = []
 known_violations = []
 context = ["KERNEL", "IRQ_OFF", "ISR_TOP"]
@@ -661,7 +661,7 @@ public_api = [
   "vfs::PartitionView",
 ]
 allowed_callers = ["capability", "diagnostics", "integration", "sched"]
-dependencies = ["arch", "boot", "driver", "irq", "memory", "pci", "sync", "time"]
+dependencies = ["arch", "boot", "driver", "irq", "memory", "pci", "time"]
 forbidden_dependencies = []
 known_violations = []
 context = ["KERNEL", "IRQ_OFF", "ISR_TOP"]
@@ -736,7 +736,7 @@ public_api = [
   "state_store::MAX_FRAMES",
 ]
 allowed_callers = ["arch", "boot", "display", "input", "integration", "memory", "sched", "sync", "testing", "time"]
-dependencies = ["arch", "irq", "memory", "pci", "storage", "sync", "time"]
+dependencies = ["arch", "irq", "memory", "pci", "storage", "time"]
 forbidden_dependencies = []
 known_violations = []
 context = ["BOOT", "KERNEL", "IRQ_OFF", "ISR_TOP", "PANIC"]
@@ -768,7 +768,7 @@ public_api = [
   "kbd::set_ui_capture",
 ]
 allowed_callers = ["integration", "sched"]
-dependencies = ["arch", "diagnostics", "irq", "memory", "pci", "sync"]
+dependencies = ["arch", "diagnostics", "irq", "memory", "pci"]
 forbidden_dependencies = ["storage", "capability"]
 known_violations = []
 context = ["BOOT", "KERNEL", "ISR_TOP"]
@@ -830,7 +830,7 @@ public_api = [
   "tsc::total_stages",
 ]
 allowed_callers = ["arch", "diagnostics", "integration", "memory", "sched", "storage", "sync"]
-dependencies = ["arch", "diagnostics", "sync"]
+dependencies = ["arch", "diagnostics"]
 forbidden_dependencies = []
 known_violations = []
 context = ["BOOT", "KERNEL", "IRQ_OFF", "ISR_TOP"]
@@ -973,22 +973,22 @@ known_scc = [
 [baseline.ring_edge_sites]
 # ADR-044 的棘轮：环内每条边的引用站点数（check-module-interfaces 按行实测）。
 # 只许减不许增；减了要显式改小，改到 0 就删这一行。环外的单向边不登记。
-# 冻结时点：46 条边、449 个站点、最小割 12 条边。
+# 原始冻结时点：46 条边 / 449 个站点 / 最小割 12 条边（那一份图把 `core::arch|sync|time`
+# 也算成了到 crate 同名模块的边，见 BACKLOG §363）。
+# 2026-11-16 修正短名误检后重钉：41 条边 / 422 个站点；最小割是旧图上的分析，未重算。
 "arch->boot" = 2
 "arch->diagnostics" = 19
 "arch->irq" = 2
 "arch->memory" = 21
 "arch->pci" = 6
-"arch->sync" = 8
+"arch->sync" = 3
 "arch->time" = 22
 "boot->diagnostics" = 11
-"boot->sync" = 4
-"diagnostics->arch" = 34
+"diagnostics->arch" = 32
 "diagnostics->irq" = 3
 "diagnostics->memory" = 6
 "diagnostics->pci" = 1
 "diagnostics->storage" = 15
-"diagnostics->sync" = 3
 "diagnostics->time" = 3
 "driver->arch" = 4
 "driver->irq" = 18
@@ -996,32 +996,25 @@ known_scc = [
 "driver->pci" = 3
 "irq->arch" = 29
 "irq->memory" = 1
-"irq->sync" = 1
 # P3（ADR-065）：VA 容量改 256 定长，删掉派生公式里的 cpu::MAX_CPUS 引用 ⇒ 67→64（解耦，收紧）。
-"memory->arch" = 64
+"memory->arch" = 61
 "memory->boot" = 8
 "memory->diagnostics" = 9
 "memory->resource" = 2
-"memory->sync" = 11
+"memory->sync" = 7
 "memory->time" = 2
-"pci->arch" = 2
 "pci->memory" = 9
-"pci->sync" = 1
 "resource->memory" = 1
-"resource->sync" = 3
+"resource->sync" = 2
 "storage->arch" = 51
 "storage->boot" = 1
 "storage->driver" = 2
 "storage->irq" = 1
 "storage->memory" = 12
 "storage->pci" = 13
-# 2026-11-16：12→13。新增的 1 站是 filesystem/block_io 的 `use core::sync::atomic::…`
-# （不是到本仓库 sync 的新边；该族的每一站都是这个短名误撞，见 BACKLOG §360 的欠账）。
-"storage->sync" = 13
 "storage->time" = 13
-"sync->arch" = 16
+"sync->arch" = 12
 "sync->diagnostics" = 3
 "sync->time" = 3
-"time->arch" = 3
+"time->arch" = 1
 "time->diagnostics" = 3
-"time->sync" = 2

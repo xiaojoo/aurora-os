@@ -258,18 +258,22 @@ pub const E_NOT_DIR: u64 = err_ret(AbiError::NotDir);
 pub const E_IS_DIR: u64 = err_ret(AbiError::IsDir);
 pub const E_NOT_SUPPORTED: u64 = err_ret(AbiError::NotSupported);
 
+/// 句柄层错误 → 用户可见的 `rax`。`pub(crate)` 只为 ktest 能拿**同一张表**验 `-7` 那一格
+/// （`sys_file_read` 自己的分支用它）；用例里另抄一份映射就是在给这张表写第三个副本。
 #[cfg(feature = "handles")]
-fn handle_err(e: crate::handle::HErr) -> u64 {
+pub(crate) fn handle_err(e: crate::handle::HErr) -> u64 {
     use crate::handle::HErr;
     match e {
         HErr::Invalid => E_INVALID,
         HErr::NoSuch | HErr::Stale => E_BAD_HANDLE,
         HErr::NotOwner | HErr::Denied => E_DENIED,
         HErr::Exhausted => E_EXHAUSTED,
-        // 既有句柄的盘失败仍按历史 ABI 带 -2，避免 10 号旧调用方的返回集合被顺手改掉。
-        HErr::Io(_) => {
-            crate::log_info!("abi: file_read 块设备失败（{}）⇒ 暂按 -2 带出", e.tag());
-            E_FAULT
+        // 块设备/VFS 的盘失败对用户统一 `-7`（用户裁决 2026-11-16，BACKLOG §364）：
+        // 分区越界、设备报错、超时/取消都从 `BlockError` 原样上来，不再降级成"参数坏了"(-2)。
+        // 旧口径曾是 -2（避免 10 号旧调用方的返回集合变宽）；全仓没有一格钉 -2，这次换掉。
+        HErr::Io(e) => {
+            crate::log_info!("abi: 块设备失败（{}）⇒ -7 EIO", e.tag());
+            E_IO
         }
         #[cfg(feature = "fs-open")]
         HErr::Vfs(e) => {

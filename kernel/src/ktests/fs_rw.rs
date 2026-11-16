@@ -186,7 +186,34 @@ fn t_fs_rw_syscall23() -> bool {
             return false;
         }
     };
-    syscall23_cells(hw, hr)
+    // 第三格：授一个**空分区区间**（0..=0）的文件句柄。读在翻译之前就会被 `PartitionView` 拒，
+    // 所以这是确定性的盘侧失败（不需要真让 AHCI 坏掉），专门量"块失败 ⇒ -7"（BACKLOG §364）。
+    let ghost_cur = match fs.open(&log) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = handle::close(hw, ident);
+            let _ = handle::close(hr, ident);
+            crate::log_fatal!("fs-rw-23: 空区间句柄的游标打开失败 {}", e.tag());
+            return false;
+        }
+    };
+    let hbad = match handle::grant_vfs_file(
+        ident,
+        fs_rw::PORT,
+        Some(crate::filesystem::vfs::Partition { base: 0, last: 0 }),
+        ghost_cur,
+        log,
+        RIGHT_READ,
+    ) {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = handle::close(hw, ident);
+            let _ = handle::close(hr, ident);
+            crate::log_fatal!("fs-rw-23: 授空区间句柄被拒 {}", e.tag());
+            return false;
+        }
+    };
+    syscall23_cells(ident, hw, hr, hbad)
 }
 
 /// **`#[inline(never)]` 是栈预算**（同 `fs_open.rs::syscall_cells` 的理由）：用例跑在 16 KiB
@@ -194,7 +221,7 @@ fn t_fs_rw_syscall23() -> bool {
 ///
 /// 返回之前一定走完两个 close——中途任何一格红都只是 `ok = false`，不是提前 `return`。
 #[inline(never)]
-fn syscall23_cells(hw: Handle, hr: Handle) -> bool {
+fn syscall23_cells(ident: (usize, u32), hw: Handle, hr: Handle, hbad: Handle) -> bool {
     let Some(va) = mm::alloc_user_va_range(1) else {
         crate::log_fatal!("fs-rw-23: 用户 VA 分配失败");
         return false;
@@ -266,27 +293,40 @@ fn syscall23_cells(hw: Handle, hr: Handle) -> bool {
     let mut head = [0u8; 4];
     ok &= s0 == 0 && bad == user::E_FAULT;
     ok &= head_n == 4 && get_user(va.0, 128, &mut head) && head == [after[0], after[1], after[2], after[3]];
+    // 块侧失败 ⇒ -7（EIO），不是 -2：空区间句柄在第一扇区翻译之前就被拒。
+    // 走**句柄层**的 `handle::read`（它按 `part` 翻地址）再喂给 syscall 用的同一张
+    // `user::handle_err` 表——syscall 读路径今天不按 `part` 翻地址（另一个已记的洞，
+    // BACKLOG §364），在它上面造确定性的盘失败会扰动 ring3 探针，不在这一刀里动。
+    let mut one = [0u8; 1];
+    let mut eio = 0u64;
+    match handle::read(hbad, ident, &mut one) {
+        Err(e) => eio = user::handle_err(e),
+        Ok(_) => {}
+    }
+    ok &= eio == user::E_IO;
 
     // 各自 close（经 8 号，与 ring3 调用方同一条路）；关后旧句柄必须是 -5。
     let c1 = call(&mut fr, user::SYS_HANDLE_CLOSE, hw.0, 0, 0);
     let c2 = call(&mut fr, user::SYS_HANDLE_CLOSE, hr.0, 0, 0);
+    let c3 = call(&mut fr, user::SYS_HANDLE_CLOSE, hbad.0, 0, 0);
     let stale_w = call(&mut fr, user::SYS_FILE_WRITE, hw.0, va.0, 1);
     let stale_r = call(&mut fr, user::SYS_FILE_READ, hr.0, va.0, 1);
-    ok &= c1 == 0 && c2 == 0;
+    ok &= c1 == 0 && c2 == 0 && c3 == 0;
     ok &= stale_w == user::E_BAD_HANDLE && stale_r == user::E_BAD_HANDLE;
 
     let live = handle::used();
     crate::log_info!(
-        "fs-rw-23: 写4={} 空写={} 越EOF={} 只读句柄={} 坏指针={} 读回={} 内容对={} 基线={} 关={} 关后活={}",
+        "fs-rw-23: 写4={} 空写={} 越EOF={} 只读句柄={} 坏指针={} 盘失败={} 读回={} 内容对={} 基线={} 关={} 关后活={}",
         wrote,
         empty as i64,
         over as i64,
         ro_w as i64,
         bad as i64,
+        eio as i64,
         read_n,
         cells_ok,
         base_ok,
-        c1 == 0 && c2 == 0,
+        c1 == 0 && c2 == 0 && c3 == 0,
         live
     );
     drop(map);

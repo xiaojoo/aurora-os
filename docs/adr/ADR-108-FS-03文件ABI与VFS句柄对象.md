@@ -347,3 +347,22 @@ fs_open::open 1,496 + Volume::mount 1,656 + lookup 4,520 + next_entry_disk 648 +
 所以本文"未决 1：真卷只测根文件"**结案**。仍开着的是它的边界：`MAX_COMPONENTS = 16` 这条上限
 没有被真深链喂过（夹具只有三层，十七级路径的负样本要另造一条深链）——那是夹具的事，
 不是"多级路径没证过"。
+
+## 补记六（2026-11-16）：块设备/VFS 的盘失败统一 `-7`（EIO）
+
+用户裁决：`HErr::Io(_)` 从旧的 `-2` 改成 `-7`（`AbiError::Io`）。旧口径的理由是"避免 10 号
+旧调用方的返回集合变宽"，但全仓没有任何一格钉住 `-2`（`E_FAULT` 只被坏指针用），所以这次换掉：
+分区越界、设备报错、超时/取消都从 `BlockError` 原样上来，不再降级成"参数坏了"。
+
+证据：`t_fs_rw_syscall23` 授一个**空分区区间**（`Partition{base:0,last:0}`）的 VfsFile，
+`handle::read` 在翻译之前被 `PartitionView` 拒 ⇒ `HErr::Io(BeyondPartition)` ⇒
+同一张 `user::handle_err` 表给 `-7`（串口 `盘失败=-7`）。变异：把 `E_IO` 改回 `E_FAULT` ⇒
+`盘失败=-2` 且该格红；还原后 `fs-rw` 99/99。`handle_err` 因此升成 `pub(crate)`，只为了让用例
+拿同一张表而不是另抄一份。
+
+**未决 7（新记）**：`sys_file_read`/`sys_file_write` 拿到票后**没有**按 `ticket.partition()` 包
+`PartitionView`——今天所有 `VfsFile` 都是 `part=None` 所以读不到症状，但一旦有分区内的文件句柄，
+syscall 会读到分区外的字节而那看起来"读成功了"。试过补它：运行期对 `None` 等价，却让
+`t_fs_open_ring3` 从"偶发绿"变成**同 ELF 连续 6 次红**、撤回后 3 次连绿（`fs-open` 97/97，
+ELF `299b60dfaff5`）⇒ 这是一个布局/栈敏感的下游，**不能靠"语义等价"就合入**；要另开一刀
+先把它定位（BACKLOG §364）。

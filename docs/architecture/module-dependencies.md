@@ -34,24 +34,27 @@ Boot / Platform     (boot)
 
 | 逻辑模块 | 实际依赖（`dependencies`） |
 | --- | --- |
-| boot | diagnostics, sync |
+<!-- 2026-11-16：本表按 `module-interfaces.toml` 重新生成。此前的版本把 `core::arch` / `core::sync`
+     / `core::time` 也数成了到 crate 同名模块的边（BACKLOG §363），所以 `boot/irq/storage/...`
+     的 `sync`、`pci` 的 `arch` 全是误检——那几行在这里已经删掉。 -->
+| boot | diagnostics |
 | arch | boot, diagnostics, irq, memory, pci, sync, time |
 | memory | arch, boot, diagnostics, resource, sync, time |
 | sched | arch, boot, capability, diagnostics, input, memory, storage, sync, time |
 | sync | arch, diagnostics, time |
 | driver | arch, irq, memory, pci |
-| pci | arch, memory, sync |
-| irq | arch, memory, sync |
-| storage | arch, boot, driver, irq, memory, pci, sync, time |
-| diagnostics | arch, memory, storage, sync, time |
+| pci | memory |
+| irq | arch, memory |
+| storage | arch, boot, driver, irq, memory, pci, time |
+| diagnostics | arch, irq, memory, pci, storage, time |
 | security | （无产品路径出边；签名目前只在用例里调用） |
-| time | arch, diagnostics, sync |
-| capability | storage, sync |
+| time | arch, diagnostics |
+| capability | memory, storage, sync |
 | resource | memory, sync |
 | testing | diagnostics |
-| display (S6b) | boot, diagnostics, memory, pci, sync |
-| input (S6c) | arch, diagnostics, irq, memory, pci, sync |
-| integration (main) | arch, boot, capability, diagnostics, display, driver, input, irq, memory, pci, resource, sched, storage, sync, testing, time |
+| display | boot, diagnostics, memory, pci |
+| input | arch, diagnostics, irq, memory, pci |
+| integration | arch, boot, capability, diagnostics, driver, irq, memory, pci, security, sched, storage, sync, testing, time, display, input |
 
 ## 3. 循环依赖基线（实测）
 
@@ -130,6 +133,12 @@ Boot / Platform     (boot)
 实测），其中**互为双向的有 11 组**——`arch` 对 `diagnostics/irq/memory/pci/sync/time` 六组，
 `diagnostics` 对 `memory/sync/time` 三组，`memory<->resource`、`sync<->time` 各一组。每一组
 至少要断一条，所以最小割的下界是 11；精确解是 **12 条边 / 90 个站点**。
+
+> **2026-11-16 修正（BACKLOG §363）**：上一段是**旧图**上的读数。短名误检修掉后
+> （`core::arch|sync|time` 不再算成到 crate 同名模块的边），环内是 **41 条边 / 422 个站点**；
+> 互为双向的组从 11 降到 **8**（`arch` 对 `diagnostics/irq/memory/sync/time` 五组、
+> `diagnostics` 对 `memory/time` 两组、`memory<->resource` 一组）。下界因此是 8，
+> **精确最小割没有在本轮重算**——下表的 12/90 与 S0..A4 都是旧图口径，别当现读数。
 
 **事实二：把模块拆开不会让割变小，只会让它变大。** 拆 `diagnostics`（把 `serial`、`exit`
 独立）或按关注点拆 `arch`（`smp`/`trap`/`apic` 独立）之后：

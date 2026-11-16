@@ -1863,6 +1863,48 @@ def check_deep_hi_cluster(log: str) -> list[str]:
     return bad
 
 
+# ADR-111 决策 3：两条写用例按同一对常量写（23 号的 [4,8) 与 t_fs_rw_write 的 [8,12)）。
+FS_RW_LOG_WRITES = ((4, bytes([0xD3, 0xA5, 0x5A, 0xC3])), (8, bytes([0xDE, 0xAD, 0xBE, 0xEF])))
+
+
+def _fs_rw_body(seed: int, n: int) -> bytes:
+    # 与 `tools/make_fat32_rw.py` 的 body() 同一个式子；两处各写一份，改配方时两边都要改。
+    return bytes([((i * 37 + seed * 11) & 0xFF) ^ (seed & 0xFF) for i in range(n)])
+
+
+def check_fs_rw_image(log: str) -> list[str]:
+    """宿主机按 FAT 规范解析**跑完之后**那块可写卷，看两段写是不是只改了该改的字节。
+
+    内核 `fs-rw:` / `fs-rw-23:` 两行是"自己写、自己读回"；这一台不看那两行的结论，
+    只看盘上的字节：LOG.TXT 的两段各是注入值、其余 56 字节与配方逐字节相同，
+    DATA.BIN 整份未动。任何一处不符都点名到首个不同的字节。
+    """
+    if "fs-rw-23: 写4=" not in log or "fs-rw: 写读" not in log:
+        return ["串口没有 `fs-rw:`/`fs-rw-23:` 两行（两条写用例没跑到结论）"]
+    img = FAT_IMG.get("fat32-rw", BUILD / "fat32-rw.img")
+    if not img.exists():
+        return [f"跑完的 {img.name} 不在位 ⇒ 对账没有对象"]
+    h = fat32_host_volume(img.read_bytes(), ("LOG.TXT", "DATA.BIN"))
+    bad: list[str] = []
+    lg = h["files"].get("LOG.TXT")
+    if lg is None:
+        return ["宿主机在根目录里找不到 LOG.TXT"]
+    want = bytearray(_fs_rw_body(3, 64))
+    for off, pat in FS_RW_LOG_WRITES:
+        want[off:off + len(pat)] = pat
+    if lg["size"] != 64 or lg["blob"] != bytes(want):
+        i = next((k for k in range(min(len(lg["blob"]), len(want))) if lg["blob"][k] != want[k]), None)
+        lo = max(0, (i or 0) - 4)
+        bad.append(f"LOG.TXT 不是'只改了两段'的形状：大小={lg['size']} 首个不同字节={i} "
+                   f"盘上[{lo}:{lo + 8}]={lg['blob'][lo:lo + 8].hex()} 期望={bytes(want)[lo:lo + 8].hex()}")
+    dt = h["files"].get("DATA.BIN")
+    want_d = _fs_rw_body(1, 512) + _fs_rw_body(2, 512)
+    if dt is None:
+        bad.append("宿主机在根目录里找不到 DATA.BIN")
+    elif dt["size"] != 1024 or dt["blob"] != want_d:
+        bad.append(f"DATA.BIN 被写坏了：大小={dt['size']} 盘上={dt['blob'][:8].hex()} 期望={want_d[:8].hex()}")
+    return bad
+
 FAT_HOST_WITNESS = {
     "fault-fat32-exec-byte": check_fat32_exec_byte,
     "fault-fat32-cluster-hi": check_fat32_cluster_hi,
@@ -4763,8 +4805,11 @@ def check_module_interfaces() -> list[str]:
             b = path2log.get(p)
             if b is None or a == b:
                 continue
-            n = sum(1 for ln in code.splitlines()
-                    if re.search(r"\b" + re.escape(short) + r"::|\bcrate::" + re.escape(short) + r"\b", ln))
+            # `core::sync::atomic` 与 crate 的 `sync` 撞短名：它不是一条到本仓库 sync 的边。
+            # 只排除 std/core/alloc 三个外部前缀；`crate::`/`super::`/裸短名照数（真实边一个不少）。
+            pat = (r"(?<!core::)(?<!std::)(?<!alloc::)\b" + re.escape(short) + r"::"
+                   r"|\bcrate::" + re.escape(short) + r"\b")
+            n = sum(1 for ln in code.splitlines() if re.search(pat, ln))
             if n:
                 actual.setdefault(a, set()).add(b)
                 callers.setdefault(b, set()).add(a)
@@ -8198,6 +8243,15 @@ def do_test(timeout: int) -> int:
         print("    对账:", x)
     IMAGE.unlink(missing_ok=True)
 
+    print("=== 写方向：宿主机按 FAT 规范解析跑完的可写卷，逐字节对账（ADR-111 决策 3）===")
+    # 内核侧是"自己写、自己读回"；这一行换成"盘上的字节由另一台实现解析"。
+    IMAGE.unlink(missing_ok=True)
+    frwv, frwrc, frwlog = do_run(["fs-rw"], timeout)
+    frw_bad = check_fs_rw_image(frwlog)
+    frw_verdict = frwv if frwv != "PASS" else ("PASS" if not frw_bad else "CONTENT-MISMATCH")
+    for x in frw_bad:
+        print("    对账:", x)
+
     rows = [
         ("正向", v if v != "PASS" or not p4_bad else "CONTENT-MISMATCH", rc, "PASS", 33),
         ("负样本", nv, nrc, "FAIL", 35),
@@ -8335,6 +8389,8 @@ def do_test(timeout: int) -> int:
         # ADR-109 的两条负样本：改的都是**多级那一层**的字节，同一份 ELF、只有盘不同。
         # 期望是 FAIL(35)——注入就该让格红；证人再判红得对不对，方向错了就是 CONTENT-MISMATCH。
         ("多级LFN校验和被改只塌长名", dlfn_verdict, dlfrc, "FAIL", 35),
+        # ADR-111 决策 3：写方向。内核绿而宿主机从**跑完的卷**上解出的字节对不上 ⇒ CONTENT-MISMATCH
+        ("FS写方向与可写卷对账", frw_verdict, frwrc, "PASS", 33),
         ("多级首簇高半抹零读到别处", dhih_verdict, dhihrc, "FAIL", 35),
     ]
     # 每一行对应那一跑的串口：不符时把红的那几格打出来。
@@ -8390,6 +8446,7 @@ def do_test(timeout: int) -> int:
         "FS-03文件ABI与多级真卷对账": folog,
         "FS-03ring3探针与多级真卷对账": frlog,
         "多级LFN校验和被改只塌长名": dlfnlog,
+        "FS写方向与可写卷对账": frwlog,
         "多级首簇高半抹零读到别处": dhihlog,
     }
     all_ok = True
