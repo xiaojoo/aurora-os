@@ -1,6 +1,6 @@
 # unsafe 逐处审计表（U1–U6）
 
-总计 427 处。U1 79 · U2 114 · U3 13 · U4 131 · U5 54 · U6 36
+总计 425 处。U1 79 · U2 114 · U3 13 · U4 129 · U5 54 · U6 36
 
 本表由 `tools/aurora.py` 的 `unsafe_sites()` 从源码逐处生成，**不是手写的**。
 机器可读的权威来源是 `docs/security/unsafe-whitelist.toml` 的 `[modules.*]` 段（模块×类别→处数），
@@ -917,26 +917,22 @@
 
 ### virtio
 
-- `kernel/src/virtio.rs:455` [impl] **U4** fn=`off_in`
-  > unsafe impl Sync for DevCell {} static DEV: DevCell = DevCell(core::cell::UnsafeCell::new(None));  
-- `kernel/src/virtio.rs:463` [{] **U4** fn=`b`
-  > unsafe { (*DEV.0.get()).as_ref().map(f).ok_or(VirtioError::NoDevice)? } }  
-- `kernel/src/virtio.rs:565` [{] **U4** fn=`bind`
-  > if unsafe { (*DEV.0.get()).is_some() } { return Ok(()); } 
-- `kernel/src/virtio.rs:602` [{] **U4** fn=`bind`
-  > unsafe { *DEV.0.get() = Some(bound) }; Ok(()) } 
-- `kernel/src/virtio.rs:609` [{] **U4** fn=`status`
-  > unsafe { (*DEV.0.get()).as_ref().map(|d| { ( 
-- `kernel/src/virtio.rs:865` [impl] **U4** fn=`net_payload_byte`
-  > unsafe impl Sync for NetCell {} static NET_DEV: NetCell = NetCell(core::cell::UnsafeCell::new(None)); static NET_USED_SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0); 
-- `kernel/src/virtio.rs:871` [{] **U4** fn=`bn`
-  > unsafe { (*NET_DEV.0.get()).as_ref().map(f).ok_or(VirtioError::NoDevice)? } }  
-- `kernel/src/virtio.rs:877` [{] **U4** fn=`bind_net`
-  > if unsafe { (*NET_DEV.0.get()).is_some() } { return Ok(()); } 
-- `kernel/src/virtio.rs:976` [{] **U4** fn=`bind_net`
-  > unsafe { *NET_DEV.0.get() = Some(net) }; Ok(()) } 
-- `kernel/src/virtio.rs:982` [{] **U4** fn=`net_info`
-  > unsafe { (*NET_DEV.0.get()).as_ref().map(|d| NetInfo { bdf: d.bdf, 
+- `kernel/src/virtio.rs:459` [impl] **U4** fn=`DevCell`
+  > unsafe impl Sync for DevCell {}
+- `kernel/src/virtio.rs:476` [{] **U4** fn=`b_at`
+  > unsafe { (*slot.0.get()).as_ref().map(f).ok_or(VirtioError::NoDevice)? }
+- `kernel/src/virtio.rs:633` [{] **U4** fn=`bind_one`
+  > unsafe { *DEVS[slot].0.get() = Some(bound) };
+- `kernel/src/virtio.rs:936` [impl] **U4** fn=`NetCell`
+  > unsafe impl Sync for NetCell {}
+- `kernel/src/virtio.rs:942` [{] **U4** fn=`bn`
+  > unsafe { (*NET_DEV.0.get()).as_ref().map(f).ok_or(VirtioError::NoDevice)? }
+- `kernel/src/virtio.rs:948` [{] **U4** fn=`bind_net`
+  > if unsafe { (*NET_DEV.0.get()).is_some() } { return Ok(()); }
+- `kernel/src/virtio.rs:1047` [{] **U4** fn=`bind_net`
+  > unsafe { *NET_DEV.0.get() = Some(net) };
+- `kernel/src/virtio.rs:1053` [{] **U4** fn=`net_info`
+  > unsafe {
 
 ### vmo
 

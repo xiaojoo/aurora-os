@@ -14706,3 +14706,26 @@ kernel 栈/地址窗口上的脆弱）。下一刀先定位它：用同一段包
 - 变异：把写意图路由回只读根 ⇒ `写意图开=false`、该格红；还原后 100/100（ELF `a475db8f6692`）。
 - 读数：`fs-rw` PASS(33) 100/100、`fs-open` PASS(33) 97/97（`372fd232f9f4`）、默认档 PASS(33)
   （`e2d3c52a0f0e`）；`check` **17/17**。
+## 372. virtio 设备表化 + 第二台 virtio-blk（ADR-112 / 110-b）（2026-11-17）
+
+- `virtio.rs`：`DEV` 单设备静态 → `DEVS: [DevCell; MAX_VBLK=4]`，顺序 = PCI 枚举序（BDF 升序）；
+  `bind_all()` 逐台建独立队列，`bind()` 保留为"绑全部、第 0 台当主设备"；`used_seen` 从全局一格
+  移进 `Bound`（两台共用它会让对方的第一次 I/O 改掉基线）；新增 `read_block_at`/`write_block_at`、
+  `status_at`、`dev_count`/`dev_bdf`/`dev_capacity`。
+- 新变体 `virtio-two-probe`（`virtio-blk` 的依赖者）：两块**容量不同**的 qcow2（64 MiB/0x5C 与
+  96 MiB/0x3C）。`t_virtio_two` 判台数、BDF 序、容量集合、图案与容量一一对应、dev1 写回读、两台队列；
+  新判定行 `virtio 两台并存` 用宿主机 `qemu-img info` 读两份文件的虚拟容量按集合对账。
+- 读数：`virtio-two-probe` **PASS(33) 86/86**（`d987bf8045f6`），
+  `vblk2: 判据 台数=2 bdf0=6144 bdf1=8192 容量0=131072 容量1=196608 图案对=true 写读回=true 队列=true`；
+  行 **符合**。老档 `virtio-blk` PASS(33)（`a6fbb771a2ad`）、`virtio-msix-probe` PASS(33)
+  （`4ed37be9c147`）、默认档 PASS(33)（`776172aa58c1`，首跑 q2 峰值老偶发、同 ELF 复跑绿）。
+- 变异：`bind_all` 绑一台就停 ⇒ `台数=1` 红；宿主仪器自检（伪造 `bdf0>bdf1`、伪造容量 999999）
+  各自点名；还原后 86/86。
+- 门禁：unsafe 审计 virtio U4 **10→8**（拆掉幂等读与 `status()` 的两处取用，统一走 `b_at`），
+  白名单与 `unsafe-census.md` 同步收紧（总量 427→425）；`storage->pci` 棘轮 **13→15**
+  （设备枚举是真边，注明来路）。`check` **17/17**。
+- **量具坑（同族第二次）**：`virtio-two-probe` 没进 Python 的 `VBLK_FEATURES`，第一跑只挂了
+  96M 那台 ⇒ `台数=1`、旧用例按 0x5C 判图案也红。cargo 的 feature 依赖闭包**不跟**脚本走，
+  新变体必须同时登记"挂哪几块盘/哪几张夹具"。
+- 仍未做：per-disk 块计数（仍全局一份，等 `Block` 身份）；`MAX_VBLK=4` 是显式上界；MSI-X 仍只对
+  第 0 台队列 0 编程；整链现在是 **64 行**，本轮未重跑。

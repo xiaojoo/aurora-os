@@ -447,20 +447,51 @@ pub struct Bound {
     /// common_cfg 在这段映射里的偏移。MSI-X 那一格要写 `queue_msix_vector`——那是 common_cfg
     /// 内部的偏移，留在这里由 `bind` 一次算好，不在第二处重算（重算就是抄表）。
     cc: usize,
+    /// 这台设备的 BDF（表顺序的证据，ADR-112）
+    bdf: u32,
+    /// 这台设备上一次消费的 used.idx（表化之前是全局一格）
+    used_seen: core::sync::atomic::AtomicU32,
 }
 
 struct DevCell(core::cell::UnsafeCell<Option<Bound>>);
-// SAFETY: 只有一个 CPU（BSP）会在驱动路径上取用它，且所有写入都在 `bind`/`do_io` 内；
-//         与 `ahci::RingCell` 同一套前提（本内核没有并发驱动路径，M5-e 之后也不引入）。
+// SAFETY: 只有 BSP 在驱动路径上取用；所有写入都在 `bind_one` 内。表化（ADR-112）之后
+//         前提不变：每个槽一台设备、每台设备各自那一个 used_seen，不存在跨槽借用。
 unsafe impl Sync for DevCell {}
-static DEV: DevCell = DevCell(core::cell::UnsafeCell::new(None));
 
-/// 上一次被我们消费的 used.idx（`u16` 回绕，比较一律用.wrapping_sub 而不是 `<`）
-static USED_SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+impl DevCell {
+    const fn new() -> Self {
+        DevCell(core::cell::UnsafeCell::new(None))
+    }
+}
+
+/// virtio-blk 的设备表：一槽一台，顺序 = PCI 枚举顺序（即 BDF 升序）。
+pub const MAX_VBLK: usize = 4;
+static DEVS: [DevCell; MAX_VBLK] = [const { DevCell::new() }; MAX_VBLK];
+/// 已绑定台数（0 = 还没绑过）。只在 `bind_all` 里逐台增长。
+static DEV_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+fn b_at<T>(i: usize, f: impl FnOnce(&Bound) -> Result<T, VirtioError>) -> Result<T, VirtioError> {
+    // SAFETY: 见 `DevCell`；槽号由 `DEV_COUNT` 约束，`get` 再挡一次越界
+    let slot = DEVS.get(i).ok_or(VirtioError::NoDevice)?;
+    unsafe { (*slot.0.get()).as_ref().map(f).ok_or(VirtioError::NoDevice)? }
+}
 
 fn b<T>(f: impl FnOnce(&Bound) -> Result<T, VirtioError>) -> Result<T, VirtioError> {
-    // SAFETY: 见 `DevCell` 的 Sync 论证；这里只借出不逃逸
-    unsafe { (*DEV.0.get()).as_ref().map(f).ok_or(VirtioError::NoDevice)? }
+    b_at(0, f)
+}
+
+/// 已绑定台数：0 = 还没绑，其余 ≥ 1。
+pub fn dev_count() -> usize {
+    DEV_COUNT.load(Ordering::Relaxed)
+}
+
+/// 第 `i` 台的 BDF / 容量（越界或未绑返回 None）。
+pub fn dev_bdf(i: usize) -> Option<u32> {
+    b_at(i, |d| Ok(d.bdf)).ok()
+}
+
+pub fn dev_capacity(i: usize) -> Option<u64> {
+    b_at(i, |d| Ok(d.capacity)).ok()
 }
 
 /// 复位 → `ACKNOWLEDGE|DRIVER` → 不接受任何特性 → `FEATURES_OK`，每一步都拿"写下去读回来的值"
@@ -542,6 +573,12 @@ fn setup_vq(
 
 /// 按 PCI class 认领一台 virtio 设备。必须按 class 找而不是"配置空间里第一台 vendor 0x1AF4"：
 /// 命令行上多挂一张网卡之后，后者会变成随机的一件事（M8-a① 就是那"多挂的一张"）。
+/// 规范的算法：`notify 地址 = notify 区基址 + multiplier × queue_notify_off`。
+/// multiplier 读到 0 是合法的（那表示 2 字节步长），不许拿"我猜的偏移"去替它。
+fn notify_addr(noff: u16, cap_offset: u32, mult: u32) -> usize {
+    cap_offset as usize + (u64::from(mult) * u64::from(noff)) as usize
+}
+
 fn claim(class: u8) -> Result<(Dev, u8, [Cap; 8]), VirtioError> {
     let info = pci::info().ok_or(VirtioError::NoDevice)?;
     let Some(dev) = (0..info.n)
@@ -554,18 +591,9 @@ fn claim(class: u8) -> Result<(Dev, u8, [Cap; 8]), VirtioError> {
     Ok((dev, n, caps))
 }
 
-/// 规范的算法：`notify 地址 = notify 区基址 + multiplier × queue_notify_off`。
-/// multiplier 读到 0 是合法的（那表示 2 字节步长），不许拿"我猜的偏移"去替它。
-fn notify_addr(noff: u16, cap_offset: u32, mult: u32) -> usize {
-    cap_offset as usize + (u64::from(mult) * u64::from(noff)) as usize
-}
-
-/// 认领设备、握手、建环。**幂等**（`.ktests` 顺序由链接器决定，用例不能假设别人跑过）。
-pub fn bind() -> Result<(), VirtioError> {
-    if unsafe { (*DEV.0.get()).is_some() } {
-        return Ok(());
-    }
-    let (dev, n, caps) = claim(PCI_CLASS_STORAGE)?;
+/// 认领**一台**设备、握手、建环，放进第 `slot` 槽。
+fn bind_one(dev: Dev, slot: usize) -> Result<(), VirtioError> {
+    let (n, caps) = read_caps(&dev)?;
     let common = find_cap(&caps, n, CAP_COMMON_CFG).ok_or(VirtioError::NoCommonCap)?;
     let notify_cap = find_cap(&caps, n, CAP_NOTIFY_CFG).ok_or(VirtioError::NoCommonCap)?;
     let ctx = DriverCtx::for_device(MOD_VIRTIO, dev);
@@ -598,26 +626,61 @@ pub fn bind() -> Result<(), VirtioError> {
         addr_readback,
         enable_readback,
         cc,
+        bdf: dev.bdf,
+        used_seen: core::sync::atomic::AtomicU32::new(0),
     };
-    unsafe { *DEV.0.get() = Some(bound) };
+    // SAFETY: 见 `DevCell`；`slot < MAX_VBLK` 由 `bind_all` 保证，每槽只写一次
+    unsafe { *DEVS[slot].0.get() = Some(bound) };
     Ok(())
+}
+
+/// 认领**全部** virtio-blk 设备（PCI 枚举序 = BDF 升序）并各建一环。**幂等**。
+pub fn bind_all() -> Result<usize, VirtioError> {
+    let have = dev_count();
+    if have > 0 {
+        return Ok(have);
+    }
+    let info = pci::info().ok_or(VirtioError::NoDevice)?;
+    let mut count = 0usize;
+    for d in (0..info.n).filter_map(pci::dev) {
+        if d.vendor != VENDOR || d.class() != PCI_CLASS_STORAGE {
+            continue;
+        }
+        if count == MAX_VBLK {
+            break;
+        }
+        bind_one(d, count)?;
+        count += 1;
+        DEV_COUNT.store(count, Ordering::Relaxed);
+    }
+    if count == 0 {
+        return Err(VirtioError::NoDevice);
+    }
+    Ok(count)
+}
+
+/// 旧调用方的名字：绑**全部**（顺序把第 0 台当“主设备”）。
+pub fn bind() -> Result<(), VirtioError> {
+    bind_all().map(|_| ())
 }
 
 /// 绑定后的读数（判据与打印都用它，别留"只有日志知道"的事实）
 pub fn status() -> Option<(u16, u64, usize, u32, Option<bool>, u16)> {
-    // SAFETY: 见 `DevCell`
-    unsafe {
-        (*DEV.0.get()).as_ref().map(|d| {
-            (
-                d.qsize,
-                d.capacity,
-                d.notify,
-                d.notify_mult,
-                d.addr_readback,
-                d.enable_readback,
-            )
-        })
-    }
+    status_at(0)
+}
+
+pub fn status_at(i: usize) -> Option<(u16, u64, usize, u32, Option<bool>, u16)> {
+    b_at(i, |d| {
+        Ok((
+            d.qsize,
+            d.capacity,
+            d.notify,
+            d.notify_mult,
+            d.addr_readback,
+            d.enable_readback,
+        ))
+    })
+    .ok()
 }
 
 /// 有界轮询一个 u16 读数直到它满足条件。TSC 计时，不依赖中断（这条路径可能在 IF=0 下跑）。
@@ -660,11 +723,11 @@ fn put_desc(
 
 /// 一条请求：描述符链 [头(可读) → 数据(读=可写/写=可读) → 状态(可写)]，通知，有界等回执。
 /// `buf` 是调用方的那个扇区：读方向在成功后被填，写方向在发射前被填。
-fn do_io(sector: u64, write: bool, buf: &mut [u8]) -> Result<Xfer, VirtioError> {
+fn do_io_at(i: usize, sector: u64, write: bool, buf: &mut [u8]) -> Result<Xfer, VirtioError> {
     if buf.len() != SECTOR_BYTES {
         return Err(VirtioError::BadLen(buf.len()));
     }
-    b(|d| {
+    b_at(i, |d| {
         let c = &d.ctx;
         let (mmio, dma, qsize) = (d.mmio, d.dma, d.qsize as usize);
         // 1. 请求头
@@ -693,7 +756,7 @@ fn do_io(sector: u64, write: bool, buf: &mut [u8]) -> Result<Xfer, VirtioError> 
         // 5. 敲门。写的是**队列号**（u16），地址按 notify 能力的 multiplier 算出来的那一个
         c.write16(mmio, d.notify, 0).map_err(VirtioError::Ctx)?;
         // 6. 有界等 `used.idx` 前进（今天不认领中断，只能轮询）
-        let seen = USED_SEEN.load(core::sync::atomic::Ordering::Relaxed) as u16;
+        let seen = d.used_seen.load(Ordering::Relaxed) as u16;
         let got = wait_u16(
             || c.dma_read16(dma, O_USED + 2),
             |v| v != seen,
@@ -704,7 +767,7 @@ fn do_io(sector: u64, write: bool, buf: &mut [u8]) -> Result<Xfer, VirtioError> 
         let used_id = c.dma_read32(dma, O_USED + 4 + eslot).map_err(VirtioError::Ctx)?;
         let used_len = c.dma_read32(dma, O_USED + 4 + eslot + 4).map_err(VirtioError::Ctx)?;
         let status = c.dma_read8(dma, O_STATUS).map_err(VirtioError::Ctx)?;
-        USED_SEEN.store(u32::from(got), core::sync::atomic::Ordering::Relaxed);
+        d.used_seen.store(u32::from(got), Ordering::Relaxed);
         c.dma_copy_out(dma, O_DATA, buf).map_err(VirtioError::Ctx)?;
         let hash = crate::ahci::fnv1a64(buf);
         Ok(Xfer { sector, avail_idx: avail, used_idx: got, used_id, used_len, status, hash })
@@ -712,19 +775,27 @@ fn do_io(sector: u64, write: bool, buf: &mut [u8]) -> Result<Xfer, VirtioError> 
 }
 
 /// 读一个扇区（512 字节）。整扇区约束留在接口上（半个扇区要读-改-写，那是块层的事）。
+pub fn read_block_at(i: usize, sector: u64, out: &mut [u8]) -> Result<Xfer, VirtioError> {
+    do_io_at(i, sector, false, out)
+}
+
 pub fn read_block(sector: u64, out: &mut [u8]) -> Result<Xfer, VirtioError> {
-    do_io(sector, false, out)
+    read_block_at(0, sector, out)
 }
 
 /// 写一个扇区。
-pub fn write_block(sector: u64, src: &[u8]) -> Result<Xfer, VirtioError> {
-    // `do_io` 要的是 `&mut`（同一份代码两条方向），这里立刻还回去，不改调用方的借用形状
+pub fn write_block_at(i: usize, sector: u64, src: &[u8]) -> Result<Xfer, VirtioError> {
+    // `do_io_at` 要的是 `&mut`（同一份代码两条方向），这里立刻还回去，不改调用方的借用形状
     let mut buf = [0u8; SECTOR_BYTES];
     if src.len() != SECTOR_BYTES {
         return Err(VirtioError::BadLen(src.len()));
     }
     buf.copy_from_slice(src);
-    do_io(sector, true, &mut buf)
+    do_io_at(i, sector, true, &mut buf)
+}
+
+pub fn write_block(sector: u64, src: &[u8]) -> Result<Xfer, VirtioError> {
+    write_block_at(0, sector, src)
 }
 
 // ==================================================== M8-a①：virtio-net 与第一帧

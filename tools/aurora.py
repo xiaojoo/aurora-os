@@ -341,7 +341,13 @@ DRIVER_MODULES = ["ahci.rs", "virtio.rs"]
 VBLK = BUILD / "virtio-disk.qcow2"
 VBLK_MIB = 64
 VBLK_PATTERN = 0x5C
-VBLK_FEATURES = {"virtio-blk", "virtio-msix-probe"}
+VBLK_FEATURES = {"virtio-blk", "virtio-msix-probe", "virtio-two-probe"}
+# ADR-112：第二台 virtio-blk。容量**故意不同**（96 MiB vs 64 MiB）——"两台都在"不能只看台数，
+# 每一台自报的容量要与宿主机 `qemu-img info` 各自那份文件对上；图案也不同，环串了会立刻露。
+VBLK2 = BUILD / "virtio-disk2.qcow2"
+VBLK2_MIB = 96
+VBLK2_PATTERN = 0x3C
+VBLK2_FEATURES = {"virtio-two-probe"}
 # W4 S1（ADR-078 决策 7）：GPT 解析用例的夹具盘。**为什么负样本不改引导盘**（实测出来的）：
 # OVMF/EDK2 启动时会**用备份 GPT 把主表修回原值**（数组首字节 0x29 改下去、跑完读回 0x28），
 # 所以"数组 CRC/头 CRC/entry_count/备份不一致"四条注入根本到不了内核（实测都 PASS(33)）；
@@ -560,19 +566,23 @@ def read_pcap(path: Path) -> tuple[int, list[bytes]]:
     return linktype, out
 
 
-def make_vblk() -> list[str]:
-    """64 MiB 的 qcow2 + 第 0 扇区打一个图案。
-
-    大小必须是**整数 MiB**：容量对账比的是 `virtual_size / 512` 这个整数，
-    留一个不整的尾部就会两边各算出不同的扇区数，而那看起来像驱动读错了偏移。
-    """
-    VBLK.unlink(missing_ok=True)
-    if sh([str(TOOLS / "qemu" / "qemu-img.exe"), "create", "-f", "qcow2", str(VBLK), f"{VBLK_MIB}M"]) != 0:
-        return ["qemu-img 造不出 virtio 盘"]
-    cmd = f"write -P 0x{VBLK_PATTERN:02x} 0 512"
-    if sh([str(TOOLS / "qemu" / "qemu-io.exe"), "-f", "qcow2", "-c", cmd, str(VBLK)]) != 0:
-        return ["qemu-io 写不进 virtio 盘的图案"]
+def _make_vblk(path, mib: int, pattern: int, tag: str) -> list[str]:
+    """qcow2 + 第 0 扇区打一个图案。大小必须是整数 MiB（容量对账比 `virtual_size / 512`）。"""
+    path.unlink(missing_ok=True)
+    if sh([str(TOOLS / "qemu" / "qemu-img.exe"), "create", "-f", "qcow2", str(path), f"{mib}M"]) != 0:
+        return [f"qemu-img 造不出 {tag} 盘"]
+    cmd = f"write -P 0x{pattern:02x} 0 512"
+    if sh([str(TOOLS / "qemu" / "qemu-io.exe"), "-f", "qcow2", "-c", cmd, str(path)]) != 0:
+        return [f"qemu-io 写不进 {tag} 盘的图案"]
     return []
+
+
+def make_vblk() -> list[str]:
+    return _make_vblk(VBLK, VBLK_MIB, VBLK_PATTERN, "virtio")
+
+
+def make_vblk2() -> list[str]:
+    return _make_vblk(VBLK2, VBLK2_MIB, VBLK2_PATTERN, "virtio2")
 
 
 def make_gpt_fixture() -> list[str]:
@@ -597,11 +607,12 @@ def make_gpt_fixture() -> list[str]:
     return []
 
 
-def vblk_virtual_sectors() -> int | None:
+def vblk_virtual_sectors(path: Path | None = None) -> int | None:
     """宿主机这一侧的容量仪器：`qemu-img info --output=json` 的 virtual-size。"""
     import json
+    target = VBLK if path is None else path
     r = subprocess.run(
-        [str(TOOLS / "qemu" / "qemu-img.exe"), "info", "--output=json", str(VBLK)],
+        [str(TOOLS / "qemu" / "qemu-img.exe"), "info", "--output=json", str(target)],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
     )
     if r.returncode != 0:
@@ -1936,6 +1947,38 @@ def check_block_io(log: str) -> list[str]:
                        "（这五个数由核内按增量断言；链里变了先查谁动了块层/用例）")
     return bad
 
+
+VBLK2_LINE_RE = re.compile(
+    r"vblk2: 判据 台数=(?P<n>\d+) bdf0=(?P<b0>\d+) bdf1=(?P<b1>\d+) 容量0=(?P<c0>\d+) "
+    r"容量1=(?P<c1>\d+) 图案对=(?P<pat>\w+) 写读回=(?P<wr>\w+) 队列=(?P<q>\w+)")
+
+
+def check_virtio_two(log: str) -> list[str]:
+    """ADR-112：两台 virtio-blk 并存的宿主机侧核对。
+
+    内核给的是"台数/两个 BDF/两个容量/两个图案位"；宿主机用自己的 `qemu-img info` 量**两份文件**
+    的 virtual-size，并把两边容量按集合比。这样"两台都在但其中一台报的是另一台容量"也会红。
+    """
+    m = VBLK2_LINE_RE.search(log)
+    if m is None:
+        return ["串口没有 `vblk2: 判据 …` 那一行（两台并存用例没跑到结论）"]
+    bad: list[str] = []
+    if int(m.group("n")) != 2:
+        bad.append(f"台数={m.group('n')}（期望 2）")
+    if not int(m.group("b0")) < int(m.group("b1")):
+        bad.append(f"BDF 序不对：bdf0={m.group('b0')} bdf1={m.group('b1')}（期望严格递增）")
+    host = [vblk_virtual_sectors(VBLK), vblk_virtual_sectors(VBLK2)]
+    if None in host:
+        bad.append("宿主机 qemu-img 读不出两块 virtio 盘的 virtual-size")
+    else:
+        got = sorted([int(m.group("c0")), int(m.group("c1"))])
+        want = sorted(host)
+        if got != want:
+            bad.append(f"容量集合不符：内核={got} 宿主机={want}")
+    for tag, want in (("pat", "true"), ("wr", "true"), ("q", "true")):
+        if m.group(tag) != want:
+            bad.append(f"块请求层 {tag}={m.group(tag)}（期望 {want}）")
+    return bad
 
 FAT_HOST_WITNESS = {
     "fault-fat32-exec-byte": check_fat32_exec_byte,
@@ -3611,6 +3654,10 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
         bad = make_vblk()
         if bad:
             sys.exit("virtio 盘造不出来：" + " / ".join(bad))
+    if VBLK2_FEATURES & set(features):
+        bad = make_vblk2()
+        if bad:
+            sys.exit("第二块 virtio 盘造不出来：" + " / ".join(bad))
     if FAT_FEATURES & set(features):
         # L3-C①：两块只读 FAT32 卷。夹具跟着"要挂这两块盘"走（与前两块的规矩同一条），
         # 而且这里**必须**在解压之前先核指纹：内核那一批写死的期望数全是照着这两个字节串量的。
@@ -3717,6 +3764,12 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
         cmd += [
             "-drive", f"if=none,id=vblk0,format=qcow2,file={VBLK}",
             "-device", "virtio-blk-pci,drive=vblk0",
+        ]
+    if VBLK2_FEATURES & set(features):
+        # 第二台：**排在 vblk0 之后**，BDF 序因此可判（`bdf0 < bdf1` 那条）。
+        cmd += [
+            "-drive", f"if=none,id=vblk1,format=qcow2,file={VBLK2}",
+            "-device", "virtio-blk-pci,drive=vblk1",
         ]
     # 一次性实验用的附加参数（例如 `-device intel-iommu,intremap=on` 去真正解析 DMAR）。
     # 走环境变量而不是加一堆子命令开关：这类实验今天要做、明天可能就废，不该进判定链的默认路径。
@@ -8284,6 +8337,14 @@ def do_test(timeout: int) -> int:
     for x in frw_bad:
         print("    对账:", x)
 
+    print("=== ADR-112：两台 virtio-blk 并存——口序/容量/图案/队列，宿主机 qemu-img 对账 ===")
+    IMAGE.unlink(missing_ok=True)
+    tvv, tvrc, tvlog = do_run(["virtio-two-probe"], timeout)
+    tv_bad = check_virtio_two(tvlog)
+    tv_verdict = tvv if tvv != "PASS" else ("PASS" if not tv_bad else "CONTENT-MISMATCH")
+    for x in tv_bad:
+        print("    对账:", x)
+
     print("=== 块请求层：超时/取消/半途与五计数（ADR-110；fs-ro 档内跑）===")
     # 判据在核内（按增量断言）；这一行只确认它在链里仍被执行、四个 bool 与五个增量没漂。
     IMAGE.unlink(missing_ok=True)
@@ -8434,6 +8495,8 @@ def do_test(timeout: int) -> int:
         ("FS写方向与可写卷对账", frw_verdict, frwrc, "PASS", 33),
         # ADR-110 决策 1：块请求层的四格语义与五计数（核内按增量断言，这里做链级确认）
         ("块请求层超时取消半途", b_verdict, brc, "PASS", 33),
+        # ADR-112：两台 virtio-blk。内核绿而宿主机容量集合/BDF 序对不上 ⇒ CONTENT-MISMATCH
+        ("virtio 两台并存", tv_verdict, tvrc, "PASS", 33),
         ("多级首簇高半抹零读到别处", dhih_verdict, dhihrc, "FAIL", 35),
     ]
     # 每一行对应那一跑的串口：不符时把红的那几格打出来。
@@ -8491,6 +8554,7 @@ def do_test(timeout: int) -> int:
         "多级LFN校验和被改只塌长名": dlfnlog,
         "FS写方向与可写卷对账": frwlog,
         "块请求层超时取消半途": blog,
+        "virtio 两台并存": tvlog,
         "多级首簇高半抹零读到别处": dhihlog,
     }
     all_ok = True

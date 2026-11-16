@@ -386,3 +386,73 @@ fn t_virtio_block() -> bool {
 }
 #[cfg(feature = "virtio-blk")]
 ktest!(KT_VIRTIO_BLOCK, t_virtio_block);
+
+/// ADR-112 / ADR-110 决策 3（110-b）：两台 virtio-blk 并存。
+///
+/// 证的是"设备表化"的三件事：① 台数与 BDF 序；② 两台各自自报容量（宿主机的 64 MiB / 96 MiB，
+/// 由 `qemu-img info` 独立读）；③ 各自队列能真读——LBA0 的图案与容量一一对应（64M→0x5C、
+/// 96M→0x3C），再在 dev1 上写/读回一次，证明两台不串环。
+#[cfg(feature = "virtio-two-probe")]
+fn t_virtio_two() -> bool {
+    fn expected_pattern(cap: u64) -> Option<u8> {
+        if cap == 131_072 {
+            Some(0x5C)
+        } else if cap == 196_608 {
+            Some(0x3C)
+        } else {
+            None
+        }
+    }
+    let n = match virtio::bind_all() {
+        Ok(n) => n,
+        Err(e) => {
+            crate::log_fatal!("vblk2: bind_all 失败 {:?}", e);
+            return false;
+        }
+    };
+    let count_ok = n == 2 && virtio::dev_count() == 2;
+    let (b0, b1) = (virtio::dev_bdf(0), virtio::dev_bdf(1));
+    let order_ok = matches!((b0, b1), (Some(a), Some(b)) if a < b);
+    let (c0, c1) = (
+        virtio::dev_capacity(0).unwrap_or(u64::MAX),
+        virtio::dev_capacity(1).unwrap_or(u64::MAX),
+    );
+    let mut pat_ok = true;
+    let mut q_ok = true;
+    for i in 0..n.min(2) {
+        let cap = if i == 0 { c0 } else { c1 };
+        let Some(want) = expected_pattern(cap) else {
+            crate::log_fatal!("vblk2: 第 {} 台容量 {} 不在夹具里", i, cap);
+            return false;
+        };
+        let mut buf = [0u8; 512];
+        if let Err(e) = virtio::read_block_at(i, 0, &mut buf) {
+            crate::log_fatal!("vblk2: 第 {} 台读 LBA0 失败 {:?}", i, e);
+            return false;
+        }
+        pat_ok &= buf.iter().all(|b| *b == want);
+        q_ok &= virtio::status_at(i).map(|s| s.0 > 0).unwrap_or(false);
+    }
+    let mut src = [0u8; 512];
+    for i in 0..512usize {
+        src[i] = ahci::pattern_byte(1, i as u64);
+    }
+    let wrote = virtio::write_block_at(1, 1, &src).is_ok();
+    let mut back = [0u8; 512];
+    let rb = virtio::read_block_at(1, 1, &mut back).is_ok() && back == src;
+    let wr_ok = wrote && rb;
+    crate::log_info!(
+        "vblk2: 判据 台数={} bdf0={} bdf1={} 容量0={} 容量1={} 图案对={} 写读回={} 队列={}",
+        n,
+        b0.unwrap_or(u32::MAX),
+        b1.unwrap_or(u32::MAX),
+        c0,
+        c1,
+        pat_ok,
+        wr_ok,
+        q_ok
+    );
+    count_ok && order_ok && pat_ok && wr_ok && q_ok
+}
+#[cfg(feature = "virtio-two-probe")]
+ktest!(KT_VIRTIO_TWO, t_virtio_two);
