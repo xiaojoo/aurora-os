@@ -1,6 +1,6 @@
 # unsafe 逐处审计表（U1–U6）
 
-总计 427 处。U1 79 · U2 114 · U3 13 · U4 131 · U5 54 · U6 36
+总计 453 处。U1 82 · U2 114 · U3 13 · U4 131 · U5 77 · U6 36
 
 本表由 `tools/aurora.py` 的 `unsafe_sites()` 从源码逐处生成，**不是手写的**。
 机器可读的权威来源是 `docs/security/unsafe-whitelist.toml` 的 `[modules.*]` 段（模块×类别→处数），
@@ -877,43 +877,99 @@
 
 ### user/shell
 
-- `user/shell/src/main.rs:59` [{] **U1** fn=`msgs_base`
+- `user/shell/src/main.rs:71` [{] **U1** fn=`msgs_base`
 
-- `user/shell/src/main.rs:70` [{] **U5** fn=`msg`
+- `user/shell/src/main.rs:82` [{] **U5** fn=`msg`
 
-- `user/shell/src/main.rs:80` [{] **U1** fn=`panic`
+- `user/shell/src/main.rs:92` [{] **U1** fn=`panic`
 
-- `user/shell/src/main.rs:86` [fn] **U1** fn=`syscall3`
+- `user/shell/src/main.rs:98` [fn] **U1** fn=`syscall3`
 
-- `user/shell/src/main.rs:90` [{] **U1** fn=`syscall3`
+- `user/shell/src/main.rs:102` [{] **U1** fn=`syscall3`
 
-- `user/shell/src/main.rs:105` [{] **U5** fn=`con_write`
+- `user/shell/src/main.rs:117` [{] **U5** fn=`con_write`
 
-- `user/shell/src/main.rs:110` [{] **U5** fn=`con_read_byte`
+- `user/shell/src/main.rs:122` [{] **U5** fn=`con_read_byte`
 
-- `user/shell/src/main.rs:147` [fn] **U1** fn=`find_console`
+- `user/shell/src/main.rs:179` [fn] **U1** fn=`find_console`
 
-- `user/shell/src/main.rs:150` [{] **U5** fn=`find_console`
+- `user/shell/src/main.rs:182` [{] **U5** fn=`find_console`
 
-- `user/shell/src/main.rs:154` [{] **U5** fn=`find_console`
+- `user/shell/src/main.rs:186` [{] **U5** fn=`find_console`
 
-- `user/shell/src/main.rs:157` [{] **U5** fn=`find_console`
+- `user/shell/src/main.rs:189` [{] **U5** fn=`find_console`
 
-- `user/shell/src/main.rs:158` [{] **U5** fn=`find_console`
+- `user/shell/src/main.rs:190` [{] **U5** fn=`find_console`
 
-- `user/shell/src/main.rs:160` [{] **U5** fn=`find_console`
+- `user/shell/src/main.rs:192` [{] **U5** fn=`find_console`
 
-- `user/shell/src/main.rs:213` [{] **U5** fn=`dispatch`
+- `user/shell/src/main.rs:202` [{] **U5** fn=`_start`
 
-- `user/shell/src/main.rs:218` [{] **U5** fn=`dispatch`
+- `user/shell/src/main.rs:207` [{] **U1** fn=`_start`
 
-- `user/shell/src/main.rs:237` [{] **U5** fn=`_start`
+- `user/shell/src/main.rs:209` [{] **U1** fn=`_start`
 
-- `user/shell/src/main.rs:242` [{] **U1** fn=`_start`
+- `user/shell/src/main.rs:239` [{] **U5** fn=`_start`
 
-- `user/shell/src/main.rs:244` [{] **U1** fn=`_start`
+### user/shell/registry
 
-- `user/shell/src/main.rs:269` [{] **U5** fn=`_start`
+- `user/shell/src/registry.rs:58` [{] **U5** fn=`cmd_ping`
+
+- `user/shell/src/registry.rs:67` [{] **U5** fn=`cmd_abi`
+
+### user/runtime
+
+- `user/runtime/src/lib.rs:269` [fn] **U1** fn=`syscall_abi`
+
+- `user/runtime/src/lib.rs:275` [{] **U1** fn=`syscall_abi`
+
+- `user/runtime/src/lib.rs:298` [{] **U5** fn=`ping`
+
+- `user/runtime/src/lib.rs:314` [{] **U5** fn=`exit`
+
+- `user/runtime/src/lib.rs:326` [{] **U5** fn=`abi_info`
+
+- `user/runtime/src/lib.rs:337` [{] **U5** fn=`handle_close`
+
+- `user/runtime/src/lib.rs:345` [{] **U5** fn=`handle_dup`
+
+- `user/runtime/src/lib.rs:370` [{] **U5** fn=`file_read`
+
+- `user/runtime/src/lib.rs:388` [{] **U5** fn=`file_open`
+
+- `user/runtime/src/lib.rs:412` [{] **U5** fn=`file_seek`
+
+- `user/runtime/src/lib.rs:446` [{] **U5** fn=`file_stat`
+
+- `user/runtime/src/lib.rs:466` [{] **U5** fn=`dir_read`
+
+- `user/runtime/src/lib.rs:486` [{] **U5** fn=`console_write`
+
+- `user/runtime/src/lib.rs:503` [{] **U5** fn=`console_read`
+
+- `user/runtime/src/lib.rs:515` [{] **U5** fn=`process_create`
+
+- `user/runtime/src/lib.rs:532` [{] **U5** fn=`thread_create`
+
+- `user/runtime/src/lib.rs:549` [{] **U5** fn=`process_start`
+
+- `user/runtime/src/lib.rs:585` [{] **U5** fn=`process_wait`
+
+- `user/runtime/src/lib.rs:594` [{] **U5** fn=`process_kill`
+
+- `user/runtime/src/lib.rs:616` [{] **U5** fn=`object_wait`
+
+- `user/runtime/src/lib.rs:633` [fn] **U1** fn=`find_console`
+
+- `user/runtime/src/lib.rs:636` [{] **U5** fn=`find_console`
+
+- `user/runtime/src/lib.rs:641` [{] **U5** fn=`find_console`
+
+- `user/runtime/src/lib.rs:646` [{] **U5** fn=`find_console`
+
+- `user/runtime/src/lib.rs:648` [{] **U5** fn=`find_console`
+
+- `user/runtime/src/lib.rs:651` [{] **U5** fn=`find_console`
 
 ### virtio
 

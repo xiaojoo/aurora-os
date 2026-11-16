@@ -36,6 +36,11 @@ reason = "FS-03 切片 D（ADR-108 决策 8）的 ring3 文件探针：unsafe �
 scope = "main.rs：sys3 的 int 0x80（rax/rdi/rsi/rdx）与其 unsafe fn 声明 · slots_base 的 lea · put/put_byte/get_byte/get_u32 四处 volatile 访问（偏移全在本页 0..1536，基址加常量偏移）· read_all/read_dir_all/_start 里把本页地址交给内核的三处调用 · panic 与 SYS_EXIT 后的自跳转"
 expires = "FS-03 之后若它开始打写路径（23 号）或读别的页，unsafe 面会扩，那时回这条账重登记"
 
+[crate.aurora-user-runtime]
+reason = "A2 用户态运行时库（总设计切片，2026-11-16）：unsafe 需求是 int 0x80 的四参入口（含 r10 第四参）、把调用方传入的缓冲/路径指针与长度交给内核（长度上限在 safe 层先拒）、读内核交进来的 StartupInfo 那一页（只读、页内、先核魔数与 nhandles 上限）、以及 exit 的失败兜底自旋；不碰任何内核对象，不新增调用号"
+scope = "src/lib.rs：syscall_abi 的 int 0x80（rax/rdi/rsi/rdx/r10）· 18 个封装函数各自的调用块 · find_console 的 read_unaligned（头 24 字节 + 最多 16 条描述，全在那一页内）"
+expires = "A2 接线片（shell 迁入 runtime）之后 unsafe 面若无变化则维持；若新增号或读新页，回这条账重登记"
+
 [crate.aurora-user-hello]
 reason = "它是产物而不是库：唯一的 unsafe 需求是 `int 0x80` 与一个自跳转，没有任何指针算术、没有内存操作、不碰任何内核对象"
 scope = "main.rs：3 次 int 0x80（inlateout rax + in rdi/rsi）、panic 与收尾各一个 `jmp .` 自跳转"
@@ -61,12 +66,15 @@ expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe
 # 2026-11-07 P7：hello 加了 syscall3（U1 两处）与 ring3 句柄读/close（U5 三处）。
 
 [unsafe-census]
-total = 427
-U1 = 79
+# 2026-11-16 A2/A3 切片：+user/runtime（U1 3 / U5 23）、+user/shell/registry（U5 2）；
+# user/shell main.rs 的 U5 由 12 重算为 10（dispatch 的 ping/abi 两处随 A3 迁入 registry，
+# 数目对账：427+26=453、79+3=82、54+25=77——registry 两处计入 U5）。类别规则未改。
+total = 453
+U1 = 82
 U2 = 114
 U3 = 13
 U4 = 131
-U5 = 54
+U5 = 77
 U6 = 36
 
 [modules."acpi"]
@@ -284,10 +292,10 @@ U5 = 8
 # 上下文 USER_ENTRY；不变量由 ABI 约定（号 rax、参数 rdi/rsi/rdx、返回 rax）与
 # "先核魔数与条数上限再解引用"保证。生命周期 = 本进程；单任务访问无并发。
 U1 = 7
-# S5c-2 重算：U5 由 13 降到 12。逐处行已按当前源码重列（见 unsafe-census.md 的 user/shell 节）。
-# 差额落在 dispatch/_start 那一带：登记快照早于"忙等 idle 与回显"那一轮改动，
-# 具体是哪一处合并掉的**未归因**——这里只按重算结果登记，不编一个解释。
-U5 = 12
+# 2026-11-16 A3 重算：U5 由 12 降到 10，**这次差额有归因**——dispatch 里 ping/abi 两个
+# unsafe 调用块随解析器/注册表重构整体迁入 user/shell/registry（见下一登记段），逐处行
+# 已按当前源码重列（见 unsafe-census.md 的 user/shell 节）。
+U5 = 10
 
 [modules."virtio"]
 U4 = 10
@@ -304,3 +312,24 @@ U4 = 10
 #   不变量由 `unsafe impl Sync for VmoCell` 上面那段论证与 vmo_write/vmo_read 的长度检查保证。
 U2 = 3
 U4 = 2
+
+[modules."user/shell/registry"]
+# A3（总设计切片，2026-11-16）：内置命令注册表。U5 两处 = cmd_ping/cmd_abi 的
+# syscall3 调用块，随 dispatch 重构自 user/shell/src/main.rs 原样迁入，**未新增 unsafe**。
+# 指针来源：无指针参数（ping/abi 均 0 参）；上下文 USER_ENTRY；
+# 不变量由 ABI 约定（号 rax）保证。生命周期 = 本进程；单任务访问无并发。
+U5 = 2
+
+[modules."user/runtime"]
+# A2（总设计切片，2026-11-16）：用户态运行时库。U1 三处 = syscall_abi 的 unsafe fn 声明
+# 与其 int 0x80 块（照抄 shell 的 syscall3 模式加 r10 位）、find_console 的 unsafe fn 声明。
+# U5 二十三处 = 18 个封装函数各自的 syscall_abi 调用块（把调用方传入的缓冲/路径指针与
+# 长度交给内核）+ find_console 对 StartupInfo 页的 5 处 read_unaligned。
+# 指针来源：①调用方栈缓冲（as_ptr/as_mut_ptr + len，长度上限在 safe 层先拒，
+# 不给内核传未校验长度）；②SI 页（内核 process_start 校验并映射，user+只读，
+# 首参 si_va 由 set_thread_arg 交进来）。地址范围 = 缓冲自身与 SI 一页内；
+# 对齐 = read_unaligned 显式不假设对齐；上下文 USER_ENTRY；
+# 不变量 = ABI 约定（号 rax、参数 rdi/rsi/rdx/r10、返回 rax 负值错误码）与 safe 层
+# 长度/枚举编码检查；生命周期 = 调用栈内；并发 = 无共享可变状态（库无全局）。
+U1 = 3
+U5 = 23
