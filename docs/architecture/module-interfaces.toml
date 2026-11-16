@@ -638,6 +638,8 @@ public_api = [
   "fs_open::DIRENT_RECORD_LEN",
   "fs_open::Opened",
   "fs_open::PORT",
+  "fs_open::port",
+  "fs_open::set_port",
   "fs_open::STAT_KIND_FILE",
   "fs_open::STAT_RECORD_LEN",
   "fs_open::dirent_record",

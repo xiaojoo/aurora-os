@@ -126,9 +126,19 @@ pub struct Task {
 /// 一个任务能持有的映射数上限。**定长而不是 `Vec`**：任务结构住在 per-CPU 静态数组里，
 /// 而 `heap::LARGE_MAX = 2048` 会把"按段开缓冲"的写法当场打死（ADR-026）。
 /// 超了就明确失败，不静默丢——丢一次就是一批页框永久漏掉，而台账不会告诉你。
-/// 现在数的是**块**而不是页（`user::load` 按段贪心切 2 的幂）。实测 6/8 与"余量 ≥ 2"那条判据：
-/// 见 §10.7 的 `MAX_OWNED` 那一行、BACKLOG 的 R33 那节。
-pub const MAX_OWNED: usize = 8;
+/// 现在数的是**块**而不是页（`user::load` 按段贪心切 2 的幂）。
+///
+/// **8 → 16（ADR-131，A3 切片）**：8 是按"**一份**镜像"量出来的（§10.7 的 6/8 与
+/// 余量 ≥ 2，BACKLOG R33）。A3 的外部命令在执行期同时持有**两份**镜像的映射——
+/// 自己的（装载器所在进程，约 5 条）＋ 要启动的子进程的（`14` 号逐段铺进子 AS，
+/// 约 4 条），按 8 定长必满：`own_current` 满了会**先放 RUNQ 再 drop**（ADR-047 决策 2），
+/// 而 `AsMap` 的 Drop 要取 VMM——所以那条路只能明确拒绝，表现为 14 号回 -6
+/// （2026-11-17 实测：execprobe 映射 hello 第 3 段时 -6，`map_shared` 一次都没失败）。
+/// 子进程启动时 `adopt_asmaps`（16 号）会把子 AS 的那些项整批搬给子线程，父的袋子随即回落，
+/// 所以这里只需要"两份镜像 + 余量"，不需要按子进程数线性增长。
+/// 每条约 `size_of(OwnedItem)`（`AspaceMapping` 的 `frames[16]` 为主），16 条约 3 KiB/任务，
+/// 在 per-CPU 静态任务数组上可接受。
+pub const MAX_OWNED: usize = 16;
 
 /// 一组"任务名下的拥有项"（ADR-067 决策 2）。计数的仍是**条**——ADR-027 的计数规则、
 /// `owned_of` 与"回基线"判据全部不变，只是元素从单一 `Mapping` 变成两臂枚举。
@@ -150,8 +160,11 @@ pub struct OwnedSet {
 impl OwnedSet {
     /// `const fn` 是硬要求：它要进 `EMPTY_TASK` 这个静态初值。
     pub const fn new() -> Self {
+        // 命名常量做 repeat：`Option<OwnedItem>` 不是 `Copy`，字面量 `[None; N]` 不成立，
+        // 而字面量逐个列举会随 `MAX_OWNED` 反复失同步（8→16 那次就编译失败了）。
+        const EMPTY: Option<OwnedItem> = None;
         Self {
-            items: [None, None, None, None, None, None, None, None],
+            items: [EMPTY; MAX_OWNED],
             n: 0,
         }
     }

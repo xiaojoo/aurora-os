@@ -1,6 +1,6 @@
 # unsafe 逐处审计表（U1–U6）
 
-总计 454 处。U1 81 · U2 114 · U3 13 · U4 131 · U5 79 · U6 36
+总计 463 处。U1 82 · U2 116 · U3 13 · U4 131 · U5 85 · U6 36
 
 本表由 `tools/aurora.py` 的 `unsafe_sites()` 从源码逐处生成，**不是手写的**。
 机器可读的权威来源是 `docs/security/unsafe-whitelist.toml` 的 `[modules.*]` 段（模块×类别→处数），
@@ -226,6 +226,12 @@
   > let t = unsafe { &*TABLE.0.get() }; (t.mmio.iter().filter(|e| e.is_some()).count(), t.dma.iter().filter(|e| e.is_some()).count()) } 
 - `kernel/src/driver.rs:520` [{] **U4** fn=`mmio_gen_at`
   > unsafe { &*TABLE.0.get() }.mmio[usize::from(slot)].as_ref().map(|e| e.gen) } 
+
+### filesystem/fs_open
+
+- `kernel/src/filesystem/fs_open.rs:41` [{] **U2** fn=`port`
+
+- `kernel/src/filesystem/fs_open.rs:52` [{] **U2** fn=`set_port`
 
 ### heap
 
@@ -887,91 +893,105 @@
 
 ### user/runtime
 
-- `user/runtime/src/lib.rs:260` [fn] **U1** fn=`syscall_abi`
+- `user/runtime/src/lib.rs:269` [fn] **U1** fn=`syscall_abi`
 
-- `user/runtime/src/lib.rs:266` [{] **U1** fn=`syscall_abi`
+- `user/runtime/src/lib.rs:275` [{] **U1** fn=`syscall_abi`
 
-- `user/runtime/src/lib.rs:289` [{] **U5** fn=`ping`
+- `user/runtime/src/lib.rs:298` [{] **U5** fn=`ping`
 
-- `user/runtime/src/lib.rs:305` [{] **U5** fn=`exit`
+- `user/runtime/src/lib.rs:314` [{] **U5** fn=`exit`
 
-- `user/runtime/src/lib.rs:317` [{] **U5** fn=`abi_info`
+- `user/runtime/src/lib.rs:326` [{] **U5** fn=`abi_info`
 
-- `user/runtime/src/lib.rs:328` [{] **U5** fn=`handle_close`
+- `user/runtime/src/lib.rs:337` [{] **U5** fn=`handle_close`
 
-- `user/runtime/src/lib.rs:336` [{] **U5** fn=`handle_dup`
+- `user/runtime/src/lib.rs:345` [{] **U5** fn=`handle_dup`
 
-- `user/runtime/src/lib.rs:361` [{] **U5** fn=`file_read`
+- `user/runtime/src/lib.rs:370` [{] **U5** fn=`file_read`
 
-- `user/runtime/src/lib.rs:379` [{] **U5** fn=`file_open`
+- `user/runtime/src/lib.rs:388` [{] **U5** fn=`file_open`
 
-- `user/runtime/src/lib.rs:401` [fn] **U1** fn=`handle_of_role`
+- `user/runtime/src/lib.rs:422` [fn] **U1** fn=`handle_of_role`
 
-- `user/runtime/src/lib.rs:404` [{] **U5** fn=`handle_of_role`
+- `user/runtime/src/lib.rs:425` [{] **U5** fn=`handle_of_role`
 
-- `user/runtime/src/lib.rs:408` [{] **U5** fn=`handle_of_role`
+- `user/runtime/src/lib.rs:429` [{] **U5** fn=`handle_of_role`
 
-- `user/runtime/src/lib.rs:411` [{] **U5** fn=`handle_of_role`
+- `user/runtime/src/lib.rs:432` [{] **U5** fn=`handle_of_role`
 
-- `user/runtime/src/lib.rs:412` [{] **U5** fn=`handle_of_role`
+- `user/runtime/src/lib.rs:433` [{] **U5** fn=`handle_of_role`
 
-- `user/runtime/src/lib.rs:414` [{] **U5** fn=`handle_of_role`
+- `user/runtime/src/lib.rs:435` [{] **U5** fn=`handle_of_role`
 
-- `user/runtime/src/lib.rs:426` [fn] **U1** fn=`args_at`
+- `user/runtime/src/lib.rs:447` [fn] **U1** fn=`args_at`
 
-- `user/runtime/src/lib.rs:429` [{] **U5** fn=`args_at`
+- `user/runtime/src/lib.rs:450` [{] **U5** fn=`args_at`
 
-- `user/runtime/src/lib.rs:433` [{] **U5** fn=`args_at`
+- `user/runtime/src/lib.rs:454` [{] **U5** fn=`args_at`
 
-- `user/runtime/src/lib.rs:434` [{] **U5** fn=`args_at`
+- `user/runtime/src/lib.rs:455` [{] **U5** fn=`args_at`
 
-- `user/runtime/src/lib.rs:439` [{] **U5** fn=`args_at`
+- `user/runtime/src/lib.rs:460` [{] **U5** fn=`args_at`
 
-- `user/runtime/src/lib.rs:462` [{] **U5** fn=`file_seek`
+- `user/runtime/src/lib.rs:474` [{] **U5** fn=`vmo_create`
 
-- `user/runtime/src/lib.rs:496` [{] **U5** fn=`file_stat`
+- `user/runtime/src/lib.rs:489` [{] **U5** fn=`vmo_write`
 
-- `user/runtime/src/lib.rs:516` [{] **U5** fn=`dir_read`
+- `user/runtime/src/lib.rs:502` [{] **U5** fn=`vmo_map`
 
-- `user/runtime/src/lib.rs:536` [{] **U5** fn=`console_write`
+- `user/runtime/src/lib.rs:530` [{] **U5** fn=`file_seek`
 
-- `user/runtime/src/lib.rs:553` [{] **U5** fn=`console_read`
+- `user/runtime/src/lib.rs:571` [{] **U5** fn=`file_stat`
 
-- `user/runtime/src/lib.rs:565` [{] **U5** fn=`process_create`
+- `user/runtime/src/lib.rs:591` [{] **U5** fn=`dir_read`
 
-- `user/runtime/src/lib.rs:582` [{] **U5** fn=`thread_create`
+- `user/runtime/src/lib.rs:611` [{] **U5** fn=`console_write`
 
-- `user/runtime/src/lib.rs:599` [{] **U5** fn=`process_start`
+- `user/runtime/src/lib.rs:628` [{] **U5** fn=`console_read`
 
-- `user/runtime/src/lib.rs:635` [{] **U5** fn=`process_wait`
+- `user/runtime/src/lib.rs:640` [{] **U5** fn=`process_create`
 
-- `user/runtime/src/lib.rs:644` [{] **U5** fn=`process_kill`
+- `user/runtime/src/lib.rs:657` [{] **U5** fn=`thread_create`
 
-- `user/runtime/src/lib.rs:666` [{] **U5** fn=`object_wait`
+- `user/runtime/src/lib.rs:674` [{] **U5** fn=`process_start`
 
-- `user/runtime/src/lib.rs:683` [fn] **U1** fn=`find_console`
+- `user/runtime/src/lib.rs:710` [{] **U5** fn=`process_wait`
 
-- `user/runtime/src/lib.rs:686` [{] **U5** fn=`find_console`
+- `user/runtime/src/lib.rs:719` [{] **U5** fn=`process_kill`
 
-- `user/runtime/src/lib.rs:691` [{] **U5** fn=`find_console`
+- `user/runtime/src/lib.rs:741` [{] **U5** fn=`object_wait`
 
-- `user/runtime/src/lib.rs:696` [{] **U5** fn=`find_console`
+- `user/runtime/src/lib.rs:758` [fn] **U1** fn=`find_console`
 
-- `user/runtime/src/lib.rs:698` [{] **U5** fn=`find_console`
+- `user/runtime/src/lib.rs:761` [{] **U5** fn=`find_console`
 
-- `user/runtime/src/lib.rs:701` [{] **U5** fn=`find_console`
+- `user/runtime/src/lib.rs:766` [{] **U5** fn=`find_console`
+
+- `user/runtime/src/lib.rs:771` [{] **U5** fn=`find_console`
+
+- `user/runtime/src/lib.rs:773` [{] **U5** fn=`find_console`
+
+- `user/runtime/src/lib.rs:776` [{] **U5** fn=`find_console`
 
 ### user/execprobe
 
-- `user/execprobe/src/main.rs:30` [{] **U1** fn=`msgs_base`
+- `user/execprobe/src/main.rs:59` [{] **U1** fn=`chunk_base`
 
-- `user/execprobe/src/main.rs:43` [{] **U5** fn=`msg`
+- `user/execprobe/src/main.rs:74` [{] **U1** fn=`msgs_base`
 
-- `user/execprobe/src/main.rs:51` [{] **U1** fn=`panic`
+- `user/execprobe/src/main.rs:87` [{] **U5** fn=`msg`
 
-- `user/execprobe/src/main.rs:68` [{] **U5** fn=`_start`
+- `user/execprobe/src/main.rs:102` [{] **U5** fn=`put_hex`
 
-- `user/execprobe/src/main.rs:73` [{] **U5** fn=`_start`
+- `user/execprobe/src/main.rs:125` [{] **U5** fn=`run_image`
+
+- `user/execprobe/src/main.rs:213` [{] **U5** fn=`run_image`
+
+- `user/execprobe/src/main.rs:322` [{] **U1** fn=`panic`
+
+- `user/execprobe/src/main.rs:330` [{] **U5** fn=`_start`
+
+- `user/execprobe/src/main.rs:335` [{] **U5** fn=`_start`
 
 ### user/shell
 

@@ -75,12 +75,17 @@ expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe
 # 2026-11-16 A2 接线：shell 的 syscall 底座迁入 runtime ⇒ user/shell 17→4（U1 7→2、U5 10→2）、
 # user/shell/registry 段删除（cmd_ping/abi 改走 safe API，0 处）。数目对账：
 # 453-15=438、82-5=77、77-10=67。类别规则未改。
-total = 454
-U1 = 81
-U2 = 114
+# 2026-11-17 A3 切片（ADR-131）：+user/execprobe（U1 2→3 = chunk_base 的 lea 取址；
+# U5 3→6 = 静态块缓冲的 from_raw_parts_mut + 段 VMO 填充/`.slots` 标志写入的切片）、
+# +user/runtime（U5 32→35 = 12/13/14 三个 VMO 封装的调用块）、
+# +filesystem/fs_open（U2 2 = 运行期挂根的单写者 volatile 读/写）。
+# 数目对账：454+9=463、81+1=82、114+2=116、79+6=85。
+total = 463
+U1 = 82
+U2 = 116
 U3 = 13
 U4 = 131
-U5 = 79
+U5 = 85
 U6 = 36
 
 [modules."acpi"]
@@ -327,7 +332,7 @@ U4 = 2
 # 不变量 = ABI 约定（号 rax、参数 rdi/rsi/rdx/r10、返回 rax 负值错误码）与 safe 层
 # 长度/枚举编码检查；生命周期 = 调用栈内；并发 = 无共享可变状态（库无全局）。
 U1 = 5
-U5 = 32
+U5 = 35
 
 
 [modules."user/execprobe"]
@@ -336,5 +341,14 @@ U5 = 32
 # _start 对 rt::handle_of_role / rt::args_at（两个 unsafe fn）的调用——si_va 由内核
 # process_start 校验并映射（user+只读），argv 区界内性由 ADR-130 决策 2 的校验背书。
 # 上下文 USER_ENTRY；生命周期 = 本进程；单任务访问无并发。
-U1 = 2
-U5 = 3
+U1 = 3
+U5 = 6
+
+[modules."filesystem/fs_open"]
+# A3（ADR-131，2026-11-17）：FAT32 单根挂载层的**运行期挂根**。U2 两处 = `port()` 的
+# volatile 读与 `set_port()` 的 volatile 写（`core::ptr::addr_of!`/`addr_of_mut!`）。
+# 为什么不是 `AtomicU8`：本模块属 storage 组，ADR-044 的棘轮规定"环内引用只许减不许增"，
+# 引入 `core::sync::atomic` 会新增 storage→sync 的 3 个引用站点（实测）。
+# 单写者：a3-exec 的编排在任何用户任务起来之前调一次 `set_port(3)`，此后整机只读；
+# 单字节、无对齐问题；`addr_of!` 不创造引用（`static_mut_refs` 的正当写法）。
+U2 = 2

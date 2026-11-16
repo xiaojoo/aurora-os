@@ -25,6 +25,11 @@ a2-exec = ["handles"]
 # A2 切片负样本：同一编排但 args_len 故意覆盖句柄表 ⇒ 16 号校验必须拒 E_INVALID。
 # 内核侧 cfg! 注入（宿主机改盘注入不许做成特性，§80a 的另一半在这里不适用）。
 a2-exec-bad = ["a2-exec"]
+# A3 切片（ADR-131 草案）：A2 语义 + **用户态装载器**——execprobe 自己 open 卷上
+# HELLO.ELF、按段装进子进程 AS 并启动（11/15/16/17 全链）。argv 只换目标名，长度不变。
+# 22 号的模块门是 fs-open（filesystem.rs:14）：A3 的外部命令必须带它，
+# 否则 SYS_FILE_OPEN 分派整臂不存在（实测：execprobe 的 open 直接 -1）。
+a3-exec = ["a2-exec", "fs-open"]
 # M5-g① 取证：把每台设备的 MSI/MSI-X 块与 INTx pin/line 读成一张证人表。
 # 只读不改，也不进四把尺子的构建：量具的开销不能算进产品基线（与 sig-check 同一形状）。
 irq-probe = []

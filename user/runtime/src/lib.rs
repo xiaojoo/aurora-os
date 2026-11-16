@@ -18,6 +18,9 @@
 
 #![no_std]
 
+/// A3 用户态装载器（最小 ELF64：解析 + 逐段 VMO 映射 + 栈顶）。
+pub mod elf;
+
 // ---------------------------------------------------------------------------
 // 句柄
 // ---------------------------------------------------------------------------
@@ -67,6 +70,12 @@ pub const SYS_FILE_SEEK: u64 = 24;
 pub const SYS_FILE_STAT: u64 = 25;
 /// 26 `readdir(dir_handle,buf,len)`（user.rs:61；实现 user.rs:1263）。
 pub const SYS_DIR_READ: u64 = 26;
+/// 12 `vmo_create(pages)`（user.rs:43）——A3 用户态装载器的底座。
+pub const SYS_VMO_CREATE: u64 = 12;
+/// 13 `vmo_write(handle,off,buf,len)`（user.rs:46）。
+pub const SYS_VMO_WRITE: u64 = 13;
+/// 14 `aspace_map(vmo,flags,proc,va)`（user.rs:50）。
+pub const SYS_ASPACE_MAP: u64 = 14;
 
 // ---------------------------------------------------------------------------
 // 长度上限（用户侧独立声明，两侧不一致时 safe 层先拒绝，不给内核传超限长度）
@@ -392,6 +401,18 @@ pub const ROLE_STDIN: u32 = 9;
 pub const ROLE_STDOUT: u32 = 10;
 /// ADR-130：stderr 的 SI 描述角色（内核与 shell 今天都还没有 stderr 语义，常量先立）。
 pub const ROLE_STDERR: u32 = 11;
+/// Job 角色（A2 的 SI 描述里由创建方给出，带 CREATE 权限；A3 用它调 11 号）。
+pub const ROLE_JOB: u32 = 3;
+
+/// 句柄权限位（与内核 handle.rs:38-46 同名常量同值）。
+/// `RIGHT_TRANSFER` 是 16 号**转移**描述句柄的硬要求：少这一位 `transfer` 会回 -4
+/// （A3 实测：dup 只给 READ|WRITE 时 process_start 拒 E_DENIED）。
+pub const RIGHT_READ: u32 = 1 << 0;
+pub const RIGHT_WRITE: u32 = 1 << 1;
+pub const RIGHT_MAP: u32 = 1 << 2;
+pub const RIGHT_DUP: u32 = 1 << 3;
+pub const RIGHT_TRANSFER: u32 = 1 << 4;
+pub const RIGHT_CREATE: u32 = 1 << 5;
 
 /// 从 SI 页的描述表按**角色号**取句柄（A2：stdin/stdout/stderr 走这里，不再认 ROLE_LOG）。
 ///
@@ -439,6 +460,53 @@ pub unsafe fn args_at(si_va: u64) -> Option<&'static [u8]> {
     Some(unsafe { core::slice::from_raw_parts(base.add(off) as *const u8, len) })
 }
 
+// ---------------------------------------------------------------------------
+// VMO 族（12 / 13 / 14 号）——A3 用户态装载器的底座（ADR-131 草案）
+// ---------------------------------------------------------------------------
+
+/// 12 号（`SYS_VMO_CREATE`，user.rs:43）：建一个 `pages` 页的 VMO，返回句柄。
+/// 句柄权限由内核给全（READ|WRITE|MAP|DUP，user.rs:53 附近）。
+pub fn vmo_create(pages: usize) -> Result<Handle, RTError> {
+    if pages == 0 {
+        return Err(RTError::INVALID);
+    }
+    // SAFETY: 12 号 `rdi` = 页数，其余参数无语义。
+    let ret = unsafe { syscall_abi(SYS_VMO_CREATE, pages as u64, 0, 0, 0) };
+    if ret < 0 {
+        Err(RTError(ret))
+    } else {
+        Ok(ret as u64)
+    }
+}
+
+/// 13 号（`SYS_VMO_WRITE`，user.rs:46）：往 VMO 的 `off` 起写 `buf`，返回写入字节数。
+pub fn vmo_write(h: Handle, off: u64, buf: &[u8]) -> Result<usize, RTError> {
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    // SAFETY: 13 号 `rdi` = 句柄、`rsi` = 偏移、`rdx` = 缓冲指针、`r10` = 长度；
+    // 缓冲是调用方的可读内存，长度由调用方保证与 VMO 容量匹配（越界由内核回 -1/-2）。
+    let ret = unsafe { syscall_abi(SYS_VMO_WRITE, h, off, buf.as_ptr() as u64, buf.len() as u64) };
+    if ret < 0 {
+        Err(RTError(ret))
+    } else {
+        Ok(ret as usize)
+    }
+}
+
+/// 14 号（`SYS_ASPACE_MAP`，user.rs:50）：把 VMO 映射进 `proc` 的 AS 的 `va` 起，返回实际 VA。
+/// `w`/`x` 由调用方按段属性给（W+X 同段内核拒 -1，user.rs:56 附近的形状校验）。
+pub fn vmo_map(proc: Handle, vmo: Handle, va: u64, w: bool, x: bool) -> Result<u64, RTError> {
+    let flags = (w as u64) | ((x as u64) << 1);
+    // SAFETY: 14 号 `rdi` = VMO 句柄、`rsi` = 权限位、`rdx` = Proc 句柄别名、`r10` = 目标 VA。
+    let ret = unsafe { syscall_abi(SYS_ASPACE_MAP, vmo, flags, proc, va) };
+    if ret < 0 {
+        Err(RTError(ret))
+    } else {
+        Ok(ret as u64)
+    }
+}
+
 /// 24 号的基准（user.rs:56 的 whence 约定：0=SET、1=CUR、2=END）。
 /// **A2 接线后从 enum 改成 i64 newtype**，理由同 [`RTError`]（枚举映射会被 LLVM 降成
 /// 查表，用户链接基址 +4 GiB 下 `R_X86_64_32S` 溢出）。
@@ -477,6 +545,13 @@ pub struct StatRecord {
 }
 
 impl StatRecord {
+    /// 记录第 8..12 字节的文件大小（fs_open.rs 的 `put_u32(&mut b, 8, e.size)`）。
+    #[must_use]
+    pub const fn size(&self) -> u32 {
+        let b = &self.bytes;
+        (b[8] as u32) | ((b[9] as u32) << 8) | ((b[10] as u32) << 16) | ((b[11] as u32) << 24)
+    }
+
     /// 记录第 7 字节的 kind（fs_open.rs:66-68）：[`STAT_KIND_FILE`] / [`STAT_KIND_DIR`]。
     #[must_use]
     pub const fn kind(&self) -> u8 {

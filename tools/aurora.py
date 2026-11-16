@@ -446,6 +446,9 @@ FAT_PORTS = {3: "fat32-small", 4: "fat32-wide"}
 # 在卷A 上根本没有对应结构，挂在口 3 上等于"用例里有三级路径、盘上没有"。口号同时让开 3/4，
 # 是为了 `fs-open` 与 FAT 探针同跑时两块卷能并存（此前靠 QEMU 参数顺序，那是不可歧义的接线反面）。
 FS_OPEN_FEATURES = {"fs-open"}
+# A3 切片：execprobe 的 22 号 open 打的是 fs_open::PORT=5 的 deep 卷（fs_open 自 mount 固定卷）。
+# 所以这一档的镜像也要装配 deep 卷——与 fs-open 同一份夹具、同一条指纹闸。
+A3_EXEC_FEATURES = {"a3-exec"}
 FS_OPEN_PORTS = {5: "fat32-deep"}
 # 内核声明"要读哪几个文件"。这张表有两个用处，缺一不可：
 # 1 宿主机这台仪器只走这几个名字的链——卷B 上那个 34,603,008 字节的 FILLER.BIN 没有任何
@@ -3519,7 +3522,7 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
             if bad:
                 sys.exit("FAT32 宿主机侧注入不成立：" + " / ".join(bad))
     if FS_OPEN_FEATURES & set(features):
-        # ADR-109：`fs-open` 的挂载根换成了多级真卷（口 5）。它由脚本现算，不再从 `.zz` 解压；
+        # ADR-109：`fs-open` 的挂载根换成了多级真卷（口 5）。A3 不用它（挂根是口 3 的卷A）。它由脚本现算，不再从 `.zz` 解压；
         # 卷A 上根本没有多级路径、跨簇目录与子目录 LFN，挂在那里等于"用例写着三级路径、盘上没有"。
         bad = ensure_fat_deep()
         if bad:
@@ -3578,9 +3581,10 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
         # 证人换成两头的对账：`check-fat32-ports` 比口号，`check_fat32` 比内容（两块卷簇数
         # 不同，接反了内容对账当场红）。
         wanted_volumes.update(FAT_PORTS)
-    if FS_OPEN_FEATURES & set(features):
-        # FS-03 只要卷A。若同一跑同时带 `fs-open` 与 FAT 探针，两个集合必须指向同一份夹具，
-        # 绝不允许同一口号挂两块盘后只由 QEMU 参数顺序决定谁赢。
+    if (FS_OPEN_FEATURES | A3_EXEC_FEATURES) & set(features):
+        # FS-03 的 deep 卷。`a3-exec` 也要它：a3-exec 依赖 fs-open（22 号的模块门），
+        # 同一份构建里 fs-open 的用例也在跑，它们的挂根是口 5（见 fs_open::PORT 的注释）。
+        # A3 自己的目标卷是卷A（口 3），由 `fat32-probe` 装配，两口互不冲突。
         for port, name in FS_OPEN_PORTS.items():
             old = wanted_volumes.get(port)
             if old is not None and old != name:
@@ -8177,6 +8181,33 @@ def do_test(timeout: int) -> int:
     ab_ok = abv == "PASS" and "argv 校验拒 ret=0xffffffffffffffff" in ablog and "execprobe: argv[0]=" not in ablog
     ab_verdict = "CONTENT-MISMATCH" if (abv == "PASS" and not ab_ok) else abv
 
+    # =====================================================================
+    # A3 切片（ADR-131 草案）：**用户态装载器**。execprobe 经 A2 语义被启动后，
+    # 自己 open 卷上 HELLO.ELF（22 号）→ 顺序读块按段过滤写 VMO（无 seek）→
+    # 14 号映射 → 建栈页 → 构造 SI（ROLE_LOG + console dup）→ 11/15/16/17。
+    # 四格判据：open 成功（hex 非空）、read=0x4388（17288 字节）、
+    # entry=0x100000000（段表解析对）、spawn=0x0（16 号放行）、wait=timeout
+    # （hello 写完数据段自旋不 exit，超时是它的已知行为）。
+    print("=== A3 用户态装载器：execprobe 执行卷上 HELLO.ELF（--features a3-exec）===")
+    IMAGE.unlink(missing_ok=True)
+    # 带 fat32-probe：它把卷A（fat32-small）装配到口 3——A3 的挂根就是这块卷
+    # （编排里 `fs_open::set_port(3)`，见 fs_open::PORT 的运行期切换说明）。
+    # 同时装配口 5 的 deep 卷：a3-exec 依赖 fs-open，同一份构建里那批用例还在跑。
+    r3v, r3rc, r3log = do_run(["a3-exec", "fat32-probe"], timeout)  # a3-exec→fs-open→22 号门
+    # 四格判据（逐条独立，任缺一格就 CONTENT-MISMATCH）。
+    # 第四格是**真实退出码**而不是超时：execprobe 往目标数据段首（hello 的 `.slots`）
+    # 写 FLAG_EXIT，hello 自检完自己打 3 号退出 ⇒ 17 号拿到 exit:0x0。
+    # 弱观测（timeout）分不清"跑起来了没退"与"根本没跑"，这一格把它分开。
+    r3_ok = r3v == "PASS" and all((
+        "run:HELLO.ELF open=0x" in r3log,
+        "read=0x4388" in r3log,
+        "entry=0x100000000" in r3log,
+        "spawn=0x0" in r3log,
+        "wait=exit:0x0" in r3log,
+    ))
+    r3_verdict = "CONTENT-MISMATCH" if (r3v == "PASS" and not r3_ok) else r3v
+    IMAGE.unlink(missing_ok=True)
+
     rows = [
         ("正向", v if v != "PASS" or not p4_bad else "CONTENT-MISMATCH", rc, "PASS", 33),
         ("负样本", nv, nrc, "FAIL", 35),
@@ -8319,6 +8350,8 @@ def do_test(timeout: int) -> int:
         # 正向：三格全绿才 PASS；负样本：校验拒 + 不放行。
         ("A2 argv/std经继承句柄启动外部ELF", ax_verdict, axrc, "PASS", 33),
         ("A2越界argv被校验拒", ab_verdict, abrc, "PASS", 33),
+        # A3：用户态装载器（22 号卷路径 + 段表解析 + 14 号映射 + 11/15/16/17）
+        ("A3 用户态装载器执行卷上ELF", r3_verdict, r3rc, "PASS", 33),
     ]
     # 每一行对应那一跑的串口：不符时把红的那几格打出来。
     # 单独一张表而不是把日志塞进 `rows` 的元组里：元组要保持成"名字/期望/实际"这种
@@ -8376,6 +8409,7 @@ def do_test(timeout: int) -> int:
         "多级首簇高半抹零读到别处": dhihlog,
         "A2 argv/std经继承句柄启动外部ELF": axlog,
         "A2越界argv被校验拒": ablog,
+        "A3 用户态装载器执行卷上ELF": r3log,
     }
     all_ok = True
     print()

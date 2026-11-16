@@ -424,9 +424,10 @@ fn sys_aspace_map(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
             _ => return E_DENIED,
         }
     };
-    let va = if frame.r10 == 0 {
+    // 显式 VA 是否占了**全局** VA 账：归还（失败回滚）与会话记账都按它走。
+    let (va, va_reserved) = if frame.r10 == 0 {
         match mm::alloc_user_va_range(pages) {
-            Some(v) => v,
+            Some(v) => (v, true),
             None => return E_EXHAUSTED,
         }
     } else {
@@ -442,13 +443,28 @@ fn sys_aspace_map(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
         if want < mm::USER_VA_BASE || end.is_none_or(|e| e > mm::USER_VA_TOP) {
             return E_INVALID;
         }
-        if !mm::reserve_va_at(want, pages) {
-            return E_EXHAUSTED;
-        }
+        // **固定镜像区（[USER_VA_BASE, USER_MMAP_BASE)）按 AS 记账，不占全局 VA 表**：
+        // 这一段的地址就是 ET_EXEC 的 `p_vaddr`，每个进程镜像都从 `USER_VA_BASE` 起
+        // （hello 与 execprobe 都在 0x1_0000_0000）。全局表若也登记它，第二个进程永远
+        // 装不进同一段 VA——A3 实测：execprobe（自己坐在 0x1_0000_0000）经 14 号把 hello
+        // 铺进子 AS 时回 -6，卡死在第一段。冲突判定由 `aspace_map_slot` 的**目标 AS 整段
+        // 查重**兜底（`map_shared` 先整段查再铺），与内核装载器 `load_into` 同一口径
+        // ——它从不进全局表。动态区（>= USER_MMAP_BASE）仍占全局账：那里是内核发号，
+        // 跨 AS 也不该重号。
+        let reserved = if want < mm::USER_MMAP_BASE {
+            false
+        } else {
+            if !mm::reserve_va_at(want, pages) {
+                return E_EXHAUSTED;
+            }
+            true
+        };
         match mm::VirtAddr::new(want) {
-            Some(v) => v,
+            Some(v) => (v, reserved),
             None => {
-                mm::release_va(want);
+                if reserved {
+                    mm::release_va(want);
+                }
                 return E_INVALID;
             }
         }
@@ -460,7 +476,9 @@ fn sys_aspace_map(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let mut m = match m {
         Ok(m) => m,
         Err(_) => {
-            mm::release_va(va.0);
+            if va_reserved {
+                mm::release_va(va.0);
+            }
             return E_EXHAUSTED;
         }
     };
@@ -471,12 +489,16 @@ fn sys_aspace_map(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     // ADR-098：这个 VA 是从**全局**表里占的（动态区/固定地址都算），会话装载作用域里要记账。
     // **记在这里而不是 `own_current` 之后**：那一步把映射塞进调用者的袋子，而调用者
     // （park 主任务）永不退出 ⇒ 袋不落地 ⇒ 这条 VA 的 `release_va` 等于永远不执行。
-    let _ = note_va_current(va.0);
+    if va_reserved {
+        let _ = note_va_current(va.0);
+    }
     if let Some(s) = as_slot {
         if let Some(job) = crate::proc::job_of_aspace(s) {
             if crate::proc::job_charge_pages(job, m.pages() as u64).is_err() {
                 drop(m);
-                mm::release_va(va.0);
+                if va_reserved {
+                    mm::release_va(va.0);
+                }
                 return E_EXHAUSTED;
             }
         }
@@ -1192,10 +1214,10 @@ fn sys_file_open(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let rights = crate::handle::RIGHT_READ;
     let granted = match opened {
         Opened::File { cursor, stat } => {
-            crate::handle::grant_vfs_file(owner, crate::filesystem::fs_open::PORT, None, cursor, stat, rights)
+            crate::handle::grant_vfs_file(owner, crate::filesystem::fs_open::port(), None, cursor, stat, rights)
         }
         Opened::Dir { state, stat } => {
-            crate::handle::grant_vfs_dir(owner, crate::filesystem::fs_open::PORT, None, stat, state, rights)
+            crate::handle::grant_vfs_dir(owner, crate::filesystem::fs_open::port(), None, stat, state, rights)
         }
     };
     match granted {

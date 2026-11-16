@@ -1246,6 +1246,20 @@ fn stage_a2_exec() {
     };
     use crate::{mm, proc, vmo};
 
+    // a3-exec 档：**产品路径认领 AHCI**——22 号的 fs_open::open 自 mount 固定卷，
+    // 但卷必须先被驱动 probe 过（此前只有 fs/fs-open 的 ktest 做这一步，产品路径没有；
+    // execprobe 实测 open 回 -1）。这是 S3"产品路径授予文件句柄"的驱动半边。
+    #[cfg(feature = "a3-exec")]
+    {
+        match crate::ahci::init() {
+            Ok(info) => crate::log_info!("a3-exec: AHCI 认领 ports={}", info.ports),
+            Err(e) => crate::log_warn!("a3-exec: AHCI 认领失败 {:?}", e),
+        }
+        // 挂根换到卷A（口 3，根目录有 HELLO.ELF）。**任何时候只有一个调度者在写这条**：
+        // 用例全部跑完之后才走到这里，所以不会有"旧句柄挂新卷"的窗口（见 fs_open::PORT 的约定）。
+        crate::filesystem::fs_open::set_port(3);
+        crate::log_info!("a3-exec: 挂根=口{}（卷A，目标 /HELLO.ELF）", crate::filesystem::fs_open::port());
+    }
     let Some(owner) = sched::current_identity() else {
         crate::log_warn!("a2-exec: 无启动身份 ⇒ 判定行缺席");
         return;
@@ -1316,6 +1330,8 @@ fn stage_a2_exec() {
     // 负样本（a2-exec-bad）：args_off/args_len 故意压住句柄表 ⇒ 16 号校验必须拒。
     let (args_off, args_len) = if cfg!(feature = "a2-exec-bad") {
         (SI_OFF_HANDLES, 4096usize)
+    } else if cfg!(feature = "a3-exec") {
+        (280usize, 11usize) // "/HELLO.ELF" + NUL（vfs 要求绝对路径，实测 NotAbsolute）
     } else {
         (280usize, 10usize)
     };
@@ -1348,7 +1364,15 @@ fn stage_a2_exec() {
     if !cfg!(feature = "a2-exec-bad") {
         // 固定 512 缓冲（ARGS_MAX）：args_len 是运行期值，不能做数组长度（E0435）。
         let mut arg = [0u8; 512];
-        arg[..10].copy_from_slice(b"execprobe\0");
+        // a3-exec 档的目标是卷上 /HELLO.ELF（**绝对路径**：vfs_ro::lookup 拒相对路径，
+        // 内核侧诊断实测 NotAbsolute）；execprobe 见 ".ELF" 后缀就走 A3 装载器分支。
+        let target: &[u8] = if cfg!(feature = "a3-exec") {
+            b"/HELLO.ELF"
+        } else {
+            b"execprobe"
+        };
+        arg[..target.len()].copy_from_slice(target);
+        arg[target.len()] = 0;
         if vmo::vmo_write(si, args_off, &arg[..args_len]) != Ok(args_len) {
             crate::log_warn!("a2-exec: argv 区写失败");
             return;
@@ -1396,9 +1420,11 @@ fn stage_a2_exec() {
     let _ = apic::timer_start();
     let code = apic::with_interrupts(|| sched::wait_for_proc(pid, crate::clock::window_cycles(32)));
     // 双锚点第二锚：串口里必须有 execprobe 自己打出的 argv 行（stdout 来自**继承句柄**）。
+    // 期望的退出码按档：a2-exec 是探针自己的判定码 7；a3-exec 走完装载器全链后正常收尾（0）。
+    let want = if cfg!(feature = "a3-exec") { Some(0u32) } else { Some(7u32) };
     crate::log_info!(
-        "a2-exec: execprobe 收工 退出码={:?}（期望 Some(7)）args_off={} args_len={}",
-        code, args_off, args_len
+        "a2-exec: execprobe 收工 退出码={:?}（期望 {:?}）args_off={} args_len={}",
+        code, want, args_off, args_len
     );
 }
 
