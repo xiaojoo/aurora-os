@@ -18,7 +18,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use super::vfs::{Block, BlockError, SECTOR_BYTES};
+use super::vfs::{Block, BlockError, DiskKey, SECTOR_BYTES};
 
 /// 一次请求的预算。`deadline` 是**绝对 tick**，`clock` 是"现在几点"的注入源；
 /// `cancel` 指向调用方那一格旗（通常是它自己任务里的一个 `AtomicBool`）。
@@ -51,9 +51,7 @@ pub struct Outcome {
     pub error: Option<BlockError>,
 }
 
-/// 五计数（ADR-110）。**今天只有一份**，不是 ADR 草案写的"每块盘一份"：`Block` 没有身份，
-/// `read_at` 拿不到"这块盘是谁"。等 virtio-blk 进来、`Block` 有了按 BDF 的身份再分桶；
-/// 现在分桶就等于凭空造一个 id，而那个 id 没有任何调用方会填对。
+/// 五计数（ADR-110 / ADR-113）。**按盘分桶**：桶由 `Block::disk_key()` 决定。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Stats {
     /// 调用次数（形状被拒的也算——它是"试过"，不是"没发生"）
@@ -68,25 +66,64 @@ pub struct Stats {
     pub refused: u64,
 }
 
-static REQUESTS: AtomicU64 = AtomicU64::new(0);
-static SECTORS_OK: AtomicU64 = AtomicU64::new(0);
-static TIMEOUTS: AtomicU64 = AtomicU64::new(0);
-static CANCELS: AtomicU64 = AtomicU64::new(0);
-static REFUSED: AtomicU64 = AtomicU64::new(0);
+struct Bucket {
+    requests: AtomicU64,
+    sectors_ok: AtomicU64,
+    timeouts: AtomicU64,
+    cancels: AtomicU64,
+    refused: AtomicU64,
+}
 
-pub fn stats() -> Stats {
-    Stats {
-        requests: REQUESTS.load(Ordering::Relaxed),
-        sectors_ok: SECTORS_OK.load(Ordering::Relaxed),
-        timeouts: TIMEOUTS.load(Ordering::Relaxed),
-        cancels: CANCELS.load(Ordering::Relaxed),
-        refused: REFUSED.load(Ordering::Relaxed),
+impl Bucket {
+    const fn new() -> Self {
+        Bucket {
+            requests: AtomicU64::new(0),
+            sectors_ok: AtomicU64::new(0),
+            timeouts: AtomicU64::new(0),
+            cancels: AtomicU64::new(0),
+            refused: AtomicU64::new(0),
+        }
     }
 }
 
-fn refused() -> Outcome {
-    REFUSED.fetch_add(1, Ordering::Relaxed);
-    Outcome { sectors_done: 0, error: Some(BlockError::Refused) }
+/// 桶号：Unknown=0、Ahci(p)=1+p(0..31)、Virtio(i)=33+i(0..7)、Mem=41。
+/// 超出表宽的 key 折回 0——宁可少数一台，也不越界写静态。
+const BUCKETS: usize = 42;
+static STATS: [Bucket; BUCKETS] = [const { Bucket::new() }; BUCKETS];
+
+fn bucket_of(k: DiskKey) -> &'static Bucket {
+    let i = match k {
+        DiskKey::Unknown => 0,
+        DiskKey::Ahci(p) => 1 + (p as usize & 31),
+        DiskKey::Virtio(v) => 33 + (v as usize & 7),
+        DiskKey::Mem => 41,
+    };
+    &STATS[i]
+}
+
+/// 全部桶的合计（既有判据读的就是这个数，语义不变）。
+pub fn stats() -> Stats {
+    let mut s = Stats::default();
+    for b in STATS.iter() {
+        s.requests += b.requests.load(Ordering::Relaxed);
+        s.sectors_ok += b.sectors_ok.load(Ordering::Relaxed);
+        s.timeouts += b.timeouts.load(Ordering::Relaxed);
+        s.cancels += b.cancels.load(Ordering::Relaxed);
+        s.refused += b.refused.load(Ordering::Relaxed);
+    }
+    s
+}
+
+/// 单台盘的五个数（ADR-113）。读不到的就是 0，不区分"没这台"与"它一次都没动过"。
+pub fn stats_of(k: DiskKey) -> Stats {
+    let b = bucket_of(k);
+    Stats {
+        requests: b.requests.load(Ordering::Relaxed),
+        sectors_ok: b.sectors_ok.load(Ordering::Relaxed),
+        timeouts: b.timeouts.load(Ordering::Relaxed),
+        cancels: b.cancels.load(Ordering::Relaxed),
+        refused: b.refused.load(Ordering::Relaxed),
+    }
 }
 
 /// 从 `lba` 读 `dst.len() / 512` 个扇区，逐扇区判取消与死线。
@@ -94,28 +131,31 @@ fn refused() -> Outcome {
 /// 顺序是**先判停、再下发**：取消位在上一扇区的驱动里被置起时，这一扇区不再发；
 /// 死线同样在扇区边界判。两者都不做"占用中撤销"（那要驱动配合）。
 pub fn read_at(disk: &dyn Block, lba: u64, dst: &mut [u8], budget: &Budget<'_>) -> Outcome {
-    REQUESTS.fetch_add(1, Ordering::Relaxed);
+    let b = bucket_of(disk.disk_key());
+    b.requests.fetch_add(1, Ordering::Relaxed);
     if dst.is_empty() || dst.len() % SECTOR_BYTES != 0 {
-        return refused();
+        b.refused.fetch_add(1, Ordering::Relaxed);
+        return Outcome { sectors_done: 0, error: Some(BlockError::Refused) };
     }
     let n = (dst.len() / SECTOR_BYTES) as u32;
     let bounded = budget.deadline != u64::MAX;
     for i in 0..n {
         if budget.cancel.load(Ordering::Relaxed) {
-            CANCELS.fetch_add(1, Ordering::Relaxed);
+            b.cancels.fetch_add(1, Ordering::Relaxed);
             return Outcome { sectors_done: i, error: Some(BlockError::Refused) };
         }
         if bounded && (budget.clock)() >= budget.deadline {
-            TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+            b.timeouts.fetch_add(1, Ordering::Relaxed);
             return Outcome { sectors_done: i, error: Some(BlockError::NotSettled) };
         }
         let Some(cur) = lba.checked_add(u64::from(i)) else {
-            return refused();
+            b.refused.fetch_add(1, Ordering::Relaxed);
+            return Outcome { sectors_done: 0, error: Some(BlockError::Refused) };
         };
         let off = i as usize * SECTOR_BYTES;
         match disk.read_sectors(cur, &mut dst[off..off + SECTOR_BYTES]) {
             Ok(()) => {
-                SECTORS_OK.fetch_add(1, Ordering::Relaxed);
+                b.sectors_ok.fetch_add(1, Ordering::Relaxed);
             }
             Err(e) => return Outcome { sectors_done: i, error: Some(e) },
         }

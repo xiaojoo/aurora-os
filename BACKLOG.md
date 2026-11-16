@@ -14729,3 +14729,19 @@ kernel 栈/地址窗口上的脆弱）。下一刀先定位它：用同一段包
   新变体必须同时登记"挂哪几块盘/哪几张夹具"。
 - 仍未做：per-disk 块计数（仍全局一份，等 `Block` 身份）；`MAX_VBLK=4` 是显式上界；MSI-X 仍只对
   第 0 台队列 0 编程；整链现在是 **64 行**，本轮未重跑。
+## 373. 块设备身份与按盘分桶的五计数（ADR-113）（2026-11-17）
+
+- `Block` 加 `disk_key()`（**默认 `Unknown`**）：`AhciDisk → Ahci(port)`、`VirtioDisk { index } →
+  Virtio(index)`、`MemDisk → Mem`；`PartitionView` 原样透传内层身份（分区不是一台盘）。
+  `VirtioDisk` 从单元结构改成 `{ index: u8 }`，读写走 `read_block_at/write_block_at`。
+- `block_io`：五计数改成 `[Bucket; 42]`（Unknown=0、Ahci 1..32、Virtio 33..40、Mem=41，越界折回 0）。
+  `stats()` 仍是**全桶合计**（既有判据/行语义不变），新增 `stats_of(key)`。
+- 判据：`t_block_io_budget` 增加 MemDisk 一读——Unknown 桶 6/7/1/1/2、Mem 桶 1/1/0/0/0，
+  合计 7/8/1/1/2（宿主行同步改）；`t_virtio_block` 要求那批 I/O 落在 `Virtio(0)` 且 `Unknown` 不动。
+- 读数：`fs-ro` PASS(33) 88/88（`3e13719c38ab`，`计数=true 分桶=true`）、`virtio-blk` PASS(33)
+  85/85（`d3c54ca537a0`）、`fs-rw`（`465a717821f1`）/`fs-open`（`fdc8db7b72ca`）/默认档
+  （`975587b831a7`）全 PASS(33)；`check` **17/17**。接口登记补 `vfs::DiskKey`、
+  `virtio::read_block_at/write_block_at`。
+- 变异：把 Mem 折回桶 0 ⇒ 两桶增量混在一起、`计数=false`、`t_block_io_budget` 红；还原后 88/88。
+- 仍未做：按 CPU/按句柄的账（不合并，ADR-113 决策 3）；Ahci≥32 与 Virtio≥8 的 key 不可分桶
+  （显式上界）；分区共用底层盘的桶。

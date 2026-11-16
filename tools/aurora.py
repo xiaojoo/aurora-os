@@ -1922,7 +1922,8 @@ def check_fs_rw_image(log: str) -> list[str]:
 
 BLOCK_IO_RE = re.compile(
     r"vfs-ro: 块请求层 正常=(?P<ok1>\w+) 半途=(?P<ok2>\w+) 死线=(?P<ok3>\w+) 取消=(?P<ok4>\w+) "
-    r"形状=(?P<ok5>\w+) 计数=(?P<okc>\w+) 增量 requests=(?P<req>\d+) sectors=(?P<sec>\d+) "
+    r"形状=(?P<ok5>\w+) 计数=(?P<okc>\w+) 分桶=(?P<okk>\w+) 增量 requests=(?P<req>\d+) "
+    r"sectors=(?P<sec>\d+) "
     r"timeouts=(?P<to>\d+) cancels=(?P<can>\d+) refused=(?P<ref>\d+)")
 
 
@@ -1937,10 +1938,10 @@ def check_block_io(log: str) -> list[str]:
     if m is None:
         return ["串口没有 `vfs-ro: 块请求层 …` 那一行（用例没跑到结论，或被改名）"]
     bad: list[str] = []
-    for tag in ("ok1", "ok2", "ok3", "ok4", "ok5", "okc"):
+    for tag in ("ok1", "ok2", "ok3", "ok4", "ok5", "okc", "okk"):
         if m.group(tag) != "true":
             bad.append(f"块请求层 {tag}={m.group(tag)}（期望 true）")
-    want = {"req": 6, "sec": 7, "to": 1, "can": 1, "ref": 2}
+    want = {"req": 7, "sec": 8, "to": 1, "can": 1, "ref": 2}
     for tag, n in want.items():
         if int(m.group(tag)) != n:
             bad.append(f"块请求层增量 {tag}={m.group(tag)}，期望 {n}"

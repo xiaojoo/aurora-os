@@ -80,6 +80,11 @@ impl Block for PartitionView<'_> {
         self.inner.read_sectors(abs, dst)
     }
 
+    /// 分区不是一台盘：身份原样取内层（ADR-113）。同一个口上的两个分区落同一桶。
+    fn disk_key(&self) -> DiskKey {
+        self.inner.disk_key()
+    }
+
     /// 写走**同一套**越界判据（ADR-111 决策 2）：翻译之前拒，否则写会落到下一个分区，
     /// 而"写成功但写到别人家"比"被拒"难看得多。
     fn write_sectors(&self, lba: u64, src: &[u8]) -> Result<(), BlockError> {
@@ -114,6 +119,19 @@ impl BlockError {
 pub const SECTOR_BYTES: usize = 512;
 
 /// 一次能读多少字节由调用方给的缓冲区决定，所以这里只承诺"读完这些扇区"。
+/// 一台块设备的身份（ADR-113）。只用于请求层分桶：`block_io` 的五计数按它各记一份。
+///
+/// 不是句柄/分区身份：`PartitionView` 会把内层盘的身份原样透上来——"同一个口上的两个分区"
+/// 仍算同一台盘（分区级配额是另一件事）。夹具盘（`MemDisk`、ktest 的盘）不各造身份，
+/// 落进 `Unknown` 一桶就够定位。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskKey {
+    Unknown,
+    Ahci(u8),
+    Virtio(u8),
+    Mem,
+}
+
 pub trait Block {
     /// 从 `lba` 开始读 `dst.len() / 512` 个扇区填进 `dst`。
     /// 长度必须是 512 的整数倍且不为 0——不是的话返回 `Refused`，不许静默截断。
@@ -128,6 +146,12 @@ pub trait Block {
     fn write_sectors(&self, lba: u64, src: &[u8]) -> Result<(), BlockError> {
         let _ = (lba, src);
         Err(BlockError::Refused)
+    }
+
+    /// 请求层给这台盘分桶用的身份（ADR-113）。默认"未知"：
+    /// 新增一个夹具/测试盘不必为了编译去编一个假身份，而真驱动一律覆写它。
+    fn disk_key(&self) -> DiskKey {
+        DiskKey::Unknown
     }
 }
 
@@ -176,14 +200,20 @@ impl Block for AhciDisk {
         }
         Ok(())
     }
+
+    fn disk_key(&self) -> DiskKey {
+        DiskKey::Ahci(self.port)
+    }
 }
 
-/// 单设备 virtio-blk 的 `Block` 适配器（AGENTS 缺口 4 / BACKLOG 78h-3 的第一格）。
+/// virtio-blk 的 `Block` 适配器（AGENTS 缺口 4 / BACKLOG 78h-3 的第一格）。
 ///
-/// 只认 `virtio::DEV` 那一台——第二台要先把驱动改成按 BDF 的表（ADR-110 决策 3 的 110-b）。
+/// `index` 是设备表里的槽号（ADR-112 的 BDF 序）：第 0 台是主设备，多台时按槽号各取各的。
 /// 形状与 `AhciDisk` 一样逐扇区；错误按 `VirtioError` 归因，不合并成"设备坏了"一种。
 #[derive(Debug, Clone, Copy)]
-pub struct VirtioDisk;
+pub struct VirtioDisk {
+    pub index: u8,
+}
 
 impl Block for VirtioDisk {
     fn read_sectors(&self, lba: u64, dst: &mut [u8]) -> Result<(), BlockError> {
@@ -191,7 +221,8 @@ impl Block for VirtioDisk {
             return Err(BlockError::Refused);
         }
         for (i, chunk) in dst.chunks_mut(SECTOR_BYTES).enumerate() {
-            virtio::read_block(lba + i as u64, chunk).map_err(virtio_block_err)?;
+            virtio::read_block_at(self.index as usize, lba + i as u64, chunk)
+                .map_err(virtio_block_err)?;
         }
         Ok(())
     }
@@ -201,9 +232,14 @@ impl Block for VirtioDisk {
             return Err(BlockError::Refused);
         }
         for (i, chunk) in src.chunks(SECTOR_BYTES).enumerate() {
-            virtio::write_block(lba + i as u64, chunk).map_err(virtio_block_err)?;
+            virtio::write_block_at(self.index as usize, lba + i as u64, chunk)
+                .map_err(virtio_block_err)?;
         }
         Ok(())
+    }
+
+    fn disk_key(&self) -> DiskKey {
+        DiskKey::Virtio(self.index)
     }
 }
 
@@ -253,6 +289,10 @@ impl Block for MemDisk<'_> {
         }
         dst.copy_from_slice(&self.img[start..end]);
         Ok(())
+    }
+
+    fn disk_key(&self) -> DiskKey {
+        DiskKey::Mem
     }
 }
 

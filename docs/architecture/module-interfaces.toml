@@ -664,9 +664,12 @@ public_api = [
   "vfs::FileStat",
   "vfs::Partition",
   "vfs::PartitionView",
+  "vfs::DiskKey",
   "virtio::VirtioError",
   "virtio::read_block",
   "virtio::write_block",
+  "virtio::read_block_at",
+  "virtio::write_block_at",
 ]
 allowed_callers = ["capability", "diagnostics", "integration", "sched"]
 dependencies = ["arch", "boot", "driver", "irq", "memory", "pci", "time"]

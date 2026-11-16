@@ -13,7 +13,7 @@
 use crate::ahci;
 use crate::filesystem::fat32::FsError;
 use crate::filesystem::gpt;
-use crate::filesystem::vfs::{AhciDisk, Block, BlockError, MemDisk, Partition, PartitionView, SECTOR_BYTES};
+use crate::filesystem::vfs::{AhciDisk, Block, BlockError, DiskKey, MemDisk, Partition, PartitionView, SECTOR_BYTES};
 use crate::filesystem::vfs_ro::{self, Entry, ReadOnlyFs, VfsError};
 use crate::ktest;
 
@@ -1129,6 +1129,8 @@ fn t_block_io_budget() -> bool {
     let img = [0u8; 4 * SECTOR];
     let mut dst = [0u8; 4 * SECTOR];
     let before = block_io::stats();
+    let u_before = block_io::stats_of(DiskKey::Unknown);
+    let m_before = block_io::stats_of(DiskKey::Mem);
 
     // (1) 正常 4 扇区：全落地，无错误。
     let disk = BudgetDisk { img: &img, calls: core::cell::Cell::new(0), fail_at: None, op: None };
@@ -1164,20 +1166,39 @@ fn t_block_io_budget() -> bool {
     let ok5 = read_at(&disk, 0, &mut odd, &Budget::UNBOUNDED).error == Some(BlockError::Refused);
     let ok6 = read_at(&disk, 0, &mut empty, &Budget::UNBOUNDED).error == Some(BlockError::Refused);
 
+    // (6) 分桶（ADR-113）：同一个请求层，换一台盘就该换一个桶。MemDisk 读一扇区，
+    //     Mem 桶涨一格，Unknown 桶一格不动。
+    let mem = MemDisk { img: &img[..SECTOR] };
+    let mut one = [0u8; SECTOR];
+    let ok7 = read_at(&mem, 0, &mut one, &Budget::UNBOUNDED)
+        == Outcome { sectors_done: 1, error: None };
+
     let after = block_io::stats();
     let d_requests = after.requests.wrapping_sub(before.requests);
     let d_sectors = after.sectors_ok.wrapping_sub(before.sectors_ok);
     let d_timeouts = after.timeouts.wrapping_sub(before.timeouts);
     let d_cancels = after.cancels.wrapping_sub(before.cancels);
     let d_refused = after.refused.wrapping_sub(before.refused);
-    let counts_ok = d_requests == 6 && d_sectors == 7 && d_timeouts == 1 && d_cancels == 1 && d_refused == 2;
+    let counts_ok = d_requests == 7 && d_sectors == 8 && d_timeouts == 1 && d_cancels == 1 && d_refused == 2;
+    let u_after = block_io::stats_of(DiskKey::Unknown);
+    let m_after = block_io::stats_of(DiskKey::Mem);
+    let key_ok = u_after.requests.wrapping_sub(u_before.requests) == 6
+        && u_after.sectors_ok.wrapping_sub(u_before.sectors_ok) == 7
+        && u_after.timeouts.wrapping_sub(u_before.timeouts) == 1
+        && u_after.cancels.wrapping_sub(u_before.cancels) == 1
+        && u_after.refused.wrapping_sub(u_before.refused) == 2
+        && m_after.requests.wrapping_sub(m_before.requests) == 1
+        && m_after.sectors_ok.wrapping_sub(m_before.sectors_ok) == 1
+        && m_after.timeouts == m_before.timeouts
+        && m_after.cancels == m_before.cancels
+        && m_after.refused == m_before.refused;
 
     crate::log_info!(
-        "vfs-ro: 块请求层 正常={} 半途={} 死线={} 取消={} 形状={} 计数={} 增量 requests={} sectors={} timeouts={} cancels={} refused={}",
-        ok1, ok2, ok3, ok4, ok5 && ok6, counts_ok,
+        "vfs-ro: 块请求层 正常={} 半途={} 死线={} 取消={} 形状={} 计数={} 分桶={} 增量 requests={} sectors={} timeouts={} cancels={} refused={}",
+        ok1, ok2, ok3, ok4, ok5 && ok6, counts_ok && key_ok, ok7,
         d_requests, d_sectors, d_timeouts, d_cancels, d_refused
     );
-    ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && counts_ok
+    ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && counts_ok && key_ok
 }
 
 ktest!(KT_BLOCK_IO_BUDGET, t_block_io_budget);
