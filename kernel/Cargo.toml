@@ -173,6 +173,9 @@ fbcon-live = ["framebuffer", "ps2-kbd"]
 # 内核数 `irq::by_cpu()` 的槽分布，宿主机拿 `-d int` 里 `SP` 的高位分 BSP／非 BSP（BACKLOG 68e 那条）。
 # 不进正常构建：它会把目的地挪走，而第 28 行的"非 BSP 必须为 0"读的是常态形状。
 irq-affinity-probe = []
+# 诊断（BACKLOG §377）：每条用例开始前打一行 `[ktest] start <name>`。
+# **不进任何变体/矩阵**：串口量是被测量的量（§12.4.1），这条只给"链中停住"定位用。
+ktest-trace = []
 # 变体（ADR-112 / ADR-110 决策 3 的 110-b）：挂两台 virtio-blk，证"设备表化"真的能并行。
 # 单独一档：老行 22/33/MSI-X 只认第 0 台，两台同挂会改它们的设备集。
 virtio-two-probe = ["virtio-blk"]

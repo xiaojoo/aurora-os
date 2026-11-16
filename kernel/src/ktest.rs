@@ -63,6 +63,8 @@ pub fn run_all(checkpoint: fn(&'static str) -> bool) -> Summary {
     let mut passed = 0usize;
     let mut failed = 0usize;
     for t in tests {
+        #[cfg(feature = "ktest-trace")]
+        serial::line("ktest", format_args!("start {}", t.name));
         let ok = (t.run)();
         if ok {
             passed += 1;

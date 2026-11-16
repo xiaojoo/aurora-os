@@ -1512,9 +1512,13 @@ fn t_handle_vmo_release() -> bool {
 ktest!(KT_HANDLE_VMO_RELEASE, t_handle_vmo_release);
 #[cfg(feature = "handles")]
 fn kinds_sleep() -> ! {
-    // 只存在、不需要跑：C4 判的是"槽里有没有这条线程"，不是它有没有收工
+    // 只存在、不需要跑：C4 判的是"槽里有没有这条线程"，不是它有没有收工。
+    // **但必须合作让出**：它生来 Runnable，`t_handle_kinds` 在 terminate 之前会经过带 window
+    // 的锁等待；那一下的 tick 可能把它调度上来，而内核任务自带 IF=0 —— 不主动让出就再也
+    // 抢不回来，整机静默（与 `tr_worker` 同一条成因，BACKLOG §377）。
     loop {
         crate::tsc::spin(2000);
+        crate::sched::yield_now();
     }
 }
 
@@ -1682,10 +1686,16 @@ fn t_handle_kinds() -> bool {
 #[cfg(feature = "handles")]
 ktest!(KT_HANDLE_KINDS, t_handle_kinds);
 /// 一个只自旋、自己不会收工的工人：给 `block_task`/`wake_task` 当被试对象。
+///
+/// **必须合作让出**：这条任务生来 Runnable，而 `t_handle_transfer` 在 `block_task` 之前
+/// 会经过带 window 的锁等待——那一下的 tick 完全可能把它调度上来。它自带 IF=0（内核任务
+/// 的 IF 随任务），一个不主动让出的无限自旋就再也不会被抢占 ⇒ 整机静默（§377 的 QMP 现场：
+/// BSP RIP 落在 `tsc::spin`、IF=0、AP 全在 hlt）。`yield_now` 走 `int 0xF0`，不需要 IF。
 #[cfg(feature = "handles")]
 fn tr_worker() -> ! {
     loop {
         crate::tsc::spin(2_000);
+        crate::sched::yield_now();
     }
 }
 
