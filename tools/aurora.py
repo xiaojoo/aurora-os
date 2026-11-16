@@ -422,10 +422,13 @@ FAT_PORTS = {3: "fat32-small", 4: "fat32-wide"}
 # 是为了 `fs-open` 与 FAT 探针同跑时两块卷能并存（此前靠 QEMU 参数顺序，那是不可歧义的接线反面）。
 FS_OPEN_FEATURES = {"fs-open"}
 FS_OPEN_PORTS = {5: "fat32-deep"}
-# ADR-111：写方向单独一档，挂在**可写**卷上（口 6）。它与 `FS_OPEN_PORTS` 一样要与内核的
-# `fs_open::RW_PORT` 对账（`check-fat32-ports` 里那一格扩成两张表）。
+# ADR-111：写方向单独一档，挂在**可写**卷上（口 4）。它与 `FS_OPEN_PORTS` 一样要与内核的
+# `filesystem/fs_rw.rs` 的 `PORT` 对账（`check-fat32-ports` 里那一格扩成两张表）。
+# 为什么不是 6：q35 的 ich9-ahci 只映射 ide 0..5，`index=6` 直接"不支持"；这一档不编 FAT 探针，
+# 口 4 空着就用它——不新造一条没量过的挂线方式。
 FS_RW_FEATURES = {"fs-rw"}
-FS_RW_PORTS = {4: "fat32-rw"}
+FS_RW_NAME = "fat32-rw"
+FS_RW_PORTS = {4: FS_RW_NAME}
 # 内核声明"要读哪几个文件"。这张表有两个用处，缺一不可：
 # 1 宿主机这台仪器只走这几个名字的链——卷B 上那个 34,603,008 字节的 FILLER.BIN 没有任何
 #   一条判据读它，跟着算哈希会让对账先挂死（本轮实测：一次 3,400 万次的逐字节循环）。
@@ -2458,6 +2461,29 @@ def check_fat32_ports() -> list[str]:
     for port, name in sorted(FAT_PORTS.items()):
         if port in taken:
             bad.append(f"口 {port} 已被 {taken[port]} 占用，却又要挂 {name}")
+    # ADR-111：写方向的挂载口同样两处各写一份（内核 `filesystem/fs_rw.rs` 的 `PORT` 与本脚本的
+    # `FS_RW_PORTS`）。口号接错 ⇒ 写方向挂在只读判据的多级卷上（当场写坏它的 sha256 判据），
+    # 或与 fs-open 的口撞上（同一跑两块卷只能有一块赢），两种都表现为"写成功、宿主机对不上"。
+    # 口 4 与 FAT 卷B 同号是**按变体错开的**：fs-rw 不编 fat32-probe，反向组合由 run 侧的
+    # `接线不可歧义` 闸拒——所以这一格不把"口在 FAT_PORTS 里"当红。
+    rsrc = (ROOT / "kernel" / "src" / "filesystem" / "fs_rw.rs").read_text(encoding="utf-8")
+    rm = re.search(r"^pub const PORT: u8 = (\d+);", rsrc, re.M)
+    if rm is None:
+        bad.append("filesystem/fs_rw.rs 里找不到模块层的 `pub const PORT`（挪进函数体了？两处各写一份就会分家）")
+    else:
+        port = int(rm.group(1))
+        if port not in FS_RW_PORTS:
+            bad.append(f"fs-rw 挂载根：内核用口 {port}，本脚本 FS_RW_PORTS 只有 {sorted(FS_RW_PORTS)}")
+        elif FS_RW_PORTS[port] != FS_RW_NAME:
+            bad.append(f"fs-rw 挂载根：口 {port} 挂的是 `{FS_RW_PORTS[port]}`，而写方向要的是 `{FS_RW_NAME}`")
+        if port in FS_OPEN_PORTS:
+            bad.append(f"fs-rw 挂载根口 {port} 与 fs-open 的挂载根撞了 ⇒ 同一跑两块卷只能有一块赢")
+        if port in taken:
+            bad.append(f"fs-rw 挂载根口 {port} 已被 {taken[port]} 占用")
+    if len(FS_RW_PORTS) != 1:
+        bad.append("FS_RW_PORTS 只该有一张可写卷，多出来的是没人认领的判据")
+    if not FAT_RW_SCRIPT.exists():
+        bad.append(f"可写卷配方缺失：{FAT_RW_SCRIPT.relative_to(ROOT)}")
     # W4 S1（ADR-078 决策 7）：GPT 夹具盘的口号同样两处各写一份，必须机器对账。
     # 它**不能**撞引导盘（口 0）——负样本的全部意义就在于"改的是一块固件不碰的盘"，
     # 撞上去就回到实测过的那个死路：EDK2 用备份表把主表修回去，注入到不了内核。
@@ -3597,7 +3623,7 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
                 sys.exit(f"口 {port} 同时被 FAT 卷 {old} 与 FS-03 卷 {name} 占用；接线不可歧义")
             wanted_volumes[port] = name
     if FS_RW_FEATURES & set(features):
-        # 写方向那块卷单独挂口 6；它与 FS-03 的多级卷不共用口号（5 是只读判据的根）。
+        # 写方向那块卷单独挂口 4；它与 FS-03 的多级卷不共用口号（5 是只读判据的根）。
         for port, name in list(FS_OPEN_PORTS.items()) + list(FS_RW_PORTS.items()):
             old = wanted_volumes.get(port)
             if old is not None and old != name:

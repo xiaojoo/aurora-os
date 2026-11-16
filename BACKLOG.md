@@ -14388,3 +14388,110 @@ P7 句柄授错主人必须红     : FAIL(rc=35) 期望 FAIL(rc=35) -> 符合
 2. 在**只含这些改动**的树上重跑 `check` + 整链 —— 那才是合并前的那份读数；
 3. 全绿后按 COORD §5 合并 `feat/wb-dev`（合并态再跑一次）。
 在此之前，"量具修复是否可合并"这个问题**没有答案**，不能拿 57/4 去说它坏。
+
+## 358. 纯净树验证连撞三次**环境管道**；把两根管道写下来（2026-11-16）
+
+`H:/aurora-os-verify`（`verify/fs-write` = `70c73f3`）想跑 `check` + 整链，三次都死在跑之前：
+
+1. **`build/` 不存在**（gitignore 的空目录）：`… > build/check-verify.txt` 的**重定向先失败**，
+   整条命令静默没执行——"脚本跑完了"不等于"跑过了"，这一条要记。
+2. **`.tools/` 不在**：`aurora.py` 按 `ROOT`（worktree）找工具链，`qemu`/`cargo` 都在主树的
+   `.tools` 里、且是 gitignore 的 ⇒ 新 worktree 天然没有。
+3. 补 `mkdir -p build` 后，`mklink /J` 建目录联接**被拒**（"当文件已存在时，无法创建该文件"）：
+   `.tools` 已被前一次失败的 `mklink` 落成一个空目录，`rmdir` 之后仍报同一句
+   （GBK 乱码，`cmd //c` 的引号/路径形态还要再试）。
+
+**所以"量具修复能否合并"这一问，今天仍然没有读数**；不是代码红，是仪器没起来。
+
+**给下一个人的确切配方**（在 worktree 建后、跑任何 `aurora.py` 之前）：
+```bash
+cd /h/aurora-os-verify
+mkdir -p build
+# 先确认没有同名目录残留，再建联接（路径写绝对、用 MKLINK 的 /J）
+[ -e .tools ] && rmdir .tools
+cmd //c mklink /J "H:urora-os-verify\.tools" "H:urora-os\.tools"
+ls .tools/qemu/qemu-system-x86_64.exe     # 这一步必须能列出
+```
+这三步应当写进 COORD.md 的"建 worktree"一节——workbuddy 那棵 `H:/aurora-os-wb` 也会撞上同一面墙
+（除非他已经在里面编过、`.tools` 早就在了）。
+
+**已有的读数（主树，可用）**：`fs-open` 双跑 PASS(33)、`fs-rw` PASS(33) 97/97、默认档 PASS(33)、
+`check 17/17`。**混入树的 57/4 不作数**（§357）。
+
+## 359. 23 号的帧级判据重写：§354 的成因**不是清表**，是漏关了两格（2026-11-16）
+
+- 去翻了撤回那一跑的串口（`build/run-2602.log` / `run-2603.log`），形状与 §354 记的不一样：
+  `t_fs_rw_syscall23` 本身是 `ok`，但从它之后**每一条**用例的收尾检查都在红：
+  `用例收尾不变量破坏：test=… 之后仍有 2 个句柄没关（close 或 revoke_task）`，一直红到链尾；
+  `ktests: total=98 passed=95 failed=42` 里的 42 就是这批收尾红。所以"`reset_for_test()` 把别人的
+  句柄作废了"这句话**没有证据**——别的用例全都 `ok`；真正的原因是这一格授了两个句柄、**没关**。
+  §354 的成因段改正，教训保留：全局表现要读那条"谁留下的"fatal，不要拿"我调过什么"顶替现场。
+- 重写：不碰 `reset_for_test`；授两个句柄（`/LOG.TXT` 拿 `RIGHT_READ|RIGHT_WRITE`，`/DATA.BIN`
+  只拿 `RIGHT_READ`），用户页用 `ktests/common.rs` 那套，跑完**各自经 8 号 close**，并断言
+  `handle::used()==0`。写目标是 `[4,8)`，刻意避开 `t_fs_rw_write` 的 `[8,12)`，两条用例不依赖链接顺序。
+- 判据（一次跑完，串口一行）：`写4=4 空写=-1 越EOF=-1 只读句柄=-4 坏指针=-2 读回=64 内容对=true
+  基线=true 关=true 关后活=0`。其中"越 EOF"与"坏指针"两格各多一句：**票作废后游标不提交**
+  （从失败位置重读到的仍是原字节）。
+- 变异证红：把 `vfs_ro::write_at` 改成"过完边界直接 `return Ok(src.len())`、不落盘" ⇒
+  `t_fs_rw_syscall23` 的 `内容对=false`，`t_fs_rw_write`/`t_vfs_ro_write` 同红，`ktests 95/98`；
+  还原后 98/98。**新判据会咬"写没落盘"这件事**，不是只咬返回值。
+- 读数（还原后的树，ELF `bdfba282d5d2`）：`run --features fs-rw` = **PASS(33)**、ktests **98/98**、
+  收尾不变量零条；同轮 `run`（默认档）PASS(33) `ab0aa1fd1041`、`run --features fs-open`
+  PASS(33) `e49b3c0b1464`。
+
+### 359 附：`check-fat32-ports` 补齐 `FS_RW_PORTS` 对账
+
+- 之前只对了 `FS_OPEN_PORTS`；`fs_rw.rs` 的 `PORT` 与本脚本的 `FS_RW_PORTS` 各写一份却没有闸。
+  新增四条：口在表里、表里挂的是 `FS_RW_NAME`、口不许撞 `FS_OPEN_PORTS`（`fs-rw` 同跑两块卷）、
+  口不许撞保留口（0/2）；再加"表只该有一张""配方脚本在位"。
+- **口 4 与 FAT 卷B 同号不当红**：`fs-rw` 不编 `fat32-probe`，反向组合由 `run` 侧的"接线不可歧义"拒。
+  第一版把它写成红，`check` 自己先红——闸写错了也会像被测物坏了。
+- 变异证红三连（各自单独造错、还原）：内核口 4→3 ⇒"内核用口 3，本脚本只有 [4]"；内核口→5 且表
+  `{5}` ⇒"与 fs-open 的挂载根撞了"；表加一格 `6` ⇒"只该有一张可写卷"。三次都红，还原后 `check` **17/17**。
+- 顺手把两处仍写"口 6"的注释（`fs_rw.rs` 模块头、`aurora.py` 挂盘段）与 ADR-111 决策 3 改成口 4，
+  并把"为什么不是 6"留在原地。
+
+**仍未做（记在这里，别当成已交付）**：
+1. `fs-rw` 没有**判定行**：`do_test` 里没有它，ADR-111 决策 3 要求的"宿主机按 FAT 规范独立解析
+   改过的镜像、逐字节比对"这台仪器不存在。今天只有内核侧自比（读回）+ 用例的 `used()==0`。
+2. 块设备失败仍映射 `-2`（`handle_err` 的旧口径），不是 ADR-108 未决要的 `-7=EIO`。
+3. ADR-110 的请求层（`block_io::read_at` + 五计数）当时**未开工**；本日随后按拍板落地，见 §360。
+
+## 360. ADR-110 落地：block_io 请求层 + 五计数，16 处调用点一次接（2026-11-16）
+
+- 拍板（用户裁决）：请求层在 `Block` 之上；deadline 用 **tick 传值**（`Budget.clock: fn() -> u64`，
+  `deadline == u64::MAX` 时一次都不调）；**全部**生产调用点一次接入（原草案只接一条链）。
+- 新模块 `filesystem/block_io.rs`：`read_at(disk, lba, dst, &Budget) -> Outcome` 逐扇区提交，
+  先判取消、再判死线、再下发；取消与死线都只在扇区边界生效；盘错误原样带出。`read_checked`
+  是既有调用点用的薄包装（只把 `Outcome.error` 摊回 `Result`，计数/取消/死线仍在 `read_at` 里）。
+- 计数：requests / sectors_ok / timeouts / cancels / refused，**只有一份**（ADR 写的"每块盘一份"
+  落不了地：`Block` 没有身份；等 virtio 那刀再分桶）。形状被拒算一次 requests、只入 refused、不碰盘。
+- 接入面：fat32 七处、vfs_ro 五处、gpt 四处 = 16 处。`PartitionView`/`TestDisk` 是实现不是调用点
+  （转发/委托），不塞进去——会重复计数、逐扇区绕两圈。
+- 判据 `t_block_io_budget`（fs-ro 档）：正常 4 扇区 / 第 3 扇区 DeviceError（sectors_done=2）/
+  死线 0（sectors_done=0、NotSettled）/ 取消一次后停（sectors_done=1、Refused）/ 511 字节与空缓冲
+  被拒。五计数按**增量**判：requests=6 sectors=7 timeouts=1 cancels=1 refused=2。
+- 变异证红三连：`bounded=false` ⇒ 死线=false；取消判断改 `if false` ⇒ 取消=false；
+  `Err(_) => {}` 吞盘错 ⇒ 半途=false。三次都红（各 87/88），还原后 88/88。
+- 读数：`run --features fs-ro` PASS(33) ktests 88/88（ELF `373cb31d9b6e`）；default `2827c2597a1e`、
+  fs-rw `ad2a4bfc6a0c`、gpt-probe `d7b371c9d840` 全 PASS(33)；fs-open 首跑红、同一 ELF
+  `d269a87e67ea` 复跑 PASS(33) 97/97 ⇒ 环境形状，**不归因**（`fs-open-ring3` 探针槽=0 的老偶发，
+  与 §355 同族）。`check` 17/17。
+- **fat32-probe 的红是既有的**：`卷1 HELLO.ELF 大小=17288 … 该到簇数=64 该到尾格=416 目录对=false
+  链对=false`，run-2791…2798（本轮改动之前）逐字相同。成因：70c73f3 把两卷里的 hello.elf 换成
+  17,288 字节，`ktests/fs.rs` 的 `Want` 表还写着 32_672（⇒ 64 簇/416 尾）。**本轮未改**——
+  改期望数要先用宿主机按 FAT 规范把卷里那份文件再量一遍（那是下一刀，不是"顺手"）。
+- 门禁侧：`check-module-interfaces` 先报三条漏登记，已登记 `filesystem/block_io`、`block_io::Budget`、
+  `block_io::read_checked` 与 `t_block_io_budget`。另一条红是**量具自身**：短名匹配把
+  `use core::sync::atomic::…` 算成 storage→sync 的真边。实测该"边"原先登记的 12 站**全部**是
+  core::sync（ahci 1 + virtio 11），也就是说 `storage.dependencies` 里的 `sync` 从来不存在。
+  全局修它要重算十几个模块的 dependencies/allowed_callers 与环基线（试过一次，当场红出 20+ 条），
+  **不在本刀**；本轮按既有口径把棘轮 12→13 并写明这 1 站是误撞。量具欠账：建议单独一刀只改匹配、
+  再按实测收紧基线。
+
+**仍未做**：
+1. 「块请求层」没有**判定行**：`do_test` 里没有它，宿主机也没有第二台仪器能读这五个数。
+2. 块设备失败仍映射 `-2`（`handle_err` 旧口径），不是 ADR-108 未决要的 `-7=EIO`。
+3. 计数仍是全局一份（等 `Block` 有身份/分桶）。
+4. 整链矩阵未跑：树里混着别人的 `shell.elf` 在途改动，按 §357/§358 那种成分不纯的树，
+   矩阵读数不归因。

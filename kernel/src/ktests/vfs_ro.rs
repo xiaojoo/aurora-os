@@ -1089,3 +1089,95 @@ ktest!(KT_VFS_RO_FAT32, t_vfs_ro_fat32);
 ktest!(KT_VFS_RO_WRITE, t_vfs_ro_write);
 ktest!(KT_VFS_RO_LFN, t_vfs_ro_lfn);
 ktest!(KT_VFS_RO_ESP, t_vfs_ro_esp);
+
+// ---------------------------------------------------------------- ADR-110：块请求层
+/// 可编排的盘：第 `fail_at` 次读（从 0 数）返回 `DeviceError`；读完第 `cancel_at` 次后把
+/// 取消位置起——模拟"驱动还在读的时候调用方改了主意"，取消只能在**下一个扇区边界**生效。
+struct BudgetDisk<'a> {
+    img: &'a [u8],
+    calls: core::cell::Cell<u32>,
+    fail_at: Option<u32>,
+    op: Option<(u32, &'a core::sync::atomic::AtomicBool)>,
+}
+
+impl Block for BudgetDisk<'_> {
+    fn read_sectors(&self, lba: u64, dst: &mut [u8]) -> Result<(), BlockError> {
+        let n = self.calls.get();
+        if self.fail_at == Some(n) {
+            return Err(BlockError::DeviceError);
+        }
+        if let Some((k, flag)) = self.op {
+            if n + 1 >= k {
+                flag.store(true, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        self.calls.set(n + 1);
+        MemDisk { img: self.img }.read_sectors(lba, dst)
+    }
+}
+
+fn zero_tick() -> u64 {
+    0
+}
+
+/// ADR-110 的三条语义各一格：半途失败时 `sectors_done` 停在真落地的那几个、死线在扇区边界
+/// 立刻停、取消只在边界生效；形状被拒不碰盘。五计数按**增量**判（别的用例也在用这块层）。
+fn t_block_io_budget() -> bool {
+    use crate::filesystem::block_io::{self, Budget, Outcome, read_at};
+    use core::sync::atomic::AtomicBool;
+
+    let img = [0u8; 4 * SECTOR];
+    let mut dst = [0u8; 4 * SECTOR];
+    let before = block_io::stats();
+
+    // (1) 正常 4 扇区：全落地，无错误。
+    let disk = BudgetDisk { img: &img, calls: core::cell::Cell::new(0), fail_at: None, op: None };
+    let ok1 = read_at(&disk, 0, &mut dst, &Budget::UNBOUNDED)
+        == Outcome { sectors_done: 4, error: None };
+
+    // (2) 第 3 个扇区（i=2）设备报错：前两格已落地，错误原样带出（不合并成"整条没发"）。
+    let bad = BudgetDisk { img: &img, calls: core::cell::Cell::new(0), fail_at: Some(2), op: None };
+    let ok2 = read_at(&bad, 0, &mut dst, &Budget::UNBOUNDED)
+        == Outcome { sectors_done: 2, error: Some(BlockError::DeviceError) };
+
+    // (3) 死线 0：第一扇区下发之前就停，一个都没落地。
+    let never = AtomicBool::new(false);
+    let deadline0 = Budget { deadline: 0, clock: zero_tick, cancel: &never };
+    let ok3 = read_at(&disk, 0, &mut dst, &deadline0)
+        == Outcome { sectors_done: 0, error: Some(BlockError::NotSettled) };
+
+    // (4) 取消：盘在自己的读里把旗置起 ⇒ 第二扇区不再下发（第一扇区已经落地）。
+    let cancel = AtomicBool::new(false);
+    let slow = BudgetDisk {
+        img: &img,
+        calls: core::cell::Cell::new(0),
+        fail_at: None,
+        op: Some((1, &cancel)),
+    };
+    let cancel_budget = Budget { deadline: u64::MAX, clock: zero_tick, cancel: &cancel };
+    let ok4 = read_at(&slow, 0, &mut dst, &cancel_budget)
+        == Outcome { sectors_done: 1, error: Some(BlockError::Refused) };
+
+    // (5) 形状：非整扇区与空缓冲都被拒，不碰盘。
+    let mut odd = [0u8; SECTOR - 1];
+    let mut empty: [u8; 0] = [];
+    let ok5 = read_at(&disk, 0, &mut odd, &Budget::UNBOUNDED).error == Some(BlockError::Refused);
+    let ok6 = read_at(&disk, 0, &mut empty, &Budget::UNBOUNDED).error == Some(BlockError::Refused);
+
+    let after = block_io::stats();
+    let d_requests = after.requests.wrapping_sub(before.requests);
+    let d_sectors = after.sectors_ok.wrapping_sub(before.sectors_ok);
+    let d_timeouts = after.timeouts.wrapping_sub(before.timeouts);
+    let d_cancels = after.cancels.wrapping_sub(before.cancels);
+    let d_refused = after.refused.wrapping_sub(before.refused);
+    let counts_ok = d_requests == 6 && d_sectors == 7 && d_timeouts == 1 && d_cancels == 1 && d_refused == 2;
+
+    crate::log_info!(
+        "vfs-ro: 块请求层 正常={} 半途={} 死线={} 取消={} 形状={} 计数={} 增量 requests={} sectors={} timeouts={} cancels={} refused={}",
+        ok1, ok2, ok3, ok4, ok5 && ok6, counts_ok,
+        d_requests, d_sectors, d_timeouts, d_cancels, d_refused
+    );
+    ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && counts_ok
+}
+
+ktest!(KT_BLOCK_IO_BUDGET, t_block_io_budget);

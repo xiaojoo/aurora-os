@@ -1,6 +1,7 @@
 # ADR-110：块设备请求层（deadline / 取消 / 完成通知）与 virtio-blk 的第一刀
 
-状态：**提议**（2026-11-16 起草。等拍板；采纳前不动 `Block` 接口，也不动 virtio 的设备表）。
+状态：**采纳**（2026-11-16 起草；同日拍板：请求层在 `Block` 之上、deadline 用 **tick 传值**、
+全部调用点一次接入。实现见 `filesystem/block_io.rs` 与 BACKLOG §360）。
 关联：ADR-078（AHCI 分片与分区视图）、ADR-107（只读 VFS）、ADR-108（未决：块设备失败没有 `-7=EIO`）、
 BACKLOG 78h-3（virtio-blk 的 `Block` 实现与它的理由）、AGENTS.md 里程碑缺口 4。
 
@@ -39,7 +40,10 @@ pub fn read_at(disk: &dyn Block, lba: u64, dst: &mut [u8], budget: &Budget) -> O
 3. **错误归因不合并**：`Outcome.error` 原样带 `BlockError`，`sectors_done` 与它一起上报；
    上层（句柄层）再用 ADR-108 的映射表把它变成 `-7 EIO`。
 
-计数（每块盘一份，`AtomicU64`）：`requests / sectors_ok / timeouts / cancels / refused`。
+计数（`AtomicU64`）：`requests / sectors_ok / timeouts / cancels / refused`。
+**落地第一版只有一份**，不是这里写的"每块盘一份"：`Block` 没有身份，`read_at` 拿不到
+"这块盘是谁"；凭空造一个 id 没有调用方会填对。等 virtio-blk/`Block` 有了按 BDF 的身份再分桶。
+"形状被拒"算一次 `requests`（它是"试过"），只计入 `refused` 而不碰盘。
 判定行读这五个数，不读串口里的字符串。
 
 ### 决策 2：`Block` 接口这一刀**只加 `write_sectors`**，S2 复用同一层
@@ -56,20 +60,24 @@ MSI-X 变体的取证形状。那一刀需要：`DEV` 表化 + 两台设备并�
 
 ## 后果
 
-- 读路径（`fat32.rs` 七处、`vfs_ro.rs` 四处、`gpt.rs` 四处）**先只接 `vfs_ro`/`fs_open` 这一条链**：
-  让它带上 `Budget` 之后，判据能问"超时那次落了多少扇区"。其余调用点保持直接调 `Block`，
-  它们没有 deadline 需求（引导期 GPT/FAT 探测是一次性的）。
+- 调用点**一次接完**（2026-11-16 拍板；原草案只接一条链）：`fat32.rs` 七处、`vfs_ro.rs` 五处、
+  `gpt.rs` 四处，共 16 处，全部经 `block_io::read_checked(…, &Budget::UNBOUNDED)` 走请求层；
+  计数因此覆盖全部生产读。`PartitionView` 与 `TestDisk` 是**实现**（转发/委托给另一个 Block），
+  不是调用点，保持原样——把它们也塞进请求层会重复计数并逐扇区绕两圈。
 - `BlockError` 不新增变体（`Refused` 复用为"取消"）——新增变体会让现有 7 个 `tag()` 与两张映射表
   同时变宽；等 S2 有真实写失败用例时再议。
-- 判定行：新增一行"块请求层：超时/取消/半途"（`fs-ro` 档内跑，`TestDisk` 注入第 N 扇区失败），
-  期望 PASS，配两条负样本：死线设成 0（必须立刻 `NotSettled` 且 `sectors_done=0`）、
-  取消在中途（必须停在扇区边界）。
+- 判据（已落地，`fs-ro` 档）：`t_block_io_budget` 用可编排的盘测"半途失败/死线 0/中途取消/
+  两种形状被拒"四格 + 五计数的**增量**。三条变异各证红一次（不判死线、不判取消、吞掉盘错误）。
+  **判定行还没加**：`do_test` 里没有"块请求层"这一行，宿主机侧也没有第二台仪器可读这五个数。
+
+- 落地代价一条：`check-module-interfaces` 的短名匹配把 `use core::sync::atomic::…` 记成
+  storage→sync 的一站（该族每一站都是这个误撞，不是真环边），棘轮因此 12→13。
+  量具欠账见 BACKLOG §360，**不在本 ADR 里顺带重修**。
 
 ## 未决
 
-1. `Budget.deadline_tsc` 用 TSC 还是 tick？TSC 在 qemu 下不稳（本仓库多处注明），
-   倾向 tick；但 `Block` 层拿不到 `ticks()`，要么传值进来（当前写法），要么把时钟注入成参数。
-   本 ADR 按"传值"写，等第一版读数出来再定。
+1. ~~`Budget.deadline_tsc` 用 TSC 还是 tick？~~ **已裁（2026-11-16）：tick**，由调用方把
+   "读 tick 的函数"放进 `Budget`；`block_io` 不依赖 `sched`，全不设死线时该函数不被调用。
 2. 完成通知：本 ADR **不**承诺回调/工作队列，只承诺 `Outcome`。（真正的异步要等中断驱动，
    那是 110-b 之后的事；现在就加回调等于给一个没有异步的地方造异步。）
 3. `MemDisk` 是否也该走请求层（判据更一致）还是继续"直连以标定基线"（当前 `TestDisk`

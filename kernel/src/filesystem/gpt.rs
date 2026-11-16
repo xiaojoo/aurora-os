@@ -15,6 +15,7 @@
 //! 3. **找到也不提前退出**。CRC 必须覆盖整个数组，提前退出就等于没核完整性 ——
 //!    `find_by_type` 因此照样扫完，只是不再往回调里记第二条。
 
+use crate::filesystem::block_io;
 use crate::filesystem::vfs::{Block, BlockError, SECTOR_BYTES};
 
 /// 保护性 MBR 在整盘 LBA0。
@@ -249,11 +250,11 @@ fn parse_entry(b: &[u8], index: u32) -> Entry {
 /// 不分配内存；失败不升 L4、不 panic，`BlockError` 原样带上去。
 pub fn scan(disk: &dyn Block, visit: &mut dyn FnMut(&Entry)) -> Result<Table, GptError> {
     let mut sector = [0u8; SECTOR_BYTES];
-    disk.read_sectors(MBR_LBA, &mut sector).map_err(GptError::Io)?;
+    block_io::read_checked(disk, MBR_LBA, &mut sector, &block_io::Budget::UNBOUNDED).map_err(GptError::Io)?;
     if !protective_mbr(&sector) {
         return Err(GptError::NoProtectiveMbr);
     }
-    disk.read_sectors(HEADER_LBA, &mut sector).map_err(GptError::Io)?;
+    block_io::read_checked(disk, HEADER_LBA, &mut sector, &block_io::Budget::UNBOUNDED).map_err(GptError::Io)?;
     let header = parse_header(&sector)?;
 
     // 先验上界再用：这三个数都来自盘上，照着它们去读/开缓冲就是 BACKLOG 61a 那种死法。
@@ -279,7 +280,7 @@ pub fn scan(disk: &dyn Block, visit: &mut dyn FnMut(&Entry)) -> Result<Table, Gp
     let mut index = 0u32;
     let mut used = 0u32;
     while remaining > 0 {
-        disk.read_sectors(lba, &mut sector).map_err(GptError::Io)?;
+        block_io::read_checked(disk, lba, &mut sector, &block_io::Budget::UNBOUNDED).map_err(GptError::Io)?;
         let take = remaining.min(SECTOR_BYTES);
         crc = crc32_update(crc, &sector[..take]);
         // 条目可以跨扇区（entry_size 不必整除 512），所以装够一条才解析、然后清空重装。
@@ -306,7 +307,7 @@ pub fn scan(disk: &dyn Block, visit: &mut dyn FnMut(&Entry)) -> Result<Table, Gp
         return Err(GptError::ArrayCrc { want: header.array_crc, got: crc });
     }
 
-    disk.read_sectors(header.alternate_lba, &mut sector).map_err(GptError::Io)?;
+    block_io::read_checked(disk, header.alternate_lba, &mut sector, &block_io::Budget::UNBOUNDED).map_err(GptError::Io)?;
     if &sector[0..8] != b"EFI PART" {
         return Err(GptError::BackupSignature);
     }

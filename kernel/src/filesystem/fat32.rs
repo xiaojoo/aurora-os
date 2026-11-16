@@ -34,6 +34,7 @@
 //! FAT 得先有 GPT 分区这一层，且那份是固定根目录的 FAT16 形状）、通用 VFS 门面（inode/dentry）。
 //! 这些都记在 BACKLOG 78 的欠账里。
 
+use super::block_io;
 use super::vfs::{Block, BlockError, FileStat, SECTOR_BYTES};
 
 // ---------------------------------------------------------------- BPB 偏移（引导扇区，512 字节）
@@ -381,7 +382,7 @@ impl<'a> Volume<'a> {
     /// 上层读数之前就红，否则后面每一格数都是从错的基准上算出来的。
     pub fn mount(disk: &'a dyn Block) -> Result<Volume<'a>, FsError> {
         let mut bs = [0u8; SECTOR_BYTES];
-        disk.read_sectors(0, &mut bs).map_err(FsError::Io)?;
+        block_io::read_checked(disk, 0, &mut bs, &block_io::Budget::UNBOUNDED).map_err(FsError::Io)?;
         let bpb = parse_boot_sector(&bs)?;
         let mut info = [0u8; SECTOR_BYTES];
         let is16 = bpb.fat_type == FatType::Fat16;
@@ -391,7 +392,7 @@ impl<'a> Volume<'a> {
         let (lead, struct_sig, free_clusters, next_free, backup_same) = if is16 {
             (0u32, 0u32, 0u32, 0u32, false)
         } else {
-            disk.read_sectors(u64::from(bpb.fsinfo_sector), &mut info)
+            block_io::read_checked(disk, u64::from(bpb.fsinfo_sector), &mut info, &block_io::Budget::UNBOUNDED)
                 .map_err(FsError::Io)?;
             let lead = u32_at(&info, 0);
             let struct_sig = u32_at(&info, OFF_FSINFO_STRUCT);
@@ -400,7 +401,7 @@ impl<'a> Volume<'a> {
                 return Err(FsError::FsinfoSignature { lead, struct_sig, trail });
             }
             let mut backup = [0u8; SECTOR_BYTES];
-            disk.read_sectors(u64::from(bpb.backup_boot_sector), &mut backup)
+            block_io::read_checked(disk, u64::from(bpb.backup_boot_sector), &mut backup, &block_io::Budget::UNBOUNDED)
                 .map_err(FsError::Io)?;
             let mut first_diff = None;
             for i in 0..SECTOR_BYTES {
@@ -443,7 +444,7 @@ impl<'a> Volume<'a> {
         let byte_off = cluster as usize * v.fat_entry_bytes;
         let lba = v.reserved_sectors as u64 + (byte_off / SECTOR_BYTES) as u64;
         let mut sec = [0u8; SECTOR_BYTES];
-        self.disk.read_sectors(lba, &mut sec).map_err(FsError::Io)?;
+        block_io::read_checked(self.disk, lba, &mut sec, &block_io::Budget::UNBOUNDED).map_err(FsError::Io)?;
         let in_sec = byte_off % SECTOR_BYTES;
         if in_sec + v.fat_entry_bytes > SECTOR_BYTES {
             // 一项跨在两个 FAT 扇区之间。FAT32 里只有 `cluster*4 % 512 > 508` 才会这样，
@@ -492,8 +493,7 @@ impl<'a> Volume<'a> {
                 (self.cluster_to_lba(cluster), v.sectors_per_cluster as u32)
             };
             for s in 0..nsec {
-                self.disk
-                    .read_sectors(lba + s as u64, &mut sector)
+                block_io::read_checked(self.disk, lba + s as u64, &mut sector, &block_io::Budget::UNBOUNDED)
                     .map_err(FsError::Io)?;
                 let mut o = 0usize;
                 while o + ENTRY_BYTES <= sector.len() {
@@ -568,8 +568,7 @@ impl<'a> Volume<'a> {
             }
             let want = core::cmp::min(v.cluster_bytes, left);
             for s in 0..((want + SECTOR_BYTES - 1) / SECTOR_BYTES) as u32 {
-                self.disk
-                    .read_sectors(self.cluster_to_lba(cluster) + s as u64, &mut sector)
+                block_io::read_checked(self.disk, self.cluster_to_lba(cluster) + s as u64, &mut sector, &block_io::Budget::UNBOUNDED)
                     .map_err(FsError::Io)?;
                 // 尾格只喂真的属于文件的那几个字节。多喂一个字节，"文件末尾之后"的盘上内容
                 // 就会被当成文件内容算进哈希（注入 `fault-fat32-tail` 就是让它多喂，必须红）。
@@ -703,7 +702,8 @@ impl FileCursor {
         if fat_sector >= u64::from(v.sectors_per_fat) {
             return Err(FsError::BadCluster(self.cluster));
         }
-        disk.read_sectors(u64::from(v.reserved_sectors) + fat_sector, sector).map_err(FsError::Io)?;
+        block_io::read_checked(disk, u64::from(v.reserved_sectors) + fat_sector, sector, &block_io::Budget::UNBOUNDED)
+            .map_err(FsError::Io)?;
         let in_sec = (byte_off % SECTOR_BYTES as u64) as usize;
         Ok(if v.fat_entry_bytes == FAT16_ENTRY_BYTES {
             u32::from(u16_at(sector, in_sec)) & v.cluster_mask
@@ -724,7 +724,7 @@ impl FileCursor {
             }
             let cluster_off = pending.position as usize % pending.bpb.cluster_bytes;
             let lba = pending.data_lba(pending.cluster)? + (cluster_off / SECTOR_BYTES) as u64;
-            disk.read_sectors(lba, &mut sector).map_err(FsError::Io)?;
+            block_io::read_checked(disk, lba, &mut sector, &block_io::Budget::UNBOUNDED).map_err(FsError::Io)?;
             let sector_off = cluster_off % SECTOR_BYTES;
             let take = (want - done).min(SECTOR_BYTES - sector_off);
             dst[done..done + take].copy_from_slice(&sector[sector_off..sector_off + take]);

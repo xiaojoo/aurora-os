@@ -22,6 +22,7 @@
 use crate::filesystem::fat32::{
     self, Bpb, FatType, FsError, Volume, ATTR_DIR, ATTR_LFN, ATTR_VOLUME, ENTRY_BYTES, MIN_CLUSTER,
 };
+use crate::filesystem::block_io;
 use crate::filesystem::vfs::{Block, BlockError, FileStat, SECTOR_BYTES};
 
 /// 8.3 名字的最长字节数（8 + 点 + 3）。
@@ -568,7 +569,7 @@ fn load_sector(disk: &dyn Block, cur: &mut DirCursor) -> Result<bool, VfsError> 
                 cur.done = true;
                 return Ok(false);
             }
-            disk.read_sectors(cur.lba, &mut cur.sector).map_err(io)?;
+            block_io::read_checked(disk, cur.lba, &mut cur.sector, &block_io::Budget::UNBOUNDED).map_err(io)?;
             cur.lba += 1;
             cur.fixed_left -= 1;
         }
@@ -588,7 +589,7 @@ fn load_sector(disk: &dyn Block, cur: &mut DirCursor) -> Result<bool, VfsError> 
                 cur.lba = cluster_to_lba(&v, next);
                 cur.cluster_left = v.sectors_per_cluster as u32;
             }
-            disk.read_sectors(cur.lba, &mut cur.sector).map_err(io)?;
+            block_io::read_checked(disk, cur.lba, &mut cur.sector, &block_io::Budget::UNBOUNDED).map_err(io)?;
             cur.lba += 1;
             cur.cluster_left -= 1;
         }
@@ -636,7 +637,7 @@ pub fn read_disk(disk: &dyn Block, cur: &mut ReadCursor, dst: &mut [u8]) -> Resu
         }
         let cluster_off = pending.position as usize % v.cluster_bytes;
         let lba = data_lba(&v, pending.cluster)? + (cluster_off / SECTOR_BYTES) as u64;
-        disk.read_sectors(lba, &mut sector).map_err(io)?;
+        block_io::read_checked(disk, lba, &mut sector, &block_io::Budget::UNBOUNDED).map_err(io)?;
         let sector_off = cluster_off % SECTOR_BYTES;
         let take = core::cmp::min(want - done, SECTOR_BYTES - sector_off);
         dst[done..done + take].copy_from_slice(&sector[sector_off..sector_off + take]);
@@ -729,7 +730,7 @@ fn fat_next_disk(disk: &dyn Block, v: &Bpb, cluster: u32) -> Result<u32, FsError
     let byte_off = cluster as usize * v.fat_entry_bytes;
     let lba = v.reserved_sectors as u64 + (byte_off / SECTOR_BYTES) as u64;
     let mut sec = [0u8; SECTOR_BYTES];
-    disk.read_sectors(lba, &mut sec).map_err(FsError::Io)?;
+    block_io::read_checked(disk, lba, &mut sec, &block_io::Budget::UNBOUNDED).map_err(FsError::Io)?;
     let in_sec = byte_off % SECTOR_BYTES;
     if in_sec + v.fat_entry_bytes > SECTOR_BYTES {
         return Err(FsError::BadCluster(cluster));
@@ -777,7 +778,7 @@ pub fn write_at(disk: &dyn Block, cur: &mut ReadCursor, src: &[u8]) -> Result<us
         let take = core::cmp::min(SECTOR_BYTES - in_sector, src.len() - done);
         if in_sector != 0 || take != SECTOR_BYTES {
             let mut sec = [0u8; SECTOR_BYTES];
-            disk.read_sectors(lba, &mut sec).map_err(io)?;
+            block_io::read_checked(disk, lba, &mut sec, &block_io::Budget::UNBOUNDED).map_err(io)?;
             sec[in_sector..in_sector + take].copy_from_slice(&src[done..done + take]);
             disk.write_sectors(lba, &sec).map_err(io)?;
         } else {
