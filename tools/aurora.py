@@ -166,7 +166,11 @@ SHELL_RUSTFLAGS = "-C link-arg=-Tuser/shell/link.ld -C relocation-model=static -
 FILEPROBE_PKG = "aurora-user-fileprobe"
 FILEPROBE_ELF = ROOT / "target" / TARGET / "debug" / "fileprobe"
 FILEPROBE_FIXTURE = ROOT / "kernel" / "fixtures" / "fileprobe.elf"
+EXECPROBE_PKG = "aurora-user-execprobe"
+EXECPROBE_ELF = ROOT / "target" / TARGET / "debug" / "execprobe"
+EXECPROBE_FIXTURE = ROOT / "kernel" / "fixtures" / "execprobe.elf"
 FILEPROBE_RUSTFLAGS = "-C link-arg=-Tuser/fileprobe/link.ld -C relocation-model=static -C panic=abort -C opt-level=1 -C debuginfo=0 --remap-path-prefix=H:/aurora-os-wb=/src --remap-path-prefix=H:/aurora-os=/src --remap-path-prefix=H:////aurora-os-wb=/src"
+EXECPROBE_RUSTFLAGS = "-C link-arg=-Tuser/execprobe/link.ld -C relocation-model=static -C panic=abort -C opt-level=1 -C debuginfo=0 --remap-path-prefix=H:/aurora-os-wb=/src --remap-path-prefix=H:/aurora-os=/src --remap-path-prefix=H:////aurora-os-wb=/src"
 
 
 def do_build_fileprobe() -> Path:
@@ -187,6 +191,26 @@ def do_build_fileprobe() -> Path:
     print(f"文件探针: {FILEPROBE_FIXTURE.relative_to(ROOT)}  {len(data)} 字节  "
           f"sha256={hashlib.sha256(data).hexdigest()[:12]} {'（夹具已更新）' if changed else '（与夹具一致）'}")
     return FILEPROBE_FIXTURE
+
+
+def do_build_execprobe() -> Path:
+    """A2（ADR-130）：构建外部命令探针并落成夹具。与 do_build_fileprobe 逐条同形。"""
+    r = subprocess.run(
+        [str(CARGO), "build", "--target", TARGET, "-p", EXECPROBE_PKG],
+        capture_output=True, text=True, cwd=str(ROOT),
+        env={**env(), "RUSTFLAGS": EXECPROBE_RUSTFLAGS},
+    )
+    if r.returncode != 0:
+        sys.exit("execprobe 构建失败：" + (r.stdout + r.stderr)[-3000:])
+    data = EXECPROBE_ELF.read_bytes()
+    EXECPROBE_FIXTURE.parent.mkdir(exist_ok=True)
+    changed = not EXECPROBE_FIXTURE.exists() or EXECPROBE_FIXTURE.read_bytes() != data
+    if changed:
+        EXECPROBE_FIXTURE.write_bytes(data)
+    import hashlib
+    print(f"外部命令探针: {EXECPROBE_FIXTURE.relative_to(ROOT)}  {len(data)} 字节  "
+          f"sha256={hashlib.sha256(data).hexdigest()[:12]} {'（夹具已更新）' if changed else '（与夹具一致）'}")
+    return EXECPROBE_FIXTURE
 
 
 def do_build_shell() -> Path:
@@ -235,6 +259,7 @@ def do_build(features: list[str]) -> Path:
     do_build_probe()
     do_build_shell()
     do_build_fileprobe()
+    do_build_execprobe()
     elf = kernel_binary(features)
     print(f"内核: {elf}  ({elf.stat().st_size} 字节)")
     return elf
@@ -8130,6 +8155,28 @@ def do_test(timeout: int) -> int:
         print("    对账:", x)
     IMAGE.unlink(missing_ok=True)
 
+    # =====================================================================
+    # A2 切片（ADR-130）：**第一个经 A2 语义启动的外部 ELF**。
+    # 正向：a2-exec 档——init 编排构造带 argv 区（280 起 "execprobe\0"）与
+    # std 三口（ROLE_STDIN/STDOUT/STDERR，三份独立 console 句柄）的 SI 页，
+    # 16 号启动 execprobe；判据三格：串口出现 execprobe 自己打的 argv 行
+    # （证明 argv 读到 + stdout 来自继承句柄）+ 收工行退出码 Some(7)（证明
+    # 3 号 rdi → 退出码寄存器 → 收尸 → 17 号形状的链路）。
+    # 负样本：a2-exec-bad——args_len 覆盖句柄表 ⇒ 16 号校验必须拒 E_INVALID，
+    # 且不得放行（execprobe 不许跑起来）。
+    print("=== A2 argv/std：外部 ELF 经 A2 语义启动（--features a2-exec）===")
+    IMAGE.unlink(missing_ok=True)
+    axv, axrc, axlog = do_run(["a2-exec"], timeout)
+    ax_ok = axv == "PASS" and "execprobe: argv[0]=execprobe" in axlog and "退出码=Some(7)" in axlog
+    ax_verdict = "CONTENT-MISMATCH" if (axv == "PASS" and not ax_ok) else axv
+    IMAGE.unlink(missing_ok=True)
+    print("=== A2 越界 argv 被校验拒（--features a2-exec-bad，负样本）===")
+    IMAGE.unlink(missing_ok=True)
+    abv, abrc, ablog = do_run(["a2-exec-bad"], timeout)
+    # 负样本判据：校验拒点名 E_INVALID，且**没有** execprobe 的输出（不许放行）。
+    ab_ok = abv == "PASS" and "argv 校验拒 ret=0xffffffffffffffff" in ablog and "execprobe: argv[0]=" not in ablog
+    ab_verdict = "CONTENT-MISMATCH" if (abv == "PASS" and not ab_ok) else abv
+
     rows = [
         ("正向", v if v != "PASS" or not p4_bad else "CONTENT-MISMATCH", rc, "PASS", 33),
         ("负样本", nv, nrc, "FAIL", 35),
@@ -8268,6 +8315,10 @@ def do_test(timeout: int) -> int:
         # 期望是 FAIL(35)——注入就该让格红；证人再判红得对不对，方向错了就是 CONTENT-MISMATCH。
         ("多级LFN校验和被改只塌长名", dlfn_verdict, dlfrc, "FAIL", 35),
         ("多级首簇高半抹零读到别处", dhih_verdict, dhihrc, "FAIL", 35),
+        # ADR-130 / A2：argv 区 + std 句柄继承 + 退出码寄存器（3 号 rdi 赋义）。
+        # 正向：三格全绿才 PASS；负样本：校验拒 + 不放行。
+        ("A2 argv/std经继承句柄启动外部ELF", ax_verdict, axrc, "PASS", 33),
+        ("A2越界argv被校验拒", ab_verdict, abrc, "PASS", 33),
     ]
     # 每一行对应那一跑的串口：不符时把红的那几格打出来。
     # 单独一张表而不是把日志塞进 `rows` 的元组里：元组要保持成"名字/期望/实际"这种
@@ -8323,6 +8374,8 @@ def do_test(timeout: int) -> int:
         "FS-03ring3探针与多级真卷对账": frlog,
         "多级LFN校验和被改只塌长名": dlfnlog,
         "多级首簇高半抹零读到别处": dhihlog,
+        "A2 argv/std经继承句柄启动外部ELF": axlog,
+        "A2越界argv被校验拒": ablog,
     }
     all_ok = True
     print()

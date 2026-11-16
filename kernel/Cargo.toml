@@ -19,6 +19,12 @@ default = []
 # 负样本：让 ktest 里的一条断言故意不成立，用于证明判定契约的尺子能分辨
 # （手册 §12.3 R19）。正常运行时不得带这个 feature 合入。
 negative-probe = []
+# A2 切片（ADR-130）：**产品路径上的外部 ELF 执行取证档**——init 编排在 S4a 之后
+# 用 A2 语义（argv 区 + std 句柄继承）启动 execprobe，串口与退出码双锚点判定。
+a2-exec = ["handles"]
+# A2 切片负样本：同一编排但 args_len 故意覆盖句柄表 ⇒ 16 号校验必须拒 E_INVALID。
+# 内核侧 cfg! 注入（宿主机改盘注入不许做成特性，§80a 的另一半在这里不适用）。
+a2-exec-bad = ["a2-exec"]
 # M5-g① 取证：把每台设备的 MSI/MSI-X 块与 INTx pin/line 读成一张证人表。
 # 只读不改，也不进四把尺子的构建：量具的开销不能算进产品基线（与 sig-check 同一形状）。
 irq-probe = []

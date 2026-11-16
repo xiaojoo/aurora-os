@@ -130,6 +130,12 @@ pub const ROLE_NS_ROOT: u32 = 6;
 pub const ROLE_SI: u32 = 7;
 /// ADR-098 补记三：`console-probe` 的反例句柄同样归子任务，免得每轮漏一格。
 pub const ROLE_CONSOLE_ECHO: u32 = 8;
+
+// ADR-130（A2 切片）：标准句柄角色。机制面零改动——16 号 transfer 对任意 role 可用，
+// 这里只把"stdin/stdout/stderr"从约定升格成常量；用户侧（runtime）有逐字同源的声明。
+pub const ROLE_STDIN: u32 = 9;
+pub const ROLE_STDOUT: u32 = 10;
+pub const ROLE_STDERR: u32 = 11;
 /// kind 编号与 `handle::ObjRef` 一一对应，用户侧独立声明。
 pub const KIND_FILE: u32 = 1;
 pub const KIND_VMO: u32 = 2;
@@ -736,6 +742,23 @@ fn sys_process_start(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     }
     if n > MAX_STARTUP_TRANSFERS {
         return E_INVALID;
+    }
+    // ADR-130 决策 2：argv 区（页内 args_off 起 args_len 字节）的**校验**，不搬运不解析——
+    // SI 页整页已映射给子进程（只读），子进程直接读内存。`0/0` = 无 argv，既有产物全如此
+    // ⇒ 向后兼容；console-probe 的探针参数（512/8）恰好落进这套校验，天然合法。
+    let args_off = u32::from_le_bytes([hdr[12], hdr[13], hdr[14], hdr[15]]) as usize;
+    let args_len = u32::from_le_bytes([hdr[16], hdr[17], hdr[18], hdr[19]]) as usize;
+    if (args_off, args_len) != (0, 0) {
+        const ARGS_MAX: usize = 512;
+        let handles_end = SI_OFF_HANDLES + n * SI_DESC_BYTES;
+        let page_bytes = crate::vmo::vmo_pages(vid).unwrap_or(0) * crate::mm::PAGE;
+        if args_len == 0
+            || args_off < handles_end
+            || args_off + args_len > page_bytes
+            || args_len > ARGS_MAX
+        {
+            return E_INVALID;
+        }
     }
     let mut area = [0u8; MAX_STARTUP_HANDLES * SI_DESC_BYTES];
     if crate::vmo::vmo_read(vid, SI_OFF_HANDLES, &mut area) != Ok(area.len()) {
@@ -1804,6 +1827,14 @@ pub fn syscall_dispatch(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> boo
         2 => frame.rdi.wrapping_add(frame.rsi), // 参数确实穿过来了：0x2a + 0x12
         SYS_EXIT => {
             EXITS.fetch_add(1, Ordering::Relaxed);
+            // ADR-130（A2 切片）：`rdi` 从此有语义 = **退出码**。分派跑在本任务上下文，
+            // 记进退出码寄存器，收尸点（terminate_task）按它写进程结局——17/19 号的
+            // 等待者由此拿到真实退出码。此前 3 号不记 rdi，收尸写死 1（execprobe 实测）。
+            // 旧调用方传 0/任意值的兼容性由判定表整链重验兜底。
+            crate::sched::record_exit_code(
+                crate::sched::current_id(),
+                u32::try_from(frame.rdi).unwrap_or(0),
+            );
             exit = true;
             0 // §10.2：非负为成功值
         }

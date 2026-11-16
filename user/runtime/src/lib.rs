@@ -384,6 +384,61 @@ pub fn file_open(path: &[u8], flags: u64) -> Result<Handle, RTError> {
     }
 }
 
+// ---- ADR-130：标准句柄角色与 argv 区（A2 内核侧配套的用户侧声明）----
+
+/// ADR-130：stdin 的 SI 描述角色。与内核 user.rs 的同名常量独立声明（两侧同数的既有成法）。
+pub const ROLE_STDIN: u32 = 9;
+/// ADR-130：stdout 的 SI 描述角色。
+pub const ROLE_STDOUT: u32 = 10;
+/// ADR-130：stderr 的 SI 描述角色（内核与 shell 今天都还没有 stderr 语义，常量先立）。
+pub const ROLE_STDERR: u32 = 11;
+
+/// 从 SI 页的描述表按**角色号**取句柄（A2：stdin/stdout/stderr 走这里，不再认 ROLE_LOG）。
+///
+/// # Safety
+/// `si_va` 必须是内核映射好的那一页（`process_start` 校验过 user+只读），且在读取期间
+/// 不被解映射。与 [`find_console`] 同一条契约。
+pub unsafe fn handle_of_role(si_va: u64, role: u32) -> Option<Handle> {
+    let base = si_va as *const u8;
+    // SAFETY: 见上；头 24 字节与描述表都在那一页内。
+    let magic = unsafe { core::ptr::read_unaligned(base.add(SI_OFF_MAGIC) as *const u32) };
+    if magic != SI_MAGIC {
+        return None;
+    }
+    let n = unsafe { core::ptr::read_unaligned(base.add(SI_OFF_NHANDLES) as *const u32) } as usize;
+    let n = if n > 16 { 16 } else { n };
+    for i in 0..n {
+        let d = unsafe { base.add(SI_OFF_HANDLES + i * SI_DESC_BYTES) };
+        let r = unsafe { core::ptr::read_unaligned(d.add(SI_DESC_ROLE) as *const u32) };
+        if r == role {
+            return Some(unsafe { core::ptr::read_unaligned(d.add(SI_DESC_HANDLE) as *const u64) });
+        }
+    }
+    None
+}
+
+/// 读 SI 页的 **argv 区**（ADR-130：`SI_OFF_ARGS_OFF/LEN` 赋义后的那一块）。
+/// 返回 `None` = 这页没带 argv（`args_off/args_len` 全零，既有产物的默认形状）。
+///
+/// # Safety
+/// 同 [`handle_of_role`]：那一页由内核校验，argv 区已被内核 process_start 校验
+/// "在页内且不与句柄表重叠"（ADR-130 决策 2），本函数不再二次判界。
+pub unsafe fn args_at(si_va: u64) -> Option<&'static [u8]> {
+    let base = si_va as *const u8;
+    // SAFETY: 见上；头 24 字节都在那一页内。
+    let magic = unsafe { core::ptr::read_unaligned(base.add(SI_OFF_MAGIC) as *const u32) };
+    if magic != SI_MAGIC {
+        return None;
+    }
+    let off = unsafe { core::ptr::read_unaligned(base.add(SI_OFF_ARGS_OFF) as *const u32) } as usize;
+    let len = unsafe { core::ptr::read_unaligned(base.add(SI_OFF_ARGS_LEN) as *const u32) } as usize;
+    if off == 0 || len == 0 {
+        return None;
+    }
+    // SAFETY: 界内性已由内核校验（ADR-130 决策 2）；这里只按内核背书过的范围切片。
+    Some(unsafe { core::slice::from_raw_parts(base.add(off) as *const u8, len) })
+}
+
 /// 24 号的基准（user.rs:56 的 whence 约定：0=SET、1=CUR、2=END）。
 /// **A2 接线后从 enum 改成 i64 newtype**，理由同 [`RTError`]（枚举映射会被 LLVM 降成
 /// 查表，用户链接基址 +4 GiB 下 `R_X86_64_32S` 溢出）。

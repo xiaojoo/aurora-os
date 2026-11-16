@@ -293,6 +293,7 @@ owner = "sched"
 layer = "service"
 source_modules = ["sched", "proc", "user", "elf"]
 public_api = [
+  "sched::record_exit_code",
   "elf::ElfError",
   "elf::Program",
   "elf::USER_VA_TOP",

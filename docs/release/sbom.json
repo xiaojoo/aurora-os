@@ -2,11 +2,18 @@
   "format": "aurora-sbom-v1",
   "generator": "tools/aurora.py release",
   "note": "外部 crate 数为 0 是实测而不是省略；依赖出现的第一天 check-sbom 就要管到它",
-  "workspace_packages": 6,
+  "workspace_packages": 7,
   "external_packages": 0,
   "packages": [
     {
       "name": "aurora-kernel",
+      "version": "0.0.0",
+      "license": "",
+      "source": "workspace",
+      "description": ""
+    },
+    {
+      "name": "aurora-user-execprobe",
       "version": "0.0.0",
       "license": "",
       "source": "workspace",
@@ -48,14 +55,14 @@
       "description": ""
     }
   ],
-  "kernel_elf_sha256": "8799c993af615def2671e4639aa2a83a41a92c8b04730928a364c6481ea6d9e1",
-  "image_sha256": "98351beb54bf0db67e14b6b4ccf441f0feb3e416da173199db88f5286bf4a341",
+  "kernel_elf_sha256": "2efbec61a2c9fe94f92403431c7878c04ecaf4b7043bc3aa732cff15269a63c1",
+  "image_sha256": "63d058fa29abd8e54e2a953ba1af94984d4a4d8352b9de6ab3e948a6439ced74",
   "image_file_digests": {
     "/EFI/": "e3b0c44298fc1c14",
     "/EFI/BOOT/": "e3b0c44298fc1c14",
     "/EFI/BOOT/BOOTX64.EFI": "333f7a69379b1f47",
     "/boot/": "e3b0c44298fc1c14",
-    "/boot/aurora.bin": "8799c993af615def",
+    "/boot/aurora.bin": "2efbec61a2c9fe94",
     "/limine.conf": "ceb9d14a0d1eea51"
   }
 }

@@ -34,6 +34,10 @@ crate.aurora-user-fileprobe = "aurora-user-fileprobe"
 # （草案，落地编号按分区归 workbuddy，需使用者批准）。
 crate.aurora-user-runtime = "aurora-user-runtime"
 
+# A2 切片（ADR-130）：第六个成员——**第一个经 A2 语义（argv 区 + std 句柄继承）启动的
+# 外部 ELF**。只在 `a2-exec` 构建里被内核 include_bytes!；与 probe/fileprobe 同样不进签名链。
+crate.aurora-user-execprobe = "aurora-user-execprobe"
+
 # ---------------------------------------------------------------- 许可证策略（§11.2 R10 / ADR-009b）
 #
 # 白名单与"登记过的留空"的唯一来源就在这里，`check-sbom` 直接读这两段。
@@ -55,3 +59,4 @@ license.pending.aurora-user-probe = "同上：第二个用户产物夹具（W3 P
 license.pending.aurora-user-shell = "同上：第三个用户产物（S5c 串口 shell），许可证随内核一起定"
 license.pending.aurora-user-fileprobe = "同上：第四个用户产物（FS-03 D ring3 文件探针），许可证随内核一起定"
 license.pending.aurora-user-runtime = "同上：A2 用户态库骨架（总设计 §9 A2），许可证随内核一起定"
+license.pending.aurora-user-execprobe = "同上：A2 外部命令探针（ADR-130），许可证随内核一起定"

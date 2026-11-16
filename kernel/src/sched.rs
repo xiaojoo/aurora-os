@@ -266,6 +266,29 @@ pub fn task_proc_id(task: usize) -> Option<u16> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ADR-130（A2 切片）：**退出码寄存器**。3 号 SYS_EXIT 的 `rdi` 在分派器里被记进这里
+// （`record_exit_code`），任务被终止时收尸点按这里的值写进进程结局——此前 3 号的
+// `rdi` 无语义，`proc_thread_exited` 的退出码是收尸路径写死的常量（自然收工 0、
+// 被杀/终止 1），17/19 号的等待者拿不到进程真正的退出码（execprobe 实测 Some(1)）。
+// 高位 0x8000_0000 是"已记"标记：终止一个没自记过退出码的任务（被杀）仍按口径 1，
+// 自记过（含 0）就按自记值——两类路径不互相污染。
+static EXIT_CODES: [core::sync::atomic::AtomicU32; MAX_TASKS_TOTAL] = {
+    const Z: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    [Z; MAX_TASKS_TOTAL]
+};
+/// 3 号分派器调用：记下本任务的退出码（`rdi`）。每个任务只记最后一次。
+pub fn record_exit_code(task: usize, code: u32) {
+    if task >= MAX_TASKS_TOTAL {
+        return;
+    }
+    EXIT_CODES[task].store(code | 0x8000_0000, core::sync::atomic::Ordering::Release);
+}
+fn exit_code_recorded(task: usize) -> Option<u32> {
+    let v = EXIT_CODES[task].load(core::sync::atomic::Ordering::Acquire);
+    (v & 0x8000_0000 != 0).then(|| v & !0x8000_0000)
+}
+
 pub fn terminate_task(task: usize) -> bool {
     if task >= MAX_TASKS_TOTAL {
         return false;
@@ -300,10 +323,15 @@ pub fn terminate_task(task: usize) -> bool {
     // **被杀的线程也要给它的进程记一笔收工**（P5c-3 修的一条 P3 遗留洞）：
     // 这条路径不走 `finish_current`/`kill_current`，只清 `proc_id` 的话进程的 `threads`
     // 永远减不到 0 ⇒ 那个进程永远 reap/discard 不掉（名额与它名下的 AS 一起漏）。
-    // 退出码 1 = 非正常，与 `kill_current` 同一口径。放在放掉 RUNQ 之后：
+    // 退出码：**自记过（3 号 rdi，ADR-130）按自记值**；没记过（被杀/故障终止）仍按
+    // 口径 1 = 非正常，与 `kill_current` 同一口径。放在放掉 RUNQ 之后：
     // `proc_thread_exited` 今天只动原子量，但这条边不该依赖"它恰好不取锁"。
     if dead_proc != crate::proc::NO_PROC {
-        crate::proc::proc_thread_exited(dead_proc, 1);
+        let code = match exit_code_recorded(task) {
+            Some(c) => c,
+            None => 1,
+        };
+        crate::proc::proc_thread_exited(dead_proc, code);
     }
     // P6a：旁观者终止也算收工（这条路径把槽直接标 Free），等待者同样要收到发布
     task_wait_signal(TW_TASK, task as u32, 1);
