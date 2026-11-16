@@ -1951,7 +1951,8 @@ def check_block_io(log: str) -> list[str]:
 
 VBLK2_LINE_RE = re.compile(
     r"vblk2: 判据 台数=(?P<n>\d+) bdf0=(?P<b0>\d+) bdf1=(?P<b1>\d+) 容量0=(?P<c0>\d+) "
-    r"容量1=(?P<c1>\d+) 图案对=(?P<pat>\w+) 写读回=(?P<wr>\w+) 队列=(?P<q>\w+)")
+    r"容量1=(?P<c1>\d+) 图案对=(?P<pat>\w+) 写读回=(?P<wr>\w+) 队列=(?P<q>\w+) "
+    r"msix=(?P<msix>\w+)")
 
 
 def check_virtio_two(log: str) -> list[str]:
@@ -1976,7 +1977,7 @@ def check_virtio_two(log: str) -> list[str]:
         want = sorted(host)
         if got != want:
             bad.append(f"容量集合不符：内核={got} 宿主机={want}")
-    for tag, want in (("pat", "true"), ("wr", "true"), ("q", "true")):
+    for tag, want in (("pat", "true"), ("wr", "true"), ("q", "true"), ("msix", "true")):
         if m.group(tag) != want:
             bad.append(f"块请求层 {tag}={m.group(tag)}（期望 {want}）")
     return bad

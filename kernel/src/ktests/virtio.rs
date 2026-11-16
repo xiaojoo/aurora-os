@@ -450,8 +450,18 @@ fn t_virtio_two() -> bool {
     let mut back = [0u8; 512];
     let rb = virtio::read_block_at(1, 1, &mut back).is_ok() && back == src;
     let wr_ok = wrote && rb;
+    // MSI-X 必须按槽走：对第 1 台编队列表、真读、收得到（§372 的"MSI-X 只对第 0 台"在此关掉）。
+    let msix_ok = match virtio::msix_probe_at(1) {
+        // `calls > 0` 是前提：0==0 会让"根本没投递"看起来像"收到并认领了"。
+        Ok(p) => p.calls > 0
+            && p.claims == p.calls
+            && p.flag_seen
+            && p.content_ok
+            && p.qvector_back == p.entry as u16,
+        Err(_) => false,
+    };
     crate::log_info!(
-        "vblk2: 判据 台数={} bdf0={} bdf1={} 容量0={} 容量1={} 图案对={} 写读回={} 队列={}",
+        "vblk2: 判据 台数={} bdf0={} bdf1={} 容量0={} 容量1={} 图案对={} 写读回={} 队列={} msix={}",
         n,
         b0.unwrap_or(u32::MAX),
         b1.unwrap_or(u32::MAX),
@@ -459,9 +469,10 @@ fn t_virtio_two() -> bool {
         c1,
         pat_ok,
         wr_ok,
-        q_ok
+        q_ok,
+        msix_ok
     );
-    count_ok && order_ok && pat_ok && wr_ok && q_ok
+    count_ok && order_ok && pat_ok && wr_ok && q_ok && msix_ok
 }
 #[cfg(feature = "virtio-two-probe")]
 ktest!(KT_VIRTIO_TWO, t_virtio_two);

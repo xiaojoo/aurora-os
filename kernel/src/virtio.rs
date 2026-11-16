@@ -1446,7 +1446,13 @@ fn set_fn_mask(dev: &pci::Dev, ctrl_off: u32, on: bool) -> bool {
 /// 两处顺序不许换：**先遮再改表**（改表途中设备正在发这一发，就会读到半新半旧的条目）；
 /// **撤销之后重遮**（留一条 unmasked 而没人认领的条目 = 把中断扔进没人数的账里）。
 pub fn msix_probe() -> Result<MsixProbe, VirtioError> {
-    b(|bd| {
+    msix_probe_at(0)
+}
+
+/// 对第 `i` 台设备（ADR-112 的槽号）做同一套 MSI-X 表编程与一次真读。
+/// 两台并存时两条都必须能各自编、各自收——§372 记的"MSI-X 只对第 0 台"由它关掉。
+pub fn msix_probe_at(i: usize) -> Result<MsixProbe, VirtioError> {
+    b_at(i, |bd| {
         let ctx = &bd.ctx;
         let dev = ctx.device();
         let caps = dev.irq_caps();
@@ -1505,7 +1511,7 @@ pub fn msix_probe() -> Result<MsixProbe, VirtioError> {
         MSIX_FLAG.store(false, Ordering::Release);
         let (c0, k0) = ctx.irq_counts(h).map_err(VirtioError::Ctx)?;
         let mut buf = [0u8; 512];
-        let r = crate::arch::x86_64::apic::with_interrupts(|| read_block(0, &mut buf));
+        let r = crate::arch::x86_64::apic::with_interrupts(|| read_block_at(i, 0, &mut buf));
         let mut waited = 0u32;
         while !MSIX_FLAG.load(Ordering::Acquire) && waited < 200_000 {
             core::hint::spin_loop();

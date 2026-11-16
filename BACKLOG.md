@@ -14826,3 +14826,17 @@ kernel 栈/地址窗口上的脆弱）。下一刀先定位它：用同一段包
   负样本守着：若再出现整机静默，先看 QMP RIP 是否又落在 `tsc::spin`。
 - 同时按决策收口两条欠账口径：ADR-108 未决 4 前半由 ADR-114 落地、后半（卸载 EBUSY 号）明确
   暂缓（无调用方，不先编号）；ADR-113 决策 3 的 per-CPU/per-handle 记账仍刻意不与请求层合并。
+## 380. MSI-X 按槽走：第 1 台 virtio-blk 也能编队列表并收到（§372 遗留）（2026-11-17）
+
+- `virtio::msix_probe()` 泛化成 `msix_probe_at(i)`（`b_at(i)` + `read_block_at(i, 0)`），旧名字保留为
+  `msix_probe_at(0)`。`t_virtio_two` 增加一格：对**第 1 台**编 MSI-X 表、真读、要求 `calls>0`、
+  `claims==calls`、旗子见到、`qvector_back==entry`。
+- **空转教训（当场踩到）**：第一版只判 `claims==calls`，而变异（探针仍用第 0 台的句柄、却读第 1 台）
+  下两边都是 0 ⇒ `msix=true` **没咬**。补上前提 `calls>0` 后同一变异立刻 `msix=false` 红。
+  "计数器没动"的格必须先证明触发事件发生过（与 `t_virtio_msix` 的 `flag_seen == (calls>0)` 同一口径）。
+- 宿主行同步：`check_virtio_two` 的串口正则加 `msix=` 并要求 true。
+- 读数：`virtio-two-probe` **PASS(33) 86/86**（ELF `a39d2d2a7868`），行 **PASS**、host ok；
+  `virtio-msix-probe` PASS(33)（`e7755271dca3`，第 0 台行为不变）、默认档 PASS(33)（`d60cd0ba0d5c`）；
+  `check` **17/17**。
+- 变异：`msix_probe_at` 内部改用 `b_at(0)`（表编在第 0 台、I/O 打第 1 台）⇒ `msix=false`；
+  还原后 86/86。
