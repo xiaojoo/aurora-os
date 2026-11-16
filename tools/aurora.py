@@ -1905,6 +1905,34 @@ def check_fs_rw_image(log: str) -> list[str]:
         bad.append(f"DATA.BIN 被写坏了：大小={dt['size']} 盘上={dt['blob'][:8].hex()} 期望={want_d[:8].hex()}")
     return bad
 
+BLOCK_IO_RE = re.compile(
+    r"vfs-ro: 块请求层 正常=(?P<ok1>\w+) 半途=(?P<ok2>\w+) 死线=(?P<ok3>\w+) 取消=(?P<ok4>\w+) "
+    r"形状=(?P<ok5>\w+) 计数=(?P<okc>\w+) 增量 requests=(?P<req>\d+) sectors=(?P<sec>\d+) "
+    r"timeouts=(?P<to>\d+) cancels=(?P<can>\d+) refused=(?P<ref>\d+)")
+
+
+def check_block_io(log: str) -> list[str]:
+    """ADR-110 的判定行：块请求层的四格语义与五计数在链里必须仍在跑（`fs-ro` 档）。
+
+    真正的判据在核内（`t_block_io_budget` 按**增量**断言：超时/取消/半途/形状各一格）；
+    这台只做链级确认：那一行必须在、四个 bool 必须 true、五项增量必须是 6/7/1/1/2。
+    数字变了说明有人在别处动了块层或用例（不是"容忍一点"的那种量）。
+    """
+    m = BLOCK_IO_RE.search(log)
+    if m is None:
+        return ["串口没有 `vfs-ro: 块请求层 …` 那一行（用例没跑到结论，或被改名）"]
+    bad: list[str] = []
+    for tag in ("ok1", "ok2", "ok3", "ok4", "ok5", "okc"):
+        if m.group(tag) != "true":
+            bad.append(f"块请求层 {tag}={m.group(tag)}（期望 true）")
+    want = {"req": 6, "sec": 7, "to": 1, "can": 1, "ref": 2}
+    for tag, n in want.items():
+        if int(m.group(tag)) != n:
+            bad.append(f"块请求层增量 {tag}={m.group(tag)}，期望 {n}"
+                       "（这五个数由核内按增量断言；链里变了先查谁动了块层/用例）")
+    return bad
+
+
 FAT_HOST_WITNESS = {
     "fault-fat32-exec-byte": check_fat32_exec_byte,
     "fault-fat32-cluster-hi": check_fat32_cluster_hi,
@@ -8252,6 +8280,15 @@ def do_test(timeout: int) -> int:
     for x in frw_bad:
         print("    对账:", x)
 
+    print("=== 块请求层：超时/取消/半途与五计数（ADR-110；fs-ro 档内跑）===")
+    # 判据在核内（按增量断言）；这一行只确认它在链里仍被执行、四个 bool 与五个增量没漂。
+    IMAGE.unlink(missing_ok=True)
+    bv, brc, blog = do_run(["fs-ro"], timeout)
+    b_bad = check_block_io(blog)
+    b_verdict = bv if bv != "PASS" else ("PASS" if not b_bad else "CONTENT-MISMATCH")
+    for x in b_bad:
+        print("    对账:", x)
+
     rows = [
         ("正向", v if v != "PASS" or not p4_bad else "CONTENT-MISMATCH", rc, "PASS", 33),
         ("负样本", nv, nrc, "FAIL", 35),
@@ -8391,6 +8428,8 @@ def do_test(timeout: int) -> int:
         ("多级LFN校验和被改只塌长名", dlfn_verdict, dlfrc, "FAIL", 35),
         # ADR-111 决策 3：写方向。内核绿而宿主机从**跑完的卷**上解出的字节对不上 ⇒ CONTENT-MISMATCH
         ("FS写方向与可写卷对账", frw_verdict, frwrc, "PASS", 33),
+        # ADR-110 决策 1：块请求层的四格语义与五计数（核内按增量断言，这里做链级确认）
+        ("块请求层超时取消半途", b_verdict, brc, "PASS", 33),
         ("多级首簇高半抹零读到别处", dhih_verdict, dhihrc, "FAIL", 35),
     ]
     # 每一行对应那一跑的串口：不符时把红的那几格打出来。
@@ -8447,6 +8486,7 @@ def do_test(timeout: int) -> int:
         "FS-03ring3探针与多级真卷对账": frlog,
         "多级LFN校验和被改只塌长名": dlfnlog,
         "FS写方向与可写卷对账": frwlog,
+        "块请求层超时取消半途": blog,
         "多级首簇高半抹零读到别处": dhihlog,
     }
     all_ok = True
