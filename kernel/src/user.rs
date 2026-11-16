@@ -1092,6 +1092,8 @@ fn sys_file_write(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
         Err(e) => return handle_err(e),
     };
     let disk = crate::filesystem::vfs::AhciDisk { port: ticket.port() };
+    // 与读同一条：分区区间在翻译之前判（S2b）。
+    let part = ticket.partition();
     let mut buf = [0u8; crate::filesystem::vfs::SECTOR_BYTES];
     let mut done = 0usize;
     while done < want {
@@ -1106,7 +1108,15 @@ fn sys_file_write(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
                 return E_FAULT;
             }
         }
-        match crate::handle::write_chunk(&mut ticket, &disk, &buf[..ask]) {
+        let wrote = match part {
+            None => crate::handle::write_chunk(&mut ticket, &disk, &buf[..ask]),
+            Some(p) => crate::handle::write_chunk(
+                &mut ticket,
+                &crate::filesystem::vfs::PartitionView { inner: &disk, part: p },
+                &buf[..ask],
+            ),
+        };
+        match wrote {
             Ok(n) => done += n,
             Err(e) => {
                 crate::handle::abort(ticket);
@@ -1137,11 +1147,18 @@ fn sys_file_read(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
         Err(e) => return handle_err(e),
     };
     let disk = crate::filesystem::vfs::AhciDisk { port: ticket.port() };
+    // 分区是对象身份的一部分（S2b）：句柄说它在哪个区间，syscall 这条路径也必须按它翻地址。
+    let part = ticket.partition();
     let mut chunk = [0u8; crate::filesystem::vfs::SECTOR_BYTES];
     let mut done = 0usize;
     while done < want {
         let ask = core::cmp::min(chunk.len(), want - done);
-        match ticket.read_chunk(&disk, &mut chunk[..ask]) {
+        let got = match part {
+            None => ticket.read_chunk(&disk, &mut chunk[..ask]),
+            Some(p) => ticket
+                .read_chunk(&crate::filesystem::vfs::PartitionView { inner: &disk, part: p }, &mut chunk[..ask]),
+        };
+        match got {
             Ok(0) => break, // EOF
             Ok(n) => match copy_to_user(&chunk[..n], frame.rsi + done as u64) {
                 Ok(m) if m == n => done += n,

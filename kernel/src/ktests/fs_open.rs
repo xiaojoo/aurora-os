@@ -743,14 +743,33 @@ fn t_fs_open_ring3() -> bool {
     crate::arch::x86_64::apic::timer_start().ok();
     let mut rounds = 0u64;
     let mut in_window = true;
+    let mut box_ = [0u64; FP_CELLS];
+    // 两段窗口：第一段只等 `DONE`，看到就**退出**——`with_interrupts` 退出时 `cli`，
+    // 于是下面的整页快照与异步 reaper 互斥（reap 只在 tick 的抢占点上跑）。
+    // 旧版把快照放在整段窗口之后、中间还隔着 2M 周期自旋：那期间任何一次 tick 都会把
+    // 已 Done 的容器回收、把它的页还掉，`read_at` 便读到"页表链没走完"的全 0（§366）。
     crate::arch::x86_64::apic::with_interrupts(|| {
         let t0 = crate::tsc::now();
         // 等**哨兵**，不等"打了几个号"：调用数会被代码生成挪顺序（`elfdisk` 那段同样的教训）。
-        while slot(data, fp::DONE) != fp::DONE_VAL && crate::tsc::now().wrapping_sub(t0) < 400_000_000 {
+        while crate::tsc::now().wrapping_sub(t0) < 400_000_000 {
             rounds += 1;
+            if slot(data, fp::DONE) == fp::DONE_VAL {
+                return;
+            }
             crate::tsc::spin(20_000);
         }
-        in_window = slot(data, fp::DONE) == fp::DONE_VAL;
+    });
+    // IF 关着：先复核哨兵，再整页取快照。这两步之间不会有 tick。
+    in_window = slot(data, fp::DONE) == fp::DONE_VAL;
+    if in_window {
+        let mut nread = 0usize;
+        while nread < FP_CELLS {
+            box_[nread] = slot(data, (nread as u64) * 8);
+            nread += 1;
+        }
+    }
+    // 第二段窗口：让容器退出、启动上下文回到 CPU（这两件都要 tick）。
+    crate::arch::x86_64::apic::with_interrupts(|| {
         crate::tsc::spin(2_000_000);
         if !sched::wait_for_boot_task(300_000_000) {
             crate::log_fatal!("fs-open-ring3: 窗口收不了场（启动上下文没回到 CPU）");
@@ -759,15 +778,8 @@ fn t_fs_open_ring3() -> bool {
     if !timer_was_running {
         crate::arch::x86_64::apic::timer_stop().ok();
     }
-    // **必须在回收之前把整页读走**：容器一被 reap，它名下的页就还给分配器，之后再 `read_at`
-    // 读到的就是"页表链没走完"。实测过这个形状：判据在页面还在时全绿，紧接着的取证行读到全 0，
-    // 于是宿主机证人把这一跑读成 CONTENT-MISMATCH（判定级 PASS、用例级 95/95，红在两层之间）。
-    let mut box_ = [0u64; FP_CELLS];
-    let mut nread = 0usize;
-    while nread < FP_CELLS {
-        box_[nread] = slot(data, (nread as u64) * 8);
-        nread += 1;
-    }
+    // 快照已在上面（第一段窗口退出、IF 关着时）取走：容器一被 reap，它名下的页就还给分配器，
+    // 之后再 `read_at` 读到的就是"页表链没走完"（§366）。
     let reaped = drained_or_free(rel0, t);
     let table_clean = handle::live() == 0;
 

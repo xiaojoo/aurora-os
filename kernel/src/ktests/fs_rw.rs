@@ -213,7 +213,7 @@ fn t_fs_rw_syscall23() -> bool {
             return false;
         }
     };
-    syscall23_cells(ident, hw, hr, hbad)
+    syscall23_cells(hw, hr, hbad)
 }
 
 /// **`#[inline(never)]` 是栈预算**（同 `fs_open.rs::syscall_cells` 的理由）：用例跑在 16 KiB
@@ -221,7 +221,7 @@ fn t_fs_rw_syscall23() -> bool {
 ///
 /// 返回之前一定走完两个 close——中途任何一格红都只是 `ok = false`，不是提前 `return`。
 #[inline(never)]
-fn syscall23_cells(ident: (usize, u32), hw: Handle, hr: Handle, hbad: Handle) -> bool {
+fn syscall23_cells(hw: Handle, hr: Handle, hbad: Handle) -> bool {
     let Some(va) = mm::alloc_user_va_range(1) else {
         crate::log_fatal!("fs-rw-23: 用户 VA 分配失败");
         return false;
@@ -293,16 +293,11 @@ fn syscall23_cells(ident: (usize, u32), hw: Handle, hr: Handle, hbad: Handle) ->
     let mut head = [0u8; 4];
     ok &= s0 == 0 && bad == user::E_FAULT;
     ok &= head_n == 4 && get_user(va.0, 128, &mut head) && head == [after[0], after[1], after[2], after[3]];
-    // 块侧失败 ⇒ -7（EIO），不是 -2：空区间句柄在第一扇区翻译之前就被拒。
-    // 走**句柄层**的 `handle::read`（它按 `part` 翻地址）再喂给 syscall 用的同一张
-    // `user::handle_err` 表——syscall 读路径今天不按 `part` 翻地址（另一个已记的洞，
-    // BACKLOG §364），在它上面造确定性的盘失败会扰动 ring3 探针，不在这一刀里动。
-    let mut one = [0u8; 1];
-    let mut eio = 0u64;
-    match handle::read(hbad, ident, &mut one) {
-        Err(e) => eio = user::handle_err(e),
-        Ok(_) => {}
-    }
+    // 块侧失败 ⇒ -7（EIO），不是 -2：空区间句柄在第一扇区翻译之前就被 `PartitionView` 拒。
+    // 走 10 号 syscall 本身——分区包装在 `sys_file_read` 里（ADR-108 补记七）。
+    // 这条同时咬两件事：映射表是 -7，且 syscall 真的按 `ticket.partition()` 翻地址
+    // （没有包装的话这次读会从真盘上读到 1 字节，而不是 -7）。
+    let eio = call(&mut fr, user::SYS_FILE_READ, hbad.0, va.0, 1);
     ok &= eio == user::E_IO;
 
     // 各自 close（经 8 号，与 ring3 调用方同一条路）；关后旧句柄必须是 -5。
