@@ -995,6 +995,17 @@ fn run_ktests_and_finish() -> ! {
     // S4a（W5 第一片，BACKLOG §229）：产品路径**真起 ring3**。放在判定之前、ktests 之后，
     // 这样用例读数不受影响，而 hello 的输出能进同一份串口。
     // S5d：接住 init 的任务号——判定之后要不要等它，由 `park_until_init_exits` 说。
+    // A3 验收档（ADR-131）：shell 要能 `run` 卷上的 ELF ⇒ 产品路径必须先认领盘
+    // （22 号 `fs_open::open` 自 mount 固定卷，但卷得先被驱动 probe 过；此前只有测试路径做）。
+    #[cfg(feature = "a3-shell")]
+    {
+        match crate::ahci::init() {
+            Ok(info) => crate::log_info!("a3-shell: AHCI 认领 ports={}", info.ports),
+            Err(e) => crate::log_warn!("a3-shell: AHCI 认领失败 {:?}", e),
+        }
+        // 挂根换卷A（口 3，根目录有 HELLO.ELF）；此刻还没有任何 VFS 句柄。
+        crate::filesystem::fs_open::set_port(3);
+    }
     // A2 切片（ADR-130）：判定档不起交互会话（句柄表 16 格留给判定路径）。
     // init_task 的作用域提到两 cfg 块之外：判定后的 `park_until_init_exits` 两个分支都要它。
     #[cfg(not(feature = "a2-exec"))]
@@ -1179,7 +1190,19 @@ fn park_until_init_exits(init: Option<usize>) {
             }
         }
     }
-    #[cfg(not(feature = "resident-init"))]
+    #[cfg(feature = "a3-shell")]
+    {
+        // A3 验收档：shell 跑完 argv 里那条命令就自己 exit，这里等它收工再交付判定。
+        // 窗口给足：一次 `run` 要读卷上 17 KiB（AHCI 逐扇区，遇"发射被吞"还会恢复重发）
+        // + shell 侧 5 s 的 17 号等待。8 s 实测不够（0x1e6→0x1ec 就没窗口了），给到 ~30 s。
+        if let Some(g) = init {
+            let _ = apic::with_interrupts(|| {
+                sched::wait_for_task(g, crate::clock::window_cycles(1500))
+            });
+            crate::log_info!("a3-shell: 会话收工（或窗口到）");
+        }
+    }
+    #[cfg(all(not(feature = "resident-init"), not(feature = "a3-shell")))]
     {
         let _ = init;
     }
@@ -1426,6 +1449,7 @@ fn stage_a2_exec() {
         "a2-exec: execprobe 收工 退出码={:?}（期望 {:?}）args_off={} args_len={}",
         code, want, args_off, args_len
     );
+
 }
 
 /// 起一个 shell 会话：`sid` 决定它拿到的控制台句柄属于哪个会话（0 号兼作 init）。
@@ -1545,6 +1569,18 @@ fn stage_init_user(sid: u8) -> Option<usize> {
     if cfg!(feature = "console-probe") {
         hdr[12..16].copy_from_slice(&512u32.to_le_bytes());
         hdr[16..20].copy_from_slice(&8u32.to_le_bytes());
+    }
+    // A3 验收档（ADR-131）：给 shell 一条**启动命令**（`sh -c` 语义）。偏移取 280：
+    // 描述表最多 4 条（24 + 4×16 = 88），280 在页内且不与表重叠（ADR-130 决策 2 的校验）。
+    #[cfg(feature = "a3-shell")]
+    {
+        const A3_CMD: &[u8] = b"run /HELLO.ELF\0";
+        hdr[12..16].copy_from_slice(&280u32.to_le_bytes());
+        hdr[16..20].copy_from_slice(&(A3_CMD.len() as u32).to_le_bytes());
+        if vmo::vmo_write(si, 280, A3_CMD) != Ok(A3_CMD.len()) {
+            crate::log_warn!("init-user: a3-shell 的 argv 写失败");
+            bail!(1275, led, led_n, owner);
+        }
     }
     if vmo::vmo_write(si, 0, &hdr) != Ok(hdr.len()) { crate::log_warn!("init-user: si 头写失败"); bail!(1274, led, led_n, owner); }
     let mut d = [0u8; SI_DESC_BYTES];

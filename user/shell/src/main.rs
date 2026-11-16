@@ -175,6 +175,20 @@ pub extern "C" fn _start(si_va: u64) -> ! {
         }
     };
     con_write(console, msg(M_BANNER));
+    // A3（ADR-131）：SI 页的 **argv 区**若带了一条命令，就执行它一次然后退出
+    // （`sh -c` 语义）。默认构建的内核不写 argv（0/0），所以交互行为**一字未变**；
+    // 有 argv 时不打印提示符——脚本模式不该等输入。
+    // SAFETY: si_va 契约同 `find_console`（内核 process_start 校验并映射、user+只读）。
+    if let Some(argv) = unsafe { rt::args_at(si_va) } {
+        let cmd = argv.split(|&b| b == 0).next().unwrap_or(&[]);
+        if !cmd.is_empty() {
+            con_write(console, cmd);
+            con_write(console, msg(M_NL));
+            let parsed = parser::parse(cmd);
+            let _ = registry::dispatch(console, si_va, &parsed);
+            rt::exit(0);
+        }
+    }
     let mut line = [0u8; LINE_MAX];
     let mut len = 0usize;
     let mut overflow = false;

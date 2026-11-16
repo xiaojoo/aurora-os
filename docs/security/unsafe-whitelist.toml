@@ -83,12 +83,14 @@ expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe
 # 2026-11-17 A3 收尾（shell `run` + runtime exec）：+user/runtime/exec（U1 1 = 静态读块的
 # RIP 相对 lea）、+user/shell/registry（U5 1 = 按角色取 Job 句柄的那次 handle_of_role）。
 # 数目对账：463+2=465、82+1=83、85+1=86。
-total = 465
+# 2026-11-17 A3 收尾（shell 的 argv 一次性命令）：user/shell U5 2→3（`rt::args_at` 那一次）。
+# 数目对账：465+1=466、86+1=87。
+total = 466
 U1 = 83
 U2 = 116
 U3 = 13
 U4 = 131
-U5 = 86
+U5 = 87
 U6 = 36
 
 [modules."acpi"]
@@ -301,11 +303,12 @@ U5 = 8
 [modules."user/shell"]
 # S5c→A2 接线后（2026-11-16）：syscall 底座（int 0x80 入口、find_console、con 读写）整体迁入
 # aurora-user-runtime，本模块只剩交互逻辑。U1 两处 = msgs_base 的 RIP 相对 lea 取基址块、
-# panic 自跳转。U5 两处 = msg 的 from_raw_parts（对自家静态 MSGS blob 的切片，常量偏移有界）
-# 与 _start 对 rt::find_console（unsafe fn）的那一次调用——si_va 由内核 process_start 校验
-# 并映射（user+只读），契约原文在 runtime 侧。上下文 USER_ENTRY；生命周期 = 本进程；无并发。
+# panic 自跳转。U5 三处 = msg 的 from_raw_parts（对自家静态 MSGS blob 的切片，常量偏移有界）、
+# _start 对 rt::find_console（unsafe fn）的那一次调用、_start 对 rt::args_at（unsafe fn）的
+# 那一次调用（A3：argv 一次性命令）——两个 si_va 同一份契约：内核 process_start 校验并映射、
+# user+只读。上下文 USER_ENTRY；生命周期 = 本进程；无并发。
 U1 = 2
-U5 = 2
+U5 = 3
 
 [modules."virtio"]
 U4 = 10

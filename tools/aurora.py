@@ -448,7 +448,7 @@ FAT_PORTS = {3: "fat32-small", 4: "fat32-wide"}
 FS_OPEN_FEATURES = {"fs-open"}
 # A3 切片：execprobe 的 22 号 open 打的是 fs_open::PORT=5 的 deep 卷（fs_open 自 mount 固定卷）。
 # 所以这一档的镜像也要装配 deep 卷——与 fs-open 同一份夹具、同一条指纹闸。
-A3_EXEC_FEATURES = {"a3-exec"}
+A3_EXEC_FEATURES = {"a3-exec", "a3-shell"}
 FS_OPEN_PORTS = {5: "fat32-deep"}
 # 内核声明"要读哪几个文件"。这张表有两个用处，缺一不可：
 # 1 宿主机这台仪器只走这几个名字的链——卷B 上那个 34,603,008 字节的 FILLER.BIN 没有任何
@@ -3521,8 +3521,10 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
             bad = apply_fat_host_fault(host_fault)
             if bad:
                 sys.exit("FAT32 宿主机侧注入不成立：" + " / ".join(bad))
-    if FS_OPEN_FEATURES & set(features):
-        # ADR-109：`fs-open` 的挂载根换成了多级真卷（口 5）。
+    if (FS_OPEN_FEATURES | A3_EXEC_FEATURES) & set(features):
+        # ADR-109：`fs-open` 的挂载根换成了多级真卷（口 5）。A3 的两档（a3-exec/a3-shell）
+        # 都依赖 fs-open（22 号的模块门），所以它们的卷也必须每跑重算——否则会拿到上一次
+        # 注入/改动留下的盘，ring3 探针读到的就不是用例期望的那份内容。
         # 卷A 上根本没有多级路径、跨簇目录与子目录 LFN，挂在那里等于"用例写着三级路径、盘上没有"。
         bad = ensure_fat_deep()
         if bad:
@@ -8208,6 +8210,22 @@ def do_test(timeout: int) -> int:
     r3_verdict = "CONTENT-MISMATCH" if (r3v == "PASS" and not r3_ok) else r3v
     IMAGE.unlink(missing_ok=True)
 
+    # =====================================================================
+    # A3 验收（ADR-131）：**shell 自己跑外部命令**——init 会话的 SI 页带一条 argv
+    # （`run /HELLO.ELF`，`sh -c` 语义），shell 起手执行一次再退出。
+    # 判据三格：串口里有 shell 打的结果行前缀 + `(timeout)`（hello 是内核探针，
+    # 没人给它写 FLAG_EXIT 就自旋，5 s 超时是它的**已知行为**）+ 整跑 PASS。
+    # `exit=<码>` 那一路由 a3-exec 的 `wait=exit:0x0` 证（那是同一个 17 号返回值）。
+    print("=== A3 验收：shell 执行 argv 里的外部命令（--features a3-shell）===")
+    IMAGE.unlink(missing_ok=True)
+    ashv, ashrc, ashlog = do_run(["a3-shell", "fat32-probe"], timeout)
+    ash_ok = ashv == "PASS" and all((
+        "run: /HELLO.ELF" in ashlog,
+        "(timeout)" in ashlog,
+    ))
+    ash_verdict = "CONTENT-MISMATCH" if (ashv == "PASS" and not ash_ok) else ashv
+    IMAGE.unlink(missing_ok=True)
+
     rows = [
         ("正向", v if v != "PASS" or not p4_bad else "CONTENT-MISMATCH", rc, "PASS", 33),
         ("负样本", nv, nrc, "FAIL", 35),
@@ -8352,6 +8370,8 @@ def do_test(timeout: int) -> int:
         ("A2越界argv被校验拒", ab_verdict, abrc, "PASS", 33),
         # A3：用户态装载器（22 号卷路径 + 段表解析 + 14 号映射 + 11/15/16/17）
         ("A3 用户态装载器执行卷上ELF", r3_verdict, r3rc, "PASS", 33),
+        # A3 验收句的后半："命令输出和退出码返回 Shell"——shell 自己装载并等收工。
+        ("A3 shell执行argv里的外部命令", ash_verdict, ashrc, "PASS", 33),
     ]
     # 每一行对应那一跑的串口：不符时把红的那几格打出来。
     # 单独一张表而不是把日志塞进 `rows` 的元组里：元组要保持成"名字/期望/实际"这种
@@ -8410,6 +8430,7 @@ def do_test(timeout: int) -> int:
         "A2 argv/std经继承句柄启动外部ELF": axlog,
         "A2越界argv被校验拒": ablog,
         "A3 用户态装载器执行卷上ELF": r3log,
+        "A3 shell执行argv里的外部命令": ashlog,
     }
     all_ok = True
     print()
