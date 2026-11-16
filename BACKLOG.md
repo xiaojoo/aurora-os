@@ -14672,3 +14672,19 @@ kernel 栈/地址窗口上的脆弱）。下一刀先定位它：用同一段包
   证人自检——注入后把那个字节**还原**再取证 ⇒ `盘上偏移 34643968 又回到原值 50 ⇒ 注入被谁还原了`
   （非空 ⇒ 该行会翻成 CONTENT-MISMATCH），证明这台证人会咬。
 - `check` 17/17。
+## 370. virtio-blk 的 `Block` 适配器落地（AGENTS 缺口 4 / BACKLOG 78h-3 第一格）（2026-11-17）
+
+- `filesystem/vfs.rs` 新增 `pub struct VirtioDisk` + `impl Block`：逐扇区走 `virtio::read_block` /
+  `write_block`，错误按 `VirtioError` 归因（设备/能力族 → `NoDevice`、`UsedTimeout` → `NotSettled`、
+  `BadLen` → `Refused`、网卡解析错 → `DeviceError`）。**不是** 110-b 的设备表：第二台设备仍要先把
+  `virtio::DEV` 改成按 BDF 的表。
+- 判据 `t_virtio_block`（`virtio-blk` 档，85/85）：两扇区读（LBA0 = qemu-io 预填 `0x5C`）、两扇区写后
+  读回（图案绑定 LBA，写错扇区/少写一半都过不了）、空/半扇区形状拒绝；五计数增量
+  `requests=4 sectors=4 refused=2`。变异（适配器忽略 LBA、永远读 0 扇区）⇒ `写读回=false`、红；
+  还原后 PASS(33) 85/85（ELF `428e4fe1e7c5`）。
+- 接口登记：`module-interfaces.toml` 的 storage.public_api 加 `virtio::{read_block,write_block,VirtioError}`，
+  test_targets 加 `t_virtio_block`；逻辑模块依赖不变（`virtio` 与 `vfs` 同属 storage）。
+- 门禁教育一条：只改 `module-interfaces.toml` 不改 ADR ⇒ `check-interface-change` 当场红
+  （"接口变更先有决策、后有实现"）。已补 ADR-110 补记一，`check` **17/17**。
+- 读数：`virtio-blk` PASS(33) 85/85（`428e4fe1e7c5`）、`virtio-msix-probe` PASS(33)
+  （`5dfe81b95019`）、默认档 PASS(33)（`7fdd76f0dd97`）、`fs-rw` PASS(33)（`46d657d4f56`）。

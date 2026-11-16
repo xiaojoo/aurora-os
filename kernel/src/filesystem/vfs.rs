@@ -3,15 +3,16 @@
 //! 为什么是 trait 而不是直接叫 `ahci::read_bytes`：同一个解析器要能对着 AHCI 的第二块盘、
 //! virtio-blk，以及**内存里的夹具镜像**跑同一套判据。第三条尤其关键——没有它，
 //! "解析器对不对"只能靠真盘上的真文件验证，而那次失败没法区分是解析错还是传输错。
-//! 今天有两个实现：`AhciDisk`（真控制器，两块卷挂在两个口）与 `MemDisk`（内存里那块
-//! 11,264 字节的合成卷）。第三个——virtio-blk——**没做**：`virtio.rs` 的 `DEV` 是单设备静态，
-//! 挂第二台就要把它改成按 BDF 的表，会动到已绿的第 22/33 行与 MSI-X 变体，那是另一次改动
-//! （BACKLOG 78 的欠账带着这个理由，不是"还没来得及"）。
+//! 今天有三个实现：`AhciDisk`（真控制器，两块卷挂在两个口）、`VirtioDisk`（单设备
+//! virtio-blk，AGENTS 缺口 4 的第一格）与 `MemDisk`（内存里那块 11,264 字节的合成卷）。
+//! 第二个 virtio 设备仍要先把 `virtio::DEV` 从单设备静态改成按 BDF 的表（ADR-110 决策 3
+//! 的 110-b），那一刀会动到已绿的第 22/33 行与 MSI-X 变体，不在这里顺带做。
 //!
 //! 三个互相作证的实现之外还有两台仪器：宿主机 `tools/aurora.py` 用 Python 把同一块卷再解析一遍，
 //! 以及造夹具的 `mtools`（`minfo` 的原文记在 BACKLOG 78）。
 
 use crate::ahci::{self, AhciError};
+use crate::virtio;
 
 /// 块设备的一次读失败。**每一格一个成因**，不许合并——合并之后"设备没接走这条命令"和
 /// "上层参数写错"会长成同一个数，而那正是最该分开的两种。
@@ -174,6 +175,57 @@ impl Block for AhciDisk {
             ahci::write_bytes(self.port, lba + i as u64, chunk).map_err(block_err)?;
         }
         Ok(())
+    }
+}
+
+/// 单设备 virtio-blk 的 `Block` 适配器（AGENTS 缺口 4 / BACKLOG 78h-3 的第一格）。
+///
+/// 只认 `virtio::DEV` 那一台——第二台要先把驱动改成按 BDF 的表（ADR-110 决策 3 的 110-b）。
+/// 形状与 `AhciDisk` 一样逐扇区；错误按 `VirtioError` 归因，不合并成"设备坏了"一种。
+#[derive(Debug, Clone, Copy)]
+pub struct VirtioDisk;
+
+impl Block for VirtioDisk {
+    fn read_sectors(&self, lba: u64, dst: &mut [u8]) -> Result<(), BlockError> {
+        if dst.is_empty() || dst.len() % SECTOR_BYTES != 0 {
+            return Err(BlockError::Refused);
+        }
+        for (i, chunk) in dst.chunks_mut(SECTOR_BYTES).enumerate() {
+            virtio::read_block(lba + i as u64, chunk).map_err(virtio_block_err)?;
+        }
+        Ok(())
+    }
+
+    fn write_sectors(&self, lba: u64, src: &[u8]) -> Result<(), BlockError> {
+        if src.is_empty() || src.len() % SECTOR_BYTES != 0 {
+            return Err(BlockError::Refused);
+        }
+        for (i, chunk) in src.chunks(SECTOR_BYTES).enumerate() {
+            virtio::write_block(lba + i as u64, chunk).map_err(virtio_block_err)?;
+        }
+        Ok(())
+    }
+}
+
+fn virtio_block_err(e: virtio::VirtioError) -> BlockError {
+    use virtio::VirtioError as V;
+    match e {
+        // 设备/能力/认证这一族 = "这台设备不能用"，与"这条命令超时"分开。
+        V::NoDevice
+        | V::NoCommonCap
+        | V::BadBar(_)
+        | V::StructBeyondBar { .. }
+        | V::Ctx(_)
+        | V::CapLoop
+        | V::NoMsixCap
+        | V::MsixTooSmall(_)
+        | V::StatusStuck(_)
+        | V::DeviceRefused(_)
+        | V::BadQueue(_) => BlockError::NoDevice,
+        V::UsedTimeout => BlockError::NotSettled,
+        V::BadLen(_) => BlockError::Refused,
+        // 块路径上收到网卡的解析错，说明调用方向错了——不当"超时"也不当"没设备"。
+        V::NotV4 { .. } => BlockError::DeviceError,
     }
 }
 

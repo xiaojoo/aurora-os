@@ -83,3 +83,18 @@ MSI-X 变体的取证形状。那一刀需要：`DEV` 表化 + 两台设备并�
    那是 110-b 之后的事；现在就加回调等于给一个没有异步的地方造异步。）
 3. `MemDisk` 是否也该走请求层（判据更一致）还是继续"直连以标定基线"（当前 `TestDisk`
    就是用来做对照的）。倾向：请求层的 ktest 用 `TestDisk`，`MemDisk` 不动。
+
+## 补记一（2026-11-17）：单设备 `VirtioDisk` 适配器落地（原本挂在 110-b 的第一格）
+
+- `filesystem/vfs.rs` 新增 `pub struct VirtioDisk` 与它的 `Block` 实现：逐扇区走
+  `virtio::read_block`/`write_block`，错误按 `VirtioError` 归因（设备/能力族 → `NoDevice`，
+  `UsedTimeout` → `NotSettled`，`BadLen` → `Refused`）。**这不等于 110-b 的设备表**：第二台
+  virtio-blk 仍要先把 `virtio::DEV` 改成按 BDF 的表，那是另一刀（它动第 22/33 行与 MSI-X 变体）。
+- 接口登记随之增加（`module-interfaces.toml` 的 storage.public_api）：
+  `virtio::read_block`、`virtio::write_block`、`virtio::VirtioError`。逻辑模块依赖不变
+  （`virtio` 与 `vfs` 同属 storage）。
+- 判据 `t_virtio_block`（`virtio-blk` 档）：两扇区读（LBA0 的 qemu-io 0x5C 图案）、两扇区写后
+  读回（图案按 LBA 绑定）、空/半扇区形状拒绝；计数按增量 `requests=4 sectors=4 refused=2`。
+  变异（适配器忽略 LBA、永远读 0 扇区）⇒ `写读回=false`、该格红；还原后 85/85。
+- 读数：`run --features virtio-blk` PASS(33) 85/85（`428e4fe1e7c5`）；`virtio-msix-probe`
+  PASS(33)（`5dfe81b95019`）、默认档 PASS(33)（`7fdd76f0dd97`）、`fs-rw` PASS(33)（`46d657d4f56`）。

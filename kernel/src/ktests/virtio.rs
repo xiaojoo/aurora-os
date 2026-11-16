@@ -325,3 +325,64 @@ fn t_virtio_io() -> bool {
 #[cfg(feature = "virtio-blk")]
 ktest!(KT_VIRTIO_IO, t_virtio_io);
 
+/// ADR-110 决策 3 / BACKLOG 78h-3 的第一格：`VirtioDisk` 这个 `Block` 实现本身。
+///
+/// 与 `t_virtio_io`（直接调驱动）分工：这条走**块层**（`block_io::read_at` + `Block`），
+/// 证的是"适配器把多扇区/形状/错误映射接对了"，不是驱动又测一遍。写用 LBA 10..12，
+/// 与 `t_virtio_io` 的扇区 8、宿主机那行的对账互不重叠。
+#[cfg(feature = "virtio-blk")]
+fn t_virtio_block() -> bool {
+    use crate::filesystem::block_io::{self, Budget};
+    use crate::filesystem::vfs::{Block, BlockError, VirtioDisk};
+    const EXPECT_PATTERN: u8 = 0x5C; // 与 tools/aurora.py 的 VBLK_PATTERN 同数（check-virtio-pattern）
+    const LBA: u64 = 10;
+    if let Err(e) = virtio::bind() {
+        crate::log_fatal!("vblk: 绑定/握手失败 {:?}", e);
+        return false;
+    }
+    let before = block_io::stats();
+
+    // ① 多扇区读：LBA0 那段是 qemu-io 预填的 0x5C，两扇区读必须都落地。
+    let mut two = [0u8; 2 * 512];
+    let r = block_io::read_at(&VirtioDisk, 0, &mut two, &Budget::UNBOUNDED);
+    let read_ok = r.sectors_done == 2 && r.error.is_none()
+        && two[..512].iter().all(|b| *b == EXPECT_PATTERN);
+
+    // ② 两扇区写后再读回：图案按 LBA 绑定，写错扇区/少写一半都过不了。
+    let mut src = [0u8; 2 * 512];
+    for i in 0..src.len() {
+        src[i] = ahci::pattern_byte(LBA, i as u64);
+    }
+    let wrote = VirtioDisk.write_sectors(LBA, &src).is_ok();
+    let mut back = [0u8; 2 * 512];
+    let rb = block_io::read_at(&VirtioDisk, LBA, &mut back, &Budget::UNBOUNDED);
+    let write_ok = wrote && rb.sectors_done == 2 && rb.error.is_none() && back == src;
+
+    // ③ 形状：空与半扇区在碰设备之前被拒（走块层，这样 refused 计数也被量到）。
+    let mut empty: [u8; 0] = [];
+    let mut odd = [0u8; 511];
+    let shape_ok = block_io::read_at(&VirtioDisk, 0, &mut empty, &Budget::UNBOUNDED).error
+        == Some(BlockError::Refused)
+        && block_io::read_at(&VirtioDisk, 0, &mut odd, &Budget::UNBOUNDED).error
+            == Some(BlockError::Refused);
+
+    let after = block_io::stats();
+    let d_req = after.requests.wrapping_sub(before.requests);
+    let d_sec = after.sectors_ok.wrapping_sub(before.sectors_ok);
+    let d_ref = after.refused.wrapping_sub(before.refused);
+    let counts_ok = d_req == 4 && d_sec == 4 && d_ref == 2;
+
+    crate::log_info!(
+        "vblk: 判据 多扇区读={} 写读回={} 形状={} 计数={} 增量 requests={} sectors={} refused={}",
+        read_ok,
+        write_ok,
+        shape_ok,
+        counts_ok,
+        d_req,
+        d_sec,
+        d_ref
+    );
+    read_ok && write_ok && shape_ok && counts_ok
+}
+#[cfg(feature = "virtio-blk")]
+ktest!(KT_VIRTIO_BLOCK, t_virtio_block);
