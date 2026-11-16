@@ -1,6 +1,6 @@
 # unsafe 逐处审计表（U1–U6）
 
-总计 463 处。U1 82 · U2 116 · U3 13 · U4 131 · U5 85 · U6 36
+总计 465 处。U1 83 · U2 116 · U3 13 · U4 131 · U5 86 · U6 36
 
 本表由 `tools/aurora.py` 的 `unsafe_sites()` 从源码逐处生成，**不是手写的**。
 机器可读的权威来源是 `docs/security/unsafe-whitelist.toml` 的 `[modules.*]` 段（模块×类别→处数），
@@ -881,6 +881,10 @@
 - `user/probe/src/main.rs:394` [{] **U1** fn=`_start`
   > unsafe { core::arch::asm!("2: jmp 2b", options(nomem, nostack, noreturn)) }; } }
 
+### user/shell/registry
+
+- `user/shell/src/registry.rs:157` [{] **U5** fn=`cmd_run`
+
 ### user/shell
 
 - `user/shell/src/main.rs:61` [{] **U1** fn=`msgs_base`
@@ -972,6 +976,10 @@
 - `user/runtime/src/lib.rs:773` [{] **U5** fn=`find_console`
 
 - `user/runtime/src/lib.rs:776` [{] **U5** fn=`find_console`
+
+### user/runtime/exec
+
+- `user/runtime/src/exec.rs:48` [{] **U1** fn=`chunk`
 
 ### user/execprobe
 

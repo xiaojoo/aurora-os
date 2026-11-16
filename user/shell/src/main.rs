@@ -38,7 +38,7 @@ mod registry;
 /// （hello/probe 的模块头都记过这个坑，本轮实测又撞一次）。改成 RIP 相对 lea 取基址 + 常量偏移。
 /// S6u：横幅的前导 `\x0a` 去掉了——那是当年为了跟上面的内核日志隔开留的，
 /// ADR-096 之后画面正文只有会话输出，前面什么都没有，那一格就成了纯粹的空行。
-static MSGS: [u8; 215] = *b"commands: help | echo <text> | ping | abi | exit\x0aAurora shell (S5c). type 'help'.\x0aAURORA:/ > \x0aline too long, discarded\x0aunknown command:  (try help)\x0aping=abi_info=bye\x0a\x08 \x08^C\x0aAurora OS 6.1.0-aurora (tty1)\x0aaurora@os:~$ ";
+static MSGS: [u8; 262] = *b"commands: help | echo <text> | ping | abi | exit\x0aAurora shell (S5c). type 'help'.\x0aAURORA:/ > \x0aline too long, discarded\x0aunknown command:  (try help)\x0aping=abi_info=bye\x0a\x08 \x08^C\x0aAurora OS 6.1.0-aurora (tty1)\x0aaurora@os:~$ run:  exit= (timeout) error=usage: run <path>\x0a-";
 
 const M_HELP: (usize, usize) = (0, 49);
 const M_BANNER: (usize, usize) = (172, 30);
@@ -53,6 +53,19 @@ const M_BYE: (usize, usize) = (162, 4);
 const M_BS: (usize, usize) = (166, 3);
 /// Ctrl+C 的回显串（S6q）。**追加在 blob 末尾**：这样前面那 11 条偏移一个都不用动。
 const M_INT: (usize, usize) = (169, 3);
+// ---- A3 外部命令（`run`）：**追加在 blob 末尾**，前面 12 条偏移一个不动 ----
+/// `run: `
+const M_RUN_PREFIX: (usize, usize) = (215, 5);
+/// ` exit=`
+const M_RUN_EXIT: (usize, usize) = (220, 6);
+/// ` (timeout)`
+const M_RUN_TIMEOUT: (usize, usize) = (226, 10);
+/// ` error=`
+const M_RUN_ERR: (usize, usize) = (236, 7);
+/// `usage: run <path>\n`
+const M_RUN_USAGE: (usize, usize) = (243, 18);
+/// `-`（负错误码的符号位）
+const M_MINUS: (usize, usize) = (261, 1);
 
 /// blob 的真实基址（RIP 相对 lea，不产生 32 位绝对重定位）。
 fn msgs_base() -> u64 {
@@ -185,7 +198,9 @@ pub extern "C" fn _start(si_va: u64) -> ! {
                 // A3：解析 → 注册表分派。msg 常量与打印顺序一行未动，
                 // 五命令与 unknown 的输出路径逐字节不变（见两模块头注释）。
                 let parsed = parser::parse(line.get(..len).unwrap_or(&[]));
-                if !registry::dispatch(console, &parsed) {
+                // A3：`run` 要按角色取 Job 句柄，所以把 SI 页地址一并传进分派层
+                // （只有 `run` 用它，其余命令一个字都没变）。
+                if !registry::dispatch(console, si_va, &parsed) {
                     // A2 接线：与旧版同义（3 号、code=0）。`rt::exit` 是 `-> !`，
                     // 失败时 runtime 侧自旋兜底（旧版这里无兜底，exit 失败会掉回循环——
                     // 那是内核异常态，自旋比静默继续更诚实）。

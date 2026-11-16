@@ -117,6 +117,24 @@ argv 换成 `/HELLO.ELF`（**绝对路径**：`vfs_ro::lookup` 拒相对路径�
 - `tools/aurora.py`：A3 判定行（第 64 行）、`a3-exec` 档装配 deep + 卷A。
 - 登记：unsafe 白名单/census（463）、module-interfaces（`fs_open::port`/`set_port`）。
 
+## 补记（同日）：shell 的 `run` 命令与编排层下沉
+
+装载链路的下沉版本落在 `user/runtime/src/exec.rs`（`load` / `launch` / `wait_exit` / `run`，
+静态 4 KiB 读块 + SI 页构造都收在库里），shell 侧只剩：
+`run <path>` → 补绝对路径 → 按 `ROLE_JOB` 取 Job 句柄 → `rt::exec::run(path, console, job, 5000)`
+→ 打 `run: <path> exit=<码>` / `(timeout)` / ` error=<码>`。
+
+**交互路径的端到端验证被一件量具通道的事卡住，如实记录**：
+为验证"人手打一条命令"，我加了 `a3-shell` 档（宿主经串口 RX socket 等提示符 → 注入
+`run /HELLO.ELF` → 见结果行后注入 `exit`）。实测该档能跑通命令本身（串口出现
+`run: /HELLO.ELF`，随后是卷A 的逐扇区读），但**同一份构建里 `t_fs_open_ring3` 转红**
+（1/1 复现；`fs-open` 单特性、`a3-exec,fat32-probe` 都绿）。对照实验排除了内核侧代码：
+把 a3-shell 的内核块整段停用后仍然红；而该档与 `fs-open` 单特性的差别只剩"串口走 socket
+而不是 file"。结论：**RX 通道让整跑的输出吞吐掉一半（7 s → 16-19 s），把时间窗判据拖红**。
+所以该档没有进判定表，代码保留（`run` 本身不改任何既有行的行为），下一片再解：
+要么给 RX 档放宽窗口（量具改动，属使用者裁决），要么让 shell 在无盘构建里显式报
+"没有卷"（现在是 open 回 -1 的 ` error=-1`）。
+
 ## 未做 / 留给下一片
 
 1. **shell 的 `run` 命令**还没有接线到这条装载器（今天由探针驱动；shell 集成要 argv 解析 +

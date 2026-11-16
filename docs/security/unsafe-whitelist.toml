@@ -80,12 +80,15 @@ expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe
 # +user/runtime（U5 32→35 = 12/13/14 三个 VMO 封装的调用块）、
 # +filesystem/fs_open（U2 2 = 运行期挂根的单写者 volatile 读/写）。
 # 数目对账：454+9=463、81+1=82、114+2=116、79+6=85。
-total = 463
-U1 = 82
+# 2026-11-17 A3 收尾（shell `run` + runtime exec）：+user/runtime/exec（U1 1 = 静态读块的
+# RIP 相对 lea）、+user/shell/registry（U5 1 = 按角色取 Job 句柄的那次 handle_of_role）。
+# 数目对账：463+2=465、82+1=83、85+1=86。
+total = 465
+U1 = 83
 U2 = 116
 U3 = 13
 U4 = 131
-U5 = 85
+U5 = 86
 U6 = 36
 
 [modules."acpi"]
@@ -352,3 +355,14 @@ U5 = 6
 # 单写者：a3-exec 的编排在任何用户任务起来之前调一次 `set_port(3)`，此后整机只读；
 # 单字节、无对齐问题；`addr_of!` 不创造引用（`static_mut_refs` 的正当写法）。
 U2 = 2
+
+[modules."user/runtime/exec"]
+# A3 收尾（ADR-131）：装载与启动的编排层。U1 一处 = 静态 4 KiB 读块的 RIP 相对 lea
+# （`.bss` 在 4 GiB 之上，`addr_of_mut!` 会退化成 R_X86_64_32S；实测 shell 链接时三处
+# 引用该 section 越界）。切片本身由本模块独占（单线程用户程序，无并发窗口）。
+U1 = 1
+
+[modules."user/shell/registry"]
+# A3 收尾：`run` 命令。U5 一处 = `rt::handle_of_role(si_va, ROLE_JOB)` 那一次调用——
+# si_va 由内核 `process_start` 校验并映射（user+只读），契约原文在 runtime 侧。
+U5 = 1
