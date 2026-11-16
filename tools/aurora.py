@@ -123,7 +123,7 @@ FIXTURE = ROOT / "kernel" / "fixtures" / "hello.elf"
 # 与 .cargo/config.toml 里给内核那组 rustflags **平行**的一份：链接脚本不同，
 # 而 cargo 的 `[target.*]` 段是按 target 生效的，两个包共用同一个 target 时只能靠
 # RUSTFLAGS 覆盖（这是 cargo 的既定优先级，不是本机 hack）。
-USER_RUSTFLAGS = "-C link-arg=-Tuser/hello/link.ld -C relocation-model=static -C panic=abort -C opt-level=1"
+USER_RUSTFLAGS = "-C link-arg=-Tuser/hello/link.ld -C relocation-model=static -C panic=abort -C opt-level=1 -C debuginfo=0 --remap-path-prefix=H:/aurora-os-wb=/src --remap-path-prefix=H:/aurora-os=/src --remap-path-prefix=H:////aurora-os-wb=/src"
 
 
 def do_build_user() -> Path:
@@ -154,19 +154,19 @@ def do_build_user() -> Path:
 PROBE_PKG = "aurora-user-probe"
 PROBE_ELF = ROOT / "target" / TARGET / "debug" / "probe"
 PROBE_FIXTURE = ROOT / "kernel" / "fixtures" / "probe.elf"
-PROBE_RUSTFLAGS = "-C link-arg=-Tuser/probe/link.ld -C relocation-model=static -C panic=abort -C opt-level=1"
+PROBE_RUSTFLAGS = "-C link-arg=-Tuser/probe/link.ld -C relocation-model=static -C panic=abort -C opt-level=1 -C debuginfo=0 --remap-path-prefix=H:/aurora-os-wb=/src --remap-path-prefix=H:/aurora-os=/src --remap-path-prefix=H:////aurora-os-wb=/src"
 # S5c：第三个用户产物（串口 shell）。与 probe 同一条构建纪律，只换链接脚本与包名。
 SHELL_PKG = "aurora-user-shell"
 SHELL_ELF = ROOT / "target" / TARGET / "debug" / "shell"
 SHELL_FIXTURE = ROOT / "kernel" / "fixtures" / "shell.elf"
-SHELL_RUSTFLAGS = "-C link-arg=-Tuser/shell/link.ld -C relocation-model=static -C panic=abort -C opt-level=1"
+SHELL_RUSTFLAGS = "-C link-arg=-Tuser/shell/link.ld -C relocation-model=static -C panic=abort -C opt-level=1 -C debuginfo=0 --remap-path-prefix=H:/aurora-os-wb=/src --remap-path-prefix=H:/aurora-os=/src --remap-path-prefix=H:////aurora-os-wb=/src"
 # FS-03 切片 D（ADR-108 决策 8）：第四个用户产物 = ring3 文件探针。构建纪律与 probe/shell 逐条相同，
 # 只换包名、产物名与链接脚本。它**只在 `fs-open` 构建里被内核 include_bytes!**，
 # 但产物每次都造：构建不该看特性的脸色，看不看是内核编译期决定的。
 FILEPROBE_PKG = "aurora-user-fileprobe"
 FILEPROBE_ELF = ROOT / "target" / TARGET / "debug" / "fileprobe"
 FILEPROBE_FIXTURE = ROOT / "kernel" / "fixtures" / "fileprobe.elf"
-FILEPROBE_RUSTFLAGS = "-C link-arg=-Tuser/fileprobe/link.ld -C relocation-model=static -C panic=abort -C opt-level=1"
+FILEPROBE_RUSTFLAGS = "-C link-arg=-Tuser/fileprobe/link.ld -C relocation-model=static -C panic=abort -C opt-level=1 -C debuginfo=0 --remap-path-prefix=H:/aurora-os-wb=/src --remap-path-prefix=H:/aurora-os=/src --remap-path-prefix=H:////aurora-os-wb=/src"
 
 
 def do_build_fileprobe() -> Path:
@@ -445,8 +445,8 @@ FAT_IMG = {name: BUILD / f"{name}.img" for name in set(FAT_PORTS.values()) | set
 # 存成 `.img.zz` 的理由很实际：`.gitignore` 里 `*.img` 挡的是构建产物，裸卷 32/64 MiB 不该进仓库，
 # 而它们**是**源（配方与 mtools 数值记在 BACKLOG 78）。压缩后 40 KB 与 262 KB，几乎全是零与重复图案。
 FAT_EXPECT = {
-    "fat32-small": (33_554_432, "3eb1d518923ae4e3692aafec7d545c1bfa92ef75366ea3ab82fbc5256f97c976"),
-    "fat32-wide": (67_108_864, "da3aa3a2e2e7d600d45fa47ad142b635c072269a9bba25d7df2f51e08c8d34e9"),
+    "fat32-small": (33_554_432, "e415e29b388d92c0228ab041189d9fabcde863341db13a9ad7aecf2789e747e4"),
+    "fat32-wide": (67_108_864, "e317234fcc7b4d217d09abc5e1d35ae7d2523a65d75664e15e0b0955239ebecd"),
 }
 # ADR-109 的多级真卷（`fs-open` 的挂载根）：它**不在仓库里**，由 `tools/make_fat32_deep.py` 现算，
 # 所以登记的是"配方 + 现算出来的字节"这一对。指纹先于解析判，同 `FAT_EXPECT` 那条理由：

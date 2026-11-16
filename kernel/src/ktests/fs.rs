@@ -159,12 +159,12 @@ fn t_fat32() -> bool {
         lo: u16,
     }
     let want_a = [
-        Want { name: "HELLO.ELF", size: 32_672, cluster: 3, seen: 1, hi: 0, lo: 3 },
+        Want { name: "HELLO.ELF", size: 17_288, cluster: 3, seen: 1, hi: 0, lo: 3 },
         Want { name: "NOTES", size: 1_000, cluster: 65, seen: 2, hi: 0, lo: 65 },
         Want { name: "SMALL.BIN", size: 100, cluster: 67, seen: 3, hi: 0, lo: 67 },
     ];
     let want_b = [
-        Want { name: "HELLO.ELF", size: 32_672, cluster: 67_587, seen: 2, hi: 1, lo: 2_051 },
+        Want { name: "HELLO.ELF", size: 17_288, cluster: 67_587, seen: 2, hi: 1, lo: 2_051 },
         Want { name: "NOTES", size: 1_000, cluster: 67_649, seen: 3, hi: 1, lo: 2_113 },
         Want { name: "SMALL.BIN", size: 100, cluster: 67_651, seen: 4, hi: 1, lo: 2_115 },
     ];
