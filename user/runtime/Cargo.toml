@@ -1,0 +1,13 @@
+[package]
+name = "aurora-user-runtime"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# A2 切片：用户态运行时库（no_std，无堆分配，不 panic）。
+# 封装 kernel/src/user.rs 里**已存在**的系统调用号；不新增任何号（23 预留给未来 write）。
+# 命名沿用 user/* 现有惯例（aurora-user-shell / aurora-user-probe / aurora-user-fileprobe）。
+# 登记进根 Cargo.toml 的 members 与 docs/architecture/crates.toml 由主会话完成（§2.5 R10）。
+
+[lints]
+workspace = true

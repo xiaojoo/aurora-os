@@ -13,9 +13,17 @@
 //!
 //! **命令只用真实存在的 syscall**：help/echo/ping/abi/exit。
 //! `ps`/`mem`/`reboot` 需要新号，本片**不做**，也不假装做了。
+//!
+//! A3：命令分发重构为"解析器 + 注册表"——`parser.rs` 负责切词，
+//! `registry.rs` 持有全部命令与 unknown 输出；本文件只剩读行循环与
+//! 串口底座（MSGS/con_write/con_read/syscall3）。五个命令与 unknown
+//! 提示的串口输出保持**逐字节不变**（回归安全线）。
 
 #![no_std]
 #![no_main]
+
+mod parser;
+mod registry;
 
 // ---- 调用号（与 kernel/src/user.rs 同一组数，用户侧独立声明）----
 const SYS_PING: u64 = 1;
@@ -187,73 +195,6 @@ unsafe fn find_console(si_va: u64) -> Option<u64> {
     None
 }
 
-const CMD_HELP: [u8; 4] = [b'h', b'e', b'l', b'p'];
-const CMD_ECHO: [u8; 4] = [b'e', b'c', b'h', b'o'];
-const CMD_PING: [u8; 4] = [b'p', b'i', b'n', b'g'];
-const CMD_ABI: [u8; 3] = [b'a', b'b', b'i'];
-const CMD_EXIT: [u8; 4] = [b'e', b'x', b'i', b't'];
-
-/// 命令词用 const 字节数组而不是字符串字面量：const 数组会被折成 immediates，
-/// 不产生 .rodata 的 32 位绝对重定位（字面量会，本轮实测撞到）。
-fn streq(a: &[u8], b: &[u8]) -> bool {
-    a == b
-}
-
-/// 分派一条命令。返回 false 表示要退出 shell。
-fn dispatch(h: u64, line: &[u8]) -> bool {
-    // 去掉首尾空白
-    let mut s = line;
-    while let Some((c, rest)) = s.split_first() {
-        if *c == b' ' || *c == b'\t' {
-            s = rest;
-        } else {
-            break;
-        }
-    }
-    while let Some((c, rest)) = s.split_last() {
-        if *c == b' ' || *c == b'\t' || *c == b'\r' {
-            s = rest;
-        } else {
-            break;
-        }
-    }
-    if s.is_empty() {
-        return true;
-    }
-    // 命令词与参数
-    let (cmd, arg) = match s.iter().position(|c| *c == b' ') {
-        Some(i) => match s.split_at_checked(i) {
-            Some((a, b)) => (a, b.get(1..).unwrap_or(&[])),
-            None => (s, &[][..]),
-        },
-        None => (s, &[][..]),
-    };
-    if streq(cmd, &CMD_HELP) {
-        con_write(h, msg(M_HELP));
-    } else if streq(cmd, &CMD_ECHO) {
-        con_write(h, arg);
-        con_write(h, msg(M_NL));
-    } else if streq(cmd, &CMD_PING) {
-        let n = unsafe { syscall3(SYS_PING, 0, 0, 0) };
-        con_write(h, msg(M_PING));
-        put_u64(h, n);
-        con_write(h, msg(M_NL));
-    } else if streq(cmd, &CMD_ABI) {
-        let v = unsafe { syscall3(SYS_ABI_INFO, 0, 0, 0) };
-        con_write(h, msg(M_ABI));
-        put_u64(h, v);
-        con_write(h, msg(M_NL));
-    } else if streq(cmd, &CMD_EXIT) {
-        con_write(h, msg(M_BYE));
-        return false;
-    } else {
-        con_write(h, msg(M_UNKNOWN));
-        con_write(h, cmd);
-        con_write(h, msg(M_TRYHELP));
-    }
-    true
-}
-
 /// 入口。`rdi` = StartupInfo 那一页在子 AS 里的 VA（`process_start` 的 set_thread_arg）。
 #[no_mangle]
 pub extern "C" fn _start(si_va: u64) -> ! {
@@ -289,8 +230,14 @@ pub extern "C" fn _start(si_va: u64) -> ! {
             con_write(console, msg(M_NL));
             if overflow {
                 con_write(console, msg(M_TOOLONG));
-            } else if !dispatch(console, line.get(..len).unwrap_or(&[])) {
-                unsafe { syscall3(SYS_EXIT, 0, 0, 0) };
+            } else {
+                // A3：解析 → 注册表分派。msg 常量与打印顺序一行未动，
+                // 五命令与 unknown 的输出路径逐字节不变（见两模块头注释）。
+                let parsed = parser::parse(line.get(..len).unwrap_or(&[]));
+                if !registry::dispatch(console, &parsed) {
+                    // SAFETY: 与旧 dispatch 返回 false 后的那次调用逐字相同：3 号 SYS_EXIT。
+                    unsafe { syscall3(SYS_EXIT, 0, 0, 0) };
+                }
             }
             len = 0;
             overflow = false;
