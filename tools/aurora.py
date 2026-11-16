@@ -3521,10 +3521,8 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
             bad = apply_fat_host_fault(host_fault)
             if bad:
                 sys.exit("FAT32 宿主机侧注入不成立：" + " / ".join(bad))
-    if (FS_OPEN_FEATURES | A3_EXEC_FEATURES) & set(features):
-        # ADR-109：`fs-open` 的挂载根换成了多级真卷（口 5）。A3 的挂根是口 3 的卷A，但
-        # A3 的 a3-exec 档也依赖 `fs-open`（22 号的模块门）⇒ 同一份构建里 fs-open 的
-        # 用例也在跑，这块卷必须照样现算（否则那一批用例红在"盘上没有三级路径"）。
+    if FS_OPEN_FEATURES & set(features):
+        # ADR-109：`fs-open` 的挂载根换成了多级真卷（口 5）。
         # 卷A 上根本没有多级路径、跨簇目录与子目录 LFN，挂在那里等于"用例写着三级路径、盘上没有"。
         bad = ensure_fat_deep()
         if bad:
