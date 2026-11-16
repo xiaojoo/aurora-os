@@ -41,6 +41,20 @@ const SLOT_DIR_CLOSE: u64 = 248;
 /// 一次用展开式 `t*435 + (t<<40)`。两格不同 ⇒ 分歧在乘法的降级；两格相同但与核内不同
 /// ⇒ 分歧在写入通路或字节本身。**不参与判据**，只把数字打出来。
 const SLOT_FNVMUL: u64 = 256;
+/// ADR-109 / §343：多级路径与中间层目录。ring3 侧此前只走根目录那一层，
+/// 于是"用户空间能读多级路径"这句话没有证人（ADR-108 未决 1 的另一半）。
+const SLOT_N_OPEN: u64 = 272;
+const SLOT_N_TOTAL: u64 = 280;
+const SLOT_N_HEAD: u64 = 288;
+const SLOT_N_SUM: u64 = 296;
+const SLOT_N_STAT: u64 = 304;
+const SLOT_N_SIZE: u64 = 312;
+const SLOT_N_FIRST: u64 = 320;
+const SLOT_N_CLOSE: u64 = 328;
+const SLOT_P_OPEN: u64 = 336;
+const SLOT_P_RECS: u64 = 344;
+const SLOT_P_NAMES: u64 = 352;
+const SLOT_P_CLOSE: u64 = 360;
 const SLOT_FNVADD: u64 = 264;
 const SLOT_SEEK50: u64 = 48;
 const SLOT_READ50_TOTAL: u64 = 56;
@@ -152,6 +166,14 @@ fn get_u32(off: u64) -> u32 {
 fn set_path(lo: u64, hi: u64) {
     put(BUF_PATH, lo);
     put(BUF_PATH + 8, hi);
+}
+
+/// 24 字节的路径要三格（`/PROJECT/DOCS/NESTED.TXT` 正好 24）：`set_path` 只写两格，
+/// 这一段自己补第三格。路径仍然全是**立即数**——本产物没有重定位器（见模块头）。
+fn set_path24(p0: u64, p1: u64, p2: u64) {
+    put(BUF_PATH, p0);
+    put(BUF_PATH + 8, p1);
+    put(BUF_PATH + 16, p2);
 }
 
 /// 同一个 `h` 用两种写法各推一步：`wrapping_mul(素数)` 与展开式 `t*435 + (t<<40)`。
@@ -296,7 +318,34 @@ pub extern "C" fn _start(_mailbox: u64) -> ! {
                 put(SLOT_DIR_CLOSE, sys3(SYS_HANDLE_CLOSE, dir, 0, 0));
             }
 
-            // ---- 失败格：相对路径、不存在、非零 flags ----
+            // ---- ADR-109：三级路径与中间层目录（ring3 侧第一次走多级 lookup） ----
+        // 首选簇 65,600 的高半是 1：只拼低半会读到 64 号簇，而字节数照样是 64。
+        set_path24(0x5443_454a_4f52_502f, 0x454e_2f53_434f_442f, 0x5458_542e_4445_5453);
+        let nested = sys3(SYS_FILE_OPEN, slots_base() + BUF_PATH, 24, 0);
+        put(SLOT_N_OPEN, nested);
+        if (nested as i64) >= 0 {
+            let (total, _) = read_all(nested, BUF_SMALL, 64);
+            put(SLOT_N_TOTAL, total);
+            put(SLOT_N_HEAD, word8(BUF_SMALL));
+            put(SLOT_N_SUM, byte_sum(BUF_SMALL, total));
+            put(SLOT_N_STAT, sys3(SYS_FILE_STAT, nested, slots_base() + BUF_STAT, 48));
+            put(SLOT_N_SIZE, get_u32(BUF_STAT + ST_SIZE_AT) as u64);
+            put(SLOT_N_FIRST, get_u32(BUF_STAT + ST_FIRST_AT) as u64);
+            // 不关就是「表清空」那一格的假红（根目录那条注释记过同一笔）。
+            put(SLOT_N_CLOSE, sys3(SYS_HANDLE_CLOSE, nested, 0, 0));
+        }
+        set_path(0x5443_454a_4f52_502f, 0); // "/PROJECT"
+        let proj = sys3(SYS_FILE_OPEN, slots_base() + BUF_PATH, 8, 0);
+        put(SLOT_P_OPEN, proj);
+        if (proj as i64) >= 0 {
+            let (recs, names, _) = read_dir_all(proj);
+            put(SLOT_P_RECS, recs);
+            put(SLOT_P_NAMES, names);
+            put(SLOT_P_CLOSE, sys3(SYS_HANDLE_CLOSE, proj, 0, 0));
+        }
+
+
+        // ---- 失败格：相对路径、不存在、非零 flags ----
             set_path(0x4942_2e4c_4c41_4d53, 0x0000_0000_0000_004e); // "SMALL.BIN"
             put(SLOT_REL, sys3(SYS_FILE_OPEN, slots_base() + BUF_PATH, 9, 0));
             set_path(0x0000_0000_4550_4f4e_2f, 0); // "/NOPE"

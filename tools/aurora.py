@@ -452,7 +452,7 @@ FAT_EXPECT = {
 # 所以登记的是"配方 + 现算出来的字节"这一对。指纹先于解析判，同 `FAT_EXPECT` 那条理由：
 # 红要落在"配方与镜像分家"上，而不是落在核内解析器身上。
 FAT_DEEP_SCRIPT = ROOT / "tools" / "make_fat32_deep.py"
-FAT_DEEP_EXPECT = (34336768, "086855ab254a363518c53529b4ce2b3b3e55f3b5e2be181a21f8e335a2e37749")
+FAT_DEEP_EXPECT = (34336768, "188439830af785f747c4ba12c9c48c19470f5e406c502b0c5a827e9c84206a1c")
 # L3-C② 的内存夹具卷：11,264 字节，由 `tools/make_fat32_mem.py` 现算（这块卷**不在仓库里**——
 # `.gitignore` 的 `*.img` 把它挡了，而能被配方重新算出来的东西本来就该不进仓库）。
 # 指纹登记在这里，构建前先跑配方脚本：对不上就是"配方与镜像分家"，红在编译之前，
@@ -1527,6 +1527,8 @@ FS_RING3_RE = re.compile(
     r"fs-open-ring3: 取证 读回=(?P<read>\d+) 首8=(?P<head>0x[0-9a-f]+) 字节和=(?P<sum>\d+) "
     r"尾首8=(?P<thead>0x[0-9a-f]+) 尾和=(?P<tsum>\d+) stat大小=(?P<size>\d+) 首簇=(?P<first>\d+) "
     r"条目=(?P<recs>\d+) 名字和=(?P<nsum>\d+) 大小和=(?P<ssize>\d+) "
+    r"多级读回=(?P<mread>\d+) 多级首8=(?P<mhead>0x[0-9a-f]+) 多级和=(?P<msum>\d+) "
+    r"多级首簇=(?P<mfirst>\d+) proj条目=(?P<precs>\d+) proj名字和=(?P<pnames>\d+) "
     r"表清空=(?P<clean>true|false) 回收=(?P<reaped>true|false) "
     r"rounds=(?P<rounds>\d+) served=(?P<served>\d+) "
     r"诊断mul=(?P<mul>0x[0-9a-f]+) 诊断add=(?P<add>0x[0-9a-f]+)")
@@ -1541,7 +1543,7 @@ FS_DEEP_RE = re.compile(
     r"fs-open: 多级取证 首8=(?P<dhead>0x[0-9a-f]+) 和=(?P<dsum>\d+) 首簇=(?P<dfirst>\d+) "
     r"proj条目=(?P<proj>\d+) docs条目=(?P<docs>\d+) docs大小和=(?P<docsum>\d+) "
     r"长名条数=(?P<lcount>\d+) 长名和=(?P<lsum>\d+) 长名同字节=(?P<lsame>\d+) "
-    r"非目录=(?P<notdir>-?\d+) 点路径=(?P<dot>-?\d+)")
+    r"非目录=(?P<notdir>-?\d+) 点路径=(?P<dot>-?\d+) 16级=(?P<d16>-?\d+) 17级=(?P<d17>-?\d+)")
 
 
 def deep_host_rows() -> tuple[list[list[str]], list[str]]:
@@ -1592,6 +1594,8 @@ def deep_expectations(rows: list[list[str]]) -> tuple[dict[str, object], list[st
         "small.fnv": int(small["fnv"], 16),
         "small.head": int(small["head8"], 16),
         "small.sum": int(small["bytesum"]),
+        # 整份声明字节：判定行按任意字节段自己算（尾段那三格就靠它，§342 欠账①）。
+        "small.body": bytes.fromhex(small["bodyhex"]),
         "root.order": order,
         "root.sizes": sizes,
         "root.namesum": int(root["namesum"]),
@@ -1628,7 +1632,9 @@ def deep_cells_bad(m, want: dict[str, object], who: str) -> list[str]:
         got = int(m.group(g), 16) if hexg else int(m.group(g))
         if got != want[key]:
             bad.append(f"{who}的 {tag}={m.group(g)}，宿主机按当时那块盘算出 {want[key]}")
-    for tag, g, key in (("中间层是文件", "notdir", -10), ("点号路径", "dot", -1)):
+    # 16 级不是错误（0 = 最高位没置），17 级必须是 -3：这条上限两侧都要有对象。
+    for tag, g, key in (("中间层是文件", "notdir", -10), ("点号路径", "dot", -1),
+                        ("16 级路径", "d16", 0), ("17 级路径", "d17", -3)):
         if int(m.group(g)) != key:
             bad.append(f"{who}的 {tag} 拒因={m.group(g)}，ABI 表承诺的是 {key}"
                        "（这两种拒绝的处置方向不同，不能糊成一个 -1）")
@@ -1668,7 +1674,30 @@ def check_fs_open_ring3(log: str) -> list[str]:
         ("readdir 大小和", int(m.group("ssize")), want["root.sizesum"])):
         if got != exp:
             bad.append(f"ring3 的 {tag}={got}，宿主机按当时那块盘算出 {exp}")
-    # 尾段那三格由核内写死的期望数与第 42 行的第二台仪器覆盖（独立解析不交出整份字节）。
+    # ring3 侧的多级那一段：三级文件与中间层目录，由独立解析按同一块盘重算。
+    nested = deep_row_map(rows, "file", "/PROJECT/DOCS/NESTED.TXT")
+    proj_dir = deep_row_map(rows, "dir", "/PROJECT/")
+    if nested is None or proj_dir is None:
+        bad.append("独立解析没给出 NESTED.TXT 或 /PROJECT 那一行 ⇒ ring3 的多级格没有对照物")
+    else:
+        for tag, got, exp in (
+            ("多级读回字节", int(m.group("mread")), int(nested["size"])),
+            ("多级首 8 字节", int(m.group("mhead"), 16), int(nested["head8"], 16)),
+            ("多级字节和", int(m.group("msum")), int(nested["bytesum"])),
+            ("多级首簇两半", int(m.group("mfirst")), int(nested["first"])),
+            ("中间层条目", int(m.group("precs")), int(proj_dir["visible"])),
+            ("中间层名字字节和", int(m.group("pnames")), int(proj_dir["namesum"]))):
+            if got != exp:
+                bad.append(f"ring3 的 {tag}={got}，宿主机按当时那块盘算出 {exp}")
+    # 尾段三格：探针 seek 到 50 再读到 EOF，宿主机从**同一份字节**的 [50..] 自己算。
+    # 这三格在 §342 里曾因为没有对象可比而降级（只剩核内写死的期望数）；`bodyhex` 补上之后它们
+    # 回来了——比的是另一段字节，不是另一份实现算的同一个数。
+    body = want["small.body"]
+    for tag, got, exp in (
+        ("尾段首 8 字节", int(m.group("thead"), 16), int.from_bytes(body[50:58], "little")),
+        ("尾段字节和", int(m.group("tsum")), sum(body[50:]))):
+        if got != exp:
+            bad.append(f"ring3 的 {tag}={got}，宿主机按当时那块盘算出 {exp}")
     if int(m.group("mul"), 16) != int(m.group("add"), 16):
         bad.append(f"ring3 自己那两份 FNV 不同数：mul={m.group('mul')} add={m.group('add')}"
                    "（同一段字节、同一个 h，两写法必等；不等就是乘法的降级）")

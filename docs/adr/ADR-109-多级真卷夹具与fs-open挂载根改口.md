@@ -132,5 +132,6 @@ ring3 探针的多级格仍未做，所以未决 1 只算部分结案）。
    的那一类。现在 `make_fat32_deep.py` 落盘之后按规范偏移把 BPB 十个字段、备份扇区逐字节、
    两把判型尺子、三级首簇两半、LFN 校验和与序号、FSInfo 三处签名**从文件里重读一遍**再算一次。
 
-仍未做（不要当成已交）：`MAX_COMPONENTS > 16` 那条负样本要真十七级深链才能造；
-`user/fileprobe` 仍未打开任何多级路径。
+当时仍未做、**同日已结**（BACKLOG §343）：`user/fileprobe` 现在会开 `/PROJECT/DOCS/NESTED.TXT`
+并读 `/PROJECT`，第 43 行的尾段两格也接回了第二台仪器（`--deep-tree` 交出 `bodyhex`）。
+`MAX_COMPONENTS = 16` 的两侧也用真深链喂过了（16 级目录能开、17 级 `-3`，配源码变异证红），见 BACKLOG §344。

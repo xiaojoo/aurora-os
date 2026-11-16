@@ -24,6 +24,7 @@
 | `/PROJECT/DOCS/NESTED.TXT` | 三级命中：open/read/stat 走 ring3 |
 | `/PROJECT/DOCS/AURORA~1.TXT` + 长名 `AuroraLongDocument.txt` | 子目录 LFN：校验和绑定短名、序号物理倒序 |
 | `/GONE.BIN`（首字节 `0xE5`） | 已删除项：跳过但仍计入扫过项，与根目录同一数法 |
+| `/D1/D2/…/D16/F.TXT` | 16 层真深链（17 个组件）⇒ `MAX_COMPONENTS = 16` 的边界 |
 """
 
 import hashlib
@@ -50,6 +51,11 @@ FILLER_FIRST = 11
 # 卷B 已经在根目录那一层证过"只取低半会读到别处"，这一格证的是**多级 lookup 之后**
 # 那一次拼接还在不在——两条路径在核内不是同一个调用点（`find_child` 返回的 `Entry` 再走簇链）。
 NESTED_CL = 65_600
+# `MAX_COMPONENTS = 16` 那条上限要**真深链**才喂得动（ADR-109 最后一条负样本）：16 层目录
+# 各占一簇、第 16 层里放一个文件；17 个组件的路径必须在第 17 次查找**之前**就被拒。
+CHAIN_FIRST = 65_700
+CHAIN = 16
+CHAIN_FILE_CL = CHAIN_FIRST + CHAIN
 
 OUT = Path("build/fat32-deep.img")
 if len(sys.argv) > 1:                    # tools/aurora.py 用绝对路径调用，不着 CWD——与 make_fat16_mem 同一规矩
@@ -195,7 +201,7 @@ if bs[510:512] != bytes([0x55, 0xAA]):
 img[0:SEC] = bs
 
 # ---------------------------------------------------------------- FSInfo 与其备份
-used = 1 + 1 + 1 + 2 + 1 + 1 + 1 + FILLER   # 根+SMALL+PROJECT+DOCS(2)+NESTED+长名+GONE+填充
+used = 1 + 1 + 1 + 2 + 1 + 1 + 1 + FILLER + CHAIN + 1   # 根+SMALL+PROJECT+DOCS(2)+NESTED+长名+GONE+填充+深链(16+文件)
 fi = bytearray(SEC)
 fi[0:4] = u32(0x4161_5252)
 fi[484:488] = u32(0x6141_7272)
@@ -224,8 +230,11 @@ def set_chain(first, n=1):
         fat[(first + k) * 4:(first + k) * 4 + 4] = u32(nxt)
 
 
-for c, n in ((ROOT_CLUSTER, 1), (3, 1), (4, 1), (5, 2), (NESTED_CL, 1), (8, 1), (9, 1)):
+for c, n in ((ROOT_CLUSTER, 1), (3, 1), (4, 1), (5, 2), (NESTED_CL, 1), (8, 1), (9, 1),
+           (CHAIN_FILE_CL, 1)):
     set_chain(c, n)
+for i in range(CHAIN):
+    set_chain(CHAIN_FIRST + i, 1)          # 深链的每一层各一簇
 for f in range(FILLER_FIRST, FILLER_FIRST + FILLER):
     set_chain(f, 1)
 for k in range(FATS):
@@ -238,6 +247,7 @@ root.put(dentry("PROJECT", "", 0x10, 4, 0))
 gone = dentry("GONE", "BIN", 0x20, 9, 33)
 gone[0] = 0xE5                    # 已删除项：内核要跳过它**并且**把它计入扫过的项数
 root.put(gone)
+root.put(dentry("D1", "", 0x10, CHAIN_FIRST, 0))
 root_p = root.finish(img)
 
 # ---------------------------------------------------------------- /PROJECT（簇 4）
@@ -258,11 +268,22 @@ for e in lfn_entries(LONG, "AURORA~1", "TXT"):
 docs.put(dentry("AURORA~1", "TXT", 0x20, 8, 48))
 docs_p = docs.finish(img)
 
+# ---------------------------------------------------------------- 深链 /D1/…/D16
+# 每层只有一条子目录项；第 16 层放一个 8 字节文件。这一串是 `MAX_COMPONENTS` 唯一的真对象。
+for i in range(CHAIN):
+    d = Dir(CHAIN_FIRST + i, 1)
+    if i + 1 < CHAIN:
+        d.put(dentry(f"D{i + 2}", "", 0x10, CHAIN_FIRST + i + 1, 0))
+    else:
+        d.put(dentry("F", "TXT", 0x20, CHAIN_FILE_CL, 8))
+    d.finish(img)
+
 # ---------------------------------------------------------------- 文件内容
 img[sector_of(3) * SEC:sector_of(3) * SEC + 100] = body(1, 100)
 img[sector_of(NESTED_CL) * SEC:sector_of(NESTED_CL) * SEC + 64] = body(2, 64)
 img[sector_of(8) * SEC:sector_of(8) * SEC + 48] = body(3, 48)
 img[sector_of(9) * SEC:sector_of(9) * SEC + 33] = body(4, 33)
+img[sector_of(CHAIN_FILE_CL) * SEC:sector_of(CHAIN_FILE_CL) * SEC + 8] = body(9, 8)
 for idx in range(FILLER):
     sec = sector_of(FILLER_FIRST + idx)
     img[sec * SEC:sec * SEC + 8] = body(5 + idx, 8)
@@ -424,5 +445,21 @@ for u in flat:
 long_read = "".join(name_units)
 if long_read != LONG:
     raise SystemExit(f"长名读回 {long_read!r}，配方写的是 {LONG!r}")
+# 深链读回来：从根目录的 D1 开始一层层 find，层数必须正好 CHAIN，底层那项必须是 F.TXT/8 字节。
+depth, cur, last = 0, None, None
+for e in dentries(g32(44)):
+    if e[11] != 0x0F and short(e) == ("D1", ""):
+        last = e
+while last is not None and (last[11] & 0x10):
+    depth += 1
+    cl = struct.unpack_from("<H", last, 20)[0] << 16 | struct.unpack_from("<H", last, 26)[0]
+    nxt = dentries(cl)
+    if not nxt:
+        raise SystemExit(f"深链第 {depth} 层没有条目")
+    last = nxt[0]
+if depth != CHAIN:
+    raise SystemExit(f"深链读回只有 {depth} 层，配方写的是 {CHAIN}")
+if short(last) != ("F", "TXT") or struct.unpack_from("<I", last, 28)[0] != 8:
+    raise SystemExit(f"深链底层不是 F.TXT/8 字节：{short(last)}")
 print(f"readback: clusters={cluster_count} band={band} struct_fat32={struct_fat32} "
       f"NESTED first={first} hi={struct.unpack_from('<H', e, 20)[0]} 长名={long_read!r} lfn={len(run)}条 校验和={want_sum:#04x}")

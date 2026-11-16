@@ -392,7 +392,10 @@ def deep_tree_lines(d: bytes):
             yield ["deep", "file", path, f"size={size}", f"first={first}",
                    f"hi={struct.unpack_from('<H', e, 20)[0]}", f"lo={struct.unpack_from('<H', e, 26)[0]}",
                    f"head8=0x{int.from_bytes(body[:8], 'little'):x}", f"bytesum={sum(body[:size])}",
-                   f"chainlen={len(body)}", f"fnv=0x{fnv1a64(body[:size]):x}", f"entoff={off}"]
+                   f"chainlen={len(body)}", f"fnv=0x{fnv1a64(body[:size]):x}", f"entoff={off}",
+                   # 整份声明字节的十六进制：判定行要按**任意字节段**（比如从 50 到 EOF）自己算，
+                   # 只给首 8 字节与总和，第 43 行的尾段三格就只能靠核内写死的期望数（§342 欠账①）。
+                   f"bodyhex={bytes(body[:size]).hex()}"]
             if lng:
                 nb = lng.encode("utf-8")
                 yield ["deep", "long", path, f"long={lng}", f"longlen={len(lng)}",

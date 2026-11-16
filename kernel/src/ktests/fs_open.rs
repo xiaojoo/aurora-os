@@ -24,6 +24,10 @@ const ALIAS: &[u8] = b"/PROJECT/DOCS/AURORA~1.TXT";
 const LONGPATH: &[u8] = b"/PROJECT/DOCS/AuroraLongDocument.txt";
 const NOTDIR: &[u8] = b"/SMALL.BIN/X";
 const DOT: &[u8] = b"/./PROJECT";
+// `MAX_COMPONENTS = 16` 的两侧：16 个组件要能解开，17 个必须在第 17 次查找之前被拒。
+// 夹具里那条 `/D1/…/D16` 是**真深链**（16 层目录各占一簇），不是字符串凑出来的。
+const DEPTH16: &[u8] = b"/D1/D2/D3/D4/D5/D6/D7/D8/D9/D10/D11/D12/D13/D14/D15/D16";
+const DEPTH17: &[u8] = b"/D1/D2/D3/D4/D5/D6/D7/D8/D9/D10/D11/D12/D13/D14/D15/D16/F.TXT";
 const DATA_OFF: usize = 256;
 // DirentV1 一条就 512 字节，与文件缓冲、路径字符串错开页内偏移：三样东西共用这一页。
 const REC_OFF: usize = 768;
@@ -448,12 +452,20 @@ fn nested_cells(fr: &mut TrapFrame, va: u64, fs: &ReadOnlyFs<'_>) -> bool {
     let dot = open_ret(fr, va, DOT);
     ok &= fail("open 中间层是文件", notdir, user::E_NOT_DIR);
     ok &= fail("open 带点号的路径", dot, user::E_INVALID);
+    // `MAX_COMPONENTS = 16` 的两侧都用真深链喂：16 级是目录（返回不是错误），17 级是 -3。
+    let depth16 = open_ret(fr, va, DEPTH16);
+    let depth17 = open_ret(fr, va, DEPTH17);
+    ok &= fail("open 16 级路径不是错误", (depth16 >> 63) as u64, 0);
+    ok &= fail("open 17 级路径被拒", depth17, user::E_TOO_LONG);
+    if (depth16 as i64) > 0 {
+        ok &= fail("16 级目录句柄归还", call(fr, user::SYS_HANDLE_CLOSE, depth16, 0, 0), 0);
+    }
 
     for h in [nested, alias] {
         ok &= fail("多级句柄归还", call(fr, user::SYS_HANDLE_CLOSE, h.0, 0, 0), 0);
     }
     nested_evidence(head, sum, st_first, docs_recs, docs_sum, long_count, long_sum,
-                    notdir, dot, proj_recs, long_same);
+                    notdir, dot, proj_recs, long_same, depth16, depth17);
     ok
 }
 
@@ -565,11 +577,11 @@ fn docs_diag(fs: &ReadOnlyFs<'_>) -> (u64, u64) {
 #[inline(never)]
 fn nested_evidence(head: u64, sum: u64, first: u64, docs_recs: u64, docs_sum: u64,
                    long_count: u64, long_sum: u64, notdir: u64, dot: u64, proj_recs: u64,
-                   long_len: u64) {
+                   long_len: u64, depth16: u64, depth17: u64) {
     crate::log_info!(
-        "fs-open: 多级取证 首8={:#x} 和={} 首簇={} proj条目={} docs条目={} docs大小和={} 长名条数={} 长名和={} 长名同字节={} 非目录={} 点路径={}",
+        "fs-open: 多级取证 首8={:#x} 和={} 首簇={} proj条目={} docs条目={} docs大小和={} 长名条数={} 长名和={} 长名同字节={} 非目录={} 点路径={} 16级={} 17级={}",
         head, sum, first, proj_recs, docs_recs, docs_sum, long_count, long_sum, long_len,
-        notdir as i64, dot as i64);
+        notdir as i64, dot as i64, (depth16 >> 63) as i64, depth17 as i64);
 }
 /// 宿主机那台独立仪器对账用的读数：全部来自 **syscall 路径**（22 打开、10 读、25 stat、26 readdir），
 /// 不是上面那些自校验的中间变量。名字用原始字节打出来，宿主机按 latin1 拼回去比。
@@ -600,7 +612,7 @@ ktest!(KT_FS_OPEN_SYSCALLS, t_fs_open_syscalls);
 /// ring3 信箱的偏移表（`user/fileprobe/src/main.rs` 里**另有独立的一份**）。
 /// 这里故意不引用那一份：两边各写一遍、由读回的数对账，才是两台仪器（ADR-108 决策 8）。
 /// 信箱快照的格数：偏移表里最大一格是 `FNVADD=264`，40 格留余量。
-const FP_CELLS: usize = 40;
+const FP_CELLS: usize = 46;
 
 mod fp {
     pub const MAGIC: u64 = 0;
@@ -636,6 +648,19 @@ mod fp {
     pub const SUM_TAIL: u64 = 240;
     pub const DIR_CLOSE: u64 = 248;
     pub const FNVMUL: u64 = 256;
+    // ADR-109 / §343：多级路径与中间层目录（探针侧同一组偏移，各写一份）。
+    pub const N_OPEN: u64 = 272;
+    pub const N_TOTAL: u64 = 280;
+    pub const N_HEAD: u64 = 288;
+    pub const N_SUM: u64 = 296;
+    pub const N_STAT: u64 = 304;
+    pub const N_SIZE: u64 = 312;
+    pub const N_FIRST: u64 = 320;
+    pub const N_CLOSE: u64 = 328;
+    pub const P_OPEN: u64 = 336;
+    pub const P_RECS: u64 = 344;
+    pub const P_NAMES: u64 = 352;
+    pub const P_CLOSE: u64 = 360;
     pub const FNVADD: u64 = 264;
 
     pub const MAGIC_VAL: u64 = 0x544f_4c53_315f_5046;
@@ -672,8 +697,8 @@ mod expect {
     pub const SMALL_TAIL_SUM: u64 = 6_257;
     /// 根目录的可见项是 `SMALL.BIN` 与 `PROJECT`：那条 `GONE.BIN` 带删除标记，
     /// 跳过但仍计入扫过项——"跳过"与"数过"是两格，不能合并成一格。
-    pub const ROOT_RECORDS: u64 = 2;
-    pub const ROOT_NAME_SUM: u64 = 1_175;
+    pub const ROOT_RECORDS: u64 = 3;
+    pub const ROOT_NAME_SUM: u64 = 1_292;
     pub const ROOT_SIZE_SUM: u64 = 100;
     /// 同一份 100 字节的 FNV-1a/64：宿主机 `fnv1a64`、核内 `ahci::fnv1a64`、ring3 探针自己那两份
     /// 必须同数。这个数字由 `tools/aurora.py` 的独立解析现算（BACKLOG §335 欠账②的结案读数）。
@@ -685,6 +710,8 @@ mod expect {
     pub const NESTED_HEAD: u64 = 0xe7c8_a98a_6b4c_2d0e;
     pub const NESTED_SUM: u64 = 8_096;
     pub const PROJ_RECORDS: u64 = 1;
+    /// `/PROJECT` 里那条 `DOCS` 的 8.3 短名字节和（探针累计的是名字字段，不是长名字段）。
+    pub const PROJ_NAME_SUM: u64 = 297;
     /// 跨两簇的目录：15 条填充 + NESTED + 长名那条 = 17 条可见项，声明大小合计 232 字节。
     pub const DOCS_RECORDS: u64 = 17;
     pub const DOCS_SIZE_SUM: u64 = 15 * 8 + 64 + 48;
@@ -806,6 +833,17 @@ fn t_fs_open_ring3() -> bool {
     ok &= cell_eq(box_[(fp::FLAGS / 8) as usize], user::E_NOT_SUPPORTED, "非零 flags");
     ok &= cell_eq(box_[(fp::CLOSE / 8) as usize], 0, "close 文件");
     ok &= cell_eq(box_[(fp::DIR_CLOSE / 8) as usize], 0, "close 目录");
+    // ---- ADR-109：ring3 侧的三级路径与中间层目录 ----
+    ok &= cell_eq(box_[(fp::N_TOTAL / 8) as usize], expect::NESTED_BYTES, "多级读回字节");
+    ok &= cell_eq(box_[(fp::N_HEAD / 8) as usize], expect::NESTED_HEAD, "多级首 8 字节");
+    ok &= cell_eq(box_[(fp::N_SUM / 8) as usize], expect::NESTED_SUM, "多级字节和");
+    ok &= cell_eq(box_[(fp::N_STAT / 8) as usize], 0, "多级 stat 返回");
+    ok &= cell_eq(box_[(fp::N_SIZE / 8) as usize], expect::NESTED_BYTES, "多级 stat 大小");
+    ok &= cell_eq(box_[(fp::N_FIRST / 8) as usize], expect::NESTED_FIRST, "多级 stat 首簇两半");
+    ok &= cell_eq(box_[(fp::N_CLOSE / 8) as usize], 0, "close 多级文件");
+    ok &= cell_eq(box_[(fp::P_RECS / 8) as usize], expect::PROJ_RECORDS, "中间层条目");
+    ok &= cell_eq(box_[(fp::P_NAMES / 8) as usize], expect::PROJ_NAME_SUM, "中间层名字字节和");
+    ok &= cell_eq(box_[(fp::P_CLOSE / 8) as usize], 0, "close 中间层目录");
     ok &= cell_eq(box_[(fp::STALE / 8) as usize], user::E_BAD_HANDLE, "close 后旧句柄");
     // 探针自己的两种乘法写法必须同数：这一步抓住过素数字面量多打一组下划线（2^44+435）。
     let (mul, add) = (box_[(fp::FNVMUL / 8) as usize], box_[(fp::FNVADD / 8) as usize]);
@@ -824,7 +862,9 @@ fn t_fs_open_ring3() -> bool {
             abi, user::F_FS_OPEN, user::ABI_MINOR);
         ok = false;
     }
-    for (name, h) in [("open", open), ("dir", dir)] {
+    let nested_h = box_[(fp::N_OPEN / 8) as usize];
+    let proj_h = box_[(fp::P_OPEN / 8) as usize];
+    for (name, h) in [("open", open), ("dir", dir), ("多级", nested_h), ("/PROJECT", proj_h)] {
         if (h as i64) < 0 || h >> 63 != 0 {
             crate::log_fatal!("fs-open-ring3: 不成立 句柄形状 {}={:#x}", name, h);
             ok = false;
@@ -832,7 +872,7 @@ fn t_fs_open_ring3() -> bool {
     }
 
     crate::log_info!(
-        "fs-open-ring3: 取证 读回={} 首8={:#x} 字节和={} 尾首8={:#x} 尾和={} stat大小={} 首簇={} 条目={} 名字和={} 大小和={} 表清空={} 回收={} rounds={} served={} 诊断mul={:#x} 诊断add={:#x} ⇒ {}",
+        "fs-open-ring3: 取证 读回={} 首8={:#x} 字节和={} 尾首8={:#x} 尾和={} stat大小={} 首簇={} 条目={} 名字和={} 大小和={} 多级读回={} 多级首8={:#x} 多级和={} 多级首簇={} proj条目={} proj名字和={} 表清空={} 回收={} rounds={} served={} 诊断mul={:#x} 诊断add={:#x} ⇒ {}",
         box_[(fp::READ_TOTAL / 8) as usize],
         box_[(fp::HEAD / 8) as usize],
         box_[(fp::SUM_FULL / 8) as usize],
@@ -843,6 +883,12 @@ fn t_fs_open_ring3() -> bool {
         box_[(fp::DIR_RECORDS / 8) as usize],
         box_[(fp::DIR_NAME_SUM / 8) as usize],
         box_[(fp::DIR_SIZE_SUM / 8) as usize],
+        box_[(fp::N_TOTAL / 8) as usize],
+        box_[(fp::N_HEAD / 8) as usize],
+        box_[(fp::N_SUM / 8) as usize],
+        box_[(fp::N_FIRST / 8) as usize],
+        box_[(fp::P_RECS / 8) as usize],
+        box_[(fp::P_NAMES / 8) as usize],
         table_clean,
         reaped,
         rounds,
