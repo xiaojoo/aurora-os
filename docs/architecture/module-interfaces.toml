@@ -642,7 +642,6 @@ public_api = [
   "fs_open::OPEN_WRITE",
   "fs_rw::PORT",
   "filesystem::fs_rw",
-  "fs_open::open_on",
   "fs_open::STAT_KIND_FILE",
   "fs_open::STAT_RECORD_LEN",
   "fs_open::dirent_record",

@@ -35,24 +35,60 @@ pub const DIRENT_FLAG_LONG_TRUNCATED: u8 = 1;
 
 static DISK: AhciDisk = AhciDisk { port: PORT };
 
-/// open 成功后、进入句柄表之前的一份状态。调用方负责把其中的游标与元数据放进
-/// capability 对象；这层不能反过来调用 capability，否则 storage 会被迫认识句柄表。
+/// open 成功后、进入句柄表之前的一份状态。`port` 由挂载表决定（ADR-114）：
+/// 调用方按它授句柄，不要再自己从 flags 推一个口——那会让"路径落在哪个根"有两份答案。
 #[derive(Debug, Clone, Copy)]
 pub enum Opened {
-    File { cursor: vfs_ro::ReadCursor, stat: Entry },
-    Dir { state: DirState, stat: Entry },
+    File { port: u8, cursor: vfs_ro::ReadCursor, stat: Entry },
+    Dir { port: u8, state: DirState, stat: Entry },
+}
+
+/// 一个挂载点：`prefix` 是命名空间里的前缀，`writable` 决定写意图能不能在这儿过。
+#[derive(Debug, Clone, Copy)]
+pub struct MountEntry {
+    pub prefix: &'static str,
+    pub port: u8,
+    pub writable: bool,
+}
+
+/// 静态挂载表（ADR-114）：最长前缀先匹配。`/` 是只读根（口 5）；
+/// `/w` 是可写卷（口 4），只在 `fs-rw` 档存在。
+#[cfg(feature = "fs-rw")]
+pub const MOUNTS: &[MountEntry] = &[
+    MountEntry { prefix: "/w", port: crate::filesystem::fs_rw::PORT, writable: true },
+    MountEntry { prefix: "/", port: PORT, writable: false },
+];
+#[cfg(not(feature = "fs-rw"))]
+pub const MOUNTS: &[MountEntry] = &[MountEntry { prefix: "/", port: PORT, writable: false }];
+
+/// 把绝对路径解析成（挂载点，去掉前缀后的路径）。不跨根拼接：一个路径只落一个根。
+fn resolve(path: &str) -> Result<(&'static MountEntry, &str), VfsError> {
+    if !path.starts_with('/') {
+        return Err(VfsError::BadPath);
+    }
+    let mut best: Option<(&'static MountEntry, &str)> = None;
+    for m in MOUNTS {
+        let sub = if m.prefix == "/" {
+            Some(path)
+        } else if path == m.prefix {
+            Some("/")
+        } else {
+            path.strip_prefix(m.prefix).filter(|rest| rest.starts_with('/'))
+        };
+        if let Some(sub) = sub {
+            if best.map_or(true, |(b, _)| m.prefix.len() > b.prefix.len()) {
+                best = Some((m, sub));
+            }
+        }
+    }
+    best.ok_or(VfsError::BadPath)
 }
 
 pub fn mount() -> Result<ReadOnlyFs<'static>, VfsError> {
     ReadOnlyFs::mount(&DISK)
 }
 
-/// 在**指定的口**上打开。调用方按 flags 选口：读意图 → 只读根（`PORT`），写意图 → 可写卷。
-/// 两个根各自挂载、命名空间分开——这里不做跨根查找（那要挂载表，ADR-108 未决 4）。
-pub fn open_on(port: u8, path: &str, flags: u64) -> Result<Opened, VfsError> {
-    if flags != OPEN_READ_ONLY && flags != OPEN_WRITE {
-        return Err(VfsError::BadFlags);
-    }
+fn open_on(port: u8, path: &str, flags: u64) -> Result<Opened, VfsError> {
     let disk = AhciDisk { port };
     let fs = ReadOnlyFs::mount(&disk)?;
     let stat = fs.lookup(path)?;
@@ -62,19 +98,24 @@ pub fn open_on(port: u8, path: &str, flags: u64) -> Result<Opened, VfsError> {
             return Err(VfsError::BadFlags);
         }
         let state = DirState::new(&fs.bpb(), &stat)?;
-        Ok(Opened::Dir { state, stat })
+        Ok(Opened::Dir { port, state, stat })
     } else {
         let cursor = fs.open(&stat)?;
-        Ok(Opened::File { cursor, stat })
+        Ok(Opened::File { port, cursor, stat })
     }
 }
 
+/// 按挂载表打开。`flags`：0 = 读意图；1 = 写意图（只允许落在可写挂载上）；
+/// 其余位 ⇒ `BadFlags`（对用户 `-15`）。写意图打在目录上同样 `BadFlags`。
 pub fn open(path: &str, flags: u64) -> Result<Opened, VfsError> {
-    // 只读根（口 5）上不许写意图：它的 sha256 就是判据（ADR-111 决策 3）。
-    if flags == OPEN_WRITE {
+    if flags != OPEN_READ_ONLY && flags != OPEN_WRITE {
         return Err(VfsError::BadFlags);
     }
-    open_on(PORT, path, flags)
+    let (m, sub) = resolve(path)?;
+    if flags == OPEN_WRITE && !m.writable {
+        return Err(VfsError::BadFlags);
+    }
+    open_on(m.port, sub, flags)
 }
 
 pub fn stat_record(e: &Entry) -> [u8; 48] {

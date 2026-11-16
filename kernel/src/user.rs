@@ -67,7 +67,7 @@ pub const F_CONSOLE: u64 = 256;
 /// ABI 版本。minor=4 对应用户态闭环这一段（M4）；minor=5 追加 capability 句柄族（P7）；
 /// minor=6 追加 VMO 三个号（12/13/14）与 `F_VMO` 位（W3 P4b，ADR-074）。号只追加不复用（Q1）。
 pub const ABI_MAJOR: u64 = 0;
-pub const ABI_MINOR: u64 = 13;
+pub const ABI_MINOR: u64 = 14;
 pub const F_FASTPATH: u64 = 1;
 pub const F_SMAP: u64 = 2;
 pub const F_SMEP: u64 = 4;
@@ -169,7 +169,7 @@ pub fn abi_word() -> u64 {
     }
     #[cfg(feature = "fs-rw")]
     {
-        f |= F_FS_WRITE_OPEN;
+        f |= F_FS_WRITE_OPEN | F_FS_WRITE_ROOT;
     }
     (ABI_MAJOR << 32) | (ABI_MINOR << 16) | f
 }
@@ -883,6 +883,9 @@ pub const F_FS_OPEN: u64 = 512;
 /// 只在 `fs-rw` 置位：**只读构建里写意图 open 一律 `-15`**，不能从 `F_FS_OPEN` 推断它可用。
 /// 置位时写意图 open 路由到可写卷（口 4）并授 `READ|WRITE`；读意图仍走只读根（口 5）。
 pub const F_FS_WRITE_OPEN: u64 = 1024;
+/// ADR-114：挂载表里的 `/w`（可写根，口 4）在这份构建里存在。只在 `fs-rw` 置位；
+/// 没有它时写意图只能落在只读根上 ⇒ `-15`。
+pub const F_FS_WRITE_ROOT: u64 = 2048;
 /// 17：`rdi` = Proc 句柄（要 `READ`），`rsi` = 时限毫秒（0 = 只查一次不阻塞）→
 /// `rax` = `(observed << 32) | 退出码`；**0 = 超时**（不升 L4，"目标永远不收工"是业务事实）。
 pub const SYS_PROCESS_WAIT: u64 = 17;
@@ -1243,42 +1246,24 @@ fn sys_file_open(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
         return E_INVALID;
     };
     let flags = frame.rdx;
-    let write = flags == crate::filesystem::fs_open::OPEN_WRITE;
-    if flags != crate::filesystem::fs_open::OPEN_READ_ONLY && !write {
-        return E_NOT_SUPPORTED;
-    }
-    // 写意图 ⇒ 可写卷（口 4，只在 fs-rw 档存在）；读意图 ⇒ 只读根（口 5）。
-    // 两个根的命名空间**分开**：同一个路径可能只在其一存在（ADR-111 补记）。
-    #[cfg(feature = "fs-rw")]
-    let port = if write {
-        crate::filesystem::fs_rw::PORT
-    } else {
-        crate::filesystem::fs_open::PORT
-    };
-    #[cfg(not(feature = "fs-rw"))]
-    let port = if write {
-        return E_NOT_SUPPORTED;
-    } else {
-        crate::filesystem::fs_open::PORT
-    };
-    let opened = if write {
-        crate::filesystem::fs_open::open_on(port, path, flags)
-    } else {
-        crate::filesystem::fs_open::open(path, flags)
-    };
-    let opened = match opened {
+    // 落哪个根由**路径**决定（挂载表，ADR-114）；flags 只表达写意图并对挂载可写性做闸。
+    let opened = match crate::filesystem::fs_open::open(path, flags) {
         Ok(o) => o,
         Err(e) => return vfs_err_ret(e),
     };
     use crate::filesystem::fs_open::Opened;
-    let rights = if write {
+    let rights = if flags == crate::filesystem::fs_open::OPEN_WRITE {
         crate::handle::RIGHT_READ | crate::handle::RIGHT_WRITE
     } else {
         crate::handle::RIGHT_READ
     };
     let granted = match opened {
-        Opened::File { cursor, stat } => crate::handle::grant_vfs_file(owner, port, None, cursor, stat, rights),
-        Opened::Dir { state, stat } => crate::handle::grant_vfs_dir(owner, port, None, stat, state, rights),
+        Opened::File { port, cursor, stat } => {
+            crate::handle::grant_vfs_file(owner, port, None, cursor, stat, rights)
+        }
+        Opened::Dir { port, state, stat } => {
+            crate::handle::grant_vfs_dir(owner, port, None, stat, state, rights)
+        }
     };
     match granted {
         Ok(h) => h.0,

@@ -358,16 +358,21 @@ fn t_fs_rw_open_write() -> bool {
     let mut fr = frame0();
     let mut ok = true;
 
-    let path = b"/LOG.TXT";
+    let path = b"/w/LOG.TXT";
     ok &= put_user(va.0, 0, path);
-    // 写意图：这路径只在可写卷上有，能开出来就说明路由生效。
+    // 写意图：`/w` 前缀落在可写卷（口 4），能开出来就说明挂载表解析生效。
     let h = call(&mut fr, user::SYS_FILE_OPEN, va.0, path.len() as u64, 1);
     let handle = Handle(h);
     let open_ok = (h as i64) > 0;
     ok &= open_ok;
-    // 读意图同一路径 ⇒ -8（只读根上没有它：命名空间分开）。
-    let miss = call(&mut fr, user::SYS_FILE_OPEN, va.0, path.len() as u64, 0);
-    ok &= miss == user::E_NOT_FOUND;
+    // 读意图走根上的同名路径 ⇒ -8（只读根没有它）；对它写意图 ⇒ -15（根不可写）。
+    ok &= put_user(va.0, 0, b"/LOG.TXT");
+    let miss = call(&mut fr, user::SYS_FILE_OPEN, va.0, 8, 0);
+    let root_w = call(&mut fr, user::SYS_FILE_OPEN, va.0, 8, 1);
+    ok &= miss == user::E_NOT_FOUND && root_w == user::E_NOT_SUPPORTED;
+    // 读意图在 `/w` 下是允许的（可写挂载也能读），但本用例只需证它会落到口 4：
+    // 由写/读回那几格覆盖，这里把路径换回去。
+    ok &= put_user(va.0, 0, path);
 
     let pat = [0x5Au8, 0xA5, 0x3C, 0xC3];
     let s16 = call(&mut fr, user::SYS_FILE_SEEK, handle.0, 16, 0);
@@ -383,11 +388,13 @@ fn t_fs_rw_open_write() -> bool {
     // flags=2 ⇒ -15；写意图打目录 ⇒ -15。
     let bad_flags = call(&mut fr, user::SYS_FILE_OPEN, va.0, path.len() as u64, 2);
     ok &= bad_flags == user::E_NOT_SUPPORTED;
-    ok &= put_user(va.0, 0, b"/");
-    let dir_w = call(&mut fr, user::SYS_FILE_OPEN, va.0, 1, 1);
+    ok &= put_user(va.0, 0, b"/w");
+    let dir_w = call(&mut fr, user::SYS_FILE_OPEN, va.0, 2, 1);
     ok &= dir_w == user::E_NOT_SUPPORTED;
-    // ABI 0.13：写意图位在这档必须置位。
-    ok &= user::abi_word() & user::F_FS_WRITE_OPEN != 0 && user::ABI_MINOR == 13;
+    // ABI 0.14：写意图位与写根位在这档都必须置位。
+    ok &= user::abi_word() & user::F_FS_WRITE_OPEN != 0
+        && user::abi_word() & user::F_FS_WRITE_ROOT != 0
+        && user::ABI_MINOR == 14;
 
     let c = if open_ok {
         call(&mut fr, user::SYS_HANDLE_CLOSE, handle.0, 0, 0)
