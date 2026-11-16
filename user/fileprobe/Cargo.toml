@@ -1,0 +1,23 @@
+[package]
+name = "aurora-user-fileprobe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# FS-03 切片 D（ADR-108 决策 8）：第四个用户产物，也是**第一个在 ring3 打 22/24/25/26 的调用方**。
+# 与 hello/probe/shell 同一条构建纪律：不是 workspace 的普通成员，另一个链接脚本、另一个入口，
+# 永远不该被宿主 `cargo test` 编译；构建入口只有 `python tools/aurora.py`（它单独传 RUSTFLAGS）。
+# **不进签名链**：与 probe/shell 同理，签名包是单载荷单包固定 LBA；这个产物走第四个内嵌夹具，
+# 而且只在 `fs-open` 构建里被内核 `include_bytes!`。
+[[bin]]
+name = "fileprobe"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

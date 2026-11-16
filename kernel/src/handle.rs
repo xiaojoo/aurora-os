@@ -21,6 +21,8 @@
 //! （`spawn` 找 Free 槽而退出当场就标 Free，见设计 §2.2）。
 
 use crate::filesystem::fat32::{FileCursor, FsError};
+#[cfg(feature = "fs-open")]
+use crate::filesystem::vfs_ro::{self, DirState, Entry as VfsEntry, ReadCursor, VfsError};
 use crate::filesystem::vfs::{AhciDisk, Block, Partition, PartitionView};
 use crate::sync::{IrqSpinLock, RANK_HANDLE};
 
@@ -52,7 +54,7 @@ impl Handle {
         Handle(slot as u64 | ((gen & GEN_MAX) << SLOT_BITS))
     }
 
-    /// 形状检查：值 0 / gen 0 / slot ≥ 16 都不合法（对用户是 `-1`，不是 `-5`）。
+    /// 形状检查：值 0 / gen 0 / slot ≥ `MAX_HANDLES` 都不合法（对用户是 `-1`，不是 `-5`）。
     pub fn unpack(self) -> Option<(u16, u64)> {
         let slot = (self.0 & SLOT_MASK) as u16;
         let gen = self.0 >> SLOT_BITS;
@@ -93,6 +95,9 @@ pub enum HErr {
     Exhausted,
     /// 块设备失败。ABI 表里还没有 EIO 码，先按 `-2` 带出去并**记日志点名成因**（BACKLOG 待批）。
     Io(FsError),
+    /// FS-03：VFS 层的成因（路径、坏卷、seek 越 EOF、目录当文件）。不许在这一层抹平。
+    #[cfg(feature = "fs-open")]
+    Vfs(VfsError),
 }
 
 impl HErr {
@@ -105,6 +110,8 @@ impl HErr {
             HErr::Denied => "权限/撤销",
             HErr::Exhausted => "表满",
             HErr::Io(_) => "块设备失败",
+            #[cfg(feature = "fs-open")]
+            HErr::Vfs(_) => "VFS 错误",
         }
     }
 }
@@ -128,7 +135,14 @@ pub struct FileObj {
 pub enum ObjRef {
     /// 控制台，附带**会话号**（S6p：每个会话一个镜像环与一份输入队列）
     Console(u8),
-    File(FileObj),
+        File(FileObj),
+    /// FS-03：通过 `vfs_ro` 打开的文件。游标自带 `Bpb`，所以表里仍是 Copy 值，
+    /// 下一次盘 I/O 在表锁外重建 `AhciDisk`/`PartitionView` 即可。
+    #[cfg(feature = "fs-open")]
+    VfsFile { port: u8, part: Option<Partition>, cursor: ReadCursor, stat: VfsEntry },
+    /// 目录句柄不内嵌 `DirCursor`（那会把每槽撑到 1.5 KiB）；`DirState` 是可复制的紧凑游标。
+    #[cfg(feature = "fs-open")]
+    VfsDir { port: u8, part: Option<Partition>, stat: VfsEntry, state: DirState },
     Vmo { slot: u8 },
     // ---- P5c-1（ADR-075 决策 4）：四种新 kind。本体各自住在 proc.rs / mm 的 AS 表 / sched 的任务表，
     // 表里只存**带世代号的引用**：`gen`（Thread 用 `id`）对不上就当"这个对象不是当初那个"。
@@ -275,6 +289,183 @@ pub fn grant_file_at(
     insert(g.get(), owner, rights, ObjRef::File(FileObj { port, part, cursor }))
 }
 
+/// FS-03：打开好的 VFS 文件句柄。`stat` 是打开那一刻的目录项读数，不是实时元数据。
+#[cfg(feature = "fs-open")]
+pub fn grant_vfs_file(
+    owner: (usize, u32),
+    port: u8,
+    part: Option<Partition>,
+    cursor: ReadCursor,
+    stat: VfsEntry,
+    rights: u32,
+) -> Result<Handle, HErr> {
+    let mut g = TABLE.lock();
+    insert(g.get(), owner, rights, ObjRef::VfsFile { port, part, cursor, stat })
+}
+
+#[cfg(feature = "fs-open")]
+pub fn grant_vfs_dir(
+    owner: (usize, u32),
+    port: u8,
+    part: Option<Partition>,
+    stat: VfsEntry,
+    state: DirState,
+    rights: u32,
+) -> Result<Handle, HErr> {
+    let mut g = TABLE.lock();
+    insert(g.get(), owner, rights, ObjRef::VfsDir { port, part, stat, state })
+}
+
+#[cfg(feature = "fs-open")]
+fn disk_for(port: u8, part: Option<Partition>) -> (AhciDisk, Option<Partition>) {
+    (AhciDisk { port }, part)
+}
+
+#[cfg(feature = "fs-open")]
+fn read_on_disk<T>(
+    disk: &AhciDisk,
+    part: Option<Partition>,
+    f: impl FnOnce(&dyn Block) -> Result<T, HErr>,
+) -> Result<T, HErr> {
+    match part {
+        None => f(disk),
+        Some(p) => f(&PartitionView { inner: disk, part: p }),
+    }
+}
+
+/// seek 用和读一样的两段式：锁内取票、锁外走 FAT、锁内按世代提交。
+/// 中途盘失败或世代变了都不提交游标（ADR-108 §7）。
+#[cfg(feature = "fs-open")]
+pub fn seek(h: Handle, owner: (usize, u32), newpos: u32) -> Result<u32, HErr> {
+    let (slot, gen, port, part, mut cursor) = {
+        let mut g = TABLE.lock();
+        let t = g.get();
+        let slot = check(t, h, owner, RIGHT_READ)?;
+        let e = &t.slots[slot];
+        match e.obj {
+            Some(ObjRef::VfsFile { port, part, cursor, .. }) => (slot, e.gen, port, part, cursor),
+            Some(_) => {
+                t.c.denied += 1;
+                return Err(HErr::Denied);
+            }
+            None => {
+                t.c.no_such += 1;
+                return Err(HErr::NoSuch);
+            }
+        }
+    };
+    let disk = AhciDisk { port };
+    let n = read_on_disk(&disk, part, |b| {
+        vfs_ro::seek_disk(b, &mut cursor, newpos).map_err(vfs_to_herr)
+    })?;
+    let mut g = TABLE.lock();
+    let t = g.get();
+    let e = &mut t.slots[slot];
+    if !e.used || e.gen != gen {
+        t.c.stale += 1;
+        return Err(HErr::Stale);
+    }
+    match e.obj.as_mut() {
+        Some(ObjRef::VfsFile { cursor: old, .. }) => {
+            *old = cursor;
+            Ok(n)
+        }
+        _ => {
+            t.c.no_such += 1;
+            Err(HErr::NoSuch)
+        }
+    }
+}
+
+#[cfg(feature = "fs-open")]
+pub fn stat(h: Handle, owner: (usize, u32)) -> Result<VfsEntry, HErr> {
+    let mut g = TABLE.lock();
+    let t = g.get();
+    let slot = check(t, h, owner, 0)?;
+    match t.slots[slot].obj {
+        Some(ObjRef::VfsFile { stat, .. }) | Some(ObjRef::VfsDir { stat, .. }) => Ok(stat),
+        Some(_) => {
+            t.c.denied += 1;
+            Err(HErr::Denied)
+        }
+        None => {
+            t.c.no_such += 1;
+            Err(HErr::NoSuch)
+        }
+    }
+}
+
+#[cfg(feature = "fs-open")]
+pub struct DirTicket {
+    slot: u16,
+    gen: u64,
+    port: u8,
+    part: Option<Partition>,
+    state: DirState,
+}
+
+#[cfg(feature = "fs-open")]
+impl DirTicket {
+    pub fn port(&self) -> u8 {
+        self.port
+    }
+
+    pub fn partition(&self) -> Option<Partition> {
+        self.part
+    }
+}
+
+#[cfg(feature = "fs-open")]
+pub fn begin_dir_read(h: Handle, owner: (usize, u32)) -> Result<DirTicket, HErr> {
+    let mut g = TABLE.lock();
+    let t = g.get();
+    let slot = check(t, h, owner, RIGHT_READ)?;
+    let e = &t.slots[slot];
+    match e.obj {
+        Some(ObjRef::VfsDir { port, part, state, .. }) => {
+            Ok(DirTicket { slot: slot as u16, gen: e.gen, port, part, state })
+        }
+        // 目录读专门把文件对象与别的对象类型分开：readdir 落在文件上不是"越权"，
+        // 是类型形状错（用户会拿它重试），必须回 ENOTDIR。
+        Some(ObjRef::File { .. }) | Some(ObjRef::VfsFile { .. }) => Err(HErr::Vfs(VfsError::NotDir)),
+        Some(_) => {
+            t.c.denied += 1;
+            Err(HErr::Denied)
+        }
+        None => {
+            t.c.no_such += 1;
+            Err(HErr::NoSuch)
+        }
+    }
+}
+
+#[cfg(feature = "fs-open")]
+pub fn next_dir_entry(ticket: &mut DirTicket) -> Result<Option<VfsEntry>, HErr> {
+    let disk = AhciDisk { port: ticket.port };
+    read_on_disk(&disk, ticket.part, |b| ticket.state.advance(b).map_err(vfs_to_herr))
+}
+
+#[cfg(feature = "fs-open")]
+pub fn commit_dir_read(ticket: DirTicket) -> Result<(), HErr> {
+    let mut g = TABLE.lock();
+    let t = g.get();
+    let e = &mut t.slots[ticket.slot as usize];
+    if !e.used || e.gen != ticket.gen {
+        t.c.stale += 1;
+        return Err(HErr::Stale);
+    }
+    match e.obj.as_mut() {
+        Some(ObjRef::VfsDir { state, .. }) => {
+            *state = ticket.state;
+            Ok(())
+        }
+        _ => {
+            t.c.no_such += 1;
+            Err(HErr::NoSuch)
+        }
+    }
+}
+
 /// 给一个 VMO 发句柄（ADR-074 决策 1）。**引用在锁外加**（VMO 表那边取 VMM），
 /// 占槽失败就在锁外退回那份引用 ⇒ HANDLE(35) 锁内一次 mm 调用都没有。
 /// 调用方自己那份引用不受影响：要转移所有权就在拿到句柄之后自己 `vmo_unref`。
@@ -304,6 +495,8 @@ fn note(err: HErr) -> HErr {
         HErr::Denied => t.c.denied += 1,
         HErr::Exhausted => t.c.exhausted += 1,
         HErr::Io(_) => t.c.denied += 1,
+        #[cfg(feature = "fs-open")]
+        HErr::Vfs(_) => {}
     }
     err
 }
@@ -557,12 +750,19 @@ pub fn vmo_of(h: Handle, owner: (usize, u32), need: u32) -> Result<crate::vmo::V
 
 /// 读票：锁内取走游标的副本，锁外读盘，锁内提交。中途任何失败都只是丢掉这张票——
 /// 表项里的游标一格不动（"失败不提交"与 `FileCursor::read` 的语义同一条）。
+#[derive(Clone, Copy)]
+enum ReadTicketKind {
+    Fat(FileCursor),
+    #[cfg(feature = "fs-open")]
+    Vfs(ReadCursor),
+}
+
 pub struct ReadTicket {
     slot: u16,
     gen: u64,
     port: u8,
     part: Option<Partition>,
-    cursor: FileCursor,
+    kind: ReadTicketKind,
 }
 
 impl ReadTicket {
@@ -576,15 +776,30 @@ impl ReadTicket {
     }
 
     pub fn position(&self) -> u32 {
-        self.cursor.position()
+        match self.kind {
+            ReadTicketKind::Fat(c) => c.position(),
+            #[cfg(feature = "fs-open")]
+            ReadTicketKind::Vfs(c) => c.position(),
+        }
     }
 
     pub fn size(&self) -> u32 {
-        self.cursor.stat().size
+        match self.kind {
+            ReadTicketKind::Fat(c) => c.stat().size,
+            #[cfg(feature = "fs-open")]
+            ReadTicketKind::Vfs(c) => c.size(),
+        }
     }
 
     pub fn read_chunk(&mut self, disk: &dyn Block, dst: &mut [u8]) -> Result<usize, HErr> {
-        self.cursor.read(disk, dst).map_err(HErr::Io)
+        match self.kind {
+            ReadTicketKind::Fat(ref mut c) => c.read(disk, dst).map_err(HErr::Io),
+            #[cfg(feature = "fs-open")]
+            ReadTicketKind::Vfs(ref mut c) => {
+                let n = vfs_ro::read_disk(disk, c, dst).map_err(vfs_to_herr)?;
+                Ok(n)
+            }
+        }
     }
 }
 
@@ -595,8 +810,16 @@ pub fn begin_read(h: Handle, owner: (usize, u32)) -> Result<ReadTicket, HErr> {
     let e = &t.slots[slot];
     match e.obj {
         Some(ObjRef::File(f)) => {
-            Ok(ReadTicket { slot: slot as u16, gen: e.gen, port: f.port, part: f.part, cursor: f.cursor })
+            Ok(ReadTicket { slot: slot as u16, gen: e.gen, port: f.port, part: f.part, kind: ReadTicketKind::Fat(f.cursor) })
         }
+        #[cfg(feature = "fs-open")]
+        Some(ObjRef::VfsFile { port, part, cursor, .. }) => {
+            Ok(ReadTicket { slot: slot as u16, gen: e.gen, port, part, kind: ReadTicketKind::Vfs(cursor) })
+        }
+        // 目录句柄有对象、有 READ 权，但"读一个目录的字节"这件事在 VFS 层就不成立：
+        // ADR-108 决策 3 要的是 `-11 EISDIR`，不是类型不符的 `-4`。（ring3 探针实测抓到过 -4。）
+        #[cfg(feature = "fs-open")]
+        Some(ObjRef::VfsDir { .. }) => Err(HErr::Vfs(crate::filesystem::vfs_ro::VfsError::IsDir)),
         // 不是文件对象就没有"文件读"这回事（VMO 与 P5c-1 的四种 kind 同理）：
         // 这是类型/权限不符，不是"槽不存在"，两个计数器分开
         Some(_) => {
@@ -619,12 +842,34 @@ pub fn finish(ticket: ReadTicket, bytes: usize) -> Result<(), HErr> {
         t.c.stale += 1;
         return Err(HErr::Stale);
     }
-    if let Some(ObjRef::File(f)) = e.obj.as_mut() {
-        f.cursor = ticket.cursor;
+    let committed = match (e.obj.as_mut(), ticket.kind) {
+        (Some(ObjRef::File(f)), ReadTicketKind::Fat(c)) => {
+            f.cursor = c;
+            true
+        }
+        #[cfg(feature = "fs-open")]
+        (Some(ObjRef::VfsFile { cursor: old, .. }), ReadTicketKind::Vfs(c)) => {
+            *old = c;
+            true
+        }
+        _ => false,
+    };
+    if !committed {
+        t.c.no_such += 1;
+        return Err(HErr::NoSuch);
     }
     t.c.reads += 1;
     t.c.bytes += bytes as u64;
     Ok(())
+}
+
+#[cfg(feature = "fs-open")]
+fn vfs_to_herr(e: VfsError) -> HErr {
+    match e {
+        // 既有块设备失败仍走 Io，保持 10 号的老负样本语义不变；其余 VFS 成因不降级成"盘坏"。
+        VfsError::Fs(FsError::Io(be)) => HErr::Io(FsError::Io(be)),
+        _ => HErr::Vfs(e),
+    }
 }
 
 /// 丢弃一张票：表项不动。显式函数而不是 `Drop`，是为了让"没有提交"在调用点看得见。
@@ -657,7 +902,7 @@ pub fn read_with(h: Handle, owner: (usize, u32), disk: &dyn Block, dst: &mut [u8
     Ok(n)
 }
 
-/// ADR-098 诊断：句柄表当前占了几格（`MAX_HANDLES = 16`）。
+/// ADR-098 诊断：句柄表当前占了几格（容量以 `MAX_HANDLES` 为唯一事实）。
 /// 只读、只取一次表锁；用来把 16 号里的 `-6` 分成"表满"与"表不满"两种——
 /// 这两类的下一步完全不同（前者去查谁没还，后者去查 `transfer` 的权限/世代）。
 pub fn used() -> usize {
@@ -725,7 +970,7 @@ pub fn preset_gen(slot: usize, gen: u64) {
 }
 
 /// 只清槽，不清计数器：分段用例之间要清表，但"这一轮发生过几次拒绝"必须能累计到最后的日志。
-#[cfg(feature = "fat32-probe")]
+#[cfg(any(feature = "fat32-probe", feature = "fs-open"))]
 pub fn reset_for_test() {
     let mut vmos = [0u8; MAX_HANDLES];
     let mut nv = 0usize;
@@ -746,7 +991,7 @@ pub fn reset_for_test() {
     }
 }
 
-#[cfg(feature = "fat32-probe")]
+#[cfg(any(feature = "fat32-probe", feature = "fs-open"))]
 pub fn reset_counters_for_test() {
     let mut g = TABLE.lock();
     g.get().c = Counters::default();
@@ -791,11 +1036,11 @@ mod tests {
         reset_counters_for_test();
         let Some(cur) = fixture() else { return false };
 
-        // ① 打包形状：48 位世代填满高位；0 / gen 0 / slot 16 全非法
+        // ① 打包形状：48 位世代填满高位；0 / gen 0 / slot `MAX_HANDLES` 全非法
         let h = Handle::pack(3, 5);
         let pack_ok = h.0 == 3 | (5u64 << 16) && h.unpack() == Some((3, 5))
-            && Handle::pack(15, GEN_MAX).unpack() == Some((15, GEN_MAX))
-            && Handle::pack(16, 1).unpack().is_none()
+            && Handle::pack(MAX_HANDLES as u16 - 1, GEN_MAX).unpack() == Some((MAX_HANDLES as u16 - 1, GEN_MAX))
+            && Handle::pack(MAX_HANDLES as u16, 1).unpack().is_none()
             && Handle::pack(0, 0).unpack().is_none()
             && Handle(0).unpack().is_none();
 
@@ -879,7 +1124,7 @@ mod tests {
 
         // ⑦ 非法形状：0 / slot 越界 / gen 0 ⇒ Invalid（对用户是 -1，不是 -5）
         let shape_ok = matches!(begin_read(Handle(0), OWNER), Err(HErr::Invalid))
-            && matches!(begin_read(Handle::pack(16, 1), OWNER), Err(HErr::Invalid))
+            && matches!(begin_read(Handle::pack(MAX_HANDLES as u16, 1), OWNER), Err(HErr::Invalid))
             && matches!(begin_read(Handle::pack(5, 0), OWNER), Err(HErr::Invalid));
 
         // ⑧ EOF：2000 字节读完再读回 0；长度大于文件时返回剩余

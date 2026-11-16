@@ -414,7 +414,9 @@ def _pad_short(short: str) -> bytes:
 def _checksum(sb: bytes) -> int:
     s = 0
     for b in sb:
-        s = ((s >> 1) + (s << 8) + b) & 0xFF
+        # FAT 规范：先循环右移一位再累加。写成 `(s >> 1) + (s << 8)` 会把最高位丢掉，
+        # 生成器与校验器一起错时看不出来（S2b 之前这两处就是同一份错算法）。
+        s = (((s & 1) << 7) + (s >> 1) + b) & 0xFF
     return s
 
 

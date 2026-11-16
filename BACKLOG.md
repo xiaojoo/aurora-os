@@ -13492,3 +13492,432 @@ wm: 铺旧矩形 旧=(5,8,70,11) 视图=true     ← 只铺了**最后一个**
   启的户框）保留。`check` 17/17；demo 档 0 error。
 · 说明：新表由宿主机离线生成（build 目录脚本不入库），参数记在本条；要加新标题字按同一参数
   生成并保持码位表有序（binary_search）。
+
+## 332. FS-01：只读 VFS 适配层第一刀（`fs-ro`，ADR-107）
+
+· 交付：`kernel/src/filesystem/vfs_ro.rs`（`fs-ro` 门控）——固定缓冲绝对路径解析（折叠重复 `/`、
+  拒 `.`/`..`/超长/非 ASCII）、`Entry`/`DirCursor`/`ReadCursor`、FAT16 固定根区与 FAT32/子目录
+  簇链枚举、LFN 只计数、顺序读。无分配；目录项上界 4096；簇链沿用 `MAX_CLUSTERS_WALKED`。
+· 用例：`kernel/src/ktests/vfs_ro.rs` 现算 24 扇区 FAT16 卷与 22 扇区 FAT32 卷，覆盖根/子目录/
+  LFN 计数/读、FAT32 高半拼接、8 类路径负格、3 类坏卷（簇链环、根项越界、文件项越界）。
+· 读数（`run --features fs-ro`）：`判定=PASS qemu_rc=33`，`ktests total=84 passed=84 failed=0`；
+  `vfs-ro` 根目录可见 3/扫过 4/长名 1、子目录可见 1/扫过 3；`vfs-ro-f32` 根=簇 2、根目录可见 2/
+  扫过 3/长名 1、高半越界被拒=true。
+· 变异证红（加 FAT32 子用例之前，83 条）：删掉 `lookup` 的 `..` 拒绝 ⇒ `负格 父目录=false`、
+  `t_vfs_ro -> failed`、`total=83 passed=82 failed=1`、判定 FAIL(35)；还原后 `b260d87f7245`、
+  83/83。最终加 FAT32 子用例后 ELF `f8c3b532dcd1`、84/84。
+· 门禁：`check` 17/17。`check-module-interfaces` 先报 `fat32::MAX_CLUSTERS_WALKED` 漏登记，
+  补进 storage 的 public_api 后转绿。默认构建 ELF sha `90d5d7259eb6` 与判定表“正向”行逐字相同，
+  `ktests 82/82`，`p4 serial_bytes=160746` ⇒ 默认构建未受影响。
+· 判定表：41 行 **39 符合 / 2 不符合**。两条不符合都指向 `t_handle_table` 的 `checks[0]`
+  （pack 形状）与 `checks[12]`（非法形状）为 false。成因是**既有不一致**：`MAX_HANDLES=64`，
+  而用例仍把 slot 16 当非法（`handle.rs:798/882`）；本轮未改 `handle.rs`，且 fat32-exec/handles
+  档不编译 `fs-ro` ⇒ **不归因、未修**，另记欠账。
+· 范围边界（未做）：不新增 syscall、不接产品启动路径、无写路径/unlink/tmpfs、无文件句柄授予；
+  LFN 只计数不解析；目录游标无并发保护；FAT32 用合成卷、未上真卷；坏环卷先撞目录项上界，
+  报 `DirTooLong` 而不是 `ChainTooLong`。
+· 另：用户提供的 V1.0 设计文档与 V1.1 补充稿存入 `docs/design/`；ADR-106/107 已起草并采纳，
+  实现按 ADR-107 的只读第一刀推进。
+
+## 333. FS-02：LFN、属性与 ESP 真卷只读挂载（`fs-ro`）
+
+· 交付：`vfs_ro` 增加 LFN 组装（序号/0x40/组内校验和/与短名校验和绑定、UTF-16→UTF-8、
+  `LONG_NAME_MAX=255` 字节截断标记）与 `lfn_bad` 计数；`Entry` 增加长短名视图、只读/隐藏/
+  系统/归档属性与 FAT 创建/访问/写时间字段；路径分量允许 UTF-8 长名，短别名仍可命中。
+  `filesystem/gpt` 门控改为 `any(gpt-probe, fs-ro)`，`fs-ro` 不变。
+· 用例：FAT16 合成卷加多级长名/中文名/属性/时间；`t_vfs_ro_esp` 走 GPT→`PartitionView`→
+  `ReadOnlyFs` 读**真 ESP** 的 `LIMINE.CON`，与 `boot/limine.conf` 逐字节对账，并验 `base=0`
+  读到保护性 MBR 必须拒。
+· 读数（`run --features fs-ro`）：`PASS(33)`，`ktests 86/86`；`vfs-ro-esp: 口=0 base=2048
+  大小=762 别名=true 字节同=true 根可见=3 扫过=6 长名=3 坏=0 base0拒=true`；
+  `vfs-ro-lfn` 正样本全 true，根(可见2/扫过5/长名3/坏0)、子(可见1/扫过5/长名2/坏0)，
+  坏校验和（整组同错/组内不一致）与孤项均 true。
+· 变异证红：去掉“LFN 校验和与短名绑定”那一条 ⇒ `坏卷 校验和=false`、`t_vfs_ro_lfn -> failed`、
+  `total=86 passed=85 failed=1`、`FAIL(35)`；还原后 ELF `05731d3c77b4`、86/86。
+· **新发现的宿主工具缺陷（已修）**：`tools/esp_image.py` 的 VFAT 校验和写成
+  `(s>>1)+(s<<8)+b`，最高位被 `&0xFF` 吃掉（`LIMINE CON` 得 0x90，规范值 0x7e）；
+  `tools/validate_esp.py` 的 `checksum()` 是**同一份错算法**，所以“第二台仪器”一直替生产者
+  背书；它的 LFN 序号判据还把物理倒序写成 `seq == k+1`（应为 `n-k`）。两处已改，重造镜像后
+  `validate_esp.py` 独立通过：GPT 头逐字段、3 个文件、LFN 校验和/序号/簇链/长度。
+  `validate_esp.py` **仍未接进门禁**，这笔欠账不因本轮修复而关闭。
+· 门禁：`check` 17/17。默认构建 ELF sha `90d5d7259eb6` 与上一轮相同，`ktests 82/82`；
+  同轮矩阵 normal `serial_bytes=161007`，与上一轮零散跑的 160746 差 261 字节，**不归因**。
+· 判定表：41 行 **39 符合 / 2 不符合**；仍是 `t_handle_table` 的 `checks[0]`/`checks[12]`
+  既有不一致（`MAX_HANDLES=64` 而用例把 slot 16 当非法），与 FS-02 无关、未修。
+· 范围边界（未做）：不新增 syscall、不接产品启动路径、无写路径/unlink/tmpfs/句柄授予；
+  长名按 UTF-8 字节截断（非 ASCII 可能截在码点边界外，`long_truncated` 只看字节数）；
+  非 ASCII 长名匹配按字节精确、不做 Unicode 大小写折叠；目录游标无并发保护；
+  FAT32 仍只走合成卷；ESP 只读的是引导盘上既有文件，不往 ESP 加新文件。
+· 新增/修改文件：`kernel/src/filesystem/vfs_ro.rs`、`kernel/src/ktests/vfs_ro.rs`、
+  `kernel/src/filesystem.rs`、`tools/esp_image.py`、`tools/validate_esp.py`、
+  `docs/architecture/module-interfaces.toml`（test_targets）、`BACKLOG.md`。
+
+## 334. FS-03 切片 A/B/C：22/24/25/26 文件 ABI、VFS 句柄对象与卷A 接线（`fs-open`，ADR-108）
+
+· 前置修复（不算 FS-03 本体）：`handle.rs` 的 `t_handle_table` 仍把 slot 16 当非法，而
+  `MAX_HANDLES=64`。改成 `MAX_HANDLES` 派生的三格（pack 上界、`pack(MAX_HANDLES,1)` 非法、
+  越界槽的 `begin_read`）。`fat32-exec` 档回到 `82/82`，§332/§333 记的那两条不符合随之关闭。
+· 交付：
+  - `kernel/src/filesystem/fs_open.rs`（`fs-open` 门控，纯存储层）：口 3 挂载、`open(path,flags)`
+    回 `Opened::File{cursor,stat}` / `Opened::Dir{state,stat}`、StatV1(48B)/DirentV1(512B) 编码。
+    **不依赖 `handle`**——授予与事务由 `user.rs` 编排，存储层不反向依赖 capability。
+  - `vfs_ro`：新增 `DirState`（不缓存 512B 扇区，每次从目录头走到 `skipped` 再取一条）、
+    `seek_disk`（下层自己拦越 EOF）、`VfsError::{DirTooLong,BadOffset,BadFlags}`。
+    句柄表槽因此不会被 1.5 KB 的 `DirCursor` 撑开——第一版用 `DirCursor` 直接进表，实跑 **HANG**。
+  - `handle.rs`：`ObjRef::VfsFile/VfsDir`、`ReadTicketKind` enum（既有 `FileObj` 行为逐字不变）、
+    `grant_vfs_file/grant_vfs_dir/seek/stat/begin_dir_read/next_dir_entry/commit_dir_read`。
+  - `user.rs`：`ABI_MINOR 11→12`、`F_FS_OPEN=512`、22/24/25/26 四个入口、`AbiError` 扩
+    `-7/-8/-10/-11/-15`。既有句柄的盘失败仍按历史 `-2` 带出，不改旧调用方的返回集合。
+  - `tools/aurora.py`：`FS_OPEN_FEATURES`/`FS_OPEN_PORTS`（口 3 同一份夹具，与 `FAT_PORTS` 撞口号
+    就当场退出）、`check_fs_open` 证人、判定表新增一行。
+· 读数（同一跑的取证行，`build/run-1766.log`，`variant=fs-open`，ELF sha `c900b3d50696`，8,166,888 B）：
+  `fs-open: 取证 读回=100 摘要=0x6d8f5d947de075cd stat大小=100 首簇=67 条目1=[HELLO.ELF]/32672 条目2=[NOTES]/1000`，
+  `判据=true`，`ktests total=94 passed=94 failed=0`，`判定=PASS qemu_rc=33`，该跑 `serial_bytes=189215`。
+· 门禁：`check` 17/17（先红在 `check-module-interfaces`：`fs_open` 的旧符号 `OpenError/begin/commit/next/seek/stat`
+  已随重构消失，新符号 `Opened/PORT/stat_record/vfs_ro::seek_disk/handle::*` 未登记——补登记后转绿）。
+  六档全编译：default `b83a073aec9e`(5,900,880 B)、`handles`、`fs-ro`、`fs-open`、`fat32-exec,handles`
+  `870d9189996e`、`wm,ps2-kbd,ps2-mouse`。默认档 `ktests 82/82`、`p4 serial_bytes=160748`
+  （与 §333 那轮 161007 差 259 字节，**不归因**）。
+· 判定表：**58 行 58 符合 / 0 不符合**（`AGENTS.md` 里写的"41 行"是旧的行数口径，本轮按实际打印计数）。
+  上一轮那两条 `FAT32④段内字节改了必须红` / `FAT32簇号高半抹零必须红` 的 **CONTENT-MISMATCH**
+  根因已定位：我把 FAT 的 `apply_fat_host_fault` 调用挪进了 `FS_OPEN` 分支，于是
+  `fat32-exec`/`fat32-probe` 那两跑**根本没改盘**（证人报"差异偏移 []（共 0 处）"），
+  内核自然绿。恢复原顺序后两行回到 FAIL(35) 符合。⇒ 又一次"量具自己先错，看起来像被测物坏了"。
+· 新证人 `check_fs_open` 双向证红（离线，拿同一跑的串口行 + `build/fat32-small.img`）：
+  真读数 ⇒ 空；改摘要/首簇 ⇒ 两条点名；把条目2 换成条目1 ⇒ 名字与大小都点名；
+  `passed=93` ⇒ 点名"用例没全过"；删掉取证行 ⇒ 点名"这条链没走到结论"。
+- 宿主机侧新增 `dirlist`（按盘上顺序列可见项，含子目录，跳卷标/LFN/已删除）：readdir 比的是**序列**，
+  原来那张按名字查的 `files` 表没有顺序语义，用它对账会把"内核漏了一项"读成查得到就通过。
+· 范围边界（未做）：**切片 D 的 ring3 独立探针还没交付**，所以 FS-03 今天只是"内核态经
+  `syscall_dispatch` 走完 22/10/24/25/26/8 的形状"，**不得写成"用户空间已可访问文件"**。
+  产品启动路径仍不授予文件句柄；真卷只测根文件（多级路径的证据仍在 FS-02 合成卷）；
+  `DirState` 每次从头走目录，是 O(n²) 取证形状，不是产品吞吐；无写路径（23 号仍空）、无 mount table。
+· 新增/修改文件：`kernel/Cargo.toml`、`kernel/src/filesystem.rs`、`kernel/src/filesystem/vfs_ro.rs`、
+  `kernel/src/filesystem/fs_open.rs`、`kernel/src/handle.rs`、`kernel/src/user.rs`、
+  `kernel/src/ktests/fs_open.rs`、`kernel/src/ktests/mod.rs`、`tools/aurora.py`、
+  `docs/architecture/module-interfaces.toml`、`docs/adr/ADR-108-*.md`、`BACKLOG.md`。
+
+## 335. FS-03 切片 D：ring3 文件探针 `aurora-user-fileprobe`（ADR-108 决策 8）
+
+· 交付：第四个用户产物 `user/fileprobe/{Cargo.toml,link.ld,src/main.rs}`，基址 **0x1000c0000**
+  （与 hello/shell 的 0x100000000、probe 的 0x100080000 全部错开，仍在固定镜像窗口
+  `[USER_VA_BASE, USER_MMAP_BASE)` 里）。产物 27,592 字节走 `include_bytes!` 成第四个夹具，
+  **只在 `fs-open` 档嵌入、不进签名链**。信箱 `.slots` 独占一页：结果格 0..256、缓冲从 512 起，
+  偏移表在 `user/fileprobe/src/main.rs` 与 `kernel/src/ktests/fs_open.rs::mod fp` **各写一份**。
+  路径用两个 u64 立即数写进缓冲——`relocation-model=static` 下静态数据的取址会退化成
+  `R_X86_64_32S`，本产物没有重定位器（probe 的模块头记过这个坑）。
+· 内核侧：`ktests/fs_open.rs::t_fs_open_ring3` 装载并 `spawn_user` 真跑，等**探针自己写的 done 哨兵**
+  （不等调用数），29 格逐格点名；对照物不再在核内重算，改用宿主机那台仪器现算的量（见下）。
+· **产品路径抓到两个真缺陷**（ktest 在 ring0 里打同一批号时都没抓到）：
+  1. `read` 一个目录句柄回的是 **-4 Denied**，不是 ADR-108 决策 3 写的 **-11 EISDIR**——
+     `handle::begin_read` 的兜底分支把所有非文件对象当成类型不符。已加 `ObjRef::VfsDir` 那一格
+     （不涨 `denied` 计数：这不是权限问题）。
+  2. 探针只关文件不关目录 ⇒ `表清空` 那一格 `live=1`。契约里"close 撤名字"要有第二条 close。
+· **栈预算（本轮最大的发现）**：ring3 打 22 号的那条链（trap 帧 → `syscall_dispatch` →
+  `sys_file_open` → `fs_open::open` → `vfs_ro::lookup`）在 4 页用户任务内核栈上用到
+  **16,760 字节**，正好越过栈底 guard 页；形状是"挂载读回 3 个扇区之后，在 `lookup` 的序言里
+  `#DF(8)` 死循环"，判定 HANG。`lookup` 反汇编出来单帧 **4,568 字节**（`subq $0x1000` +
+  `subq $0x1a8` + 6 个 push），里面是内联的 `find_child`/`next_entry_disk` 加好几份 424 字节的
+  `Entry`。这一刀的处理：`sched::USER_KSTACK_PAGES` —— **只给 `fs-open` 档的用户任务栈** 4→8 页。
+  第一版把 `STACK_PAGES` 整体改成 8，实测 `t_q2_workload_slots` 的"回基线"从相等变成
+  `free 115190→115189`（少一格）⇒ 判据不该给量具的尺寸让路，作用域收到"只有 ring3 陷入用的那条栈"。
+  **真该修的是那条链的峰值**（把 VFS 那几帧压回去），页数只是先把产品路径跑通——记为欠账 ①。
+  调试期还试过 `#[inline(never)] fn find_child`，实测**更深**（`rsp 0x...86ed8 → 0x...86e20`），已还原。
+  下一轮把"拆帧能不能救回来"量到底：四个 FS 处理号与 `next_entry_disk` 的 `#[inline(never)]` 试验
+  在撞栈读数上**一位都不变**，全部撤掉；页数二分因 `phys_alloc` 只按 2 的幂开而**读数作废**。
+  欠账 ① 仍未修，实测边界与下一步见 §336。
+· **（§336 已结案）对照量从"哈希"改成"没有算法的量"**：第一版让 ring3 自己算 FNV-1a/64 与核内、宿主机三份比。
+  实测低 32 位逐次相同、高 32 位不同（`0x6d8f5d94_7de075cd` 对 `0xfb2d3594_7de075cd`；
+  尾段与目录名字摘要同形状）。**没解释这个数字，就不把它写成判据**（§12.4.1 的那条纪律）：
+  契约改成大小、首簇、首尾 8 字节、字节和、条数、名字字节和，全部无实现依赖。
+  这份 FNV 分歧记为欠账 ②，**下一轮已结案**：根因是探针里素数字面量多打一组下划线（2^44+435），
+  现在它反过来变成判据（`两种乘法写法同数` + `整份 FNV 三实现同数`），见 §336。
+  FS-03 切片 A/B/C 那行的核内 FNV 与宿主机 FNV 一直逐次一致。
+· 读数（判定表第 43 行 `variant=fs-open`，ELF sha `c860e0ec05bd`，8,252,488 字节）：
+  `fs-open-ring3: 取证 读回=100 首8=0x79183bda c5e487a6 字节和=12966 尾首8=0x4f6e0928 cbea95b4
+  尾和=6321 stat大小=100 首簇=67 条目=3 名字和=1666 大小和=33772 表清空=true 回收=true
+  rounds=1366 served=26 ⇒ true`，`ktests total=95 passed=95 failed=0`。
+  宿主机那台仪器按同一份 `build/fat32-small.img` 独立重算这十个量，**一格都没对账不上**。
+· 新证人 `check_fs_open_ring3` 双向证红（离线，真读数 + 五种做坏）：改字节和/条数、
+  把表清空改成 false、改名字和与大小和、删掉取证行、`passed=94`——五种全部点名，真读数返回空。
+· 门禁：`check` 17/17。新包的 unsafe 全部登记：`[crate.aurora-user-fileprobe]` 与
+  `[modules."user/fileprobe"]`（U1=4：`int 0x80` 入口与其 `unsafe fn` 声明、`lea` 取 `.slots` 基址、
+  panic 自跳转；U5=8：四处 volatile 读写 + 三处把本页地址交给内核 + `_start` 那个块），
+  `[unsafe-census]` 与 `unsafe-census.md` 汇总同步为 427 处（U1 79 · U5 54）。
+  `check-sbom` 先红（成员集合差 `aurora-user-fileprobe`）⇒ 跑 `release` 重生成 `docs/release/sbom.json`。
+  七档全编译：default、`handles`、`fs-ro`、`fs-open`、`fat32-exec,handles`、
+  `wm,ps2-kbd,ps2-mouse`、`resident-init`。
+· 判定表：**59 行 57 符合 / 2 不符合**。两条不符合是同一个既有易碎格
+  `t_q2_workload_slots`（一行 `peak=false`，一行 `full/peak/done/baseline` 一起 false），
+  与 FS-03 无关、**不归因**；补测同档三跑 `run --features fs-open` 全部 `PASS(33)`、q2 零 complaint。
+  本轮不重跑整表去挑一次绿。
+· 范围边界（仍未做）：产品启动路径**还是不用**这套号（探针只在 ktest 里被装载运行，`init` 不 spawn 它）；
+  多级路径的真卷夹具仍缺（本机没 mtools）；23 号 write 未开；`dirlist` 那套顺序判据只覆盖卷A 根目录。
+· 新增/修改文件：`user/fileprobe/*`、`Cargo.toml`、`kernel/src/ktests/common.rs`、
+  `kernel/src/ktests/fs_open.rs`、`kernel/src/handle.rs`、`kernel/src/sched.rs`、
+  `tools/aurora.py`、`docs/architecture/crates.toml`、`docs/security/unsafe-whitelist.toml`、
+  `docs/security/unsafe-census.md`、`docs/release/sbom.json`、`kernel/fixtures/fileprobe.elf`（待 stage）、
+  `docs/adr/ADR-108-*.md`、`docs/design/user-abi-capability.md`、`BACKLOG.md`。
+
+## 336. FS-03 收尾：欠账②结案（FNV 分歧）、欠账①量尺结案但未修（栈峰值）
+
+· **欠账②已结案，根因是探针里一个十六进制字面量多打一组下划线**。追查形状：三格 FNV 与核内/宿主机的差
+  都是 2^40 的整数倍（`0x8d9dd800_00000000`、`0x81493700_00000000`、`0xfbfb8700_00000000`）。
+  因为 FNV 的素数 435 是奇数，**任何"字节读错了"都会把差异带进低 32 位**——低 40 位逐次相同就排除了输入差异，
+  只剩"某个只影响 bits≥40 的东西"。据此在探针里加两格诊断：同一份字节、同一个 `h`，一次走
+  `wrapping_mul(素数)`，一次走展开式 `t*435 + (t<<40)`（模 2^64 下是同一个式子）。读数一发命中：
+  `mul=0xfb2d35947de075cd`（错）对 `add=0x6d8f5d947de075cd`（对，与核内、宿主机同数）
+  ⇒ 不是编译器降级问题，是 `0x1000_0000_01b3` 被写成了 12 位十六进制（值 = 2^44+435，正确的素数是
+  2^40+435 = `0x0000_0100_0000_01b3`）。已改字面量。
+· **结案之后把它升成判据，不留成故事**：内核用例新增 `整份 FNV 三实现同数`
+  （`slot(FNVMUL) == expect::SMALL_FNV == 0x6d8f5d947de075cd`）与 `两种乘法写法同数`（mul==add）；
+  宿主机证人 `check_fs_open_ring3` 同时抓 `诊断mul`/`诊断add` 两格与自己算的那份比。
+  证人双向证红（离线）：改 `mul` ⇒ 点名 `ring3 的 FNV(mul)=… 宿主机算出 0x6d8f…`；改 `add` ⇒ 同形状点名；
+  真读数返回空。**注意这条判据曾经以"红"的形式存在过**：修字面量之前那一跑是
+  `ktests 94/95`、`判定=FAIL(35)`，红 exactly 在新加的那一格。
+· **欠账①量完了尺子，但没修好——页数那一刀仍是本轮的 shipped 处理**。读数（同一跑来路：带单个 rsp 量尺的
+  `fs-open` 跑，ELF `a9d1eec5e967`，`判定=PASS(33)`）：
+  - 容器任务内核栈顶 `rsp0 = 0xffff80002058eff0`；
+  - `vfs_ro::lookup` **入口**的 `rsp = 0xffff80002058ad30` ⇒ 上游（trap 帧 + `syscall_dispatch` +
+    `sys_file_open` + `fs_open::open` + `Volume::mount`）已经吃掉 **17,088 字节**；
+  - `lookup` 单帧反汇编 4,568 字节 ⇒ 这条链的峰值 ≈ **21.7 KB**，而 4 页栈是 16,384 字节。
+  撞穿时的形状每次都一样：`rsp=0xffff800020586ed8 / cr2=0x586ec8`，即第一个探测写就落在 guard 页里。
+· **两次拆帧试验被实测驳回并撤掉**（不留无效结构）：把 22/24/25/26 四个处理号标 `#[inline(never)]`
+  从 `syscall_dispatch` 拆出来、把 `vfs_ro::next_entry_disk` 拆出 `find_child`——两次的撞栈读数
+  **一位都不变**（同一 rip、同一 rsp）。撤掉之后 `syscall_dispatch` 的帧仍是 4,096 字节。
+· **一次无效实验记在账上**：想用页数二分把峰值夹出来，跑了 5/6/7 页三跑。这方法本身不成立——
+  `mm::phys_alloc` 只按 2 的幂开块，`trailing_zeros()` 把 5/6/7 全变成 order 0（1 页）。三跑都是 HANG，
+  但那不是"5/6/7 页放不下"的证据，**读数作废**。可用的档位只有 4 页与 8 页：4 页必撞，8 页 PASS。
+· **所以欠账①的真实下一步不是拆帧，是设计决定**（要么把 1.1 KiB 的 `DirCursor` 从栈搬到堆——
+  在 `LARGE_MAX = 2048` 之内、且只在 syscall 路径分配；要么把上游那 17 KB 里没解释的 ~9.7 KB 归因之后再谈）
+  。**那 9.7 KB 目前未归因**：`dispatch(4,096) + open(1,496) + mount(1,656) + trap 帧` 只解释得到 7.4 KB。
+  归它要先有量尺，而量尺本身要栈——这条留给下一轮，不在本轮硬编一个解释。
+· **本轮取证跑**：`check` 17/17；七档全编译（default / `handles` / `fs-ro` / `fs-open` /
+  `fat32-exec,handles` / `wm,ps2-kbd,ps2-mouse` / `resident-init`）；判定表 59 行 **56 符合 / 3 不符合**。
+  三条不符合全部落在同一个格子 `t_q2_workload_slots` 的 `active峰值`（13 对 14）；FS-03 那两行
+  （`FS-03文件ABI与卷A对账`、`FS-03ring3探针与卷A对账`）**都是 PASS(33) 且宿主机零对账投诉**。
+  q2 补测：连续五跑 `run`（default 档）全部 `82/82`、`q2: 判据不成立` 出现 0 次；本轮之前那两次矩阵分别是
+  0 行与 2 行落在这一格。**既有易碎，不归因，不重跑整表去挑一次绿**。
+· 同轮记录一件事：default 档 ELF 从 `b83a073aec9e`(5,900,880 B) 变成 `d2780ef77335`(5,900,992 B，+112 B)。
+  来路是 `sched.rs` 里 `USER_KSTACK_PAGES` 这个常量的形状（多一个 cfg 常量与一处局部算式），
+  非 `fs-open` 档的页数仍是 4 页 ⇒ **字节数变了但语义没变**，这条只作留痕，不当判据也不归因给 q2。
+· 新增/修改文件：`user/fileprobe/src/main.rs`（素数字面量 + 两格诊断 + close 目录）、
+  `kernel/src/ktests/fs_open.rs`（两格判据 + `expect::SMALL_FNV`）、`tools/aurora.py`
+  （`FS_RING3_RE` 增字段、`check_fs_open_ring3` 增三份 FNV 同数那一格）、`BACKLOG.md`。
+
+## 337. 欠账①结案：分派器逐号成帧，栈峰值压回 4 页（8 页补偿已撤销）
+
+· **先纠正上一轮的两条错读数**，它们都是量具的错，不是被测物的：
+  1. `syscall_dispatch` 的帧我记成 4,096 字节——脚本对每个函数只取了**单个** `subq $N,%rsp` 的最大值，
+     而 rustc 对 >1 页的帧发的是**两段**栈探测（`sub 0x1000` 之后再 `sub 余量`）。按序言里 `sub` 的
+     **累加**重算，它是 **10,584 字节**。同一算法也修正了 `lookup`（4,520，不是 4,568）。
+  2. "把号拆出去之后撞栈读数一位都不变"——**这把尺子本来就不分辨**：撞 guard 页时 `rsp` 会钉在边界上
+     （两次都是 `rsp=0xffff800020586ed8 / cr2=0x...6ec8`），超出 400 字节和超出 9 KB 打得出一样的字。
+     于是上一轮据它撤掉了正确的修法。改用**调用方一侧的 rsp 量尺**才量得动。
+· **修法**：`kernel/src/user.rs` 里给 syscall 分支逐个 `#[inline(never)]`——先拆 22/24/25/26 四个 FS 号，
+  再把带缓冲的十个号（`sys_file_read`/`sys_vmo_*`/`sys_aspace_map`/`sys_process_*`/`sys_thread_create`/
+  `sys_object_wait`）一起拆。分派器的序言峰值 **10,584 → 144 字节**，每个号只为自己那帧付账。
+· **量到的 22 号那条链**（`run --features fs-open`，带临时量尺那一跑，读数是 `rsp0−rsp` 与序言累加）：
+  `dispatch 144 + sys_file_open 1,352 + fs_open::open 1,496 + Volume::mount 1,656 + lookup 4,520 +
+  next_entry_disk 648 + read_disk 1,224 = 11,040 字节`，4 页栈是 16,384 ⇒ **余 ~5.3 KB**
+  （还没扣 trap 帧 184 与中断窗口自己那几帧）。量尺那一跑实测 `lookup` 入口只用掉 8,032 字节，与这个和一致。
+  量尺本身要栈，所以这条按"和"来记，不按探针字记。
+· **补偿全部撤掉**：`sched::USER_KSTACK_PAGES` 与那段 cfg 一并删除，`spawn_user` 回到 `STACK_PAGES`（4 页），
+  `kernel/src/sched.rs` 现在与 HEAD 逐字相同（`git status` 里不再出现它）。
+· **4 页这一档的稳定性**：`run --features fs-open` 四跑 = 3 次 `PASS(33) 95/95` + 1 次 `HANG(-1)`。
+  那次 HANG **不是栈**：停在第 11 条用例 `t_va_interval_table` 之后，串口无 `vector=8`、无用例红、
+  用时 120.0s 正好等于预算，宿主报告自己就写了"先怀疑预算与宿主负载"。形状与本轮另一次 8 页那档的
+  HANG 相同 ⇒ 记为**环境形状**，不当判据也不归因给 FS-03。
+· **整表取证跑**：`判定表 59 行 59 符合 / 0 不符合`（本轮三次矩阵里第一次全绿；前两次分别有 0、2、3 行
+  落在 `t_q2_workload_slots` 的 `active峰值`——那一格今早 default 档连五跑也是 0 次红，仍是易碎，不归因）。
+  FS-03 两行 `FS-03文件ABI与卷A对账`、`FS-03ring3探针与卷A对账` 都是 `PASS(rc=33)`，宿主机零对账投诉。
+  `check` 17/17；七档全编译（default / handles / fs-ro / fs-open / fat32-exec,handles /
+  wm,ps2-kbd,ps2-mouse / resident-init）。
+· **新发现一个既有组合编不过（不是本轮改出来的）**：`build --features fbcon-live,ps2-kbd` 在
+  `main.rs:1570` 撞 `crate::handle` 被 `handles` 门控挡住（`E0433`）。`main.rs` 本轮一个字没动，
+  所以这洞在 HEAD 就在——是"这组合从没被编译过"，不是回归。本轮不顺手改（改 `main.rs` 会牵动判定表的
+  来路），登记为欠账 ③。
+· **判据面的变化**：本轮没有新增判据，但把两条既有判据的地基修实了——ring3 那条链现在真的能在
+  4 页栈上跑完，而 4 页是所有档共同的默认值；`fs-open` 不再是"唯一一个要特殊改栈尺寸的档"。
+
+## 338. 欠账③结案：没声明的特性边（三个组合在 HEAD 编不过），以及证人抓到的"回收后再读信箱"竞争
+
+· **补边**（`kernel/Cargo.toml`，边写漏是根因，代码没写错）：
+  - `fbcon-live = ["framebuffer", "ps2-kbd"]` —— 它的 `∨` 下拉与键盘捕获直接用 `crate::kbd::`；
+  - `ps2-mouse = ["framebuffer"]` —— 画指针要先有帧缓冲（`crate::limine::framebuffer()`）；
+  - `wm = ["framebuffer", "handles", "fbcon-live", "multisession", "ps2-kbd", "ps2-mouse"]` ——
+    它引用 `crate::mouse`，却把键盘/鼠标留给调用方在命令行上手加，这是那个"`wm` 单独编不过、
+    必须写成 `wm,ps2-kbd,ps2-mouse`"老坑的根。
+· **补边的证据是"两档合成同一档"**：`run --features wm` 与 `run --features wm,ps2-kbd,ps2-mouse`
+  给出**同一个 ELF sha `7696b8b9d7c9`**、`判定=PASS(33)`、`ktests 90/90` ⇒ 解析出来的特性集合没变，
+  只是以前要靠人记住那三个后缀。既有判定行的来路不动（矩阵里没有 wm 档的行）。
+· **两处 cfg 补洞**（`main.rs`）：`request_spawn()` 与关窗那行日志里的"句柄表={}/{}"在
+  没有 `handles` 的构建里引用了不存在的表（`E0433`）。**带表那一半的字符串逐字不变**，
+  另加一条 `#[cfg(not(feature = "handles"))]` 的版本写"本构建没有句柄表"——日志契约里
+  判定表吃的那条一个字没动。
+· **组合面重扫**（一次编译一遍，不再凭印象）：`fbcon-live`、`fbcon-live,ps2-kbd`、
+  `fbcon-live,ps2-kbd,ps2-mouse`、`fbcon-live,multisession`、`ps2-mouse`、`ps2-kbd`、`framebuffer`、
+  `fbcon-mirror`、`console-probe`、`serial-rx-probe`、`multisession`、`resident-init`、`wm`、
+  `wm,ps2-kbd,ps2-mouse`、default、`handles`、`fs-ro`、`fs-open`、`fat32-exec,handles` ——
+  **19 个组合全部编译通过**。上一轮我说"七档全编译"时 `fbcon-live,ps2-kbd` 已经是红的，
+  那句"全"字当时就不成立——本轮把它扫干净再说。
+· **宿主证人抓到一处真竞争（不是易碎）**：判定表第 43 行报
+  `FS-03ring3探针与卷A对账: CONTENT-MISMATCH(rc=33)`，形状是"判定级 PASS、用例级 95/95，
+  但取证行十个量全是 0"。根因在**我的用例**：`t_fs_open_ring3` 先 `drained_or_free()` 回收容器任务，
+  之后还继续一格一格 `user::read_at()` 它的信箱页——容器一被 reap，那页就还给分配器，
+  于是 `abi: 读用户页被拒 va=0x1000c2040 —— 页表链没走完（没映射）` 成串出现，
+  读回来的 0 又被 `slot()` 的 `unwrap_or(0)` 洗成"看起来像数据"。判据先读所以对、取证行后读所以空，
+  **同一跑里两层各自都"自洽"**，只有宿主机那台仪器看得见。
+· **修法**：窗口一结束、回收之前就**整页快照**（`FP_CELLS=40` 格，240 字节），比对与取证都用这份；
+  跑前验空与等哨兵那两处**留在实时读**（那时页必然在）。补记到用例注释里：读死的任务的用户页
+  不是"读不到返回 0"这种小事，它会造出一条自洽的假绿。
+· **本轮取证跑**：`check` 17/17；19 个组合全编译；判定表 **59 行 57 符合 / 2 不符合**——
+  `FS-03ring3探针与卷A对账` 那一跑红在 `t_q2_workload_slots`（同一跑里 ring3 自己 `⇒ true`、
+  页读被拒 0 次，所以竞争已闭），另一行 `ESP分区偏移真读文件` 是 HANG(-1)，串口无 fail/fatal、
+  用时正好等于预算——与本轮另两次观察到的宿主负载形状同形。**都不归因**。
+  `run --features fs-open` 三跑 `PASS(33)`、`95/95`、`读用户页被拒=0`。
+
+## 339. §333 那笔欠账还掉：`validate_esp.py` 的 VFAT 规则第一次被判定行吃掉
+
+· **欠账的形状**（§333 原文："仍未接进门禁"）：校验器有三条出口——`--report`（GPT 头逐字段）、
+  `--esp-file`（按分区偏移取出那个文件）、`--fat16-report`（合成卷几何），判定行吃的就是这三条。
+  而 **VFAT 校验和、LFN 物理倒序的序号、首条 0x40 终止位、簇链与长度**这套规则只活在人读的
+  `main()` 里：没有 flag、没有 key=value，也就没有任何判定行调它。修好的算法因此无人复用。
+· **接线**（`tools/aurora.py::check_esp_file`）：ESP 那一行在字段对账之后，再跑一次
+  `validate_esp.py <同一份 build/aurora.img>`（默认模式），退出 1 ⇒ 把"发现问题："那一段的成因
+  原样抄进 bad，退出码不是 0/1 ⇒ 报"这台仪器自己挂了，不算核过"。**不复制第二份规则**——
+  §333 刚栽过"两份同错算法当两台仪器"，这次直接调那一台的原样实现。
+· **双向证据**：
+  - 真盘（同一跑、UEFI 写过之后的那份）⇒ `[]`；
+  - 变异一：把根目录第一条 LFN 的**校验和字节（条目偏移 13）**从 `0x2d` 改成 `0x77`
+    ⇒ 证人点名 `/EFI 的 LFN 校验和不符：条目0 got=0x77 want=0x2d`；
+  - 变异二（对照）：改同一条目的**偏移 14**（那是名字里的一个 UTF-16 字节）⇒ 不报。
+    这条对照是必要的：它证明新增那一格判的是**校验和规则**，不是"盘上任何字节变了都红"。
+· **顺带纠我自己两处错**：
+  1. 第一版把成因按行首字过滤（`startswith(("LFN","GPT",...))`），结果把 `GPT 头字段核对：通过`
+     抄成了"盘坏了的成因"——成因点错地方比没有成因更坏。改成解析"发现问题："那个块。
+  2. 我一度以为校验和在偏移 14，往那儿打了一枪，证人正确地不报——**是我要核对，不是它漏了**：
+     VFAT 条目里 checksum 在偏移 13，内核 `vfs_ro.rs:830` 读的也是 `e[13]`，两边一致。
+· **取证跑**：`check` 17/17；`run --features esp-probe` ⇒ `PASS(33)`；
+  判定表 **59 行 59 符合 / 0 不符合**（本轮第一次整表全绿，含这条新加的判据；
+  前几轮那两条 `t_q2_workload_slots` 与预算形状 HANG 这一跑没有复现——**仍不据此说它好了**，
+  那一格的既有读数与来路不变）。
+· **仍在账上的**：真卷多级目录夹具（本机无 mtools）、23 号 write、产品 `init` 不领文件句柄、
+  `t_q2_workload_slots` 的 `active峰值` 易碎、以及"用时正好等于预算的 HANG"这个环境形状。
+
+## 340. 起草 ADR-109（多级真卷夹具与 `fs-open` 挂载根改口）——**提议，未采纳，本轮不动代码**
+
+· 为什么是 ADR 而不是直接写：这块缺口（未决 1「真卷只测根文件」）填不了的原因是**挂载根与口号**
+  已经由 ADR-107 裁过，而改它必须先有决定（AGENTS.md「要改架构，先起草 ADR」）。
+· 本文里已经写清的东西：新夹具 `tools/make_fat32_deep.py` → `build/fat32-deep.img`，
+  与 `fat32-mem`/`fat16-mem` 同一条卫生规矩（不进仓库、现算、指纹登记、分家红在编译之前）；
+  内容清单每一项对应一格拉住；六个负样本；宿主机那一台必须**另写一份解析**（`--deep-tree`），
+  不在 Python 里复用内核的 LFN 组装——§333 那条"两份同错算法不是两台仪器"在这里照样成立。
+· **需要拍板的一格**（写在 ADR 未决 1，我不替使用者定）：这块卷按建议几何会让
+  "阈值判型=Fat16 / 结构判型=Fat32"重复卷A 那一格；要不要把簇数推过 65,525 让两半一致
+  （代价是镜像 ≥40 MiB、每跑多花挂盘与哈希时间）。
+· 三条备选与否决理由都在文里（改卷A / 拿 ESP 当真多级 / 只加内存夹具用例），
+  以及影响面：`fs-open` 的 ELF、用例数、判定表第 42/43 行的期望都要重钉；默认档与四把尺子不动。
+
+## 341. 几何裁决落地：`tools/make_fat32_deep.py` 构造验证过，但**还没接线**
+
+· 使用者拍的板：簇数推过 65,525，让**阈值判型与结构判型说同一句话**（ADR-109 决策 2）。
+· 已交出的只有配方本身：`tools/make_fat32_deep.py`（CRLF、264 行）产出 34,336,768 字节的
+  `build/fat32-deep.img`，sha256 `49d89dc2dbe3a558…`；脚本自己断言
+  `SEC < docs_entries_bytes <= 2*SEC`（实测 608）——**跨簇目录那一格若没真跨过去就退出非零**，
+  不会留下一个"造了但什么都没测"的夹具。
+· 第一次尝试把 DOCS 只写 128 字节，断言当场失败：那一格白造。这条按"新判据先要能红"记下来。
+· 两处工具性坑（同一个老熟人）：heredoc 会把 `\x00` 写成真 NUL 字节、也会把替换串里的
+  `\x00` 写成 NUL——`ast.parse` 只报"source code cannot contain null bytes"，不报第二个坑
+  （它把整个文件读回再报错，看不出我写进去的还是读出来的）。修法：脚本里一律用
+  `bytes(4)` / `bytes([0x55,0xAA])` 而不是转义串。
+· **明确没有做的**：端口表、`fs_open::PORT`、`FAT_DEEP_EXPECT` 登记、`--deep-tree` 独立解析、
+  探针多级/LFN 格、判定表第 42/43 行重钉、六个负样本。`git status` 里那 3 个新文件
+  （脚本 + 两块 build 产物之外的部分）不参与任何判据；ADR-109 未决 1 仍然开着。
+
+
+## 342. ADR-109 接线：`fs-open` 的挂载根换成多级真卷（2026-11-16）
+
+§341 那块卷"造出来但没人读"。这一轮把它接上去：端口表、口号、门禁、独立解析、判定行、负样本。
+接线的过程比接线本身值钱——**四处夹具缺陷全部是接上之后才现形的**，而其中三处是宿主机-side
+的两份实现**一起看漏的**。
+
+### 接线落点
+
+- `tools/aurora.py`：`FS_OPEN_PORTS = {5: "fat32-deep"}`（原来借口 3 挂卷A）、
+  `FAT_DEEP_SCRIPT`/`FAT_DEEP_EXPECT` 登记、`ensure_fat_deep()`（跑脚本现算 + 核指纹 + 只在字节变了时落盘）、
+  `FAT_IMG` 扩到含挂载根那块；`DEEP_HOST_FAULTS` 两条注入 + `fat_deep_fault_plan()`；
+  `check-fat32-ports` 加了对 `filesystem/fs_open.rs` 的 `pub const PORT` 的机器对账
+  （口号、卷名、与 FAT 卷不撞口、配方在位、注入**现在就定位得出来**、注入名既不是构建变量也没有内核落点）。
+- `kernel/src/filesystem/fs_open.rs`：`pub const PORT: u8 = 5`。
+- `kernel/src/ktests/fs_open.rs`：`expect` 整块照新卷重钉（首簇 67→3、根目录三项→两项、字节和全部重算），
+  新增 `nested_cells` / `walk_dir` / `docs_diag` / `nested_evidence`。
+- `tools/validate_esp.py --deep-tree`：**第三份 FAT32 实现**（裸卷、无 GPT），输出
+  `deep|bpb|file|dir|long|…|k=v`；判定行的期望数、注入点的目录项偏移全部来自它。
+  它同时是注入的定位器——"改哪一格"不能照着被测代码的算术挑。
+- 判定表：第 42/43 行改口为"与多级真卷对账"，新增第 44/45 行两条盘侧负样本（期望 FAIL=35）。
+
+### 四处缺陷（都是"接上才有证人"）
+
+1. **BPB 字段宽度写错**：`bs[24:28] = u16(0)` 与 `bs[40:44] = u16(0)`——4 字节切片塞 2 字节值，
+   `bytearray` 直接把整个引导扇区**缩短 2 字节**，于是偏移 24 之后每个字段整体错位、
+   `0x55AA` 落在 510 之前的 508，镜像短了 4 字节。发现方式：落盘文件 34,336,764 字节而脚本自己
+   打印 34,336,768——**sha 却"对得上"**，因为 sha 算的是内存里那份。
+   修法：改成两对 u16 + 一道"每个扇区写入必须等宽"的长度断言 + 读回来按规范偏移复算十个 BPB 字段。
+2. **8.3 别名超过 8 字节**：`AURORAL~1` 是 9 个字符，`ljust(8)[:8]` 静默截成 `AURORAL~`，
+   而校验和算在"真名"的 11 字节上 ⇒ 盘上这对长短名永远配不上。修法：换成合法的 `AURORA~1`，
+   校验和随之从 0xd2 变成 0x8d。
+3. **LFN 片段的内容与序号装反**（这处最贵）：物理首条带 `0x40`、序号 = 总条数，但**内容按物理位置**
+   取第 k 块。规范读者按序号落位，于是把 `AuroraLongDocument.txt` 读成 `ument.txt`（9 个字符）。
+   抓到它的是**核内那份 `vfs_ro::note_lfn`**：`docs_diag` 打出"17 条里有 1 条带长名"，而 `长名长度=9`；
+   我的两份宿主机脚本（生成器的自证 + `validate_esp`）都按物理顺序拼接，**所以两边一起绿**。
+   这就是记忆里那条"两份实现共用同一个错算法就不算独立"的现场版本。
+   修法：生成器按 `seq` 取块；`validate_esp.deep_tree` 与生成器读回复算都改成**按序号落位**，
+   并只读规范里那 13 个单元（偏移 1/14/28 三段，32:36 是保留与 Next，不是名字）。
+4. **FSInfo 少写尾签名**：核内 `fat32.rs` 读偏移 510 处那个 u16，缺它整卷挂载被拒
+   （`FSInfo签名不符`）。顺带发现 FSInfo 的**副本位置**写成了 `BACKUP+1`，规范是 `BackupBootSec+6`。
+   这一条的表现形式是"所有格子读回 0"，看起来像解析器坏了，其实夹具连挂载条件都不满足。
+
+### 读数（本轮这一跑）
+
+- 多级真卷：34,336,768 字节，sha256 `086855ab254a3635…`（配方一改就重登记，指纹闸先于解析判）。
+- `run --features fs-open`：**PASS(33)**，`ktests: total=95 passed=95 failed=0`。
+- `fs-open: 多级取证 首8=0xe7c8a98a6b4c2d0e 和=8096 首簇=65600 proj条目=1 docs条目=17 docs大小和=232
+  长名条数=1 长名和=2247 长名同字节=22 非目录=-10 点路径=-1`。
+- `fs-open: 取证 读回=100 摘要=0xf275ebb2a87c0581 stat大小=100 首簇=3 …`（root 两项 = `SMALL.BIN`/`PROJECT`，
+  名字和 1175、大小和 100，与 `--deep-tree` 独立算出的同一组数逐格相同）。
+- 第 44 行 `fault-deep-lfn-sum`：偏移 546829（LFN 物理首条的第 13 字节）`0x8d → 0x72`，
+  判定 **FAIL(35)**；串口 `长名条数=0 长名和=0 长名同字节=0` 而 `docs条目=17 docs大小和=232` 仍对
+  ⇒ 长名塌、短名不塌，两个方向同时成立；证人另判"盘上与 pristine 只差那一格"。
+- 第 45 行 `fault-deep-hi-cluster`：偏移 546804 `0100 → 0000`，判定 **FAIL(35)**；
+  串口 `首簇=64`（正向是 65600）、`首8=0x0 和=0`、`三级读回字节=-7`。
+  **两台的处置不同，必须写清**：宿主机按规范走链读到的是 64 号簇的 512 个零字节（声明 64 字节，够），
+  核内在那一簇的 FAT 项是 0（空闲簇）时选择**拒绝并回 `-7=EIO`**，而不是把别人的零当文件内容交出去。
+  这一格因此证的是"少拼高半不会静默读到内容"，**不证**"两边读到同一串零"。
+- `check`：17 道门禁全绿（含新加的那几格；`--deep-tree` 不在位会红，注入定位不出来会红）。
+- **判定表全链（本轮取证跑，`build/matrix-deep.txt`）**：61 行 = **60 符合 / 1 不符合**。
+  新增的两行都在里面：`多级LFN校验和被改只塌长名: FAIL(rc=35) 期望 FAIL(rc=35) -> 符合`、
+  `多级首簇高半抹零读到别处: FAIL(rc=35) 期望 FAIL(rc=35) -> 符合`；
+  第 42/43 行改口后仍是 `PASS(rc=33) -> 符合`。
+  那一条不符合是既有的 `FAT32③多喂一字节红在溢出: HANG(rc=-1) 期望 FAIL(rc=35)`——链里那一跑
+  240 秒没跑完，串口停在 `t_va_interval_table -> ok` 之后，红过的用例 = 无。
+  链跑完立刻单跑同一档：**同一个 ELF（sha `d19ab24e186a…`，与链里那一跑逐字相同）判定 FAIL(35)、
+  用时 7.6 秒** ⇒ 不复现。同一跑里另有两个 HANG 是**期望 HANG** 的行（`IF 归任务就挂死`、
+  `不清源就风暴（有界窗口）`），它们不是这一格的因。**不归因**，只记两条事实：链尾这一跑慢、
+  单跑同二进制快。这一行下一轮仍按 60/61 的口径重钉，不改成"期望 HANG"来迁就读数。
+- `check`：**17 道门禁全绿**；`fs-open` / `fs-ro` / `handles` / 默认档全部能编（改动的两个文件
+  都在 `fs-open` 的 cfg 后面，其余档只是复验）。
+
+### 明确没做 / 仍开着
+
+- **`MAX_COMPONENTS > 16` 那条负样本仍没做**：这块卷只有三层，十七级路径要在夹具里再造一条深链，
+  而 `lookup` 的组件计数是在**第 17 次 `find_child` 之前**判的——没有真深链，这一格造不出来。
+  ADR-109 决策里的六条负样本交了 2 条（都是盘侧、都配了"能让它红"的反向格）。
+- **ring3 探针仍未走多级**：`user/fileprobe` 还是只开 `/SMALL.BIN` 与根目录。
+  第 43 行现在证的是"ring3 在新卷上 ABI 仍然成立"，**不是**"ring3 能读多级路径"。
+- 第 44/45 行没有 bench 对照；`--deep-tree` 与 `--report` 两套机器模式没合并。
+- **欠账①（本轮接线自己造出来的）**：第 43 行的**尾段三格**（尾首 8 字节 / 尾段字节数 / 尾段和）
+  原先由宿主机走 `fat32_host_volume` 拿到整份字节后重算；换成 `--deep-tree` 之后它只交出
+  `head8` 与整份 `bytesum`，这三格退回到「只有核内写死的期望数」。修法明确：给 `deep|file|` 那一行
+  加一个整份声明字节的哈希或直接十六进制，宿主机就能对任意字节段自己算——**下轮补，别当已交**。
+- ADR-108 未决 1（真卷多级证据缺口）在本轮**部分结案**：核内与宿主机两台都有了，ring3 那台还没有。

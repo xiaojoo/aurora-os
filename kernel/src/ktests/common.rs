@@ -19,6 +19,10 @@ pub(crate) static PROBE_ELF: &[u8] = include_bytes!("../../fixtures/probe.elf");
 /// 只在 `handles` 档嵌入：控制台句柄要经 `grant_console` 授予，默认档没有这条路。
 #[cfg(feature = "handles")]
 pub(crate) static SHELL_ELF: &[u8] = include_bytes!("../../fixtures/shell.elf");
+/// 第四个用户产物（FS-03 切片 D，ADR-108 决策 8）：第一个在 ring3 打 22/24/25/26 的调用方。
+/// 只在 `fs-open` 档嵌入——没有那一族号，这个容器除了 `-1` 什么都测不到。
+#[cfg(feature = "fs-open")]
+pub(crate) static FILEPROBE_ELF: &[u8] = include_bytes!("../../fixtures/fileprobe.elf");
 
 /// M4-2 第二段：把**真 ELF** 装进用户窗口并跑起来。
 ///

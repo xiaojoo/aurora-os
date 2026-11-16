@@ -5,6 +5,10 @@
 //! 驱动不知道什么是目录项。
 
 pub mod fat32;
-#[cfg(feature = "gpt-probe")]
+#[cfg(any(feature = "gpt-probe", feature = "fs-ro"))]
 pub mod gpt;
 pub mod vfs;
+#[cfg(feature = "fs-ro")]
+pub mod vfs_ro;
+#[cfg(feature = "fs-open")]
+pub mod fs_open;

@@ -24,7 +24,9 @@ EOC = 0xFFFF
 def checksum(sb: bytes) -> int:
     s = 0
     for b in sb:
-        s = ((s >> 1) + (s << 8) + b) & 0xFF
+        # 与 esp_image 独立实现，但算法必须是 FAT 规范的 rotate-right；
+        # 两处共用错算法时“第二台仪器”只会替生产者的 bug 背书。
+        s = (((s & 1) << 7) + (s >> 1) + b) & 0xFF
     return s
 
 
@@ -268,8 +270,151 @@ def esp_file_facts(d: bytes, want: str) -> dict[str, str]:
     f["lfn"] = inner.get("lfn", "0")
     return f
 
+
+# ---------------------------------------------------------- ADR-109：多级真卷的独立解析
+#
+# 与 `main()` 那套（GPT + FAT16 的 ESP）分开：这块夹具是**裸 FAT32 整卷**，没有分区表。
+# 为什么要第三份实现：核内 `vfs_ro::lookup` 与 `tools/aurora.py` 的 `fat32_host_volume`
+# 已经各自算过一遍数，而后者**只解析根目录**——多级路径、跨簇目录、子目录 LFN 这三件事
+# 在宿主机侧此前没有任何一台仪器。注入点的定位也必须来自这里，否则"改哪一格"是照着
+# 被测代码的算术挑的，红了只能说明两边又一致了一次。
+# 输出是 `deep|种类|路径|k=v|...` 的竖线行：字段多、路径里可能带空格，用竖线分列最好解。
 
-def main(path: str) -> int:
+
+def deep_tree_lines(d: bytes):
+    spc, reserved, fats = d[13], struct.unpack_from("<H", d, 14)[0], d[16]
+    root_entries, spf16 = struct.unpack_from("<H", d, 17)[0], struct.unpack_from("<H", d, 22)[0]
+    total = struct.unpack_from("<H", d, 19)[0] or struct.unpack_from("<I", d, 32)[0]
+    spf32, root_cluster = struct.unpack_from("<I", d, 36)[0], struct.unpack_from("<I", d, 44)[0]
+    if d[510:512] != b"\x55\xaa" or spf32 == 0 or root_entries != 0:
+        yield ["deep", "error", "/", f"sig={d[510:512].hex()}", f"root_entries={root_entries}",
+               f"spf32={spf32}", "原因=不是裸 FAT32 整卷"]
+        return
+    fat_off, data_off = reserved * SECTOR, (reserved + fats * spf32) * SECTOR
+    clusters = (total - (reserved + fats * spf32)) // spc
+    # 两把判型尺子各算各的：微软那条经验阈值 vs 结构特征。ADR-109 拍板要的就是这两行同时是 Fat32。
+    band = "Fat32" if clusters >= 65525 else ("Fat16" if clusters >= 4085 else "Fat12")
+    yield ["deep", "bpb", "/", f"sectors={total}", f"clusters={clusters}", f"band={band}",
+           "struct=Fat32", f"root_cluster={root_cluster}", f"spf32={spf32}"]
+
+    def fat_get(c):
+        return struct.unpack_from("<I", d, fat_off + c * 4)[0] & 0x0FFF_FFFF
+
+    def cl_off(c):
+        return data_off + (c - 2) * spc * SECTOR
+
+    def short83(e):
+        base = e[0:8].rstrip(b" ").decode("latin1")
+        ext = e[8:11].rstrip(b" ").decode("latin1")
+        return base + ("." + ext if ext else "")
+
+    def entries(c):
+        """沿簇链把目录项读回来，附**镜像里的绝对偏移**（注入点与对账都要它）。"""
+        out = []
+        guard = 0
+        while c not in (0x0FFF_FFFF, 0) and guard < clusters + 2:
+            base = cl_off(c)
+            for i in range(0, spc * SECTOR, 32):
+                if d[base + i] == 0x00:
+                    return out
+                out.append((base + i, d[base + i:base + i + 32]))
+            c, guard = fat_get(c), guard + 1
+        return out
+
+    def long_of(group, eoff, ent):
+        """把一组 LFN 条目拼回长名；不合规范就返回 None（=读不到长名，只能退回短名）。"""
+        if not group:
+            return None
+        want = checksum(ent[0:11])
+        if any(x[13] != want for _, x in group):
+            return None
+        if not group[0][1][0] & 0x40:
+            return None
+        if [x[0] & 0x1F for _, x in group] != list(range(len(group), 0, -1)):
+            return None
+        # 13 个单元按序号落位（偏移 1/14/28 三段）。**不能**按物理顺序拼接：物理首条是尾块，
+        # 照物理顺序拼会得到一半名字——夹具与宿主机一起错过一次，就是这么被抓回来的。
+        pieces = [None] * len(group)
+        for _, x in group:
+            seq = x[0] & 0x1F
+            if seq < 1 or seq > len(group) or pieces[seq - 1] is not None:
+                return None
+            pieces[seq - 1] = (list(struct.unpack_from("<5H", x, 1))
+                               + list(struct.unpack_from("<6H", x, 14))
+                               + list(struct.unpack_from("<2H", x, 28)))
+        units = [u for p in pieces for u in p]
+        out = []
+        for u in units:
+            if u == 0 or u == 0xFFFF:
+                break
+            out.append(chr(u))
+        return "".join(out)
+
+    def walk(c, prefix):
+        visible, deleted, sizesum, lfn, lfnbad = 0, 0, 0, 0, 0
+        short_names = []      # 可见项的 8.3 名字：探针累计的是名字字段，不是长名字段
+        sized = []              # (名字, 是否目录, 声明大小)，按盘上物理次序
+        group = []
+        raw = entries(c)
+        for idx, (off, e) in enumerate(raw):
+            if e[0] == 0xE5:
+                deleted += 1
+                group = []
+                continue
+            if e[11] == 0x0F:
+                group.append((off, e))
+                continue
+            if e[11] & 0x08:                       # 卷标不是文件
+                group = []
+                continue
+            name = short83(e)
+            lng = long_of(group, off, e) if e[11] != 0x10 else None
+            if group:
+                lfn += len(group)
+                if lng is None:
+                    lfnbad += 1
+            group = []
+            visible += 1
+            short_names.append((name, bool(e[11] & 0x10)))
+            first = struct.unpack_from("<H", e, 20)[0] << 16 | struct.unpack_from("<H", e, 26)[0]
+            size = struct.unpack_from("<I", e, 28)[0]
+            path = f"{prefix}{name}"
+            sizesum += size
+            sized.append((name, bool(e[11] & 0x10), size))
+            if e[11] & 0x10:
+                yield from walk(first, path + "/")
+                continue
+            body, cur, guard = bytearray(), first, 0
+            while cur not in (0x0FFF_FFFF, 0) and guard < clusters + 2:
+                o = cl_off(cur)
+                body += d[o:o + spc * SECTOR]
+                cur, guard = fat_get(cur), guard + 1
+            yield ["deep", "file", path, f"size={size}", f"first={first}",
+                   f"hi={struct.unpack_from('<H', e, 20)[0]}", f"lo={struct.unpack_from('<H', e, 26)[0]}",
+                   f"head8=0x{int.from_bytes(body[:8], 'little'):x}", f"bytesum={sum(body[:size])}",
+                   f"chainlen={len(body)}", f"fnv=0x{fnv1a64(body[:size]):x}", f"entoff={off}"]
+            if lng:
+                nb = lng.encode("utf-8")
+                yield ["deep", "long", path, f"long={lng}", f"longlen={len(lng)}",
+                       f"longsum={sum(nb)}", f"entoff={group0_off(raw, idx)}"]
+        yield ["deep", "dir", prefix, f"visible={visible}", f"deleted={deleted}",
+               f"sizesum={sizesum}", f"lfn={lfn}", f"lfnbad={lfnbad}",
+               f"namesum={sum(ch for x, _ in short_names for ch in x.encode('latin1'))}",
+               f"order={','.join(x for x, _ in short_names)}",
+               f"sizes={','.join(str(sz) for _, _, sz in sized)}"]
+
+    def group0_off(raw, idx):
+        """倒着找紧邻这条短名的第一条 LFN 的绝对偏移：注入就是打在它第 13 字节上。"""
+        k = idx
+        while k > 0 and raw[k - 1][1][11] == 0x0F:
+            k -= 1
+        return raw[k][0] if k != idx else raw[idx][0]
+
+    yield from walk(root_cluster, "/")
+
+
+
+def main(path: str) -> int:
     d = open(path, "rb").read()
     problems_all: list[str] = []
 
@@ -351,13 +496,15 @@ def main(path: str) -> int:
             if pending:
                 sb = e[0:11]
                 want = checksum(sb)
+                n = len(pending)
                 for k, le in enumerate(pending):
                     got = le[13]          # FAT 规范：checksum 是偏移 13 的单字节
                     if got != want:
                         problems.append(f"{prefix}{e[0:8].decode().strip()} 的 LFN 校验和不符：条目{k} got={got:#04x} want={want:#04x}")
-                    seq = le[0] & 0x3F
-                    if seq != k + 1:
-                        problems.append(f"{prefix} LFN 序号不连续：第 {k} 条 seq={seq}")
+                    # 物理顺序是尾块在前：第 k 条（0 起）的序号应是 n-k。
+                    seq = le[0] & 0x1F
+                    if seq != n - k:
+                        problems.append(f"{prefix} LFN 序号不连续：第 {k} 条 seq={seq} 期望={n - k}")
                 if not (pending[0][0] & 0x40):
                     problems.append(f"{prefix} 物理首条 LFN 未带 0x40 终止位")
                 pending = []
@@ -399,6 +546,12 @@ if __name__ == "__main__":
         if i + 1 >= len(argv):
             print("--esp-file 后面要跟一个 8.3 短名"); sys.exit(2)
         esp_file = argv[i + 1]
+    if "--deep-tree" in argv:
+        i = argv.index("--deep-tree")
+        tgt = argv[i + 1] if i + 1 < len(argv) and not argv[i + 1].startswith("--") else "build/fat32-deep.img"
+        for row in deep_tree_lines(open(tgt, "rb").read()):
+            print("|".join(str(x) for x in row))
+        sys.exit(0)
     flags = ("--report", "--fat16-report", "--esp-file")
     rest = [a for a in argv if a not in flags and a != esp_file]
     target = rest[0] if rest else "build/aurora.img"

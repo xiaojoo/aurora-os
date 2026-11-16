@@ -1,6 +1,6 @@
 # unsafe 逐处审计表（U1–U6）
 
-总计 415 处。U1 75 · U2 114 · U3 13 · U4 131 · U5 46 · U6 36
+总计 427 处。U1 79 · U2 114 · U3 13 · U4 131 · U5 54 · U6 36
 
 本表由 `tools/aurora.py` 的 `unsafe_sites()` 从源码逐处生成，**不是手写的**。
 机器可读的权威来源是 `docs/security/unsafe-whitelist.toml` 的 `[modules.*]` 段（模块×类别→处数），
@@ -962,3 +962,18 @@
   > unsafe { ROW_DIRTY.iter_mut().for_each(|d| *d = true) } # S9o 首帧全脏
 - `kernel/src/frame.rs:119` [{] **U2** fn=`present`
   > let row = unsafe { &BACK[y*w..(y+1)*w] } # 交 write_slice 一次上屏
+
+### user/fileprobe
+
+- `user/fileprobe/src/main.rs:90` [x] **U1** fn=`panic`
+- `user/fileprobe/src/main.rs:98` [x] **U1** fn=`slots_base`
+- `user/fileprobe/src/main.rs:107` [x] **U1** fn=`sys3`
+- `user/fileprobe/src/main.rs:111` [x] **U1** fn=`sys3`
+- `user/fileprobe/src/main.rs:128` [x] **U5** fn=`put`
+- `user/fileprobe/src/main.rs:133` [x] **U5** fn=`put_byte`
+- `user/fileprobe/src/main.rs:138` [x] **U5** fn=`get_byte`
+- `user/fileprobe/src/main.rs:143` [x] **U5** fn=`get_u32`
+- `user/fileprobe/src/main.rs:182` [x] **U5** fn=`read_all`
+- `user/fileprobe/src/main.rs:200` [x] **U5** fn=`read_dir_all`
+- `user/fileprobe/src/main.rs:222` [x] **U5** fn=`_start`
+- `user/fileprobe/src/main.rs:288` [x] **U5** fn=`_start`

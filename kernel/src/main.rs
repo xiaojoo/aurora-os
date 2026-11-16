@@ -1567,7 +1567,12 @@ fn request_spawn() -> bool {
     match slot {
         Some(i) => {
             SPAWN_REQ.store(i as u8, Ordering::Release);
+            // `fbcon-live` 不带 `handles` 时这张表根本不存在（欠账③：`fbcon-live,ps2-kbd` 组合
+            // 在 HEAD 就编不过）。带表那一半的**日志逐字不变**，不能因为补 cfg 就动既有判据吃的字符串。
+            #[cfg(feature = "handles")]
             crate::log_info!("新建: 请求会话格 {}（上限 {}）句柄表={}/{}", i, limit, crate::handle::used(), crate::handle::MAX_HANDLES);
+            #[cfg(not(feature = "handles"))]
+            crate::log_info!("新建: 请求会话格 {}（上限 {}）本构建没有句柄表", i, limit);
             true
         }
         None => {
@@ -2460,10 +2465,18 @@ impl LiveTerm {
                                     None => false,
                                 };
                                 let (ok, bad) = crate::user::session_release_va(i as u8);
+                                // 这条日志是 UI 侧取证，不是判定表吃的那条；但没有 `handles` 的构建里
+                                // 这张表根本不存在（欠账③）。带表那一半的串逐字不变。
+                                #[cfg(feature = "handles")]
                                 crate::log_info!(
                                     "窗口: 关闭会话 {} 终止任务={} 任务={} 收尸={} Job销毁={} VA放手={}/{} 句柄表={}/{}",
                                     i, killed, g, reaped, jd, ok, bad,
                                     crate::handle::used(), crate::handle::MAX_HANDLES
+                                );
+                                #[cfg(not(feature = "handles"))]
+                                crate::log_info!(
+                                    "窗口: 关闭会话 {} 终止任务={} 任务={} 收尸={} Job销毁={} VA放手={}/{} 本构建没有句柄表",
+                                    i, killed, g, reaped, jd, ok, bad
                                 );
                                 // 条会被重画覆盖 ⇒ 指针旧底作废（否则移动时把旧 × 贴回来）。
                                 self.ptr = None;

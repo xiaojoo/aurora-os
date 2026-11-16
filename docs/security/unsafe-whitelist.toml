@@ -30,6 +30,12 @@ reason = "第三个用户产物（S5c，第一个交互式程序）：unsafe 需
 scope = "main.rs：syscall3 的 int 0x80（rax/rdi/rsi/rdx）· find_console 的 read_unaligned（头 24 字节 + 最多 16 条描述，全在那一页内，先核 SI_MAGIC 与 nhandles 上限）· con_read_byte 往调用方给的 &mut u8 写一字节 · _start 的行缓冲写入与回显 · panic 与两处收尾自跳转"
 expires = "S5c 之后若它开始打别的号或读别的页，unsafe 面会扩，那时回这条账重登记"
 
+# FS-03 切片 D（ADR-108 决策 8）：第四个用户产物 = ring3 文件探针。
+[crate.aurora-user-fileprobe]
+reason = "FS-03 切片 D（ADR-108 决策 8）的 ring3 文件探针：unsafe 需求只有 int 0x80 的三参入口与它的 unsafe fn 声明、一处 RIP 相对 lea 取自己 .slots 的基址（镜像基址在 4 GiB 之上，addr_of! 会退化成 R_X86_64_32S）、panic 与收尾两处自跳转，以及按固定偏移表对自己那一页的 volatile 字节/双字读写；不碰任何内核对象"
+scope = "main.rs：sys3 的 int 0x80（rax/rdi/rsi/rdx）与其 unsafe fn 声明 · slots_base 的 lea · put/put_byte/get_byte/get_u32 四处 volatile 访问（偏移全在本页 0..1536，基址加常量偏移）· read_all/read_dir_all/_start 里把本页地址交给内核的三处调用 · panic 与 SYS_EXIT 后的自跳转"
+expires = "FS-03 之后若它开始打写路径（23 号）或读别的页，unsafe 面会扩，那时回这条账重登记"
+
 [crate.aurora-user-hello]
 reason = "它是产物而不是库：唯一的 unsafe 需求是 `int 0x80` 与一个自跳转，没有任何指针算术、没有内存操作、不碰任何内核对象"
 scope = "main.rs：3 次 int 0x80（inlateout rax + in rdi/rsi）、panic 与收尾各一个 `jmp .` 自跳转"
@@ -55,12 +61,12 @@ expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe
 # 2026-11-07 P7：hello 加了 syscall3（U1 两处）与 ring3 句柄读/close（U5 三处）。
 
 [unsafe-census]
-total = 415
-U1 = 75
+total = 427
+U1 = 79
 U2 = 114
 U3 = 13
 U4 = 131
-U5 = 46
+U5 = 54
 U6 = 36
 
 [modules."acpi"]
@@ -258,6 +264,17 @@ U1 = 6
 # P5c-3b（ADR-075）+2：轮询内核交进来的邮箱页（只读一个 u64、上限硬）、
 # 以及装载器序列那个调用块（11/12/13/14/15/16 全是本程序自己的号，参数照 §4.4c）。
 U5 = 6
+
+[modules."user/fileprobe"]
+# FS-03 切片 D：ring3 文件探针。U1 四处 = panic 自跳转、slots_base 的 lea 块、
+# sys3 的 unsafe fn 声明与其 int 0x80。U5 八处 = 对自己那一页的四处 volatile 读写、
+# 三处把本页地址交给内核（读/目录读/退出）与 _start 的那个 unsafe 块。
+# 指针来源：唯一的基址是 `lea [rip + SLOTS]` 得到的本程序 .slots 页，偏移全是模块里那两张
+# 常量表；内核写回来的字节由内核自己的 copy_to_user 校验（USER 页、可写）。
+# 上下文 USER_ENTRY；不变量由 ABI 约定（号 rax、参数 rdi/rsi/rdx、返回 rax）与
+# "偏移表两侧各写一遍、由读回的数对账"保证。生命周期 = 本任务；单任务访问无并发。
+U1 = 4
+U5 = 8
 
 [modules."user/shell"]
 # S5c：第一个交互式用户产物。U1 六处 = syscall3 的 int 0x80 入口与其 unsafe fn 声明、

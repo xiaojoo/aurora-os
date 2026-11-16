@@ -7,6 +7,10 @@ name = "aurora-kernel"
 version = "0.0.0"
 
 [[package]]
+name = "aurora-user-fileprobe"
+version = "0.0.0"
+
+[[package]]
 name = "aurora-user-hello"
 version = "0.0.0"
 

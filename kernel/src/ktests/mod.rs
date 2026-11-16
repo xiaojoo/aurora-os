@@ -12,6 +12,10 @@ mod fat16;
 mod esp;
 #[cfg(feature = "fat32-probe")]
 pub(crate) mod fs;
+#[cfg(feature = "fs-ro")]
+mod vfs_ro;
+#[cfg(feature = "fs-open")]
+mod fs_open;
 #[cfg(feature = "gpt-probe")]
 mod gpt;
 mod heap;

@@ -158,16 +158,16 @@ fbcon-mirror = ["framebuffer"]
 # 也新增一次 IRQ 认领 ⇒ 不能悄悄进既有变体。
 ps2-kbd = []
 # 变体（W6 S6o）：PS/2 鼠标（i8042 第二口 + IRQ12），屏幕指针与点击命中。
-ps2-mouse = []
+ps2-mouse = ["framebuffer"]
 # 变体（W6 S6p）：多会话——起第二个 shell，控制台按会话分环，标签栏可切换。
 multisession = ["handles"]
 
 # S6r：窗口管理器——每个会话一扇可裁剪的浮窗（各自的标题栏与 -□×）。
-wm = ["framebuffer", "handles", "fbcon-live", "multisession"]
+wm = ["framebuffer", "handles", "fbcon-live", "multisession", "ps2-kbd", "ps2-mouse"]
 # 变体（W6 S6d，BACKLOG §247）：把 init 那一发长等待拆成有界轮询，每轮把日志环整窗重画一次
 # ⇒ 键入与应答**实时**出现在画面上。它依赖 framebuffer，但**不并进它**：并进会让 §242/§245
 # 那两条"滚动恰好一次 / 冻结之后再写无效"的像素判据失去确定的取样时刻。
-fbcon-live = ["framebuffer"]
+fbcon-live = ["framebuffer", "ps2-kbd"]
 # 变体（L3-B 亲和性那一步，BACKLOG 73）：把 AHCI 那颗 MSI 的目的地移到一颗上线的 AP 上，
 # 再做一次真读，看投递到底落到哪颗 CPU。判据是两台仪器各数一遍：
 # 内核数 `irq::by_cpu()` 的槽分布，宿主机拿 `-d int` 里 `SP` 的高位分 BSP／非 BSP（BACKLOG 68e 那条）。
@@ -181,6 +181,14 @@ virtio-msix-probe = ["virtio-blk"]
 # 由 tools/aurora.py 的 FAT_PORTS 定），一块当阈值判型的反例、一块把文件推到 65,536 簇之上。
 # 不进正常构建也不进四把尺子：每簇一次读 ⇒ 一轮走链要发几百条块命令，取证行的量会挪动串口量。
 fat32-probe = []
+
+# FS-01（ADR-107）：只读 VFS 适配层与它的用例。与 fat32-probe 同一条规矩：不进正常构建、
+# 不进四把尺子；默认构建不编译这个模块，ELF 与串口量一个字节不动。
+fs-ro = []
+
+# FS-03（ADR-108）：FAT32 卷A 单根 + open/seek/stat/readdir。只在 `fs-open` 编译新句柄 kind、
+# 新 syscall 分派与 ring3 探针；默认、handles、wm 都不引入这些对象。
+fs-open = ["handles", "fs-ro"]
 
 # 变体（L3-C③，BACKLOG 78h-1）：把用户镜像的来源从 `include_bytes!` 换成卷A 上的 `HELLO.ELF`，
 # 装进用户窗口并真跑一遍。依赖探针——没有那两条用例就没有"同一份容器的另一条路"可比。

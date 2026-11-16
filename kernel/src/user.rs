@@ -50,13 +50,22 @@ pub const SYS_VMO_WRITE: u64 = 13;
 pub const SYS_ASPACE_MAP: u64 = 14;
 pub const SYS_CONSOLE_WRITE: u64 = 20;
 pub const SYS_CONSOLE_READ: u64 = 21;
+// ---- FS-03（ADR-108）。23 留给未来 write，不空占。----
+/// 22 `open(path,len,flags) -> handle`。flags 目前必须为 0（只读）。
+pub const SYS_FILE_OPEN: u64 = 22;
+/// 24 `seek(handle,newpos,whence) -> offset`。whence：0=SET、1=CUR、2=END。
+pub const SYS_FILE_SEEK: u64 = 24;
+/// 25 `stat(handle,buf,len) -> 0`，写一份 StatV1。
+pub const SYS_FILE_STAT: u64 = 25;
+/// 26 `readdir(dir_handle,buf,len) -> count`，0=EOF。
+pub const SYS_DIR_READ: u64 = 26;
 pub const CONSOLE_MAX: usize = 256;
 pub const F_CONSOLE: u64 = 256;
 
 /// ABI 版本。minor=4 对应用户态闭环这一段（M4）；minor=5 追加 capability 句柄族（P7）；
 /// minor=6 追加 VMO 三个号（12/13/14）与 `F_VMO` 位（W3 P4b，ADR-074）。号只追加不复用（Q1）。
 pub const ABI_MAJOR: u64 = 0;
-pub const ABI_MINOR: u64 = 11;
+pub const ABI_MINOR: u64 = 12;
 pub const F_FASTPATH: u64 = 1;
 pub const F_SMAP: u64 = 2;
 pub const F_SMEP: u64 = 4;
@@ -129,6 +138,8 @@ pub const KIND_PROC: u32 = 4;
 pub const KIND_ASPACE: u32 = 5;
 pub const KIND_THREAD: u32 = 6;
 pub const KIND_CONSOLE: u32 = 7;
+/// FS-03：目录句柄（只供 readdir）。文件仍复用 KIND_FILE，legacy FileObj 与 VfsFile 对用户同类。
+pub const KIND_DIR: u32 = 8;
 
 /// `(major << 32) | (minor << 16) | features`。位一律**读回真实状态**，不读"我打算开"。
 pub fn abi_word() -> u64 {
@@ -149,6 +160,10 @@ pub fn abi_word() -> u64 {
     #[cfg(feature = "handles")]
     {
         f |= F_HANDLES | F_VMO | F_PROC | F_WAIT | F_CONSOLE;
+    }
+    #[cfg(feature = "fs-open")]
+    {
+        f |= F_FS_OPEN;
     }
     (ABI_MAJOR << 32) | (ABI_MINOR << 16) | f
 }
@@ -189,8 +204,18 @@ pub enum AbiError {
     Denied = 4,
     /// -5：槽不存在或世代号不对（核内 `NoSuch`/`Stale` 分开计数、对用户合成一个）。
     BadHandle = 5,
-    /// -6：16 格全满（第一版无配额）。
+    /// -6：64 格全满（第一版无配额）。
     Exhausted = 6,
+    /// -7：存储/VFS 设备或坏卷失败。ADR-106 把它从旧的临时 `-2` 分流出来。
+    Io = 7,
+    /// -8：路径分量或文件不存在。
+    NotFound = 8,
+    /// -10：路径分量不是目录。
+    NotDir = 10,
+    /// -11：对目录做了文件读取。
+    IsDir = 11,
+    /// -15：ABI 形状合法但本构建不支持（FS-03 的非零 flags 与目录 seek）。
+    NotSupported = 15,
 }
 
 /// `ErrorCode` → `rax` 里那个补码。写成 `const fn` 是为了让下面三个公开常量在编译期就算出来，
@@ -208,6 +233,11 @@ impl AbiError {
             AbiError::Denied => "-EDENIED（权限不够 / 不是主人 / 已撤销）",
             AbiError::BadHandle => "-EBADHANDLE（槽不存在或世代不符）",
             AbiError::Exhausted => "-EEXHAUSTED（句柄表满）",
+            AbiError::Io => "-EIO（设备或坏卷失败）",
+            AbiError::NotFound => "-ENOENT（不存在）",
+            AbiError::NotDir => "-ENOTDIR（不是目录）",
+            AbiError::IsDir => "-EISDIR（是目录）",
+            AbiError::NotSupported => "-ENOTSUP（本构建不支持该操作）",
         }
     }
 }
@@ -220,6 +250,11 @@ pub const E_TOO_LONG: u64 = err_ret(AbiError::TooLong);
 pub const E_DENIED: u64 = err_ret(AbiError::Denied);
 pub const E_BAD_HANDLE: u64 = err_ret(AbiError::BadHandle);
 pub const E_EXHAUSTED: u64 = err_ret(AbiError::Exhausted);
+pub const E_IO: u64 = err_ret(AbiError::Io);
+pub const E_NOT_FOUND: u64 = err_ret(AbiError::NotFound);
+pub const E_NOT_DIR: u64 = err_ret(AbiError::NotDir);
+pub const E_IS_DIR: u64 = err_ret(AbiError::IsDir);
+pub const E_NOT_SUPPORTED: u64 = err_ret(AbiError::NotSupported);
 
 #[cfg(feature = "handles")]
 fn handle_err(e: crate::handle::HErr) -> u64 {
@@ -229,11 +264,16 @@ fn handle_err(e: crate::handle::HErr) -> u64 {
         HErr::NoSuch | HErr::Stale => E_BAD_HANDLE,
         HErr::NotOwner | HErr::Denied => E_DENIED,
         HErr::Exhausted => E_EXHAUSTED,
-        // ABI 表里还没有 EIO 码（设计 §5.1 只批了 -4/-5/-6）。块设备失败**不许被抹成别的成因**：
-        // 打一行点名，再按 -2 带出去；新增 EIO 需要 ADR 级批准（BACKLOG 登记）。
+        // 既有句柄的盘失败仍按历史 ABI 带 -2，避免 10 号旧调用方的返回集合被顺手改掉。
         HErr::Io(_) => {
             crate::log_info!("abi: file_read 块设备失败（{}）⇒ 暂按 -2 带出", e.tag());
             E_FAULT
+        }
+        #[cfg(feature = "fs-open")]
+        HErr::Vfs(e) => {
+            let r = vfs_err_ret(e);
+            crate::log_info!("abi: VFS 拒绝 成因={} ret={}", e.tag(), r);
+            r
         }
     }
 }
@@ -243,6 +283,10 @@ fn handle_err(e: crate::handle::HErr) -> u64 {
 #[cfg(feature = "handles")]
 /// 12：建一个 VMO 并把创建者那一份引用**交给句柄**（所以 refs 最终是 1，不是 2）。
 #[cfg(feature = "handles")]
+/// 同上：分派器不该替每个号背自己的缓冲（`sys_file_read` 的落盘块、`sys_process_start` 的
+/// StartupInfo 页、`sys_object_wait` 的等待格……）。整批内联时它的序言峰值实测 10,584 字节，
+/// 逐号拆开后降到只剩分派本身。
+#[inline(never)]
 fn sys_vmo_create(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let pages = frame.rdi as usize;
     if pages == 0 || pages > crate::vmo::MAX_VMO_PAGES {
@@ -268,6 +312,10 @@ fn sys_vmo_create(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
 /// 13：把用户缓冲写进 VMO。512 字节一块搬（与 `sys_file_read` 同一手法，不按用户的数开缓冲）。
 /// **整段先校验长度**：放不下就一个字节都不写，不留"写了一半再报错"的中间态。
 #[cfg(feature = "handles")]
+/// 同上：分派器不该替每个号背自己的缓冲（`sys_file_read` 的落盘块、`sys_process_start` 的
+/// StartupInfo 页、`sys_object_wait` 的等待格……）。整批内联时它的序言峰值实测 10,584 字节，
+/// 逐号拆开后降到只剩分派本身。
+#[inline(never)]
 fn sys_vmo_write(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let want = frame.r10 as usize;
     if want == 0 {
@@ -325,6 +373,10 @@ fn sys_vmo_write(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
 /// ③失败路径必须把刚登记的 VA 保留还回去，否则动态区被失败调用吃光。
 /// 映射挂进当前任务的资源袋 ⇒ 任务退出时由 `release_owned` 在锁外 drop（清叶子 + 还参考 + 放手 VA）。
 #[cfg(feature = "handles")]
+/// 同上：分派器不该替每个号背自己的缓冲（`sys_file_read` 的落盘块、`sys_process_start` 的
+/// StartupInfo 页、`sys_object_wait` 的等待格……）。整批内联时它的序言峰值实测 10,584 字节，
+/// 逐号拆开后降到只剩分派本身。
+#[inline(never)]
 fn sys_aspace_map(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
     let id = match crate::handle::vmo_of(crate::handle::Handle(frame.rdi), owner, crate::handle::RIGHT_MAP) {
@@ -443,6 +495,10 @@ fn kind_of(o: &crate::handle::ObjRef) -> u32 {
     match o {
         crate::handle::ObjRef::Console(_) => KIND_CONSOLE,
         crate::handle::ObjRef::File(_) => KIND_FILE,
+        #[cfg(feature = "fs-open")]
+        crate::handle::ObjRef::VfsFile { .. } => KIND_FILE,
+        #[cfg(feature = "fs-open")]
+        crate::handle::ObjRef::VfsDir { .. } => KIND_DIR,
         crate::handle::ObjRef::Vmo { .. } => KIND_VMO,
         crate::handle::ObjRef::Job { .. } => KIND_JOB,
         crate::handle::ObjRef::Proc { .. } => KIND_PROC,
@@ -468,6 +524,10 @@ fn undo_transfers(newvals: &[u64], done: usize, child: (usize, u32), parent: (us
 /// 子进程的 AS 由内核建、记在 proc 表里，父进程要往子 AS 铺映射就用 14 号的 `rdx` 出示这个 Proc 句柄。
 /// 每一步失败都把前面几步收干净（AS → 进程名额），不留半截。
 #[cfg(feature = "handles")]
+/// 同上：分派器不该替每个号背自己的缓冲（`sys_file_read` 的落盘块、`sys_process_start` 的
+/// StartupInfo 页、`sys_object_wait` 的等待格……）。整批内联时它的序言峰值实测 10,584 字节，
+/// 逐号拆开后降到只剩分派本身。
+#[inline(never)]
 fn sys_process_create(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
     let (obj, _) = match crate::handle::resolve(crate::handle::Handle(frame.rdi), owner, crate::handle::RIGHT_CREATE) {
@@ -516,6 +576,10 @@ fn sys_process_create(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
 /// （`idt_gate` 的 `trap_gate = (v == 2)`，0x80 不在其中），SYSCALL 快路径的 `SFMASK` 含 `0x200`。
 /// 所以这一段没有 tick 能插进来把刚建好的线程换上去跑（那会让它看到没回填的表）。
 #[cfg(feature = "handles")]
+/// 同上：分派器不该替每个号背自己的缓冲（`sys_file_read` 的落盘块、`sys_process_start` 的
+/// StartupInfo 页、`sys_object_wait` 的等待格……）。整批内联时它的序言峰值实测 10,584 字节，
+/// 逐号拆开后降到只剩分派本身。
+#[inline(never)]
 fn sys_thread_create(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
     let (obj, _) = match crate::handle::resolve(crate::handle::Handle(frame.rdi), owner, crate::handle::RIGHT_WRITE) {
@@ -612,6 +676,10 @@ fn undo_start(
 /// 回填走 **VMO 的帧（HHDM）**，不需要子 AS 的写权限——那一页在子 AS 里是**只读**的，
 /// 这正是"只读页也能被内核填"的实现点，也是子进程改不了自己角色表的安全前提。
 #[cfg(feature = "handles")]
+/// 同上：分派器不该替每个号背自己的缓冲（`sys_file_read` 的落盘块、`sys_process_start` 的
+/// StartupInfo 页、`sys_object_wait` 的等待格……）。整批内联时它的序言峰值实测 10,584 字节，
+/// 逐号拆开后降到只剩分派本身。
+#[inline(never)]
 fn sys_process_start(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let Some(parent) = crate::sched::current_identity() else { return E_BAD_HANDLE };
     // ① 校验：进程、线程、页、形状
@@ -798,6 +866,9 @@ fn sys_process_start(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
 }/// P6a（ADR-071 决策 1、Q3）：17/19 两个等待号在这份构建里可用。依赖句柄表，
 /// 与 `F_HANDLES` 同一条件、读回真实状态。`F_PROC` 仍只覆盖 11/15/16。
 pub const F_WAIT: u64 = 128;
+/// FS-03（ADR-108）：22/24/25/26 与 VFS 句柄对象在这份构建里可用。
+/// 它只在 `fs-open` 置位；`handles`/`wm` 不得从这一位推断文件 API 存在。
+pub const F_FS_OPEN: u64 = 512;
 /// 17：`rdi` = Proc 句柄（要 `READ`），`rsi` = 时限毫秒（0 = 只查一次不阻塞）→
 /// `rax` = `(observed << 32) | 退出码`；**0 = 超时**（不升 L4，"目标永远不收工"是业务事实）。
 pub const SYS_PROCESS_WAIT: u64 = 17;
@@ -857,6 +928,10 @@ fn wait_on_proc(h: crate::handle::Handle, owner: (usize, u32), signals: u64, ms:
 
 /// 17：`process_wait` 是 19 的薄壳（Q3）——参数少一个信号位图，默认等"已终止"。
 #[cfg(feature = "handles")]
+/// 同上：分派器不该替每个号背自己的缓冲（`sys_file_read` 的落盘块、`sys_process_start` 的
+/// StartupInfo 页、`sys_object_wait` 的等待格……）。整批内联时它的序言峰值实测 10,584 字节，
+/// 逐号拆开后降到只剩分派本身。
+#[inline(never)]
 fn sys_process_wait(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
     wait_on_proc(crate::handle::Handle(frame.rdi), owner, WAIT_TERMINATED, frame.rsi)
@@ -864,6 +939,10 @@ fn sys_process_wait(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
 
 /// 19：通用对象等待。今天只支持 Proc（见常量注释），其余 kind 明确 `-4`。
 #[cfg(feature = "handles")]
+/// 同上：分派器不该替每个号背自己的缓冲（`sys_file_read` 的落盘块、`sys_process_start` 的
+/// StartupInfo 页、`sys_object_wait` 的等待格……）。整批内联时它的序言峰值实测 10,584 字节，
+/// 逐号拆开后降到只剩分派本身。
+#[inline(never)]
 fn sys_object_wait(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
     wait_on_proc(crate::handle::Handle(frame.rdi), owner, frame.rsi, frame.rdx)
@@ -872,6 +951,10 @@ fn sys_object_wait(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
 /// 进程本身随最后一条线程收工而被置 signal（`terminate_task` → `proc_thread_exited`），
 /// 所以调用方接着用 17/19 等它、或用 `proc_reap` 收名额与它名下的 AS，都是既有路径。
 #[cfg(feature = "handles")]
+/// 同上：分派器不该替每个号背自己的缓冲（`sys_file_read` 的落盘块、`sys_process_start` 的
+/// StartupInfo 页、`sys_object_wait` 的等待格……）。整批内联时它的序言峰值实测 10,584 字节，
+/// 逐号拆开后降到只剩分派本身。
+#[inline(never)]
 fn sys_process_kill(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
     let (obj, _) = match crate::handle::resolve(crate::handle::Handle(frame.rdi), owner, crate::handle::RIGHT_WRITE) {
@@ -978,6 +1061,10 @@ fn sys_console_io(frame: &crate::arch::x86_64::trap::TrapFrame, write: bool) -> 
 }
 
 #[cfg(feature = "handles")]
+/// 同上：分派器不该替每个号背自己的缓冲（`sys_file_read` 的落盘块、`sys_process_start` 的
+/// StartupInfo 页、`sys_object_wait` 的等待格……）。整批内联时它的序言峰值实测 10,584 字节，
+/// 逐号拆开后降到只剩分派本身。
+#[inline(never)]
 fn sys_file_read(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let want = frame.rdx as usize;
     if want == 0 {
@@ -1019,6 +1106,196 @@ fn sys_file_read(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     }
     match crate::handle::finish(ticket, done) {
         Ok(()) => done as u64,
+        Err(e) => handle_err(e),
+    }
+}
+
+#[cfg(feature = "fs-open")]
+fn vfs_err_ret(e: crate::filesystem::vfs_ro::VfsError) -> u64 {
+    use crate::filesystem::fat32::FsError;
+    use crate::filesystem::vfs_ro::VfsError as V;
+    match e {
+        V::BadFlags => E_NOT_SUPPORTED,
+        V::BadPath | V::NotAbsolute | V::BadOffset => E_INVALID,
+        V::TooLong => E_TOO_LONG,
+        V::NotFound => E_NOT_FOUND,
+        V::NotDir => E_NOT_DIR,
+        V::IsDir => E_IS_DIR,
+        V::DirTooLong => E_IO,
+        V::Fs(FsError::NoEntry) => E_NOT_FOUND,
+        V::Fs(_) => E_IO,
+    }
+}
+
+#[cfg(feature = "fs-open")]
+/// 分派器把每个分支都内联进自己一帧，序言峰值实测 10,584 字节（rustc 的 >1 页栈探测是
+/// `sub 0x1000` 再 `sub 余量` 两段，上一轮只读了一段，所以记成了 4,096）。ring3 打 22 号
+/// 这条链后面还要走 `fs_open::open`(1,496) → `Volume::mount`(1,656) → `lookup`(4,520)，
+/// 4 页栈（16,384）装不下；这四个号自己没有任何理由替别的号买单，所以拆出来。
+#[inline(never)]
+fn sys_file_open(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+
+    let len = frame.rsi as usize;
+    if len == 0 {
+        return E_INVALID;
+    }
+    if len > crate::filesystem::vfs_ro::PATH_MAX {
+        return E_TOO_LONG;
+    }
+    let Some(owner) = crate::sched::current_identity() else {
+        return E_BAD_HANDLE;
+    };
+    let mut buf = [0u8; crate::filesystem::vfs_ro::PATH_MAX];
+    match copy_from_user(frame.rdi, &mut buf[..len]) {
+        Ok(n) if n == len => {}
+        Ok(n) => {
+            BAD_PTRS.fetch_add(1, Ordering::Relaxed);
+            crate::log_info!("abi: file_open 路径只搬成 {}/{} 字节", n, len);
+            return E_FAULT;
+        }
+        Err(e) => {
+            BAD_PTRS.fetch_add(1, Ordering::Relaxed);
+            return ptr_err_to_ret(e);
+        }
+    }
+    let Ok(path) = core::str::from_utf8(&buf[..len]) else {
+        return E_INVALID;
+    };
+    let opened = match crate::filesystem::fs_open::open(path, frame.rdx) {
+        Ok(o) => o,
+        Err(e) => return vfs_err_ret(e),
+    };
+    use crate::filesystem::fs_open::Opened;
+    let rights = crate::handle::RIGHT_READ;
+    let granted = match opened {
+        Opened::File { cursor, stat } => {
+            crate::handle::grant_vfs_file(owner, crate::filesystem::fs_open::PORT, None, cursor, stat, rights)
+        }
+        Opened::Dir { state, stat } => {
+            crate::handle::grant_vfs_dir(owner, crate::filesystem::fs_open::PORT, None, stat, state, rights)
+        }
+    };
+    match granted {
+        Ok(h) => h.0,
+        Err(e) => handle_err(e),
+    }
+}
+
+#[cfg(feature = "fs-open")]
+/// 分派器把每个分支都内联进自己一帧，序言峰值实测 10,584 字节（rustc 的 >1 页栈探测是
+/// `sub 0x1000` 再 `sub 余量` 两段，上一轮只读了一段，所以记成了 4,096）。ring3 打 22 号
+/// 这条链后面还要走 `fs_open::open`(1,496) → `Volume::mount`(1,656) → `lookup`(4,520)，
+/// 4 页栈（16,384）装不下；这四个号自己没有任何理由替别的号买单，所以拆出来。
+#[inline(never)]
+fn sys_file_seek(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let Some(owner) = crate::sched::current_identity() else {
+        return E_BAD_HANDLE;
+    };
+    let h = crate::handle::Handle(frame.rdi);
+    let stat = match crate::handle::stat(h, owner) {
+        Ok(s) => s,
+        Err(e) => return handle_err(e),
+    };
+    if crate::filesystem::fs_open::stat_record(&stat)[7] != crate::filesystem::fs_open::STAT_KIND_FILE {
+        return E_NOT_SUPPORTED;
+    }
+    let mut ticket = match crate::handle::begin_read(h, owner) {
+        Ok(t) => t,
+        Err(e) => return handle_err(e),
+    };
+    let pos = ticket.position() as i64;
+    let size = ticket.size() as i64;
+    crate::handle::abort(ticket);
+    let offset = frame.rsi as i64;
+    let base = match frame.rdx {
+        0 => 0,
+        1 => pos,
+        2 => size,
+        _ => return E_INVALID,
+    };
+    let Some(newpos) = base.checked_add(offset) else { return E_INVALID };
+    if newpos < 0 || newpos > size {
+        return E_INVALID;
+    }
+    match crate::handle::seek(h, owner, newpos as u32) {
+        Ok(n) => n as u64,
+        Err(e) => handle_err(e),
+    }
+}
+
+#[cfg(feature = "fs-open")]
+/// 分派器把每个分支都内联进自己一帧，序言峰值实测 10,584 字节（rustc 的 >1 页栈探测是
+/// `sub 0x1000` 再 `sub 余量` 两段，上一轮只读了一段，所以记成了 4,096）。ring3 打 22 号
+/// 这条链后面还要走 `fs_open::open`(1,496) → `Volume::mount`(1,656) → `lookup`(4,520)，
+/// 4 页栈（16,384）装不下；这四个号自己没有任何理由替别的号买单，所以拆出来。
+#[inline(never)]
+fn sys_file_stat(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let len = frame.rdx as usize;
+    if len < crate::filesystem::fs_open::STAT_RECORD_LEN as usize {
+        return E_TOO_LONG;
+    }
+    if len > COPY_MAX {
+        return E_TOO_LONG;
+    }
+    let Some(owner) = crate::sched::current_identity() else {
+        return E_BAD_HANDLE;
+    };
+    let stat = match crate::handle::stat(crate::handle::Handle(frame.rdi), owner) {
+        Ok(s) => s,
+        Err(e) => return handle_err(e),
+    };
+    let record = crate::filesystem::fs_open::stat_record(&stat);
+    match copy_to_user(&record, frame.rsi) {
+        Ok(n) if n == record.len() => 0,
+        _ => {
+            BAD_PTRS.fetch_add(1, Ordering::Relaxed);
+            E_FAULT
+        }
+    }
+}
+
+#[cfg(feature = "fs-open")]
+/// 分派器把每个分支都内联进自己一帧，序言峰值实测 10,584 字节（rustc 的 >1 页栈探测是
+/// `sub 0x1000` 再 `sub 余量` 两段，上一轮只读了一段，所以记成了 4,096）。ring3 打 22 号
+/// 这条链后面还要走 `fs_open::open`(1,496) → `Volume::mount`(1,656) → `lookup`(4,520)，
+/// 4 页栈（16,384）装不下；这四个号自己没有任何理由替别的号买单，所以拆出来。
+#[inline(never)]
+fn sys_dir_read(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let len = frame.rdx as usize;
+    if len == 0 {
+        return 0;
+    }
+    if len > COPY_MAX || len % crate::filesystem::fs_open::DIRENT_RECORD_LEN as usize != 0 {
+        return E_TOO_LONG;
+    }
+    let Some(owner) = crate::sched::current_identity() else {
+        return E_BAD_HANDLE;
+    };
+    let limit = len / crate::filesystem::fs_open::DIRENT_RECORD_LEN as usize;
+    let mut ticket = match crate::handle::begin_dir_read(crate::handle::Handle(frame.rdi), owner) {
+        Ok(t) => t,
+        Err(e) => return handle_err(e),
+    };
+    let mut count = 0usize;
+    while count < limit {
+        let entry = match crate::handle::next_dir_entry(&mut ticket) {
+            Ok(Some(e)) => e,
+            Ok(None) => break,
+            Err(e) => return handle_err(e),
+        };
+        let record = crate::filesystem::fs_open::dirent_record(&entry);
+        let va = frame.rsi + (count * record.len()) as u64;
+        match copy_to_user(&record, va) {
+            Ok(n) if n == record.len() => count += 1,
+            _ => {
+                BAD_PTRS.fetch_add(1, Ordering::Relaxed);
+                crate::log_info!("abi: readdir 写用户缓冲失败，游标未提交");
+                return E_FAULT;
+            }
+        }
+    }
+    match crate::handle::commit_dir_read(ticket) {
+        Ok(()) => count as u64,
         Err(e) => handle_err(e),
     }
 }
@@ -1610,6 +1887,14 @@ pub fn syscall_dispatch(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> boo
         SYS_CONSOLE_WRITE => sys_console_io(frame, true),
         #[cfg(feature = "handles")]
         SYS_CONSOLE_READ => sys_console_io(frame, false),
+        #[cfg(feature = "fs-open")]
+        SYS_FILE_OPEN => sys_file_open(frame),
+        #[cfg(feature = "fs-open")]
+        SYS_FILE_SEEK => sys_file_seek(frame),
+        #[cfg(feature = "fs-open")]
+        SYS_FILE_STAT => sys_file_stat(frame),
+        #[cfg(feature = "fs-open")]
+        SYS_DIR_READ => sys_dir_read(frame),
         SYS_POKE_BUF => {
             // 内核 → 用户。写成 `Ok(n)` 而不是布尔：`n != want` 就是"中途被接住的故障"，
             // 程序核对字节时看得见的差异与内核报回的数必须一致（两台仪器不能各说各话）。

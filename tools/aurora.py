@@ -160,6 +160,33 @@ SHELL_PKG = "aurora-user-shell"
 SHELL_ELF = ROOT / "target" / TARGET / "debug" / "shell"
 SHELL_FIXTURE = ROOT / "kernel" / "fixtures" / "shell.elf"
 SHELL_RUSTFLAGS = "-C link-arg=-Tuser/shell/link.ld -C relocation-model=static -C panic=abort -C opt-level=1"
+# FS-03 切片 D（ADR-108 决策 8）：第四个用户产物 = ring3 文件探针。构建纪律与 probe/shell 逐条相同，
+# 只换包名、产物名与链接脚本。它**只在 `fs-open` 构建里被内核 include_bytes!**，
+# 但产物每次都造：构建不该看特性的脸色，看不看是内核编译期决定的。
+FILEPROBE_PKG = "aurora-user-fileprobe"
+FILEPROBE_ELF = ROOT / "target" / TARGET / "debug" / "fileprobe"
+FILEPROBE_FIXTURE = ROOT / "kernel" / "fixtures" / "fileprobe.elf"
+FILEPROBE_RUSTFLAGS = "-C link-arg=-Tuser/fileprobe/link.ld -C relocation-model=static -C panic=abort -C opt-level=1"
+
+
+def do_build_fileprobe() -> Path:
+    """FS-03 D：构建 ring3 文件探针并落成夹具。与 do_build_probe 逐条同形。"""
+    r = subprocess.run(
+        [str(CARGO), "build", "--target", TARGET, "-p", FILEPROBE_PKG],
+        capture_output=True, text=True, cwd=str(ROOT),
+        env={**env(), "RUSTFLAGS": FILEPROBE_RUSTFLAGS},
+    )
+    if r.returncode != 0:
+        sys.exit("fileprobe 构建失败：" + (r.stdout + r.stderr)[-3000:])
+    data = FILEPROBE_ELF.read_bytes()
+    FILEPROBE_FIXTURE.parent.mkdir(exist_ok=True)
+    changed = not FILEPROBE_FIXTURE.exists() or FILEPROBE_FIXTURE.read_bytes() != data
+    if changed:
+        FILEPROBE_FIXTURE.write_bytes(data)
+    import hashlib
+    print(f"文件探针: {FILEPROBE_FIXTURE.relative_to(ROOT)}  {len(data)} 字节  "
+          f"sha256={hashlib.sha256(data).hexdigest()[:12]} {'（夹具已更新）' if changed else '（与夹具一致）'}")
+    return FILEPROBE_FIXTURE
 
 
 def do_build_shell() -> Path:
@@ -207,6 +234,7 @@ def do_build(features: list[str]) -> Path:
     do_build_user()
     do_build_probe()
     do_build_shell()
+    do_build_fileprobe()
     elf = kernel_binary(features)
     print(f"内核: {elf}  ({elf.stat().st_size} 字节)")
     return elf
@@ -376,10 +404,24 @@ FAT_HOST_FAULTS = {
     "fault-fat32-cluster-hi": "fat32-wide",
 }
 FAT_FEATURES = FAT_DISK_FEATURES | FAT_FAULT_FEATURES
+# ADR-109：改多级真卷的那两条注入。与 `FAT_HOST_FAULTS` 同一条纪律——**不做成 cargo 特性**
+# （特性名进 `-C metadata` ⇒ 符号哈希与链接布局跟着变，"负样本用的就是正向那一跑的同一个 ELF"
+# 这句话就不再成立）。目标卷是 `FS_OPEN_PORTS` 上那块，不是 `FAT_PORTS` 那两块。
+DEEP_HOST_FAULTS = {
+    "fault-deep-lfn-sum": "fat32-deep",      # 子目录 LFN 的校验和：长名该被拒、短名仍要命中
+    "fault-deep-hi-cluster": "fat32-deep",   # 三级文件首簇高半抹零：该读到别处的字节
+}
 # 卷A 是**阈值判型的反例**（64,496 簇按微软那条经验阈值算 FAT16、按结构算 FAT32）；
 # 卷B 用一个 34,603,008 字节的 FILLER.BIN 把后面三个文件推到 65,536 簇之上，于是目录项的
 # 簇号必须两半拼（只取低半的错法在这里会读到别处，而字节数照样对得上）。角色不能互换。
 FAT_PORTS = {3: "fat32-small", 4: "fat32-wide"}
+# FS-03（ADR-108）：`fs-open` 变体挂载的**根卷**。它与 `FAT_PORTS` 分开写：同一个口号必须由
+# 同一份夹具承担，两处各自漂移时门禁直接比这张表。
+# ADR-109 把它从卷A（单级）换成了 `fat32-deep`（口 5）：多级 `lookup`、跨簇目录、子目录 LFN
+# 在卷A 上根本没有对应结构，挂在口 3 上等于"用例里有三级路径、盘上没有"。口号同时让开 3/4，
+# 是为了 `fs-open` 与 FAT 探针同跑时两块卷能并存（此前靠 QEMU 参数顺序，那是不可歧义的接线反面）。
+FS_OPEN_FEATURES = {"fs-open"}
+FS_OPEN_PORTS = {5: "fat32-deep"}
 # 内核声明"要读哪几个文件"。这张表有两个用处，缺一不可：
 # 1 宿主机这台仪器只走这几个名字的链——卷B 上那个 34,603,008 字节的 FILLER.BIN 没有任何
 #   一条判据读它，跟着算哈希会让对账先挂死（本轮实测：一次 3,400 万次的逐字节循环）。
@@ -393,8 +435,10 @@ FAT_READ_NAMES = {
 }
 # 与内核 `MAX_CLUSTERS_WALKED` 同一个数：两台实现各自有界，界还必须看得见是同一个界
 FAT_MAX_WALKED = 65_535
+FAT_LFN_SUM_AT = 13        # 长名条目里的校验和字节（FAT 规范 1.03 的 32 字节布局）
+FAT_DEEP_NAME = "fat32-deep"
 FAT_ZZ = {name: ROOT / "tools" / "fixtures" / f"{name}.img.zz" for name in FAT_PORTS.values()}
-FAT_IMG = {name: BUILD / f"{name}.img" for name in FAT_PORTS.values()}
+FAT_IMG = {name: BUILD / f"{name}.img" for name in set(FAT_PORTS.values()) | set(FS_OPEN_PORTS.values())}
 # 夹具自己的指纹（字节数 + 解压后的 sha256）。内核那一批写死的期望数全是照着这一对卷量的，
 # 所以哪天卷换了而期望数没跟着换，红会落在解析器身上——可错的是夹具。指纹先于解析判，
 # 就是把"量具换了"和"被测物坏了"分在两道闸上。
@@ -404,6 +448,11 @@ FAT_EXPECT = {
     "fat32-small": (33_554_432, "3eb1d518923ae4e3692aafec7d545c1bfa92ef75366ea3ab82fbc5256f97c976"),
     "fat32-wide": (67_108_864, "da3aa3a2e2e7d600d45fa47ad142b635c072269a9bba25d7df2f51e08c8d34e9"),
 }
+# ADR-109 的多级真卷（`fs-open` 的挂载根）：它**不在仓库里**，由 `tools/make_fat32_deep.py` 现算，
+# 所以登记的是"配方 + 现算出来的字节"这一对。指纹先于解析判，同 `FAT_EXPECT` 那条理由：
+# 红要落在"配方与镜像分家"上，而不是落在核内解析器身上。
+FAT_DEEP_SCRIPT = ROOT / "tools" / "make_fat32_deep.py"
+FAT_DEEP_EXPECT = (34336768, "086855ab254a363518c53529b4ce2b3b3e55f3b5e2be181a21f8e335a2e37749")
 # L3-C② 的内存夹具卷：11,264 字节，由 `tools/make_fat32_mem.py` 现算（这块卷**不在仓库里**——
 # `.gitignore` 的 `*.img` 把它挡了，而能被配方重新算出来的东西本来就该不进仓库）。
 # 指纹登记在这里，构建前先跑配方脚本：对不上就是"配方与镜像分家"，红在编译之前，
@@ -597,6 +646,31 @@ def make_fat_volumes() -> list[str]:
     return bad
 
 
+def ensure_fat_deep() -> list[str]:
+    """现算 ADR-109 的多级真卷并核指纹（与 `ensure_fat32_mem` 同一规矩：红在编译之前）。
+
+    与 `.img.zz` 那两块的差别只在来源：这块卷的配方是一段脚本，所以每次**跑脚本**而不是解压。
+    落盘仍然"只在内容变了才写"——QEMU 打开的就是这个文件，mtime 每跑都动会让"同一份夹具"
+    在取证上打折扣（而脚本本身带读回复算：长度/BPB 十个字段/备份扇区/两把判型尺子/
+    三级首簇两半/LFN 校验和与序号，任何一格不成立它自己先退出非零）。
+    """
+    import hashlib
+    if not FAT_DEEP_SCRIPT.exists():
+        return [f"配方脚本缺失：{FAT_DEEP_SCRIPT.relative_to(ROOT)}（这块卷不在仓库里，只能现算）"]
+    out = FAT_IMG["fat32-deep"]
+    if sh([sys.executable, str(FAT_DEEP_SCRIPT), str(out)]) != 0:
+        return ["make_fat32_deep.py 退出非零（它自己的读回复算没通过 ⇒ 先看它的报错，别改期望数）"]
+    if not out.exists():
+        return [f"脚本没写出 {out.relative_to(ROOT)}"]
+    data = out.read_bytes()
+    size, sha = FAT_DEEP_EXPECT
+    got = hashlib.sha256(data).hexdigest()
+    if len(data) != size or got != sha:
+        return [f"多级真卷指纹不符：{len(data)} 字节 sha256={got[:12]}，期望 {size} 字节 {sha[:12]}"
+                "（配方改了，核内写死的期望数与判定表那两行必须跟着重算）"]
+    return []
+
+
 def ensure_fat32_mem() -> list[str]:
     """把 L3-C② 的配方脚本跑一遍并核指纹——`include_bytes!` 是**编译时**要的。
 
@@ -692,6 +766,17 @@ def fat32_host_volume(img: bytes, read_names: tuple[str, ...] = ()) -> dict:
     # 也算在内，到命中那一项为止）——两边数法不同时，对账会红在"扫过项"那一格，
     # 而不是各数各的还都绿。
     files: dict[str, dict] = {}
+    # 目录里"看得见的项"按盘上顺序原样列一遍（文件与子目录都要，已删除/卷标/LFN 片段不算）：
+    # FS-03 的 readdir 判据比的是**序列**，不是按名字查表，所以这台仪器也得留顺序。
+    dirlist: list[tuple[str, int, int, int]] = []
+
+    def short_name(e: bytes) -> str:
+        nm = e[0:8].decode("latin1").rstrip()
+        if e[0] == 0x05:
+            nm = "?" + nm[1:]
+        ext = e[8:11].decode("latin1").rstrip()
+        return nm + ("." + ext if ext else "")
+
     labels = dirs = 0
     c, seen, lfn = _fat_u32(bs, 44), 0, 0
     stop = False
@@ -715,6 +800,7 @@ def fat32_host_volume(img: bytes, read_names: tuple[str, ...] = ()) -> dict:
                 continue
             if e[11] & 0x10:
                 dirs += 1
+                dirlist.append((short_name(e), 0, (_fat_u16(e, 20) << 16) | _fat_u16(e, 26), e[11]))
                 continue
             if e[0] == 0xE5:
                 # 已删除条目：内核跳过但仍计入扫过的项数，这台仪器必须同数法。
@@ -731,6 +817,7 @@ def fat32_host_volume(img: bytes, read_names: tuple[str, ...] = ()) -> dict:
             size = _fat_u32(e, 28)
             hi, lo = _fat_u16(e, 20), _fat_u16(e, 26)
             first = (hi << 16) | lo
+            dirlist.append((name, size, first, e[11]))
             cc, n, walked, got = first, size, 0, bytearray()
             last = after = 0
             off_image = False
@@ -791,7 +878,7 @@ def fat32_host_volume(img: bytes, read_names: tuple[str, ...] = ()) -> dict:
         fsinfo_lead=_fat_u32(fsi, 0), fsinfo_struct=_fat_u32(fsi, 484),
         fsinfo_free=_fat_u32(fsi, 488), fsinfo_next=_fat_u32(fsi, 492),
         backup_same=img[backup * FAT_SEC:backup * FAT_SEC + FAT_SEC] == bs,
-        entries_seen=seen, lfn=lfn, volume_label=labels, subdirs=dirs, files=files,
+        entries_seen=seen, lfn=lfn, volume_label=labels, subdirs=dirs, files=files, dirlist=dirlist,
     )
 
 
@@ -1148,6 +1235,93 @@ def _fat_image_off(img: bytes, first: int, blob_off: int) -> int:
     return (data_start + (c - 2) * spc) * FAT_SEC + blob_off % cb
 
 
+def deep_tree_rows(data: bytes) -> list[list[str]]:
+    """把这份字节交给 `tools/validate_esp.py --deep-tree` 那份**独立解析**，返回 `deep|种类|路径|k=v|...` 行。
+
+    注入点的偏移与判定行的期望数都从这里取。理由与 `gpt_facts` 同一条：如果"改哪一格"是照着
+    被测代码的簇号算术算出来的，红了只能说明两边又一致了一次，说明不了盘上真被改过。
+    """
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix='.img', delete=False) as tf:
+        tf.write(data)
+        tmp = Path(tf.name)
+    try:
+        r = subprocess.run([sys.executable, str(ROOT / "tools" / "validate_esp.py"),
+                            "--deep-tree", str(tmp)],
+                           capture_output=True, text=True, encoding="utf-8", env=env())
+    finally:
+        tmp.unlink(missing_ok=True)
+    if r.returncode != 0:
+        raise ValueError(f"独立解析 --deep-tree 退出 {r.returncode}：{(r.stdout or r.stderr).strip()[:160]}")
+    rows = [ln.split("|") for ln in (r.stdout or "").splitlines() if ln.startswith("deep|")]
+    if not any(row[1] == "bpb" for row in rows):
+        raise ValueError("独立解析没打出 bpb 行 ⇒ 这台仪器自己没跑起来，不能拿它当证人")
+    if any(row[1] == "error" for row in rows):
+        bad = next(row for row in rows if row[1] == "error")
+        raise ValueError(f"独立解析判定这不是裸 FAT32 整卷：{bad[3:]}")
+    return rows
+
+
+def deep_row(rows: list[list[str]], kind: str, path: str) -> dict[str, str]:
+    """按 (种类, 路径) 取一行，取不到就抛：静默的 `None` 会变成"没比对"而不是"红"。
+    同名行出现两次也抛——一条路径对两个数，那张表就不能再当基准。
+    """
+    hits = [row for row in rows if row[1] == kind and row[2] == path]
+    if len(hits) != 1:
+        raise ValueError(f"独立解析里 {kind} {path} 命中 {len(hits)} 行，要恰好 1 行")
+    return dict(f.split('=', 1) for f in hits[0][3:])
+
+
+def fat_deep_pristine() -> tuple[bytes, list[list[str]]]:
+    """现算一份 pristine 的多级卷并顺手独立解析（配方就是那段脚本，仓库里没有 `.zz`）。
+
+    注入定位与"盘上只差计划中那一格"的对账都必须拿它比：`build/` 里那份可能已被上一格改过，
+    用改过的字节算现值，"改了等于没改"那种空转就查不出来了。
+    """
+    import hashlib
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix='.img', delete=False) as tf:
+        tmp = Path(tf.name)
+    try:
+        if sh([sys.executable, str(FAT_DEEP_SCRIPT), str(tmp)]) != 0:
+            raise ValueError("make_fat32_deep.py 现算 pristine 失败（它自己的读回复算没通过）")
+        data = tmp.read_bytes()
+    finally:
+        tmp.unlink(missing_ok=True)
+    size, sha = FAT_DEEP_EXPECT
+    got = hashlib.sha256(data).hexdigest()
+    if len(data) != size or got != sha:
+        raise ValueError(f"配方现算出的字节与登记的指纹不符：{len(data)} 字节 {got[:12]}，期望 {size} {sha[:12]}"
+                       "（脚本改了而 `FAT_DEEP_EXPECT` 没跟着改）")
+    return data, deep_tree_rows(data)
+
+
+def fat_deep_fault_plan(kind: str) -> tuple[str, int, bytes, bytes]:
+    """多级真卷上的注入定位：返回 (卷名, 镜像偏移, 现值, 新值)。
+
+    偏移来自独立解析打印的**目录项绝对偏移**，不来自任何一侧实现的算术。
+    """
+    data, rows = fat_deep_pristine()
+    if kind == "fault-deep-lfn-sum":
+        off = int(deep_row(rows, "long", "/PROJECT/DOCS/AURORA~1.TXT")["entoff"]) + FAT_LFN_SUM_AT
+        old = data[off:off + 1]
+        new = bytes([old[0] ^ 0xFF])
+        if old == new:
+            raise ValueError("LFN 校验和翻转后与现值相同 ⇒ 空转")
+        return FAT_DEEP_NAME, off, old, new
+    if kind == "fault-deep-hi-cluster":
+        f = deep_row(rows, "file", "/PROJECT/DOCS/NESTED.TXT")
+        hi = f["hi"]
+        if hi != "1":
+            raise ValueError(f"三级文件首簇高半={hi} 不是 1 ⇒ 抹零是空转（夹具换了？）")
+        off = int(f["entoff"]) + FAT_DIR_HI_AT
+        old, new = data[off:off + 2], b"\x00\x00"
+        if old == new:
+            raise ValueError("高半两格现值已是 0 ⇒ 空转")
+        return FAT_DEEP_NAME, off, old, new
+    raise ValueError(f"未知的多级卷注入 {kind}")
+
+
 def fat_host_fault_plan(kind: str) -> tuple[str, int, bytes, bytes]:
     """定位一条宿主机侧注入：返回 (卷名, 镜像偏移, 现值, 新值)。
 
@@ -1195,7 +1369,8 @@ def apply_fat_host_fault(kind: str) -> list[str]:
     不让一块被改过的盘留在 build/ 里冒充下一跑的证据。
     """
     try:
-        name, off, old, new = fat_host_fault_plan(kind)
+        name, off, old, new = (fat_deep_fault_plan(kind) if kind in DEEP_HOST_FAULTS
+                               else fat_host_fault_plan(kind))
     except ValueError as e:
         return [f"{kind} 定位不成：{e}"]
     img = FAT_IMG[name]
@@ -1341,9 +1516,295 @@ def check_handle_ring3(log: str) -> list[str]:
     return bad
 
 
+# ---------------------------------------------------------------- FS-03 判定行的两台宿主机仪器
+#
+# 期望数**全部**来自 `tools/validate_esp.py --deep-tree` 那份独立解析：它现读 `build/` 上那块
+# 多级卷的字节，按 FAT 规范的偏移自己走簇链、自己按序号拼长名。核内那份解析器与它不同源，
+# 所以"串口 == 宿主机"才是两票，而不是一票投两次。
+# 换成多级卷之后这里比的对象多了一层（`多级取证` 那一行）；负样本注入改的也是这一层的字节，
+# 于是同一个函数既能判正向、也能判篡改后的盘——只要把它喂给**当时挂着的那块**盘。
+FS_RING3_RE = re.compile(
+    r"fs-open-ring3: 取证 读回=(?P<read>\d+) 首8=(?P<head>0x[0-9a-f]+) 字节和=(?P<sum>\d+) "
+    r"尾首8=(?P<thead>0x[0-9a-f]+) 尾和=(?P<tsum>\d+) stat大小=(?P<size>\d+) 首簇=(?P<first>\d+) "
+    r"条目=(?P<recs>\d+) 名字和=(?P<nsum>\d+) 大小和=(?P<ssize>\d+) "
+    r"表清空=(?P<clean>true|false) 回收=(?P<reaped>true|false) "
+    r"rounds=(?P<rounds>\d+) served=(?P<served>\d+) "
+    r"诊断mul=(?P<mul>0x[0-9a-f]+) 诊断add=(?P<add>0x[0-9a-f]+)")
+
+
+FS_OPEN_EVIDENCE_RE = re.compile(
+    r"fs-open: 取证 读回=(?P<read>\d+) 摘要=(?P<fnv>0x[0-9a-f]+) stat大小=(?P<size>\d+) "
+    r"首簇=(?P<first>\d+) 条目1=\[(?P<n1>[0-9, ]*)\]/(?P<s1>\d+) 条目2=\[(?P<n2>[0-9, ]*)\]/(?P<s2>\d+)")
+
+
+FS_DEEP_RE = re.compile(
+    r"fs-open: 多级取证 首8=(?P<dhead>0x[0-9a-f]+) 和=(?P<dsum>\d+) 首簇=(?P<dfirst>\d+) "
+    r"proj条目=(?P<proj>\d+) docs条目=(?P<docs>\d+) docs大小和=(?P<docsum>\d+) "
+    r"长名条数=(?P<lcount>\d+) 长名和=(?P<lsum>\d+) 长名同字节=(?P<lsame>\d+) "
+    r"非目录=(?P<notdir>-?\d+) 点路径=(?P<dot>-?\d+)")
+
+
+def deep_host_rows() -> tuple[list[list[str]], list[str]]:
+    """读 `build/` 上那块**当时挂着的多级卷**，交给独立解析；读不到就把原因作为红返回。
+
+    返回空表而不是抛异常是没有意义的绿：那样所有格子都变成"没有对象可比"。
+    """
+    name = next(iter(FS_OPEN_PORTS.values()))
+    img = FAT_IMG[name]
+    if not img.exists():
+        return [], [f"宿主机没有现算好的 {name} 卷 ⇒ 多级那几格没有第二台仪器"]
+    try:
+        return deep_tree_rows(img.read_bytes()), []
+    except ValueError as e:
+        return [], [f"独立解析 --deep-tree 不成：{e}"]
+
+
+def deep_row_map(rows: list[list[str]], kind: str, path: str) -> dict[str, str] | None:
+    hits = [row for row in rows if len(row) > 2 and row[1] == kind and row[2] == path]
+    if len(hits) != 1:
+        return None
+    return dict(f.split("=", 1) for f in hits[0][3:])
+
+
+def deep_expectations(rows: list[list[str]]) -> tuple[dict[str, object], list[str]]:
+    """把独立解析的行整形成"串口应当出现的数"。缺任何一行都是红，不是跳过。"""
+    bad: list[str] = []
+    small = deep_row_map(rows, "file", "/SMALL.BIN")
+    nested = deep_row_map(rows, "file", "/PROJECT/DOCS/NESTED.TXT")
+    root = deep_row_map(rows, "dir", "/")
+    proj = deep_row_map(rows, "dir", "/PROJECT/")
+    docs = deep_row_map(rows, "dir", "/PROJECT/DOCS/")
+    for tag, row in (("SMALL.BIN", small), ("NESTED.TXT", nested), ("根目录", root),
+                     ("/PROJECT", proj), ("/PROJECT/DOCS", docs)):
+        if row is None:
+            bad.append(f"独立解析没给出 {tag} 这一行 ⇒ 基准本身缺项，不能拿它当证人")
+    if bad:
+        return {}, bad
+    longs = [dict(f.split("=", 1) for f in r[3:]) for r in rows
+             if len(r) > 2 and r[1] == "long" and r[2].startswith("/PROJECT/DOCS/")]
+    order = root["order"].split(",")
+    sizes = [int(x) for x in root["sizes"].split(",")]
+    if len(order) < 2 or len(order) != len(sizes):
+        return {}, [f"根目录的次序表不完整：{order} 对 {sizes}"]
+    want: dict[str, object] = {
+        "small.size": int(small["size"]),
+        "small.first": int(small["first"]),
+        "small.fnv": int(small["fnv"], 16),
+        "small.head": int(small["head8"], 16),
+        "small.sum": int(small["bytesum"]),
+        "root.order": order,
+        "root.sizes": sizes,
+        "root.namesum": int(root["namesum"]),
+        "root.sizesum": int(root["sizesum"]),
+        "root.visible": int(root["visible"]),
+        "nested.head": int(nested["head8"], 16),
+        "nested.sum": int(nested["bytesum"]),
+        "nested.first": int(nested["first"]),
+        "proj.visible": int(proj["visible"]),
+        "docs.visible": int(docs["visible"]),
+        "docs.sizesum": int(docs["sizesum"]),
+        "docs.longcount": len(longs),
+        "docs.longsum": sum(int(x["longsum"]) for x in longs),
+        "docs.longsame": sum(int(x["longlen"]) for x in longs),
+    }
+    return want, bad
+
+
+def deep_cells_bad(m, want: dict[str, object], who: str) -> list[str]:
+    """`多级取证` 那一行的逐格对账（正向与两条负样本共用同一个函数）。"""
+    bad: list[str] = []
+    if m is None:
+        return [f"{who}：串口没有 `fs-open: 多级取证 …` 那一行（多级那一段没跑到结论）"]
+    for tag, g, key, hexg in (
+        ("三级首 8 字节", "dhead", "nested.head", True),
+        ("三级字节和", "dsum", "nested.sum", False),
+        ("三级首簇", "dfirst", "nested.first", False),
+        ("中间层条目", "proj", "proj.visible", False),
+        ("跨簇目录条目", "docs", "docs.visible", False),
+        ("跨簇目录大小和", "docsum", "docs.sizesum", False),
+        ("长名条数", "lcount", "docs.longcount", False),
+        ("长名字节和", "lsum", "docs.longsum", False),
+        ("长名与别名同字节", "lsame", "docs.longsame", False)):
+        got = int(m.group(g), 16) if hexg else int(m.group(g))
+        if got != want[key]:
+            bad.append(f"{who}的 {tag}={m.group(g)}，宿主机按当时那块盘算出 {want[key]}")
+    for tag, g, key in (("中间层是文件", "notdir", -10), ("点号路径", "dot", -1)):
+        if int(m.group(g)) != key:
+            bad.append(f"{who}的 {tag} 拒因={m.group(g)}，ABI 表承诺的是 {key}"
+                       "（这两种拒绝的处置方向不同，不能糊成一个 -1）")
+    return bad
+
+
+def kt_all_green(log: str) -> bool:
+    kt = KT_TOTAL_RE.search(log)
+    return bool(kt) and kt.group("passed") == kt.group("total") and kt.group("failed") == "0"
+
+
+def check_fs_open_ring3(log: str) -> list[str]:
+    """FS-03 判定行：ring3 任务自己读回来的数，由宿主机按当时那块多级卷独立重算。
+
+    上一行的调用者是 ring0 里的 ktest，这一行的调用者是装在用户窗口里的真 ring3 任务
+    （22/10/24/25/26/8 全走 `int 0x80`）。所以这里对账的是"用户空间真的能靠这套号读到文件"，
+    而不只是 ABI 的形状。比的全是**没有算法的量**（大小、首簇、首尾 8 字节、字节和、条数、名字和）。
+    """
+    bad: list[str] = []
+    m = FS_RING3_RE.search(log)
+    if not m:
+        return ["串口没有 `fs-open-ring3: 取证 …` 那一行（ring3 探针没跑到结论）"]
+    rows, dbad = deep_host_rows()
+    if dbad:
+        return dbad
+    want, wbad = deep_expectations(rows)
+    if wbad:
+        return wbad
+    for tag, got, exp in (
+        ("读回字节", int(m.group("read")), want["small.size"]),
+        ("stat 大小", int(m.group("size")), want["small.size"]),
+        ("stat 首簇", int(m.group("first")), want["small.first"]),
+        ("首 8 字节", int(m.group("head"), 16), want["small.head"]),
+        ("整份字节和", int(m.group("sum")), want["small.sum"]),
+        ("readdir 条数", int(m.group("recs")), want["root.visible"]),
+        ("readdir 名字字节和", int(m.group("nsum")), want["root.namesum"]),
+        ("readdir 大小和", int(m.group("ssize")), want["root.sizesum"])):
+        if got != exp:
+            bad.append(f"ring3 的 {tag}={got}，宿主机按当时那块盘算出 {exp}")
+    # 尾段那三格由核内写死的期望数与第 42 行的第二台仪器覆盖（独立解析不交出整份字节）。
+    if int(m.group("mul"), 16) != int(m.group("add"), 16):
+        bad.append(f"ring3 自己那两份 FNV 不同数：mul={m.group('mul')} add={m.group('add')}"
+                   "（同一段字节、同一个 h，两写法必等；不等就是乘法的降级）")
+    if int(m.group("mul"), 16) != want["small.fnv"]:
+        bad.append(f"ring3 的 FNV={m.group('mul')}，宿主机对 /SMALL.BIN 算出 {want['small.fnv']:#x}")
+    if m.group("clean") != "true":
+        bad.append("ring3 跑完句柄表没清空（close 没走到，或还有句柄留在死者名下）")
+    if m.group("reaped") != "true":
+        bad.append("ring3 任务没被回收（它的栈与页还挂在自己名下）")
+    if not kt_all_green(log):
+        bad.append("这一跑的 ktests 不是全过（取证行只是它的读数）")
+    return bad
+
+
+def check_fs_open(log: str) -> list[str]:
+    """FS-03 判定行：syscall 路径（22/10/25/26）与多级那一段读出的数，由宿主机独立重算。
+
+    内核那一跑自己判了几十格，全比的是"自己和写死的期望数"。这一行补第二台仪器：
+    * 根目录那一行 ⇒ 大小、首簇、首 8 字节、FNV、前两条目录项的名字与大小；
+    * `多级取证` 那一行 ⇒ 三级文件的内容与首簇两半、跨簇目录的条数与大小和、长名三格。
+    内核绿而这几格对不上 ⇒ CONTENT-MISMATCH，与"内核自己红"是两种成因。
+    """
+    bad: list[str] = []
+    m = FS_OPEN_EVIDENCE_RE.search(log)
+    if not m:
+        return ["串口没有 `fs-open: 取证 …` 那一行（syscall 那一段没跑到结论）"]
+    rows, dbad = deep_host_rows()
+    if dbad:
+        return dbad
+    want, wbad = deep_expectations(rows)
+    if wbad:
+        return wbad
+    for tag, got, exp in (
+        ("读回字节", int(m.group("read")), want["small.size"]),
+        ("FNV 摘要", int(m.group("fnv"), 16), want["small.fnv"]),
+        ("stat 大小", int(m.group("size")), want["small.size"]),
+        ("stat 首簇", int(m.group("first")), want["small.first"])):
+        if got != exp:
+            bad.append(f"核内的 {tag}={got}，宿主机按当时那块盘算出 {exp}")
+    for idx, (name_g, size_g) in enumerate((("n1", "s1"), ("n2", "s2"))):
+        want_name, want_size = want["root.order"][idx], want["root.sizes"][idx]
+        got = bytes(int(x) for x in m.group(name_g).split(",") if x.strip()).decode("latin1")
+        if got != want_name:
+            bad.append(f"readdir 第 {idx + 1} 条名字={got!r}，宿主机按盘上顺序列出的第 {idx + 1} 项是 {want_name!r}")
+        if int(m.group(size_g)) != want_size:
+            bad.append(f"readdir 第 {idx + 1} 条大小={m.group(size_g)}，宿主机读 {want_name} 的目录项={want_size}")
+    bad += deep_cells_bad(FS_DEEP_RE.search(log), want, "核内")
+    if not kt_all_green(log):
+        bad.append("这一跑的 ktests 不是全过（取证行只是它的读数，判据本身也要成立）")
+    return bad
+
+
+def deep_disk_diff_bad(kind: str) -> list[str]:
+    """负样本的地面真相：`build/` 上那块盘与配方现算的 pristine **只差计划中的那几格**。
+
+    与 FAT 那两条同一条纪律：不信串口，宿主机自己比字节。差异多一格是夹具坏了，少一格是注入空转。
+    """
+    try:
+        pristine, _ = fat_deep_pristine()
+        name, off, old, new = fat_deep_fault_plan(kind)
+    except ValueError as e:
+        return [f"{kind} 定位不成：{e}"]
+    got = FAT_IMG[name].read_bytes()
+    if len(got) != len(pristine):
+        return [f"{name} 镜像长度变了：{len(got)} 对配方 {len(pristine)}"]
+    diff = [i for i in range(len(got)) if got[i] != pristine[i]]
+    want_diff = [off + i for i in range(len(old)) if old[i] != new[i]]
+    if diff != want_diff or bytes(got[off:off + len(new)]) != new:
+        return [f"盘上不是「只差计划中那 {len(want_diff)} 格」：差异偏移 {diff[:8]}（共 {len(diff)} 处），"
+                f"计划是 {want_diff} 改成 {new.hex()}"]
+    return []
+
+
+def check_deep_lfn_sum(log: str) -> list[str]:
+    """第 44 行的证人：子目录 LFN 的校验和被改一格 ⇒ **长名不再可用，而短名照样命中**。
+
+    这一格要两个方向同时成立：长名那侧必须塌（条数 0、字节和 0、长名读不到），
+    短名那侧必须不塌（条目 17、大小和 232 仍对）。只要求"这一跑以红收场"是不够的——
+    别的用例红了这一行也照样符合。
+    """
+    bad = deep_disk_diff_bad("fault-deep-lfn-sum")
+    rows, dbad = deep_host_rows()
+    if dbad:
+        return bad + dbad
+    want, wbad = deep_expectations(rows)
+    if wbad:
+        return bad + wbad
+    if want["docs.longcount"] != 0:
+        bad.append(f"注入没把长名打掉：独立解析仍读出 {want['docs.longcount']} 条长名"
+                   "（校验和不对时规范读者该退回短名）")
+    m = FS_DEEP_RE.search(log)
+    if not m:
+        return bad + ["串口没有 `fs-open: 多级取证 …` 那一行"]
+    bad += deep_cells_bad(m, want, "LFN 篡改跑")
+    if m.group("lcount") != "0" or m.group("lsum") != "0":
+        bad.append(f"串口仍报长名条数={m.group('lcount')} 长名和={m.group('lsum')} ⇒ 校验和没起作用")
+    if m.group("lsame") != "0":
+        bad.append("长名与别名仍报「读到同一份字节」⇒ 长名 open 没被打掉")
+    if kt_all_green(log):
+        bad.append("这一跑的 ktests 全绿：负样本空转（长名该被打掉并且由格判出来）")
+    return bad
+
+
+def check_deep_hi_cluster(log: str) -> list[str]:
+    """第 45 行的证人：三级文件的首簇高半抹零 ⇒ 内核读到的是**别处的字节**，而不是读不出来。
+
+    字节数仍然是 64（簇链没变），所以只有内容格会红——这正是"只取低半"最阴的形状：
+    长度对、返回码对、读到的是另一段数据。宿主机先自己把改过的盘解析一遍，再要求串口的
+    首簇与内容数与它逐格相同，且**不等于**正向那组的 65,600。
+    """
+    bad = deep_disk_diff_bad("fault-deep-hi-cluster")
+    rows, dbad = deep_host_rows()
+    if dbad:
+        return bad + dbad
+    want, wbad = deep_expectations(rows)
+    if wbad:
+        return bad + wbad
+    m = FS_DEEP_RE.search(log)
+    if not m:
+        return bad + ["串口没有 `fs-open: 多级取证 …` 那一行"]
+    bad += deep_cells_bad(m, want, "高半抹零跑")
+    if want["nested.first"] == 65_600:
+        bad.append("改过的盘上首簇仍是 65,600 ⇒ 注入没有动到目录项（空转）")
+    if m.group("dfirst") == "65600":
+        bad.append("串口仍报首簇 65,600 ⇒ 高半抹零没被读出来")
+    if kt_all_green(log):
+        bad.append("这一跑的 ktests 全绿：负样本空转")
+    return bad
+
+
 FAT_HOST_WITNESS = {
     "fault-fat32-exec-byte": check_fat32_exec_byte,
     "fault-fat32-cluster-hi": check_fat32_cluster_hi,
+    # ADR-109 的两条：改的是多级真卷，证人仍是同一套"读改过的盘 + 与 pristine 比差异"。
+    "fault-deep-lfn-sum": check_deep_lfn_sum,
+    "fault-deep-hi-cluster": check_deep_hi_cluster,
 }
 
 
@@ -1357,7 +1818,9 @@ def fat_host_witness(kind: str, log: str) -> list[str]:
     bad = FAT_HOST_WITNESS[kind](log)
     for x in bad:
         print("    对账:", x)
-    bad += make_fat_volumes()
+    # 还原走**各自**的配方：多级卷是脚本现算的，拿 make_fat_volumes 还原它只会 KeyError；
+    # 而漏掉还原就是让一块改过的盘留在 build/ 里冒充下一跑的证据。
+    bad += ensure_fat_deep() if kind in DEEP_HOST_FAULTS else make_fat_volumes()
     return bad
 
 
@@ -1885,6 +2348,49 @@ def check_fat32_ports() -> list[str]:
     for name in set(FAT_PORTS.values()):
         if not FAT_ZZ[name].exists():
             bad.append(f"夹具源缺失：{FAT_ZZ[name].relative_to(ROOT)}")
+    # ADR-109：`fs-open` 的挂载根同样是两处各写一份（内核 `filesystem/fs_open.rs` 的 `PORT`
+    # 与本脚本的 `FS_OPEN_PORTS`），必须机器对账。口号接错不会让用例"编译不过"，只会让它
+    # 读一块根本没有多级路径的盘——那时红看起来像解析器坏了，其实断的是接线。
+    osrc = (ROOT / "kernel" / "src" / "filesystem" / "fs_open.rs").read_text(encoding="utf-8")
+    om = re.search(r"^pub const PORT: u8 = (\d+);", osrc, re.M)
+    if om is None:
+        bad.append("filesystem/fs_open.rs 里找不到模块层的 `pub const PORT`（挪进函数体了？两处各写一份就会分家）")
+    else:
+        port = int(om.group(1))
+        if port not in FS_OPEN_PORTS:
+            bad.append(f"fs-open 挂载根：内核用口 {port}，本脚本 FS_OPEN_PORTS 只有 {sorted(FS_OPEN_PORTS)}")
+        elif FS_OPEN_PORTS[port] != FAT_DEEP_NAME:
+            bad.append(f"fs-open 挂载根：口 {port} 挂的是 `{FS_OPEN_PORTS[port]}`，而多级那一刀要的是 `{FAT_DEEP_NAME}`")
+        if port in FAT_PORTS:
+            bad.append(f"fs-open 挂载根口 {port} 与 FAT 卷撞了 ⇒ 同一跑同挂时只能有一块赢，"
+                       "而谁赢由 QEMU 参数顺序决定，那不是可判定的接线")
+    if not FAT_DEEP_SCRIPT.exists():
+        bad.append(f"多级真卷配方缺失：{FAT_DEEP_SCRIPT.relative_to(ROOT)}")
+    if len(FS_OPEN_PORTS) != 1:
+        bad.append("FS_OPEN_PORTS 只该有一块挂载根，多出来的是没人认领的判据")
+    # 多级卷那两条注入查**反面**（与 FAT 那六行同一条纪律）：不是构建变量、内核里没有落点、
+    # 目标卷真挂在某个口上，而且**现在**就定位得出来。
+    deep_feats = (ROOT / "kernel" / "Cargo.toml").read_text(encoding="utf-8")
+    for f in sorted(DEEP_HOST_FAULTS):
+        if re.search(rf"^{f} = ", deep_feats, re.M):
+            bad.append(f"Cargo.toml 里有 {f}：宿主机侧注入不该是构建变量")
+        if f'feature = "{f}"' in osrc:
+            bad.append(f"filesystem/fs_open.rs 里出现了 `feature = \"{f}\"`：这是宿主机侧注入，内核不该有落点")
+        if DEEP_HOST_FAULTS[f] not in set(FS_OPEN_PORTS.values()):
+            bad.append(f"{f} 要改的卷 {DEEP_HOST_FAULTS[f]} 没挂在 fs-open 的口上 ⇒ 改了也没人读")
+            continue
+        try:
+            name, off, old, new = fat_deep_fault_plan(f)
+        except ValueError as e:
+            bad.append(f"{f} 注入点定位不成：{e}")
+            continue
+        if old == new:
+            bad.append(f"{f}: 现值与新值相同 ⇒ 这条注入是空转")
+        if not 0 <= off < FAT_DEEP_EXPECT[0]:
+            bad.append(f"{f}: 算出的偏移 {off} 不在 {name} 的 {FAT_DEEP_EXPECT[0]} 字节之内")
+    # 判定行的证人必须吃这块卷：`--deep-tree` 不在位 ⇒ 多级那几格只是"内核自己说它对"。
+    if not (ROOT / "tools" / "validate_esp.py").exists():
+        bad.append("缺 tools/validate_esp.py：多级真卷没有第二台仪器")
     # 口位不能与已有的盘撞：口 0 是引导 ESP（也是 MBR 那一格的证人），口 2 是 scratch
     # （`if=ide,index=2` 实测落在 AHCI 口 2）。撞了就是"看着挂上了，其实换了块盘"那种红。
     taken = {0: "引导 ESP/MBR", 2: "scratch 130 GiB"}
@@ -2914,9 +3420,12 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
         sys.exit(f"QEMU 未就位：{QEMU}")
     # 宿主机侧注入不是特性（见 FAT_HOST_FAULTS 那一段）：它改盘，不改构建。
     # 两道前置闸都在这里，因为"改了盘却没人读它"与"注入名写错了"都表现为一跑看不出成因的红。
-    if host_fault and host_fault not in FAT_HOST_FAULTS and host_fault not in GPT_HOST_FAULTS and host_fault not in PKG_HOST_FAULTS:
+    if host_fault and host_fault not in (set(FAT_HOST_FAULTS) | set(DEEP_HOST_FAULTS)
+                                   | set(GPT_HOST_FAULTS) | set(PKG_HOST_FAULTS)):
         sys.exit(f"不认识的宿主机侧注入：{host_fault}"
-                 f"（有的那些：{sorted([*FAT_HOST_FAULTS, *GPT_HOST_FAULTS, *PKG_HOST_FAULTS])}）")
+                 f"（有的那些：{sorted([*FAT_HOST_FAULTS, *DEEP_HOST_FAULTS, *GPT_HOST_FAULTS, *PKG_HOST_FAULTS])}）")
+    if host_fault in DEEP_HOST_FAULTS and not (FS_OPEN_FEATURES & set(features)):
+        sys.exit(f"{host_fault} 改的是多级真卷，这一跑却没带 fs-open ⇒ 改了也没人读")
     if host_fault in FAT_HOST_FAULTS and not (FAT_DISK_FEATURES & set(features)):
         sys.exit(f"{host_fault} 改的是 FAT32 卷，这一跑却没带任何挂盘的特性 ⇒ 改了也没人读")
     if host_fault in GPT_HOST_FAULTS and not (GPT_FEATURES & set(features)):
@@ -2953,6 +3462,21 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
             bad = apply_fat_host_fault(host_fault)
             if bad:
                 sys.exit("FAT32 宿主机侧注入不成立：" + " / ".join(bad))
+    if FS_OPEN_FEATURES & set(features):
+        # ADR-109：`fs-open` 的挂载根换成了多级真卷（口 5）。它由脚本现算，不再从 `.zz` 解压；
+        # 卷A 上根本没有多级路径、跨簇目录与子目录 LFN，挂在那里等于"用例写着三级路径、盘上没有"。
+        bad = ensure_fat_deep()
+        if bad:
+            sys.exit("FS-03 多级真卷夹具不成立：" + " / ".join(bad))
+        if host_fault and host_fault in DEEP_HOST_FAULTS:
+            # 注入必须在**核完指纹之后**改盘：反了就是把改过的字节拿去核 pristine 指纹，
+            # 那条闸会把注入本身读成"夹具坏了"，而真正的注入点永远走不到（§80d 同一条）。
+            bad = apply_fat_host_fault(host_fault)
+            if bad:
+                sys.exit("多级真卷宿主机侧注入不成立：" + " / ".join(bad))
+        elif host_fault:
+            sys.exit(f"{host_fault} 改的是 FAT 卷，与 `fs-open` 挂的多级真卷无关"
+                     "（要注入 FAT 卷得同时带 fat32-probe，别挂一块没人读的盘）")
     if GPT_FEATURES & set(features):
         # 与 scratch/virtio/FAT 同一条规矩：夹具跟着"要挂这块盘"走，每跑重造并核指纹。
         bad = make_gpt_fixture()
@@ -2989,14 +3513,25 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
         # `if=ide,index=2` 实测落在 AHCI 的**口 2**（q35 的内置 ich9-ahci 把 IDE 兼容总线
         # 映射到它的端口上），驱动侧就能在端口表里看到第二块 `sig=0x101 ssts=0x113` 的盘
         cmd += ["-drive", f"if=ide,index=2,format=qcow2,file={SCRATCH}"]
+    wanted_volumes: dict[int, str] = {}
     if FAT_FEATURES & set(features):
-        # 口号映射沿用 scratch 那一格**实测过**的关系：`if=ide,index=N` 落在 ich9-ahci 的口 N。
-        # 这里不另写一套 `-device ide-hd,bus=ahci0.x`：那条路径没在本机量过，而端口表是内核
-        # 自己扫出来的——接线方式一变，"口 3 挂的是卷A"这件事就得重新找证人。
+        # L3-C①：两块只读 FAT32 卷。口号映射沿用 scratch 那一格**实测过**的关系：
+        # `if=ide,index=N` 落在 ich9-ahci 的口 N。这里不另写一套 `-device ide-hd,bus=ahci0.x`：
+        # 那条路径没在本机量过，而端口表是内核自己扫出来的——接线方式一变，"口 3 挂的是卷A"
+        # 这件事就得重新找证人。
         # 证人换成两头的对账：`check-fat32-ports` 比口号，`check_fat32` 比内容（两块卷簇数
         # 不同，接反了内容对账当场红）。
-        for port, name in sorted(FAT_PORTS.items()):
-            cmd += ["-drive", f"if=ide,index={port},format=raw,file={FAT_IMG[name]}"]
+        wanted_volumes.update(FAT_PORTS)
+    if FS_OPEN_FEATURES & set(features):
+        # FS-03 只要卷A。若同一跑同时带 `fs-open` 与 FAT 探针，两个集合必须指向同一份夹具，
+        # 绝不允许同一口号挂两块盘后只由 QEMU 参数顺序决定谁赢。
+        for port, name in FS_OPEN_PORTS.items():
+            old = wanted_volumes.get(port)
+            if old is not None and old != name:
+                sys.exit(f"口 {port} 同时被 FAT 卷 {old} 与 FS-03 卷 {name} 占用；接线不可歧义")
+            wanted_volumes[port] = name
+    for port, name in sorted(wanted_volumes.items()):
+        cmd += ["-drive", f"if=ide,index={port},format=raw,file={FAT_IMG[name]}"]
     if GPT_FEATURES & set(features):
         # 口号映射沿用上面那条**实测过**的关系（`if=ide,index=N` 落在 ich9-ahci 的口 N）。
         # 这块盘固件不会去读它（不是引导盘、也没有 ESP 里的 BOOTX64.EFI），所以改它不会
@@ -6753,6 +7288,27 @@ def check_esp_file(log: str) -> list[str]:
     eq("长名项", m1.group(12), host["lfn"])
     if m1.group(6) != ESP_FILE_NAME:
         bad.append(f"内核读的文件名 {m1.group(6)} 与本脚本 ESP_FILE_NAME={ESP_FILE_NAME} 分家")
+    # ---- §333 那笔欠账在这里还：把校验器的**全量规则**接进判定行 ----
+    # `validate_esp.py` 的 VFAT 校验和、LFN 序号顺序（物理倒序、首条带 0x40）、簇链与长度
+    # 这些规则以前只在**人读模式**（不带 flag 的 main）里跑，`--report`/`--esp-file` 两条机器
+    # 读数都不碰它们 ⇒ 修好的算法没有任何判定行吃它。这里直接调那一台的原样实现，
+    # **不复制第二份规则**（两份同错算法不是两台仪器，§333 已经栽过一次）。
+    full = subprocess.run(
+        [sys.executable, str(ROOT / "tools" / "validate_esp.py"), str(IMAGE)],
+        capture_output=True, text=True, encoding="utf-8", env=env())
+    if full.returncode not in (0, 1):
+        bad.append(f"validate_esp.py 全量校验退出 {full.returncode} ⇒ 这台仪器自己挂了，"+
+                   f"不算核过：{(full.stderr or full.stdout).strip()[:200]}")
+    elif full.returncode == 1:
+        # 问题清单在 stdout 里"发现问题："那一段的缩进行里；别按前缀猜——上一版按行首字猜，
+        # 把"GPT 头字段核对：通过"抄成了成因，读起来像盘坏了而点名点错了地方。
+        lines = full.stdout.splitlines()
+        try:
+            head = next(i for i, ln in enumerate(lines) if ln.strip() == "发现问题：")
+            probs = [ln.strip() for ln in lines[head + 1:] if ln[:1].isspace() and ln.strip()]
+        except StopIteration:
+            probs = [ln.strip()[:160] for ln in lines if ln.strip()][-1:]
+        bad.append("validate_esp.py 全量校验报盘有问题（退出 1）：" + "；".join(probs[:4]))
     return bad
 
 
@@ -7497,6 +8053,52 @@ def do_test(timeout: int) -> int:
         print("    对账: 授错主人这一跑没有红在 ring3 那格（判定/魔数/布尔至少一项不符）")
     IMAGE.unlink(missing_ok=True)
 
+    print("=== 第 42 行：FS-03 文件 ABI（22/10/24/25/26/8）走 syscall 路径读多级真卷，宿主机按同一份盘核对 ===")
+    # ADR-108：内核那一跑自己判了 20 多格（大小、游标、拒绝码、表满、旧句柄），但那些全是
+    # "自己和写死的期望数"。这一行补第二台仪器：读回字节的摘要、stat 的大小与首簇、
+    # readdir 前两项的名字与大小，由宿主机解析 build/ 里那份卷A 独立重算。
+    IMAGE.unlink(missing_ok=True)
+    fov, forc, folog = do_run(["fs-open"], timeout)
+    fo_bad = check_fs_open(folog)
+    fo_verdict = "CONTENT-MISMATCH" if (fov == "PASS" and fo_bad) else fov
+    for x in fo_bad:
+        print("    对账:", x)
+    IMAGE.unlink(missing_ok=True)
+
+    print("=== 第 43 行：FS-03 切片 D——ring3 探针自己打 22/10/24/25/26/8，宿主机按同一份多级真卷核对 ===")
+    # 设计 §8 的那句"没有独立 ring3 探针就只算 ABI 形状验证"落在这一行：
+    # 调用者是装在用户窗口里的真任务，句柄是它自己用 22 号挣的，内核一格都没预先授。
+    # 复用 `fs-open` 档再跑一遍（判定表第 40 行同一条规矩：正向新行不新增构建档）。
+    IMAGE.unlink(missing_ok=True)
+    frv, frarc, frlog = do_run(["fs-open"], timeout)
+    fr_bad = check_fs_open_ring3(frlog)
+    fr_verdict = "CONTENT-MISMATCH" if (frv == "PASS" and fr_bad) else frv
+    for x in fr_bad:
+        print("    对账:", x)
+    IMAGE.unlink(missing_ok=True)
+
+    print("=== 第 44 行：ADR-109 负样本——宿主机把子目录 LFN 的校验和改一格（长名该塌、短名不该塌）===")
+    # 与第 38/39 行同一条纪律：注入不做成 cargo 特性（特性名进 -C metadata 会改符号哈希与链接
+    # 布局），改的只是盘 ⇒ 这一跑与第 42/43 行用的是**同一个内核二进制**，差异只有那一个字节。
+    IMAGE.unlink(missing_ok=True)
+    dlfnv, dlfrc, dlfnlog = do_run(["fs-open"], timeout, host_fault="fault-deep-lfn-sum")
+    dlfn_bad = fat_host_witness("fault-deep-lfn-sum", dlfnlog)
+    dlfn_verdict = "CONTENT-MISMATCH" if (dlfnv == "FAIL" and dlfn_bad) else dlfnv
+    for x in dlfn_bad:
+        print("    对账:", x)
+    IMAGE.unlink(missing_ok=True)
+
+    print("=== 第 45 行：ADR-109 负样本——三级文件首簇高半抹零（该读到别处的字节，而不是读不出来）===")
+    # 簇链长度没变 ⇒ 读回字节数仍然对、返回码仍然对，只有内容格会红。这正是"只拼低半"
+    # 最阴的形状，所以要证人把"首簇从 65,600 变成低半那个数"这件事自己再算一遍。
+    IMAGE.unlink(missing_ok=True)
+    dhihv, dhihrc, dhihlog = do_run(["fs-open"], timeout, host_fault="fault-deep-hi-cluster")
+    dhih_bad = fat_host_witness("fault-deep-hi-cluster", dhihlog)
+    dhih_verdict = "CONTENT-MISMATCH" if (dhihv == "FAIL" and dhih_bad) else dhihv
+    for x in dhih_bad:
+        print("    对账:", x)
+    IMAGE.unlink(missing_ok=True)
+
     rows = [
         ("正向", v if v != "PASS" or not p4_bad else "CONTENT-MISMATCH", rc, "PASS", 33),
         ("负样本", nv, nrc, "FAIL", 35),
@@ -7627,6 +8229,14 @@ def do_test(timeout: int) -> int:
         ("split OOM原页原样", soomv if spo_ok else "CONTENT-MISMATCH", soomrc, "PASS", 33),
         # ADR-067 / W2 P5：竞争放大档。PASS + 宿主机苛求真输家；没重叠就没证据 ⇒ CONTENT-MISMATCH
         ("demand-zero四路有真输家", dzv if not dz_bad else "CONTENT-MISMATCH", dzrc, "PASS", 33),
+        # ADR-108 / FS-03：22/24/25/26 这条 ABI 链。内核绿而对账不上 ⇒ CONTENT-MISMATCH
+        ("FS-03文件ABI与多级真卷对账", fo_verdict, forc, "PASS", 33),
+        # ADR-108 决策 8：ring3 真调用者。内核绿而对账不上 ⇒ CONTENT-MISMATCH
+        ("FS-03ring3探针与多级真卷对账", fr_verdict, frarc, "PASS", 33),
+        # ADR-109 的两条负样本：改的都是**多级那一层**的字节，同一份 ELF、只有盘不同。
+        # 期望是 FAIL(35)——注入就该让格红；证人再判红得对不对，方向错了就是 CONTENT-MISMATCH。
+        ("多级LFN校验和被改只塌长名", dlfn_verdict, dlfrc, "FAIL", 35),
+        ("多级首簇高半抹零读到别处", dhih_verdict, dhihrc, "FAIL", 35),
     ]
     # 每一行对应那一跑的串口：不符时把红的那几格打出来。
     # 单独一张表而不是把日志塞进 `rows` 的元组里：元组要保持成"名字/期望/实际"这种
@@ -7678,6 +8288,10 @@ def do_test(timeout: int) -> int:
         "P7 句柄授错主人必须红": ihlog,
         "split OOM原页原样": soomlog,
         "demand-zero四路有真输家": dzlog,
+        "FS-03文件ABI与多级真卷对账": folog,
+        "FS-03ring3探针与多级真卷对账": frlog,
+        "多级LFN校验和被改只塌长名": dlfnlog,
+        "多级首簇高半抹零读到别处": dhihlog,
     }
     all_ok = True
     print()
@@ -7828,7 +8442,8 @@ def main() -> int:
             # --host-fault fault-fat32-exec-byte` 必须与链里那一跑是同一个证人。只给 `run`——
             # 别的子命令收下这个参数却不读它，就是"看着开了其实没开"那种绿。
             p.add_argument("--host-fault", default="",
-                           choices=["", *sorted(FAT_HOST_FAULTS), *sorted(GPT_HOST_FAULTS), *sorted(PKG_HOST_FAULTS)])
+                           choices=["", *sorted(FAT_HOST_FAULTS), *sorted(DEEP_HOST_FAULTS),
+                                    *sorted(GPT_HOST_FAULTS), *sorted(PKG_HOST_FAULTS)])
     a = ap.parse_args()
     feats = [f for f in a.features.split(",") if f]
     if a.cmd == "build":

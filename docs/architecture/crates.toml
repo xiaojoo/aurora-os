@@ -21,10 +21,14 @@ crate.aurora-user-probe = "aurora-user-probe"
 # 它经 ROLE_LOG 拿到控制台句柄，用 20/21 号读写；命令只用真实存在的 syscall。
 crate.aurora-user-shell = "aurora-user-shell"
 
+# FS-03 切片 D（ADR-108 决策 8）：第四个用户产物——**第一个在 ring3 打 22/24/25/26 的调用方**。
+# 只在 `fs-open` 构建里被内核 `include_bytes!`；与 probe 同样**不进签名链**。
+crate.aurora-user-fileprobe = "aurora-user-fileprobe"
+
 # ---------------------------------------------------------------- 许可证策略（§11.2 R10 / ADR-009b）
 #
 # 白名单与"登记过的留空"的唯一来源就在这里，`check-sbom` 直接读这两段。
-# ADR-009b（发布许可证）还没定 ⇒ 两个成员**故意没有** license 字段：
+# ADR-009b（发布许可证）还没定 ⇒ 这五个成员**故意没有** license 字段：
 # 留空必须是登记过的留空（带理由与到期条件），不是没人注意的空白，
 # 也不是随手填一个 MIT 把它糊过去。
 
@@ -40,3 +44,4 @@ license.pending.aurora-kernel = "ADR-009b 未定（发布许可证由安全委�
 license.pending.aurora-user-hello = "同上：它是内核的产物夹具，许可证随内核一起定"
 license.pending.aurora-user-probe = "同上：第二个用户产物夹具（W3 P5a），许可证随内核一起定"
 license.pending.aurora-user-shell = "同上：第三个用户产物（S5c 串口 shell），许可证随内核一起定"
+license.pending.aurora-user-fileprobe = "同上：第四个用户产物（FS-03 D ring3 文件探针），许可证随内核一起定"
