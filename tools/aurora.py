@@ -1525,7 +1525,8 @@ def check_handle_ring3(log: str) -> list[str]:
 # 于是同一个函数既能判正向、也能判篡改后的盘——只要把它喂给**当时挂着的那块**盘。
 FS_RING3_RE = re.compile(
     r"fs-open-ring3: 取证 读回=(?P<read>\d+) 首8=(?P<head>0x[0-9a-f]+) 字节和=(?P<sum>\d+) "
-    r"尾首8=(?P<thead>0x[0-9a-f]+) 尾和=(?P<tsum>\d+) stat大小=(?P<size>\d+) 首簇=(?P<first>\d+) "
+    r"尾字节数=(?P<tbytes>\d+) 尾首8=(?P<thead>0x[0-9a-f]+) 尾和=(?P<tsum>\d+) "
+    r"stat大小=(?P<size>\d+) 首簇=(?P<first>\d+) "
     r"条目=(?P<recs>\d+) 名字和=(?P<nsum>\d+) 大小和=(?P<ssize>\d+) "
     r"多级读回=(?P<mread>\d+) 多级首8=(?P<mhead>0x[0-9a-f]+) 多级和=(?P<msum>\d+) "
     r"多级首簇=(?P<mfirst>\d+) proj条目=(?P<precs>\d+) proj名字和=(?P<pnames>\d+) "
@@ -1694,6 +1695,7 @@ def check_fs_open_ring3(log: str) -> list[str]:
     # 回来了——比的是另一段字节，不是另一份实现算的同一个数。
     body = want["small.body"]
     for tag, got, exp in (
+        ("尾段字节数", int(m.group("tbytes")), len(body) - 50),
         ("尾段首 8 字节", int(m.group("thead"), 16), int.from_bytes(body[50:58], "little")),
         ("尾段字节和", int(m.group("tsum")), sum(body[50:]))):
         if got != exp:

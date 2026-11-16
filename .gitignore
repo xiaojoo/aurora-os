@@ -34,3 +34,6 @@ serial.log
 # Python 编译产物
 __pycache__/
 *.pyc
+
+# 多 agent 协作层（本机运行态：认领/锁/事件/各 agent 的 memory，都不进版本库）
+/.workbuddy/

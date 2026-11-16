@@ -872,10 +872,11 @@ fn t_fs_open_ring3() -> bool {
     }
 
     crate::log_info!(
-        "fs-open-ring3: 取证 读回={} 首8={:#x} 字节和={} 尾首8={:#x} 尾和={} stat大小={} 首簇={} 条目={} 名字和={} 大小和={} 多级读回={} 多级首8={:#x} 多级和={} 多级首簇={} proj条目={} proj名字和={} 表清空={} 回收={} rounds={} served={} 诊断mul={:#x} 诊断add={:#x} ⇒ {}",
+        "fs-open-ring3: 取证 读回={} 首8={:#x} 字节和={} 尾字节数={} 尾首8={:#x} 尾和={} stat大小={} 首簇={} 条目={} 名字和={} 大小和={} 多级读回={} 多级首8={:#x} 多级和={} 多级首簇={} proj条目={} proj名字和={} 表清空={} 回收={} rounds={} served={} 诊断mul={:#x} 诊断add={:#x} ⇒ {}",
         box_[(fp::READ_TOTAL / 8) as usize],
         box_[(fp::HEAD / 8) as usize],
         box_[(fp::SUM_FULL / 8) as usize],
+        box_[(fp::READ50_TOTAL / 8) as usize],
         box_[(fp::TAIL_HEAD / 8) as usize],
         box_[(fp::SUM_TAIL / 8) as usize],
         box_[(fp::STAT_SIZE / 8) as usize],

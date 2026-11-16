@@ -1,0 +1,72 @@
+任务 T0.1：拆分 kernel/src/main.rs 里的内核用例（纯搬移，不改任何行为）
+
+【背景（我已核实的事实，开工前请你自己再核一遍）】
+- main.rs 约 7,618 行。73 条 `ktest!` 注册，但有 74 个 `fn t_`：差的那一个请在盘点表里解释。
+- 用例通过 `.ktests` 链接段注册（ktest.rs + linker.ld）。执行顺序 = 链接顺序，不是源码顺序。
+- main.rs 里有 50 个非 `t_` 的顶层项：kmain、on_panic、after_switch、
+  exit_fatal_from_exception、mp_store/mp_snapshot、GLOBAL、RSDP_VA 等是非测试代码；
+  其余多是用例的辅助（HELLO_ELF、ELF_BUF、with_elf_copy、drain_reap、run_one、
+  p2_probe、fat32_file、FAT32_MEM、PKG_BUF 等）。
+- 其他文件引用了 main.rs 里的项：smp.rs 用 crate::mp_snapshot、crate::calibrate_clock_once；
+  trap.rs 用 crate::exit_fatal_from_exception；handle.rs 用 crate::HELLO_ELF、crate::drain_reap。
+- 宿主机门禁直接读 main.rs 文本：tools/aurora.py 的 check_fat32_ports（读 FAT_PORT_* 常量、
+  want 表、feature 名、串口锚点）、check_virtio_pattern 与 check_net_pattern（读 EXPECT_PATTERN）。
+- unsafe 普查按文件路径记模块（模块名 = 相对 kernel/src 的路径去掉后缀），
+  docs/security/unsafe-whitelist.toml 里有 [modules."main"] 一项（U1=3 U4=8 U6=18）。
+- 仓库文件是 CRLF 换行。
+
+【目标】把用例及其专用辅助搬到 kernel/src/ktests/*.rs，按被测子系统分文件
+（例如 boot、mm、heap、acpi、sched、user、syscall、driver、virtio、net、fs、handle、sign）。
+main.rs 只留启动入口与非测试代码。
+
+【硬约束】
+1. 纯搬移：不得改任何函数体、断言、判据、字符串、打印文本、cfg/feature 属性。
+   唯一允许的代码改动：mod 声明、use、为跨文件引用放宽到 pub(crate)、
+   用 `pub(crate) use` 保持上面 5 个外部引用路径可用。
+2. 不得合并、删除、重命名用例；不得改 tools/ 里的期望值或阈值；不得改 Cargo features。
+3. 不得对整个仓库运行 cargo fmt（会制造巨大 diff）。
+4. 搬移必须用脚本按行区间切片（脚本放 .scratch/，不入库），不要手敲或让编辑器重排；
+   新文件沿用 CRLF。
+
+【步骤】
+步骤 0 取基线（改动前，结果存 .scratch/t01/before/）：
+ a. `python tools/aurora.py check` 与 `python tools/aurora.py test` 的完整输出。
+ b. 默认构建与 do_test 矩阵里每个特性变体各跑一次，保存：按出现顺序的
+    `test: <名> -> ok` 行列表、`ktests: total=… passed=… failed=…` 行、完整串口日志。
+ c. 保存 unsafe_census() 的 模块×类别 快照。
+
+步骤 1 盘点（只出表，不改代码，贴出后停下等我确认）：
+ - 每个 `t_` 函数 → 目标文件；74 对 73 的差额说明。
+ - 每个非 `t_` 项 → 留在 main.rs / 随用例搬走 / 放 ktests/common.rs（多文件共用）。
+ - 被其他文件引用的项清单与保持路径可用的办法。
+ - 所有读 main.rs 文本的宿主机门禁清单（上面 3 个之外若还有，一并列出）。
+
+步骤 2 分批搬移：每批一个目标文件，每批后构建必须通过，
+ 且默认构建的 `ktests: total` 不变。
+
+步骤 3 门禁改指向新位置：只改它们读哪个文件，不改判据强度。
+ 每个改过的门禁都要证一次「改坏就变红」：在新位置把它盯的常量或锚点改坏，
+ 门禁必须红，还原后绿；贴出两次的终端原文。
+
+步骤 4 unsafe 登记：把 [modules."main"] 的计数按实际落点拆给 ktests/<x> 各模块。
+ 总数与各类别合计必须与基线完全相同（应该不变），unsafe-census.md 汇总行同步。
+
+【验收（全部满足才算完成）】
+ A. 每个构建变体下，改前改后的 `test: <名> -> ok` 名称集合排序后 diff 为空，
+    且 `ktests: total/passed/failed` 三个数相等。
+ B. `check` 全绿且条数不变；`test` 判定矩阵每行均为「符合」且行数不变。
+ C. 执行顺序：记录改前改后顺序是否相同。不要求相同，但必须如实报告。
+    若顺序变了且有用例红 ⇒ 视为隐式依赖：只许在该用例开头补自足代码
+    （参照 BACKLOG §86e 补 sched::init_boot_task() 的做法），单独一个提交，BACKLOG 登记；
+    不得靠调整顺序掩盖。
+ D. 串口里非 `test:` 开头的行，抹掉数字后做多重集比较，差异逐条解释。
+ E. git diff --stat：main.rs 只减不增（mod 声明与 use 除外）；
+    搬走的行数与新文件正文行数对得上，差额只能是文件头与 use。
+ F. 变异证红（各做一次，贴终端原文，之后还原）：
+    1. 在某个新模块里把一条用例的断言改成必假 ⇒ 该用例 FAIL，矩阵对应行红。
+    2. 删掉某个新模块里的一条 `ktest!` ⇒ total 少 1，判定红。
+
+【交付物】
+ 盘点表、基线与改后对比摘要、各门禁的红绿证明原文、
+ BACKLOG 新条目草稿（第 87 条，每个结论标「实测」或「推断」）、
+ 改动文件清单。不得自行宣布通过，以宿主机的 check/test 输出为准。
