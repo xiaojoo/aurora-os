@@ -329,3 +329,84 @@ fn syscall23_cells(hw: Handle, hr: Handle, hbad: Handle) -> bool {
 }
 
 ktest!(KT_FS_RW_SYSCALL23, t_fs_rw_syscall23);
+
+/// ADR-111 决策 1（2026-11-17 裁决）：写意图 open（`flags=1`）在 `fs-rw` 档路由到可写卷（口 4）
+/// 并授 `READ|WRITE`；读意图仍走只读根（口 5）。两个根的命名空间是**分开的**——同一个路径
+/// `/LOG.TXT` 在只读根上必须 `-8`。这条用例只碰 [16,20)，避开另两条的 [4,8)/[8,12)。
+fn t_fs_rw_open_write() -> bool {
+    if ahci::init().is_err() {
+        crate::log_fatal!("fs-rw-open-w: AHCI 未认领");
+        return false;
+    }
+    sched::init_boot_task();
+    let Some(va) = mm::alloc_user_va_range(1) else {
+        crate::log_fatal!("fs-rw-open-w: 用户 VA 分配失败");
+        return false;
+    };
+    let Ok(frames) = mm::phys_alloc(0, mm::MOD_TEST) else {
+        crate::log_fatal!("fs-rw-open-w: 用户页帧分配失败");
+        return false;
+    };
+    let Ok(flags) = mm::PageFlags::new(true, false, true) else {
+        crate::log_fatal!("fs-rw-open-w: 页标志构造失败");
+        return false;
+    };
+    let Ok(map) = mm::map(va, frames, flags) else {
+        crate::log_fatal!("fs-rw-open-w: 用户页映射失败");
+        return false;
+    };
+    let mut fr = frame0();
+    let mut ok = true;
+
+    let path = b"/LOG.TXT";
+    ok &= put_user(va.0, 0, path);
+    // 写意图：这路径只在可写卷上有，能开出来就说明路由生效。
+    let h = call(&mut fr, user::SYS_FILE_OPEN, va.0, path.len() as u64, 1);
+    let handle = Handle(h);
+    let open_ok = (h as i64) > 0;
+    ok &= open_ok;
+    // 读意图同一路径 ⇒ -8（只读根上没有它：命名空间分开）。
+    let miss = call(&mut fr, user::SYS_FILE_OPEN, va.0, path.len() as u64, 0);
+    ok &= miss == user::E_NOT_FOUND;
+
+    let pat = [0x5Au8, 0xA5, 0x3C, 0xC3];
+    let s16 = call(&mut fr, user::SYS_FILE_SEEK, handle.0, 16, 0);
+    ok &= s16 == 16 && put_user(va.0, 64, &pat);
+    let wrote = call(&mut fr, user::SYS_FILE_WRITE, handle.0, va.0 + 64, 4);
+    ok &= wrote == 4;
+    let s16b = call(&mut fr, user::SYS_FILE_SEEK, handle.0, 16, 0);
+    let n = call(&mut fr, user::SYS_FILE_READ, handle.0, va.0 + 128, 4);
+    let mut back = [0u8; 4];
+    let back_ok = s16b == 16 && n == 4 && get_user(va.0, 128, &mut back) && back == pat;
+    ok &= back_ok;
+
+    // flags=2 ⇒ -15；写意图打目录 ⇒ -15。
+    let bad_flags = call(&mut fr, user::SYS_FILE_OPEN, va.0, path.len() as u64, 2);
+    ok &= bad_flags == user::E_NOT_SUPPORTED;
+    ok &= put_user(va.0, 0, b"/");
+    let dir_w = call(&mut fr, user::SYS_FILE_OPEN, va.0, 1, 1);
+    ok &= dir_w == user::E_NOT_SUPPORTED;
+    // ABI 0.13：写意图位在这档必须置位。
+    ok &= user::abi_word() & user::F_FS_WRITE_OPEN != 0 && user::ABI_MINOR == 13;
+
+    let c = if open_ok {
+        call(&mut fr, user::SYS_HANDLE_CLOSE, handle.0, 0, 0)
+    } else {
+        user::E_BAD_HANDLE
+    };
+    let live = handle::used();
+    crate::log_info!(
+        "fs-rw-open-w: 写意图开={} 读根未见={} 写4={} 读回={} 非法flags={} 目录={} 关={} 关后活={}",
+        open_ok,
+        miss == user::E_NOT_FOUND,
+        wrote,
+        back_ok,
+        bad_flags as i64,
+        dir_w as i64,
+        c,
+        live
+    );
+    drop(map);
+    ok && open_ok && c == 0 && live == 0
+}
+ktest!(KT_FS_RW_OPEN_WRITE, t_fs_rw_open_write);

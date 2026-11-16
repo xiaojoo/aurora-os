@@ -1864,7 +1864,11 @@ def check_deep_hi_cluster(log: str) -> list[str]:
 
 
 # ADR-111 决策 3：两条写用例按同一对常量写（23 号的 [4,8) 与 t_fs_rw_write 的 [8,12)）。
-FS_RW_LOG_WRITES = ((4, bytes([0xD3, 0xA5, 0x5A, 0xC3])), (8, bytes([0xDE, 0xAD, 0xBE, 0xEF])))
+FS_RW_LOG_WRITES = (
+    (4, bytes([0xD3, 0xA5, 0x5A, 0xC3])),   # 23 号 syscall 那格
+    (8, bytes([0xDE, 0xAD, 0xBE, 0xEF])),   # t_fs_rw_write 那格
+    (16, bytes([0x5A, 0xA5, 0x3C, 0xC3])),  # 写意图 open 那格（ADR-111 决策 1）
+)
 
 
 def _fs_rw_body(seed: int, n: int) -> bytes:

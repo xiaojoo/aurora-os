@@ -67,7 +67,7 @@ pub const F_CONSOLE: u64 = 256;
 /// ABI 版本。minor=4 对应用户态闭环这一段（M4）；minor=5 追加 capability 句柄族（P7）；
 /// minor=6 追加 VMO 三个号（12/13/14）与 `F_VMO` 位（W3 P4b，ADR-074）。号只追加不复用（Q1）。
 pub const ABI_MAJOR: u64 = 0;
-pub const ABI_MINOR: u64 = 12;
+pub const ABI_MINOR: u64 = 13;
 pub const F_FASTPATH: u64 = 1;
 pub const F_SMAP: u64 = 2;
 pub const F_SMEP: u64 = 4;
@@ -166,6 +166,10 @@ pub fn abi_word() -> u64 {
     #[cfg(feature = "fs-open")]
     {
         f |= F_FS_OPEN;
+    }
+    #[cfg(feature = "fs-rw")]
+    {
+        f |= F_FS_WRITE_OPEN;
     }
     (ABI_MAJOR << 32) | (ABI_MINOR << 16) | f
 }
@@ -875,6 +879,10 @@ pub const F_WAIT: u64 = 128;
 /// FS-03（ADR-108）：22/24/25/26 与 VFS 句柄对象在这份构建里可用。
 /// 它只在 `fs-open` 置位；`handles`/`wm` 不得从这一位推断文件 API 存在。
 pub const F_FS_OPEN: u64 = 512;
+/// ADR-111 决策 1（2026-11-17 裁决）：22 号的 `flags=1`（写意图）在这份构建里可用。
+/// 只在 `fs-rw` 置位：**只读构建里写意图 open 一律 `-15`**，不能从 `F_FS_OPEN` 推断它可用。
+/// 置位时写意图 open 路由到可写卷（口 4）并授 `READ|WRITE`；读意图仍走只读根（口 5）。
+pub const F_FS_WRITE_OPEN: u64 = 1024;
 /// 17：`rdi` = Proc 句柄（要 `READ`），`rsi` = 时限毫秒（0 = 只查一次不阻塞）→
 /// `rax` = `(observed << 32) | 退出码`；**0 = 超时**（不升 L4，"目标永远不收工"是业务事实）。
 pub const SYS_PROCESS_WAIT: u64 = 17;
@@ -1234,19 +1242,43 @@ fn sys_file_open(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let Ok(path) = core::str::from_utf8(&buf[..len]) else {
         return E_INVALID;
     };
-    let opened = match crate::filesystem::fs_open::open(path, frame.rdx) {
+    let flags = frame.rdx;
+    let write = flags == crate::filesystem::fs_open::OPEN_WRITE;
+    if flags != crate::filesystem::fs_open::OPEN_READ_ONLY && !write {
+        return E_NOT_SUPPORTED;
+    }
+    // 写意图 ⇒ 可写卷（口 4，只在 fs-rw 档存在）；读意图 ⇒ 只读根（口 5）。
+    // 两个根的命名空间**分开**：同一个路径可能只在其一存在（ADR-111 补记）。
+    #[cfg(feature = "fs-rw")]
+    let port = if write {
+        crate::filesystem::fs_rw::PORT
+    } else {
+        crate::filesystem::fs_open::PORT
+    };
+    #[cfg(not(feature = "fs-rw"))]
+    let port = if write {
+        return E_NOT_SUPPORTED;
+    } else {
+        crate::filesystem::fs_open::PORT
+    };
+    let opened = if write {
+        crate::filesystem::fs_open::open_on(port, path, flags)
+    } else {
+        crate::filesystem::fs_open::open(path, flags)
+    };
+    let opened = match opened {
         Ok(o) => o,
         Err(e) => return vfs_err_ret(e),
     };
     use crate::filesystem::fs_open::Opened;
-    let rights = crate::handle::RIGHT_READ;
+    let rights = if write {
+        crate::handle::RIGHT_READ | crate::handle::RIGHT_WRITE
+    } else {
+        crate::handle::RIGHT_READ
+    };
     let granted = match opened {
-        Opened::File { cursor, stat } => {
-            crate::handle::grant_vfs_file(owner, crate::filesystem::fs_open::PORT, None, cursor, stat, rights)
-        }
-        Opened::Dir { state, stat } => {
-            crate::handle::grant_vfs_dir(owner, crate::filesystem::fs_open::PORT, None, stat, state, rights)
-        }
+        Opened::File { cursor, stat } => crate::handle::grant_vfs_file(owner, port, None, cursor, stat, rights),
+        Opened::Dir { state, stat } => crate::handle::grant_vfs_dir(owner, port, None, stat, state, rights),
     };
     match granted {
         Ok(h) => h.0,

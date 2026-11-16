@@ -14688,3 +14688,21 @@ kernel 栈/地址窗口上的脆弱）。下一刀先定位它：用同一段包
   （"接口变更先有决策、后有实现"）。已补 ADR-110 补记一，`check` **17/17**。
 - 读数：`virtio-blk` PASS(33) 85/85（`428e4fe1e7c5`）、`virtio-msix-probe` PASS(33)
   （`5dfe81b95019`）、默认档 PASS(33)（`7fdd76f0dd97`）、`fs-rw` PASS(33)（`46d657d4f56`）。
+## 371. ADR-111 未决 1 结案：写意图 open（flags=1）路由到可写卷，ABI 0.13（2026-11-17）
+
+- 裁决：`SYS_FILE_OPEN` 的 `flags bit0 = 写意图`。`fs-rw` 档里写意图 open 路由到**可写卷（口 4）**
+  并授 `RIGHT_READ|RIGHT_WRITE`；读意图仍走只读根（口 5）。两个根的命名空间**分开**——同一路径
+  可能只在其一存在，跨根查找要挂载表（ADR-108 未决 4，仍开）。写意图打目录、未知 flags 位、
+  只读构建里的写意图一律 `-15`。
+- 实现：`fs_open::open_on(port, path, flags)`（`open()` 成为"只读根、拒写意图"的薄壳）；
+  `user::sys_file_open` 按 flags 选口与权限；`ABI_MINOR 12→13`，新特性位 `F_FS_WRITE_OPEN=1024`
+  **只在 `fs-rw` 置位**。接口登记补 `fs_open::{open_on,OPEN_WRITE,OPEN_READ_ONLY}`、`fs_rw::PORT`、
+  `filesystem::fs_rw`；ADR-108 补记八 + ADR-111 未决 1 结案。
+- 旧用例的两处"非零 flags"样本从 1 改成 2（bit0 现在合法）：`t_fs_open_syscalls` 与 ring3
+  `fileprobe`（探针源码改一行，`fileprobe.elf` 重建）。
+- 新取证 `t_fs_rw_open_write`（fs-rw **100/100**）：写意图开 `/LOG.TXT`（只在口 4 存在）成功、
+  写 [16,20) 读回一致、读意图同路径 `-8`、flags=2 与目录写意图 `-15`、ABI 位与 minor 按档断言。
+  宿主行同步把 LOG.TXT 的第三段写纳入逐字节对账（行路径 **PASS**、host ok）。
+- 变异：把写意图路由回只读根 ⇒ `写意图开=false`、该格红；还原后 100/100（ELF `a475db8f6692`）。
+- 读数：`fs-rw` PASS(33) 100/100、`fs-open` PASS(33) 97/97（`372fd232f9f4`）、默认档 PASS(33)
+  （`e2d3c52a0f0e`）；`check` **17/17**。

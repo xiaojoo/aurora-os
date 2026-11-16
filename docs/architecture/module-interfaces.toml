@@ -598,7 +598,7 @@ status = "部分落地"
 module_id = "storage"
 owner = "storage"
 layer = "service"
-source_modules = ["ahci", "virtio", "filesystem", "filesystem/block_io", "filesystem/fat32", "filesystem/fs_open", "filesystem/gpt", "filesystem/vfs", "filesystem/vfs_ro"]
+source_modules = ["ahci", "virtio", "filesystem", "filesystem/block_io", "filesystem/fat32", "filesystem/fs_open", "filesystem/fs_rw", "filesystem/gpt", "filesystem/vfs", "filesystem/vfs_ro"]
 public_api = [
   "ahci::REG_CAP",
   "ahci::REG_GHC",
@@ -638,6 +638,11 @@ public_api = [
   "fs_open::DIRENT_RECORD_LEN",
   "fs_open::Opened",
   "fs_open::PORT",
+  "fs_open::OPEN_READ_ONLY",
+  "fs_open::OPEN_WRITE",
+  "fs_rw::PORT",
+  "filesystem::fs_rw",
+  "fs_open::open_on",
   "fs_open::STAT_KIND_FILE",
   "fs_open::STAT_RECORD_LEN",
   "fs_open::dirent_record",

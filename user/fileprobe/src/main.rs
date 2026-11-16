@@ -345,13 +345,13 @@ pub extern "C" fn _start(_mailbox: u64) -> ! {
         }
 
 
-        // ---- 失败格：相对路径、不存在、非零 flags ----
+        // ---- 失败格：相对路径、不存在、未知 flags（bit0=写意图合法，用 2 打"未知位"） ----
             set_path(0x4942_2e4c_4c41_4d53, 0x0000_0000_0000_004e); // "SMALL.BIN"
             put(SLOT_REL, sys3(SYS_FILE_OPEN, slots_base() + BUF_PATH, 9, 0));
             set_path(0x0000_0000_4550_4f4e_2f, 0); // "/NOPE"
             put(SLOT_MISSING, sys3(SYS_FILE_OPEN, slots_base() + BUF_PATH, 5, 0));
             set_path(0x422e_4c4c_414d_532f, 0x0000_0000_0000_4e49);
-            put(SLOT_FLAGS, sys3(SYS_FILE_OPEN, slots_base() + BUF_PATH, 10, 1));
+            put(SLOT_FLAGS, sys3(SYS_FILE_OPEN, slots_base() + BUF_PATH, 10, 2));
 
             // ---- 8 close，之后旧句柄必须 -5 ----
             put(SLOT_CLOSE, sys3(SYS_HANDLE_CLOSE, open, 0, 0));

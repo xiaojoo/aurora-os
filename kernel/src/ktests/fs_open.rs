@@ -258,8 +258,9 @@ fn syscall_cells(fs: &ReadOnlyFs<'_>, small: &vfs_ro::Entry, direct: &[u8; 100])
     let long_len = call(&mut fr, user::SYS_FILE_OPEN, va.0, (vfs_ro::PATH_MAX + 1) as u64, 0);
     ok &= fail("open 路径过长", long_len, user::E_TOO_LONG);
     if put_user(va.0, 0, SMALL) {
-        let flags = call(&mut fr, user::SYS_FILE_OPEN, va.0, SMALL.len() as u64, 1);
-        ok &= fail("open flags 非零", flags, user::E_NOT_SUPPORTED);
+        // bit0=写意图现在合法（fs-rw 档），这一格打的是**未知位**；2 在两档都必须 -15。
+        let flags = call(&mut fr, user::SYS_FILE_OPEN, va.0, SMALL.len() as u64, 2);
+        ok &= fail("open flags 未知位", flags, user::E_NOT_SUPPORTED);
     } else {
         ok = false;
     }
@@ -311,7 +312,15 @@ fn syscall_cells(fs: &ReadOnlyFs<'_>, small: &vfs_ro::Entry, direct: &[u8; 100])
     }
 
     let counters = handle::counters();
-    let abi_ok = user::abi_word() & user::F_FS_OPEN != 0 && user::ABI_MINOR == 12;
+    // ABI 0.13（ADR-108 补记八）：写意图位只在 `fs-rw` 置位。
+    let abi = user::abi_word();
+    let abi_ok = abi & user::F_FS_OPEN != 0
+        && user::ABI_MINOR == 13
+        && if cfg!(feature = "fs-rw") {
+            abi & user::F_FS_WRITE_OPEN != 0
+        } else {
+            abi & user::F_FS_WRITE_OPEN == 0
+        };
     ok &= abi_ok;
     handle::reset_for_test();
     drop(map);

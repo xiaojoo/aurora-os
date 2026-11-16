@@ -14,6 +14,9 @@ use crate::filesystem::vfs_ro::{self, DirState, Entry, ReadOnlyFs, VfsError};
 /// 挂载口。口号与 `tools/aurora.py` 的 `FS_OPEN_PORTS` 各写一份，由 `check-fat32-ports` 对账。
 pub const PORT: u8 = 5;
 pub const OPEN_READ_ONLY: u64 = 0;
+/// ADR-111 决策 1（2026-11-17 裁决）：写意图。**只在 `fs-rw` 档有意义**——调用方把这类 open
+/// 路由到可写卷；本模块的 `open()`（只读根）拿到它当场拒。
+pub const OPEN_WRITE: u64 = 1;
 
 pub const STAT_MAGIC: u32 = 0x5346_5541; // "AUFS"
 pub const STAT_RECORD_LEN: u16 = 48;
@@ -44,20 +47,34 @@ pub fn mount() -> Result<ReadOnlyFs<'static>, VfsError> {
     ReadOnlyFs::mount(&DISK)
 }
 
-pub fn open(path: &str, flags: u64) -> Result<Opened, VfsError> {
-
-    if flags != OPEN_READ_ONLY {
+/// 在**指定的口**上打开。调用方按 flags 选口：读意图 → 只读根（`PORT`），写意图 → 可写卷。
+/// 两个根各自挂载、命名空间分开——这里不做跨根查找（那要挂载表，ADR-108 未决 4）。
+pub fn open_on(port: u8, path: &str, flags: u64) -> Result<Opened, VfsError> {
+    if flags != OPEN_READ_ONLY && flags != OPEN_WRITE {
         return Err(VfsError::BadFlags);
     }
-    let fs = mount()?;
+    let disk = AhciDisk { port };
+    let fs = ReadOnlyFs::mount(&disk)?;
     let stat = fs.lookup(path)?;
     if stat.is_dir() {
+        // 写意图打在目录上没有意义（创建/截断是另一刀）。
+        if flags == OPEN_WRITE {
+            return Err(VfsError::BadFlags);
+        }
         let state = DirState::new(&fs.bpb(), &stat)?;
         Ok(Opened::Dir { state, stat })
     } else {
         let cursor = fs.open(&stat)?;
         Ok(Opened::File { cursor, stat })
     }
+}
+
+pub fn open(path: &str, flags: u64) -> Result<Opened, VfsError> {
+    // 只读根（口 5）上不许写意图：它的 sha256 就是判据（ADR-111 决策 3）。
+    if flags == OPEN_WRITE {
+        return Err(VfsError::BadFlags);
+    }
+    open_on(PORT, path, flags)
 }
 
 pub fn stat_record(e: &Entry) -> [u8; 48] {

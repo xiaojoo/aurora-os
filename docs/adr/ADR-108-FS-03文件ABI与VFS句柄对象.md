@@ -376,3 +376,16 @@ ELF `299b60dfaff5`）⇒ 这是一个布局/栈敏感的下游，**不能靠"语
 只等 `DONE` 就返回（`with_interrupts` 退出即 `cli`），哨兵复核与整页快照在 IF 关着时完成，
 第二段再做自旋与等待。修好后把当时闯祸的同一段包装重新加回去：`fs-open` 6/7 PASS
 （1 次 120s HANG 停在 mm 用例后，§342/§350 的老 wedge，不归因），`fs-rw` 99/99（`盘失败=-7`）。
+
+## 补记八（2026-11-17）：ABI 0.13 — 22 号的写意图 flag 与 `F_FS_WRITE_OPEN`
+
+- `ABI_MINOR` 12 → 13；新增特性位 `F_FS_WRITE_OPEN = 1024`，**只在 `fs-rw` 置位**（`fs-open`
+  档必须为 0，`t_fs_open_syscalls` 按档位断言）。判据不写死"有没有这一位"而是按档：
+  `cfg(feature="fs-rw") ⇒ 有，否则 ⇒ 无`。
+- `SYS_FILE_OPEN` 的 `flags`：0 = 读意图（只读根，口 5）；1 = 写意图（`fs-rw` 档路由到可写卷，
+  口 4，授 `RIGHT_READ|RIGHT_WRITE`）；其余位 = `-15`。只读构建里写意图也是 `-15`。
+  写意图打目录同样是 `-15`（创建/截断是另一刀）。
+- 取证：`t_fs_rw_open_write`（100/100）——写意图开 `/LOG.TXT`（只在口 4 存在）成功、写 [16,20)
+  读回一致、读意图同路径 `-8`（命名空间分开）、flags=2 与目录写意图 `-15`、ABI 位与 minor 按档断言。
+  宿主机行同步把 LOG.TXT 的第三段写纳入逐字节对账。旧用例里把 `flags=1` 当"非零样本"的两处
+  （`t_fs_open_syscalls` 与 ring3 probe）改为 `flags=2`，因为 bit0 现在合法。
