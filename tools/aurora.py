@@ -8653,6 +8653,10 @@ def main() -> int:
         if a.host_fault in GPT_HOST_FAULTS:
             if gpt_host_witness(a.host_fault, log):
                 v = "CONTENT-MISMATCH"
+        elif a.host_fault in PKG_HOST_FAULTS:
+            # 改包注入的证人**不在** FAT 那张表里：以前落到下面的 `fat_host_witness` 会 KeyError。
+            if pkg_host_witness(a.host_fault, log):
+                v = "CONTENT-MISMATCH"
         elif a.host_fault and fat_host_witness(a.host_fault, log):
             v = "CONTENT-MISMATCH"
         return 0 if v == "PASS" else 1

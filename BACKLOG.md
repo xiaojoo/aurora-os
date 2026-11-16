@@ -14645,3 +14645,30 @@ kernel 栈/地址窗口上的脆弱）。下一刀先定位它：用同一段包
   函件自检：把串口里 `正常=true` 改成 `false` 再喂给检查器 ⇒ `块请求层 ok1=false（期望 true）`。
 - `check` **17/17**（`check-matrix-wiring` 已把新行与 `blog` 纳入对账）。整链现在是 **63 行**，
   没有在本轮重跑整链（上一轮 §367 的两遍是 62 行的读数）。
+## 369. af32eca 的两遍 63 行整链：各 61/63，四条不符合全是既有偶发（2026-11-17）
+
+- 第一遍（`build/matrix-af32eca.txt`，63 行）：**61 符合 / 2 不符合**，两条都是 HANG(120s)：
+  `FAT32④段内字节改了必须红`（run-3137）与 `P7 句柄ring3读自己镜像`（run-3139），同一个
+  `fat32-exec` ELF `1986950c02fd`，都停在 `t_frame_refcount_get_put -> ok` 之后（`t_handle_transfer`
+  还没打第一行）、无 fatal；同一遍里第 39 行（同变体）正常。该 ELF 在 §366 的单跑是 **97/97 PASS**
+  （run-2932）⇒ 环境形状，**不归因**。
+- 第二遍（`build/matrix-af32eca-r2.txt`，63 行）：**61 符合 / 2 不符合**，两条是 FAIL(35)：
+  - `virtio 取证十格证人全过`：同跑的 **`t_irq_ahci`** 红（判据行 `判定=None`、赛跑最大间隔=342，
+    与 virtio 无关；§357 记过同一条）。同 ELF `bf14ef5022d6` 单跑 **PASS(33)**。
+  - `改包头被拒仍启动`：同跑的 **`t_q2_workload_slots`** 红（`peak=false`，§342/§344 记过的
+    峰值采样易碎）。同一行的路径（`do_run([], host_fault="fault-pkg-header")`）复跑
+    **PASS(33)**、证人空表（ELF `7fdd76f0dd97`）。
+- 新行 `块请求层超时取消半途` 在两遍里都**符合**。
+- 结论：今天没有拿到一次 63/63 的干净整链；四条不符合分属三种既有偶发
+  （fat32-exec 中段 HANG、`t_irq_ahci` 计时、`t_q2_workload_slots` 峰值采样），**没有一条在
+  FS/块层代码里**，全部被同 ELF 单跑清掉。判据侧一律不改。
+
+### 369 附：`run --host-fault fault-pkg-*` 的 KeyError（量具 bug，已修）
+
+- CLI 的 `run` 分支只认 GPT 与 FAT 两张证人表，改包注入落进 `fat_host_witness` ⇒
+  `KeyError: 'fault-pkg-header'`（`test` 链里那条走的是 `pkg_host_witness`，所以链里一直是好的）。
+  已加 `elif a.host_fault in PKG_HOST_FAULTS: pkg_host_witness(...)`。
+- 验证：`run --host-fault fault-pkg-header` / `fault-pkg-payload` 都 **PASS(33)**（`7fdd76f0dd97`）；
+  证人自检——注入后把那个字节**还原**再取证 ⇒ `盘上偏移 34643968 又回到原值 50 ⇒ 注入被谁还原了`
+  （非空 ⇒ 该行会翻成 CONTENT-MISMATCH），证明这台证人会咬。
+- `check` 17/17。
