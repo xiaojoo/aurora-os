@@ -53,6 +53,8 @@ pub const SYS_CONSOLE_READ: u64 = 21;
 // ---- FS-03（ADR-108）。23 留给未来 write，不空占。----
 /// 22 `open(path,len,flags) -> handle`。flags 目前必须为 0（只读）。
 pub const SYS_FILE_OPEN: u64 = 22;
+/// ADR-111：写。只做"覆盖已有区间"，不创建/截断/扩展。
+pub const SYS_FILE_WRITE: u64 = 23;
 /// 24 `seek(handle,newpos,whence) -> offset`。whence：0=SET、1=CUR、2=END。
 pub const SYS_FILE_SEEK: u64 = 24;
 /// 25 `stat(handle,buf,len) -> 0`，写一份 StatV1。
@@ -1065,6 +1067,56 @@ fn sys_console_io(frame: &crate::arch::x86_64::trap::TrapFrame, write: bool) -> 
 /// StartupInfo 页、`sys_object_wait` 的等待格……）。整批内联时它的序言峰值实测 10,584 字节，
 /// 逐号拆开后降到只剩分派本身。
 #[inline(never)]
+/// 23 号：从用户缓冲写进文件（ADR-111 决策 1）。
+///
+/// 与 `sys_file_read` 对称：分块、每块成功才推进；中途用户内存不可读就**不提交游标**
+/// （先前那几块已经落盘，这是"覆盖写"语义下唯一诚实的做法——已写的字节不会因为后面的失败回滚）。
+#[cfg(feature = "fs-rw")]
+fn sys_file_write(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let want = frame.rdx as usize;
+    if want == 0 {
+        return E_INVALID;
+    }
+    if want > COPY_MAX {
+        return E_TOO_LONG;
+    }
+    let Some(owner) = crate::sched::current_identity() else {
+        return E_BAD_HANDLE;
+    };
+    let mut ticket = match crate::handle::begin_write(crate::handle::Handle(frame.rdi), owner) {
+        Ok(t) => t,
+        Err(e) => return handle_err(e),
+    };
+    let disk = crate::filesystem::vfs::AhciDisk { port: ticket.port() };
+    let mut buf = [0u8; crate::filesystem::vfs::SECTOR_BYTES];
+    let mut done = 0usize;
+    while done < want {
+        let ask = core::cmp::min(buf.len(), want - done);
+        match copy_from_user(frame.rsi + done as u64, &mut buf[..ask]) {
+            Ok(n) if n == ask => {}
+            _ => {
+                // 用户缓冲读不回来：票作废，游标一格不动（与读路径同一条纪律）。
+                BAD_PTRS.fetch_add(1, Ordering::Relaxed);
+                crate::handle::abort(ticket);
+                crate::log_info!("abi: file_write 读用户缓冲失败，游标未提交");
+                return E_FAULT;
+            }
+        }
+        match crate::handle::write_chunk(&mut ticket, &disk, &buf[..ask]) {
+            Ok(n) => done += n,
+            Err(e) => {
+                crate::handle::abort(ticket);
+                return handle_err(e);
+            }
+        }
+    }
+    match crate::handle::finish(ticket, done) {
+        Ok(()) => done as u64,
+        Err(e) => handle_err(e),
+    }
+}
+
+#[cfg(feature = "handles")]
 fn sys_file_read(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let want = frame.rdx as usize;
     if want == 0 {
@@ -1865,6 +1917,8 @@ pub fn syscall_dispatch(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> boo
         },
         #[cfg(feature = "handles")]
         SYS_FILE_READ => sys_file_read(frame),
+        #[cfg(feature = "fs-rw")]
+        SYS_FILE_WRITE => sys_file_write(frame),
         #[cfg(feature = "handles")]
         SYS_VMO_CREATE => sys_vmo_create(frame),
         #[cfg(feature = "handles")]

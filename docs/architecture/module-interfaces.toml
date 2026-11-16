@@ -650,6 +650,7 @@ public_api = [
   "vfs_ro::VfsError",
   "vfs_ro::read_disk",
   "vfs_ro::seek_disk",
+  "vfs_ro::write_at",
   "vfs::Block",
   "vfs::BlockError",
   "vfs::FileStat",
@@ -844,6 +845,8 @@ layer = "core"
 source_modules = ["handle"]
 public_api = [
   "handle::HErr",
+  "handle::begin_write",
+  "handle::write_chunk",
   "handle::Handle",
   "handle::used",
   "handle::MAX_HANDLES",

@@ -78,6 +78,21 @@ impl Block for PartitionView<'_> {
         let abs = self.part.base.checked_add(lba).ok_or(BlockError::BeyondPartition)?;
         self.inner.read_sectors(abs, dst)
     }
+
+    /// 写走**同一套**越界判据（ADR-111 决策 2）：翻译之前拒，否则写会落到下一个分区，
+    /// 而"写成功但写到别人家"比"被拒"难看得多。
+    fn write_sectors(&self, lba: u64, src: &[u8]) -> Result<(), BlockError> {
+        if src.is_empty() || src.len() % SECTOR_BYTES != 0 {
+            return Err(BlockError::Refused);
+        }
+        let n = (src.len() / SECTOR_BYTES) as u64;
+        let end = lba.checked_add(n).ok_or(BlockError::BeyondPartition)?;
+        if end > self.part.sectors() {
+            return Err(BlockError::BeyondPartition);
+        }
+        let abs = self.part.base.checked_add(lba).ok_or(BlockError::BeyondPartition)?;
+        self.inner.write_sectors(abs, src)
+    }
 }
 
 impl BlockError {
@@ -104,6 +119,15 @@ pub trait Block {
     ///
     /// 越过盘末尾不单独设一种错误：那是设备自己报的（`DeviceError`），块层不维护第二份容量账。
     fn read_sectors(&self, lba: u64, dst: &mut [u8]) -> Result<(), BlockError>;
+
+    /// 从 `lba` 起写 `src.len() / 512` 个扇区。形状与读一样：空/非整扇区 ⇒ `Refused`。
+    ///
+    /// **默认实现是拒绝**（ADR-111 决策 2）：只读实现（`MemDisk`、ktest 的 `TestDisk`）
+    /// 不需要为"我不支持写"说任何话，而"忘了实现写"会表现成 `Refused` 而不是静默成功。
+    fn write_sectors(&self, lba: u64, src: &[u8]) -> Result<(), BlockError> {
+        let _ = (lba, src);
+        Err(BlockError::Refused)
+    }
 }
 
 /// 打开一个文件要交回来的东西：大小、起始簇，以及**扫描的覆盖面**。
@@ -137,6 +161,17 @@ impl Block for AhciDisk {
             // `Xfer` 里的取证读数（完成状态、内容哈希）在这一层被丢掉：上层要的是字节本身。
             // 丢掉的是**这一层用不上的读数**，成因仍从 `Err` 一路带上去。
             ahci::read_bytes(self.port, lba + i as u64, chunk).map_err(block_err)?;
+        }
+        Ok(())
+    }
+
+    fn write_sectors(&self, lba: u64, src: &[u8]) -> Result<(), BlockError> {
+        if src.is_empty() || src.len() % SECTOR_BYTES != 0 {
+            return Err(BlockError::Refused);
+        }
+        for (i, chunk) in src.chunks(SECTOR_BYTES).enumerate() {
+            // 与读同构：取证读数留在驱动里，成因从 `Err` 一路上来。
+            ahci::write_bytes(self.port, lba + i as u64, chunk).map_err(block_err)?;
         }
         Ok(())
     }

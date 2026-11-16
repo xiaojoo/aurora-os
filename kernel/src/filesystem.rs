@@ -12,3 +12,5 @@ pub mod vfs;
 pub mod vfs_ro;
 #[cfg(feature = "fs-open")]
 pub mod fs_open;
+#[cfg(feature = "fs-rw")]
+pub mod fs_rw;

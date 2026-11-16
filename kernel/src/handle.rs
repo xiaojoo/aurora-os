@@ -875,6 +875,38 @@ fn vfs_to_herr(e: VfsError) -> HErr {
 /// 丢弃一张票：表项不动。显式函数而不是 `Drop`，是为了让"没有提交"在调用点看得见。
 pub fn abort(_ticket: ReadTicket) {}
 
+/// 写方向的取票（ADR-111）：与 `begin_read` 对称，但**只认 `VfsFile`**，且要 `RIGHT_WRITE`。
+///
+/// 票里装的是游标的**副本**：`write_at` 在副本上推进 `position`，成功之后由 `finish` 原样写回表
+/// （`finish` 只做 `*old = c`，不会再加一遍 `bytes`——那正是这里能直接复用它提交的原因）。
+#[cfg(feature = "fs-rw")]
+pub fn begin_write(h: Handle, owner: (usize, u32)) -> Result<ReadTicket, HErr> {
+    let mut g = TABLE.lock();
+    let t = g.get();
+    let slot = check(t, h, owner, RIGHT_WRITE)?;
+    let e = &t.slots[slot];
+    match e.obj {
+        Some(ObjRef::VfsFile { port, part, cursor, .. }) => Ok(ReadTicket {
+            slot: slot as u16,
+            gen: e.gen,
+            port,
+            part,
+            kind: ReadTicketKind::Vfs(cursor),
+        }),
+        // 目录句柄、以及任何非文件对象：写不成立。与读的 `-11 EISDIR` 相对，这里回类型不符。
+        _ => Err(HErr::Denied),
+    }
+}
+
+/// 把一段字节写进票里的游标（覆盖已有区间，越 EOF 由 `write_at` 整次拒）。
+#[cfg(feature = "fs-rw")]
+pub fn write_chunk(ticket: &mut ReadTicket, disk: &dyn Block, src: &[u8]) -> Result<usize, HErr> {
+    match ticket.kind {
+        ReadTicketKind::Vfs(ref mut c) => vfs_ro::write_at(disk, c, src).map_err(vfs_to_herr),
+        _ => Err(HErr::Denied),
+    }
+}
+
 /// 生产路径：按表项里的口**与分区区间**重建块设备。一次读全部分配的 `dst`（事务性）。
 /// 区间是身份的一部分（S2b）：这里若只重建 `AhciDisk{port}`，偏移在第一次读之后就丢了，
 /// 而句柄看起来还是"那个分区里的文件"——那种错法读出来的字节合法、内容却是别人的。

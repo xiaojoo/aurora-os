@@ -123,7 +123,7 @@ FIXTURE = ROOT / "kernel" / "fixtures" / "hello.elf"
 # 与 .cargo/config.toml 里给内核那组 rustflags **平行**的一份：链接脚本不同，
 # 而 cargo 的 `[target.*]` 段是按 target 生效的，两个包共用同一个 target 时只能靠
 # RUSTFLAGS 覆盖（这是 cargo 的既定优先级，不是本机 hack）。
-USER_RUSTFLAGS = "-C link-arg=-Tuser/hello/link.ld -C relocation-model=static -C panic=abort -C opt-level=1"
+USER_RUSTFLAGS = "-C link-arg=-Tuser/hello/link.ld -C relocation-model=static -C panic=abort -C opt-level=1 -C debuginfo=0"
 
 
 def do_build_user() -> Path:
@@ -154,19 +154,19 @@ def do_build_user() -> Path:
 PROBE_PKG = "aurora-user-probe"
 PROBE_ELF = ROOT / "target" / TARGET / "debug" / "probe"
 PROBE_FIXTURE = ROOT / "kernel" / "fixtures" / "probe.elf"
-PROBE_RUSTFLAGS = "-C link-arg=-Tuser/probe/link.ld -C relocation-model=static -C panic=abort -C opt-level=1"
+PROBE_RUSTFLAGS = "-C link-arg=-Tuser/probe/link.ld -C relocation-model=static -C panic=abort -C opt-level=1 -C debuginfo=0"
 # S5c：第三个用户产物（串口 shell）。与 probe 同一条构建纪律，只换链接脚本与包名。
 SHELL_PKG = "aurora-user-shell"
 SHELL_ELF = ROOT / "target" / TARGET / "debug" / "shell"
 SHELL_FIXTURE = ROOT / "kernel" / "fixtures" / "shell.elf"
-SHELL_RUSTFLAGS = "-C link-arg=-Tuser/shell/link.ld -C relocation-model=static -C panic=abort -C opt-level=1"
+SHELL_RUSTFLAGS = "-C link-arg=-Tuser/shell/link.ld -C relocation-model=static -C panic=abort -C opt-level=1 -C debuginfo=0"
 # FS-03 切片 D（ADR-108 决策 8）：第四个用户产物 = ring3 文件探针。构建纪律与 probe/shell 逐条相同，
 # 只换包名、产物名与链接脚本。它**只在 `fs-open` 构建里被内核 include_bytes!**，
 # 但产物每次都造：构建不该看特性的脸色，看不看是内核编译期决定的。
 FILEPROBE_PKG = "aurora-user-fileprobe"
 FILEPROBE_ELF = ROOT / "target" / TARGET / "debug" / "fileprobe"
 FILEPROBE_FIXTURE = ROOT / "kernel" / "fixtures" / "fileprobe.elf"
-FILEPROBE_RUSTFLAGS = "-C link-arg=-Tuser/fileprobe/link.ld -C relocation-model=static -C panic=abort -C opt-level=1"
+FILEPROBE_RUSTFLAGS = "-C link-arg=-Tuser/fileprobe/link.ld -C relocation-model=static -C panic=abort -C opt-level=1 -C debuginfo=0"
 
 
 def do_build_fileprobe() -> Path:
@@ -422,6 +422,10 @@ FAT_PORTS = {3: "fat32-small", 4: "fat32-wide"}
 # 是为了 `fs-open` 与 FAT 探针同跑时两块卷能并存（此前靠 QEMU 参数顺序，那是不可歧义的接线反面）。
 FS_OPEN_FEATURES = {"fs-open"}
 FS_OPEN_PORTS = {5: "fat32-deep"}
+# ADR-111：写方向单独一档，挂在**可写**卷上（口 6）。它与 `FS_OPEN_PORTS` 一样要与内核的
+# `fs_open::RW_PORT` 对账（`check-fat32-ports` 里那一格扩成两张表）。
+FS_RW_FEATURES = {"fs-rw"}
+FS_RW_PORTS = {4: "fat32-rw"}
 # 内核声明"要读哪几个文件"。这张表有两个用处，缺一不可：
 # 1 宿主机这台仪器只走这几个名字的链——卷B 上那个 34,603,008 字节的 FILLER.BIN 没有任何
 #   一条判据读它，跟着算哈希会让对账先挂死（本轮实测：一次 3,400 万次的逐字节循环）。
@@ -438,21 +442,26 @@ FAT_MAX_WALKED = 65_535
 FAT_LFN_SUM_AT = 13        # 长名条目里的校验和字节（FAT 规范 1.03 的 32 字节布局）
 FAT_DEEP_NAME = "fat32-deep"
 FAT_ZZ = {name: ROOT / "tools" / "fixtures" / f"{name}.img.zz" for name in FAT_PORTS.values()}
-FAT_IMG = {name: BUILD / f"{name}.img" for name in set(FAT_PORTS.values()) | set(FS_OPEN_PORTS.values())}
+FAT_IMG = {name: BUILD / f"{name}.img" for name in (set(FAT_PORTS.values()) | set(FS_OPEN_PORTS.values()) | set(FS_RW_PORTS.values()))}
 # 夹具自己的指纹（字节数 + 解压后的 sha256）。内核那一批写死的期望数全是照着这一对卷量的，
 # 所以哪天卷换了而期望数没跟着换，红会落在解析器身上——可错的是夹具。指纹先于解析判，
 # 就是把"量具换了"和"被测物坏了"分在两道闸上。
 # 存成 `.img.zz` 的理由很实际：`.gitignore` 里 `*.img` 挡的是构建产物，裸卷 32/64 MiB 不该进仓库，
 # 而它们**是**源（配方与 mtools 数值记在 BACKLOG 78）。压缩后 40 KB 与 262 KB，几乎全是零与重复图案。
 FAT_EXPECT = {
-    "fat32-small": (33_554_432, "3eb1d518923ae4e3692aafec7d545c1bfa92ef75366ea3ab82fbc5256f97c976"),
-    "fat32-wide": (67_108_864, "da3aa3a2e2e7d600d45fa47ad142b635c072269a9bba25d7df2f51e08c8d34e9"),
+    "fat32-small": (33554432, "e415e29b388d92c0228ab041189d9fabcde863341db13a9ad7aecf2789e747e4"),
+    "fat32-wide": (67108864, "e317234fcc7b4d217d09abc5e1d35ae7d2523a65d75664e15e0b0955239ebecd"),
 }
 # ADR-109 的多级真卷（`fs-open` 的挂载根）：它**不在仓库里**，由 `tools/make_fat32_deep.py` 现算，
 # 所以登记的是"配方 + 现算出来的字节"这一对。指纹先于解析判，同 `FAT_EXPECT` 那条理由：
 # 红要落在"配方与镜像分家"上，而不是落在核内解析器身上。
 FAT_DEEP_SCRIPT = ROOT / "tools" / "make_fat32_deep.py"
 FAT_DEEP_EXPECT = (34336768, "188439830af785f747c4ba12c9c48c19470f5e406c502b0c5a827e9c84206a1c")
+
+# ADR-111 的可写卷：同样按「现算 + 指纹」登记。它只给 `fs-rw` 档用；两块只读真卷与
+# 多级真卷永不以可写方式挂载——它们的 sha256 就是判据。
+FAT_RW_SCRIPT = ROOT / "tools" / "make_fat32_rw.py"
+FAT_RW_EXPECT = (1082368, "1aeb47a069a949285ed8afbe0f6ffdb108f7c277d644baf3aaf4f3ffc396eb9e")
 # L3-C② 的内存夹具卷：11,264 字节，由 `tools/make_fat32_mem.py` 现算（这块卷**不在仓库里**——
 # `.gitignore` 的 `*.img` 把它挡了，而能被配方重新算出来的东西本来就该不进仓库）。
 # 指纹登记在这里，构建前先跑配方脚本：对不上就是"配方与镜像分家"，红在编译之前，
@@ -670,6 +679,27 @@ def ensure_fat_deep() -> list[str]:
                 "（配方改了，核内写死的期望数与判定表那两行必须跟着重算）"]
     return []
 
+
+
+def ensure_fat_rw() -> list[str]:
+    """现算 ADR-111 的可写卷并核指纹（与 `ensure_fat_deep` 同一规矩：红在挂盘之前）。
+
+    与多级卷的区别只在用途：这块卷**会被写坏**，所以只活在 `build/` 里。配方自带读回复算
+    （BPB / 备份扇区 / FSInfo 三签名与副本位置 / 两份 FAT 逐字节相同 / 根目录三项 / 两个文件）。
+    """
+    import hashlib
+    if not FAT_RW_SCRIPT.exists():
+        return [f"配方脚本缺失：{FAT_RW_SCRIPT.relative_to(ROOT)}（这块卷不在仓库里，只能现算）"]
+    out = FAT_IMG.get("fat32-rw", BUILD / "fat32-rw.img")
+    if sh([sys.executable, str(FAT_RW_SCRIPT), str(out)]) != 0:
+        return ["make_fat32_rw.py 退出非零（它自己的读回复算没通过 ⇒ 先看它的报错）"]
+    data = out.read_bytes()
+    size, sha = FAT_RW_EXPECT
+    got = hashlib.sha256(data).hexdigest()
+    if len(data) != size or got != sha:
+        return [f"可写卷指纹不符：{len(data)} 字节 sha256={got[:12]}，期望 {size} 字节 {sha[:12]}"
+                "（配方改了，FAT_RW_EXPECT 与 23 号那几格的期望数必须跟着重算）"]
+    return []
 
 def ensure_fat32_mem() -> list[str]:
     """把 L3-C② 的配方脚本跑一遍并核指纹——`include_bytes!` 是**编译时**要的。
@@ -3493,6 +3523,11 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
             bad = apply_fat_host_fault(host_fault)
             if bad:
                 sys.exit("FAT32 宿主机侧注入不成立：" + " / ".join(bad))
+    if FS_RW_FEATURES & set(features):
+        # 写方向：可写卷每次现算（它会被写坏），先核指纹再挂盘。
+        bad = ensure_fat_deep() + ensure_fat_rw()
+        if bad:
+            sys.exit("FS 可写卷夹具不成立：" + " / ".join(bad))
     if FS_OPEN_FEATURES & set(features):
         # ADR-109：`fs-open` 的挂载根换成了多级真卷（口 5）。它由脚本现算，不再从 `.zz` 解压；
         # 卷A 上根本没有多级路径、跨簇目录与子目录 LFN，挂在那里等于"用例写着三级路径、盘上没有"。
@@ -3560,6 +3595,13 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
             old = wanted_volumes.get(port)
             if old is not None and old != name:
                 sys.exit(f"口 {port} 同时被 FAT 卷 {old} 与 FS-03 卷 {name} 占用；接线不可歧义")
+            wanted_volumes[port] = name
+    if FS_RW_FEATURES & set(features):
+        # 写方向那块卷单独挂口 6；它与 FS-03 的多级卷不共用口号（5 是只读判据的根）。
+        for port, name in list(FS_OPEN_PORTS.items()) + list(FS_RW_PORTS.items()):
+            old = wanted_volumes.get(port)
+            if old is not None and old != name:
+                sys.exit(f"口 {port} 同时被 {old} 与可写卷 {name} 占用；接线不可歧义")
             wanted_volumes[port] = name
     for port, name in sorted(wanted_volumes.items()):
         cmd += ["-drive", f"if=ide,index={port},format=raw,file={FAT_IMG[name]}"]

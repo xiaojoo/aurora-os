@@ -189,6 +189,8 @@ fs-ro = []
 # FS-03（ADR-108）：FAT32 卷A 单根 + open/seek/stat/readdir。只在 `fs-open` 编译新句柄 kind、
 # 新 syscall 分派与 ring3 探针；默认、handles、wm 都不引入这些对象。
 fs-open = ["handles", "fs-ro"]
+# ADR-111：写方向。挂的是**可写**卷（口 6），两块只读真卷与多级卷永不挂它。
+fs-rw = ["handles", "fs-open"]
 
 # 变体（L3-C③，BACKLOG 78h-1）：把用户镜像的来源从 `include_bytes!` 换成卷A 上的 `HELLO.ELF`，
 # 装进用户窗口并真跑一遍。依赖探针——没有那两条用例就没有"同一份容器的另一条路"可比。

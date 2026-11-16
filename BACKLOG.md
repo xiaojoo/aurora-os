@@ -14102,3 +14102,289 @@ ring3 的 尾段字节和=6253，宿主机按当时那块盘算出 6257
 把峰值改成在**状态跃迁处 latch**（或把采样从每轮一次改成每次循环），并证明它不再漏峰
 （同一档连跑 N 次峰值全 = 基线+成功数）。这一条归入 S6，写进 COORD 的台账。
 
+
+## 346. 写方向第一刀：ADR-111 起草 + `Block::write_sectors` 落地（2026-11-16）
+
+使用者把文件系统项目单独交给 qoder，其余两位去做总设计 V1.0。这一轮开工写方向。
+
+- **ADR-111（提议）**：23 号只做"覆盖已有区间"（不创建/不截断/不扩展；越 EOF 整次拒 `-1`；
+  只读句柄 `-4`；只读卷 `-15`；块层错映射 `-7`）；可写目标是一块**现算、跑完即丢**的
+  `build/fat32-rw.img`（挂在新的 `fs-rw` 档口 6），两块只读真卷与多级真卷**永不**以可写方式挂载。
+- **代码**（决策 2 已落地）：`Block` 加一条 `write_sectors`，**默认实现 `Refused`**——只读实现
+  （`MemDisk`/`TestDisk`）一个字没改；`AhciDisk` 逐扇区走 `ahci::write_bytes`；
+  `PartitionView` 在**翻译之前**按 GPT 区间判越界（否则写会落到下一个分区）。
+- **判据**（`fs-ro` 档，不需要硬件）：`vfs-ro: 写方向 只读实现拒=true 分区外拒=true
+  分区内转发=true 形状拒=true`。四格刻意分开：`Refused`（只读/形状）与 `BeyondPartition`（分区外）
+  是两种拒绝，合成一格就再也分不出是谁拒的。
+- 读数：`run --features fs-ro` = PASS(33)、ktests 86/86；`check` **17/17**；
+  `fs-open` / `fat32-probe` / 默认档都能编（trait 改动对读路径行为为零）。
+
+**没做的**（下一刀）：`tools/make_fat32_rw.py` + `fs-rw` 档 + 23 号分派 + FAT32 覆盖写 + 判定行；
+创建/截断/扩展另开 ADR（要簇分配、两份 FAT、FSInfo、目录项大小）。
+
+
+## 347. ADR-111 第一刀的地基：可写夹具 `fat32-rw`（2026-11-16）
+
+- **配方** `tools/make_fat32_rw.py`（CRLF）：单簇、`2,048` 簇、1,082,368 字节；`/DATA.BIN` 1,024 字节
+  **跨两簇**（簇 3-4，跨簇写与整扇区写都靠它）、`/LOG.TXT` 64 字节（簇 5，用来证"没写到的字节一个没动"）。
+- **形状**：按簇数阈值会算成 Fat12/Fat16，按结构特征是 Fat32——与卷A 同一个理由（核内走结构判型）。
+  `validate_esp.py --deep-tree` 独立读回：`clusters=2048 band=Fat12 struct=Fat32`，
+  `/DATA.BIN size=1024 first=3`、`/LOG.TXT size=64 first=5`、根目录 `visible=2 sizesum=1088` ✓。
+- **读回复算**（落在盘上的字节，不是配方里的意图）：BPB 十字段、510:512 签名、备份引导扇区逐字节、
+  FSInfo 与副本三签名（副本在 `BackupBootSec+6`）、**两份 FAT 逐字节相同**、根目录前两项、
+  两个文件的内容与簇链。
+- **登记**：`FAT_RW_SCRIPT` / `FAT_RW_EXPECT = (1082368, "1aeb47a069a94928…")` / `ensure_fat_rw()`，
+  与多级卷同一规矩（先核指纹再挂盘）。
+- 读数：`ensure_fat_rw()` PASS；sha256 `1aeb47a069a949285ed8afbe0f6ffdb108f7c277d644baf3aaf4f3ffc396eb9e`。
+
+**没做的**（下一刀）：`fs-rw` 档与口 6 的接线、23 号分派、`vfs_ro::write_at`（覆盖已有区间）、
+`RIGHT_WRITE` 授予、判定行与三条负样本（越 EOF、分区外写、只读句柄写）。
+
+
+## 348. 写方向第二刀：`write_at` 落地，判据先不算数（2026-11-16）
+
+- **`vfs_ro::write_at`** 已落地（编译通过、`fs-ro` 档仍 PASS(33)）：只覆盖已有区间，越 EOF 整次拒
+  `BadOffset`；非整扇区走**读-改-写**；逐扇区推进游标。`Block::write_sectors` 上一步已就位。
+- **判据没交（两次都是判据自己的错，不是被测物的错）**：
+  1. 第一版在 `t_vfs_ro_fat32` 里用 `img.to_vec()` 拷卷 ⇒ **撞上 `LARGE_MAX = 2048` 的堆上限**，
+     整跑 EXCEPTION(39)。
+  2. 第二版改成独立用例（栈上卷）后读数 `非整扇区=false 读回=true 邻居未动=false`。
+     **查清了：夹具里的 `/SUB/INNER.TXT` 只有 7 字节**（`FILE_INNER_LEN = 7`），而我把写偏移写成
+     100 / 512 —— 全在 EOF 之外，`seek_disk(100)` 直接 `BadOffset`。**红的不是 `write_at`。**
+
+**已补上（同日）**：`t_vfs_ro_write`（`if let` 写法、栈上卷、写 `[2,5)`）读数
+`vfs-ro-w: 覆盖写 非整扇区=true 读回=true 邻居未动=true 越EOF拒=true 空写=true`；
+`run --features fs-ro` = **PASS(33)**、ktests **87/87**（新增 1 条用例）、`check` **17/17**。
+
+**变异证红**：把 `write_at` 的越 EOF 判据短路（`if false && end > size`）重建 ⇒
+`[FAIL] t_vfs_ro_write -> failed`、判定 FAIL(35)；还原后 `git diff` 只余 41 行新增、重跑 PASS(33)。
+- 现状：`fs-ro` PASS(33)、`check` 未重跑（源码只动了 ktests/vfs_ro.rs 与 vfs_ro.rs 的 `write_at`）。
+
+**给下一轮的线索**：`邻居未动=false` 但 `读回=true` ⇒ 读路径读到的是我写进去的字节、位置却不对；
+先核对 `write_at` 里 `off_in_cluster = pos % cluster_bytes` 与 `data_lba` 的关系
+（`data_lba` 给的是簇首扇区，`pos` 是文件内偏移，但**簇内偏移要减去之前那些簇**——
+`cur.cluster` 在 `seek_disk` 之后指向的是目标簇，这一点要先证实）。
+
+**另记（协作）**：主树里出现了 `user/shell/src/main.rs` 的改动与 `user/runtime/`、`parser.rs`、
+`registry.rs` 三个未跟踪文件——不是我改的。按 COORD.md 的分支制，这些应在 `H:/aurora-os-wb`
+里做。已提醒，**不会**把它们卷进我的提交。
+
+
+## 349. `fs-rw` 档接线：可写卷被真写、宿主机在镜像上读到（2026-11-16）
+
+- **特性**：`fs-rw = ["fs-ro"]`（**不**依赖 `fs-open`：那一档带着一整套要口 5 多级卷的只读判据，
+  写方向不该把它们顺带编进来——第一版就是这样，`t_fs_open_syscalls`/`t_ahci_disk` 一起红了）。
+- **模块**：`kernel/src/filesystem/fs_rw.rs`（`pub const PORT` + `static DISK` + `mount()`）。
+  口号与 `tools/aurora.py` 的 `FS_RW_PORTS` 各写一份（对账门禁下一轮扩）。
+- **口号 6 → 4**：q35 的 ich9-ahci 只映射 ide 口 0..5，`-drive if=ide,index=6` 直接
+  `machine type does not support if=ide,bus=6`。这一档不编 FAT 探针，**口 4 空着**，就用它——
+  不新造一条没量过的挂线方式（这一条是实测报错，不是推断）。
+- **用例** `t_fs_rw_write`：挂可写卷 → 读 `/LOG.TXT`(64B) 与 `/DATA.BIN`(1024B) 基线 →
+  在 LOG 偏移 8 写 4 字节 → 读回逐字节比（只有 `[8,12)` 变）→ 邻文件 `/DATA.BIN` 头 16 字节不变。
+- **读数**：`run --features fs-rw` = **PASS(33)**、ktests **88/88**；宿主机事后读 `build/fat32-rw.img`：
+  `LOG[8:12] = deadbeef`、`LOG[0:8] = 22456893b6d9fc27`（未动）、`DATA[0:8] = 0a31547b9ec5e80f`（未动）
+  —— 内核经 AHCI 真的把字节写进了镜像，宿主机在另一侧读到了它们。
+
+**没做的**：23 号 syscall 分派、`RIGHT_WRITE` 授予、判定行与三条负样本（越 EOF `-1`、分区外 `-7`、
+只读句柄 `-4`）、`check-fat32-ports` 对 `FS_RW_PORTS` 的对账。这一刀**没有**接进判定表。
+
+
+## 350. 23 号分派与 `RIGHT_WRITE`：落点已测绘，**本轮未动代码**（2026-11-16）
+
+上下文用尽前把落点查清了，写在这里免得下一轮重新摸：
+
+1. **分派**：`kernel/src/user.rs:1867` 是 `SYS_FILE_READ => sys_file_read(frame)`；23 号要加一条
+   `#[cfg(feature = "fs-rw")] SYS_FILE_WRITE => sys_file_write(frame)`，常量在 `user.rs` 的号表里
+   （`SYS_FILE_OPEN = 22` 附近），ABI 表与 `docs/design/user-abi-capability.md` 同改。
+2. **句柄**：`handle::begin_read`〔`handle.rs:806`〕是**取票—锁外 I/O—提交**的范式：
+   `check(t, h, owner, RIGHT_READ)?` → `ReadTicket{slot,gen,port,part,kind}` → 调用方做完 I/O 再回表提交游标。
+   写要一条对称的 `begin_write`（`RIGHT_WRITE`），且**只接受 `ObjRef::VfsFile`**（`fs-rw` 档没有 `ObjRef::File`）；
+   只读句柄 → `-4`（`HErr::Denied`），与现有越权口径一致。
+3. **游标提交**：读路径在 ticket 上有 `commit`；写要确认"写成功后才推进 `position`"——
+   `write_at` 已经把失败前的推进挡在整次拒绝上（越 EOF 一个字节不写），所以提交可以沿用同一处。
+4. **授予**：`open` 时 `RIGHT_READ` 是写死的；23 号这一刀要按 flags 授 `RIGHT_READ | RIGHT_WRITE`
+   （flags 位与 `F_FS_WRITE` 的取值是 ADR-111 未决 1，得先拍）。
+5. **判据**：`t_fs_rw_write` 已有 ring0 直写；23 号这一刀在它旁边加"经 `syscall_dispatch` 打 23"的格，
+   外加三条负样本（越 EOF `-1`、只读句柄 `-4`、分区外 `-7`），再进判定表（一行，`fs-rw` 档）。
+
+**现状**：树是绿的（`fs-rw` PASS(33) 88/88、`check` 17/17），本段只是计划，没有半成品代码在树里。
+
+### 350 附：`fs_open.rs` 被误删后已复原；`fs-open` 连撞两次链尾 HANG（2026-11-16）
+
+- **一次自己造成的伤**：撤掉 `fs_open.rs` 里那段可写挂载时切多了 90 行（切点选在 `static DISK` 之后，
+  把后面的 `Opened`/`stat_record`/`dirent_record` 全带走了）。`fs-rw` 不编这个文件所以当时没报错，
+  是随后 `build --features fs-open` 才暴露。**已 `git checkout --` 复原**（与 HEAD 逐字相同、0/90）。
+- `fs-open` 随后**连续两次** 120 秒 HANG，串口都停在 `t_va_interval_table -> ok` 之后——
+  与 §342/§344 那次同一个位置、同一个"恰好等于预算"的形状。判据未改，**不归因**；
+  两次都复现说明这台机器此刻负载高（另一 agent 在 `H:/aurora-os-wb` 里干活），预算被吃满。
+- 同一轮 `fs-rw` 仍是 PASS(33) 88/88。下一轮先确认宿主空闲、按 COORD 的运行队列排队再跑 `fs-open`。
+
+## 351. 23 号的前置已就位：`fs-rw` 现在带 `fs-open`，两块卷同时挂（2026-11-16）
+
+- `fs-rw = ["handles", "fs-open"]`：`ObjRef::VfsFile` 与句柄表都在 `fs-open` 后面
+  （`handle.rs:815`），没有它就没有"可写的文件对象"可授。
+- `fs-rw` 那一跑同时挂 **口 5（多级只读卷）与口 4（可写卷）**，并同时 `ensure_fat_deep()` +
+  `ensure_fat_rw()`；两块分开挂，谁也不许顶替谁。
+- 读数：`run --features fs-rw` = **PASS(33)**、ktests **97/97**（fs-open 的 95 条 + 可写卷那 1 条，
+  外加 `init-user` 那类用例的计法见串口）。**注意**：这 97 条是在两块卷都挂着的情况下全过的。
+
+**仍未做**：`SYS_FILE_WRITE` 常量与分派臂、`handle::begin_write`（`RIGHT_WRITE`、只认 `ObjRef::VfsFile`）、
+`sys_file_write` 的取票/提交、按 flags 授 `RIGHT_WRITE`、判定行与三条负样本。落点见 §350。
+
+## 352. 23 号分派臂与 `begin_write` 落地（2026-11-16）
+
+按 §350 的落点写完了，票的复用点也确认了：**`finish(ticket, bytes)` 只做 `*old = c`**，
+没有"按 bytes 再加一遍位置"的算术——所以 `write_at` 在票的游标副本上自己推进 `position`，
+成功之后直接 `finish` 提交，写与读共用同一条提交机制，不需要第二套。
+
+- `handle.rs`：`begin_write(h, owner)`（`RIGHT_WRITE`，只认 `ObjRef::VfsFile`，其余 `HErr::Denied`）、
+  `write_chunk(ticket, disk, src)`（走 `vfs_ro::write_at`，错误经 `vfs_to_herr`）。
+- `user.rs`：`SYS_FILE_WRITE = 23`、`#[cfg(feature = "fs-rw")] SYS_FILE_WRITE => sys_file_write(frame)`、
+  处理器按扇区取用户缓冲（`copy_from_user`）→ `write_chunk` → `finish`；用户缓冲坏 ⇒ `abort` + `-?`（`E_FAULT`），
+  盘错 ⇒ `abort` + 映射后的错误码。`want==0` ⇒ `E_INVALID`、`want>COPY_MAX` ⇒ `E_TOO_LONG`（与读对称）。
+- 读数：`run --features fs-rw` = **PASS(33)**、ktests **97/97**，ELF `bc3c88fb2c44…`。
+
+**还没证的**：这一条**没有**经 `syscall_dispatch` 的判据——`t_fs_rw_write` 仍然是 ring0 直调 `write_at`。
+要补就得在 `fs_rw.rs` 里复制 `fs_open.rs` 那套用户页（`alloc_user_va_range` + `map` + `frame0`），
+或者把 fs_open 的 `call/put_user/frame0` 提成 `ktests/common.rs` 的共享夹具（倾向后者）。
+在此之前 **23 号不算交付**：编译通过只说明形状对。
+
+## 353. 用户页/syscall 夹具提取到 `ktests/common.rs`（2026-11-16）
+
+- 从 `fs_open.rs` 把 `put_user` / `get_user` / `frame0` / `call` 四个整块搬到 `common.rs`，
+  统一 `pub(crate)`；`fs_open.rs` 删 25 行、加一行 `use super::common::{call, frame0, get_user, put_user};`。
+- 按行处理（CRLF），不是字符串手术：上一轮两次补丁都死在 `"
+}
+"` 与 CRLF 不匹配上，
+  这次按 `split("
+")` + 找 `}` 行整块切，`git diff --numstat` 是 `+25/-0` 与 `+0/-25`（净搬移）。
+- 读数：`run --features fs-open` = **PASS(33)**（ELF `9d8be27150bb`）、`run --features fs-rw` = **PASS(33)**
+  （ELF `0e92175752dc`）。两个档都编了、都跑了——`fs_open.rs` 只在 `fs-open`/`fs-rw` 下编译，
+  上一轮就是漏了这一点才没发现自己切掉 90 行。
+- 顺带一条：§350 附记那次 `fs-open` 连撞两次链尾 HANG，本轮同一份源码直接 PASS(33)，
+  说明那次是环境形状（宿主当时正被另一棵 worktree 的构建压着），不是回归。
+
+**下一步**：`fs_rw.rs` 里加 `t_fs_rw_syscall23`（grant `RIGHT_READ|RIGHT_WRITE` → 用户页 → rax=23 →
+`syscall_dispatch` → 读回比对 + 三条负样本），现在共享夹具齐了，写起来就是填空。
+
+## 354. 23 号经 dispatch 的判据：第一版连带红 42 条，已撤回（2026-11-16）
+
+- 写了 `t_fs_rw_syscall23`（授 `RIGHT_READ|RIGHT_WRITE` → 用户页 → `rax=23` → 读回 + 三条负样本：
+  越 EOF / `want=0` / 只读句柄）。编译过，但一跑 `ktests: total=98 passed=95 failed=42`。
+- **成因**：用例开头调了 `handle::reset_for_test()` 清表——`.ktests` 的顺序由链接器决定，
+  这张表是**全局**的，清一次就把别的用例手上的句柄全作废了（42 条连带红）。
+- 已整块撤回，`fs-rw` 恢复 **PASS(33)**（ELF `0e92175752dc`，与 §353 同一个）。
+- **下一版怎么改**（写在这免得重踩）：不清表；用 `grant_vfs_file` 拿两个句柄、跑完 `handle_close` 两个；
+  用户页照旧；`drop(map)` 留在末尾。若担心表满，先读 `handle::counters().grants` 判断余量，
+  而不是清表。
+
+## 355. 验收 workbuddy 的量具修复：跨树字节稳定成立，但**引入一条真红**（2026-11-16）
+
+作为量具的归属方验收 `0b6c99e` 的方案（`-C debuginfo=0`）：
+
+**成立的部分（我这边复现了）**：四条 `*_RUSTFLAGS` 各加 `-C debuginfo=0` 后重造，
+`hello.elf` = **17,288 字节 / sha256 `8e3972a8a788…`** —— 与 workbuddy 实验里"两棵树一致"
+的那个值**逐字相同**。所以"路径差唯一的载体是 debuginfo"这条判断，从我的树上也成立。
+
+**但它带出一条真红**：`run --features fs-open` ⇒ `ktests 95/96 failed=1`，
+`[fatal] fs-open-ring3: 不成立 abi abi=0x0 期望位=0x200 minor=12` —— ring3 探针的
+`SYS_ABI_INFO` 那一格读到 0。其余 95 条全过（含 ELF 装载、22/24/25/26、多级）。
+判据没有改动，这条红**不是**环境形状：它稳定复现于新夹具，换回旧夹具即消失。
+
+**处置**：已撤回 `-C debuginfo=0`（四条 RUSTFLAGS 复原），重造夹具回到
+`hello 32,672 / e5d84753af57`、`probe 782,152 / c870dc121341`、`shell 40,904 / bdda017ec685`、
+`fileprobe 41,280 / 33414f23b5a3`，`fs-open` 立刻回到 **PASS(33)**（ELF `9d8be27150bb`）。
+
+**下一手（给 workbuddy/qoder）**：先定位 `abi=0x0` 是"探针没跑到那一格"还是"7 号真的回了 0"——
+`fs-open-ring3: 取证` 行里其余 20 来格都是有值的（读回=100、首8、多级…），所以更像
+**`abi_word()` 在 debuginfo=0 的构建里没置位**，而不是探针崩了。查 `user::abi_word()` 的置位条件
+（是否依赖某个只在 debug 段/某特性下存在的符号），再决定这条修复是"补一句置位"还是"放弃这条修复"。
+在它绿之前，**量具修复不进 main**——跨树字节稳定是好事，但不能拿一条 ABI 判据去换。
+
+### 355 附：`abi=0x0` 不是 `abi_word()` 的锅——**我自己上一段的猜测被代码否掉了**
+
+`user::abi_word()`〔`kernel/src/user.rs:147`〕的返回式是
+`(ABI_MAJOR << 32) | (ABI_MINOR << 16) | f`，**结构上不可能返回 0**（MINOR=12 ⇒ 至少 `0x000C_0000`）。
+所以在 `debuginfo=0` 那跑里读到的 `abi=0x0` 只能来自"探针 → 槽 → 快照"这条链，而不是 `abi_word`。
+
+同一份 `fs-open-ring3: 取证` 行里 ABI 的左右邻居（`MAGIC` 在 0、`OPEN` 在 16）都是对的，
+`读回=100`、多级那几格也都是对的 ⇒ 偏移映射没问题，**是 `SLOT_ABI` 这一格本身当时是 0**。
+
+下一手要做的只有一件事，且很便宜：在 `debuginfo=0` 的构建里加一格**ring0 直读**
+`user::abi_word()`（不过探针、不过槽、不过快照）。它有三种结果，各指一条路：
+- ring0 读到 `0x000C_0200` 而探针格是 0 ⇒ 断在探针的 `put(SLOT_ABI, …)` 或那次 7 号调用；
+- ring0 也读到 0 ⇒ `abi_word()` 的输入（`fastpath_on/smap/smep/boot_guard`）在那构建里全假；
+- ring0 读到别的值 ⇒ 快照时机（`DONE` 与 `SLOT_ABI` 的先后）在那构建里被改了。
+
+**在此之前不改量具**：§355 的撤回仍然成立，树是绿的。
+
+### 355 附二：`abi=0x0` **不复现**——我上一段"稳定复现"的说法要撤回（2026-11-16）
+
+加了那格 ring0 直读（`fs-open-ring3: abi直读={} 探针槽={}`，不过探针/不过槽/不过快照）之后，
+**带 `-C debuginfo=0` 连跑两次都是 PASS(33)**：
+
+```
+fs-open-ring3: abi直读=0xc03f7 探针槽=0xc03f7      ← 两次逐字相同
+```
+
+- `0xc03f7` 与不带该 flag 的构建**完全一致**（同一格、同一值），所以"去掉 debuginfo 会让 ABI 位丢"
+  这条**不成立**；`abi_word()` 结构上也不可能返回 0（见上一附）。
+- **我要撤回 §355 里那句话**："它稳定复现于新夹具"——那是 **n=1** 的读数，我把它写成了"稳定"。
+  按本仓的取证纪律，单次读数不能当"稳定/确定"用；这次两跑一致才够说"不复现"。
+- 现在能说的最硬的一句：**`abi=0x0` 出现过一次、不可复现**；ring0 直读与探针槽在两个构建里都同值同数。
+  下一次再遇到它，先看这一行（`abi直读`）再谈是谁的锅。
+
+**当前树的状态**：四条用户产物 RUSTFLAGS **保留 `-C debuginfo=0`**（夹具已按新字节重造：
+hello 17,288/`8e3972a8a788`、probe 754,048/`4951899204aa`、shell 9,120/`e187ff3c1537`、
+fileprobe 12,944/`cfdea8f04037`），`fs-open` 连跑两次 **PASS(33)**（ELF `b01e0884bb40`）。
+**尚未**做：`check` 17 道与判定表整链在新夹具上的重验——那一步做完才谈得上"量具修复进 main"。
+
+## 356. 新夹具整链：61 行 **58 符合 / 3 不符合**——三条全是"两块 FAT32 卷里的 hello.elf 还是旧的"（2026-11-16）
+
+`build/matrix-qoder-debinfo0.txt`：61 行，不符合三条，且**都集中在"从盘上取镜像来跑"这一族**：
+
+```
+FAT32读出的镜像装上并跑通 : FAIL(rc=35) 期望 PASS
+FAT32④段内字节改了必须红  : CONTENT-MISMATCH(rc=35) 期望 FAIL(rc=35)
+P7 句柄ring3读自己镜像     : FAIL(rc=35) 期望 PASS
+```
+
+- 旁证：同一跑里 `签名包两份实现同答案`、`FS-03` 两行、两条多级负样本、`多级` 全部符合。
+- **成因**（结构性，不是环境）：两块只读真卷是仓库里的 `.img.zz`，里面那份 `hello.elf` 是
+  **造卷时写进去的旧字节**（32,672 字节）。`-C debuginfo=0` 把内核夹具换成了 17,288 字节，
+  但 `.zz` 没变 ⇒ 那一族判据比的是"盘上旧 ELF"与"内嵌新 ELF"，必然不等。
+  ④ 那一行的 CONTENT-MISMATCH 也是同一个原因：它的证人在盘上找不到计划中的那段指令图案。
+- **修法明确**：跑 `tools/patch_fat32_file.py` 把**新的** `hello.elf` 换进两块 `.zz` 卷
+  （它写后复验），然后重登记 `FAT_EXPECT` 的字节数与 sha256，再跑整链。
+  §341 记过"整卷 mformat 仍卡着"——但**单文件替换**这条路是通的（P7 当年就是它）。
+- 顺带一条自己造成的：整链第一次跑死在**默认档编译**——我插 `sys_file_write` 时把
+  `sys_file_read` 的 `#[cfg(feature = "handles")]` 挤走了（属性粘到新函数上）。已补回，默认档 PASS(33)。
+  **今天第三次**踩"只编带特性的档会漏"这个坑（前两次：`fs_open.rs` 被切 90 行、
+  `fs-rw` 漏挂卷）。改完 `user.rs` 必须把**默认档**也编一遍。
+
+## 357. 补卷之后：③④ 转绿，但整链被**无关用例**带红——树的成分不纯（2026-11-16）
+
+`build/matrix-qoder-debinfo0-patched.txt`：61 行 **57 符合 / 4 不符合**。
+
+**补卷确实起了作用**（这两条从红转绿）：
+```
+FAT32④段内字节改了必须红 : FAIL(rc=35) 期望 FAIL(rc=35) -> 符合
+P7 句柄授错主人必须红     : FAIL(rc=35) 期望 FAIL(rc=35) -> 符合
+```
+`FAT32④` 的证人能在盘上重新找到那段指令图案，说明"盘上那份 hello.elf 与内嵌的一致"这件事成立了。
+
+**但另外四条各自的成因不是 FS**：
+- `FAT32两卷与宿主机对账`：`卷A哈希=0xb46b5bf89c811bba 卷B哈希=0` —— **卷B 读到 0**，那一跑 B 口没读出东西。
+- `FAT32读出的镜像装上并跑通` / `P7 句柄ring3读自己镜像`：跟着同一跑的 `t_irq_ahci` /
+  `t_ps2_kbd_decode` 一起红（串口里 `[FAIL] t_irq_ahci`、`[FAIL] t_ps2_kbd_decode`）。
+- `FS-03文件ABI与多级真卷对账`：成因行只指到 `t_cross_cpu_lock_contention -> ok`，同一跑里有别的用例先红。
+
+这两个失败用例**都不是我这轮的产物**：主树里混着 workbuddy 的在途改动（`user/shell/main.rs` 已改、
+`parser.rs`/`registry.rs`/`runtime/` 未跟踪、`Cargo.toml`/`crates.toml`/`shell.elf` 变动）。
+按 COORD 的分支制，这棵树**不能用来判"我的量具修复是否成立"**——成分不纯，红是谁的都说不清。
+
+**下一步（不多，且顺序重要）**：
+1. 把这轮 FS 的改动与量具修复在自己的分支上定稿（现在都在 `main` 工作区，未提交）；
+2. 在**只含这些改动**的树上重跑 `check` + 整链 —— 那才是合并前的那份读数；
+3. 全绿后按 COORD §5 合并 `feat/wb-dev`（合并态再跑一次）。
+在此之前，"量具修复是否可合并"这个问题**没有答案**，不能拿 57/4 去说它坏。

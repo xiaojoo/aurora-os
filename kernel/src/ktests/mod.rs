@@ -16,6 +16,8 @@ pub(crate) mod fs;
 mod vfs_ro;
 #[cfg(feature = "fs-open")]
 mod fs_open;
+#[cfg(feature = "fs-rw")]
+mod fs_rw;
 #[cfg(feature = "gpt-probe")]
 mod gpt;
 mod heap;

@@ -13,6 +13,7 @@ use crate::filesystem::vfs::AhciDisk;
 use crate::filesystem::vfs_ro::{self, ReadOnlyFs, VfsError};
 use crate::handle::{self, Handle, MAX_HANDLES, RIGHT_READ};
 use crate::{ahci, ktest, mm, sched, user};
+use super::common::{call, frame0, get_user, put_user};
 
 const SMALL: &[u8] = b"/SMALL.BIN";
 const ROOT: &[u8] = b"/";
@@ -38,31 +39,6 @@ fn u16_le(b: &[u8], off: usize) -> u16 {
 
 fn u32_le(b: &[u8], off: usize) -> u32 {
     (b[off] as u32) | ((b[off + 1] as u32) << 8) | ((b[off + 2] as u32) << 16) | ((b[off + 3] as u32) << 24)
-}
-
-fn put_user(va: u64, off: usize, bytes: &[u8]) -> bool {
-    matches!(user::copy_to_user(bytes, va + off as u64), Ok(n) if n == bytes.len())
-}
-
-fn get_user(va: u64, off: usize, dst: &mut [u8]) -> bool {
-    matches!(user::copy_from_user(va + off as u64, dst), Ok(n) if n == dst.len())
-}
-
-fn frame0() -> TrapFrame {
-    TrapFrame {
-        cr2: 0, r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
-        rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0, vector: 0,
-        error_code: 0, rip: 0, cs: 0, rflags: 0, rsp: 0, ss: 0,
-    }
-}
-
-fn call(fr: &mut TrapFrame, nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
-    fr.rax = nr;
-    fr.rdi = a1;
-    fr.rsi = a2;
-    fr.rdx = a3;
-    user::syscall_dispatch(fr);
-    fr.rax
 }
 
 fn open_path(fr: &mut TrapFrame, va: u64, path: &[u8]) -> Result<Handle, u64> {
@@ -871,6 +847,8 @@ fn t_fs_open_ring3() -> bool {
         }
     }
 
+    // §355 附：这格不过探针、不过槽、不过快照——用来把"abi=0"钉到链上的哪一段。
+    crate::log_info!("fs-open-ring3: abi直读={:#x} 探针槽={:#x}", crate::user::abi_word(), abi);
     crate::log_info!(
         "fs-open-ring3: 取证 读回={} 首8={:#x} 字节和={} 尾字节数={} 尾首8={:#x} 尾和={} stat大小={} 首簇={} 条目={} 名字和={} 大小和={} 多级读回={} 多级首8={:#x} 多级和={} 多级首簇={} proj条目={} proj名字和={} 表清空={} 回收={} rounds={} served={} 诊断mul={:#x} 诊断add={:#x} ⇒ {}",
         box_[(fp::READ_TOTAL / 8) as usize],

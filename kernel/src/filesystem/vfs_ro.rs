@@ -748,6 +748,47 @@ fn check_entry_cluster(v: &Bpb, c: u32) -> Result<(), VfsError> {
     Ok(())
 }
 
+/// 覆盖写（ADR-111 决策 1）：从游标当前位置开始，**只覆盖已有区间**。
+///
+/// 这一层刻意不做创建/截断/扩展：那要分配簇、改两份 FAT、改 FSInfo、改目录项大小，
+/// 是另一刀。越 EOF 时**整次拒绝**（`BadOffset`）并且一个字节都不写——部分写会让调用方
+/// 以为成功，而它拿到的是"写了一半"。
+///
+/// 非整扇区的那几段必须**读-改-写**：直接写整扇区会把同一扇区里没被请求的邻居字节一起改掉，
+/// 这是写方向最典型的一种错，`vfs-ro: 写方向` 那几格专门盯着它。
+pub fn write_at(disk: &dyn Block, cur: &mut ReadCursor, src: &[u8]) -> Result<usize, VfsError> {
+    if src.is_empty() {
+        return Ok(0);
+    }
+    let start = cur.position as usize;
+    let end = start.checked_add(src.len()).ok_or(VfsError::BadOffset)?;
+    if end > cur.stat.size as usize {
+        return Err(VfsError::BadOffset);
+    }
+    let mut done = 0usize;
+    while done < src.len() {
+        let pos = cur.position as usize;
+        seek_disk(disk, cur, pos as u32)?;
+        let v = cur.bpb;
+        let base = data_lba(&v, cur.cluster)?;
+        let off_in_cluster = pos % v.cluster_bytes;
+        let in_sector = pos % SECTOR_BYTES;
+        let lba = base + (off_in_cluster / SECTOR_BYTES) as u64;
+        let take = core::cmp::min(SECTOR_BYTES - in_sector, src.len() - done);
+        if in_sector != 0 || take != SECTOR_BYTES {
+            let mut sec = [0u8; SECTOR_BYTES];
+            disk.read_sectors(lba, &mut sec).map_err(io)?;
+            sec[in_sector..in_sector + take].copy_from_slice(&src[done..done + take]);
+            disk.write_sectors(lba, &sec).map_err(io)?;
+        } else {
+            disk.write_sectors(lba, &src[done..done + take]).map_err(io)?;
+        }
+        done += take;
+        cur.position += take as u32;
+    }
+    Ok(done)
+}
+
 fn data_lba(v: &Bpb, c: u32) -> Result<u64, VfsError> {
     let limit = if v.fat_type == FatType::Fat16 { FAT16_DATA_LIMIT } else { FAT32_DATA_LIMIT };
     if c < MIN_CLUSTER || c >= limit || (c - MIN_CLUSTER) as u64 >= v.clusters {

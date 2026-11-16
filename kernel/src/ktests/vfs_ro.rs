@@ -13,7 +13,7 @@
 use crate::ahci;
 use crate::filesystem::fat32::FsError;
 use crate::filesystem::gpt;
-use crate::filesystem::vfs::{AhciDisk, MemDisk, Partition, PartitionView};
+use crate::filesystem::vfs::{AhciDisk, Block, BlockError, MemDisk, Partition, PartitionView, SECTOR_BYTES};
 use crate::filesystem::vfs_ro::{self, Entry, ReadOnlyFs, VfsError};
 use crate::ktest;
 
@@ -549,8 +549,77 @@ fn t_vfs_ro() -> bool {
         return fail("坏卷负样本", VfsError::BadPath);
     }
 
+    // ADR-111 决策 2：写方向的两种拒绝必须分得开——"只读实现"是 Refused，
+    // "越过 GPT 给的那个区间"是 BeyondPartition。合成一格，负样本就再也分不开是谁拒的。
+    // 借用只在这一次里：上面 `make_image(&mut img)` 之后，早先那个 `disk` 已经不再借 `img`，
+    // 这里另起一个短借，别把旧绑定的生命周期拖到函数末尾（会的，NLL 一扩就红）。
+    let mut one = [0u8; 512];
+    let (ro_refused, out_beyond, in_refused, bad_shape) = {
+        let ro = MemDisk { img: &img };
+        let part = Partition { base: 0, last: 0 };
+        let view = PartitionView { inner: &ro, part };
+        (
+            ro.write_sectors(0, &one) == Err(BlockError::Refused),
+            view.write_sectors(1, &one) == Err(BlockError::BeyondPartition),
+            view.write_sectors(0, &one) == Err(BlockError::Refused),
+            ro.write_sectors(0, &one[..SECTOR_BYTES - 1]) == Err(BlockError::Refused),
+        )
+    };
+    crate::log_info!(
+        "vfs-ro: 写方向 只读实现拒={} 分区外拒={} 分区内转发={} 形状拒={}",
+        ro_refused, out_beyond, in_refused, bad_shape
+    );
+    if !(ro_refused && out_beyond && in_refused && bad_shape) {
+        return fail("写方向四种拒绝", VfsError::BadPath);
+    }
+
     crate::log_info!("vfs-ro: 判据 到达末尾=true");
     true
+}
+
+
+/// 可变内存盘：写方向的判据要"写进去再读回来"，只读的 `MemDisk` 给不了。
+/// 用 `RefCell<&mut [u8]>` 而不是裸指针：这一格不值得开一个 unsafe 白名单条目。
+struct RwDisk<'a>(core::cell::RefCell<&'a mut [u8]>);
+
+impl<'a> RwDisk<'a> {
+    fn new(buf: &'a mut [u8]) -> Self {
+        RwDisk(core::cell::RefCell::new(buf))
+    }
+
+    fn snapshot(&self) -> alloc::vec::Vec<u8> {
+        self.0.borrow().to_vec()
+    }
+}
+
+impl crate::filesystem::vfs::Block for RwDisk<'_> {
+    fn read_sectors(&self, lba: u64, dst: &mut [u8]) -> Result<(), BlockError> {
+        let img = self.0.borrow();
+        if dst.is_empty() || dst.len() % SECTOR_BYTES != 0 {
+            return Err(BlockError::Refused);
+        }
+        let start = lba as usize * SECTOR_BYTES;
+        let end = start + dst.len();
+        if end > img.len() {
+            return Err(BlockError::Refused);
+        }
+        dst.copy_from_slice(&img[start..end]);
+        Ok(())
+    }
+
+    fn write_sectors(&self, lba: u64, src: &[u8]) -> Result<(), BlockError> {
+        let mut img = self.0.borrow_mut();
+        if src.is_empty() || src.len() % SECTOR_BYTES != 0 {
+            return Err(BlockError::Refused);
+        }
+        let start = lba as usize * SECTOR_BYTES;
+        let end = start + src.len();
+        if end > img.len() {
+            return Err(BlockError::Refused);
+        }
+        img[start..end].copy_from_slice(src);
+        Ok(())
+    }
 }
 
 /// FAT32 那一半：根在簇链上而不是固定区，目录项簇号要拼高半。与 FAT16 用例分开登记，
@@ -911,7 +980,112 @@ fn t_vfs_ro_esp() -> bool {
     true
 }
 
+
+
+
+/// ADR-111：覆盖写。栈上自开一块 `F32_VOL_BYTES` 的卷，不碰 `LARGE_MAX = 2048` 的堆上限。
+///
+/// 夹具里的 `/SUB/INNER.TXT` 只有 **7 字节**（`inner!\n`）：写限定在 `[2,5)`，
+/// 同扇区的 0/1/6 三格就是"读-改-写没把邻居一起换掉"的证人。
+fn t_vfs_ro_write() -> bool {
+    let mut img = [0u8; F32_VOL_BYTES];
+    make_image32(&mut img);
+    let rw = RwDisk::new(&mut img);
+    let fs = match ReadOnlyFs::mount(&rw) {
+        Ok(f) => f,
+        Err(e) => {
+            crate::log_fatal!("vfs-ro-w: 可写卷挂载被拒 成因={}", e.tag());
+            return false;
+        }
+    };
+    let f = match fs.lookup("/SUB/INNER.TXT") {
+        Ok(e) => e,
+        Err(e) => {
+            crate::log_fatal!("vfs-ro-w: 查 INNER 被拒 成因={}", e.tag());
+            return false;
+        }
+    };
+    let size = f.size as usize;
+    if size != FILE_INNER_LEN {
+        crate::log_fatal!("vfs-ro-w: 夹具 INNER 大小变了 size={}", size);
+        return false;
+    }
+    let mut cur = match fs.open(&f) {
+        Ok(c) => c,
+        Err(e) => {
+            crate::log_fatal!("vfs-ro-w: 打开 INNER 被拒 成因={}", e.tag());
+            return false;
+        }
+    };
+
+    // 基线：整份 7 字节
+    let mut before = [0u8; FILE_INNER_LEN];
+    let base_ok = crate::filesystem::vfs_ro::seek_disk(&rw, &mut cur, 0).is_ok();
+    let base_ok = base_ok && {
+        match fs.read(&mut cur, &mut before) {
+            Ok(n) => n == size,
+            Err(_) => false,
+        }
+    };
+
+    // (1) 非整扇区写：偏移 2、3 字节 ⇒ 必须走读-改-写
+    let seek_ok = crate::filesystem::vfs_ro::seek_disk(&rw, &mut cur, 2).is_ok();
+    let mut wrote_mis = false;
+    if seek_ok {
+        if let Ok(n) = crate::filesystem::vfs_ro::write_at(&rw, &mut cur, &[0xA5, 0x5A, 0xC3]) {
+            wrote_mis = n == 3;
+        }
+    }
+    wrote_mis = wrote_mis && base_ok;
+
+    // (2) 读回 + 邻居：0/1/6 必须还是原值
+    let mut after = [0u8; FILE_INNER_LEN];
+    let back_ok = crate::filesystem::vfs_ro::seek_disk(&rw, &mut cur, 0).is_ok();
+    let read_back = back_ok && {
+        match fs.read(&mut cur, &mut after) {
+            Ok(n) => n == size,
+            Err(_) => false,
+        }
+    };
+    let pat = [0xA5u8, 0x5A, 0xC3];
+    let mut neigh_ok = read_back;
+    if read_back {
+        let mut i = 0usize;
+        while i < size {
+            let want = if i >= 2 && i < 5 { pat[i - 2] } else { before[i] };
+            if after[i] != want {
+                neigh_ok = false;
+                break;
+            }
+            i += 1;
+        }
+    }
+
+    // (3) 越 EOF：整次拒（一个字节都不写）
+    let mut eof_ok = false;
+    if crate::filesystem::vfs_ro::seek_disk(&rw, &mut cur, size as u32).is_ok() {
+        if let Err(VfsError::BadOffset) = crate::filesystem::vfs_ro::write_at(&rw, &mut cur, &[0xFFu8; 1]) {
+            eof_ok = true;
+        }
+    }
+
+    // (4) 空写：Ok(0)，不动游标内容
+    let mut empty_ok = false;
+    if crate::filesystem::vfs_ro::seek_disk(&rw, &mut cur, 0).is_ok() {
+        if let Ok(0) = crate::filesystem::vfs_ro::write_at(&rw, &mut cur, &[]) {
+            empty_ok = true;
+        }
+    }
+
+    crate::log_info!(
+        "vfs-ro-w: 覆盖写 非整扇区={} 读回={} 邻居未动={} 越EOF拒={} 空写={}",
+        wrote_mis, read_back, neigh_ok, eof_ok, empty_ok
+    );
+    wrote_mis && read_back && neigh_ok && eof_ok && empty_ok
+}
+
 ktest!(KT_VFS_RO, t_vfs_ro);
 ktest!(KT_VFS_RO_FAT32, t_vfs_ro_fat32);
+ktest!(KT_VFS_RO_WRITE, t_vfs_ro_write);
 ktest!(KT_VFS_RO_LFN, t_vfs_ro_lfn);
 ktest!(KT_VFS_RO_ESP, t_vfs_ro_esp);

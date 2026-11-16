@@ -1,7 +1,8 @@
 //! 跨用例共用的夹具与等待辅助（T0.1 从 main.rs 纯搬移）。
 
 use crate::arch::x86_64::{apic};
-use crate::{sched, tsc};
+use crate::arch::x86_64::trap::TrapFrame;
+use crate::{sched, tsc, user};
 
 // ---------------------------------------------------------------- M4-2：ELF 容器
 //
@@ -86,3 +87,26 @@ pub(crate) fn drain_reap() -> bool {
     hit
 }
 
+// ---------------------------------------------------------------- 用户页与 syscall 夹具
+// 从 `fs_open.rs` 提出来（23 号写方向要同一套）：三份各自维护，"用户页怎么造"就会漂成三份。
+pub(crate) fn put_user(va: u64, off: usize, bytes: &[u8]) -> bool {
+    matches!(user::copy_to_user(bytes, va + off as u64), Ok(n) if n == bytes.len())
+}
+pub(crate) fn get_user(va: u64, off: usize, dst: &mut [u8]) -> bool {
+    matches!(user::copy_from_user(va + off as u64, dst), Ok(n) if n == dst.len())
+}
+pub(crate) fn frame0() -> TrapFrame {
+    TrapFrame {
+        cr2: 0, r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
+        rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0, vector: 0,
+        error_code: 0, rip: 0, cs: 0, rflags: 0, rsp: 0, ss: 0,
+    }
+}
+pub(crate) fn call(fr: &mut TrapFrame, nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    fr.rax = nr;
+    fr.rdi = a1;
+    fr.rsi = a2;
+    fr.rdx = a3;
+    user::syscall_dispatch(fr);
+    fr.rax
+}
