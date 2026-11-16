@@ -26,9 +26,9 @@ scope = "main.rs：sys4 的 int 0x80（rax/rdi/rsi/rdx/r10）· slots_base/src_a
 expires = "P5c 之后若它开始打 11/15/16 或读 StartupInfo，unsafe 面会扩，那时回这条账重登记"
 
 [crate.aurora-user-shell]
-reason = "第三个用户产物（S5c，第一个交互式程序）：unsafe 需求是 int 0x80 的三参入口、读内核交进来的 StartupInfo 那一页（只读、页内、先核魔数与条数上限）、往自己的行缓冲写字节、以及 panic/收尾的自跳转；不碰任何内核对象"
-scope = "main.rs：syscall3 的 int 0x80（rax/rdi/rsi/rdx）· find_console 的 read_unaligned（头 24 字节 + 最多 16 条描述，全在那一页内，先核 SI_MAGIC 与 nhandles 上限）· con_read_byte 往调用方给的 &mut u8 写一字节 · _start 的行缓冲写入与回显 · panic 与两处收尾自跳转"
-expires = "S5c 之后若它开始打别的号或读别的页，unsafe 面会扩，那时回这条账重登记"
+reason = "第三个用户产物（S5c→A2 接线后）：syscall 底座已迁 aurora-user-runtime，本包剩余 unsafe 需求只有 msgs_base 的 RIP 相对 lea 取基址、panic 自跳转、对自家静态 blob 的切片、以及对 rt::find_console（unsafe fn）的一次调用；不碰任何内核对象"
+scope = "main.rs：msgs_base 的 lea 块 · msg 的 from_raw_parts（MSGS blob 内、常量偏移有界）· panic 自跳转 · _start 对 rt::find_console 的一次调用"
+expires = "A2 接线后 unsafe 面已收窄到交互逻辑本身；若它重新长出 int 0x80 或读别的页，回这条账重登记"
 
 # FS-03 切片 D（ADR-108 决策 8）：第四个用户产物 = ring3 文件探针。
 [crate.aurora-user-fileprobe]
@@ -66,15 +66,16 @@ expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe
 # 2026-11-07 P7：hello 加了 syscall3（U1 两处）与 ring3 句柄读/close（U5 三处）。
 
 [unsafe-census]
-# 2026-11-16 A2/A3 切片：+user/runtime（U1 3 / U5 23）、+user/shell/registry（U5 2）；
-# user/shell main.rs 的 U5 由 12 重算为 10（dispatch 的 ping/abi 两处随 A3 迁入 registry，
-# 数目对账：427+26=453、79+3=82、54+25=77——registry 两处计入 U5）。类别规则未改。
-total = 453
-U1 = 82
+# 2026-11-16 A2/A3 切片：+user/runtime（U1 3 / U5 23）；
+# 2026-11-16 A2 接线：shell 的 syscall 底座迁入 runtime ⇒ user/shell 17→4（U1 7→2、U5 10→2）、
+# user/shell/registry 段删除（cmd_ping/abi 改走 safe API，0 处）。数目对账：
+# 453-15=438、82-5=77、77-10=67。类别规则未改。
+total = 438
+U1 = 77
 U2 = 114
 U3 = 13
 U4 = 131
-U5 = 77
+U5 = 67
 U6 = 36
 
 [modules."acpi"]
@@ -285,17 +286,13 @@ U1 = 4
 U5 = 8
 
 [modules."user/shell"]
-# S5c：第一个交互式用户产物。U1 六处 = syscall3 的 int 0x80 入口与其 unsafe fn 声明、
-# panic 自跳转、_start 里两处收尾自跳转、以及 find_console 的 unsafe fn 声明。
-# 指针来源：StartupInfo 那一页由内核 process_start 校验并映射（user+只读），
-# 首参 si_va 由 set_thread_arg 交进来；行缓冲是本函数栈上的 [u8;128]。
-# 上下文 USER_ENTRY；不变量由 ABI 约定（号 rax、参数 rdi/rsi/rdx、返回 rax）与
-# "先核魔数与条数上限再解引用"保证。生命周期 = 本进程；单任务访问无并发。
-U1 = 7
-# 2026-11-16 A3 重算：U5 由 12 降到 10，**这次差额有归因**——dispatch 里 ping/abi 两个
-# unsafe 调用块随解析器/注册表重构整体迁入 user/shell/registry（见下一登记段），逐处行
-# 已按当前源码重列（见 unsafe-census.md 的 user/shell 节）。
-U5 = 10
+# S5c→A2 接线后（2026-11-16）：syscall 底座（int 0x80 入口、find_console、con 读写）整体迁入
+# aurora-user-runtime，本模块只剩交互逻辑。U1 两处 = msgs_base 的 RIP 相对 lea 取基址块、
+# panic 自跳转。U5 两处 = msg 的 from_raw_parts（对自家静态 MSGS blob 的切片，常量偏移有界）
+# 与 _start 对 rt::find_console（unsafe fn）的那一次调用——si_va 由内核 process_start 校验
+# 并映射（user+只读），契约原文在 runtime 侧。上下文 USER_ENTRY；生命周期 = 本进程；无并发。
+U1 = 2
+U5 = 2
 
 [modules."virtio"]
 U4 = 10
@@ -312,13 +309,6 @@ U4 = 10
 #   不变量由 `unsafe impl Sync for VmoCell` 上面那段论证与 vmo_write/vmo_read 的长度检查保证。
 U2 = 3
 U4 = 2
-
-[modules."user/shell/registry"]
-# A3（总设计切片，2026-11-16）：内置命令注册表。U5 两处 = cmd_ping/cmd_abi 的
-# syscall3 调用块，随 dispatch 重构自 user/shell/src/main.rs 原样迁入，**未新增 unsafe**。
-# 指针来源：无指针参数（ping/abi 均 0 参）；上下文 USER_ENTRY；
-# 不变量由 ABI 约定（号 rax）保证。生命周期 = 本进程；单任务访问无并发。
-U5 = 2
 
 [modules."user/runtime"]
 # A2（总设计切片，2026-11-16）：用户态运行时库。U1 三处 = syscall_abi 的 unsafe fn 声明

@@ -16,9 +16,10 @@
 //! `rest`（原始剩余）才能保住逐字节回归线，见 `cmd_echo`。
 
 use crate::parser::Parsed;
-use crate::{con_write, msg, put_u64, syscall3};
+use aurora_user_runtime as rt;
+
+use crate::{con_write, msg, put_u64};
 use crate::{M_ABI, M_BYE, M_HELP, M_NL, M_PING, M_TRYHELP, M_UNKNOWN};
-use crate::{SYS_ABI_INFO, SYS_PING};
 
 /// 控制台句柄（内核按角色 `ROLE_LOG` 转移给 shell 的那个 u64）。
 pub type ConsoleHandle = u64;
@@ -53,9 +54,8 @@ fn cmd_echo(h: ConsoleHandle, p: &Parsed) -> bool {
 }
 
 fn cmd_ping(h: ConsoleHandle, _p: &Parsed) -> bool {
-    // SAFETY: 与旧 dispatch 逐字相同的那次调用——只有内核能处理 0x80 中断，
-    // 号与参数按 §10.2 的 ABI 走寄存器；随命令处理逻辑迁入本模块，未新增 unsafe。
-    let n = unsafe { syscall3(SYS_PING, 0, 0, 0) };
+    // A2 接线：1 号调用迁到 `rt::ping()`（返回值同义：内核服务计数）。
+    let n = rt::ping();
     con_write(h, msg(M_PING));
     put_u64(h, n);
     con_write(h, msg(M_NL));
@@ -63,8 +63,8 @@ fn cmd_ping(h: ConsoleHandle, _p: &Parsed) -> bool {
 }
 
 fn cmd_abi(h: ConsoleHandle, _p: &Parsed) -> bool {
-    // SAFETY: 同 cmd_ping：同一次迁入的 7 号调用，ABI 与旧 dispatch 逐字相同。
-    let v = unsafe { syscall3(SYS_ABI_INFO, 0, 0, 0) };
+    // A2 接线：7 号调用迁到 `rt::abi_info()`。
+    let v = rt::abi_info();
     con_write(h, msg(M_ABI));
     put_u64(h, v);
     con_write(h, msg(M_NL));

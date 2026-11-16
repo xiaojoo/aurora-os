@@ -1,6 +1,6 @@
 # unsafe 逐处审计表（U1–U6）
 
-总计 453 处。U1 82 · U2 114 · U3 13 · U4 131 · U5 77 · U6 36
+总计 438 处。U1 77 · U2 114 · U3 13 · U4 131 · U5 67 · U6 36
 
 本表由 `tools/aurora.py` 的 `unsafe_sites()` 从源码逐处生成，**不是手写的**。
 机器可读的权威来源是 `docs/security/unsafe-whitelist.toml` 的 `[modules.*]` 段（模块×类别→处数），
@@ -877,45 +877,13 @@
 
 ### user/shell
 
-- `user/shell/src/main.rs:71` [{] **U1** fn=`msgs_base`
+- `user/shell/src/main.rs:61` [{] **U1** fn=`msgs_base`
 
-- `user/shell/src/main.rs:82` [{] **U5** fn=`msg`
+- `user/shell/src/main.rs:72` [{] **U5** fn=`msg`
 
-- `user/shell/src/main.rs:92` [{] **U1** fn=`panic`
+- `user/shell/src/main.rs:82` [{] **U1** fn=`panic`
 
-- `user/shell/src/main.rs:98` [fn] **U1** fn=`syscall3`
-
-- `user/shell/src/main.rs:102` [{] **U1** fn=`syscall3`
-
-- `user/shell/src/main.rs:117` [{] **U5** fn=`con_write`
-
-- `user/shell/src/main.rs:122` [{] **U5** fn=`con_read_byte`
-
-- `user/shell/src/main.rs:179` [fn] **U1** fn=`find_console`
-
-- `user/shell/src/main.rs:182` [{] **U5** fn=`find_console`
-
-- `user/shell/src/main.rs:186` [{] **U5** fn=`find_console`
-
-- `user/shell/src/main.rs:189` [{] **U5** fn=`find_console`
-
-- `user/shell/src/main.rs:190` [{] **U5** fn=`find_console`
-
-- `user/shell/src/main.rs:192` [{] **U5** fn=`find_console`
-
-- `user/shell/src/main.rs:202` [{] **U5** fn=`_start`
-
-- `user/shell/src/main.rs:207` [{] **U1** fn=`_start`
-
-- `user/shell/src/main.rs:209` [{] **U1** fn=`_start`
-
-- `user/shell/src/main.rs:239` [{] **U5** fn=`_start`
-
-### user/shell/registry
-
-- `user/shell/src/registry.rs:58` [{] **U5** fn=`cmd_ping`
-
-- `user/shell/src/registry.rs:67` [{] **U5** fn=`cmd_abi`
+- `user/shell/src/main.rs:155` [{] **U5** fn=`_start`
 
 ### user/runtime
 

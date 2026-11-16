@@ -15,33 +15,23 @@
 //! `ps`/`mem`/`reboot` 需要新号，本片**不做**，也不假装做了。
 //!
 //! A3：命令分发重构为"解析器 + 注册表"——`parser.rs` 负责切词，
-//! `registry.rs` 持有全部命令与 unknown 输出；本文件只剩读行循环与
-//! 串口底座（MSGS/con_write/con_read/syscall3）。五个命令与 unknown
-//! 提示的串口输出保持**逐字节不变**（回归安全线）。
+//! `registry.rs` 持有全部命令与 unknown 输出；本文件只剩读行循环。
+//! A2 接线：串口底座（int 0x80 入口 / con_read/con_write / SI 页解析）迁到
+//! `aurora-user-runtime`，本 crate 不再持有任何 syscall 底座 unsafe。
+//! 五个命令与 unknown 提示的串口输出保持**逐字节不变**（回归安全线）。
 
 #![no_std]
 #![no_main]
 
+use aurora_user_runtime as rt;
+
 mod parser;
 mod registry;
 
-// ---- 调用号（与 kernel/src/user.rs 同一组数，用户侧独立声明）----
-const SYS_PING: u64 = 1;
-const SYS_EXIT: u64 = 3;
-const SYS_ABI_INFO: u64 = 7;
-const SYS_CONSOLE_WRITE: u64 = 20;
-const SYS_CONSOLE_READ: u64 = 21;
-
-// ---- StartupInfo 布局（ADR-075 决策 3；与内核同一组偏移）----
-const SI_MAGIC: u32 = 0x4155_524f;
-const SI_OFF_MAGIC: usize = 0;
-const SI_OFF_NHANDLES: usize = 8;
-const SI_OFF_HANDLES: usize = 24;
-const SI_DESC_BYTES: usize = 16;
-const SI_DESC_ROLE: usize = 0;
-const SI_DESC_HANDLE: usize = 8;
-const ROLE_LOG: u32 = 5;
-const MAX_STARTUP_HANDLES: usize = 16;
+// A2 接线：调用号（SYS_*）与 StartupInfo 布局（SI_*）随 syscall 底座一起迁到
+// `aurora-user-runtime`——本文件不再直接打 int 0x80，也不再解析 SI 页。
+// shell 侧保留的 unsafe 只剩：panic/收尾的自跳转与对 `rt::find_console`（unsafe fn）
+// 的那一处调用，见 unsafe-census.md 的 user/shell 节。
 
 /// 所有提示串拼成一个静态 blob。**为什么不用字符串字面量**：镜像基址在 4 GiB 之上，
 /// `relocation-model=static` 下字面量地址会退化成 `R_X86_64_32S` 绝对重定位，链接期 out of range
@@ -93,37 +83,20 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
     }
 }
 
-/// 三参 syscall。`int 0x80` 不动 rcx/r11，所以不声明它们为 clobber。
-#[inline]
-unsafe fn syscall3(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
-    let ret: u64;
-    // SAFETY: 只有内核能处理这条中断；号走 rax、参数 rdi/rsi/rdx、返回 rax。
-    // preserves_flags 是对的：中断门清的是内核的 IF，iretq 把用户帧那份 rflags 原样装回。
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            inlateout("rax") nr => ret,
-            in("rdi") a1,
-            in("rsi") a2,
-            in("rdx") a3,
-            options(preserves_flags)
-        );
-    }
-    ret
-}
-
-/// 往控制台写一段字节。返回内核实际写出的字节数（负数 = 错误码取反）。
-fn con_write(h: u64, s: &[u8]) -> u64 {
-    unsafe { syscall3(SYS_CONSOLE_WRITE, h, s.as_ptr() as u64, s.len() as u64) }
+/// 往控制台写一段字节。
+/// A2 接线：本体迁到 `rt::console_write`。旧版返回 syscall rax，但**全仓没有调用方
+/// 读它**（逐处核对过）——签名顺势改 `()`，错误也和旧版一样不上抛（旧版忽略 rax，
+/// 交互程序对写失败没有可恢复动作；`let _` 是显式声明"与旧版同口径地忽略"，不是吞错）。
+fn con_write(h: u64, s: &[u8]) {
+    let _ = rt::console_write(h, s);
 }
 
 /// 从控制台读**一个**字节。返回 None 表示当前没有输入（21 号不阻塞）。
+/// A2 接线：本体迁到 `rt::console_read`；判据与旧版逐字同义（成功且恰好 1 字节）。
 fn con_read_byte(h: u64, slot: &mut u8) -> Option<u8> {
-    let n = unsafe { syscall3(SYS_CONSOLE_READ, h, slot as *mut u8 as u64, 1) };
-    if n == 1 {
-        Some(*slot)
-    } else {
-        None
+    match rt::console_read(h, core::slice::from_mut(slot)) {
+        Ok(1) => Some(*slot),
+        _ => None,
     }
 }
 
@@ -171,43 +144,21 @@ fn put_u64(h: u64, mut v: u64) {
     }
 }
 
-/// 从 StartupInfo 里按**角色号**取控制台句柄。找不到就返回 None。
-///
-/// # Safety
-/// `si_va` 必须是内核映射好的那一页（`process_start` 校验过 user+只读），
-/// 且在本函数读取期间不被解映射。
-unsafe fn find_console(si_va: u64) -> Option<u64> {
-    let base = si_va as *const u8;
-    // SAFETY: 见上；只读前 24 字节头 + 最多 16 条描述，都在那一页内。
-    let magic = unsafe { core::ptr::read_unaligned(base.add(SI_OFF_MAGIC) as *const u32) };
-    if magic != SI_MAGIC {
-        return None;
-    }
-    let n = unsafe { core::ptr::read_unaligned(base.add(SI_OFF_NHANDLES) as *const u32) } as usize;
-    let n = if n > MAX_STARTUP_HANDLES { MAX_STARTUP_HANDLES } else { n };
-    for i in 0..n {
-        let d = unsafe { base.add(SI_OFF_HANDLES + i * SI_DESC_BYTES) };
-        let role = unsafe { core::ptr::read_unaligned(d.add(SI_DESC_ROLE) as *const u32) };
-        if role == ROLE_LOG {
-            return Some(unsafe { core::ptr::read_unaligned(d.add(SI_DESC_HANDLE) as *const u64) });
-        }
-    }
-    None
-}
+// A2 接线：find_console（SI 页解析）整段迁到 `rt::find_console`——两边逐字同源
+// （runtime 版注明了出处 main.rs 原实现），Si 页偏移常量也随之迁走。
 
 /// 入口。`rdi` = StartupInfo 那一页在子 AS 里的 VA（`process_start` 的 set_thread_arg）。
 #[no_mangle]
 pub extern "C" fn _start(si_va: u64) -> ! {
-    // SAFETY: si_va 由内核校验并映射（user+只读），见 find_console 的契约。
-    let console = match unsafe { find_console(si_va) } {
+    // SAFETY: si_va 由内核校验并映射（user+只读）；`rt::find_console` 的 Safety 契约
+    // 与旧 shell 版逐字相同（那一页在读取期间不被解映射）。
+    let console = match unsafe { rt::find_console(si_va) } {
         Some(h) => h,
         None => {
             // 没有控制台就什么都做不了。**不**静默自旋假装在跑：
             // 直接 exit(1)，让内核侧的收工读数能看出"shell 没拿到控制台"。
-            unsafe { syscall3(SYS_EXIT, 1, 0, 0) };
-            loop {
-                unsafe { core::arch::asm!("2: jmp 2b", options(nomem, nostack, noreturn)) };
-            }
+            // `rt::exit` 是 `-> !`：失败时 runtime 侧已带自旋兜底，不再手写第二份 asm。
+            rt::exit(1);
         }
     };
     con_write(console, msg(M_BANNER));
@@ -235,8 +186,10 @@ pub extern "C" fn _start(si_va: u64) -> ! {
                 // 五命令与 unknown 的输出路径逐字节不变（见两模块头注释）。
                 let parsed = parser::parse(line.get(..len).unwrap_or(&[]));
                 if !registry::dispatch(console, &parsed) {
-                    // SAFETY: 与旧 dispatch 返回 false 后的那次调用逐字相同：3 号 SYS_EXIT。
-                    unsafe { syscall3(SYS_EXIT, 0, 0, 0) };
+                    // A2 接线：与旧版同义（3 号、code=0）。`rt::exit` 是 `-> !`，
+                    // 失败时 runtime 侧自旋兜底（旧版这里无兜底，exit 失败会掉回循环——
+                    // 那是内核异常态，自旋比静默继续更诚实）。
+                    rt::exit(0);
                 }
             }
             len = 0;

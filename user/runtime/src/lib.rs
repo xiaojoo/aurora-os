@@ -185,58 +185,49 @@ pub const ROLE_LOG: u32 = 5;
 /// 系统调用的错误返回。内核约定（user.rs:18/180）：`rax` 为负数即 `-ErrorCode`。
 /// 编号与 `AbiError`（user.rs:190-219）一一对应；**未知负值映射到 [`RTError::Unknown`]，
 /// 不吞掉**——内核只增不改的编号规则意味着将来可能出现新码，静默吞掉会掩盖 ABI 漂移。
+/// 系统调用的错误返回。内核约定（user.rs:18/180）：`rax` 为负数即 `-ErrorCode`。
+/// **A2 接线后从 enum 改成 i64 newtype**（2026-11-16，实测驱动）：
+/// 12 变体 enum 的映射 match 被 LLVM（SimplifyCFG lookup-table 转换）降成查表，
+/// 且 black_box 也拦不住聚合常量进 `.rodata` 模板——而**用户程序链接脚本基址在 +4 GiB
+/// （正数）**，查表/模板引用的 `R_X86_64_32S`（有符号 32 位）装不下 ⇒ 链接期 out of range
+/// （内核 higher-half 地址作为有符号 32 位恰好可表达，所以同一张表在内核侧从不炸——
+/// shell MSGS 手写 lea、ctrl_c 防降级是同一族坑）。错误码域本来就是 `rax` 的 i64 负值，
+/// newtype 直接透传：无 discriminant、无查表、无聚合模板，三类问题一并消失。
+/// 编号与 `AbiError`（user.rs:190-219）一一对应（见下方关联常量）；**未知负值原样携带
+/// （[`Self::code`]），不吞掉**——内核只增不改的编号规则意味着将来可能出现新码，
+/// 静默吞掉会掩盖 ABI 漂移。调用方判读用关联常量比较，语义与旧枚举逐项一致。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RTError {
-    /// -1：未知调用号，或参数的形状就不对（user.rs:192）。
-    Invalid,
-    /// -2：指针是坏的（user.rs:197）。
-    Fault,
-    /// -3：长度超过上限（user.rs:201）。
-    TooLong,
-    /// -4：句柄权限不够 / 不是主人 / 已撤销（user.rs:205）。
-    Denied,
-    /// -5：槽不存在或世代号不对（user.rs:208）。
-    BadHandle,
-    /// -6：64 格全满（user.rs:211）。
-    Exhausted,
-    /// -7：存储/VFS 设备或坏卷失败（user.rs:213）。
-    Io,
-    /// -8：路径分量或文件不存在（user.rs:215）。
-    NotFound,
-    /// -10：路径分量不是目录（user.rs:217）。
-    NotDir,
-    /// -11：对目录做了文件读取（user.rs:219）。
-    IsDir,
-    /// -15：ABI 形状合法但本构建不支持（user.rs:221）。
-    NotSupported,
-    /// 其它负值：将来新增的错误码。携带原始补码值，调用方自行判读。
-    Unknown(i64),
-}
+pub struct RTError(pub i64);
 
 impl RTError {
-    /// 把 `rax` 里的负值映射成枚举。正数不会进来（调用方先判符号）。
-    fn from_ret(ret: i64) -> Self {
-        match ret {
-            -1 => RTError::Invalid,
-            -2 => RTError::Fault,
-            -3 => RTError::TooLong,
-            -4 => RTError::Denied,
-            -5 => RTError::BadHandle,
-            -6 => RTError::Exhausted,
-            -7 => RTError::Io,
-            -8 => RTError::NotFound,
-            -10 => RTError::NotDir,
-            -11 => RTError::IsDir,
-            -15 => RTError::NotSupported,
-            other => RTError::Unknown(other),
-        }
-    }
+    /// -1：未知调用号，或参数的形状就不对（user.rs:192）。
+    pub const INVALID: RTError = RTError(-1);
+    /// -2：访了不可访的内存（user.rs:194）。
+    pub const FAULT: RTError = RTError(-2);
+    /// -3：长度超限（user.rs:196）。
+    pub const TOOLONG: RTError = RTError(-3);
+    /// -4：权限不够 / 越权句柄操作（user.rs:198）。
+    pub const DENIED: RTError = RTError(-4);
+    /// -5：句柄不存在或已关（user.rs:200）。
+    pub const BADHANDLE: RTError = RTError(-5);
+    /// -6：资源耗尽（表满 / 帧不够，user.rs:202）。
+    pub const EXHAUSTED: RTError = RTError(-6);
+    /// -7：设备 I/O 失败（user.rs:204）。
+    pub const IO: RTError = RTError(-7);
+    /// -8：路径不存在（user.rs:206）。
+    pub const NOTFOUND: RTError = RTError(-8);
+    /// -10：对目录打了文件操作（user.rs:208）。
+    pub const NOTDIR: RTError = RTError(-10);
+    /// -11：对文件打了目录操作（user.rs:210）。
+    pub const ISDIR: RTError = RTError(-11);
+    /// -15：该对象不支持此操作（user.rs:212）。
+    pub const NOTSUPPORTED: RTError = RTError(-15);
 }
 
 /// 负数 → 错误；非负 → 成功计数（10/20/21/26 号的返回形状）。
 fn ret_len(ret: i64) -> Result<usize, RTError> {
     if ret < 0 {
-        Err(RTError::from_ret(ret))
+        Err(RTError(ret))
     } else {
         Ok(ret as usize)
     }
@@ -245,7 +236,7 @@ fn ret_len(ret: i64) -> Result<usize, RTError> {
 /// 负数 → 错误；非负 → 成功（8/16/25 号的成功返回约定：user.rs:1849、865、1249）。
 fn ret_zero(ret: i64) -> Result<(), RTError> {
     if ret < 0 {
-        Err(RTError::from_ret(ret))
+        Err(RTError(ret))
     } else {
         Ok(())
     }
@@ -344,7 +335,7 @@ pub fn handle_dup(h: Handle, rights: u32) -> Result<Handle, RTError> {
     // SAFETY: 9 号 `rdi` = 句柄、`rsi` = 新权限位图，其余参数位无语义。
     let ret = unsafe { syscall_abi(SYS_HANDLE_DUP, h, rights as u64, 0, 0) };
     if ret < 0 {
-        Err(RTError::from_ret(ret))
+        Err(RTError(ret))
     } else {
         Ok(ret as u64)
     }
@@ -356,14 +347,14 @@ pub fn handle_dup(h: Handle, rights: u32) -> Result<Handle, RTError> {
 
 /// 打 10 号（`SYS_FILE_READ`，user.rs:41）：从游标继续读。成功返回字节数，**0 = EOF**。
 ///
-/// 长度检查在 safe 层（与内核 user.rs:1069-1075 同一形状）：空缓冲 → [`RTError::Invalid`]、
-/// 超过 [`COPY_MAX`] → [`RTError::TooLong`]，都不打内核。
+/// 长度检查在 safe 层（与内核 user.rs:1069-1075 同一形状）：空缓冲 → [`RTError::INVALID`]、
+/// 超过 [`COPY_MAX`] → [`RTError::TOOLONG`]，都不打内核。
 pub fn file_read(h: Handle, buf: &mut [u8]) -> Result<usize, RTError> {
     if buf.is_empty() {
-        return Err(RTError::Invalid);
+        return Err(RTError::INVALID);
     }
     if buf.len() > COPY_MAX {
-        return Err(RTError::TooLong);
+        return Err(RTError::TOOLONG);
     }
     // SAFETY: 10 号 `rdi` = 句柄、`rsi` = 用户缓冲、`rdx` = 长度；长度已过上面的校验，
     // 缓冲是调用方自己的可写内存。
@@ -372,46 +363,50 @@ pub fn file_read(h: Handle, buf: &mut [u8]) -> Result<usize, RTError> {
 }
 
 /// 打 22 号（`SYS_FILE_OPEN`，user.rs:55）：按路径打开文件或目录，成功返回句柄。
-/// `flags` 目前必须为 0（只读；user.rs:54 的注释），非 0 由内核回 [`RTError::NotSupported`]。
+/// `flags` 目前必须为 0（只读；user.rs:54 的注释），非 0 由内核回 [`RTError::NOTSUPPORTED`]。
 ///
-/// 长度检查在 safe 层（与内核 user.rs:1138-1144 同一形状）：空路径 → [`RTError::Invalid`]、
-/// 超过 [`PATH_MAX`] → [`RTError::TooLong`]。内核还要求路径是合法 UTF-8
-///（user.rs:1161），非 UTF-8 由内核回 [`RTError::Invalid`]，safe 层不再复制一份判定。
+/// 长度检查在 safe 层（与内核 user.rs:1138-1144 同一形状）：空路径 → [`RTError::INVALID`]、
+/// 超过 [`PATH_MAX`] → [`RTError::TOOLONG`]。内核还要求路径是合法 UTF-8
+///（user.rs:1161），非 UTF-8 由内核回 [`RTError::INVALID`]，safe 层不再复制一份判定。
 pub fn file_open(path: &[u8], flags: u64) -> Result<Handle, RTError> {
     if path.is_empty() {
-        return Err(RTError::Invalid);
+        return Err(RTError::INVALID);
     }
     if path.len() > PATH_MAX {
-        return Err(RTError::TooLong);
+        return Err(RTError::TOOLONG);
     }
     // SAFETY: 22 号 `rdi` = 路径指针、`rsi` = 路径长度、`rdx` = flags；长度已过上面的校验。
     let ret = unsafe { syscall_abi(SYS_FILE_OPEN, path.as_ptr() as u64, path.len() as u64, flags, 0) };
     if ret < 0 {
-        Err(RTError::from_ret(ret))
+        Err(RTError(ret))
     } else {
         Ok(ret as u64)
     }
 }
 
 /// 24 号的基准（user.rs:56 的 whence 约定：0=SET、1=CUR、2=END）。
+/// **A2 接线后从 enum 改成 i64 newtype**，理由同 [`RTError`]（枚举映射会被 LLVM 降成
+/// 查表，用户链接基址 +4 GiB 下 `R_X86_64_32S` 溢出）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Whence {
+pub struct Whence(pub i64);
+
+impl Whence {
     /// 0：相对文件头。
-    Set,
+    pub const SET: Whence = Whence(0);
     /// 1：相对当前游标。
-    Cur,
+    pub const CUR: Whence = Whence(1);
     /// 2：相对文件尾。
-    End,
+    pub const END: Whence = Whence(2);
 }
 
 /// 打 24 号（`SYS_FILE_SEEK`，user.rs:57）：移动游标，成功返回新位置。
-/// 对目录 seek 内核回 [`RTError::NotSupported`]（user.rs:1199-1200）。
+/// 对目录 seek 内核回 [`RTError::NOTSUPPORTED`]（user.rs:1199-1200）。
 pub fn file_seek(h: Handle, whence: Whence, offset: i64) -> Result<u64, RTError> {
     // SAFETY: 24 号 `rdi` = 句柄、`rsi` = 位置（有符号数按补码进 rsi，user.rs:1209 取 i64）、
     // `rdx` = whence。whence 的合法性由枚举保证（内核侧非法值也是 -1，user.rs:1214）。
-    let ret = unsafe { syscall_abi(SYS_FILE_SEEK, h, offset as u64, whence as u64, 0) };
+    let ret = unsafe { syscall_abi(SYS_FILE_SEEK, h, offset as u64, whence.0 as u64, 0) };
     if ret < 0 {
-        Err(RTError::from_ret(ret))
+        Err(RTError(ret))
     } else {
         Ok(ret as u64)
     }
@@ -454,13 +449,13 @@ pub fn file_stat(h: Handle) -> Result<StatRecord, RTError> {
 ///
 /// 长度检查在 safe 层（与内核 user.rs:1264-1270 同一形状）：空缓冲 → Ok(0)
 ///（内核对 len==0 直接回 0，user.rs:1265-1267，不打内核）；超过 [`COPY_MAX`] 或
-/// 不是 [`DIRENT_RECORD_LEN`] 的整数倍 → [`RTError::TooLong`]。
+/// 不是 [`DIRENT_RECORD_LEN`] 的整数倍 → [`RTError::TOOLONG`]。
 pub fn dir_read(h: Handle, buf: &mut [u8]) -> Result<usize, RTError> {
     if buf.is_empty() {
         return Ok(0);
     }
     if buf.len() > COPY_MAX || buf.len() % DIRENT_RECORD_LEN != 0 {
-        return Err(RTError::TooLong);
+        return Err(RTError::TOOLONG);
     }
     // SAFETY: 26 号 `rdi` = 目录句柄、`rsi` = 缓冲指针、`rdx` = 缓冲长度；长度已过上面的校验。
     let ret = unsafe { syscall_abi(SYS_DIR_READ, h, buf.as_mut_ptr() as u64, buf.len() as u64, 0) };
@@ -474,10 +469,10 @@ pub fn dir_read(h: Handle, buf: &mut [u8]) -> Result<usize, RTError> {
 /// 打 20 号（`SYS_CONSOLE_WRITE`，user.rs:51）：往控制台写，成功返回写出的字节数。
 ///
 /// 长度检查在 safe 层（与内核 user.rs:1015-1021 同一形状）：超过 [`CONSOLE_MAX`] →
-/// [`RTError::TooLong`]；空缓冲 → Ok(0)（内核对 want==0 直接回 0，不打内核）。
+/// [`RTError::TOOLONG`]；空缓冲 → Ok(0)（内核对 want==0 直接回 0，不打内核）。
 pub fn console_write(h: Handle, buf: &[u8]) -> Result<usize, RTError> {
     if buf.len() > CONSOLE_MAX {
-        return Err(RTError::TooLong);
+        return Err(RTError::TOOLONG);
     }
     if buf.is_empty() {
         return Ok(0);
@@ -490,10 +485,10 @@ pub fn console_write(h: Handle, buf: &[u8]) -> Result<usize, RTError> {
 /// 打 21 号（`SYS_CONSOLE_READ`，user.rs:52）：从控制台读，**不阻塞**（无输入回 0，
 /// user/shell/main.rs:112 的同一口径）。
 ///
-/// 长度检查在 safe 层：超过 [`CONSOLE_MAX`] → [`RTError::TooLong`]；空缓冲 → Ok(0)。
+/// 长度检查在 safe 层：超过 [`CONSOLE_MAX`] → [`RTError::TOOLONG`]；空缓冲 → Ok(0)。
 pub fn console_read(h: Handle, buf: &mut [u8]) -> Result<usize, RTError> {
     if buf.len() > CONSOLE_MAX {
-        return Err(RTError::TooLong);
+        return Err(RTError::TOOLONG);
     }
     if buf.is_empty() {
         return Ok(0);
@@ -514,7 +509,7 @@ pub fn process_create(job: Handle) -> Result<Handle, RTError> {
     // SAFETY: 11 号 `rdi` = Job 句柄，其余参数位无语义。
     let ret = unsafe { syscall_abi(SYS_PROCESS_CREATE, job, 0, 0, 0) };
     if ret < 0 {
-        Err(RTError::from_ret(ret))
+        Err(RTError(ret))
     } else {
         Ok(ret as u64)
     }
@@ -531,7 +526,7 @@ pub fn thread_create(proc_h: Handle, entry: u64, stack_top: u64, arg: u64) -> Re
     // `r10` = 首参。VA 合法性由内核校验（user.rs:599-608）。
     let ret = unsafe { syscall_abi(SYS_THREAD_CREATE, proc_h, entry, stack_top, arg) };
     if ret < 0 {
-        Err(RTError::from_ret(ret))
+        Err(RTError(ret))
     } else {
         Ok(ret as u64)
     }
@@ -564,7 +559,7 @@ pub struct WaitOutcome {
 ///（`WAIT_TERMINATED` = bit0），所以 `rax == 0` 与"观测到了什么"不会撞。
 fn decode_wait(ret: i64) -> Result<Option<WaitOutcome>, RTError> {
     if ret < 0 {
-        return Err(RTError::from_ret(ret));
+        return Err(RTError(ret));
     }
     if ret == 0 {
         return Ok(None); // 超时
@@ -576,10 +571,10 @@ fn decode_wait(ret: i64) -> Result<Option<WaitOutcome>, RTError> {
 /// 打 17 号（`SYS_PROCESS_WAIT`，user.rs:874）：等一个进程收工。它是 19 号的薄壳
 ///（user.rs:929），默认等"已终止"。返回 `None` = 超时（含 ms==0 的"只查一次"，user.rs:914）。
 ///
-/// 时限检查在 safe 层：超过 [`WAIT_MAX_MS`] → [`RTError::Invalid`]（内核 user.rs:900 同此）。
+/// 时限检查在 safe 层：超过 [`WAIT_MAX_MS`] → [`RTError::INVALID`]（内核 user.rs:900 同此）。
 pub fn process_wait(proc_h: Handle, timeout_ms: u64) -> Result<Option<WaitOutcome>, RTError> {
     if timeout_ms > WAIT_MAX_MS {
-        return Err(RTError::Invalid);
+        return Err(RTError::INVALID);
     }
     // SAFETY: 17 号 `rdi` = Proc 句柄（要 READ）、`rsi` = 时限毫秒，其余参数位无语义。
     let ret = unsafe { syscall_abi(SYS_PROCESS_WAIT, proc_h, timeout_ms, 0, 0) };
@@ -587,30 +582,30 @@ pub fn process_wait(proc_h: Handle, timeout_ms: u64) -> Result<Option<WaitOutcom
 }
 
 /// 打 18 号（`SYS_PROCESS_KILL`，user.rs:96）：收掉一个进程的全部线程，成功返回**真收掉的
-/// 线程数**。杀自己的进程由内核回 [`RTError::Denied`]（user.rs:971-974），那条路要交给
+/// 线程数**。杀自己的进程由内核回 [`RTError::DENIED`]（user.rs:971-974），那条路要交给
 /// [`exit`]，本库不做包装。
 pub fn process_kill(proc_h: Handle) -> Result<u64, RTError> {
     // SAFETY: 18 号 `rdi` = Proc 句柄（要 WRITE），其余参数位无语义。
     let ret = unsafe { syscall_abi(SYS_PROCESS_KILL, proc_h, 0, 0, 0) };
     if ret < 0 {
-        Err(RTError::from_ret(ret))
+        Err(RTError(ret))
     } else {
         Ok(ret as u64)
     }
 }
 
 /// 打 19 号（`SYS_OBJECT_WAIT`，user.rs:879）：通用对象等待。今天只支持 Proc 对象，
-/// 拿别的 kind 来等内核回 [`RTError::Denied`]（user.rs:877-878）。
+/// 拿别的 kind 来等内核回 [`RTError::DENIED`]（user.rs:877-878）。
 /// 返回 `None` = 超时。
 ///
 /// 形状检查在 safe 层（与内核 user.rs:896-902 同一形状）：`signals` 里有不认识的位 →
-/// [`RTError::Invalid`]；`timeout_ms` 超过 [`WAIT_MAX_MS`] → [`RTError::Invalid`]。
+/// [`RTError::INVALID`]；`timeout_ms` 超过 [`WAIT_MAX_MS`] → [`RTError::INVALID`]。
 pub fn object_wait(h: Handle, signals: u64, timeout_ms: u64) -> Result<Option<WaitOutcome>, RTError> {
     if signals & !WAIT_TERMINATED != 0 {
-        return Err(RTError::Invalid);
+        return Err(RTError::INVALID);
     }
     if timeout_ms > WAIT_MAX_MS {
-        return Err(RTError::Invalid);
+        return Err(RTError::INVALID);
     }
     // SAFETY: 19 号 `rdi` = 对象句柄、`rsi` = 信号位图、`rdx` = 时限毫秒。
     let ret = unsafe { syscall_abi(SYS_OBJECT_WAIT, h, signals, timeout_ms, 0) };
