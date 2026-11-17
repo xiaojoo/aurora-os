@@ -719,6 +719,112 @@ pub fn dir_read(h: Handle, buf: &mut [u8]) -> Result<usize, RTError> {
     ret_len(ret)
 }
 
+/// 一条目录记录的解码结果（内核 `filesystem/fs_open.rs::dirent_record` 写的那张 512 字节表）。
+/// `name` 是**短名（8.3）**；记录里另有长名（偏移 64），今天 `ls` 只显示短名。
+pub struct DirEnt<'a> {
+    /// 1 = 文件，2 = 目录（与内核 `DIRENT_KIND_*` 同数）。
+    pub kind: u8,
+    pub name: &'a [u8],
+    pub size: u32,
+}
+
+/// `DIRENT_MAGIC`（"AUFD"）与版本：解码前先核，形状不对按 `INVALID` 拒（不猜）。
+const DIRENT_MAGIC: u32 = 0x4446_5541;
+const DIRENT_NAME_AT: usize = 48;
+const DIRENT_SIZE_AT: usize = 16;
+
+fn le32_at(b: &[u8], at: usize) -> u32 {
+    let mut v = 0u32;
+    let mut i = 0usize;
+    while i < 4 {
+        if let Some(x) = b.get(at + i) {
+            v |= u32::from(*x) << (8 * i);
+        }
+        i += 1;
+    }
+    v
+}
+
+/// 列一个目录：把 26 号的记录逐条解码后回调。返回**条数**（游标耗尽为止）。
+/// 缓冲用本模块那份 4 KiB（`chunk()`，单线程程序、无并发窗口，与 `load` 同一条约定）。
+pub fn dir_list<F: FnMut(&DirEnt)>(path: &[u8], mut f: F) -> Result<u32, RTError> {
+    let h = file_open(path, 0)?;
+    let buf = crate::exec::chunk();
+    let cap = buf.len() / DIRENT_RECORD_LEN;
+    let mut n = 0u32;
+    let mut bad = None;
+    loop {
+        let k = match dir_read(h, &mut buf[..cap * DIRENT_RECORD_LEN]) {
+            Ok(k) => k,
+            Err(e) => {
+                bad = Some(e);
+                break;
+            }
+        };
+        if k == 0 {
+            break;
+        }
+        let mut i = 0usize;
+        while i < k {
+            let rec = match buf.get(i * DIRENT_RECORD_LEN..(i + 1) * DIRENT_RECORD_LEN) {
+                Some(r) => r,
+                None => {
+                    bad = Some(RTError::INVALID);
+                    break;
+                }
+            };
+            if le32_at(rec, 0) != DIRENT_MAGIC || rec[6] != 1 {
+                bad = Some(RTError::INVALID);
+                break;
+            }
+            let nl = rec[8] as usize;
+            let name = match rec.get(DIRENT_NAME_AT..DIRENT_NAME_AT + nl) {
+                Some(s) if nl > 0 => s,
+                _ => {
+                    bad = Some(RTError::INVALID);
+                    break;
+                }
+            };
+            f(&DirEnt { kind: rec[7], name, size: le32_at(rec, DIRENT_SIZE_AT) });
+            n += 1;
+            i += 1;
+        }
+        if bad.is_some() || k < cap {
+            break;
+        }
+    }
+    let _ = handle_close(h);
+    match bad {
+        Some(e) => Err(e),
+        None => Ok(n),
+    }
+}
+
+/// 顺序读一个文件，把每块交给回调（`cat` 用）。返回总字节数。
+pub fn cat_each<F: FnMut(&[u8])>(path: &[u8], mut f: F) -> Result<u64, RTError> {
+    let h = file_open(path, 0)?;
+    let buf = crate::exec::chunk();
+    let mut total = 0u64;
+    loop {
+        let n = match file_read(h, buf) {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = handle_close(h);
+                return Err(e);
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        if let Some(part) = buf.get(..n) {
+            f(part);
+        }
+        total += n as u64;
+    }
+    let _ = handle_close(h);
+    Ok(total)
+}
+
 // ---------------------------------------------------------------------------
 // 控制台族（20 / 21 号）
 // ---------------------------------------------------------------------------

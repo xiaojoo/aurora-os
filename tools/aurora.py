@@ -8511,7 +8511,12 @@ def do_test(timeout: int) -> int:
     print("=== A3 验收：shell 执行 argv 里的外部命令（--features a3-shell）===")
     IMAGE.unlink(missing_ok=True)
     ashv, ashrc, ashlog = do_run(["a3-shell", "fat32-probe"], timeout)
-    # `;` 分隔三条：外部命令（A3）+ ps/free（A4 的 27 号）。一条 argv 覆盖两片。
+    # `;` 分隔五条：外部命令（A3）+ ls/cat（26/22+24）+ ps/free（A4 的 27 号）。
+    # ls 与 cat 的期望值由宿主机**独立解析卷A**得到（第二台仪器）：三个名字/大小，
+    # 以及 NOTES 的 FNV-1a 64——与 shell 在串口上打的那条尾巴必须同数。
+    _a_vol = __import__("zlib").decompress(FAT_ZZ["fat32-small"].read_bytes())
+    _a_root = fat32_host_volume(_a_vol, ("HELLO.ELF", "NOTES", "SMALL.BIN"))["files"]
+    _ls_lines = [f"f {k} {v['size']}" for k, v in _a_root.items()]
     ash_ok = ashv == "PASS" and all((
         "run: /HELLO.ELF" in ashlog,
         "(timeout)" in ashlog,
@@ -8519,7 +8524,11 @@ def do_test(timeout: int) -> int:
         "PID GEN THR ST PAGES" in ashlog,   # ps 的表头
         "live " in ashlog,                  # ps 至少一行活进程（含页数）
         "free: procs=" in ashlog,           # free 的聚合读数
-
+        "ls: /" in ashlog,
+        f"ls: {len(_a_root)} entries" in ashlog,
+        all(ln in ashlog for ln in _ls_lines),
+        "cat: /NOTES" in ashlog,
+        f"cat: {_a_root['NOTES']['size']} bytes= fnv={_a_root['NOTES']['fnv']}" in ashlog,
     ))
     _tot = EXEC_TOTAL_RE.search(ashlog)
     if not _tot or int(_tot.group(1)) < 1 or int(_tot.group(2)) != 0:

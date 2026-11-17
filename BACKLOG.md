@@ -15190,3 +15190,21 @@ ET_EXEC 的 `p_vaddr` 每个进程都从 `0x1_0000_0000` 起；14 号原来把�
 - **S1–S5 收口**：验签（S1–S3）、执行字节绑定（S4a/S4b）、TOCTOU 封存（S4c）、读不到包
   fail-closed（S5）。仍未做：包"魔数都没了但区域非零"仍按 ABSENT；数据段不封；信任根/轮换/
   吊销（ADR-011）。**不称安全启动**；本轮未推送。
+
+## 399. shell 接上 `ls` 与 `cat`（2026-11-18）
+
+- runtime：`DirEnt` 解码（核 `dirent_record` 的 512 字节表，短名在 48、大小在 16）+ `dir_list`
+  （26 号循环，复用那份 4 KiB 静态块，`chunk()` 改 `pub(crate)`）+ `cat_each`（22+24 顺序读）。
+- shell：`ls [path]`（默认 `/`；`d <短名>` / `f <短名> <字节数>`，末尾 `ls: <条数> entries`）、
+  `cat <path>`（原样打印，末尾 `cat: <字节数> bytes= fnv=<FNV-1a 64>`）；help 追加 ` ls | cat`。
+- a3 命令改成 `run /HELLO.ELF; ls; cat /NOTES; ps; free`；a3-shell 行加**第二台仪器**：
+  宿主机独立解析卷A（`fat32_host_volume`）拿三个名字/大小与 NOTES 的 FNV-1a 64，
+  与串口逐格对：`ls: /`、三条 `f <名> <大小>`、`ls: 3 entries`、`cat: 1000 bytes= fnv=5662670289846903997`。
+- 踩坑：①无参 `ls` 被解析成**空词** ⇒ 空路径 -1，改成空词按默认根；②`b"/"` 被提升成
+  .rodata 常量，`dispatch+0xce9` 又撞 `R_X86_64_32S`（用局部数组）；③`.text` 涨到 0x4114，
+  把 16 KiB 预算撞穿 —— link.ld 把 .text 放到 20 KiB（.rodata 0x100005000、.data 0x100007000）。
+- 变异证红（已还原）：`dir_list` 的大小 +1 ⇒ 三条 `f` 全对不上 ⇒ a3-shell 行红。
+- 读数：`check` **17/17**；整链 **72 行 72 符合**（`build/lscat-matrix.log`，默认档
+  `1d2e6132e7fc`）；`shell.elf` 39880 / `17acca6ef0a6`；`a3-shell,fat32-probe` ELF `26cb5d70b29d`。
+- 仍未做：长名（记录里有，`ls` 还只显示短名）；`cd`/`pwd`（无 per-process cwd，口径另定）；
+  创建/删除/截断；管道与重定向。

@@ -38,7 +38,7 @@ mod registry;
 /// （hello/probe 的模块头都记过这个坑，本轮实测又撞一次）。改成 RIP 相对 lea 取基址 + 常量偏移。
 /// S6u：横幅的前导 `\x0a` 去掉了——那是当年为了跟上面的内核日志隔开留的，
 /// ADR-096 之后画面正文只有会话输出，前面什么都没有，那一格就成了纯粹的空行。
-static MSGS: [u8; 316] = *b"commands: help | echo <text> | ping | abi | ps | free | exit\x0aAurora OS 6.1.0-aurora (tty1)\x0aaurora@os:~$ \x0aline too long, discarded\x0aunknown command:  (try help)\x0aping=abi_info=bye\x0a\x08 \x08^C\x0arun:  exit= (timeout) error=usage: run <path>\x0a-PID GEN THR ST PAGES\x0aps: no job handle\x0alivedead ps: error=free: procs= threads= pages=";
+static MSGS: [u8; 376] = *b"commands: help | echo <text> | ping | abi | ps | free | exit\x0aAurora OS 6.1.0-aurora (tty1)\x0aaurora@os:~$ \x0aline too long, discarded\x0aunknown command:  (try help)\x0aping=abi_info=bye\x0a\x08 \x08^C\x0arun:  exit= (timeout) error=usage: run <path>\x0a-PID GEN THR ST PAGES\x0aps: no job handle\x0alivedead ps: error=free: procs= threads= pages=ls: cat: d f  entries bytes= fnv=usage: cat <path> ls | cat\x0a";
 
 const M_HELP: (usize, usize) = (0, 61);
 const M_BANNER: (usize, usize) = (61, 30);
@@ -66,7 +66,16 @@ const M_SP: (usize, usize) = (277, 1);
 const M_PS_ERR: (usize, usize) = (278, 10);
 const M_FREE_PFX: (usize, usize) = (288, 12);
 const M_FREE_THR: (usize, usize) = (300, 9);
+const M_LS: (usize, usize) = (316, 4);
 const M_FREE_PAGES: (usize, usize) = (309, 7);
+const M_CAT: (usize, usize) = (320, 5);
+const M_D: (usize, usize) = (325, 2);
+const M_F: (usize, usize) = (327, 2);
+const M_ENTRIES: (usize, usize) = (329, 8);
+const M_BYTES: (usize, usize) = (337, 7);
+const M_FNV: (usize, usize) = (344, 5);
+const M_CAT_USAGE: (usize, usize) = (349, 17);
+const M_HELP2: (usize, usize) = (366, 9);
 /// blob 的真实基址（RIP 相对 lea，不产生 32 位绝对重定位）。
 fn msgs_base() -> u64 {
     let b: u64;

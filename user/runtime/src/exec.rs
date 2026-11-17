@@ -39,7 +39,7 @@ static mut CHUNK_BUF: [u8; CHUNK] = [0u8; CHUNK];
 ///
 /// # Safety（内部）
 /// 由本模块独占：`load` 在同一时刻只可能被同一个单线程程序调用一次。
-fn chunk() -> &'static mut [u8] {
+pub(crate) fn chunk() -> &'static mut [u8] {
     let p: *mut u8;
     // SAFETY: `lea` 只算地址不访存；取址走 **RIP 相对**，因为 `.bss` 在 4 GiB 之上，
     // `addr_of_mut!` 会退化成 `R_X86_64_32S` 绝对重定位（实测：shell 链接 runtime 时

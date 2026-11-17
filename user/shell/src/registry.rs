@@ -20,9 +20,10 @@ use aurora_user_runtime as rt;
 
 use crate::{con_write, msg, put_u64};
 use crate::{
-    M_ABI, M_BYE, M_DEAD, M_FREE_PAGES, M_FREE_PFX, M_FREE_THR, M_HELP, M_LIVE, M_MINUS, M_NL,
-    M_PING, M_PS_ERR, M_PS_HDR, M_PS_NOJOB, M_RUN_ERR, M_RUN_EXIT, M_RUN_PREFIX, M_RUN_TIMEOUT,
-    M_RUN_USAGE, M_SP, M_TRYHELP, M_UNKNOWN,
+    M_ABI, M_BYE, M_BYTES, M_CAT, M_CAT_USAGE, M_D, M_DEAD, M_ENTRIES, M_F, M_FNV, M_FREE_PAGES,
+    M_FREE_PFX, M_FREE_THR, M_HELP, M_LIVE, M_LS, M_MINUS, M_NL, M_PING, M_PS_ERR, M_PS_HDR,
+    M_PS_NOJOB, M_HELP2, M_RUN_ERR, M_RUN_EXIT, M_RUN_PREFIX, M_RUN_TIMEOUT, M_RUN_USAGE, M_SP, M_TRYHELP,
+    M_UNKNOWN,
 };
 
 /// 控制台句柄（内核按角色 `ROLE_LOG` 转移给 shell 的那个 u64）。
@@ -48,6 +49,8 @@ const CMD_EXIT: [u8; 4] = [b'e', b'x', b'i', b't'];
 const CMD_RUN: [u8; 3] = [b'r', b'u', b'n'];
 const CMD_PS: [u8; 2] = [b'p', b's'];
 const CMD_FREE: [u8; 4] = [b'f', b'r', b'e', b'e'];
+const CMD_LS: [u8; 2] = [b'l', b's'];
+const CMD_CAT: [u8; 3] = [b'c', b'a', b't'];
 
 /// 命令词比较。走 `&[u8] == &[u8]`，LLVM 折成 immediate 比较（旧 dispatch 同款）。
 fn streq(a: &[u8], b: &[u8]) -> bool {
@@ -58,6 +61,7 @@ fn streq(a: &[u8], b: &[u8]) -> bool {
 
 fn cmd_help(c: &Ctx) -> bool {
     con_write(c.h, msg(M_HELP));
+    con_write(c.h, msg(M_HELP2));
     true
 }
 
@@ -294,6 +298,90 @@ fn put_i64(h: ConsoleHandle, v: i64) {
     }
 }
 
+/// `ls [path]`：默认列根。每条一行：`d <短名>` 或 `f <短名> <字节数>`，末尾 `ls: <条数> entries`。
+fn cmd_ls(c: &Ctx) -> bool {
+    // 局部数组而不是 `b"/"`：后者会被提升成 .rodata 常量，取址即 32 位绝对重定位
+    // （put_u64 的注释记过同一个坑；本题第一版就撞在 dispatch+0xce9）。
+    let slash = [b'/'];
+    let path: &[u8] = match c.p.args.get(0) {
+        Some(a) if c.p.err.is_none() && !a.is_empty() => a,
+        _ => &slash[..],
+    };
+    con_write(c.h, msg(M_LS));
+    con_write(c.h, path);
+    con_write(c.h, msg(M_NL));
+    let mut n = 0u64;
+    let r = rt::dir_list(path, |e| {
+        con_write(c.h, if e.kind == 2 { msg(M_D) } else { msg(M_F) });
+        con_write(c.h, e.name);
+        if e.kind != 2 {
+            con_write(c.h, msg(M_SP));
+            put_u64(c.h, u64::from(e.size));
+        }
+        con_write(c.h, msg(M_NL));
+        n += 1;
+    });
+    match r {
+        Ok(_) => {
+            con_write(c.h, msg(M_LS));
+            put_u64(c.h, n);
+            con_write(c.h, msg(M_ENTRIES));
+            con_write(c.h, msg(M_NL));
+        }
+        Err(e) => {
+            con_write(c.h, msg(M_RUN_ERR));
+            put_i64(c.h, e.0);
+            con_write(c.h, msg(M_NL));
+        }
+    }
+    true
+}
+
+/// `cat <path>`：原样打印文件字节，随后一行 `cat: <字节数> bytes= fnv=<FNV-1a 64>`。
+/// 那条尾巴是**第二台仪器**：宿主机用自己解析 FAT 的同一份字节算同一个数（行里对得上）。
+fn cmd_cat(c: &Ctx) -> bool {
+    let path = match (c.p.err.is_none(), c.p.args.get(0)) {
+        (true, Some(a)) if !a.is_empty() => a,
+        _ => {
+            con_write(c.h, msg(M_CAT_USAGE));
+            con_write(c.h, msg(M_NL));
+            return true;
+        }
+    };
+    con_write(c.h, msg(M_CAT));
+    con_write(c.h, path);
+    con_write(c.h, msg(M_NL));
+    let mut n = 0u64;
+    let mut hsh = 0xcbf2_9ce4_8422_2325u64;
+    let r = rt::cat_each(path, |b| {
+        con_write(c.h, b);
+        let mut i = 0usize;
+        while i < b.len() {
+            hsh ^= u64::from(b[i]);
+            hsh = hsh.wrapping_mul(0x100_0000_01b3);
+            i += 1;
+        }
+        n += b.len() as u64;
+    });
+    match r {
+        Ok(_) => {
+            con_write(c.h, msg(M_NL));
+            con_write(c.h, msg(M_CAT));
+            put_u64(c.h, n);
+            con_write(c.h, msg(M_BYTES));
+            con_write(c.h, msg(M_FNV));
+            put_u64(c.h, hsh);
+            con_write(c.h, msg(M_NL));
+        }
+        Err(e) => {
+            con_write(c.h, msg(M_RUN_ERR));
+            put_i64(c.h, e.0);
+            con_write(c.h, msg(M_NL));
+        }
+    }
+    true
+}
+
 /// 分派一条已解析的命令。返回 false = 退出 shell。
 ///
 /// 每个分支都是"名字 immediate 比较 → 直接调用处理器"，不写 `match lookup()`：
@@ -330,6 +418,12 @@ pub fn dispatch(h: ConsoleHandle, si_va: u64, p: &Parsed) -> bool {
     }
     if streq(p.cmd, &CMD_FREE) {
         return cmd_free(&c);
+    }
+    if streq(p.cmd, &CMD_LS) {
+        return cmd_ls(&c);
+    }
+    if streq(p.cmd, &CMD_CAT) {
+        return cmd_cat(&c);
     }
     // unknown：三段输出与旧实现逐字节一致——词原样回显（借用不拷贝，全长不截断）。
     con_write(c.h, msg(M_UNKNOWN));
