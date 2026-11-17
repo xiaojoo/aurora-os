@@ -114,7 +114,7 @@ fn fail(out: rt::Handle, at: (usize, usize), code: i64, site: u8) -> ! {
 }
 
 /// A3：装载并运行卷上的 `name`（8.3 名，ASCII）。不返回。
-fn run_image(name: &[u8], out: rt::Handle, si_va: u64) -> ! {
+fn run_image(name: &[u8], out: rt::Handle, si_va: u64, lie: bool) -> ! {
     // 22 号：open（fs_open 自 mount 固定卷，不依赖挂载表）。路径按字节给，非 UTF-8 也照传。
     let fh = match rt::file_open(name, 0) {
         Ok(h) => h,
@@ -169,6 +169,32 @@ fn run_image(name: &[u8], out: rt::Handle, si_va: u64) -> ! {
         total += n as u64;
     }
     let _ = rt::handle_close(fh);
+
+    // S4b（ADR-116）：负样本——在**可执行段**的 VMO 上改一个字节。16 号应当判
+    // `映射不符`；不改数据段（那是被允许的合法改写），专门改指令流。
+    if lie {
+        let mut patched = false;
+        let mut i = 0usize;
+        while i < img.nseg {
+            let s = match img.segs.get(i) {
+                Some(v) => *v,
+                None => fail(out, M_ERR, -1, 89),
+            };
+            if s.x == 0 {
+                i += 1;
+                continue;
+            }
+            let bad = [0x90u8; 1]; // nop 落在 hello 段内偏移 10（原字节不是 0x90）
+            if rt::vmo_write(sv[i], 10, &bad).is_err() {
+                fail(out, M_ERR, -1, 89);
+            }
+            patched = true;
+            break;
+        }
+        if !patched {
+            fail(out, M_ERR, -1, 89);
+        }
+    }
 
     // **让被装载的程序自己退出**：hello 的 `link.ld` 把 `.slots` 摆在数据段最前
     // （VA 0x100002000），第 48 字节是 `OFF_FLAG`；写 `FLAG_EXIT = 1` 它就跑完
@@ -384,7 +410,8 @@ pub extern "C" fn _start(si_va: u64) -> ! {
     // A3：目标是 ELF 文件 ⇒ 装载并运行；否则 A2 行为（打印后 exit(7)）。
     let tail = target.len().checked_sub(4).and_then(|i| target.get(i..));
     if tail == Some(msg(M_ELF)) {
-        run_image(target, stdout, si_va);
+        let lie = nth_arg(args, 2) == b"lie";
+        run_image(target, stdout, si_va, lie);
     }
     rt::exit(7);
 }

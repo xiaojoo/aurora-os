@@ -1378,6 +1378,9 @@ fn stage_a2_exec() {
     // 负样本（a2-exec-bad）：args_off/args_len 故意压住句柄表 ⇒ 16 号校验必须拒。
     let (args_off, args_len) = if cfg!(feature = "a2-exec-bad") {
         (SI_OFF_HANDLES, 4096usize)
+    } else if cfg!(feature = "a3-exec-bad") {
+        // S4b：再带一条 argv[2]=`lie`——execprobe 据此在可执行段上改一个字节。
+        (280usize, 25usize) // "execprobe\0/HELLO.ELF\0lie\0"
     } else if cfg!(feature = "a3-exec") {
         // S4（ADR-116）：argv[0] 是 execprobe 自己的名字，目标是 argv[1]。
         // 把目标当自己的名字，16 号的验签闸会把它当成那个文件（实测：映射不符）。
@@ -1416,7 +1419,9 @@ fn stage_a2_exec() {
         let mut arg = [0u8; 512];
         // a3-exec 档的目标是卷上 /HELLO.ELF（**绝对路径**：vfs_ro::lookup 拒相对路径，
         // 内核侧诊断实测 NotAbsolute）；execprobe 见 ".ELF" 后缀就走 A3 装载器分支。
-        let target: &[u8] = if cfg!(feature = "a3-exec") {
+        let target: &[u8] = if cfg!(feature = "a3-exec-bad") {
+            b"execprobe\0/HELLO.ELF\0lie"
+        } else if cfg!(feature = "a3-exec") {
             b"execprobe\0/HELLO.ELF"
         } else {
             b"execprobe"

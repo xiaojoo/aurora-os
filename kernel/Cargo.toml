@@ -30,6 +30,8 @@ a2-exec-bad = ["a2-exec"]
 # 22 号的模块门是 fs-open（filesystem.rs:14）：A3 的外部命令必须带它，
 # 否则 SYS_FILE_OPEN 分派整臂不存在（实测：execprobe 的 open 直接 -1）。
 a3-exec = ["a2-exec", "fs-open"]
+# S4b（ADR-116）：a3-exec 的负样本——execprobe 在可执行段上改一个字节再交给 16。
+a3-exec-bad = ["a3-exec"]
 # A3 验收档（ADR-131）：**shell 自己跑外部命令**。init 会话的 SI 页带一条 argv
 # （`run /HELLO.ELF`），shell 起手执行一次再退出（`sh -c` 语义）。
 # **不依赖 a3-exec**：那一档会先跑 execprobe，它和它的子进程把动态 VA 段占住，

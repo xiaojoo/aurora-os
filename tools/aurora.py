@@ -457,7 +457,7 @@ FAT_PORTS = {3: "fat32-small", 4: "fat32-wide"}
 FS_OPEN_FEATURES = {"fs-open"}
 # A3 切片：execprobe 的 22 号 open 打的是 fs_open::PORT=5 的 deep 卷（fs_open 自 mount 固定卷）。
 # 所以这一档的镜像也要装配 deep 卷——与 fs-open 同一份夹具、同一条指纹闸。
-A3_EXEC_FEATURES = {"a3-exec", "a3-shell"}
+A3_EXEC_FEATURES = {"a3-exec", "a3-shell", "a3-exec-bad"}
 FS_OPEN_PORTS = {5: "fat32-deep"}
 # ADR-111：写方向单独一档，挂在**可写**卷上（口 4）。它与 `FS_OPEN_PORTS` 一样要与内核的
 # `filesystem/fs_rw.rs` 的 `PORT` 对账（`check-fat32-ports` 里那一格扩成两张表）。
@@ -8528,6 +8528,25 @@ def do_test(timeout: int) -> int:
     IMAGE.unlink(missing_ok=True)
 
     # =====================================================================
+    # S4b（ADR-116）：**负样本**——装载器在可执行段上改一个字节再交给 16（包与盘都不动）。
+    # 闸门必须点名 `映射不符`；同一跑里不许出现 `判=通过`；合计 通过=0 拒=1。
+    print("=== A3 闸门负样本：装载器改可执行段一个字节 ===")
+    IMAGE.unlink(missing_ok=True)
+    r4v, r4rc, r4log = do_run(["a3-exec-bad", "fat32-probe"], timeout)
+    r4_ok = r4v == "PASS" and all((
+        "exec-verify: 判=拒 原因=映射不符 名=/HELLO.ELF" in r4log,
+        "exec-verify: 判=通过" not in r4log,
+        "err=0xffffffffffffffff" in r4log,   # execprobe 把 16 号的 -1 原样打出来
+    ))
+    _t4 = EXEC_TOTAL_RE.search(r4log)
+    if not _t4 or int(_t4.group(1)) != 0 or int(_t4.group(2)) != 1 or int(_t4.group(3)) < 1:
+        r4_ok = False
+    r4_verdict = "CONTENT-MISMATCH" if (r4v == "PASS" and not r4_ok) else r4v
+    for x in ([] if r4_ok else ["S4b 证人：判=拒/无判=通过/err=-1/合计 四格有一格不成立"]):
+        print("    对账:", x)
+    IMAGE.unlink(missing_ok=True)
+
+    # =====================================================================
     # S3（ADR-115）：**负样本**——只改盘上 HELLO.ELF 的一个字节，包一个字不动。
     # 闸门必须点名拒启（`判=拒 原因=摘要不符`），且同一跑里不许出现 `判=通过`；
     # 判定级照旧 FAIL(35)：同一块卷上的 FAT 用例也会读到那一格，这与第 38 行同形。
@@ -8693,6 +8712,8 @@ def do_test(timeout: int) -> int:
         ("A3 shell执行argv命令并ps/free读数", ash_verdict, ashrc, "PASS", 33),
         # S3（ADR-115）：闸门的拒启那一格——宿主改盘、包不动。
         ("A3改盘一字节⇒16号拒启", ed_verdict, edrc, "FAIL", 35),
+        # S4b（ADR-116）：装载器改**代码段**一字节 ⇒ 映射不符。
+        ("A3换代码字节⇒16号拒启", r4_verdict, r4rc, "PASS", 33),
 
     ]
     # 每一行对应那一跑的串口：不符时把红的那几格打出来。
@@ -8757,6 +8778,7 @@ def do_test(timeout: int) -> int:
         "A3 用户态装载器执行卷上ELF": r3log,
         "A3 shell执行argv命令并ps/free读数": ashlog,
         "A3改盘一字节⇒16号拒启": edlog,
+        "A3换代码字节⇒16号拒启": r4log,
 
     }
     all_ok = True
