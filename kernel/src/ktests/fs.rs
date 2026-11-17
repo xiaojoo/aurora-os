@@ -710,6 +710,9 @@ fn t_fat32_exec() -> bool {
     };
     let mut hoff = 0usize;
     let mut hsame = true;
+    // 与**编译期内嵌夹具**逐字节相同：走链那格比对的是 `disk`（也来自盘，注入后两边一起变），
+    // 所以宿主机改盘在句柄路径上咬不到。这一格的上游注入重跑是 §86 第 12 条（BACKLOG §384）。
+    let mut hfrozen = true;
     let mut hchunk = [0u8; crate::filesystem::vfs::SECTOR_BYTES];
     while hoff < size {
         let ask = core::cmp::min(hchunk.len(), size - hoff);
@@ -717,6 +720,7 @@ fn t_fat32_exec() -> bool {
             Ok(0) => break,
             Ok(n) => {
                 hsame &= disk[hoff..hoff + n] == hchunk[..n];
+                hfrozen &= hoff + n <= HELLO_ELF.len() && HELLO_ELF[hoff..hoff + n] == hchunk[..n];
                 hoff += n;
                 if n < ask {
                     break;
@@ -730,13 +734,14 @@ fn t_fat32_exec() -> bool {
     }
     let heof = crate::handle::read(h, ident, &mut hchunk) == Ok(0);
     let hclose = crate::handle::close(h, ident).is_ok();
-    let handle_ok = hoff == size && hsame && heof && hclose;
+    let handle_ok = hoff == size && hsame && hfrozen && heof && hclose;
     crate::log_info!(
-        "elfdisk: 句柄 slot={} gen={:#x} 字节={} 同走链={} EOF={} 关闭={}",
+        "elfdisk: 句柄 slot={} gen={:#x} 字节={} 同走链={} 同内嵌={} EOF={} 关闭={}",
         h.slot(),
         h.gen(),
         hoff,
         hsame,
+        hfrozen,
         heof,
         hclose
     );
