@@ -36,6 +36,8 @@ a3-exec-bad = ["a3-exec"]
 a3-exec-seal = ["a3-exec"]
 # 裁决（2026-11-18）：读包失败 ⇒ 覆盖未知 ⇒ 16 号对绝对路径 fail-closed。
 fault-pkg-read = []
+# 2026-11-18：长名验收——shell 的根换成多级真卷（口 5），命令改成只列目录。
+a3-ls-deep = ["a3-shell"]
 # A3 验收档（ADR-131）：**shell 自己跑外部命令**。init 会话的 SI 页带一条 argv
 # （`run /HELLO.ELF`），shell 起手执行一次再退出（`sh -c` 语义）。
 # **不依赖 a3-exec**：那一档会先跑 execprobe，它和它的子进程把动态 VA 段占住，

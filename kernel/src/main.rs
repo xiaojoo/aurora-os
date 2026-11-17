@@ -1040,7 +1040,9 @@ fn run_ktests_and_finish() -> ! {
             Err(e) => crate::log_warn!("a3-shell: AHCI 认领失败 {:?}", e),
         }
         // 挂根换卷A（口 3，根目录有 HELLO.ELF）；此刻还没有任何 VFS 句柄。
-        crate::filesystem::fs_open::set_port(3);
+        // a3-ls-deep：换多级真卷（口 5）——长名（LFN）只在那一块上有。
+        let port = if cfg!(feature = "a3-ls-deep") { 5 } else { 3 };
+        crate::filesystem::fs_open::set_port(port);
     }
     // A2 切片（ADR-130）：判定档不起交互会话（句柄表 16 格留给判定路径）。
     // init_task 的作用域提到两 cfg 块之外：判定后的 `park_until_init_exits` 两个分支都要它。
@@ -1629,9 +1631,11 @@ fn stage_init_user(sid: u8) -> Option<usize> {
     #[cfg(feature = "a3-shell")]
     {
         const A3_CMD: &[u8] = b"run /HELLO.ELF; ls; cat /NOTES; ps; free\0";
+        const A3_CMD_DEEP: &[u8] = b"ls /PROJECT/DOCS; ps; free\0";
+        let cmd: &[u8] = if cfg!(feature = "a3-ls-deep") { A3_CMD_DEEP } else { A3_CMD };
         hdr[12..16].copy_from_slice(&280u32.to_le_bytes());
-        hdr[16..20].copy_from_slice(&(A3_CMD.len() as u32).to_le_bytes());
-        if vmo::vmo_write(si, 280, A3_CMD) != Ok(A3_CMD.len()) {
+        hdr[16..20].copy_from_slice(&(cmd.len() as u32).to_le_bytes());
+        if vmo::vmo_write(si, 280, cmd) != Ok(cmd.len()) {
             crate::log_warn!("init-user: a3-shell 的 argv 写失败");
             bail!(1275, led, led_n, owner);
         }

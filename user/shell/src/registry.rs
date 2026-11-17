@@ -313,7 +313,8 @@ fn cmd_ls(c: &Ctx) -> bool {
     let mut n = 0u64;
     let r = rt::dir_list(path, |e| {
         con_write(c.h, if e.kind == 2 { msg(M_D) } else { msg(M_F) });
-        con_write(c.h, e.name);
+        // 有长名就显示长名（`DirEnt.long` 空串 = 没有），否则短名。
+        con_write(c.h, if e.long.is_empty() { e.name } else { e.long });
         if e.kind != 2 {
             con_write(c.h, msg(M_SP));
             put_u64(c.h, u64::from(e.size));

@@ -457,7 +457,7 @@ FAT_PORTS = {3: "fat32-small", 4: "fat32-wide"}
 FS_OPEN_FEATURES = {"fs-open"}
 # A3 切片：execprobe 的 22 号 open 打的是 fs_open::PORT=5 的 deep 卷（fs_open 自 mount 固定卷）。
 # 所以这一档的镜像也要装配 deep 卷——与 fs-open 同一份夹具、同一条指纹闸。
-A3_EXEC_FEATURES = {"a3-exec", "a3-shell", "a3-exec-bad", "a3-exec-seal"}
+A3_EXEC_FEATURES = {"a3-exec", "a3-shell", "a3-exec-bad", "a3-exec-seal", "a3-ls-deep"}
 FS_OPEN_PORTS = {5: "fat32-deep"}
 # ADR-111：写方向单独一档，挂在**可写**卷上（口 4）。它与 `FS_OPEN_PORTS` 一样要与内核的
 # `filesystem/fs_rw.rs` 的 `PORT` 对账（`check-fat32-ports` 里那一格扩成两张表）。
@@ -8537,6 +8537,27 @@ def do_test(timeout: int) -> int:
     IMAGE.unlink(missing_ok=True)
 
     # =====================================================================
+    # 长名（LFN）：根换成多级真卷（口 5），只列 /PROJECT/DOCS。宿主机用
+    # `validate_esp.py --deep-tree`（第三份实现）给期望：17 条短名+大小，其中
+    # AURORA~1.TXT 显示为长名 AuroraLongDocument.txt。
+    print("=== A3 长名：ls 显示 LFN（--features a3-ls-deep）===")
+    IMAGE.unlink(missing_ok=True)
+    lsv, lsrc, lslog = do_run(["a3-ls-deep"], timeout)
+    _drows = deep_tree_rows(FAT_IMG["fat32-deep"].read_bytes())
+    _long = next((r for r in _drows if r[:3] == ["deep", "long", "/PROJECT/DOCS/AURORA~1.TXT"]), None)
+    _dir = next((r for r in _drows if r[:3] == ["deep", "dir", "/PROJECT/DOCS/"]), None)
+    ls_ok = lsv == "PASS" and _long is not None and _dir is not None
+    if ls_ok:
+        _f = dict(x.split("=", 1) for x in _long[3:] + _dir[3:] if "=" in x)
+        _exp = [f"f {(_f['long'] if n == 'AURORA~1.TXT' else n)} {sz}"
+                for n, sz in zip(_f["order"].split(","), _f["sizes"].split(","))]
+        ls_ok = all(e in lslog for e in _exp) and f"ls: {len(_exp)} entries" in lslog             and "ls: /PROJECT/DOCS" in lslog
+    ls_verdict = "CONTENT-MISMATCH" if (lsv == "PASS" and not ls_ok) else lsv
+    for x in ([] if ls_ok else ["长名证人：deep-tree 的 order/sizes/long 与串口逐条对不上"]):
+        print("    对账:", x)
+    IMAGE.unlink(missing_ok=True)
+
+    # =====================================================================
     # S5（裁决 2026-11-18）：**读不到包 ⇒ 覆盖未知 ⇒ 对绝对名字 fail-closed**
     # （不是"无包放行"）。注入是内核侧特性 fault-pkg-read，不改盘。
     print("=== A3 闸门：读包失败必须拒启（fault-pkg-read）===")
@@ -8764,6 +8785,8 @@ def do_test(timeout: int) -> int:
         ("A3启动后写段VMO必须拒", r5_verdict, r5rc, "PASS", 33),
         # S5（裁决 2026-11-18）：读不到包 ⇒ 覆盖未知 ⇒ 拒启（不是无包放行）。
         ("A3包读不到⇒16号拒启", r6_verdict, r6rc, "PASS", 33),
+        # 2026-11-18：ls 显示长名（LFN）。
+        ("A3长名ls显示LFN", ls_verdict, lsrc, "PASS", 33),
 
     ]
     # 每一行对应那一跑的串口：不符时把红的那几格打出来。
@@ -8831,6 +8854,7 @@ def do_test(timeout: int) -> int:
         "A3换代码字节⇒16号拒启": r4log,
         "A3启动后写段VMO必须拒": r5log,
         "A3包读不到⇒16号拒启": r6log,
+        "A3长名ls显示LFN": lslog,
 
     }
     all_ok = True

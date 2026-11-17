@@ -724,13 +724,18 @@ pub fn dir_read(h: Handle, buf: &mut [u8]) -> Result<usize, RTError> {
 pub struct DirEnt<'a> {
     /// 1 = 文件，2 = 目录（与内核 `DIRENT_KIND_*` 同数）。
     pub kind: u8,
+    /// 短名（8.3）。
     pub name: &'a [u8],
+    /// 长名（LFN）；没有就是空串。显示优先用长名。
+    pub long: &'a [u8],
     pub size: u32,
 }
 
 /// `DIRENT_MAGIC`（"AUFD"）与版本：解码前先核，形状不对按 `INVALID` 拒（不猜）。
 const DIRENT_MAGIC: u32 = 0x4446_5541;
 const DIRENT_NAME_AT: usize = 48;
+const DIRENT_LONG_AT: usize = 64;
+const DIRENT_LONG_LEN_AT: usize = 10;
 const DIRENT_SIZE_AT: usize = 16;
 
 fn le32_at(b: &[u8], at: usize) -> u32 {
@@ -785,7 +790,15 @@ pub fn dir_list<F: FnMut(&DirEnt)>(path: &[u8], mut f: F) -> Result<u32, RTError
                     break;
                 }
             };
-            f(&DirEnt { kind: rec[7], name, size: le32_at(rec, DIRENT_SIZE_AT) });
+            let ll = usize::from(rec.get(DIRENT_LONG_LEN_AT).copied().unwrap_or(0))
+                | (usize::from(rec.get(DIRENT_LONG_LEN_AT + 1).copied().unwrap_or(0)) << 8);
+            // 长名：长度字段在 10（u16），内容在 64 起；越界按空串（短名兜底，不因长名坏整条）。
+            let long = if ll == 0 {
+                &rec[DIRENT_LONG_AT..DIRENT_LONG_AT]
+            } else {
+                rec.get(DIRENT_LONG_AT..DIRENT_LONG_AT + ll).unwrap_or(&rec[DIRENT_LONG_AT..DIRENT_LONG_AT])
+            };
+            f(&DirEnt { kind: rec[7], name, long, size: le32_at(rec, DIRENT_SIZE_AT) });
             n += 1;
             i += 1;
         }

@@ -15208,3 +15208,18 @@ ET_EXEC 的 `p_vaddr` 每个进程都从 `0x1_0000_0000` 起；14 号原来把�
   `1d2e6132e7fc`）；`shell.elf` 39880 / `17acca6ef0a6`；`a3-shell,fat32-probe` ELF `26cb5d70b29d`。
 - 仍未做：长名（记录里有，`ls` 还只显示短名）；`cd`/`pwd`（无 per-process cwd，口径另定）；
   创建/删除/截断；管道与重定向。
+
+## 400. `ls` 显示长名（LFN）（2026-11-18）
+
+- runtime：`DirEnt` 加 `long`（记录偏移 10 的 u16 长度 + 64 起的内容；越界按空串兜底）；
+  shell 的 `ls` 有长名显示长名，否则短名。
+- 新档 `a3-ls-deep`（= `a3-shell`）：根换成多级真卷（口 5），命令只做
+  `ls /PROJECT/DOCS; ps; free`（长名只在那一块卷上有）。
+- 判定行 `A3长名ls显示LFN`（第 73 行）：宿主机用 `validate_esp.py --deep-tree`（第三份实现）
+  取 `/PROJECT/DOCS` 的 `order`/`sizes` 与 `AURORA~1.TXT` 的 `long`，逐条对串口——
+  17 条 `f <短名或长名> <大小>`、`f AuroraLongDocument.txt 48`、`ls: 17 entries`。
+- 变异证红（已还原）：`ls` 恒用短名 ⇒ 长名那一行消失 ⇒ 行红。
+- 读数：`check` **17/17**；整链 **73 行 73 符合**（`build/lfn-matrix.log`，默认档
+  `b20f5ae6d534`）；`shell.elf` 39880 / `10f48d1b6176`；`a3-ls-deep` ELF `a1c42face7bf`。
+- 仍未做：`cd`/`pwd`（内核路径是绝对路径、无 per-process cwd，口径要另定）；创建/删除/截断；
+  管道与重定向。
