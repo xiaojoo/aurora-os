@@ -18,12 +18,12 @@
 use crate::parser::Parsed;
 use aurora_user_runtime as rt;
 
-use crate::{con_write, msg, put_u64};
+use crate::{con_write, msg, put_u64, ShellState};
 use crate::{
     M_ABI, M_BYE, M_BYTES, M_CAT, M_CAT_USAGE, M_D, M_DEAD, M_ENTRIES, M_F, M_FNV, M_FREE_PAGES,
     M_FREE_PFX, M_FREE_THR, M_HELP, M_LIVE, M_LS, M_MINUS, M_NL, M_PING, M_PS_ERR, M_PS_HDR,
-    M_PS_NOJOB, M_HELP2, M_RUN_ERR, M_RUN_EXIT, M_RUN_PREFIX, M_RUN_TIMEOUT, M_RUN_USAGE, M_SP, M_TRYHELP,
-    M_UNKNOWN,
+    M_PS_NOJOB, M_HELP2, M_HELP3, M_CD, M_CD_USAGE, M_NOTDIR, M_PWD, M_RUN_ERR, M_RUN_EXIT,
+    M_RUN_PREFIX, M_RUN_TIMEOUT, M_RUN_USAGE, M_SP, M_TRYHELP, M_UNKNOWN,
 };
 
 /// 控制台句柄（内核按角色 `ROLE_LOG` 转移给 shell 的那个 u64）。
@@ -38,6 +38,8 @@ pub struct Ctx<'a> {
     pub si_va: u64,
     /// 已解析的一行。
     pub p: &'a Parsed<'a>,
+    /// shell 自己的当前目录（内核只认绝对路径）。
+    pub st: &'a mut ShellState,
 }
 
 // ---- 命令词：const 字节数组折成 immediates，不取地址（沿用旧 dispatch 的纪律）----
@@ -51,6 +53,8 @@ const CMD_PS: [u8; 2] = [b'p', b's'];
 const CMD_FREE: [u8; 4] = [b'f', b'r', b'e', b'e'];
 const CMD_LS: [u8; 2] = [b'l', b's'];
 const CMD_CAT: [u8; 3] = [b'c', b'a', b't'];
+const CMD_CD: [u8; 2] = [b'c', b'd'];
+const CMD_PWD: [u8; 3] = [b'p', b'w', b'd'];
 
 /// 命令词比较。走 `&[u8] == &[u8]`，LLVM 折成 immediate 比较（旧 dispatch 同款）。
 fn streq(a: &[u8], b: &[u8]) -> bool {
@@ -62,6 +66,7 @@ fn streq(a: &[u8], b: &[u8]) -> bool {
 fn cmd_help(c: &Ctx) -> bool {
     con_write(c.h, msg(M_HELP));
     con_write(c.h, msg(M_HELP2));
+    con_write(c.h, msg(M_HELP3));
     true
 }
 
@@ -298,14 +303,192 @@ fn put_i64(h: ConsoleHandle, v: i64) {
     }
 }
 
+/// 把 `arg` 解析成**绝对路径**（写进 `out`，返回长度）：
+/// - 以 `/` 开头按原样，否则接在当前目录后面；
+/// - `.` 跳过、`..` 回退一级、连续 `/` 折叠、根上的 `..` 仍是根；
+/// - 越界（> out.len()-1）给 `None`，**不截断**。
+///
+/// **全程 `get`/`get_mut`，不做会失败的切片索引**：`out[len] = …`、`copy_from_slice`
+/// 这类写法在 `relocation-model=static` 下会把 panic Location 提升成 `.rodata` 常量，
+/// 取址即 32 位绝对重定位（本仓已在 `put_u64` 与 `dispatch+0xce9` 上各撞过；本轮第一次
+/// 是 cmd_cd 里的 `cwd[..n].copy_from_slice`）。
+#[inline(never)]
+fn resolve_path(st: &ShellState, arg: Option<&[u8]>, out: &mut [u8; 160]) -> Option<usize> {
+    let arg: &[u8] = match arg {
+        Some(a) => a,
+        None => st.cwd.get(..0)?,
+    };
+    // 先拼出"原始路径"：绝对参数直接用；相对参数接在 cwd 后面。
+    let mut j = [0u8; 160];
+    let mut jl = 0usize;
+    let absolute = !arg.is_empty() && arg.first() == Some(&b'/');
+    if !absolute {
+        let mut k = 0usize;
+        while k < st.cwd_len {
+            *j.get_mut(jl)? = *st.cwd.get(k)?;
+            jl += 1;
+            k += 1;
+        }
+        // cwd 与参数之间补一个 `/`（cwd 恒以非 `/` 结尾，根 "/" 除外）。
+        if jl > 0 && j.get(jl - 1) != Some(&b'/') {
+            *j.get_mut(jl)? = b'/';
+            jl += 1;
+        }
+    }
+    let mut i = 0usize;
+    while i < arg.len() {
+        *j.get_mut(jl)? = *arg.get(i)?;
+        jl += 1;
+        i += 1;
+    }
+    // 归一：逐组件写回 out。
+    let mut len = 1usize;
+    *out.get_mut(0)? = b'/';
+    let mut ci = 0usize;
+    while ci <= jl {
+        while ci < jl && j.get(ci) == Some(&b'/') {
+            ci += 1;
+        }
+        let cs = ci;
+        while ci < jl && j.get(ci) != Some(&b'/') {
+            ci += 1;
+        }
+        let ce = ci;
+        if ce == cs {
+            break;
+        }
+        let n = ce - cs;
+        if n == 1 && j.get(cs) == Some(&b'.') {
+            continue;
+        }
+        if n == 2 && j.get(cs) == Some(&b'.') && j.get(cs + 1) == Some(&b'.') {
+            while len > 1 {
+                len -= 1;
+                if out.get(len) == Some(&b'/') {
+                    break;
+                }
+            }
+            continue;
+        }
+        if len > 1 {
+            if len >= out.len() - 1 {
+                return None;
+            }
+            *out.get_mut(len)? = b'/';
+            len += 1;
+        }
+        if len + n > out.len() - 1 {
+            return None;
+        }
+        let mut k = 0usize;
+        while k < n {
+            *out.get_mut(len + k)? = *j.get(cs + k)?;
+            k += 1;
+        }
+        len += n;
+    }
+    Some(len)
+}
+
+/// 目标是不是目录：打开拿句柄 → 25 号 stat → 看 kind 字节 → 关。
+fn path_is_dir(path: &[u8]) -> Result<bool, rt::RTError> {
+    let h = rt::file_open(path, 0)?;
+    // 根目录的 kind 是 3（`STAT_KIND_ROOT`），子目录是 2 —— 两个都算目录。
+    let r = rt::file_stat(h)
+        .map(|s| s.bytes[7] == rt::STAT_KIND_DIR || s.bytes[7] == rt::STAT_KIND_ROOT);
+    let _ = rt::handle_close(h);
+    r
+}
+
+/// `pwd`：打当前目录。
+fn cmd_pwd(c: &Ctx) -> bool {
+    con_write(c.h, msg(M_PWD));
+    // `cwd[..len]` 的越界检查会生成 panic Location（static 模型下 .rodata 32 位重定位）。
+    let cur = c.st.cwd.get(..c.st.cwd_len).unwrap_or(c.st.cwd.as_slice());
+    con_write(c.h, cur);
+    con_write(c.h, msg(M_NL));
+    true
+}
+
+/// `cd [path]`：默认回根。先解析成绝对路径、再核目标真是目录，才替换。
+fn cmd_cd(c: &mut Ctx) -> bool {
+    // 空切片也走局部数组：`&[]` 会被提升成 .rodata 常量，取址就是 32 位绝对重定位。
+    let arg = match c.p.args.get(0) {
+        Some(a) if c.p.err.is_none() && !a.is_empty() => Some(a),
+        _ => None,
+    };
+    let mut buf = [0u8; 160];
+    let Some(n) = resolve_path(c.st, arg, &mut buf) else {
+        con_write(c.h, msg(M_CD_USAGE));
+        con_write(c.h, msg(M_NL));
+        return true;
+    };
+    // `&buf[..n]` 的越界检查也会生成 panic Location（本轮实测在 .rodata 里抓到）；
+    // 换成 `get(..n)`，失败按 usage 拒。
+    let Some(img) = buf.get(..n) else {
+        con_write(c.h, msg(M_CD_USAGE));
+        con_write(c.h, msg(M_NL));
+        return true;
+    };
+    match path_is_dir(img) {
+        Ok(true) => {
+            // 手写逐字节写回（get/get_mut），不生成 panic 位置；超长按 usage 拒。
+            let mut k = 0usize;
+            let mut ok = true;
+            while k < n {
+                match (c.st.cwd.get_mut(k), buf.get(k)) {
+                    (Some(d), Some(s)) => *d = *s,
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+                k += 1;
+            }
+            if ok {
+                c.st.cwd_len = n;
+            } else {
+                con_write(c.h, msg(M_CD_USAGE));
+                con_write(c.h, msg(M_NL));
+            }
+        }
+        Ok(false) => {
+            con_write(c.h, msg(M_CD));
+            con_write(c.h, img);
+            con_write(c.h, msg(M_NOTDIR));
+            con_write(c.h, msg(M_NL));
+        }
+        Err(e) => {
+            con_write(c.h, msg(M_CD));
+            con_write(c.h, img);
+            con_write(c.h, msg(M_RUN_ERR));
+            put_i64(c.h, e.0);
+            con_write(c.h, msg(M_NL));
+        }
+    }
+    true
+}
+
 /// `ls [path]`：默认列根。每条一行：`d <短名>` 或 `f <短名> <字节数>`，末尾 `ls: <条数> entries`。
 fn cmd_ls(c: &Ctx) -> bool {
     // 局部数组而不是 `b"/"`：后者会被提升成 .rodata 常量，取址即 32 位绝对重定位
     // （put_u64 的注释记过同一个坑；本题第一版就撞在 dispatch+0xce9）。
-    let slash = [b'/'];
-    let path: &[u8] = match c.p.args.get(0) {
-        Some(a) if c.p.err.is_none() && !a.is_empty() => a,
-        _ => &slash[..],
+    let raw = match c.p.args.get(0) {
+        Some(a) if c.p.err.is_none() && !a.is_empty() => Some(a),
+        _ => None,
+    };
+    let mut abuf = [0u8; 160];
+    let Some(al) = resolve_path(c.st, raw, &mut abuf) else {
+        con_write(c.h, msg(M_LS));
+        con_write(c.h, msg(M_RUN_ERR));
+        con_write(c.h, msg(M_NL));
+        return true;
+    };
+    let Some(path) = abuf.get(..al) else {
+        con_write(c.h, msg(M_LS));
+        con_write(c.h, msg(M_RUN_ERR));
+        con_write(c.h, msg(M_NL));
+        return true;
     };
     con_write(c.h, msg(M_LS));
     con_write(c.h, path);
@@ -349,6 +532,19 @@ fn cmd_cat(c: &Ctx) -> bool {
             return true;
         }
     };
+    let mut abuf = [0u8; 160];
+    let Some(al) = resolve_path(c.st, Some(path), &mut abuf) else {
+        con_write(c.h, msg(M_CAT));
+        con_write(c.h, msg(M_RUN_ERR));
+        con_write(c.h, msg(M_NL));
+        return true;
+    };
+    let Some(path) = abuf.get(..al) else {
+        con_write(c.h, msg(M_CAT));
+        con_write(c.h, msg(M_RUN_ERR));
+        con_write(c.h, msg(M_NL));
+        return true;
+    };
     con_write(c.h, msg(M_CAT));
     con_write(c.h, path);
     con_write(c.h, msg(M_NL));
@@ -390,8 +586,8 @@ fn cmd_cat(c: &Ctx) -> bool {
 ///
 /// **加命令的配方**：一个 const 名字数组 + 一个处理器 + 链上加一节；
 /// 带参命令在处理器里先查 `p.err` 再用 `p.args`。
-pub fn dispatch(h: ConsoleHandle, si_va: u64, p: &Parsed) -> bool {
-    let c = Ctx { h, si_va, p };
+pub fn dispatch(h: ConsoleHandle, si_va: u64, p: &Parsed, st: &mut ShellState) -> bool {
+    let mut c = Ctx { h, si_va, p, st };
     if p.cmd.is_empty() {
         // 空行：旧实现静默回到提示符，不产出任何输出。
         return true;
@@ -425,6 +621,12 @@ pub fn dispatch(h: ConsoleHandle, si_va: u64, p: &Parsed) -> bool {
     }
     if streq(p.cmd, &CMD_CAT) {
         return cmd_cat(&c);
+    }
+    if streq(p.cmd, &CMD_CD) {
+        return cmd_cd(&mut c);
+    }
+    if streq(p.cmd, &CMD_PWD) {
+        return cmd_pwd(&c);
     }
     // unknown：三段输出与旧实现逐字节一致——词原样回显（借用不拷贝，全长不截断）。
     con_write(c.h, msg(M_UNKNOWN));

@@ -38,7 +38,7 @@ mod registry;
 /// （hello/probe 的模块头都记过这个坑，本轮实测又撞一次）。改成 RIP 相对 lea 取基址 + 常量偏移。
 /// S6u：横幅的前导 `\x0a` 去掉了——那是当年为了跟上面的内核日志隔开留的，
 /// ADR-096 之后画面正文只有会话输出，前面什么都没有，那一格就成了纯粹的空行。
-static MSGS: [u8; 376] = *b"commands: help | echo <text> | ping | abi | ps | free | exit\x0aAurora OS 6.1.0-aurora (tty1)\x0aaurora@os:~$ \x0aline too long, discarded\x0aunknown command:  (try help)\x0aping=abi_info=bye\x0a\x08 \x08^C\x0arun:  exit= (timeout) error=usage: run <path>\x0a-PID GEN THR ST PAGES\x0aps: no job handle\x0alivedead ps: error=free: procs= threads= pages=ls: cat: d f  entries bytes= fnv=usage: cat <path> ls | cat\x0a";
+static MSGS: [u8; 428] = *b"commands: help | echo <text> | ping | abi | ps | free | exit\x0aAurora OS 6.1.0-aurora (tty1)\x0aaurora@os:~$ \x0aline too long, discarded\x0aunknown command:  (try help)\x0aping=abi_info=bye\x0a\x08 \x08^C\x0arun:  exit= (timeout) error=usage: run <path>\x0a-PID GEN THR ST PAGES\x0aps: no job handle\x0alivedead ps: error=free: procs= threads= pages=ls: cat: d f  entries bytes= fnv=usage: cat <path> ls | catpwd: cd:  not a directoryusage: cd <path> | cd | pwd\x0a";
 
 const M_HELP: (usize, usize) = (0, 61);
 const M_BANNER: (usize, usize) = (61, 30);
@@ -76,6 +76,11 @@ const M_BYTES: (usize, usize) = (337, 7);
 const M_FNV: (usize, usize) = (344, 5);
 const M_CAT_USAGE: (usize, usize) = (349, 17);
 const M_HELP2: (usize, usize) = (366, 9);
+const M_PWD: (usize, usize) = (376, 5);
+const M_CD: (usize, usize) = (381, 4);
+const M_NOTDIR: (usize, usize) = (385, 16);
+const M_CD_USAGE: (usize, usize) = (401, 16);
+const M_HELP3: (usize, usize) = (417, 11);
 /// blob 的真实基址（RIP 相对 lea，不产生 32 位绝对重定位）。
 fn msgs_base() -> u64 {
     let b: u64;
@@ -188,6 +193,20 @@ fn put_u64(h: u64, mut v: u64) {
 // A2 接线：find_console（SI 页解析）整段迁到 `rt::find_console`——两边逐字同源
 // （runtime 版注明了出处 main.rs 原实现），Si 页偏移常量也随之迁走。
 
+/// 2026-11-18：shell 自己的**当前目录**（内核只认绝对路径，cwd 纯属 shell 状态）。
+/// 初始 `/`；`cd` 校验目标真是目录后整串替换。单线程程序，一个实例在 `_start` 里。
+pub struct ShellState {
+    pub cwd: [u8; 128],
+    pub cwd_len: usize,
+}
+
+impl ShellState {
+    pub fn new() -> Self {
+        let mut cwd = [0u8; 128];
+        cwd[0] = b'/';
+        ShellState { cwd, cwd_len: 1 }
+    }
+}
 /// 入口。`rdi` = StartupInfo 那一页在子 AS 里的 VA（`process_start` 的 set_thread_arg）。
 #[no_mangle]
 pub extern "C" fn _start(si_va: u64) -> ! {
@@ -203,6 +222,7 @@ pub extern "C" fn _start(si_va: u64) -> ! {
         }
     };
     con_write(console, msg(M_BANNER));
+    let mut st = ShellState::new();
     // A3（ADR-131）：SI 页的 **argv 区**若带了一条命令，就执行它一次然后退出
     // （`sh -c` 语义）。默认构建的内核不写 argv（0/0），所以交互行为**一字未变**；
     // 有 argv 时不打印提示符——脚本模式不该等输入。
@@ -221,7 +241,7 @@ pub extern "C" fn _start(si_va: u64) -> ! {
             con_write(console, cmd);
             con_write(console, msg(M_NL));
             let parsed = parser::parse(cmd);
-            let _ = registry::dispatch(console, si_va, &parsed);
+            let _ = registry::dispatch(console, si_va, &parsed, &mut st);
         }
         if any {
             rt::exit(0);
@@ -252,7 +272,7 @@ pub extern "C" fn _start(si_va: u64) -> ! {
                 let parsed = parser::parse(line.get(..len).unwrap_or(&[]));
                 // A3：`run` 要按角色取 Job 句柄，所以把 SI 页地址一并传进分派层
                 // （只有 `run` 用它，其余命令一个字都没变）。
-                if !registry::dispatch(console, si_va, &parsed) {
+                if !registry::dispatch(console, si_va, &parsed, &mut st) {
                     // A2 接线：与旧版同义（3 号、code=0）。`rt::exit` 是 `-> !`，
                     // 失败时 runtime 侧自旋兜底（旧版这里无兜底，exit 失败会掉回循环——
                     // 那是内核异常态，自旋比静默继续更诚实）。

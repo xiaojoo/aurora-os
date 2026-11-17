@@ -8551,7 +8551,14 @@ def do_test(timeout: int) -> int:
         _f = dict(x.split("=", 1) for x in _long[3:] + _dir[3:] if "=" in x)
         _exp = [f"f {(_f['long'] if n == 'AURORA~1.TXT' else n)} {sz}"
                 for n, sz in zip(_f["order"].split(","), _f["sizes"].split(","))]
-        ls_ok = all(e in lslog for e in _exp) and f"ls: {len(_exp)} entries" in lslog             and "ls: /PROJECT/DOCS" in lslog
+        _nes = next((r for r in _drows if r[:3] == ["deep", "file", "/PROJECT/DOCS/NESTED.TXT"]), None)
+        _nf = dict(x.split("=", 1) for x in (_nes or [])[3:] if "=" in x)
+        ls_ok = all(e in lslog for e in _exp) and f"ls: {len(_exp)} entries" in lslog
+        ls_ok = ls_ok and "ls: /PROJECT/DOCS" in lslog
+        # cwd 回根的证据用"无参 ls 打出 ls: /"（pwd 的串口行在重日志下会被吞字符，不当判据）
+        ls_ok = ls_ok and "ls: /" in lslog
+        ls_ok = ls_ok and "cat: /PROJECT/DOCS/NESTED.TXT" in lslog
+        ls_ok = ls_ok and f"cat: {_nf.get('size')} bytes= fnv={int(_nf.get('fnv', '0'), 16)}" in lslog
     ls_verdict = "CONTENT-MISMATCH" if (lsv == "PASS" and not ls_ok) else lsv
     for x in ([] if ls_ok else ["长名证人：deep-tree 的 order/sizes/long 与串口逐条对不上"]):
         print("    对账:", x)
@@ -8786,7 +8793,7 @@ def do_test(timeout: int) -> int:
         # S5（裁决 2026-11-18）：读不到包 ⇒ 覆盖未知 ⇒ 拒启（不是无包放行）。
         ("A3包读不到⇒16号拒启", r6_verdict, r6rc, "PASS", 33),
         # 2026-11-18：ls 显示长名（LFN）。
-        ("A3长名ls显示LFN", ls_verdict, lsrc, "PASS", 33),
+        ("A3长名与cd/pwd", ls_verdict, lsrc, "PASS", 33),
 
     ]
     # 每一行对应那一跑的串口：不符时把红的那几格打出来。
@@ -8854,7 +8861,7 @@ def do_test(timeout: int) -> int:
         "A3换代码字节⇒16号拒启": r4log,
         "A3启动后写段VMO必须拒": r5log,
         "A3包读不到⇒16号拒启": r6log,
-        "A3长名ls显示LFN": lslog,
+        "A3长名与cd/pwd": lslog,
 
     }
     all_ok = True

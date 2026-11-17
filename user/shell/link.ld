@@ -8,6 +8,7 @@
  * overlaps with .rodata`（本轮实测）。段仍各自 ALIGN(4K)，窗口约束不变。
  * S6（2026-11-18）：接上 ls/cat 后 .text 到 0x4114，又把 16 KiB 撞穿一次 —— 这次把
  * .text 预算放到 20 KiB（.rodata 挪到 0x100005000、.data 0x100007000），不是再挤代码。
+ * 2026-11-18 接 cd/pwd 后 .text 到 0x54F4 ⇒ 再放到 24 KiB（.rodata 0x100006000、.data 0x100008000）。
  */
 
 OUTPUT_FORMAT(elf64-x86-64)
@@ -28,13 +29,13 @@ SECTIONS {
     *(.text .text.*)
   } :text
 
-  . = 0x100005000;
+  . = 0x100006000;
   .rodata ALIGN(4K) : {
     *(.rodata .rodata.*)
     *(.rdata)
   } :rodata
 
-  . = 0x100007000;
+  . = 0x100008000;
   .data ALIGN(4K) : {
     *(.data .data.*)
   } :data

@@ -102,6 +102,8 @@ pub const DIRENT_RECORD_LEN: usize = 512;
 pub const STAT_KIND_FILE: u8 = 1;
 /// stat 记录第 7 字节 = 目录（fs_open.rs:22）。
 pub const STAT_KIND_DIR: u8 = 2;
+/// 根目录（`/`）单独一个 kind：挂载根的 stat 记录用 3，不是 2。
+pub const STAT_KIND_ROOT: u8 = 3;
 /// 等待信号位：bit0 = 对象已终止（user.rs:882）。用户侧稳定位图，与内核内部布局无关。
 pub const WAIT_TERMINATED: u64 = 1;
 /// 等待时限上限毫秒，必须有界（user.rs:885）。

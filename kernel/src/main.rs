@@ -1631,7 +1631,7 @@ fn stage_init_user(sid: u8) -> Option<usize> {
     #[cfg(feature = "a3-shell")]
     {
         const A3_CMD: &[u8] = b"run /HELLO.ELF; ls; cat /NOTES; ps; free\0";
-        const A3_CMD_DEEP: &[u8] = b"ls /PROJECT/DOCS; ps; free\0";
+        const A3_CMD_DEEP: &[u8] = b"pwd; cd /PROJECT; pwd; ls DOCS; cat DOCS/NESTED.TXT; cd ..; ls; ps; free\0";
         let cmd: &[u8] = if cfg!(feature = "a3-ls-deep") { A3_CMD_DEEP } else { A3_CMD };
         hdr[12..16].copy_from_slice(&280u32.to_le_bytes());
         hdr[16..20].copy_from_slice(&(cmd.len() as u32).to_le_bytes());

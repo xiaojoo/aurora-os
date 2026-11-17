@@ -15223,3 +15223,25 @@ ET_EXEC 的 `p_vaddr` 每个进程都从 `0x1_0000_0000` 起；14 号原来把�
   `b20f5ae6d534`）；`shell.elf` 39880 / `10f48d1b6176`；`a3-ls-deep` ELF `a1c42face7bf`。
 - 仍未做：`cd`/`pwd`（内核路径是绝对路径、无 per-process cwd，口径要另定）；创建/删除/截断；
   管道与重定向。
+
+## 401. shell 接上 `cd`/`pwd`——cwd 是 shell 自己的状态（2026-11-18）
+
+- 口径：内核**只认绝对路径**（FS 决策 3）不动；cwd 纯粹是 shell 的状态（`ShellState`，单线程
+  一个实例）。`cd`/`ls`/`cat` 的路径先由 shell 拼成绝对路径再交给 22/24/26。
+- `cd [path]`（默认回根）：`.` 跳过、`..` 回退、连续 `/` 折叠、根上的 `..` 仍是根；拼好后用
+  22+25 核目标**真是目录**（kind 2 **或 3**——根的 stat kind 是 3，实测漏了它会拒 `cd /`）；
+  越界按 usage 拒、不截断。`pwd` 打当前目录。`ls`/`cat` 输出**解析后的绝对路径**。
+- a3-ls-deep 命令扩成 `pwd; cd /PROJECT; pwd; ls DOCS; cat DOCS/NESTED.TXT; cd ..; ls; ps; free`；
+  判定行（原 `A3长名ls显示LFN`）改名 `A3长名与cd/pwd`：除 17 条 LFN 与
+  `f AuroraLongDocument.txt 48` 外，加 `ls: /PROJECT/DOCS`（相对路径解析）、
+  `cat: /PROJECT/DOCS/NESTED.TXT` + `cat: 64 bytes= fnv=15377205761677747429`（宿主机 deep-tree
+  的 NESTED.TXT 同数）、`cd ..` 之后无参 `ls` 打出 `ls: /`（cwd 回根）。
+  **pwd 的串口行不当判据**：重日志下会被吞字符（实测 `pwd: /` 读成 `wd: c/`），命令仍跑但读数不可信。
+- 静态重定位的坑（三连）：`cwd[..n].copy_from_slice`、`&buf[..n]`、`&[]`/`b"."` 这些写法会把
+  panic Location / 空切片提升成 `.rodata` 常量，取址即 `R_X86_64_32S` ⇒ 全部改 `get/get_mut`、
+  字面量比较改逐字节；`.text` 到 0x54F4 ⇒ link.ld 的 text 预算放到 24 KiB。
+- 变异证红（已还原）：`resolve_path` 恒按绝对处理（不拼 cwd）⇒ `ls: /DOCS` ⇒ 行红。
+- 读数：`check` **17/17**；整链 **73 行 73 符合**（`build/cdpwd-matrix.log`，默认档
+  `2017cbe9a1e0`）；`shell.elf` 40168 / `3ea371ec11e3`；`a3-ls-deep` ELF `eb924f384d34`
+  （单跑一次撞 120 s 楔子，同 ELF 复跑 PASS）。
+- 仍未做：创建/删除/截断（23 号只覆盖已有区间）；管道与重定向。
