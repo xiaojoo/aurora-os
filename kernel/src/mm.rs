@@ -1769,11 +1769,16 @@ struct AspaceEntry {
     /// **对象世代号**（P5c-1，ADR-075 决策 4 的补充）：`aspace_new` 在旧值上 +1，
     /// `aspace_release` 不清零 ⇒ 槽位复用后旧句柄的 `(slot, gen)` 必然对不上。
     gen: u32,
+    /// **这张 AS 名下当前映射着的页数**（ADR-132 决策 2 的 `pages` 字段用）。
+    /// 记账点在 `map_shared` 成功之后与 `AspaceMapping::drop` 清叶子之后，都在 VMM 里，
+    /// 所以它是一个可对账的量；`saturating` 处理"退多了"（那是调用方的账错了，由判据抓）。
+    /// **口径**：数的是**映射页**，不是物理常驻页（后者今天没有量具）。
+    mapped: u32,
 }
 
 const AS_PT_SLOTS: usize = 16;
 const AS_EMPTY: AspaceEntry =
-    AspaceEntry { used: false, pml4: 0, pt_frames: [0; AS_PT_SLOTS], pt_count: 0, gen: 0 };
+    AspaceEntry { used: false, pml4: 0, pt_frames: [0; AS_PT_SLOTS], pt_count: 0, gen: 0, mapped: 0 };
 
 #[derive(Clone, Copy)]
 struct AspaceTable {
@@ -1900,7 +1905,7 @@ fn aspace_new_slot() -> Option<(u8, u32)> {
     }
     AS_ON[slot].store(0, Ordering::Release);
     let gen = t.items[slot].gen.wrapping_add(1);
-    t.items[slot] = AspaceEntry { used: true, pml4, pt_frames: [0; AS_PT_SLOTS], pt_count: 0, gen };
+    t.items[slot] = AspaceEntry { used: true, pml4, pt_frames: [0; AS_PT_SLOTS], pt_count: 0, gen, mapped: 0 };
     t.items[slot].pt_frames[0] = frame;
     t.items[slot].pt_count = 1;
     AS_PT_LIVE.fetch_add(1, Ordering::Relaxed);
@@ -1973,6 +1978,21 @@ fn aspace_release(slot: u8) {
         }
     }
     AS_PT_LIVE.fetch_sub(frames.1, Ordering::Relaxed);
+}
+
+/// 这张 AS 名下当前映射着的页数（ADR-132）：槽不存在或已销毁返回 `None`。
+///
+/// **口径**：数的是映射页（`map_shared` 成功 +n、`AspaceMapping::drop` -n），
+/// 不是物理常驻页——后者今天没有量具，别把它当 RSS 用。
+#[must_use]
+pub fn aspace_mapped_pages(slot: u8) -> Option<u32> {
+    let _g = vmm();
+    let e = aspaces().items.get(usize::from(slot))?;
+    if e.used {
+        Some(e.mapped)
+    } else {
+        None
+    }
 }
 
 /// 按槽号读它的 PML4 物理地址（槽不存在返回 None）。**给登记路径用一次**：
@@ -2122,6 +2142,14 @@ impl Drop for AspaceMapping {
                 // 这一句就是无效操作；syscall 路径的 VA 是 alloc_user_va_range 发的，必须还。
                 release_va_locked(self.va.0);
                 UNMAPPED_PAGES.fetch_add(n, Ordering::Relaxed);
+                // 按 AS 的页计数（ADR-132）：与 map_shared 的 +n 对称；这里同样持 VMM。
+                if let Some(slot) = self.as_slot {
+                    if let Some(e) = aspaces().items.get_mut(usize::from(slot)) {
+                        if e.used {
+                            e.mapped = e.mapped.saturating_sub(n as u32);
+                        }
+                    }
+                }
             }
         }
         // 锁外还参考：frame_put 到 0 才真还（毒化 + 台账 + free_frames），与 aspace_release 同律
@@ -2261,6 +2289,14 @@ fn map_shared(
     }
     MAP_CALLS.fetch_add(1, Ordering::Relaxed);
     MAPPED_PAGES.fetch_add(n, Ordering::Relaxed);
+    // 按 AS 的页计数（ADR-132 的 `pages`）：这里持着 VMM，直接改表项。
+    if let Some(s) = as_slot {
+        if let Some(e) = aspaces().items.get_mut(usize::from(s)) {
+            if e.used {
+                e.mapped = e.mapped.saturating_add(n as u32);
+            }
+        }
+    }
     let mut out = AspaceMapping { as_slot, root, va, pages: n, frames: [0; MAX_AS_MAP_PAGES], owner };
     out.frames[..n].copy_from_slice(&got[..n]);
     Ok(out)

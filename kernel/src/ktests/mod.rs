@@ -24,6 +24,8 @@ mod heap;
 mod mm;
 #[cfg(feature = "virtio-net")]
 mod net;
+#[cfg(feature = "handles")]
+mod procinfo;
 mod resource;
 mod sched;
 #[cfg(feature = "sig-check")]

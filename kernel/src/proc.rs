@@ -248,6 +248,61 @@ pub fn proc_thread_exited(proc_id: u16, exit_code: u32) {
     }
 }
 
+/// 一张进程快照（ADR-132：27/28 号共用）。**全整数、不含指针**。
+///
+/// `aspace` 是给调用方查页数用的**内部**字段（`mm::aspace_mapped_pages` 自己要取 VMM，
+/// 不能在持锁的这里调），**不写进用户记录**——用户拿到的只有 pid/gen/计数/状态。
+#[derive(Clone, Copy)]
+pub struct ProcInfo {
+    /// 槽号（就是今天的 pid）。
+    pub pid: u16,
+    /// 世代号（句柄里那一位的来源）。
+    pub gen: u32,
+    /// 还活着的线程数。
+    pub threads: u16,
+    /// 所属 Job 的槽号（枚举按它过滤）。
+    pub job: u16,
+    /// 是否已终止（僵尸也算终止：结局已定，只等 reap）。
+    pub terminated: bool,
+    /// 终止时的退出码（活着时无意义）。
+    pub exit_code: u32,
+    /// 名下那张 AS 的槽号（**内部用**，调用方查完页数就丢）。
+    pub aspace: u8,
+}
+
+/// 进程表容量（27 号枚举的游标上界）。
+#[must_use]
+pub const fn proc_slots() -> usize {
+    MAX_PROCESSES
+}
+
+/// 读第 `idx` 槽的快照：空槽返回 `None`。
+///
+/// 取 VMM 只为读 `job`/`aspace` 这两格非原子字段；`threads`/`signal` 是原子量，
+/// 与 `proc_thread_exited` 的分界一致（判据可能读到"刚终止"的瞬时值，那是允许的）。
+#[must_use]
+pub fn proc_info(idx: usize) -> Option<ProcInfo> {
+    let live = mm::with_vmm_lock(|| {
+        let s = st();
+        let e = s.procs.get(idx)?;
+        if !alive_flag(&e.used) {
+            return None;
+        }
+        let sig = e.signal.load(Ordering::Acquire);
+        Some((e.gen, e.job, e.aspace, e.threads.load(Ordering::Acquire), sig))
+    });
+    let (gen, job, aspace, threads, sig) = live?;
+    Some(ProcInfo {
+        pid: idx as u16,
+        gen,
+        threads,
+        job,
+        terminated: sig & SIG_TERMINATED != 0,
+        exit_code: sig & !SIG_TERMINATED,
+        aspace,
+    })
+}
+
 /// 收走一个**已终止**的进程（僵尸）：还额度、清槽，返回退出码。
 /// 只在进程上下文里调（取 VMM），**不在故障路径上**。
 pub fn proc_reap(proc_id: u16) -> Result<u32, ProcError> {

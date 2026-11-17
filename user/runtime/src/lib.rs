@@ -72,6 +72,10 @@ pub const SYS_FILE_SEEK: u64 = 24;
 pub const SYS_FILE_STAT: u64 = 25;
 /// 26 `readdir(dir_handle,buf,len)`（user.rs:61；实现 user.rs:1263）。
 pub const SYS_DIR_READ: u64 = 26;
+/// 27 `proc_enum(job,cursor,buf,len)`（ADR-132；user.rs 的实现见 `sys_proc_enum`）。
+pub const SYS_PROC_ENUM: u64 = 27;
+/// 28 `proc_stat(proc,buf,len)`（ADR-132）。
+pub const SYS_PROC_STAT: u64 = 28;
 /// 12 `vmo_create(pages)`（user.rs:43）——A3 用户态装载器的底座。
 pub const SYS_VMO_CREATE: u64 = 12;
 /// 13 `vmo_write(handle,off,buf,len)`（user.rs:46）。
@@ -507,6 +511,127 @@ pub fn vmo_map(proc: Handle, vmo: Handle, va: u64, w: bool, x: bool) -> Result<u
     } else {
         Ok(ret as u64)
     }
+}
+
+// ---------------------------------------------------------------------------
+// 进程观测（27 / 28 号，ADR-132）
+// ---------------------------------------------------------------------------
+
+/// 一条记录的定长（枚举与统计同为 32 字节，布局见 ADR-132 §2.2）。
+pub const PROC_RECORD_LEN: usize = 32;
+
+/// 一条枚举记录（解码后）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcEntry {
+    /// 槽号（今天的 pid）。
+    pub pid: u32,
+    /// 世代号。
+    pub gen: u32,
+    /// 还活着的线程数。
+    pub threads: u32,
+    /// 是否已终止（僵尸也算）。
+    pub terminated: bool,
+    /// 名下 AS 的**映射页数**（不是常驻页）。
+    pub pages: u32,
+    /// 所属 Job 的槽号。
+    pub job: u32,
+}
+
+/// 一条统计记录（比枚举多一个退出码）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcStat {
+    /// 槽号。
+    pub pid: u32,
+    /// 世代号。
+    pub gen: u32,
+    /// 线程数。
+    pub threads: u32,
+    /// 是否已终止。
+    pub terminated: bool,
+    /// 终止时的退出码（活着时无意义）。
+    pub exit_code: u32,
+    /// 映射页数。
+    pub pages: u32,
+}
+
+fn le32(b: &[u8], off: usize) -> u32 {
+    match b.get(off..off + 4) {
+        Some(s) => u32::from_le_bytes([s[0], s[1], s[2], s[3]]),
+        None => 0,
+    }
+}
+
+/// 27 号：枚举自己 Job 名下的进程。返回 `(下一个游标, 本次条数)`；**游标 0 = 扫完**。
+pub fn proc_enum(job: Handle, cursor: u32, buf: &mut [u8]) -> Result<(u32, u32), RTError> {
+    if buf.len() < PROC_RECORD_LEN {
+        return Err(RTError::TOOLONG);
+    }
+    // SAFETY: 27 号 `rdi` = Job 句柄（要 READ）、`rsi` = 游标、`rdx` = 缓冲、`r10` = 字节数；
+    // 缓冲由调用方给出，长度已在上行校验，内核侧还有 `COPY_MAX` 与 `copy_to_user` 的窗口校验。
+    let ret = unsafe {
+        syscall_abi(
+            SYS_PROC_ENUM,
+            job,
+            u64::from(cursor),
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        )
+    };
+    if ret < 0 {
+        return Err(RTError(ret));
+    }
+    let v = ret as u64;
+    Ok(((v >> 32) as u32, (v & 0xffff_ffff) as u32))
+}
+
+/// 27 号的解码：`buf` 里第 `i` 条（越界/魔数不对回 `None`，不 panic）。
+#[must_use]
+pub fn proc_enum_at(buf: &[u8], i: usize) -> Option<ProcEntry> {
+    let off = i.checked_mul(PROC_RECORD_LEN)?;
+    let rec = buf.get(off..off + PROC_RECORD_LEN)?;
+    if le32(rec, 0) != 0x3150_5541 || rec.get(4) != Some(&1) {
+        return None;
+    }
+    Some(ProcEntry {
+        pid: le32(rec, 8),
+        gen: le32(rec, 12),
+        threads: le32(rec, 16),
+        terminated: le32(rec, 20) != 0,
+        pages: le32(rec, 24),
+        job: le32(rec, 28),
+    })
+}
+
+/// 28 号：取一个进程的统计。成功后记录在 `buf` 的前 32 字节里。
+pub fn proc_stat(proc: Handle, buf: &mut [u8]) -> Result<(), RTError> {
+    if buf.len() < PROC_RECORD_LEN {
+        return Err(RTError::TOOLONG);
+    }
+    // SAFETY: 28 号 `rdi` = Proc 句柄（要 READ）、`rsi` = 缓冲、`rdx` = 字节数。
+    let ret = unsafe {
+        syscall_abi(SYS_PROC_STAT, proc, buf.as_mut_ptr() as u64, buf.len() as u64, 0)
+    };
+    if ret < 0 {
+        return Err(RTError(ret));
+    }
+    Ok(())
+}
+
+/// 28 号的解码。
+#[must_use]
+pub fn proc_stat_at(buf: &[u8]) -> Option<ProcStat> {
+    let rec = buf.get(..PROC_RECORD_LEN)?;
+    if le32(rec, 0) != 0x3153_5541 || rec.get(4) != Some(&1) {
+        return None;
+    }
+    Some(ProcStat {
+        pid: le32(rec, 8),
+        gen: le32(rec, 12),
+        threads: le32(rec, 16),
+        terminated: le32(rec, 20) != 0,
+        exit_code: le32(rec, 24),
+        pages: le32(rec, 28),
+    })
 }
 
 /// 24 号的基准（user.rs:56 的 whence 约定：0=SET、1=CUR、2=END）。

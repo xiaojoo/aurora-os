@@ -394,7 +394,7 @@ fn t_fs_rw_open_write() -> bool {
     // ABI 0.15：写意图位与写根位在这档都必须置位（0.14 的挂载表 + 0.15 的 dup 共享游标）。
     ok &= user::abi_word() & user::F_FS_WRITE_OPEN != 0
         && user::abi_word() & user::F_FS_WRITE_ROOT != 0
-        && user::ABI_MINOR == 16;
+        && user::ABI_MINOR == 17;
 
     let c = if open_ok {
         call(&mut fr, user::SYS_HANDLE_CLOSE, handle.0, 0, 0)
