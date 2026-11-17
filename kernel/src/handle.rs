@@ -125,6 +125,9 @@ pub struct FileObj {
     /// （见下面 `read`），表项里不带区间就只能重建出整盘 ⇒ 偏移在第一次读之后就丢了。
     pub part: Option<Partition>,
     pub cursor: FileCursor,
+    /// 共享游标格子（ADR-108 补记二）：`None` = 游标还在本表项里（**未 dup 过的老形状**）；
+    /// `Some(i)` = 游标住在 `Table.cells[i]`，dup 出来的句柄推进同一份读取位置。
+    pub share: Option<u8>,
 }
 
 /// 表里存的**对象引用**，全 Copy（ADR-074 决策 1）。
@@ -139,7 +142,13 @@ pub enum ObjRef {
     /// FS-03：通过 `vfs_ro` 打开的文件。游标自带 `Bpb`，所以表里仍是 Copy 值，
     /// 下一次盘 I/O 在表锁外重建 `AhciDisk`/`PartitionView` 即可。
     #[cfg(feature = "fs-open")]
-    VfsFile { port: u8, part: Option<Partition>, cursor: ReadCursor, stat: VfsEntry },
+    VfsFile {
+        port: u8,
+        part: Option<Partition>,
+        cursor: ReadCursor,
+        stat: VfsEntry,
+        share: Option<u8>,
+    },
     /// 目录句柄不内嵌 `DirCursor`（那会把每槽撑到 1.5 KiB）；`DirState` 是可复制的紧凑游标。
     #[cfg(feature = "fs-open")]
     VfsDir { port: u8, part: Option<Partition>, stat: VfsEntry, state: DirState },
@@ -196,14 +205,39 @@ pub struct Counters {
     pub live_peak: u32,
 }
 
+/// 一个共享游标格（ADR-108 补记二）。只在 `dup` 之后才出现：
+/// 一条格子至少被两条句柄引用，所以格子上限是 `MAX_HANDLES / 2`。
+#[derive(Clone, Copy)]
+enum CellCur {
+    Fat(FileCursor),
+    #[cfg(feature = "fs-open")]
+    Vfs(ReadCursor),
+}
+
+#[derive(Clone, Copy)]
+struct Cell {
+    used: bool,
+    gen: u32,
+    refs: u16,
+    cur: Option<CellCur>,
+}
+
+const EMPTY_CELL: Cell = Cell {
+    used: false,
+    gen: 0,
+    refs: 0,
+    cur: None,
+};
+
 struct Table {
     slots: [Entry; MAX_HANDLES],
+    cells: [Cell; MAX_SHARE],
     c: Counters,
 }
 
 impl Table {
     const fn empty() -> Table {
-        Table { slots: [EMPTY; MAX_HANDLES], c: Counters {
+        Table { slots: [EMPTY; MAX_HANDLES], cells: [EMPTY_CELL; MAX_SHARE], c: Counters {
             grants: 0, closes: 0, stale: 0, not_owner: 0, denied: 0, exhausted: 0, transfers: 0,
             invalid: 0, no_such: 0, revoked: 0, reads: 0, bytes: 0, live_peak: 0,
         } }
@@ -211,6 +245,50 @@ impl Table {
 
     fn live(&self) -> u32 {
         self.slots.iter().filter(|e| e.used).count() as u32
+    }
+}
+
+const MAX_SHARE: usize = MAX_HANDLES / 2;
+
+/// 占一格共享游标（锁内）。引用数从 1 起；世代 0 留给"从未分配"。
+fn cell_alloc(t: &mut Table, cur: CellCur) -> Option<u8> {
+    for i in 0..MAX_SHARE {
+        if !t.cells[i].used {
+            let mut gen = t.cells[i].gen.wrapping_add(1);
+            if gen == 0 {
+                gen = 1;
+            }
+            t.cells[i] = Cell {
+                used: true,
+                gen,
+                refs: 1,
+                cur: Some(cur),
+            };
+            return Some(i as u8);
+        }
+    }
+    t.c.exhausted += 1;
+    None
+}
+
+fn cell_retain(t: &mut Table, i: u8) {
+    if let Some(c) = t.cells.get_mut(i as usize) {
+        if c.used {
+            c.refs = c.refs.saturating_add(1);
+        }
+    }
+}
+
+/// 关一条名字：引用减一；最后一条关上才丢格子（世代保留，票上的旧世代因此失效）。
+fn cell_release(t: &mut Table, i: u8) {
+    if let Some(c) = t.cells.get_mut(i as usize) {
+        if c.used {
+            c.refs = c.refs.saturating_sub(1);
+            if c.refs == 0 {
+                c.used = false;
+                c.cur = None;
+            }
+        }
     }
 }
 
@@ -286,7 +364,7 @@ pub fn grant_file_at(
     rights: u32,
 ) -> Result<Handle, HErr> {
     let mut g = TABLE.lock();
-    insert(g.get(), owner, rights, ObjRef::File(FileObj { port, part, cursor }))
+    insert(g.get(), owner, rights, ObjRef::File(FileObj { port, part, cursor, share: None }))
 }
 
 /// FS-03：打开好的 VFS 文件句柄。`stat` 是打开那一刻的目录项读数，不是实时元数据。
@@ -300,7 +378,7 @@ pub fn grant_vfs_file(
     rights: u32,
 ) -> Result<Handle, HErr> {
     let mut g = TABLE.lock();
-    insert(g.get(), owner, rights, ObjRef::VfsFile { port, part, cursor, stat })
+    insert(g.get(), owner, rights, ObjRef::VfsFile { port, part, cursor, stat, share: None })
 }
 
 #[cfg(feature = "fs-open")]
@@ -337,13 +415,30 @@ fn read_on_disk<T>(
 /// 中途盘失败或世代变了都不提交游标（ADR-108 §7）。
 #[cfg(feature = "fs-open")]
 pub fn seek(h: Handle, owner: (usize, u32), newpos: u32) -> Result<u32, HErr> {
-    let (slot, gen, port, part, mut cursor) = {
+    let (slot, gen, port, part, mut cursor, cell) = {
         let mut g = TABLE.lock();
         let t = g.get();
         let slot = check(t, h, owner, RIGHT_READ)?;
-        let e = &t.slots[slot];
-        match e.obj {
-            Some(ObjRef::VfsFile { port, part, cursor, .. }) => (slot, e.gen, port, part, cursor),
+        let e_gen = t.slots[slot].gen;
+        match t.slots[slot].obj {
+            Some(ObjRef::VfsFile { port, part, cursor, share, .. }) => {
+                let (cur, cell) = match share {
+                    None => (cursor, None),
+                    Some(i) => match t.cells[i as usize] {
+                        Cell {
+                            used: true,
+                            gen,
+                            cur: Some(CellCur::Vfs(c)),
+                            ..
+                        } => (c, Some((i, gen))),
+                        _ => {
+                            t.c.no_such += 1;
+                            return Err(HErr::NoSuch);
+                        }
+                    },
+                };
+                (slot, e_gen, port, part, cur, cell)
+            }
             Some(_) => {
                 t.c.denied += 1;
                 return Err(HErr::Denied);
@@ -360,6 +455,26 @@ pub fn seek(h: Handle, owner: (usize, u32), newpos: u32) -> Result<u32, HErr> {
     })?;
     let mut g = TABLE.lock();
     let t = g.get();
+    if let Some((i, cg)) = cell {
+        let c = &mut t.cells[i as usize];
+        if !c.used || c.gen != cg {
+            t.c.stale += 1;
+            return Err(HErr::Stale);
+        }
+        let ok = match c.cur.as_mut() {
+            Some(CellCur::Vfs(x)) => {
+                *x = cursor;
+                true
+            }
+            _ => false,
+        };
+        return if ok {
+            Ok(n)
+        } else {
+            t.c.no_such += 1;
+            Err(HErr::NoSuch)
+        };
+    }
     let e = &mut t.slots[slot];
     if !e.used || e.gen != gen {
         t.c.stale += 1;
@@ -676,10 +791,24 @@ pub fn close(h: Handle, owner: (usize, u32)) -> Result<(), HErr> {
         let mut g = TABLE.lock();
         let t = g.get();
         let slot = check(t, h, owner, 0)?;
-        let e = &mut t.slots[slot];
-        let obj = e.obj.take();
-        e.used = false;
-        e.rights = 0;
+        let obj = t.slots[slot].obj.take();
+        // 共享格子（ADR-108 补记二）：关掉一条名字只减引用，最后一条关上才丢格子。
+        match obj {
+            Some(ObjRef::File(f)) => {
+                if let Some(i) = f.share {
+                    cell_release(t, i);
+                }
+            }
+            #[cfg(feature = "fs-open")]
+            Some(ObjRef::VfsFile { share, .. }) => {
+                if let Some(i) = share {
+                    cell_release(t, i);
+                }
+            }
+            _ => {}
+        }
+        t.slots[slot].used = false;
+        t.slots[slot].rights = 0;
         // gen 保留：这一格下一回 grant 在它上面 +1（旧句柄因此变成 Stale）。
         t.c.closes += 1;
         obj
@@ -693,12 +822,14 @@ pub fn close(h: Handle, owner: (usize, u32)) -> Result<(), HErr> {
 /// `dup` = 新占一格、同对象、权限收窄。第一版**没有** `DUP` 就没有 `dup`；
 /// `new ⊄ old` 一律拒（扩权是这一格存在的理由）。
 ///
-/// 对象语义分两种：文件对象复制的是**游标值**（两个句柄不共享读取位置，共享偏移要一张带
-/// 引用计数的对象表，设计 §3.3）；VMO 共享的是**同一份帧**（靠 `vmo_ref`，ADR-074 的 C3 判据）。
-/// VMO 那份引用必须在锁外加，所以这里是"取票（锁内）→ 加引用（锁外）→ 提交（锁内）"三段，
-/// 与 `begin_read`/`finish` 同一形状；提交失败就在锁外退回引用。
+/// 对象语义按 kind 分三种（ADR-108 补记二改了第一种）：
+/// * 文件 / VFS 文件：dup 之后**共享读取位置**——游标搬进 `Table.cells`，两条句柄推进同一份。
+///   搬格子与 `insert` 在**同一把** HANDLE 锁内完成，不取别的锁，锁序不变。
+/// * VMO：共享**同一份帧**（靠 `vmo_ref`，ADR-074 的 C3）。那份引用必须在锁外加，
+///   所以仍走"取票（锁内）→ 加引用（锁外）→ 提交（锁内）"三段；提交失败在锁外退回引用。
+/// * 其余 kind：引用本来就是"槽号 + 世代"，复制值即共享本体。
 pub fn dup(h: Handle, owner: (usize, u32), new_rights: u32) -> Result<Handle, HErr> {
-    let obj = {
+    {
         let mut g = TABLE.lock();
         let t = g.get();
         let slot = check(t, h, owner, RIGHT_DUP)?;
@@ -707,7 +838,58 @@ pub fn dup(h: Handle, owner: (usize, u32), new_rights: u32) -> Result<Handle, HE
             t.c.denied += 1;
             return Err(HErr::Denied);
         }
-        match old.obj {
+        let shared = match old.obj {
+            Some(ObjRef::File(f)) => {
+                let i = match f.share {
+                    Some(i) => {
+                        cell_retain(t, i);
+                        i
+                    }
+                    None => match cell_alloc(t, CellCur::Fat(f.cursor)) {
+                        // 格子出生时只有一条引用；新名字再加一条（一共 2 条）。
+                        Some(i) => {
+                            cell_retain(t, i);
+                            i
+                        }
+                        None => return Err(HErr::Exhausted),
+                    },
+                };
+                Some(ObjRef::File(FileObj { share: Some(i), ..f }))
+            }
+            #[cfg(feature = "fs-open")]
+            Some(ObjRef::VfsFile { port, part, cursor, stat, share }) => {
+                let i = match share {
+                    Some(i) => {
+                        cell_retain(t, i);
+                        i
+                    }
+                    None => match cell_alloc(t, CellCur::Vfs(cursor)) {
+                        Some(i) => {
+                            cell_retain(t, i);
+                            i
+                        }
+                        None => return Err(HErr::Exhausted),
+                    },
+                };
+                Some(ObjRef::VfsFile { port, part, cursor, stat, share: Some(i) })
+            }
+            Some(_) => None,
+            None => {
+                t.c.no_such += 1;
+                return Err(HErr::NoSuch);
+            }
+        };
+        if let Some(obj) = shared {
+            // 原句柄也改指向共享格子（第一次 dup 时它是 None；之后的 dup 是同一个 i）。
+            t.slots[slot].obj = Some(obj);
+            return insert(t, owner, new_rights, obj);
+        }
+    }
+    let obj = {
+        let mut g = TABLE.lock();
+        let t = g.get();
+        let slot = check(t, h, owner, RIGHT_DUP)?;
+        match t.slots[slot].obj {
             Some(o) => o,
             None => {
                 t.c.no_such += 1;
@@ -762,6 +944,8 @@ pub struct ReadTicket {
     gen: u64,
     port: u8,
     part: Option<Partition>,
+    /// 共享游标格 `(下标, 世代)`；`None` = 游标在本表项（未 dup 的老形状）。
+    cell: Option<(u8, u32)>,
     kind: ReadTicketKind,
 }
 
@@ -807,14 +991,52 @@ pub fn begin_read(h: Handle, owner: (usize, u32)) -> Result<ReadTicket, HErr> {
     let mut g = TABLE.lock();
     let t = g.get();
     let slot = check(t, h, owner, RIGHT_READ)?;
-    let e = &t.slots[slot];
-    match e.obj {
+    let e_gen = t.slots[slot].gen;
+    let made = match t.slots[slot].obj {
         Some(ObjRef::File(f)) => {
-            Ok(ReadTicket { slot: slot as u16, gen: e.gen, port: f.port, part: f.part, kind: ReadTicketKind::Fat(f.cursor) })
+            let (cur, cell) = match f.share {
+                None => (f.cursor, None),
+                Some(i) => match t.cells[i as usize] {
+                    Cell {
+                        used: true,
+                        gen,
+                        cur: Some(CellCur::Fat(c)),
+                        ..
+                    } => (c, Some((i, gen))),
+                    _ => Err(HErr::NoSuch)?,
+                },
+            };
+            Ok(ReadTicket {
+                slot: slot as u16,
+                gen: e_gen,
+                port: f.port,
+                part: f.part,
+                cell,
+                kind: ReadTicketKind::Fat(cur),
+            })
         }
         #[cfg(feature = "fs-open")]
-        Some(ObjRef::VfsFile { port, part, cursor, .. }) => {
-            Ok(ReadTicket { slot: slot as u16, gen: e.gen, port, part, kind: ReadTicketKind::Vfs(cursor) })
+        Some(ObjRef::VfsFile { port, part, cursor, share, .. }) => {
+            let (cur, cell) = match share {
+                None => (cursor, None),
+                Some(i) => match t.cells[i as usize] {
+                    Cell {
+                        used: true,
+                        gen,
+                        cur: Some(CellCur::Vfs(c)),
+                        ..
+                    } => (c, Some((i, gen))),
+                    _ => Err(HErr::NoSuch)?,
+                },
+            };
+            Ok(ReadTicket {
+                slot: slot as u16,
+                gen: e_gen,
+                port,
+                part,
+                cell,
+                kind: ReadTicketKind::Vfs(cur),
+            })
         }
         // 目录句柄有对象、有 READ 权，但"读一个目录的字节"这件事在 VFS 层就不成立：
         // ADR-108 决策 3 要的是 `-11 EISDIR`，不是类型不符的 `-4`。（ring3 探针实测抓到过 -4。）
@@ -830,29 +1052,52 @@ pub fn begin_read(h: Handle, owner: (usize, u32)) -> Result<ReadTicket, HErr> {
             t.c.no_such += 1;
             Err(HErr::NoSuch)
         }
-    }
+    };
+    made
 }
 
 /// 提交。表项必须仍是同一槽、同一世代——否则这次读的成果作废（返回 Stale）。
 pub fn finish(ticket: ReadTicket, bytes: usize) -> Result<(), HErr> {
     let mut g = TABLE.lock();
     let t = g.get();
-    let e = &mut t.slots[ticket.slot as usize];
-    if !e.used || e.gen != ticket.gen {
-        t.c.stale += 1;
-        return Err(HErr::Stale);
-    }
-    let committed = match (e.obj.as_mut(), ticket.kind) {
-        (Some(ObjRef::File(f)), ReadTicketKind::Fat(c)) => {
-            f.cursor = c;
-            true
+    let committed = if let Some((i, cg)) = ticket.cell {
+        // 共享格子：只认格子的世代。句柄可以在读盘期间被别的名字关掉——那不影响提交，
+        // 只要这个文件对象还有别的名字（POSIX 的 open-file-description 语义）。
+        let c = &mut t.cells[i as usize];
+        if !c.used || c.gen != cg {
+            t.c.stale += 1;
+            return Err(HErr::Stale);
         }
-        #[cfg(feature = "fs-open")]
-        (Some(ObjRef::VfsFile { cursor: old, .. }), ReadTicketKind::Vfs(c)) => {
-            *old = c;
-            true
+        match (c.cur.as_mut(), ticket.kind) {
+            (Some(CellCur::Fat(x)), ReadTicketKind::Fat(k)) => {
+                *x = k;
+                true
+            }
+            #[cfg(feature = "fs-open")]
+            (Some(CellCur::Vfs(x)), ReadTicketKind::Vfs(k)) => {
+                *x = k;
+                true
+            }
+            _ => false,
         }
-        _ => false,
+    } else {
+        let e = &mut t.slots[ticket.slot as usize];
+        if !e.used || e.gen != ticket.gen {
+            t.c.stale += 1;
+            return Err(HErr::Stale);
+        }
+        match (e.obj.as_mut(), ticket.kind) {
+            (Some(ObjRef::File(f)), ReadTicketKind::Fat(c)) => {
+                f.cursor = c;
+                true
+            }
+            #[cfg(feature = "fs-open")]
+            (Some(ObjRef::VfsFile { cursor: old, .. }), ReadTicketKind::Vfs(c)) => {
+                *old = c;
+                true
+            }
+            _ => false,
+        }
     };
     if !committed {
         t.c.no_such += 1;
@@ -884,15 +1129,30 @@ pub fn begin_write(h: Handle, owner: (usize, u32)) -> Result<ReadTicket, HErr> {
     let mut g = TABLE.lock();
     let t = g.get();
     let slot = check(t, h, owner, RIGHT_WRITE)?;
-    let e = &t.slots[slot];
-    match e.obj {
-        Some(ObjRef::VfsFile { port, part, cursor, .. }) => Ok(ReadTicket {
-            slot: slot as u16,
-            gen: e.gen,
-            port,
-            part,
-            kind: ReadTicketKind::Vfs(cursor),
-        }),
+    let e_gen = t.slots[slot].gen;
+    match t.slots[slot].obj {
+        Some(ObjRef::VfsFile { port, part, cursor, share, .. }) => {
+            let (cur, cell) = match share {
+                None => (cursor, None),
+                Some(i) => match t.cells[i as usize] {
+                    Cell {
+                        used: true,
+                        gen,
+                        cur: Some(CellCur::Vfs(c)),
+                        ..
+                    } => (c, Some((i, gen))),
+                    _ => return Err(HErr::Denied),
+                },
+            };
+            Ok(ReadTicket {
+                slot: slot as u16,
+                gen: e_gen,
+                port,
+                part,
+                cell,
+                kind: ReadTicketKind::Vfs(cur),
+            })
+        }
         // 目录句柄、以及任何非文件对象：写不成立。与读的 `-11 EISDIR` 相对，这里回类型不符。
         _ => Err(HErr::Denied),
     }
@@ -952,15 +1212,30 @@ pub fn revoke_task(gidx: usize, id: u32) -> usize {
         let mut g = TABLE.lock();
         let t = g.get();
         let mut n = 0u32;
-        for e in t.slots.iter_mut() {
-            if e.used && e.owner_gidx as usize == gidx && e.owner_id == id {
-                if let Some(ObjRef::Vmo { slot }) = e.obj.take() {
-                    vmos[nv] = slot;
-                    nv += 1;
+        for i in 0..MAX_HANDLES {
+            if t.slots[i].used && t.slots[i].owner_gidx as usize == gidx && t.slots[i].owner_id == id
+            {
+                match t.slots[i].obj.take() {
+                    Some(ObjRef::Vmo { slot }) => {
+                        vmos[nv] = slot;
+                        nv += 1;
+                    }
+                    Some(ObjRef::File(f)) => {
+                        if let Some(c) = f.share {
+                            cell_release(t, c);
+                        }
+                    }
+                    #[cfg(feature = "fs-open")]
+                    Some(ObjRef::VfsFile { share, .. }) => {
+                        if let Some(c) = share {
+                            cell_release(t, c);
+                        }
+                    }
+                    _ => {}
                 }
-                e.used = false;
-                e.obj = None;
-                e.rights = 0;
+                t.slots[i].used = false;
+                t.slots[i].obj = None;
+                t.slots[i].rights = 0;
                 n += 1;
             }
         }
@@ -1494,6 +1769,60 @@ mod tests {
         ok
     }
 
+    #[cfg(feature = "fat32-exec")]
+    /// dup 共享读取位置（ADR-108 补记二）：一条游标两个名字。
+    #[cfg(feature = "fat32-exec")]
+    pub fn t_handle_dup_shared() -> bool {
+        use crate::filesystem::fat32::Volume;
+        if crate::ahci::init().is_err() {
+            return false;
+        }
+        crate::sched::init_boot_task();
+        let port = crate::FAT_PORT_A;
+        let disk = AhciDisk { port };
+        let vol = match Volume::mount(&disk) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let cur = match vol.open_cursor("HELLO.ELF") {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        let Some(ident) = crate::sched::current_identity() else {
+            return false;
+        };
+        reset_for_test();
+        let h1 = match grant_file(ident, port, cur, RIGHT_READ | RIGHT_DUP) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let img = crate::ktests::common::HELLO_ELF;
+        let mut a = [0u8; 16];
+        let first = read(h1, ident, &mut a) == Ok(16) && a == img[..16];
+        let h2 = match dup(h1, ident, RIGHT_READ) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        // 关键顺序：dup 之后**先让原名字推进**，再读第二个名字。
+        // 窗口 16 字节且落在 ELF 的非零区：复制语义下第二个名字从 dup 那一刻读（16..32），
+        // 共享语义读到 32..48（e_phoff 一带）——两者字节不同，这一格才不是空转。
+        let mut b = [0u8; 16];
+        let advanced = read(h1, ident, &mut b) == Ok(16) && b == img[16..32];
+        let mut c = [0u8; 16];
+        let shared = read(h2, ident, &mut c) == Ok(16) && c == img[32..48];
+        let closed1 = close(h1, ident).is_ok();
+        let mut d = [0u8; 16];
+        let survive = read(h2, ident, &mut d) == Ok(16) && d == img[48..64];
+        let stale = matches!(close(h1, ident), Err(HErr::NoSuch));
+        let closed2 = close(h2, ident).is_ok();
+        crate::log_info!(
+            "handle-dup: 首读={} 原名字推进={} 第二名字共享={} 关一条仍续读={} 旧名坏={} 端点={}",
+            first, advanced, shared, survive, stale, closed1 && closed2
+        );
+        first && advanced && shared && survive && stale && closed1 && closed2
+    }
+    #[cfg(feature = "fat32-exec")]
+    crate::ktest!(KT_HANDLE_DUP_SHARED, t_handle_dup_shared);
     #[cfg(feature = "fat32-exec")]
     crate::ktest!(KT_HANDLE_REAP, t_handle_reap);
 

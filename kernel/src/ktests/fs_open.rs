@@ -315,7 +315,7 @@ fn syscall_cells(fs: &ReadOnlyFs<'_>, small: &vfs_ro::Entry, direct: &[u8; 100])
     // ABI 0.13（ADR-108 补记八）：写意图位只在 `fs-rw` 置位。
     let abi = user::abi_word();
     let abi_ok = abi & user::F_FS_OPEN != 0
-        && user::ABI_MINOR == 14
+        && user::ABI_MINOR == 15
         && if cfg!(feature = "fs-rw") {
             abi & user::F_FS_WRITE_OPEN != 0 && abi & user::F_FS_WRITE_ROOT != 0
         } else {
@@ -900,5 +900,76 @@ fn t_fs_open_ring3() -> bool {
     handle::reset_for_test();
     ok
 }
+
+/// dup 共享读取位置（ADR-108 补记二），VFS 文件那一支：产品路径（22/24 号）用的正是这种句柄。
+#[cfg(feature = "fs-open")]
+fn t_fs_open_dup_shared() -> bool {
+    if ahci::init().is_err() {
+        return false;
+    }
+    sched::init_boot_task();
+    let Some(ident) = sched::current_identity() else {
+        return false;
+    };
+    let disk = AhciDisk { port: fs_open::PORT };
+    let fs = match ReadOnlyFs::mount(&disk) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let st = match fs.lookup("/SMALL.BIN") {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+    // 参考字节：直接走 VFS（不经句柄），句柄读出来的每一段都必须与它相同。
+    let mut refb = [0u8; 64];
+    let mut rc = match fs.open(&st) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let got = match vfs_ro::read_disk(&disk, &mut rc, &mut refb) {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    if got != 64 {
+        return false;
+    }
+    handle::reset_for_test();
+    let cur = match fs.open(&st) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let h1 = match handle::grant_vfs_file(
+        ident,
+        fs_open::PORT,
+        None,
+        cur,
+        st,
+        handle::RIGHT_READ | handle::RIGHT_DUP,
+    ) {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    let mut a = [0u8; 16];
+    let first = handle::read(h1, ident, &mut a) == Ok(16) && a == refb[..16];
+    let h2 = match handle::dup(h1, ident, handle::RIGHT_READ) {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    // 同一条顺序：dup 之后先让原名字推进，再读第二个名字（复制语义会读到 16..32）。
+    let mut b = [0u8; 16];
+    let advanced = handle::read(h1, ident, &mut b) == Ok(16) && b == refb[16..32];
+    let mut c = [0u8; 16];
+    let shared = handle::read(h2, ident, &mut c) == Ok(16) && c == refb[32..48];
+    let closed1 = handle::close(h1, ident).is_ok();
+    let mut d = [0u8; 16];
+    let survive = handle::read(h2, ident, &mut d) == Ok(16) && d == refb[48..64];
+    let closed2 = handle::close(h2, ident).is_ok();
+    crate::log_info!(
+        "fs-open-dup: 首读={} 原名字推进={} 第二名字共享={} 关一条仍续读={} 端点={}",
+        first, advanced, shared, survive, closed1 && closed2
+    );
+    first && advanced && shared && survive && closed1 && closed2
+}
+ktest!(KT_FS_OPEN_DUP_SHARED, t_fs_open_dup_shared);
 
 ktest!(KT_FS_OPEN_RING3, t_fs_open_ring3);

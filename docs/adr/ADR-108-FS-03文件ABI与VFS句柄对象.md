@@ -390,3 +390,22 @@ ELF `299b60dfaff5`）⇒ 这是一个布局/栈敏感的下游，**不能靠"语
   读回一致、读意图同路径 `-8`（命名空间分开）、flags=2 与目录写意图 `-15`、ABI 位与 minor 按档断言。
   宿主机行同步把 LOG.TXT 的第三段写纳入逐字节对账。旧用例里把 `flags=1` 当"非零样本"的两处
   （`t_fs_open_syscalls` 与 ring3 probe）改为 `flags=2`，因为 bit0 现在合法。
+
+
+## 补记二（2026-11-17）：dup 改为共享读取位置（使用者裁决）
+
+- **裁决**：本文"`dup` 只复制游标值，两个句柄之后可各自推进"改掉——dup 之后两个句柄推进
+  **同一份**读取位置（POSIX open-file-description 语义）。ABI minor 14 → **15**（照 12→13→14 的先例）。
+- **实现**（`handle.rs`，**不新增锁**，HANDLE rank 35 不变）：`Table.cells: [Cell; MAX_HANDLES/2]`
+  与 `FileObj`/`VfsFile` 的新字段 `share: Option<u8>`。`None` = 老形状（游标还在表项里，
+  **未 dup 的路径零改动**）；第一次 dup 把游标搬进格子、引用记 2；再 dup 引用 +1；
+  `close`/`revoke_task` 引用 -1，最后一条名字关掉才丢格（世代保留 ⇒ 旧票 `Stale`）。
+- **读票**：`ReadTicket` 多一格 `cell: Option<(u8, u32)>`；提交只认**格子**的世代——
+  读盘期间关掉其中一条名字不影响提交，只要对象还有别的名字；`seek` 同样读写格子。
+- **边界**：格子上限 `MAX_HANDLES / 2 = 8`（每格至少两条句柄）；`exhausted` 只在异常形状下出现。
+  目录句柄（`VfsDir`）与 Console/VMO/Job/Proc/ASpace/Thread 的语义**不变**。
+- **证咬**：`t_handle_dup_shared`（FAT32 文件，98/98）与 `t_fs_open_dup_shared`（VFS 文件，98/98）
+  各五格：首读、原名字推进、第二名字共享、关一条仍续读、旧名失效。变异"dup 退回复制游标值"
+  ⇒ `第二名字共享=false`、rc=35；还原后绿。判据窗口取 16 字节并落在 ELF 非零区——
+  8..16 全是 `EI_PAD` 零字节，原先 4 字节窗口在那一带不可辨（本轮当场抓到）。
+- 读数：整链 **68 行 68 符合**（`build/matrix-dup-abi15.log`），`check` **17/17**。

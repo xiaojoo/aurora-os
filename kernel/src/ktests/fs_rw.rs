@@ -391,10 +391,10 @@ fn t_fs_rw_open_write() -> bool {
     ok &= put_user(va.0, 0, b"/w");
     let dir_w = call(&mut fr, user::SYS_FILE_OPEN, va.0, 2, 1);
     ok &= dir_w == user::E_NOT_SUPPORTED;
-    // ABI 0.14：写意图位与写根位在这档都必须置位。
+    // ABI 0.15：写意图位与写根位在这档都必须置位（0.14 的挂载表 + 0.15 的 dup 共享游标）。
     ok &= user::abi_word() & user::F_FS_WRITE_OPEN != 0
         && user::abi_word() & user::F_FS_WRITE_ROOT != 0
-        && user::ABI_MINOR == 14;
+        && user::ABI_MINOR == 15;
 
     let c = if open_ok {
         call(&mut fr, user::SYS_HANDLE_CLOSE, handle.0, 0, 0)

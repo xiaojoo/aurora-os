@@ -65,9 +65,11 @@ pub const CONSOLE_MAX: usize = 256;
 pub const F_CONSOLE: u64 = 256;
 
 /// ABI 版本。minor=4 对应用户态闭环这一段（M4）；minor=5 追加 capability 句柄族（P7）；
-/// minor=6 追加 VMO 三个号（12/13/14）与 `F_VMO` 位（W3 P4b，ADR-074）。号只追加不复用（Q1）。
+/// minor=6 追加 VMO 三个号（12/13/14）与 `F_VMO` 位（W3 P4b，ADR-074）。
+/// minor=15：9 号 `dup` 改为**共享读取位置**（ADR-108 补记二，2026-11-17 使用者裁决）。
+/// 号只追加不复用（Q1）。
 pub const ABI_MAJOR: u64 = 0;
-pub const ABI_MINOR: u64 = 14;
+pub const ABI_MINOR: u64 = 15;
 pub const F_FASTPATH: u64 = 1;
 pub const F_SMAP: u64 = 2;
 pub const F_SMEP: u64 = 4;
