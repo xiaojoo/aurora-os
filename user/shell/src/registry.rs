@@ -22,7 +22,7 @@ use crate::{con_write, msg, put_u64};
 use crate::{
     M_ABI, M_BYE, M_DEAD, M_FREE_PAGES, M_FREE_PFX, M_FREE_THR, M_HELP, M_LIVE, M_MINUS, M_NL,
     M_PING, M_PS_ERR, M_PS_HDR, M_PS_NOJOB, M_RUN_ERR, M_RUN_EXIT, M_RUN_PREFIX, M_RUN_TIMEOUT,
-    M_RUN_USAGE, M_SP, M_TRYHELP, M_UNKNOWN,
+    M_RUN_USAGE, M_SP, M_TOP_FRAME, M_TOP_USAGE, M_TRYHELP, M_UNKNOWN,
 };
 
 /// 控制台句柄（内核按角色 `ROLE_LOG` 转移给 shell 的那个 u64）。
@@ -48,6 +48,7 @@ const CMD_EXIT: [u8; 4] = [b'e', b'x', b'i', b't'];
 const CMD_RUN: [u8; 3] = [b'r', b'u', b'n'];
 const CMD_PS: [u8; 2] = [b'p', b's'];
 const CMD_FREE: [u8; 4] = [b'f', b'r', b'e', b'e'];
+const CMD_TOP: [u8; 3] = [b't', b'o', b'p'];
 
 /// 命令词比较。走 `&[u8] == &[u8]`，LLVM 折成 immediate 比较（旧 dispatch 同款）。
 fn streq(a: &[u8], b: &[u8]) -> bool {
@@ -294,6 +295,236 @@ fn put_i64(h: ConsoleHandle, v: i64) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `top`（ADR-133）：定期刷新的进程表，纯用户态
+// ---------------------------------------------------------------------------
+
+/// `top` 的快照行数。单 Job 的形状由 `t_proc_info`/`q2` 的判据约束着（`make_job_proc`
+/// 每次 2 条、q2 至多 4 条），4 条就是枚举能给出的全部；行数组放**栈上**而不是
+/// static——static 的地址在 4 GiB+ 链接基址下同样会被取成 32 位绝对重定位
+/// （`R_X86_32S out of range`，本轮实测；与 MSGS 注释是同一族事故）。
+/// 320 字节（8 行）曾把 shell 的一页栈顶穿出去（`#PF cr2=栈底下一页 err=0x6`，
+/// rip=0x10000397e，本轮实测），4 行 160 字节是留有余量的形状。
+const TOP_ROWS_MAX: usize = 4;
+
+/// 一帧快照的原始行（`ps` 同款五列，按 [`top_cmp`] 排好序后逐条打印）。
+#[derive(Clone, Copy)]
+struct TopRow {
+    pid: u64,
+    gen: u64,
+    threads: u64,
+    terminated: bool,
+    pages: u64,
+}
+
+/// 排序口径（ADR-132 §未做 1 在本片定案）：**pages 降序**（资源视角，与 `free`
+/// 的聚合口径同源），并列时 pid 升序（同页数下按诞生先后读）。
+/// 返回 true = `a` 应排在 `b` 之前。
+fn top_cmp(a: &TopRow, b: &TopRow) -> bool {
+    if a.pages != b.pages {
+        return a.pages > b.pages;
+    }
+    a.pid < b.pid
+}
+
+/// 扫一帧快照进 `rows`，返回实际条数。枚举语义与 `cmd_ps` 同款（游标推进到 0）。
+/// 错误（含 `ps: no job handle` 的前置）由调用方处置，这里只攒数据。
+fn top_scan(job: rt::Handle, rows: &mut [TopRow; TOP_ROWS_MAX]) -> usize {
+    let mut buf = [0u8; rt::PROC_RECORD_LEN * 4];
+    let mut cursor = 0u32;
+    let mut n = 0usize;
+    loop {
+        match rt::proc_enum(job, cursor, &mut buf) {
+            Ok((next, count)) => {
+                let mut i = 0usize;
+                while i < count as usize {
+                    if let Some(e) = rt::proc_enum_at(&buf, i) {
+                        if let Some(slot) = rows.get_mut(n) {
+                            *slot = TopRow {
+                                pid: u64::from(e.pid),
+                                gen: u64::from(e.gen),
+                                threads: u64::from(e.threads),
+                                terminated: e.terminated,
+                                pages: u64::from(e.pages),
+                            };
+                            n += 1;
+                        }
+                    }
+                    i += 1;
+                }
+                if next == 0 {
+                    break;
+                }
+                cursor = next;
+            }
+            Err(_) => break,
+        }
+    }
+    n
+}
+
+/// 选择排序（原位，`top_cmp` 升序谓词）。n ≤ TOP_ROWS_MAX，交换开销可忽略。
+fn top_sort(rows: &mut [TopRow; TOP_ROWS_MAX], n: usize) {
+    let mut i = 0usize;
+    while i < n {
+        let mut best = i;
+        let mut j = i + 1;
+        while j < n {
+            // rows.get 两侧都拿不到时保持 best 不动：n 由调用方约束 ≤ 数组长度，
+            // 这个分支不可达，写成不 panic 的形状（本仓库 32S 纪律）。
+            let take = match (rows.get(j), rows.get(best)) {
+                (Some(rj), Some(rb)) => top_cmp(rj, rb),
+                _ => false,
+            };
+            if take {
+                best = j;
+            }
+            j += 1;
+        }
+        if best != i {
+            // 不用 `rows.swap(i, best)`：那是切片方法，带越界检查，会生成一条
+            // panic Location 常量（.rodata 匿名 8 字节），4 GiB+ 基址下取址就是
+            // `R_X86_32S out of range`（本轮实测）。两个 get_mut 一次拿会撞借用检查，
+            // 所以按"读出两值→写回"分三步走；`None` 分支不可达（best/j 都 < n ≤ 上限），
+            // 缺格的当轮跳过，仍写成不 panic 形状。
+            let (vi, vb) = match (rows.get(i), rows.get(best)) {
+                (Some(a), Some(b)) => (*a, *b),
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            };
+            match rows.get_mut(i) {
+                Some(a) => *a = vb,
+                None => {}
+            }
+            match rows.get_mut(best) {
+                Some(b) => *b = vi,
+                None => {}
+            }
+        }
+        i += 1;
+    }
+}
+
+/// 打一帧：`frame N` 前缀行 + 表头 + 排好序的表行。`#[inline(never)]`：帧打印是
+/// `cmd_top` 里唯一的输出体，关进独立函数让它对 `.text` 只贡献一份代码
+/// （shell 链接脚本给 `.text` 留 16 KiB，第一版把打印循环内联两份直接撞
+/// `section .text virtual address range overlaps with .rodata`——本轮实测）。
+#[inline(never)]
+fn top_print_frame(h: ConsoleHandle, frame: u64, rows: &[TopRow; TOP_ROWS_MAX], n: usize) {
+    con_write(h, msg(M_TOP_FRAME));
+    put_u64(h, frame);
+    con_write(h, msg(M_NL));
+    con_write(h, msg(M_PS_HDR));
+    let mut i = 0usize;
+    while i < n {
+        let Some(r) = rows.get(i) else { break };
+        put_u64(h, r.pid);
+        con_write(h, msg(M_SP));
+        put_u64(h, r.gen);
+        con_write(h, msg(M_SP));
+        put_u64(h, r.threads);
+        con_write(h, msg(M_SP));
+        con_write(h, if r.terminated { msg(M_DEAD) } else { msg(M_LIVE) });
+        con_write(h, msg(M_SP));
+        put_u64(h, r.pages);
+        con_write(h, msg(M_NL));
+        i += 1;
+    }
+}
+
+/// `top <秒数>`：按 pages 降序刷新进程表。
+///
+/// **帧数由参数给**（`top` 无参 = 默认 3 帧；`top 0`/负数/超上限 = usage）——
+/// 判定语义"至少两帧"不靠次数硬凑：串口里每帧带 `frame N` 前缀行，宿主机对账按
+/// 前缀行数与表行数核。帧间隔 1000 ms 走 [`rt::sleep_ms`]（19 号带时限等待，
+/// 任务真阻塞不让 CPU 空转，见该函数注释）。
+///
+/// 每帧之间 pid/gen 集合**不做**快照间一致性断言（那是内核判据的事，`t_proc_info`
+/// 已有"隔离"格）；显示层的职责只是把每一帧如实打出来。
+fn cmd_top(c: &Ctx) -> bool {
+    // 参数：无参 = 3 帧；有参必须是能读的十进制且 ≤ 5（秒）。解析失败 = usage。
+    let frames: u64 = if c.p.args.count() == 0 {
+        3
+    } else {
+        let arg = match c.p.args.get(0) {
+            Some(a) => a,
+            None => {
+                con_write(c.h, msg(M_TOP_USAGE));
+                return true;
+            }
+        };
+        match parse_u64(arg) {
+            Some(v) if v >= 2 && v <= 5 => v,
+            _ => {
+                con_write(c.h, msg(M_TOP_USAGE));
+                return true;
+            }
+        }
+    };
+    let Some(job) = job_of(c) else { return true };
+    // SELF_THREAD 句柄：16 号回填进 SI 表的角色 0 描述（内核自动 grant，user.rs:990）。
+    // 拿不到就没有可睡的对象——如实说一句（不假装刷新）。
+    // SAFETY: si_va 契约同 job_of（内核校验并映射、只读、存活期不解映射）。
+    let sleep_h = match unsafe { rt::handle_of_role(c.si_va, rt::ROLE_SELF_THREAD) } {
+        Some(h) => h,
+        None => {
+            con_write(c.h, msg(M_TOP_USAGE));
+            return true;
+        }
+    };
+    // 行数组在栈上（见 TOP_ROWS_MAX 的注释：static 的地址在 4 GiB+ 基址下会被
+    // 取成 32S 绝对重定位，栈才是这个程序里唯一免费的缓冲位）。
+    let mut rows: [TopRow; TOP_ROWS_MAX] = [TopRow { pid: 0, gen: 0, threads: 0, terminated: false, pages: 0 }; TOP_ROWS_MAX];
+    // 显式把所有格写成已知值（零值），保证 `0..TOP_ROWS_MAX` 全部可读——
+    // 不依赖上一次 `top` 残留的任何内容。
+    let mut k = 0usize;
+    while k < TOP_ROWS_MAX {
+        if let Some(slot) = rows.get_mut(k) {
+            slot.pid = 0;
+            slot.gen = 0;
+            slot.threads = 0;
+            slot.terminated = false;
+            slot.pages = 0;
+        }
+        k += 1;
+    }
+    let mut sleeping = true;
+    let mut frame = 0u64;
+    while frame < frames {
+        let n = top_scan(job, &mut rows);
+        top_sort(&mut rows, n);
+        top_print_frame(c.h, frame, &rows, n);
+        frame += 1;
+        // 帧间睡 1 s（总时长 = (frames-1) × 1s）；最后一帧之后不再睡。
+        // 睡不成的档位（SELF_THREAD 句柄不在/内核等待表没起）：降级成"不睡连打"，
+        // 剩下的帧一次打完——显示层如实降级而不是死循环。
+        if frame < frames && sleeping {
+            if rt::sleep_ms(sleep_h, 1000).is_err() {
+                sleeping = false;
+            }
+        }
+    }
+    true
+}
+
+/// 十进制解析（无堆、不 panic）。空串/非数字/溢出都回 None。
+fn parse_u64(b: &[u8]) -> Option<u64> {
+    if b.is_empty() {
+        return None;
+    }
+    let mut v: u64 = 0;
+    for &c in b {
+        if !(c >= b'0' && c <= b'9') {
+            return None;
+        }
+        let d = u64::from(c - b'0');
+        v = v.checked_mul(10)?.checked_add(d)?;
+    }
+    Some(v)
+}
+
 /// 分派一条已解析的命令。返回 false = 退出 shell。
 ///
 /// 每个分支都是"名字 immediate 比较 → 直接调用处理器"，不写 `match lookup()`：
@@ -330,6 +561,9 @@ pub fn dispatch(h: ConsoleHandle, si_va: u64, p: &Parsed) -> bool {
     }
     if streq(p.cmd, &CMD_FREE) {
         return cmd_free(&c);
+    }
+    if streq(p.cmd, &CMD_TOP) {
+        return cmd_top(&c);
     }
     // unknown：三段输出与旧实现逐字节一致——词原样回显（借用不拷贝，全长不截断）。
     con_write(c.h, msg(M_UNKNOWN));

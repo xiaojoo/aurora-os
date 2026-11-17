@@ -7839,6 +7839,33 @@ def check_gpt(log: str) -> list[str]:
     return bad
 
 
+def _top_pages_nondecreasing(log: str) -> bool:
+    """ADR-133 `top` 的排序对账：把串口里每个 `frame N` 快照的表行抽出来，
+    逐帧核 pages 列**非升**（pages 降序，同 pages 时按 pid 升序 ⇒ 同值行序稳定）。
+    行形状与内核打印严格同构：五列单空格分隔、第五列是十进制页数。解析不出
+    每帧至少一行 ⇒ 判不成立（空表也该报出来，不是静默绿）。"""
+    ok_any = False
+    # 每个 frame 块：frame N 之后到下一个 frame/日志行为止的表行。
+    frames = re.split(r"frame \d+\n", log)[1:]
+    for body in frames:
+        rows = []
+        for ln in body.splitlines():
+            m = re.match(r"^(\d+) (\d+) (\d+) (live|dead) (\d+)$", ln)
+            if m:
+                rows.append((int(m.group(1)), int(m.group(5))))  # (pid, pages)
+            elif rows:
+                break  # 表行后面是别的输出，这一帧抽完了
+        if not rows:
+            return False
+        for a, b in zip(rows, rows[1:]):
+            if b[1] > a[1]:          # 后一行 pages 更大 ⇒ 违反降序
+                return False
+            if b[1] == a[1] and b[0] < a[0]:  # 同 pages 时 pid 必须升
+                return False
+        ok_any = True
+    return ok_any
+
+
 def do_test(timeout: int) -> int:
     """正向必须 33、负样本必须 35。只跑正向的话，永远分不清“代码没问题”
     和“判定链根本没生效”。"""
@@ -8511,7 +8538,8 @@ def do_test(timeout: int) -> int:
     print("=== A3 验收：shell 执行 argv 里的外部命令（--features a3-shell）===")
     IMAGE.unlink(missing_ok=True)
     ashv, ashrc, ashlog = do_run(["a3-shell", "fat32-probe"], timeout)
-    # `;` 分隔三条：外部命令（A3）+ ps/free（A4 的 27 号）。一条 argv 覆盖两片。
+    # `;` 分隔四条：外部命令（A3）+ ps/free（A4 的 27 号）+ top 2（ADR-133）。
+    # 一条 argv 覆盖三片。
     ash_ok = ashv == "PASS" and all((
         "run: /HELLO.ELF" in ashlog,
         "(timeout)" in ashlog,
@@ -8519,7 +8547,14 @@ def do_test(timeout: int) -> int:
         "PID GEN THR ST PAGES" in ashlog,   # ps 的表头
         "live " in ashlog,                  # ps 至少一行活进程（含页数）
         "free: procs=" in ashlog,           # free 的聚合读数
-
+        # ---- top（ADR-133）三格 ----
+        "top 2" in ashlog,                  # argv 确实把 top 带进来了
+        # 两帧快照都在（"定期刷新"的最低语义：frame 0 + frame 1）
+        re.search(r"frame 0\nPID GEN THR ST PAGES", ashlog) is not None,
+        re.search(r"frame 1\nPID GEN THR ST PAGES", ashlog) is not None,
+        # 排序口径：每帧的 pages 列必须**非升**（pages 降序，并列按 pid 升序，
+        # pid 升序 ⇒ 同 pages 时行序稳定）。负样本：把 top_cmp 翻转 ⇒ 这格红。
+        _top_pages_nondecreasing(ashlog),
     ))
     _tot = EXEC_TOTAL_RE.search(ashlog)
     if not _tot or int(_tot.group(1)) < 1 or int(_tot.group(2)) != 0:

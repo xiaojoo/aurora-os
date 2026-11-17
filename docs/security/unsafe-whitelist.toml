@@ -87,12 +87,15 @@ expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe
 # 数目对账：465+1=466、86+1=87。
 # 2026-11-17 A4（ADR-132）：+user/runtime U5 35→37（27/28 两个调用块）、
 # +user/shell/registry U5 1→2（`job_of` 的 handle_of_role）。对账：466+3=469、87+3=90。
-total = 467
+# 2026-11-17 ADR-133（top）：+user/shell/registry U5 2→3（`cmd_top` 取 ROLE_SELF_THREAD
+# 的 handle_of_role）。runtime 零新增——`sleep_ms` 是 safe fn `object_wait` 的薄壳，
+# 自身没有 unsafe 块。对账：467+1=468、U5 90+1=91。
+total = 468
 U1 = 83
 U2 = 116
 U3 = 13
 U4 = 129
-U5 = 90
+U5 = 91
 U6 = 36
 
 [modules."acpi"]
@@ -368,6 +371,9 @@ U2 = 2
 U1 = 1
 
 [modules."user/shell/registry"]
-# A3 收尾：`run` 命令。U5 一处 = `rt::handle_of_role(si_va, ROLE_JOB)` 那一次调用——
-# si_va 由内核 `process_start` 校验并映射（user+只读），契约原文在 runtime 侧。
-U5 = 2
+# A3 收尾：`run` 命令。U5 两处 = `rt::handle_of_role(si_va, ROLE_JOB)` 两次调用
+# （cmd_run 与 job_of，ps/free 共用后者）——si_va 由内核 `process_start` 校验并映射
+# （user+只读），契约原文在 runtime 侧。
+# ADR-133（top）：U5 2→3 = `cmd_top` 里取 ROLE_SELF_THREAD 的那一次 handle_of_role
+# （同一份 si_va 契约；16 号回填的 SELF_* 句柄，内核自动 grant）。
+U5 = 3

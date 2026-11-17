@@ -3,9 +3,11 @@
  *   2) 段地址落在低半区且在内核加载器窗口里（mm::USER_VA_BASE = 4 GiB 起）；
  *   3) 每段 p_vaddr 与 p_offset 对 4 KiB 同余，且不允许 W+X 同段。
  * 与 hello 的差别：①**没有 .slots 哨兵段**——shell 的结果走控制台，不走内存信箱，
- * 所以不需要"内核按固定偏移读回"那套契约；②**.text 留 16 KiB**（hello 只留 4 KiB）——
- * shell 的代码比 hello 大，第一版按 4 KiB 排直接撞 `section .text virtual address range
- * overlaps with .rodata`（本轮实测）。段仍各自 ALIGN(4K)，窗口约束不变。
+ * 所以不需要"内核按固定偏移读回"那套契约；②**.text 留 20 KiB**（hello 只留 4 KiB）——
+ * shell 的代码比 hello 大：第一版按 4 KiB 排直接撞 `section .text virtual address range
+ * overlaps with .rodata`（S5c 实测）；ADR-133 的 `top`（排序 + 帧打印 + sleep）再涨
+ * ~2.5 KiB，16 KiB 又不够（本轮实测 .text 结束 0x100004804 > .rodata 起点），提到 20 KiB。
+ * 段仍各自 ALIGN(4K)，窗口约束不变。
  */
 
 OUTPUT_FORMAT(elf64-x86-64)
@@ -26,13 +28,13 @@ SECTIONS {
     *(.text .text.*)
   } :text
 
-  . = 0x100004000;
+  . = 0x100005000;
   .rodata ALIGN(4K) : {
     *(.rodata .rodata.*)
     *(.rdata)
   } :rodata
 
-  . = 0x100006000;
+  . = 0x100007000;
   .data ALIGN(4K) : {
     *(.data .data.*)
   } :data
