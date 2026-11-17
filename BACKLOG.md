@@ -15090,3 +15090,28 @@ ET_EXEC 的 `p_vaddr` 每个进程都从 `0x1_0000_0000` 起；14 号原来把�
 本机的删除闸（`CODEBUDDY_SAFE_DELETE_*`）按"每回合 50 次"计数，够到阈值就把**当次删除**
 拦下来、整链当场退出（`rc=1`，退出前最后一行是内核二进制路径）。
 处置：给那一跑显式放宽阈值（`CODEBUDDY_SAFE_DELETE_BULK_THRESHOLD=600`），不动仓库任何文件。
+
+## 394. 合并 feat/wb-dev（8a0fcdb）：A4 进程观测并入（2026-11-17）
+
+- 并入内容：27 号枚举 / 28 号统计 + `ProcEnumV1`/`ProcStatV1` + `F_PROCINFO`；shell 的 `ps`/`free`
+  与 `;` 分隔脚本命令（a3 命令改成 `run /HELLO.ELF; ps; free`）；`t_proc_info` 七格四负样本；
+  ADR-132 与两份设计文档、unsafe census 增量；`t_fs_open_ring3` 的 ring3 窗口 4e8→1.6e9。
+- 冲突 8 份、语义裁定 4 处：
+  1 **ABI 0.17**：wb 树停在 0.12，A4 没 bump；main 已是 0.16（S2 验签闸）⇒ 合并取 0.17，
+     `ktests/fs_open.rs`、`fs_rw.rs` 的断言同步；`F_PROCINFO` 在 wb 是 1024，与 ABI 0.13 的
+     `F_FS_WRITE_OPEN` 撞位 ⇒ 改 **8192**（注释与 ADR-132 的补记里说明）。
+  2 `fs_open` 的 ring3 窗口：main 是"纯超时 + 循环内查 DONE"，wb 是"循环条件里查 DONE"；
+     取 main 的结构、采纳 wb 的 1.6e9 与理由（串口吞吐 ≈13 ms/行）。
+  3 BACKLOG 撞号：wb 的 §346 与 main 的 §346 同号 ⇒ wb 那节改 **§393**。
+  4 a3 行：wb 改名并加 ps/free 三格，main 加了验签闸两格与 S3 负样本行 ⇒ 行名取 wb 的
+     （`A3 shell执行argv命令并ps/free读数`），**判据取并集**（闸门 `判=通过` + 合计 + `run:` +
+     `(timeout)` + `PID GEN THR ST PAGES` + `free: procs=`）；S3 行原样保留。
+- EOL：wb 树整棵 CRLF，合并时按仓内约定归一（`user.rs`/`proc.rs`/`BACKLOG` 落 LF 并保住
+  `user.rs` 那 5 行 CRLF；其余落 CRLF）；unsafe 快照按合并源码重算为 **467 处**（U4 129、U5 90，
+  `[modules.virtio] U4` 10→8）。
+- 夹具由合并源码重建：`shell.elf` **35056 / 77bbfe60a1fb**（wb 的 ps/free + main 的 argv 写入），
+  hello/probe/fileprobe 与 main 同字节。
+- 读数：`check` **17/17**；合并态整链 **68/69 符合**（默认档 `7ae9c7e9f775`）。唯一不符合 =
+  `demand-zero四路有真输家`，那一跑 `t_ap_released_and_ticking` 红（cpu_ticks 三 AP 都在涨）；
+  同 ELF `4eb4d8a9805e` 单跑该档 **PASS(33)**，且 BACKLOG 已记过它"复跑 PASS、不连续复现"
+  ⇒ 环境形状，**不归因**；判据未改。
