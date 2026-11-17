@@ -7837,6 +7837,33 @@ def check_gpt(log: str) -> list[str]:
     elif mn.group(1) != mn.group(2) or int(mn.group(2)) == 0:
         bad.append(f"点名负样本={mn.group(1)}/{mn.group(2)}（必须全中且分母非零，否则那批闸是空转）")
     return bad
+def _dmesg_repeats(log: str) -> bool:
+    """`dmesg` 的输出必须是内核日志的**重复**（ADR-135）。
+
+    为什么用"重复"当判据：`dmesg` 打出来的就是内核自己打过的那些行，所以只要它
+    工作，串口里必然出现**同一行的第二次**。这比"有输出"强——后者会被紧随其后的
+    内核日志冒充（本片实测踩过：一度以为 dmesg 不出，其实是它的输出与内核日志
+    长得一样、被肉眼当成内核自己打的）。也不依赖具体日志文本或行号。
+
+    形状：`dmesg: tail` 之后的第一行，必须在它**之前**的日志里已经出现过一次。
+    """
+    lines = log.split("\n")
+    for i, ln in enumerate(lines):
+        if ln.strip() != "dmesg: tail":
+            continue
+        body = ""
+        for cand in lines[i + 1 : i + 4]:
+            if cand.strip():
+                body = cand
+                break
+        if not body:
+            continue
+        # 该行必须在表头**之前**出现过（= 内核原来打的那一次）
+        if body in lines[:i]:
+            return True
+    return False
+
+
 
 
 def _top_pages_nondecreasing(log: str) -> bool:
@@ -8559,6 +8586,11 @@ def do_test(timeout: int) -> int:
         # 调用者名下的 Proc 句柄反查不到 ⇒ -5。这验 kill 命令接线 + capability
         # 语义；真正"能杀"由内核侧 t_proc_kill 的按 pid 杀那格覆盖。
         re.search(r"kill 9999\n-5\n", ashlog) is not None,
+        # dmesg（ADR-135）：表头之后必须紧跟内核日志的**重复**内容。
+        # 判据用"重复"而不是"有输出"：dmesg 打出来的就是内核自己打过的那些行，
+        # 所以只要它工作，串口里必然出现同一行的第二次。这一格不依赖任何
+        # 具体日志文本，也不依赖 dmesg 打到第几行。
+        _dmesg_repeats(ashlog),
     ))
     _tot = EXEC_TOTAL_RE.search(ashlog)
     if not _tot or int(_tot.group(1)) < 1 or int(_tot.group(2)) != 0:
