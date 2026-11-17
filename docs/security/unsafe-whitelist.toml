@@ -90,12 +90,12 @@ expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe
 # 2026-11-17 ADR-133（top）：+user/shell/registry U5 2→3（`cmd_top` 取 ROLE_SELF_THREAD
 # 的 handle_of_role）。runtime 零新增——`sleep_ms` 是 safe fn `object_wait` 的薄壳，
 # 自身没有 unsafe 块。对账：467+1=468、U5 90+1=91。
-total = 469
+total = 470
 U1 = 83
 U2 = 116
 U3 = 13
 U4 = 129
-U5 = 92
+U5 = 93
 U6 = 36
 
 [modules."acpi"]
@@ -343,7 +343,7 @@ U4 = 2
 # 不变量 = ABI 约定（号 rax、参数 rdi/rsi/rdx/r10、返回 rax 负值错误码）与 safe 层
 # 长度/枚举编码检查；生命周期 = 调用栈内；并发 = 无共享可变状态（库无全局）。
 U1 = 5
-U5 = 38
+U5 = 39
 
 
 [modules."user/execprobe"]

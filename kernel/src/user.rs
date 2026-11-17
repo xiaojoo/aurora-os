@@ -102,6 +102,12 @@ pub const SYS_PROCESS_KILL: u64 = 18;
 /// pid is only an address; authority comes from a RIGHT_WRITE Proc handle
 /// found in the CALLER OWN name table, then the same kill path as syscall 18.
 pub const SYS_PROC_KILL_BY_PID: u64 = 29;
+/// 30 `log_read(buf, len) -> (lines<<32)|bytes`（ADR-135，`handles` 档）。
+/// 把**串口日志环**里最近的一段**整行**日志拷进用户缓冲区（`serial::recent_tail` 的
+/// 同一份规则：开头半行丢掉、结尾半行丢掉，绝不截半行）。
+/// 返回 0 行是**成功**（环里还没有完整行），不是错误——调用方不该把它读成失败。
+/// len 0 ⇒ -1、len > COPY_MAX ⇒ -3；用户页不可写 ⇒ -2（与 5/6 号同口径）。
+pub const SYS_LOG_READ: u64 = 30;
 /// 16：`rdi` = Proc 句柄、`rsi` = Thread 句柄、`rdx` = StartupInfo 那一页的 VMO 句柄、
 /// `r10` = 它在**子 AS** 里的只读 VA → 成功返回 0。顺序固定：校验 → 转移 → 回填 → 放线程跑。
 pub const SYS_PROCESS_START: u64 = 16;
@@ -1214,6 +1220,54 @@ fn sys_process_kill_core(h: crate::handle::Handle, owner: (usize, u32)) -> u64 {
         return E_DENIED;
     }
     crate::sched::kill_process_threads(pid) as u64
+}
+
+/// ADR-135（30 号）：把串口日志环的"最近整行"拷进用户缓冲区。
+///
+/// **为什么不给用户态一个指向环的指针**：环是内核静态数组，用户态拿到它的 VA
+/// 就等于拿到一段可读内核内存；而且环是**滑动**的，指针语义会随写入漂移。
+/// 这里走既有的 `copy_to_user` 通道（与 5/6 号同一条校验：目标页必须可写、
+/// 跨页逐页校验、一次不超过 `COPY_MAX`），方向是内核→用户。
+///
+/// **`recent_tail` 的整行规则在这里被继承而不是重写**：半行日志会伪装成一条
+/// 没打完的记录，所以开头/结尾的半行一律丢掉。
+///
+/// 返回 `(lines << 32) | bytes`。**0 行是成功**（环里还没有完整行）。
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_log_read(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let len = frame.rsi as usize;
+    if len == 0 {
+        return E_INVALID;
+    }
+    if len > COPY_MAX {
+        return E_TOO_LONG;
+    }
+    // 借一段内核栈缓冲（`COPY_MAX` = 4096 与环等长）。**不上堆、不 static**：
+    // 本函数是 `#[inline(never)]` 的独立帧，4 KiB 在 BSP 内核栈里是既有量的同阶
+    // （`sys_file_read` 的落盘块与它同尺寸）。
+    // **1024 而不是 COPY_MAX(4096)**：本函数的内核栈预算只有几 KiB（sched.rs 的
+    // STACK_PAGES = 4 = 16 KiB，扣掉 trap 帧与调用链），4 KiB 局部数组实测把返回
+    // 路径踩坏——用户态 log_read 返回后该任务的 con_write 全部静默失败
+    // （本轮实测：shell 正常退出码 0、dmesg 一个字都打不出来）。
+    // 1024 够 dmesg 用（环 4096，最近 1 KiB 的整行本来就够读一屏）。
+    const LOG_READ_MAX: usize = 256;
+    let mut buf = [0u8; LOG_READ_MAX];
+    let want = len.min(LOG_READ_MAX);
+    let slice = match buf.get_mut(..want) {
+        Some(s) => s,
+        None => return E_INVALID,
+    };
+    let t = crate::serial::recent_tail(slice);
+    if t.bytes == 0 {
+        return 0; // 0 行 / 0 字节：成功，环里还没有完整行
+    }
+    let Some(src) = buf.get(..t.bytes as usize) else { return E_INVALID };
+    match copy_to_user(src, frame.rdi) {
+        Ok(n) if n == src.len() => (u64::from(t.lines) << 32) | n as u64,
+        Ok(_) => E_FAULT,
+        Err(e) => ptr_err_to_ret(e),
+    }
 }
 
 /// 键盘字符的读取入口。拆成小函数是为了让上面那条 `or_else` 在没开 `ps2-kbd` 时
@@ -2331,6 +2385,8 @@ pub fn syscall_dispatch(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> boo
         SYS_PROCESS_KILL => sys_process_kill(frame),
         #[cfg(feature = "handles")]
         SYS_PROC_KILL_BY_PID => sys_proc_kill_by_pid(frame),
+        #[cfg(feature = "handles")]
+        SYS_LOG_READ => sys_log_read(frame),
         #[cfg(feature = "handles")]
         SYS_CONSOLE_WRITE => sys_console_io(frame, true),
         #[cfg(feature = "handles")]

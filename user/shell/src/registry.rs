@@ -22,7 +22,9 @@ use crate::{con_write, msg, put_u64};
 use crate::{
     M_ABI, M_BYE, M_DEAD, M_FREE_PAGES, M_FREE_PFX, M_FREE_THR, M_HELP, M_LIVE, M_MINUS, M_NL,
     M_PING, M_PS_ERR, M_PS_HDR, M_PS_NOJOB, M_RUN_ERR, M_RUN_EXIT, M_RUN_PREFIX, M_RUN_TIMEOUT,
-    M_KILLED, M_KILL_USAGE, M_RUN_USAGE, M_SP, M_TOP_FRAME, M_TOP_USAGE, M_TRYHELP, M_UNKNOWN,
+    M_DMESG_ERR, M_DMESG_HDR, M_DMESG_USAGE, M_KILLED, M_KILL_USAGE, M_RUN_USAGE, M_SP,
+    M_TOP_FRAME,
+    M_TOP_USAGE, M_TRYHELP, M_UNKNOWN,
 };
 
 /// 控制台句柄（内核按角色 `ROLE_LOG` 转移给 shell 的那个 u64）。
@@ -50,6 +52,7 @@ const CMD_PS: [u8; 2] = [b'p', b's'];
 const CMD_FREE: [u8; 4] = [b'f', b'r', b'e', b'e'];
 const CMD_TOP: [u8; 3] = [b't', b'o', b'p'];
 const CMD_KILL: [u8; 4] = [b'k', b'i', b'l', b'l'];
+const CMD_DMESG: [u8; 5] = [b'd', b'm', b'e', b's', b'g'];
 
 /// 命令词比较。走 `&[u8] == &[u8]`，LLVM 折成 immediate 比较（旧 dispatch 同款）。
 fn streq(a: &[u8], b: &[u8]) -> bool {
@@ -557,6 +560,49 @@ fn cmd_kill(c: &Ctx) -> bool {
     true
 }
 
+/// ADR-135：`dmesg` —— 把内核串口日志环的最近整行打出来（30 号）。
+///
+/// 缓冲放**栈上**（`COPY_MAX` 512 字节一页够用；ADR-133 记过：static 在 4 GiB+
+/// 用户镜像里会被取成 32S 绝对重定位）。内核只给整行，所以这里直接写出去，
+/// 不需要再拼换行——多拼一个会在用户侧造出一条空行，破坏与串口原文的逐行对账。
+///
+/// 返回 0 行是**成功**（环里还没有完整行），此时什么都不打。
+/// ADR-135：`dmesg` —— 内核串口日志环的最近整行（30 号）。
+///
+/// **⚠ 本命令目前不进判定行，且已知缺陷未归因**：实测 `rt::log_read` 返回之后，
+/// 同一任务后续的 `con_write` 全部静默失败（连表头都打不出来），而把 `log_read`
+/// 换成任何别的调用则正常。内核侧 30 号有自己的判据 `t_log_read`（十格全绿 +
+/// 变异证红），所以问题在"30 号返回后的用户态上下文"这一侧，**根因未归因**
+/// （候选：trap 帧/被调用者保存寄存器、串口行锁状态）。记在 BACKLOG，留作独立一片。
+/// 命令本身保留：内核面已验，等根因定位后接进 argv 判据即可。
+fn cmd_dmesg(c: &Ctx) -> bool {
+    // 只接受无参形式：过滤/翻页属后续片，带参一律 usage（不静默忽略）。
+    if c.p.err.is_some() || c.p.args.count() != 0 {
+        con_write(c.h, msg(M_DMESG_USAGE));
+        return true;
+    }
+    let mut buf = [0u8; 256];
+    match rt::log_read(&mut buf) {
+        Ok((_lines, bytes)) => {
+            con_write(c.h, msg(M_DMESG_HDR));
+            // 内核回的是"环里最近整行的字节数"，可能大于本次请求长度
+            // （30 号按环容量算）⇒ 必须夹到缓冲长度。
+            let n = (bytes as usize).min(buf.len());
+            if n > 0 {
+                if let Some(s) = buf.get(..n) {
+                    con_write(c.h, s);
+                }
+            }
+        }
+        Err(e) => {
+            con_write(c.h, msg(M_DMESG_ERR));
+            put_i64(c.h, e.0);
+            con_write(c.h, msg(M_NL));
+        }
+    }
+    true
+}
+
 /// 分派一条已解析的命令。返回 false = 退出 shell。
 ///
 /// 每个分支都是"名字 immediate 比较 → 直接调用处理器"，不写 `match lookup()`：
@@ -599,6 +645,9 @@ pub fn dispatch(h: ConsoleHandle, si_va: u64, p: &Parsed) -> bool {
     }
     if streq(p.cmd, &CMD_KILL) {
         return cmd_kill(&c);
+    }
+    if streq(p.cmd, &CMD_DMESG) {
+        return cmd_dmesg(&c);
     }
     // unknown：三段输出与旧实现逐字节一致——词原样回显（借用不拷贝，全长不截断）。
     con_write(c.h, msg(M_UNKNOWN));

@@ -38,41 +38,45 @@ mod registry;
 /// （hello/probe 的模块头都记过这个坑，本轮实测又撞一次）。改成 RIP 相对 lea 取基址 + 常量偏移。
 /// S6u：横幅的前导 `\x0a` 去掉了——那是当年为了跟上面的内核日志隔开留的，
 /// ADR-096 之后画面正文只有会话输出，前面什么都没有，那一格就成了纯粹的空行。
-static MSGS: [u8; 367] = *b"commands: help | echo <text> | ping | abi | ps | free | top | kill | exit\x0aAurora OS 6.1.0-aurora (tty1)\x0aaurora@os:~$ \x0aline too long, discarded\x0aunknown command:  (try help)\x0aping=abi_info=bye\x0a\x08 \x08^C\x0arun:  exit= (timeout) error=usage: run <path>\x0a-PID GEN THR ST PAGES\x0aps: no job handle\x0alivedead ps: error=free: procs= threads= pages=#\x0atop: usage\x0aframe kill: usage\x0akilled=";
+static MSGS: [u8; 440] = *b"dmesg: usage\x0admesg: err=\x0admesg: tail\x0acommands: help | echo <text> | ping | abi | ps | free | top | kill | exit\x0aAurora OS 6.1.0-aurora (tty1)\x0aaurora@os:~$ \x0aline too long, discarded\x0aunknown command:  (try help)\x0aping=abi_info=bye\x0a\x08 \x08^C\x0arun:  exit= (timeout) error=usage: run <path>\x0a-PID GEN THR ST PAGES\x0aps: no job handle\x0alivedead ps: error=free: procs= threads= pages=#\x0atop: usage\x0aframe kill: usage\x0akilled=dmesg: usage\x0admesg: err=dmesg: tail\x0a";
 
-const M_HELP: (usize, usize) = (0, 74);
-const M_BANNER: (usize, usize) = (74, 30);
-const M_PROMPT: (usize, usize) = (104, 13);
-const M_NL: (usize, usize) = (117, 1);
-const M_TOOLONG: (usize, usize) = (118, 25);
-const M_UNKNOWN: (usize, usize) = (143, 17);
-const M_TRYHELP: (usize, usize) = (160, 12);
-const M_PING: (usize, usize) = (172, 5);
-const M_ABI: (usize, usize) = (177, 9);
-const M_BYE: (usize, usize) = (186, 4);
-const M_BS: (usize, usize) = (190, 3);
-const M_INT: (usize, usize) = (193, 3);
-const M_RUN_PREFIX: (usize, usize) = (196, 5);
-const M_RUN_EXIT: (usize, usize) = (201, 6);
-const M_RUN_TIMEOUT: (usize, usize) = (207, 10);
-const M_RUN_ERR: (usize, usize) = (217, 7);
-const M_RUN_USAGE: (usize, usize) = (224, 18);
-const M_MINUS: (usize, usize) = (242, 1);
-const M_PS_HDR: (usize, usize) = (243, 21);
-const M_PS_NOJOB: (usize, usize) = (264, 18);
-const M_LIVE: (usize, usize) = (282, 4);
-const M_DEAD: (usize, usize) = (286, 4);
-const M_SP: (usize, usize) = (290, 1);
-const M_PS_ERR: (usize, usize) = (291, 10);
-const M_FREE_PFX: (usize, usize) = (301, 12);
-const M_FREE_THR: (usize, usize) = (313, 9);
-const M_FREE_PAGES: (usize, usize) = (322, 7);
+const M_HELP: (usize, usize) = (37, 14);
+const M_BANNER: (usize, usize) = (111, 30);
+const M_PROMPT: (usize, usize) = (141, 13);
+const M_NL: (usize, usize) = (110, 1);
+const M_TOOLONG: (usize, usize) = (155, 25);
+const M_UNKNOWN: (usize, usize) = (180, 17);
+const M_TRYHELP: (usize, usize) = (197, 12);
+const M_PING: (usize, usize) = (209, 5);
+const M_ABI: (usize, usize) = (214, 9);
+const M_BYE: (usize, usize) = (223, 4);
+const M_BS: (usize, usize) = (227, 3);
+const M_INT: (usize, usize) = (230, 3);
+const M_RUN_PREFIX: (usize, usize) = (233, 5);
+const M_RUN_EXIT: (usize, usize) = (238, 6);
+const M_RUN_TIMEOUT: (usize, usize) = (244, 10);
+const M_RUN_ERR: (usize, usize) = (254, 7);
+const M_RUN_USAGE: (usize, usize) = (261, 18);
+const M_MINUS: (usize, usize) = (279, 1);
+const M_PS_HDR: (usize, usize) = (280, 21);
+const M_PS_NOJOB: (usize, usize) = (301, 18);
+const M_LIVE: (usize, usize) = (319, 4);
+const M_DEAD: (usize, usize) = (323, 4);
+const M_SP: (usize, usize) = (327, 1);
+const M_PS_ERR: (usize, usize) = (328, 10);
+const M_FREE_PFX: (usize, usize) = (338, 12);
+const M_FREE_THR: (usize, usize) = (350, 9);
+const M_FREE_PAGES: (usize, usize) = (359, 7);
 // `top`（ADR-133）：表头与 ps 同列名，另加"快照序号"前缀行与 usage。
-const M_TOP_USAGE: (usize, usize) = (331, 11);
-const M_TOP_FRAME: (usize, usize) = (342, 6);
+const M_TOP_USAGE: (usize, usize) = (368, 11);
+const M_TOP_FRAME: (usize, usize) = (379, 6);
 // `kill`（ADR-134）：usage 与成功后的收掉线程数。
-const M_KILL_USAGE: (usize, usize) = (348, 12);
-const M_KILLED: (usize, usize) = (360, 7);
+const M_KILL_USAGE: (usize, usize) = (385, 12);
+const M_KILLED: (usize, usize) = (397, 7);
+// `dmesg`（ADR-135）：usage 与读取失败前缀。
+const M_DMESG_USAGE: (usize, usize) = (0, 13);
+const M_DMESG_ERR: (usize, usize) = (13, 11);
+const M_DMESG_HDR: (usize, usize) = (25, 12);
 /// blob 的真实基址（RIP 相对 lea，不产生 32 位绝对重定位）。
 fn msgs_base() -> u64 {
     let b: u64;

@@ -61,6 +61,9 @@ pub const SYS_PROCESS_KILL: u64 = 18;
 /// ADR-134 (29): rdi=pid -> threads killed. pid is only an address; the kernel
 /// still requires a RIGHT_WRITE Proc handle in the caller own name table.
 pub const SYS_PROC_KILL_BY_PID: u64 = 29;
+/// ADR-135 (30): log_read(buf,len) -> (lines<<32)|bytes. Reads the serial log ring
+/// as whole lines only (half lines are dropped by the kernel). 0 means success.
+pub const SYS_LOG_READ: u64 = 30;
 /// 19 通用对象等待，今天只支持 Proc（user.rs:879；实现 user.rs:946）。
 pub const SYS_OBJECT_WAIT: u64 = 19;
 /// 20 控制台写（user.rs:51；实现 `sys_console_io` user.rs:1006）。
@@ -865,6 +868,27 @@ pub fn process_kill_pid(pid: u16) -> Result<u64, RTError> {
     } else {
         Ok(ret as u64)
     }
+}
+
+/// 30 号：把**串口日志环**的最近整行读进 `buf`。返回 `(行数, 字节数)`。
+///
+/// 内核侧保证：只给整行（开头/结尾的半行丢掉），所以拿回来的段一定以 `\n` 结尾
+/// 或为空。**0 行是成功**（环里还没有完整行），不是错误。
+/// `buf` 长度必须 ≥ 1 且 ≤ `COPY_MAX`（内核 user.rs 的容量边界）。
+pub fn log_read(buf: &mut [u8]) -> Result<(u32, u32), RTError> {
+    if buf.is_empty() || buf.len() > COPY_MAX {
+        return Err(RTError::TOOLONG);
+    }
+    // SAFETY: 30 号 rdi = 用户缓冲、rsi = 字节数；缓冲由调用方给出，长度已在上行校验，
+    // 内核侧还有 COPY_MAX 与 copy_to_user 的窗口校验。
+    let ret = unsafe {
+        syscall_abi(SYS_LOG_READ, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0)
+    };
+    if ret < 0 {
+        return Err(RTError(ret));
+    }
+    let v = ret as u64;
+    Ok(((v >> 32) as u32, (v & 0xffff_ffff) as u32))
 }
 
 /// 打 19 号（`SYS_OBJECT_WAIT`，user.rs:879）：通用对象等待。今天只支持 Proc 对象，

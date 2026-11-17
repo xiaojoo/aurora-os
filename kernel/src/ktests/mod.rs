@@ -28,6 +28,8 @@ mod net;
 mod procinfo;
 #[cfg(feature = "handles")]
 mod prockill;
+#[cfg(feature = "handles")]
+mod logread;
 mod resource;
 mod sched;
 #[cfg(feature = "sig-check")]

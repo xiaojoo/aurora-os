@@ -159,6 +159,7 @@
 | 27 | `SYS_PROC_ENUM` | 游标式枚举自己 Job 名下的进程（handles feature，ADR-132） |
 | 28 | `SYS_PROC_STAT` | 取一个进程的 ProcStatV1 统计（handles feature，ADR-132） |
 | 29 | `SYS_PROC_KILL_BY_PID` | 按 pid 杀进程：内核在调用者名下反查带 WRITE 的 Proc 句柄后走 18 号同一路径（handles feature，ADR-134） |
+| 30 | `SYS_LOG_READ` | 把串口日志环的最近整行拷进用户缓冲（handles feature，ADR-135） |
 
 此表是当前源码快照的调用号清单，不代表所有 feature 在默认构建中都启用。用户程序必须先通过 `SYS_ABI_INFO` 读取 ABI 版本与能力位，再使用对应接口。新增调用必须登记、测试和版本化；不得自行选择空号后就视为已批准。
 
