@@ -457,7 +457,7 @@ FAT_PORTS = {3: "fat32-small", 4: "fat32-wide"}
 FS_OPEN_FEATURES = {"fs-open"}
 # A3 切片：execprobe 的 22 号 open 打的是 fs_open::PORT=5 的 deep 卷（fs_open 自 mount 固定卷）。
 # 所以这一档的镜像也要装配 deep 卷——与 fs-open 同一份夹具、同一条指纹闸。
-A3_EXEC_FEATURES = {"a3-exec", "a3-shell", "a3-exec-bad"}
+A3_EXEC_FEATURES = {"a3-exec", "a3-shell", "a3-exec-bad", "a3-exec-seal"}
 FS_OPEN_PORTS = {5: "fat32-deep"}
 # ADR-111：写方向单独一档，挂在**可写**卷上（口 4）。它与 `FS_OPEN_PORTS` 一样要与内核的
 # `filesystem/fs_rw.rs` 的 `PORT` 对账（`check-fat32-ports` 里那一格扩成两张表）。
@@ -8528,6 +8528,23 @@ def do_test(timeout: int) -> int:
     IMAGE.unlink(missing_ok=True)
 
     # =====================================================================
+    # S4c（ADR-116）：**TOCTOU 封存**——16 号通过后父进程再写段 VMO，必须被拒（`seal=denied`）。
+    print("=== A3 闸门：启动后父进程再写段 VMO 必须被拒（封存）===")
+    IMAGE.unlink(missing_ok=True)
+    r5v, r5rc, r5log = do_run(["a3-exec-seal", "fat32-probe"], timeout)
+    r5_ok = r5v == "PASS" and all((
+        "exec-verify: 判=通过 名=/HELLO.ELF" in r5log,
+        "seal=denied" in r5log,
+        "seal=ok" not in r5log,
+        "spawn=0x0" in r5log,
+        "wait=exit:0x0" in r5log,   # 子进程照常跑完（封存不伤正常执行）
+    ))
+    r5_verdict = "CONTENT-MISMATCH" if (r5v == "PASS" and not r5_ok) else r5v
+    for x in ([] if r5_ok else ["S4c 证人：判=通过 / seal=denied / 无 seal=ok / spawn=0x0 / wait=exit:0x0 有一格不成立"]):
+        print("    对账:", x)
+    IMAGE.unlink(missing_ok=True)
+
+    # =====================================================================
     # S4b（ADR-116）：**负样本**——装载器在可执行段上改一个字节再交给 16（包与盘都不动）。
     # 闸门必须点名 `映射不符`；同一跑里不许出现 `判=通过`；合计 通过=0 拒=1。
     print("=== A3 闸门负样本：装载器改可执行段一个字节 ===")
@@ -8714,6 +8731,8 @@ def do_test(timeout: int) -> int:
         ("A3改盘一字节⇒16号拒启", ed_verdict, edrc, "FAIL", 35),
         # S4b（ADR-116）：装载器改**代码段**一字节 ⇒ 映射不符。
         ("A3换代码字节⇒16号拒启", r4_verdict, r4rc, "PASS", 33),
+        # S4c（ADR-116）：16 返回后父进程再写段 VMO ⇒ 封存拒绝。
+        ("A3启动后写段VMO必须拒", r5_verdict, r5rc, "PASS", 33),
 
     ]
     # 每一行对应那一跑的串口：不符时把红的那几格打出来。
@@ -8779,6 +8798,7 @@ def do_test(timeout: int) -> int:
         "A3 shell执行argv命令并ps/free读数": ashlog,
         "A3改盘一字节⇒16号拒启": edlog,
         "A3换代码字节⇒16号拒启": r4log,
+        "A3启动后写段VMO必须拒": r5log,
 
     }
     all_ok = True

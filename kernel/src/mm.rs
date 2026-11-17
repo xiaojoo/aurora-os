@@ -63,6 +63,9 @@ struct FrameInfo {
 const FI_FREE: u8 = 0;
 const FI_USED: u8 = 1;
 const FI_PINNED: u8 = 2;
+/// S4c（ADR-116）：这一帧已经作为**可执行映像**交给过 16 号，此后任何 VMO 写都不许碰它
+/// （TOCTOU 封存）。`fi_set_used` 在分配/归还时重写 flags，所以帧被回收再发出去时不带封印。
+const FI_SEALED: u8 = 4;
 const FRAME_INFO_BYTES: usize = core::mem::size_of::<FrameInfo>();
 /// VA 保留登记表容量。**memory 拥有的固定上限**（ADR-065 supersede ADR-041 的派生公式）：
 /// 定长 256 + 空闲位图，给 W3 每进程 VA 保留留余量。旧派生公式 `MAX_CPUS*MAX_TASKS_SUPPORTED+16`
@@ -2762,6 +2765,38 @@ pub fn frame_get(frame: u64) -> SharedFrame {
 
 /// 归还一个参考（ADR-063 决策 3，P1c）：refcnt--，**减到 0 才归还**（毒化 + 台账 + free_frames）。
 /// refcnt 已 0 再 put ⇒ DoubleFree（沿用 free_violation 升 L4 的语义，这里返回 Err 由调用方处置）。
+/// 给一帧打上"执行映像"封印（一次生效、不可撤销；帧被归还后由 `fi_set_used` 清掉）。
+/// 帧不存在/未用 ⇒ `false`（调用方据此拒绝启动，不吞这个失败）。
+pub fn frame_seal(frame: u64) -> bool {
+    let _g = pmm();
+    let st = s();
+    if frame >= st.frame_info_frames as u64 {
+        return false;
+    }
+    let arr = st.frame_info.load(Ordering::Relaxed) as *mut FrameInfo;
+    // SAFETY: arr 覆盖 frame_info_frames 个条目，frame 在界内；PMM 锁保证互斥。
+    unsafe {
+        let e = &mut *arr.add(frame as usize);
+        if e.flags & FI_USED == 0 {
+            return false;
+        }
+        e.flags |= FI_SEALED;
+        true
+    }
+}
+
+/// 这一帧是否已封存。VMO 写路径每次落页前问一遍。
+pub fn frame_sealed(frame: u64) -> bool {
+    let _g = pmm();
+    let st = s();
+    if frame >= st.frame_info_frames as u64 {
+        return false;
+    }
+    let arr = st.frame_info.load(Ordering::Relaxed) as *const FrameInfo;
+    // SAFETY: 同上；只读一个 u8。
+    unsafe { (*arr.add(frame as usize)).flags & FI_SEALED != 0 }
+}
+
 pub fn frame_put(frame: u64) -> Result<(), MmError> {
     let _g = pmm();
     let rc = fi_refcnt(frame);

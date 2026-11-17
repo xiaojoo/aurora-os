@@ -370,6 +370,7 @@ fn sys_vmo_write(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
         }
         match crate::vmo::vmo_write(id, offset + done, &chunk[..ask]) {
             Ok(n) => done += n,
+            Err(crate::vmo::VmoError::Sealed) => return E_DENIED,
             Err(_) => return E_BAD_HANDLE,
         }
     }
@@ -828,6 +829,33 @@ fn child_bytes_eq(as_slot: u8, mut va: u64, mut want: &[u8]) -> bool {
     true
 }
 
+/// S4c（ADR-116）：把子 AS 里**可执行段**的帧封存起来——16 号返回后，父进程即便还握着
+/// 段 VMO 的写句柄，`vmo_write` 也会撞上 `Sealed`（TOCTOU 窗口就此关掉，不再是"只在 16 那一刻"）。
+#[cfg(feature = "fs-open")]
+fn seal_exec_frames(as_slot: u8, segs: &[LoadSeg]) -> bool {
+    for s in segs {
+        let mut va = s.va;
+        let end = match s.va.checked_add(s.len) {
+            Some(e) => e,
+            None => return false,
+        };
+        while va < end {
+            let Some(pte) = crate::mm::aspace_leaf_slot(as_slot, crate::mm::VirtAddr(va)) else {
+                return false;
+            };
+            if pte & 1 == 0 || pte & (1 << 2) == 0 || pte & (1 << 7) != 0 {
+                return false;
+            }
+            let frame = (pte & PTE_FRAME) / crate::mm::PAGE as u64;
+            if !crate::mm::frame_seal(frame) {
+                return false;
+            }
+            va = (va & !(crate::mm::PAGE as u64 - 1)) + crate::mm::PAGE as u64;
+        }
+    }
+    true
+}
+
 /// 一段盘上字节（文件偏移 `file_off` 起）与它落在的每个 `PT_LOAD` 在子 AS 里的副本比。
 #[cfg(feature = "fs-open")]
 fn exec_binding_chunk(as_slot: u8, segs: &[LoadSeg], file_off: u64, data: &[u8]) -> bool {
@@ -980,6 +1008,10 @@ fn exec_gate(name: &str, as_slot: u8) -> Option<u64> {
     let d = h.finish();
     if got != cov.pay_len || d != cov.pay_digest {
         return Some(exec_deny(name, "摘要不符"));
+    }
+    // S4c：比过之后把可执行帧封上——之后谁再想写这几页（包括父进程手里的段 VMO）都拒。
+    if !seal_exec_frames(as_slot, &segs[..nseg]) {
+        return Some(exec_deny(name, "封存失败"));
     }
     EXEC_VERIFIED.fetch_add(1, Ordering::Relaxed);
     crate::log_info!("exec-verify: 判=通过 名={} 字节={}", name, got);

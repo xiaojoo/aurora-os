@@ -34,6 +34,8 @@ pub enum VmoError {
     /// 长度为 0、越界、或 offset+len 溢出。
     BadLength,
     NoSuch,
+    /// S4c（ADR-116）：写到一帧已经封存的"执行映像"上 ⇒ 拒（TOCTOU 封存）。
+    Sealed,
     Mm(MmError),
 }
 
@@ -252,6 +254,9 @@ pub fn vmo_write(id: VmoId, offset: usize, src: &[u8]) -> Result<usize, VmoError
             let pi = pos / PAGE;
             let po = pos % PAGE;
             let k = (PAGE - po).min(src.len() - done);
+            if mm::frame_sealed(e.frames[pi]) {
+                return Err(VmoError::Sealed);
+            }
             let pa = e.frames[pi] * PAGE as u64 + po as u64;
             // SAFETY: pa 属于本对象（refs>0 ⇒ 不会被归还），HHDM 覆盖全部物理内存，
             // k <= PAGE - po 所以不越出这一页；src[done..done+k] 在界内。

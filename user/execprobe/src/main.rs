@@ -25,8 +25,8 @@ use aurora_user_runtime as rt;
 // 布局（偏移/长度）由 tools 侧对账：0|19 argv 前缀 · 19|1 换行 · 20|13 run 头 ·
 // 33|6 " open=" · 39|6 " read=" · 45|7 " entry=" · 52|7 " spawn=" · 59|6 " wait=" ·
 // 65|8 "timeout\n" · 73|4 "err=" · 77|16 十六进制字表。
-static MSGS: [u8; 104] =
-    *b"execprobe: argv[0]=\nrun:HELLO.ELF open= read= entry= spawn= wait=timeout\nerr=0123456789abcdef0xexit:.ELF";
+static MSGS: [u8; 117] =
+    *b"execprobe: argv[0]=\nrun:HELLO.ELF open= read= entry= spawn= wait=timeout\nerr=0123456789abcdef0xexit:.ELFseal=deniedok";
 
 const M_ARGV: (usize, usize) = (0, 19);
 const M_NL: (usize, usize) = (19, 1);
@@ -44,6 +44,10 @@ const M_HEX: (usize, usize) = (77, 16);
 const M_ZEROX: (usize, usize) = (93, 2);
 const M_EXIT: (usize, usize) = (95, 5);
 const M_ELF: (usize, usize) = (100, 4);
+/// S4c：`seal=` / `denied` / `ok`（追加在 blob 末尾，前面偏移不动）。
+const M_SEAL: (usize, usize) = (104, 5);
+const M_SEAL_DENY: (usize, usize) = (109, 6);
+const M_SEAL_OK: (usize, usize) = (115, 2);
 
 // **块缓冲必须放 .bss，不能放栈**：execprobe 的内核栈只有一页（4 KiB），
 // run_image 里一个 [u8; 4096] 局部数组就会把栈顶穿出去——实测 #PF
@@ -114,7 +118,7 @@ fn fail(out: rt::Handle, at: (usize, usize), code: i64, site: u8) -> ! {
 }
 
 /// A3：装载并运行卷上的 `name`（8.3 名，ASCII）。不返回。
-fn run_image(name: &[u8], out: rt::Handle, si_va: u64, lie: bool) -> ! {
+fn run_image(name: &[u8], out: rt::Handle, si_va: u64, lie: bool, seal_probe: bool) -> ! {
     // 22 号：open（fs_open 自 mount 固定卷，不依赖挂载表）。路径按字节给，非 UTF-8 也照传。
     let fh = match rt::file_open(name, 0) {
         Ok(h) => h,
@@ -330,6 +334,20 @@ fn run_image(name: &[u8], out: rt::Handle, si_va: u64, lie: bool) -> ! {
         Ok(()) => 0u64,
         Err(e) => fail(out, M_ERR, e.0, 16),
     };
+    // S4c（ADR-116）：启动成功后**再写**一次段 VMO——内核应当已把可执行帧封存，写必须失败。
+    if seal_probe {
+        let _ = rt::console_write(out, msg(M_SEAL));
+        let bad = [0x90u8; 1];
+        match rt::vmo_write(sv[0], 10, &bad) {
+            Ok(_) => {
+                let _ = rt::console_write(out, msg(M_SEAL_OK));
+            }
+            Err(_) => {
+                let _ = rt::console_write(out, msg(M_SEAL_DENY));
+            }
+        }
+        let _ = rt::console_write(out, msg(M_NL));
+    }
     let _ = rt::console_write(out, msg(M_SPAWN));
     put_hex(out, sr);
     // 17 号：等 3 秒。hello 写完数据段就自旋，不 exit ⇒ 超时是**预期**（判据第四格）。
@@ -410,8 +428,8 @@ pub extern "C" fn _start(si_va: u64) -> ! {
     // A3：目标是 ELF 文件 ⇒ 装载并运行；否则 A2 行为（打印后 exit(7)）。
     let tail = target.len().checked_sub(4).and_then(|i| target.get(i..));
     if tail == Some(msg(M_ELF)) {
-        let lie = nth_arg(args, 2) == b"lie";
-        run_image(target, stdout, si_va, lie);
+        let mode = nth_arg(args, 2);
+        run_image(target, stdout, si_va, mode == b"lie", mode == b"seal");
     }
     rt::exit(7);
 }

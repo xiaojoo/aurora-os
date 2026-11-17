@@ -1381,6 +1381,9 @@ fn stage_a2_exec() {
     } else if cfg!(feature = "a3-exec-bad") {
         // S4b：再带一条 argv[2]=`lie`——execprobe 据此在可执行段上改一个字节。
         (280usize, 25usize) // "execprobe\0/HELLO.ELF\0lie\0"
+    } else if cfg!(feature = "a3-exec-seal") {
+        // S4c：argv[2]=`seal`——启动成功后父进程再写段 VMO，必须被拒。
+        (280usize, 26usize) // "execprobe\0/HELLO.ELF\0seal\0"
     } else if cfg!(feature = "a3-exec") {
         // S4（ADR-116）：argv[0] 是 execprobe 自己的名字，目标是 argv[1]。
         // 把目标当自己的名字，16 号的验签闸会把它当成那个文件（实测：映射不符）。
@@ -1421,6 +1424,8 @@ fn stage_a2_exec() {
         // 内核侧诊断实测 NotAbsolute）；execprobe 见 ".ELF" 后缀就走 A3 装载器分支。
         let target: &[u8] = if cfg!(feature = "a3-exec-bad") {
             b"execprobe\0/HELLO.ELF\0lie"
+        } else if cfg!(feature = "a3-exec-seal") {
+            b"execprobe\0/HELLO.ELF\0seal"
         } else if cfg!(feature = "a3-exec") {
             b"execprobe\0/HELLO.ELF"
         } else {

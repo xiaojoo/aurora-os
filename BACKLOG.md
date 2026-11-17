@@ -15156,3 +15156,20 @@ ET_EXEC 的 `p_vaddr` 每个进程都从 `0x1_0000_0000` 起；14 号原来把�
   `execprobe.elf` 27408 / `f64dd47ecd33`。
 - ADR-116 状态更新为**部分采纳**；仍未做：TOCTOU 封存（16 返回后父进程仍能改共享帧）、
   启动读盘失败时闸门不生效、信任根/轮换/吊销（ADR-011）。不称安全启动。
+
+## 397. ADR-116 S4c：帧级封存——TOCTOU 窗口关掉（2026-11-18）
+
+- 机制：`FrameInfo.flags` 加 `FI_SEALED`（`mm::frame_seal/sealed`，PMM 锁内只动一个 u8）；
+  16 号在绑定比对通过后把子 AS **可执行段**各页的帧封上；`vmo_write` 每落一页前问一次封印
+  （VMM→PMM 与 `map_shared → frame_get` 同序），撞上回 `VmoError::Sealed`，13 号映射成 `-4`。
+  封印是**帧**级的：再创 VMO 别名或 dup 句柄写同一帧都会拒；帧被归还/重分配时
+  `fi_set_used` 重写 flags，不泄漏给下一个主人。
+- 判定行 `A3启动后写段VMO必须拒`（新档 `a3-exec-seal`，第 71 行）期望 PASS(33)，五格：
+  `判=通过 名=/HELLO.ELF`、`seal=denied`、同跑无 `seal=ok`、`spawn=0x0`、`wait=exit:0x0`。
+- 变异证红（已还原）：`seal_exec_frames` 恒真 ⇒ `seal=ok` 出现、`seal=denied` 消失 ⇒ 行红。
+- 读数：`check` **17/17**（unsafe census 470：U2 119）；整链 **70/71 符合**
+  （默认档 `49f69a31ef0e`）——唯一不符合 `P7 句柄ring3读自己镜像`，那一跑
+  `t_ap_released_and_ticking` 红；同 ELF `e1f6f3e95c9c` 单跑 **PASS(33)**（该用例 ok），
+  与 §394 记过的"复跑 PASS、不连续复现"同形 ⇒ 环境形状，**不归因**。
+- ADR-116 的"没做到的"第 2 条（TOCTOU）关闭；仍开：启动读盘失败时闸门不生效、信任根/轮换/
+  吊销（ADR-011）。口径：只封可执行段；数据段按 S4a 仍可写；不称安全启动。

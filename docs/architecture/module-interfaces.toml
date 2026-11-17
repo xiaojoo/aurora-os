@@ -214,6 +214,8 @@ public_api = [
   "mm::aspace_map_slot",
   "mm::aspace_effective_flags",
   "mm::aspace_mapped_pages",
+  "mm::frame_seal",
+  "mm::frame_sealed",
   "mm::aspace_leaf_slot",
   "mm::aspace_gen",
   "mm::aspace_new_kernel",

@@ -87,9 +87,9 @@ expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe
 # 数目对账：465+1=466、86+1=87。
 # 2026-11-17 A4（ADR-132）：+user/runtime U5 35→37（27/28 两个调用块）、
 # +user/shell/registry U5 1→2（`job_of` 的 handle_of_role）。对账：466+3=469、87+3=90。
-total = 468
+total = 470
 U1 = 83
-U2 = 117
+U2 = 119
 U3 = 13
 U4 = 129
 U5 = 90
@@ -214,6 +214,7 @@ U4 = 5
 # 所以子进程跑起来之后"启动那棵树"与"硬件真正在用的树"不是同一张。用户缓冲校验
 # （user::validate_range）要的是后者。不取锁，与 effective_flags 同一纪律，可在 with_vmm_lock 内调用。
 U1 = 6
+# S4c（ADR-116）：frame_seal / frame_sealed 两处 FrameInfo 读写（PMM 锁内，只动一个 u8）。
 # P1a/P1b/P1c（ADR-063）共 7 处 FrameInfo unsafe：引导写入（bootstrap_frame_info）、
 # 读 refcnt（fi_refcnt）、读 owner（fi_owner）、写 used（fi_set_used）、refcnt 加一（fi_inc_refcnt）、
 # refcnt 减一（fi_dec_refcnt）、最终归还毒化（fi_final_free）。指针来自 phys_alloc_locked 分出的
@@ -229,7 +230,7 @@ U1 = 6
 # set_leaf_in 读/写叶子、aspace_map 的冲突预查与回滚清叶子、AspaceMapping::drop 清叶子、
 # aspace_leaf 只读对照、new_table_frame_in 的清零。前提与既有 walk_leaf 逐字相同：
 # va 规范、根是有效 PML4、持 VMM(20)；新增的只是"根可以是别的 AS"与"表页记进那个 AS 的清单"。
-U2 = 53
+U2 = 55
 # P5（ADR-067）+2：LazyCell 的 Sync（互斥由 VMM 提供，载荷全 Copy）与 lazy_items 取表。
 # 白名单理由：表读写全部在 VMM(20) 内（demand_zero_try 的锁外窗口只碰 phys_alloc/map 自己
 # 的锁序），无跨锁别名逃逸。demand_zero_try 的分配即清零 write_bytes 记在上面的 U2（37→38）。
