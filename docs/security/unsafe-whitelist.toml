@@ -1,306 +1,371 @@
-# unsafe 登记表（手册 §1.3 的唯一来源）
-#
-# 规则：
-#   * 只有这里列出的 crate 可以含 unsafe；其余 crate 必须 #![forbid(unsafe_code)]
-#   * CI 双向对账：登记了但实际 unsafe 统计为 0 -> 报“白名单虚报”；
-#     实际有 unsafe 但未登记 -> 报“越权 unsafe”（§1.3 第 6 条）
-#   * 每条都要写 reason 与 expires；到期未处理就得改成正式条目或删除该 unsafe
-#
-# 检查脚本：python tools/aurora.py check
-
-[crate.aurora-kernel]
-reason = "垂直切片阶段整个内核就是一个二进制 crate，异常桩/描述符表/端口 I/O 都在里面"
-scope = "arch/x86_64/trap.rs(asm+描述符+CR2) · serial.rs(端口) · limine.rs(启动信息指针转引用) · arch/x86_64/cpuid.rs · main.rs(启动期 UnsafeCell)"
-# 2026-11-06 那一刀：`trap/apic/smp/cpu/cpuid` 已从 kernel/src/ 平铺移进 kernel/src/arch/x86_64/（BACKLOG 77）。
-# 下面两行里的裸名字（trap/cpu/apic/smp…）指的是**模块名**，不是文件路径；门禁按包计数，路径变化不影响它，但引用这些文件时请用新路径。
-# M4-2 之后这条 scope 已经**不再完整**（sched/sync/apic/mm/cpu/smp/user/tsc 也都有 unsafe），
-# 而门禁是按包计数的，所以这行写漏不会让检查失败——那正是它该被写全的理由。
-# 逐包拆分之前，先把"这个包里 unsafe 集中在哪几类"说明白，而不是留一份 M1 时代的清单。
-scope_actual = "asm 全局符号与异常桩(trap/sched/cpu) · 描述符表与 CR4/CR3(trap/cpu/mm) · 端口与 MMIO(serial/apic) · 页表遍历(mm) · per-CPU 静态区的裸指针读写(sched/sync/resource/smp/user/cpu) · 内联 asm 的取指/STAC-CLAC(user) · ktest 里的现场读回(main 与 ktests/*) · arch↔sched 回调表(hooks) · 句柄表里那一段连续物理内存的 volatile 字节/双字访问与 `UnsafeCell` 表(driver) · 驱动静态区取句柄(ahci，只剩 5 处，全部是拿句柄不是拿指针) · 崩溃现场的有界栈走(crash：两处 read_volatile，每处都先过「8 字节对齐 + 内核半区 + 已映射」三关，读回来的值只进记录、不解引用、不参与控制流)"
-expires = "M2：按 §2.5 拆出 aurora-arch / aurora-hw / aurora-mm-core 后，本条改为逐 crate 登记"
-
-# M4-2：第一个用户程序（测试夹具）。它的 unsafe 只有两类，都写在源码注释里。
-[crate.aurora-user-probe]
-reason = "第二个用户产物（W3 P5a）：unsafe 需求是 int 0x80 的四参入口、两处 RIP 相对 lea 取自己段的基址、两个自跳转，以及往自己 .slots 写结果与从 14 号返回的用户 VA 读回 8 字节；不碰任何内核对象"
-scope = "main.rs：sys4 的 int 0x80（rax/rdi/rsi/rdx/r10）· slots_base/src_addr 的 lea（镜像基址在 4 GiB 之上，addr_of! 会退化成 R_X86_64_32S）· put 的原子写（偏移 0..=48）· _start 的读回比对（只读、同页内、先判返回值非负）· panic 与收尾自跳转"
-expires = "P5c 之后若它开始打 11/15/16 或读 StartupInfo，unsafe 面会扩，那时回这条账重登记"
-
-[crate.aurora-user-shell]
-reason = "第三个用户产物（S5c，第一个交互式程序）：unsafe 需求是 int 0x80 的三参入口、读内核交进来的 StartupInfo 那一页（只读、页内、先核魔数与条数上限）、往自己的行缓冲写字节、以及 panic/收尾的自跳转；不碰任何内核对象"
-scope = "main.rs：syscall3 的 int 0x80（rax/rdi/rsi/rdx）· find_console 的 read_unaligned（头 24 字节 + 最多 16 条描述，全在那一页内，先核 SI_MAGIC 与 nhandles 上限）· con_read_byte 往调用方给的 &mut u8 写一字节 · _start 的行缓冲写入与回显 · panic 与两处收尾自跳转"
-expires = "S5c 之后若它开始打别的号或读别的页，unsafe 面会扩，那时回这条账重登记"
-
-# FS-03 切片 D（ADR-108 决策 8）：第四个用户产物 = ring3 文件探针。
-[crate.aurora-user-fileprobe]
-reason = "FS-03 切片 D（ADR-108 决策 8）的 ring3 文件探针：unsafe 需求只有 int 0x80 的三参入口与它的 unsafe fn 声明、一处 RIP 相对 lea 取自己 .slots 的基址（镜像基址在 4 GiB 之上，addr_of! 会退化成 R_X86_64_32S）、panic 与收尾两处自跳转，以及按固定偏移表对自己那一页的 volatile 字节/双字读写；不碰任何内核对象"
-scope = "main.rs：sys3 的 int 0x80（rax/rdi/rsi/rdx）与其 unsafe fn 声明 · slots_base 的 lea · put/put_byte/get_byte/get_u32 四处 volatile 访问（偏移全在本页 0..1536，基址加常量偏移）· read_all/read_dir_all/_start 里把本页地址交给内核的三处调用 · panic 与 SYS_EXIT 后的自跳转"
-expires = "FS-03 之后若它开始打写路径（23 号）或读别的页，unsafe 面会扩，那时回这条账重登记"
-
-[crate.aurora-user-hello]
-reason = "它是产物而不是库：唯一的 unsafe 需求是 `int 0x80` 与一个自跳转，没有任何指针算术、没有内存操作、不碰任何内核对象"
-scope = "main.rs：3 次 int 0x80（inlateout rax + in rdi/rsi）、panic 与收尾各一个 `jmp .` 自跳转"
-expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe；多了就得回这条账"
-
-# ---------------------------------------------------------------- P3 细分登记（模块 × 类别）
-#
-# 上面两条 [crate.*] 是**按包**的准入闸（哪个包允许含 unsafe），一字未动。
-# 下面这一段是**按现场**的普查快照：每个模块每类各多少处。类别 U1..U6 的含义：
-#   U1 架构入口与特殊寄存器
-#   U2 页表、物理内存与 MMIO
-#   U3 DMA 与设备共享内存
-#   U4 并发共享状态与 UnsafeCell
-#   U5 用户指针与地址空间访问
-#   U6 诊断路径的有限现场读取
-#
-# 这份数不是手写的，是 `tools/aurora.py` 的 `unsafe_sites()` 从源码逐处算出来的；
-# 门禁 `check-unsafe` 每次重算一遍再与本段逐格双向对账：源码有而这里没登记 ⇒ 红，
-# 这里登记了而源码算不出来 ⇒ 红。**类别判错了改分类规则，不改这里的数去凑。**
-# 逐处判定（含行号、所属函数、判定依据原文）见 docs/security/unsafe-census.md。
-#
-# 本轮普查：278 处 = U1 53 + U2 60 + U3 13 + U4 103 + U5 28 + U6 21
-# 2026-11-07 P7：hello 加了 syscall3（U1 两处）与 ring3 句柄读/close（U5 三处）。
-
-[unsafe-census]
-total = 425
-U1 = 79
-U2 = 114
-U3 = 13
-U4 = 129
-U5 = 54
-U6 = 36
-
-[modules."acpi"]
-U2 = 1
-U4 = 6
-
-[modules."ahci"]
-U4 = 9
-
-[modules."arch/x86_64/apic"]
-U1 = 4
-U2 = 2
-U4 = 3
-
-[modules."arch/x86_64/cpu"]
-U1 = 5
-
-[modules."arch/x86_64/smp"]
-U1 = 5
-U4 = 12
-
-[modules."arch/x86_64/trap"]
-U1 = 13
-U4 = 9
-
-[modules."crash"]
-U6 = 2
-
-[modules."driver"]
-U3 = 9
-U4 = 9
-
-[modules."heap"]
-U2 = 7
-
-[modules."hooks"]
-U4 = 3
-
-[modules."hw"]
-U1 = 2
-# S9k（双缓冲）+1 U2：write_slice 把整行已打包像素 copy_nonoverlapping 进帧缓冲窗口，
-# present 一次上屏 height 次；check 保证 off+len*4<=len，源为内核私有 back buffer，不重叠。
-U2 = 7
-
-[modules."frame"]
-# S9k/S9o（双缓冲+行级脏标）5 处 U2：离屏 back buffer（static mut [u32;1280*800]，BSS 不进堆）的
-# put/put_raw/get/present 访问。单核 UI 串行绘制（park 主循环体，非 IRQ 上下文），
-# 同一时刻只有一个活终端开启 db；几何超容量自动退回直写。分类按操作实质归 U2。
-U2 = 5
-
-[modules."irq"]
-U4 = 9
-
-[modules."ktest"]
-U6 = 1
-
-[modules."ktests/acpi"]
-U6 = 1
-
-[modules."ktests/crash"]
-U6 = 1
-
-[modules."ktests/elf"]
-U4 = 2
-
-[modules."ktests/fs"]
-U4 = 1
-U6 = 3
-
-[modules."ktests/heap"]
-U6 = 6
-
-[modules."ktests/mm"]
-# P4（ADR-066）+4：t_split_huge 的金丝雀旧写/新读、OOM 格读回、跨别名双向，
-# 全部落在本用例 phys_alloc 独占的块或新帧上，页对齐、HHDM 覆盖。
-# P5（ADR-067）+1：t_demand_zero 把桩代码写进尚未启动任务的 code2 帧（HHDM 内核别名直写）。
-# P5b 收尾（ADR-075）+4：D9 那一段的 aspace_switch / aspace_switch_kernel 调用点
-# （切进 a2、切回内核、收场再确认一次）。都是"按已核对的根表换 CR3"，
-# 指针来源与范围由 mm 自己的 AS 表保证；分类沿用同族的既有口径。
-U6 = 18
-# P5（ADR-067）+1：dz_page 的桩内容 HHDM 直写（帧由本用例 phys_alloc 独占、尚未映射成
-# 用户页，ADR-026 配方）。分类按操作实质：物理内存直写不是诊断现场读，故 U2。
-# P5c-3（ADR-075）+1：读被停住线程的首帧第 10 格（rdi），证"16 号真的把 StartupInfo 的 VA 交给了它"。
-U2 = 3
-
-[modules."ktests/sched"]
-U1 = 3
-U6 = 3
-
-[modules."ktests/sign"]
-U4 = 2
-
-[modules."ktests/user"]
-U6 = 1
-
-# S6a（BACKLOG §240）+4 处 U2：Limine framebuffer 响应是"启动信息里的指针数组"，
-# 读它必须解引用 bootloader 写的裸指针（`*base`、`&*fb`、条目 `as_ref`、`memmap_slice`）。
-# 指针来源：bootloader 在移交控制权之前按协议写好；地址范围：内核 higher-half / HHDM 内；
-# 对齐：协议规定的 repr(C) 结构；生命周期：响应一经提供在内核运行期内稳定（协议未规定失效）；
-# 并发：只在 BSP 启动阶段单线程读一次，之后只读数值副本（FbInfo 不带指针）；
-# 上下文：BOOT/KERNEL，不在 ISR、不持锁；不变量由"先判非空 + 条目数上界 64/4096"保证。
-[modules."limine"]
-U2 = 14
-U3 = 4
-
-# T0.1（2026-11-07）：用例搬进 kernel/src/ktests/*.rs，main 只剩启动路径的 3 处 U4；
-# 原 U1 3 / U6 18 按实际落点拆到 ktests/sched 与各用例模块。总数与类别合计不变。
-# W4 S3（2026-11-11，ADR-080）+2：产品路径自己那份签名包缓冲 BootPkgCell
-# （`unsafe impl Sync` + 一次 `&mut *…get()`）。57,856 字节比堆上限 2048 大两个数量级，
-# 按外部输入大小分配第一次就走 handle_alloc_error ⇒ 整机 39（ADR-018/026），所以只能静态。
-# 不复用 ktests/sign.rs 那份：它是 sig-check 门控的，正常构建里不存在。
-# 七项论证写在 main.rs 的 SAFETY 注释里（单一访问者、启动编排只调一次、调用点在 AP 释放之前）。
-[modules."main"]
-U4 = 5
-
-[modules."mm"]
-# S5c-2 +1：current_effective_flags 读 CR3（aspace_cr3_read 原语，只动 rax）。
-# 为什么必须读 CR3 而不是用 pml4_phys：后者只在 take_over 写一次，aspace_switch 只动 CR3，
-# 所以子进程跑起来之后"启动那棵树"与"硬件真正在用的树"不是同一张。用户缓冲校验
-# （user::validate_range）要的是后者。不取锁，与 effective_flags 同一纪律，可在 with_vmm_lock 内调用。
-U1 = 6
-# P1a/P1b/P1c（ADR-063）共 7 处 FrameInfo unsafe：引导写入（bootstrap_frame_info）、
-# 读 refcnt（fi_refcnt）、读 owner（fi_owner）、写 used（fi_set_used）、refcnt 加一（fi_inc_refcnt）、
-# refcnt 减一（fi_dec_refcnt）、最终归还毒化（fi_final_free）。指针来自 phys_alloc_locked 分出的
-# MOD_BOOT 帧 + HHDM，范围 [0, frame_info_frames)，AtomicU32 首字段 4 对齐，生命周期整个内核（永不归还），
-# 全部持 PMM 锁（引导期单核 IF=0）；frame_get 前置"调用方已持参考"保证不与归还竞争。
-# P2（ADR-064）+3：KBuf 清零（write_bytes）、as_slice（from_raw_parts）、as_mut_slice
-# （from_raw_parts_mut）。指针 = HHDM + phys_alloc 连续帧基址，范围 [0,len<=cap)，u8 任意对齐，
-# 生命周期绑 KBuf（OwnedFrames 字段，Drop 才归还），&self/&mut self 保证访问期不归还、无别名。
-# P4（ADR-066）+6：phys_of/leaf_value 只读遍历（前提同 is_mapped：写者全在 VMM 内）；
-# split_huge 走 PD 项、读旧大页项、填 512 叶子（PT 页来自 new_table_frame、尚未挂进 PD，
-# 无并发读者）、单次对齐写发布 PD 项。全部持 VMM(20)，指针经 HHDM 可达自建表。
-# P4a（ADR-074）+10：walk_leaf_in 的遍历（根表由调用方给，仍是自建表经 HHDM）、
-# set_leaf_in 读/写叶子、aspace_map 的冲突预查与回滚清叶子、AspaceMapping::drop 清叶子、
-# aspace_leaf 只读对照、new_table_frame_in 的清零。前提与既有 walk_leaf 逐字相同：
-# va 规范、根是有效 PML4、持 VMM(20)；新增的只是"根可以是别的 AS"与"表页记进那个 AS 的清单"。
-U2 = 53
-# P5（ADR-067）+2：LazyCell 的 Sync（互斥由 VMM 提供，载荷全 Copy）与 lazy_items 取表。
-# 白名单理由：表读写全部在 VMM(20) 内（demand_zero_try 的锁外窗口只碰 phys_alloc/map 自己
-# 的锁序），无跨锁别名逃逸。demand_zero_try 的分配即清零 write_bytes 记在上面的 U2（37→38）。
+# unsafe 登记表（手册 §1.3 的唯一来源）
+#
+# 规则：
+#   * 只有这里列出的 crate 可以含 unsafe；其余 crate 必须 #![forbid(unsafe_code)]
+#   * CI 双向对账：登记了但实际 unsafe 统计为 0 -> 报“白名单虚报”；
+#     实际有 unsafe 但未登记 -> 报“越权 unsafe”（§1.3 第 6 条）
+#   * 每条都要写 reason 与 expires；到期未处理就得改成正式条目或删除该 unsafe
+#
+# 检查脚本：python tools/aurora.py check
+
+[crate.aurora-kernel]
+reason = "垂直切片阶段整个内核就是一个二进制 crate，异常桩/描述符表/端口 I/O 都在里面"
+scope = "arch/x86_64/trap.rs(asm+描述符+CR2) · serial.rs(端口) · limine.rs(启动信息指针转引用) · arch/x86_64/cpuid.rs · main.rs(启动期 UnsafeCell)"
+# 2026-11-06 那一刀：`trap/apic/smp/cpu/cpuid` 已从 kernel/src/ 平铺移进 kernel/src/arch/x86_64/（BACKLOG 77）。
+# 下面两行里的裸名字（trap/cpu/apic/smp…）指的是**模块名**，不是文件路径；门禁按包计数，路径变化不影响它，但引用这些文件时请用新路径。
+# M4-2 之后这条 scope 已经**不再完整**（sched/sync/apic/mm/cpu/smp/user/tsc 也都有 unsafe），
+# 而门禁是按包计数的，所以这行写漏不会让检查失败——那正是它该被写全的理由。
+# 逐包拆分之前，先把"这个包里 unsafe 集中在哪几类"说明白，而不是留一份 M1 时代的清单。
+scope_actual = "asm 全局符号与异常桩(trap/sched/cpu) · 描述符表与 CR4/CR3(trap/cpu/mm) · 端口与 MMIO(serial/apic) · 页表遍历(mm) · per-CPU 静态区的裸指针读写(sched/sync/resource/smp/user/cpu) · 内联 asm 的取指/STAC-CLAC(user) · ktest 里的现场读回(main 与 ktests/*) · arch↔sched 回调表(hooks) · 句柄表里那一段连续物理内存的 volatile 字节/双字访问与 `UnsafeCell` 表(driver) · 驱动静态区取句柄(ahci，只剩 5 处，全部是拿句柄不是拿指针) · 崩溃现场的有界栈走(crash：两处 read_volatile，每处都先过「8 字节对齐 + 内核半区 + 已映射」三关，读回来的值只进记录、不解引用、不参与控制流)"
+expires = "M2：按 §2.5 拆出 aurora-arch / aurora-hw / aurora-mm-core 后，本条改为逐 crate 登记"
+
+# M4-2：第一个用户程序（测试夹具）。它的 unsafe 只有两类，都写在源码注释里。
+[crate.aurora-user-probe]
+reason = "第二个用户产物（W3 P5a）：unsafe 需求是 int 0x80 的四参入口、两处 RIP 相对 lea 取自己段的基址、两个自跳转，以及往自己 .slots 写结果与从 14 号返回的用户 VA 读回 8 字节；不碰任何内核对象"
+scope = "main.rs：sys4 的 int 0x80（rax/rdi/rsi/rdx/r10）· slots_base/src_addr 的 lea（镜像基址在 4 GiB 之上，addr_of! 会退化成 R_X86_64_32S）· put 的原子写（偏移 0..=48）· _start 的读回比对（只读、同页内、先判返回值非负）· panic 与收尾自跳转"
+expires = "P5c 之后若它开始打 11/15/16 或读 StartupInfo，unsafe 面会扩，那时回这条账重登记"
+
+[crate.aurora-user-shell]
+reason = "第三个用户产物（S5c→A2 接线后）：syscall 底座已迁 aurora-user-runtime，本包剩余 unsafe 需求只有 msgs_base 的 RIP 相对 lea 取基址、panic 自跳转、对自家静态 blob 的切片、以及对 rt::find_console（unsafe fn）的一次调用；不碰任何内核对象"
+scope = "main.rs：msgs_base 的 lea 块 · msg 的 from_raw_parts（MSGS blob 内、常量偏移有界）· panic 自跳转 · _start 对 rt::find_console 的一次调用"
+expires = "A2 接线后 unsafe 面已收窄到交互逻辑本身；若它重新长出 int 0x80 或读别的页，回这条账重登记"
+
+# FS-03 切片 D（ADR-108 决策 8）：第四个用户产物 = ring3 文件探针。
+[crate.aurora-user-fileprobe]
+reason = "FS-03 切片 D（ADR-108 决策 8）的 ring3 文件探针：unsafe 需求只有 int 0x80 的三参入口与它的 unsafe fn 声明、一处 RIP 相对 lea 取自己 .slots 的基址（镜像基址在 4 GiB 之上，addr_of! 会退化成 R_X86_64_32S）、panic 与收尾两处自跳转，以及按固定偏移表对自己那一页的 volatile 字节/双字读写；不碰任何内核对象"
+scope = "main.rs：sys3 的 int 0x80（rax/rdi/rsi/rdx）与其 unsafe fn 声明 · slots_base 的 lea · put/put_byte/get_byte/get_u32 四处 volatile 访问（偏移全在本页 0..1536，基址加常量偏移）· read_all/read_dir_all/_start 里把本页地址交给内核的三处调用 · panic 与 SYS_EXIT 后的自跳转"
+expires = "FS-03 之后若它开始打写路径（23 号）或读别的页，unsafe 面会扩，那时回这条账重登记"
+
+[crate.aurora-user-runtime]
+reason = "A2 用户态运行时库（总设计切片，2026-11-16）：unsafe 需求是 int 0x80 的四参入口（含 r10 第四参）、把调用方传入的缓冲/路径指针与长度交给内核（长度上限在 safe 层先拒）、读内核交进来的 StartupInfo 那一页（只读、页内、先核魔数与 nhandles 上限）、以及 exit 的失败兜底自旋；不碰任何内核对象，不新增调用号"
+scope = "src/lib.rs：syscall_abi 的 int 0x80（rax/rdi/rsi/rdx/r10）· 18 个封装函数各自的调用块 · find_console 的 read_unaligned（头 24 字节 + 最多 16 条描述，全在那一页内）"
+expires = "A2 接线片（shell 迁入 runtime）之后 unsafe 面若无变化则维持；若新增号或读新页，回这条账重登记"
+
+[crate.aurora-user-execprobe]
+reason = "A2 外部命令探针（ADR-130）：unsafe 需求是 msgs_base 的 RIP 相对 lea、panic 自跳转、对自家静态 blob 的切片、以及对 rt::handle_of_role / rt::args_at 两个 unsafe fn 的调用；不碰任何内核对象"
+scope = "src/main.rs：msgs_base 的 lea 块 · msg 的 from_raw_parts · panic 自跳转 · _start 的两处 runtime unsafe fn 调用"
+expires = "A2 收尾后若 unsafe 面扩大，回这条账重登记"
+
+[crate.aurora-user-hello]
+reason = "它是产物而不是库：唯一的 unsafe 需求是 `int 0x80` 与一个自跳转，没有任何指针算术、没有内存操作、不碰任何内核对象"
+scope = "main.rs：3 次 int 0x80（inlateout rax + in rdi/rsi）、panic 与收尾各一个 `jmp .` 自跳转"
+expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe；多了就得回这条账"
+
+# ---------------------------------------------------------------- P3 细分登记（模块 × 类别）
+#
+# 上面两条 [crate.*] 是**按包**的准入闸（哪个包允许含 unsafe），一字未动。
+# 下面这一段是**按现场**的普查快照：每个模块每类各多少处。类别 U1..U6 的含义：
+#   U1 架构入口与特殊寄存器
+#   U2 页表、物理内存与 MMIO
+#   U3 DMA 与设备共享内存
+#   U4 并发共享状态与 UnsafeCell
+#   U5 用户指针与地址空间访问
+#   U6 诊断路径的有限现场读取
+#
+# 这份数不是手写的，是 `tools/aurora.py` 的 `unsafe_sites()` 从源码逐处算出来的；
+# 门禁 `check-unsafe` 每次重算一遍再与本段逐格双向对账：源码有而这里没登记 ⇒ 红，
+# 这里登记了而源码算不出来 ⇒ 红。**类别判错了改分类规则，不改这里的数去凑。**
+# 逐处判定（含行号、所属函数、判定依据原文）见 docs/security/unsafe-census.md。
+#
+# 本轮普查：278 处 = U1 53 + U2 60 + U3 13 + U4 103 + U5 28 + U6 21
+# 2026-11-07 P7：hello 加了 syscall3（U1 两处）与 ring3 句柄读/close（U5 三处）。
+
+[unsafe-census]
+# 2026-11-16 A2/A3 切片：+user/runtime（U1 3 / U5 23）；
+# 2026-11-16 A2 接线：shell 的 syscall 底座迁入 runtime ⇒ user/shell 17→4（U1 7→2、U5 10→2）、
+# user/shell/registry 段删除（cmd_ping/abi 改走 safe API，0 处）。数目对账：
+# 453-15=438、82-5=77、77-10=67。类别规则未改。
+# 2026-11-17 A3 切片（ADR-131）：+user/execprobe（U1 2→3 = chunk_base 的 lea 取址；
+# U5 3→6 = 静态块缓冲的 from_raw_parts_mut + 段 VMO 填充/`.slots` 标志写入的切片）、
+# +user/runtime（U5 32→35 = 12/13/14 三个 VMO 封装的调用块）、
+# +filesystem/fs_open（U2 2 = 运行期挂根的单写者 volatile 读/写）。
+# 数目对账：454+9=463、81+1=82、114+2=116、79+6=85。
+# 2026-11-17 A3 收尾（shell `run` + runtime exec）：+user/runtime/exec（U1 1 = 静态读块的
+# RIP 相对 lea）、+user/shell/registry（U5 1 = 按角色取 Job 句柄的那次 handle_of_role）。
+# 数目对账：463+2=465、82+1=83、85+1=86。
+# 2026-11-17 A3 收尾（shell 的 argv 一次性命令）：user/shell U5 2→3（`rt::args_at` 那一次）。
+# 数目对账：465+1=466、86+1=87。
+total = 464
+U1 = 83
+U2 = 116
+U3 = 13
+U4 = 129
+U5 = 87
+U6 = 36
+
+[modules."acpi"]
+U2 = 1
+U4 = 6
+
+[modules."ahci"]
+U4 = 9
+
+[modules."arch/x86_64/apic"]
+U1 = 4
+U2 = 2
+U4 = 3
+
+[modules."arch/x86_64/cpu"]
+U1 = 5
+
+[modules."arch/x86_64/smp"]
+U1 = 5
+U4 = 12
+
+[modules."arch/x86_64/trap"]
+U1 = 13
+U4 = 9
+
+[modules."crash"]
+U6 = 2
+
+[modules."driver"]
+U3 = 9
+U4 = 9
+
+[modules."heap"]
+U2 = 7
+
+[modules."hooks"]
+U4 = 3
+
+[modules."hw"]
+U1 = 2
+# S9k（双缓冲）+1 U2：write_slice 把整行已打包像素 copy_nonoverlapping 进帧缓冲窗口，
+# present 一次上屏 height 次；check 保证 off+len*4<=len，源为内核私有 back buffer，不重叠。
+U2 = 7
+
+[modules."frame"]
+# S9k/S9o（双缓冲+行级脏标）5 处 U2：离屏 back buffer（static mut [u32;1280*800]，BSS 不进堆）的
+# put/put_raw/get/present 访问。单核 UI 串行绘制（park 主循环体，非 IRQ 上下文），
+# 同一时刻只有一个活终端开启 db；几何超容量自动退回直写。分类按操作实质归 U2。
+U2 = 5
+
+[modules."irq"]
+U4 = 9
+
+[modules."ktest"]
+U6 = 1
+
+[modules."ktests/acpi"]
+U6 = 1
+
+[modules."ktests/crash"]
+U6 = 1
+
+[modules."ktests/elf"]
+U4 = 2
+
+[modules."ktests/fs"]
+U4 = 1
+U6 = 3
+
+[modules."ktests/heap"]
+U6 = 6
+
+[modules."ktests/mm"]
+# P4（ADR-066）+4：t_split_huge 的金丝雀旧写/新读、OOM 格读回、跨别名双向，
+# 全部落在本用例 phys_alloc 独占的块或新帧上，页对齐、HHDM 覆盖。
+# P5（ADR-067）+1：t_demand_zero 把桩代码写进尚未启动任务的 code2 帧（HHDM 内核别名直写）。
+# P5b 收尾（ADR-075）+4：D9 那一段的 aspace_switch / aspace_switch_kernel 调用点
+# （切进 a2、切回内核、收场再确认一次）。都是"按已核对的根表换 CR3"，
+# 指针来源与范围由 mm 自己的 AS 表保证；分类沿用同族的既有口径。
+U6 = 18
+# P5（ADR-067）+1：dz_page 的桩内容 HHDM 直写（帧由本用例 phys_alloc 独占、尚未映射成
+# 用户页，ADR-026 配方）。分类按操作实质：物理内存直写不是诊断现场读，故 U2。
+# P5c-3（ADR-075）+1：读被停住线程的首帧第 10 格（rdi），证"16 号真的把 StartupInfo 的 VA 交给了它"。
+U2 = 3
+
+[modules."ktests/sched"]
+U1 = 3
+U6 = 3
+
+[modules."ktests/sign"]
+U4 = 2
+
+[modules."ktests/user"]
+U6 = 1
+
+# S6a（BACKLOG §240）+4 处 U2：Limine framebuffer 响应是"启动信息里的指针数组"，
+# 读它必须解引用 bootloader 写的裸指针（`*base`、`&*fb`、条目 `as_ref`、`memmap_slice`）。
+# 指针来源：bootloader 在移交控制权之前按协议写好；地址范围：内核 higher-half / HHDM 内；
+# 对齐：协议规定的 repr(C) 结构；生命周期：响应一经提供在内核运行期内稳定（协议未规定失效）；
+# 并发：只在 BSP 启动阶段单线程读一次，之后只读数值副本（FbInfo 不带指针）；
+# 上下文：BOOT/KERNEL，不在 ISR、不持锁；不变量由"先判非空 + 条目数上界 64/4096"保证。
+[modules."limine"]
+U2 = 14
+U3 = 4
+
+# T0.1（2026-11-07）：用例搬进 kernel/src/ktests/*.rs，main 只剩启动路径的 3 处 U4；
+# 原 U1 3 / U6 18 按实际落点拆到 ktests/sched 与各用例模块。总数与类别合计不变。
+# W4 S3（2026-11-11，ADR-080）+2：产品路径自己那份签名包缓冲 BootPkgCell
+# （`unsafe impl Sync` + 一次 `&mut *…get()`）。57,856 字节比堆上限 2048 大两个数量级，
+# 按外部输入大小分配第一次就走 handle_alloc_error ⇒ 整机 39（ADR-018/026），所以只能静态。
+# 不复用 ktests/sign.rs 那份：它是 sig-check 门控的，正常构建里不存在。
+# 七项论证写在 main.rs 的 SAFETY 注释里（单一访问者、启动编排只调一次、调用点在 AP 释放之前）。
+[modules."main"]
+U4 = 5
+
+[modules."mm"]
+# S5c-2 +1：current_effective_flags 读 CR3（aspace_cr3_read 原语，只动 rax）。
+# 为什么必须读 CR3 而不是用 pml4_phys：后者只在 take_over 写一次，aspace_switch 只动 CR3，
+# 所以子进程跑起来之后"启动那棵树"与"硬件真正在用的树"不是同一张。用户缓冲校验
+# （user::validate_range）要的是后者。不取锁，与 effective_flags 同一纪律，可在 with_vmm_lock 内调用。
+U1 = 6
+# P1a/P1b/P1c（ADR-063）共 7 处 FrameInfo unsafe：引导写入（bootstrap_frame_info）、
+# 读 refcnt（fi_refcnt）、读 owner（fi_owner）、写 used（fi_set_used）、refcnt 加一（fi_inc_refcnt）、
+# refcnt 减一（fi_dec_refcnt）、最终归还毒化（fi_final_free）。指针来自 phys_alloc_locked 分出的
+# MOD_BOOT 帧 + HHDM，范围 [0, frame_info_frames)，AtomicU32 首字段 4 对齐，生命周期整个内核（永不归还），
+# 全部持 PMM 锁（引导期单核 IF=0）；frame_get 前置"调用方已持参考"保证不与归还竞争。
+# P2（ADR-064）+3：KBuf 清零（write_bytes）、as_slice（from_raw_parts）、as_mut_slice
+# （from_raw_parts_mut）。指针 = HHDM + phys_alloc 连续帧基址，范围 [0,len<=cap)，u8 任意对齐，
+# 生命周期绑 KBuf（OwnedFrames 字段，Drop 才归还），&self/&mut self 保证访问期不归还、无别名。
+# P4（ADR-066）+6：phys_of/leaf_value 只读遍历（前提同 is_mapped：写者全在 VMM 内）；
+# split_huge 走 PD 项、读旧大页项、填 512 叶子（PT 页来自 new_table_frame、尚未挂进 PD，
+# 无并发读者）、单次对齐写发布 PD 项。全部持 VMM(20)，指针经 HHDM 可达自建表。
+# P4a（ADR-074）+10：walk_leaf_in 的遍历（根表由调用方给，仍是自建表经 HHDM）、
+# set_leaf_in 读/写叶子、aspace_map 的冲突预查与回滚清叶子、AspaceMapping::drop 清叶子、
+# aspace_leaf 只读对照、new_table_frame_in 的清零。前提与既有 walk_leaf 逐字相同：
+# va 规范、根是有效 PML4、持 VMM(20)；新增的只是"根可以是别的 AS"与"表页记进那个 AS 的清单"。
+U2 = 53
+# P5（ADR-067）+2：LazyCell 的 Sync（互斥由 VMM 提供，载荷全 Copy）与 lazy_items 取表。
+# 白名单理由：表读写全部在 VMM(20) 内（demand_zero_try 的锁外窗口只碰 phys_alloc/map 自己
+# 的锁序），无跨锁别名逃逸。demand_zero_try 的分配即清零 write_bytes 记在上面的 U2（37→38）。
+U4 = 8
+
+[modules."pci"]
+U2 = 3
+U4 = 7
+
+[modules."proc"]
+# W3 P3（ADR-073）：进程/Job 定长表。三处都是同一形状——
+# 指针来源是本模块静态 `StateCell(UnsafeCell<ProcState>)` 的 `get()`，地址范围固定在
+# `S` 这一个静态对象内，对齐由编译器保证，生命周期是 'static，
+# 并发规则：非原子字段只在 VMM(20) 内读写，used/threads/signal 是原子量、锁外也可碰；
+# 上下文约束：收工出口（proc_thread_exited）可能在故障路径上被调，所以那条路径一个锁都不取；
+# 不变量由 `unsafe impl Sync for StateCell` 上面那段论证保证。
+U4 = 3
+
+[modules."sched"]
+U1 = 4
+# P5c-3（ADR-075）+1：set_thread_arg 写已停住线程的首帧 rdi（持 RUNQ、任务是 Blocked ⇒ 无人同时读它）。
+U2 = 8
+# P5c-1（ADR-075）+1：`id_of` 的每 CPU 任务表快照读（与 `state_of` 同一条 SAFETY 论证）。
+U4 = 17
+
+[modules."serial"]
+U1 = 2
+
+[modules."sync"]
+U1 = 4
+U4 = 6
+
+[modules."tsc"]
+U1 = 1
+
+[modules."user"]
+U1 = 1
+U2 = 8
+U4 = 8
+U5 = 6
+
+[modules."user/hello"]
+U1 = 12
+U5 = 22
+
+[modules."user/probe"]
+# W3 P5a（ADR-075）：第二个用户产物，真在 ring3 打 12/13/14。
+# U1 六处 = 五个 asm 现场（int 0x80 的四参入口、两处 RIP 相对 lea 取 .slots/.rodata 基址、
+# panic 与收尾的自跳转）加 `unsafe fn sys4` 的入口声明本身。指针来源：无（只动寄存器与号），
+# 上下文 USER_ENTRY，不变量由 ABI 约定（号 rax、参数 rdi/rsi/rdx/r10、返回 rax）保证。
+# **为什么用 lea 而不是 addr_of!**：镜像基址在 4 GiB 之上，relocation-model=static 下
+# 取静态量地址会退化成 R_X86_64_32S，链接期就 out of range（本轮实测撞到）。
+# U5 四处 = 往自己 .slots 的原子写（偏移 0..=88，结构 104 字节）、_start 的调用序列块、
+# 从 14 号返回的用户 VA 读回 8 字节、以及 P5c-2 新增的"从**请求的** VA 读回 8 字节"
+# （同一判据：先要求返回逐字等于请求值才解引用，只读、8 字节落在同一页内）。
+# 生命周期 = 本进程；单任务访问无并发；分类规则本轮从写死 user/hello 改成认 user/ 前缀。
+U1 = 6
+# P5c-3b（ADR-075）+2：轮询内核交进来的邮箱页（只读一个 u64、上限硬）、
+# 以及装载器序列那个调用块（11/12/13/14/15/16 全是本程序自己的号，参数照 §4.4c）。
+U5 = 6
+
+[modules."user/fileprobe"]
+# FS-03 切片 D：ring3 文件探针。U1 四处 = panic 自跳转、slots_base 的 lea 块、
+# sys3 的 unsafe fn 声明与其 int 0x80。U5 八处 = 对自己那一页的四处 volatile 读写、
+# 三处把本页地址交给内核（读/目录读/退出）与 _start 的那个 unsafe 块。
+# 指针来源：唯一的基址是 `lea [rip + SLOTS]` 得到的本程序 .slots 页，偏移全是模块里那两张
+# 常量表；内核写回来的字节由内核自己的 copy_to_user 校验（USER 页、可写）。
+# 上下文 USER_ENTRY；不变量由 ABI 约定（号 rax、参数 rdi/rsi/rdx、返回 rax）与
+# "偏移表两侧各写一遍、由读回的数对账"保证。生命周期 = 本任务；单任务访问无并发。
+U1 = 4
+U5 = 8
+
+[modules."user/shell"]
+# S5c→A2 接线后（2026-11-16）：syscall 底座（int 0x80 入口、find_console、con 读写）整体迁入
+# aurora-user-runtime，本模块只剩交互逻辑。U1 两处 = msgs_base 的 RIP 相对 lea 取基址块、
+# panic 自跳转。U5 三处 = msg 的 from_raw_parts（对自家静态 MSGS blob 的切片，常量偏移有界）、
+# _start 对 rt::find_console（unsafe fn）的那一次调用、_start 对 rt::args_at（unsafe fn）的
+# 那一次调用（A3：argv 一次性命令）——两个 si_va 同一份契约：内核 process_start 校验并映射、
+# user+只读。上下文 USER_ENTRY；生命周期 = 本进程；无并发。
+U1 = 2
+U5 = 3
+
+[modules."virtio"]
 U4 = 8
-
-[modules."pci"]
-U2 = 3
-U4 = 7
-
-[modules."proc"]
-# W3 P3（ADR-073）：进程/Job 定长表。三处都是同一形状——
-# 指针来源是本模块静态 `StateCell(UnsafeCell<ProcState>)` 的 `get()`，地址范围固定在
-# `S` 这一个静态对象内，对齐由编译器保证，生命周期是 'static，
-# 并发规则：非原子字段只在 VMM(20) 内读写，used/threads/signal 是原子量、锁外也可碰；
-# 上下文约束：收工出口（proc_thread_exited）可能在故障路径上被调，所以那条路径一个锁都不取；
-# 不变量由 `unsafe impl Sync for StateCell` 上面那段论证保证。
-U4 = 3
-
-[modules."sched"]
-U1 = 4
-# P5c-3（ADR-075）+1：set_thread_arg 写已停住线程的首帧 rdi（持 RUNQ、任务是 Blocked ⇒ 无人同时读它）。
-U2 = 8
-# P5c-1（ADR-075）+1：`id_of` 的每 CPU 任务表快照读（与 `state_of` 同一条 SAFETY 论证）。
-U4 = 17
-
-[modules."serial"]
-U1 = 2
-
-[modules."sync"]
-U1 = 4
-U4 = 6
-
-[modules."tsc"]
-U1 = 1
-
-[modules."user"]
-U1 = 1
-U2 = 8
-U4 = 8
-U5 = 6
-
-[modules."user/hello"]
-U1 = 12
-U5 = 22
-
-[modules."user/probe"]
-# W3 P5a（ADR-075）：第二个用户产物，真在 ring3 打 12/13/14。
-# U1 六处 = 五个 asm 现场（int 0x80 的四参入口、两处 RIP 相对 lea 取 .slots/.rodata 基址、
-# panic 与收尾的自跳转）加 `unsafe fn sys4` 的入口声明本身。指针来源：无（只动寄存器与号），
-# 上下文 USER_ENTRY，不变量由 ABI 约定（号 rax、参数 rdi/rsi/rdx/r10、返回 rax）保证。
-# **为什么用 lea 而不是 addr_of!**：镜像基址在 4 GiB 之上，relocation-model=static 下
-# 取静态量地址会退化成 R_X86_64_32S，链接期就 out of range（本轮实测撞到）。
-# U5 四处 = 往自己 .slots 的原子写（偏移 0..=88，结构 104 字节）、_start 的调用序列块、
-# 从 14 号返回的用户 VA 读回 8 字节、以及 P5c-2 新增的"从**请求的** VA 读回 8 字节"
-# （同一判据：先要求返回逐字等于请求值才解引用，只读、8 字节落在同一页内）。
-# 生命周期 = 本进程；单任务访问无并发；分类规则本轮从写死 user/hello 改成认 user/ 前缀。
-U1 = 6
-# P5c-3b（ADR-075）+2：轮询内核交进来的邮箱页（只读一个 u64、上限硬）、
-# 以及装载器序列那个调用块（11/12/13/14/15/16 全是本程序自己的号，参数照 §4.4c）。
-U5 = 6
-
-[modules."user/fileprobe"]
-# FS-03 切片 D：ring3 文件探针。U1 四处 = panic 自跳转、slots_base 的 lea 块、
-# sys3 的 unsafe fn 声明与其 int 0x80。U5 八处 = 对自己那一页的四处 volatile 读写、
-# 三处把本页地址交给内核（读/目录读/退出）与 _start 的那个 unsafe 块。
-# 指针来源：唯一的基址是 `lea [rip + SLOTS]` 得到的本程序 .slots 页，偏移全是模块里那两张
-# 常量表；内核写回来的字节由内核自己的 copy_to_user 校验（USER 页、可写）。
-# 上下文 USER_ENTRY；不变量由 ABI 约定（号 rax、参数 rdi/rsi/rdx、返回 rax）与
-# "偏移表两侧各写一遍、由读回的数对账"保证。生命周期 = 本任务；单任务访问无并发。
-U1 = 4
-U5 = 8
-
-[modules."user/shell"]
-# S5c：第一个交互式用户产物。U1 六处 = syscall3 的 int 0x80 入口与其 unsafe fn 声明、
-# panic 自跳转、_start 里两处收尾自跳转、以及 find_console 的 unsafe fn 声明。
-# 指针来源：StartupInfo 那一页由内核 process_start 校验并映射（user+只读），
-# 首参 si_va 由 set_thread_arg 交进来；行缓冲是本函数栈上的 [u8;128]。
-# 上下文 USER_ENTRY；不变量由 ABI 约定（号 rax、参数 rdi/rsi/rdx、返回 rax）与
-# "先核魔数与条数上限再解引用"保证。生命周期 = 本进程；单任务访问无并发。
-U1 = 7
-# S5c-2 重算：U5 由 13 降到 12。逐处行已按当前源码重列（见 unsafe-census.md 的 user/shell 节）。
-# 差额落在 dispatch/_start 那一带：登记快照早于"忙等 idle 与回显"那一轮改动，
-# 具体是哪一处合并掉的**未归因**——这里只按重算结果登记，不编一个解释。
-U5 = 12
-
-[modules."virtio"]
-U4 = 8
-
-[modules."vmo"]
-# W3 P4（ADR-074）：VMO 对象表。指针来源有两类——
-# ①本模块静态 `VmoCell(UnsafeCell<VmoTable>)` 的 `get()`（U4 两处：Sync 论证 + tbl()），
-#   地址范围固定在这一个静态对象内，对齐由编译器保证，生命周期 'static，
-#   并发规则：表结构与三本计数全在 VMM(20) 内读写，锁外不碰；
-# ②帧的 HHDM 别名（U2 三处：create 清零、write、read），物理地址来自表里登记的帧号，
-#   那些帧在 refs>0 期间不会被归还（归还只在 unref 到 0 时发生，且先在锁内清表项），
-#   范围逐次不超过一页（k <= PAGE - po），对齐按字节，上下文 KERNEL 且持 VMM，
-#   重叠拷贝用 memmove 语义（调用方的缓冲可能就映射在这个对象里）。
-#   不变量由 `unsafe impl Sync for VmoCell` 上面那段论证与 vmo_write/vmo_read 的长度检查保证。
-U2 = 3
-U4 = 2
+
+[modules."vmo"]
+# W3 P4（ADR-074）：VMO 对象表。指针来源有两类——
+# ①本模块静态 `VmoCell(UnsafeCell<VmoTable>)` 的 `get()`（U4 两处：Sync 论证 + tbl()），
+#   地址范围固定在这一个静态对象内，对齐由编译器保证，生命周期 'static，
+#   并发规则：表结构与三本计数全在 VMM(20) 内读写，锁外不碰；
+# ②帧的 HHDM 别名（U2 三处：create 清零、write、read），物理地址来自表里登记的帧号，
+#   那些帧在 refs>0 期间不会被归还（归还只在 unref 到 0 时发生，且先在锁内清表项），
+#   范围逐次不超过一页（k <= PAGE - po），对齐按字节，上下文 KERNEL 且持 VMM，
+#   重叠拷贝用 memmove 语义（调用方的缓冲可能就映射在这个对象里）。
+#   不变量由 `unsafe impl Sync for VmoCell` 上面那段论证与 vmo_write/vmo_read 的长度检查保证。
+U2 = 3
+U4 = 2
+
+[modules."user/runtime"]
+# A2（总设计切片，2026-11-16）：用户态运行时库。U1 三处 = syscall_abi 的 unsafe fn 声明
+# 与其 int 0x80 块（照抄 shell 的 syscall3 模式加 r10 位）、find_console 的 unsafe fn 声明。
+# U5 二十三处 = 18 个封装函数各自的 syscall_abi 调用块（把调用方传入的缓冲/路径指针与
+# 长度交给内核）+ find_console 对 StartupInfo 页的 5 处 read_unaligned。
+# 指针来源：①调用方栈缓冲（as_ptr/as_mut_ptr + len，长度上限在 safe 层先拒，
+# 不给内核传未校验长度）；②SI 页（内核 process_start 校验并映射，user+只读，
+# 首参 si_va 由 set_thread_arg 交进来）。地址范围 = 缓冲自身与 SI 一页内；
+# 对齐 = read_unaligned 显式不假设对齐；上下文 USER_ENTRY；
+# 不变量 = ABI 约定（号 rax、参数 rdi/rsi/rdx/r10、返回 rax 负值错误码）与 safe 层
+# 长度/枚举编码检查；生命周期 = 调用栈内；并发 = 无共享可变状态（库无全局）。
+U1 = 5
+U5 = 35
+
+
+[modules."user/execprobe"]
+# A2（ADR-130，2026-11-16）：外部命令探针。U1 两处 = msgs_base 的 RIP 相对 lea 取基址、
+# panic 自跳转。U5 三处 = msg 的 from_raw_parts（自家 MSGS blob、常量偏移有界）、
+# _start 对 rt::handle_of_role / rt::args_at（两个 unsafe fn）的调用——si_va 由内核
+# process_start 校验并映射（user+只读），argv 区界内性由 ADR-130 决策 2 的校验背书。
+# 上下文 USER_ENTRY；生命周期 = 本进程；单任务访问无并发。
+U1 = 3
+U5 = 6
+
+[modules."filesystem/fs_open"]
+# A3（ADR-131，2026-11-17）：FAT32 单根挂载层的**运行期挂根**。U2 两处 = `port()` 的
+# volatile 读与 `set_port()` 的 volatile 写（`core::ptr::addr_of!`/`addr_of_mut!`）。
+# 为什么不是 `AtomicU8`：本模块属 storage 组，ADR-044 的棘轮规定"环内引用只许减不许增"，
+# 引入 `core::sync::atomic` 会新增 storage→sync 的 3 个引用站点（实测）。
+# 单写者：a3-exec 的编排在任何用户任务起来之前调一次 `set_port(3)`，此后整机只读；
+# 单字节、无对齐问题；`addr_of!` 不创造引用（`static_mut_refs` 的正当写法）。
+U2 = 2
+
+[modules."user/runtime/exec"]
+# A3 收尾（ADR-131）：装载与启动的编排层。U1 一处 = 静态 4 KiB 读块的 RIP 相对 lea
+# （`.bss` 在 4 GiB 之上，`addr_of_mut!` 会退化成 R_X86_64_32S；实测 shell 链接时三处
+# 引用该 section 越界）。切片本身由本模块独占（单线程用户程序，无并发窗口）。
+U1 = 1
+
+[modules."user/shell/registry"]
+# A3 收尾：`run` 命令。U5 一处 = `rt::handle_of_role(si_va, ROLE_JOB)` 那一次调用——
+# si_va 由内核 `process_start` 校验并映射（user+只读），契约原文在 runtime 侧。
+U5 = 1

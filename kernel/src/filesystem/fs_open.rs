@@ -13,6 +13,28 @@ use crate::filesystem::vfs_ro::{self, DirState, Entry, ReadOnlyFs, VfsError};
 
 /// 挂载口。口号与 `tools/aurora.py` 的 `FS_OPEN_PORTS` 各写一份，由 `check-fat32-ports` 对账。
 pub const PORT: u8 = 5;
+
+/// `/` 这一项的**运行期根**（0 = 用 [`PORT`] 的默认值 5）。A3（ADR-131）在起命令解释器
+/// 之前 `set_port(3)` 把 `/` 换到卷A（根目录有 HELLO.ELF）。与 `/w` 无关：可写挂载的表项
+/// 自带口号，不受它影响。
+///
+/// **单写者**（boot 期编排一次，此后只读）、单字节、无并发窗口；约定"只允许在任何 VFS
+/// 句柄创建之前调用"（句柄里存的是解析后的口号）。用 volatile 把这件事写清楚，不引原子。
+static mut ROOT_PORT: u8 = 0;
+
+/// 当前 `/` 的根口号。
+#[must_use]
+pub fn port() -> u8 {
+    // SAFETY: 单字节；唯一写者 `set_port` 在任何用户任务之前跑完，之后整机只读。
+    let p = unsafe { core::ptr::addr_of!(ROOT_PORT).read_volatile() };
+    if p == 0 { PORT } else { p }
+}
+
+/// 切 `/` 的根（见 [`port`] 的约定）。
+pub fn set_port(p: u8) {
+    // SAFETY: 同上——唯一写者、单字节、跑在任何用户任务之前。
+    unsafe { core::ptr::addr_of_mut!(ROOT_PORT).write_volatile(p) }
+}
 pub const OPEN_READ_ONLY: u64 = 0;
 /// ADR-111 决策 1（2026-11-17 裁决）：写意图。**只在 `fs-rw` 档有意义**——调用方把这类 open
 /// 路由到可写卷；本模块的 `open()`（只读根）拿到它当场拒。
@@ -84,8 +106,16 @@ fn resolve(path: &str) -> Result<(&'static MountEntry, &str), VfsError> {
     best.ok_or(VfsError::BadPath)
 }
 
+// 每口一份 `'static` 盘描述：`mount()` 的返回把盘借进去，不能按口号临时构造。
+static DISK_DEEP: AhciDisk = AhciDisk { port: PORT };
+static DISK_SMALL: AhciDisk = AhciDisk { port: 3 };
+
+fn disk() -> &'static AhciDisk {
+    if port() == 3 { &DISK_SMALL } else { &DISK_DEEP }
+}
+
 pub fn mount() -> Result<ReadOnlyFs<'static>, VfsError> {
-    ReadOnlyFs::mount(&DISK)
+    ReadOnlyFs::mount(disk())
 }
 
 fn open_on(port: u8, path: &str, flags: u64) -> Result<Opened, VfsError> {
@@ -115,7 +145,9 @@ pub fn open(path: &str, flags: u64) -> Result<Opened, VfsError> {
     if flags == OPEN_WRITE && !m.writable {
         return Err(VfsError::BadFlags);
     }
-    open_on(m.port, sub, flags)
+    // `/` 是运行期根（`set_port` 换的就是它）；其余表项用自己登记的口号。
+    let port = if m.prefix == "/" { self::port() } else { m.port };
+    open_on(port, sub, flags)
 }
 
 pub fn stat_record(e: &Entry) -> [u8; 48] {

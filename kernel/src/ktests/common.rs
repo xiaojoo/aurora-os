@@ -25,6 +25,10 @@ pub(crate) static SHELL_ELF: &[u8] = include_bytes!("../../fixtures/shell.elf");
 #[cfg(feature = "fs-open")]
 pub(crate) static FILEPROBE_ELF: &[u8] = include_bytes!("../../fixtures/fileprobe.elf");
 
+/// A2 切片（ADR-130）：外部命令探针。只在 `a2-exec` 构建里被 include（init 编排的
+/// `cfg` 门），构建入口 `tools/aurora.py` 的 `do_build_execprobe`。
+pub(crate) static EXECPROBE_ELF: &[u8] = include_bytes!("../../fixtures/execprobe.elf");
+
 /// M4-2 第二段：把**真 ELF** 装进用户窗口并跑起来。
 ///
 /// 与 `t_user_roundtrip` 的分工是刻意的：那条继续用内核自己编的 66 字节镜像，

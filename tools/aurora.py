@@ -167,6 +167,10 @@ FILEPROBE_PKG = "aurora-user-fileprobe"
 FILEPROBE_ELF = ROOT / "target" / TARGET / "debug" / "fileprobe"
 FILEPROBE_FIXTURE = ROOT / "kernel" / "fixtures" / "fileprobe.elf"
 FILEPROBE_RUSTFLAGS = "-C link-arg=-Tuser/fileprobe/link.ld -C relocation-model=static -C panic=abort -C opt-level=1 -C debuginfo=0"
+EXECPROBE_PKG = "aurora-user-execprobe"
+EXECPROBE_ELF = ROOT / "target" / TARGET / "debug" / "execprobe"
+EXECPROBE_FIXTURE = ROOT / "kernel" / "fixtures" / "execprobe.elf"
+EXECPROBE_RUSTFLAGS = "-C link-arg=-Tuser/execprobe/link.ld -C relocation-model=static -C panic=abort -C opt-level=1 -C debuginfo=0"
 
 
 def do_build_fileprobe() -> Path:
@@ -187,6 +191,26 @@ def do_build_fileprobe() -> Path:
     print(f"文件探针: {FILEPROBE_FIXTURE.relative_to(ROOT)}  {len(data)} 字节  "
           f"sha256={hashlib.sha256(data).hexdigest()[:12]} {'（夹具已更新）' if changed else '（与夹具一致）'}")
     return FILEPROBE_FIXTURE
+
+
+def do_build_execprobe() -> Path:
+    """A2（ADR-130）：构建外部命令探针并落成夹具。与 do_build_fileprobe 逐条同形。"""
+    r = subprocess.run(
+        [str(CARGO), "build", "--target", TARGET, "-p", EXECPROBE_PKG],
+        capture_output=True, text=True, cwd=str(ROOT),
+        env={**env(), "RUSTFLAGS": EXECPROBE_RUSTFLAGS},
+    )
+    if r.returncode != 0:
+        sys.exit("execprobe 构建失败：" + (r.stdout + r.stderr)[-3000:])
+    data = EXECPROBE_ELF.read_bytes()
+    EXECPROBE_FIXTURE.parent.mkdir(exist_ok=True)
+    changed = not EXECPROBE_FIXTURE.exists() or EXECPROBE_FIXTURE.read_bytes() != data
+    if changed:
+        EXECPROBE_FIXTURE.write_bytes(data)
+    import hashlib
+    print(f"外部命令探针: {EXECPROBE_FIXTURE.relative_to(ROOT)}  {len(data)} 字节  "
+          f"sha256={hashlib.sha256(data).hexdigest()[:12]} {'（夹具已更新）' if changed else '（与夹具一致）'}")
+    return EXECPROBE_FIXTURE
 
 
 def do_build_shell() -> Path:
@@ -235,6 +259,7 @@ def do_build(features: list[str]) -> Path:
     do_build_probe()
     do_build_shell()
     do_build_fileprobe()
+    do_build_execprobe()
     elf = kernel_binary(features)
     print(f"内核: {elf}  ({elf.stat().st_size} 字节)")
     return elf
@@ -427,6 +452,9 @@ FAT_PORTS = {3: "fat32-small", 4: "fat32-wide"}
 # 在卷A 上根本没有对应结构，挂在口 3 上等于"用例里有三级路径、盘上没有"。口号同时让开 3/4，
 # 是为了 `fs-open` 与 FAT 探针同跑时两块卷能并存（此前靠 QEMU 参数顺序，那是不可歧义的接线反面）。
 FS_OPEN_FEATURES = {"fs-open"}
+# A3 切片：execprobe 的 22 号 open 打的是 fs_open::PORT=5 的 deep 卷（fs_open 自 mount 固定卷）。
+# 所以这一档的镜像也要装配 deep 卷——与 fs-open 同一份夹具、同一条指纹闸。
+A3_EXEC_FEATURES = {"a3-exec", "a3-shell"}
 FS_OPEN_PORTS = {5: "fat32-deep"}
 # ADR-111：写方向单独一档，挂在**可写**卷上（口 4）。它与 `FS_OPEN_PORTS` 一样要与内核的
 # `filesystem/fs_rw.rs` 的 `PORT` 对账（`check-fat32-ports` 里那一格扩成两张表）。
@@ -3677,8 +3705,10 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
         bad = ensure_fat_deep() + ensure_fat_rw()
         if bad:
             sys.exit("FS 可写卷夹具不成立：" + " / ".join(bad))
-    if FS_OPEN_FEATURES & set(features):
-        # ADR-109：`fs-open` 的挂载根换成了多级真卷（口 5）。它由脚本现算，不再从 `.zz` 解压；
+    if (FS_OPEN_FEATURES | A3_EXEC_FEATURES) & set(features):
+        # ADR-109：`fs-open` 的挂载根换成了多级真卷（口 5）。A3 的两档（a3-exec/a3-shell）
+        # 都依赖 fs-open（22 号的模块门），所以它们的卷也必须每跑重算——否则会拿到上一次
+        # 注入/改动留下的盘，ring3 探针读到的就不是用例期望的那份内容。
         # 卷A 上根本没有多级路径、跨簇目录与子目录 LFN，挂在那里等于"用例写着三级路径、盘上没有"。
         bad = ensure_fat_deep()
         if bad:
@@ -3737,9 +3767,10 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
         # 证人换成两头的对账：`check-fat32-ports` 比口号，`check_fat32` 比内容（两块卷簇数
         # 不同，接反了内容对账当场红）。
         wanted_volumes.update(FAT_PORTS)
-    if FS_OPEN_FEATURES & set(features):
-        # FS-03 只要卷A。若同一跑同时带 `fs-open` 与 FAT 探针，两个集合必须指向同一份夹具，
-        # 绝不允许同一口号挂两块盘后只由 QEMU 参数顺序决定谁赢。
+    if (FS_OPEN_FEATURES | A3_EXEC_FEATURES) & set(features):
+        # FS-03 的 deep 卷。`a3-exec` 也要它：a3-exec 依赖 fs-open（22 号的模块门），
+        # 同一份构建里 fs-open 的用例也在跑，它们的挂根是口 5（见 fs_open::PORT 的注释）。
+        # A3 自己的目标卷是卷A（口 3），由 `fat32-probe` 装配，两口互不冲突。
         for port, name in FS_OPEN_PORTS.items():
             old = wanted_volumes.get(port)
             if old is not None and old != name:
@@ -3803,7 +3834,7 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
     print("   + QEMU 接线:", " ".join(x for x in cmd if x.startswith("-drive") or "qcow2" in x or x == "-M" or "q35" in x))
     rx_bad: list[str] = []
     if serial_rx:
-        r, rx_bad = run_serial_rx(cmd, timeout)
+        r, rx_bad = run_serial_rx(cmd, timeout, rx_probe=False, console_probe=False)
         rc = r.returncode
     elif qmp_port:
         with subprocess.Popen(cmd, cwd=str(ROOT), stdout=subprocess.PIPE,
@@ -8355,6 +8386,70 @@ def do_test(timeout: int) -> int:
     b_verdict = bv if bv != "PASS" else ("PASS" if not b_bad else "CONTENT-MISMATCH")
     for x in b_bad:
         print("    对账:", x)
+    # =====================================================================
+    # A2 切片（ADR-130）：**第一个经 A2 语义启动的外部 ELF**。
+    # 正向：a2-exec 档——init 编排构造带 argv 区（280 起 "execprobe\0"）与
+    # std 三口（ROLE_STDIN/STDOUT/STDERR，三份独立 console 句柄）的 SI 页，
+    # 16 号启动 execprobe；判据三格：串口出现 execprobe 自己打的 argv 行
+    # （证明 argv 读到 + stdout 来自继承句柄）+ 收工行退出码 Some(7)（证明
+    # 3 号 rdi → 退出码寄存器 → 收尸 → 17 号形状的链路）。
+    # 负样本：a2-exec-bad——args_len 覆盖句柄表 ⇒ 16 号校验必须拒 E_INVALID，
+    # 且不得放行（execprobe 不许跑起来）。
+    print("=== A2 argv/std：外部 ELF 经 A2 语义启动（--features a2-exec）===")
+    IMAGE.unlink(missing_ok=True)
+    axv, axrc, axlog = do_run(["a2-exec"], timeout)
+    ax_ok = axv == "PASS" and "execprobe: argv[0]=execprobe" in axlog and "退出码=Some(7)" in axlog
+    ax_verdict = "CONTENT-MISMATCH" if (axv == "PASS" and not ax_ok) else axv
+    IMAGE.unlink(missing_ok=True)
+    print("=== A2 越界 argv 被校验拒（--features a2-exec-bad，负样本）===")
+    IMAGE.unlink(missing_ok=True)
+    abv, abrc, ablog = do_run(["a2-exec-bad"], timeout)
+    # 负样本判据：校验拒点名 E_INVALID，且**没有** execprobe 的输出（不许放行）。
+    ab_ok = abv == "PASS" and "argv 校验拒 ret=0xffffffffffffffff" in ablog and "execprobe: argv[0]=" not in ablog
+    ab_verdict = "CONTENT-MISMATCH" if (abv == "PASS" and not ab_ok) else abv
+
+    # =====================================================================
+    # A3 切片（ADR-131 草案）：**用户态装载器**。execprobe 经 A2 语义被启动后，
+    # 自己 open 卷上 HELLO.ELF（22 号）→ 顺序读块按段过滤写 VMO（无 seek）→
+    # 14 号映射 → 建栈页 → 构造 SI（ROLE_LOG + console dup）→ 11/15/16/17。
+    # 四格判据：open 成功（hex 非空）、read=0x4388（17288 字节）、
+    # entry=0x100000000（段表解析对）、spawn=0x0（16 号放行）、wait=timeout
+    # （hello 写完数据段自旋不 exit，超时是它的已知行为）。
+    print("=== A3 用户态装载器：execprobe 执行卷上 HELLO.ELF（--features a3-exec）===")
+    IMAGE.unlink(missing_ok=True)
+    # 带 fat32-probe：它把卷A（fat32-small）装配到口 3——A3 的挂根就是这块卷
+    # （编排里 `fs_open::set_port(3)`，见 fs_open::PORT 的运行期切换说明）。
+    # 同时装配口 5 的 deep 卷：a3-exec 依赖 fs-open，同一份构建里那批用例还在跑。
+    r3v, r3rc, r3log = do_run(["a3-exec", "fat32-probe"], timeout)  # a3-exec→fs-open→22 号门
+    # 四格判据（逐条独立，任缺一格就 CONTENT-MISMATCH）。
+    # 第四格是**真实退出码**而不是超时：execprobe 往目标数据段首（hello 的 `.slots`）
+    # 写 FLAG_EXIT，hello 自检完自己打 3 号退出 ⇒ 17 号拿到 exit:0x0。
+    # 弱观测（timeout）分不清"跑起来了没退"与"根本没跑"，这一格把它分开。
+    r3_ok = r3v == "PASS" and all((
+        "run:HELLO.ELF open=0x" in r3log,
+        "read=0x4388" in r3log,
+        "entry=0x100000000" in r3log,
+        "spawn=0x0" in r3log,
+        "wait=exit:0x0" in r3log,
+    ))
+    r3_verdict = "CONTENT-MISMATCH" if (r3v == "PASS" and not r3_ok) else r3v
+    IMAGE.unlink(missing_ok=True)
+
+    # =====================================================================
+    # A3 验收（ADR-131）：**shell 自己跑外部命令**——init 会话的 SI 页带一条 argv
+    # （`run /HELLO.ELF`，`sh -c` 语义），shell 起手执行一次再退出。
+    # 判据三格：串口里有 shell 打的结果行前缀 + `(timeout)`（hello 是内核探针，
+    # 没人给它写 FLAG_EXIT 就自旋，5 s 超时是它的**已知行为**）+ 整跑 PASS。
+    # `exit=<码>` 那一路由 a3-exec 的 `wait=exit:0x0` 证（那是同一个 17 号返回值）。
+    print("=== A3 验收：shell 执行 argv 里的外部命令（--features a3-shell）===")
+    IMAGE.unlink(missing_ok=True)
+    ashv, ashrc, ashlog = do_run(["a3-shell", "fat32-probe"], timeout)
+    ash_ok = ashv == "PASS" and all((
+        "run: /HELLO.ELF" in ashlog,
+        "(timeout)" in ashlog,
+    ))
+    ash_verdict = "CONTENT-MISMATCH" if (ashv == "PASS" and not ash_ok) else ashv
+    IMAGE.unlink(missing_ok=True)
 
     rows = [
         ("正向", v if v != "PASS" or not p4_bad else "CONTENT-MISMATCH", rc, "PASS", 33),
@@ -8500,6 +8595,14 @@ def do_test(timeout: int) -> int:
         # ADR-112：两台 virtio-blk。内核绿而宿主机容量集合/BDF 序对不上 ⇒ CONTENT-MISMATCH
         ("virtio 两台并存", tv_verdict, tvrc, "PASS", 33),
         ("多级首簇高半抹零读到别处", dhih_verdict, dhihrc, "FAIL", 35),
+        # ADR-130 / A2：argv 区 + std 句柄继承 + 退出码寄存器（3 号 rdi 赋义）。
+        # 正向：三格全绿才 PASS；负样本：校验拒 + 不放行。
+        ("A2 argv/std经继承句柄启动外部ELF", ax_verdict, axrc, "PASS", 33),
+        ("A2越界argv被校验拒", ab_verdict, abrc, "PASS", 33),
+        # A3：用户态装载器（22 号卷路径 + 段表解析 + 14 号映射 + 11/15/16/17）
+        ("A3 用户态装载器执行卷上ELF", r3_verdict, r3rc, "PASS", 33),
+        # A3 验收句的后半："命令输出和退出码返回 Shell"——shell 自己装载并等收工。
+        ("A3 shell执行argv里的外部命令", ash_verdict, ashrc, "PASS", 33),
     ]
     # 每一行对应那一跑的串口：不符时把红的那几格打出来。
     # 单独一张表而不是把日志塞进 `rows` 的元组里：元组要保持成"名字/期望/实际"这种
@@ -8558,6 +8661,10 @@ def do_test(timeout: int) -> int:
         "块请求层超时取消半途": blog,
         "virtio 两台并存": tvlog,
         "多级首簇高半抹零读到别处": dhihlog,
+        "A2 argv/std经继承句柄启动外部ELF": axlog,
+        "A2越界argv被校验拒": ablog,
+        "A3 用户态装载器执行卷上ELF": r3log,
+        "A3 shell执行argv里的外部命令": ashlog,
     }
     all_ok = True
     print()

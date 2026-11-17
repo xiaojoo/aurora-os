@@ -101,8 +101,13 @@ fn on_panic(info: &PanicInfo) -> ! {
     // panic=abort（ADR-005）：这里是终点，不是可恢复错误。
     // 只打印位置：PanicInfo::message() 返回 PanicMessage，在 no_std 下没有可移植的
     // payload 读法，凭空包一层 Display 只会打出骗人的内容。
-    let loc = info.location().map_or("<unknown location>", |l| l.file());
-    crate::log_fatal!("kernel panic at {}", loc);
+    // A2 接线调参期临时扩展：在既有前缀后追加行号（前缀不动，既有判据匹配不受影响；
+    // 落地稳定后是否保留由判定行口径定）。
+    if let Some(l) = info.location() {
+        crate::log_fatal!("kernel panic at {}:{}", l.file(), l.line());
+    } else {
+        crate::log_fatal!("kernel panic at <unknown location>");
+    }
     exit::finish(exit::Code::ExceptionFatal)
 }
 
@@ -990,9 +995,36 @@ fn run_ktests_and_finish() -> ! {
     // S4a（W5 第一片，BACKLOG §229）：产品路径**真起 ring3**。放在判定之前、ktests 之后，
     // 这样用例读数不受影响，而 hello 的输出能进同一份串口。
     // S5d：接住 init 的任务号——判定之后要不要等它，由 `park_until_init_exits` 说。
+    // A3 验收档（ADR-131）：shell 要能 `run` 卷上的 ELF ⇒ 产品路径必须先认领盘
+    // （22 号 `fs_open::open` 自 mount 固定卷，但卷得先被驱动 probe 过；此前只有测试路径做）。
+    #[cfg(feature = "a3-shell")]
+    {
+        match crate::ahci::init() {
+            Ok(info) => crate::log_info!("a3-shell: AHCI 认领 ports={}", info.ports),
+            Err(e) => crate::log_warn!("a3-shell: AHCI 认领失败 {:?}", e),
+        }
+        // 挂根换卷A（口 3，根目录有 HELLO.ELF）；此刻还没有任何 VFS 句柄。
+        crate::filesystem::fs_open::set_port(3);
+    }
+    // A2 切片（ADR-130）：判定档不起交互会话（句柄表 16 格留给判定路径）。
+    // init_task 的作用域提到两 cfg 块之外：判定后的 `park_until_init_exits` 两个分支都要它。
+    #[cfg(not(feature = "a2-exec"))]
     let init_task = stage_init_user(0);
-    // ADR-097：留一份任务号给关闭路径（`×` 关的是会话，不是整机）。
-    SESSION_TASK[0].store(init_task.unwrap_or(0), core::sync::atomic::Ordering::Relaxed);
+    #[cfg(feature = "a2-exec")]
+    let init_task: Option<usize> = None;
+    #[cfg(feature = "a2-exec")]
+    {
+        stage_a2_exec();
+        SESSION_TASK[0].store(0, core::sync::atomic::Ordering::Relaxed);
+    }
+    #[cfg(not(feature = "a2-exec"))]
+    {
+        // S4a（W5 第一片，BACKLOG §229）：产品路径**真起 ring3**。放在判定之前、ktests 之后，
+        // 这样用例读数不受影响，而 hello 的输出能进同一份串口。
+        // S5d：接住 init 的任务号——判定之后要不要等它，由 `park_until_init_exits` 说。
+        // ADR-097：留一份任务号给关闭路径（`×` 关的是会话，不是整机）。
+        SESSION_TASK[0].store(init_task.unwrap_or(0), core::sync::atomic::Ordering::Relaxed);
+    }
     // S6p：第二个会话（多标签）。**只在新特性下起**：既有变体的任务与句柄账一格不动。
     #[cfg(feature = "multisession")]
     {
@@ -1031,10 +1063,12 @@ fn run_ktests_and_finish() -> ! {
         && ruler_ok;
     if clean {
         crate::log_info!("verdict: PASS");
+        #[cfg(not(feature = "a2-exec"))]
         park_until_init_exits(init_task);
         exit::finish(exit::Code::Success);
     }
     crate::log_warn!("verdict: FAIL");
+    #[cfg(not(feature = "a2-exec"))]
     park_until_init_exits(init_task);
     exit::finish(exit::Code::Failed)
 }
@@ -1156,7 +1190,19 @@ fn park_until_init_exits(init: Option<usize>) {
             }
         }
     }
-    #[cfg(not(feature = "resident-init"))]
+    #[cfg(feature = "a3-shell")]
+    {
+        // A3 验收档：shell 跑完 argv 里那条命令就自己 exit，这里等它收工再交付判定。
+        // 窗口给足：一次 `run` 要读卷上 17 KiB（AHCI 逐扇区，遇"发射被吞"还会恢复重发）
+        // + shell 侧 5 s 的 17 号等待。8 s 实测不够（0x1e6→0x1ec 就没窗口了），给到 ~30 s。
+        if let Some(g) = init {
+            let _ = apic::with_interrupts(|| {
+                sched::wait_for_task(g, crate::clock::window_cycles(1500))
+            });
+            crate::log_info!("a3-shell: 会话收工（或窗口到）");
+        }
+    }
+    #[cfg(all(not(feature = "resident-init"), not(feature = "a3-shell")))]
     {
         let _ = init;
     }
@@ -1202,6 +1248,208 @@ fn stage_init_user(_sid: u8) -> Option<usize> {
     );
     // S5d：默认档没有控制台句柄可授，谈不上常驻 ⇒ 交回 None。
     None
+}
+
+// ---------------------------------------------------------------------------
+// A2 切片（ADR-130）：产品路径上的**外部 ELF 执行**取证档。
+// 与 S4a init-user 的差别只在"输入从哪来"：SI 页带 **argv 区**（args_off/args_len 赋义）
+// 且 std 句柄（ROLE_STDIN/STDOUT/STDERR）经既有 16 号转移进入子进程——内核侧唯一新增
+// 是 `sys_process_start` 里的 argv 区校验（决策 2）与三个 role 常量；机制面零改动。
+// 正向（a2-exec）：execprobe 读 argv → 写继承的 stdout → exit(7)；
+// 负样本（a2-exec-bad）：args_len 覆盖句柄表 ⇒ 16 号校验必须拒 E_INVALID。
+#[cfg(feature = "a2-exec")]
+fn stage_a2_exec() {
+    use crate::arch::x86_64::trap::TrapFrame;
+    use crate::handle::{self, Handle, RIGHT_CREATE, RIGHT_DUP, RIGHT_MAP, RIGHT_READ, RIGHT_TRANSFER, RIGHT_WRITE};
+    use crate::user::{
+        syscall_dispatch, SYS_ASPACE_MAP, SYS_PROCESS_CREATE, SYS_PROCESS_START,
+        SYS_THREAD_CREATE, ABI_MAJOR, ABI_MINOR, SI_MAGIC, SI_DESC_BYTES, SI_DESC_HANDLE,
+        SI_DESC_ROLE, SI_OFF_ARGS_LEN, SI_OFF_ARGS_OFF, SI_OFF_HANDLES, ROLE_JOB,
+        ROLE_STDERR, ROLE_STDIN, ROLE_STDOUT, E_INVALID,
+    };
+    use crate::{mm, proc, vmo};
+
+    // a3-exec 档：**产品路径认领 AHCI**——22 号的 fs_open::open 自 mount 固定卷，
+    // 但卷必须先被驱动 probe 过（此前只有 fs/fs-open 的 ktest 做这一步，产品路径没有；
+    // execprobe 实测 open 回 -1）。这是 S3"产品路径授予文件句柄"的驱动半边。
+    #[cfg(feature = "a3-exec")]
+    {
+        match crate::ahci::init() {
+            Ok(info) => crate::log_info!("a3-exec: AHCI 认领 ports={}", info.ports),
+            Err(e) => crate::log_warn!("a3-exec: AHCI 认领失败 {:?}", e),
+        }
+        // 挂根换到卷A（口 3，根目录有 HELLO.ELF）。**任何时候只有一个调度者在写这条**：
+        // 用例全部跑完之后才走到这里，所以不会有"旧句柄挂新卷"的窗口（见 fs_open::PORT 的约定）。
+        crate::filesystem::fs_open::set_port(3);
+        crate::log_info!("a3-exec: 挂根=口{}（卷A，目标 /HELLO.ELF）", crate::filesystem::fs_open::port());
+    }
+    let Some(owner) = sched::current_identity() else {
+        crate::log_warn!("a2-exec: 无启动身份 ⇒ 判定行缺席");
+        return;
+    };
+    // 会话 1 的登记先建立（grant_console 按 sid 找会话，顺序不能反——init-user 同款顺序）。
+    crate::user::begin_session_load(1);
+    let mut f = TrapFrame {
+        cr2: 0, r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
+        rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0, vector: 0,
+        error_code: 0, rip: 0, cs: 0, rflags: 0, rsp: 0, ss: 0,
+    };
+    let Some(madt) = acpi::summary().and_then(|s| s.madt) else {
+        crate::log_warn!("a2-exec: 无 MADT，stdout 授不了");
+        return;
+    };
+    if let Err(e) = serial::enable_rx(&madt) {
+        crate::log_warn!("a2-exec: 控制台接收初始化失败 {:?}", e);
+        return;
+    }
+    // stdout 句柄（console）：转移给 execprobe 的 ROLE_STDOUT/STDERR（stdin 同句柄）。
+    // A2 语义：stdin/stdout/stderr 是**三个独立句柄**——16 号 transfer 同一个句柄
+    // 第二次必 -5（第一次就把它从父表移走了）。三份各授各的，DUP 是 grant_console 的
+    // 既有约定（init-user 同款）。
+    let mut consoles = [Handle(0); 3];
+    for (i, c) in consoles.iter_mut().enumerate() {
+        match handle::grant_console(owner, RIGHT_READ | RIGHT_WRITE | RIGHT_DUP | RIGHT_TRANSFER, 1) {
+            Ok(h) => *c = h,
+            Err(e) => { crate::log_warn!("a2-exec: console {} 授予失败 {:?}", i, e); return; }
+        }
+    }
+    let console = consoles[1];
+    // Job 句柄（CREATE）：process_create 的门票（与 init-user 同款）。
+    let job = match proc::job_create(None, 2, 64) {
+        Ok(v) => v,
+        Err(e) => { crate::log_warn!("a2-exec: job_create 失败 {:?}", e); return; }
+    };
+    let jgen = proc::job_gen(job).unwrap_or(0);
+    let hj = match handle::grant_job(owner, job, jgen, RIGHT_READ | RIGHT_CREATE | RIGHT_TRANSFER) {
+        Ok(h) => h,
+        Err(e) => { crate::log_warn!("a2-exec: grant_job 失败 {:?}", e); return; }
+    };
+    // 11 号：create 进程对象。
+    f.rax = SYS_PROCESS_CREATE; f.rdi = hj.0; f.rsi = 0; f.rdx = 0; f.r10 = 0;
+    syscall_dispatch(&mut f);
+    let hp = Handle(f.rax);
+    let (pid, pgen) = match handle::resolve(hp, owner, 0) {
+        Ok((handle::ObjRef::Proc { slot, gen }, _)) => (slot, gen),
+        _ => { crate::log_warn!("a2-exec: Proc 句柄解不开 ret={:#x}", f.rax); return; }
+    };
+    let Some((aslot, _)) = proc::proc_aspace(pid, pgen) else {
+        crate::log_warn!("a2-exec: 进程没有 AS");
+        return;
+    };
+    // 装载 execprobe 进子 AS（与 init-user 的会话装载同款：映射归创建者，16 号才搬得动）。
+    let loaded = {
+        let r = crate::user::load_into(aslot, crate::ktests::common::EXECPROBE_ELF);
+        crate::user::end_session_load();
+        match r {
+            Ok(l) => l,
+            Err(e) => { crate::log_warn!("a2-exec: load_into 失败 {}", crate::user::describe_load(e)); return; }
+        }
+    };
+    if let Err(e) = loaded.owned.into_current() {
+        crate::log_warn!("a2-exec: 映射归创建者失败 {:?}", e);
+        return;
+    }
+    // SI 页：头 24 字节 + argv 区（280 起）+ 描述表（24 起 4 条）。
+    // 负样本（a2-exec-bad）：args_off/args_len 故意压住句柄表 ⇒ 16 号校验必须拒。
+    let (args_off, args_len) = if cfg!(feature = "a2-exec-bad") {
+        (SI_OFF_HANDLES, 4096usize)
+    } else if cfg!(feature = "a3-exec") {
+        (280usize, 11usize) // "/HELLO.ELF" + NUL（vfs 要求绝对路径，实测 NotAbsolute）
+    } else {
+        (280usize, 10usize)
+    };
+    let si = match vmo::vmo_create(1) {
+        Ok(v) => v,
+        Err(e) => { crate::log_warn!("a2-exec: si vmo 失败 {:?}", e); return; }
+    };
+    let mut hdr = [0u8; SI_OFF_HANDLES];
+    hdr[0..4].copy_from_slice(&SI_MAGIC.to_le_bytes());
+    hdr[4..6].copy_from_slice(&(ABI_MAJOR as u16).to_le_bytes());
+    hdr[6..8].copy_from_slice(&(ABI_MINOR as u16).to_le_bytes());
+    hdr[8..12].copy_from_slice(&4u32.to_le_bytes());
+    hdr[SI_OFF_ARGS_OFF..SI_OFF_ARGS_OFF + 4].copy_from_slice(&(args_off as u32).to_le_bytes());
+    hdr[SI_OFF_ARGS_LEN..SI_OFF_ARGS_LEN + 4].copy_from_slice(&(args_len as u32).to_le_bytes());
+    if vmo::vmo_write(si, 0, &hdr) != Ok(hdr.len()) { crate::log_warn!("a2-exec: si 头写失败"); return; }
+    // 描述表 4 条：Job + stdin/stdout/stderr（三口同指 console——本内核尚无独立输入源）。
+    let roles = [ROLE_JOB, ROLE_STDIN, ROLE_STDOUT, ROLE_STDERR];
+    let handles = [hj.0, consoles[0].0, consoles[1].0, consoles[2].0];
+    for (i, (&role, &hv)) in roles.iter().zip(handles.iter()).enumerate() {
+        let mut d = [0u8; SI_DESC_BYTES];
+        d[SI_DESC_ROLE..SI_DESC_ROLE + 4].copy_from_slice(&role.to_le_bytes());
+        d[SI_DESC_HANDLE..SI_DESC_HANDLE + 8].copy_from_slice(&hv.to_le_bytes());
+        let off = SI_OFF_HANDLES + i * SI_DESC_BYTES;
+        if vmo::vmo_write(si, off, &d) != Ok(SI_DESC_BYTES) {
+            crate::log_warn!("a2-exec: 描述 {} 写失败", i);
+            return;
+        }
+    }
+    // argv 区：首串 "execprobe\0"（execprobe 打印 argv[0] 后判据锚点）。
+    if !cfg!(feature = "a2-exec-bad") {
+        // 固定 512 缓冲（ARGS_MAX）：args_len 是运行期值，不能做数组长度（E0435）。
+        let mut arg = [0u8; 512];
+        // a3-exec 档的目标是卷上 /HELLO.ELF（**绝对路径**：vfs_ro::lookup 拒相对路径，
+        // 内核侧诊断实测 NotAbsolute）；execprobe 见 ".ELF" 后缀就走 A3 装载器分支。
+        let target: &[u8] = if cfg!(feature = "a3-exec") {
+            b"/HELLO.ELF"
+        } else {
+            b"execprobe"
+        };
+        arg[..target.len()].copy_from_slice(target);
+        arg[target.len()] = 0;
+        if vmo::vmo_write(si, args_off, &arg[..args_len]) != Ok(args_len) {
+            crate::log_warn!("a2-exec: argv 区写失败");
+            return;
+        }
+    }
+    // si 页句柄（内核读 si 用 rdx=si 句柄；给子进程的另一份经描述表转移）。
+    let si_h = match handle::grant_vmo(owner, si, RIGHT_READ | RIGHT_WRITE | RIGHT_MAP | RIGHT_TRANSFER) {
+        Ok(h) => h,
+        Err(e) => { crate::log_warn!("a2-exec: si 句柄授予失败 {:?}", e); return; }
+    };
+    // 15 号：thread。entry/栈来自装载器。
+    f.rax = SYS_THREAD_CREATE; f.rdi = hp.0; f.rsi = loaded.entry; f.rdx = loaded.stack_top; f.r10 = 0;
+    syscall_dispatch(&mut f);
+    let ht = Handle(f.rax);
+    // si 页也要经 14 号铺进**子 AS**（与 init-user 同款：地址从全局 VA 表占，登记进会话袋）。
+    // a2-exec 档下 init 不起 ⇒ 用 sid=1 的那页地址（0x2_5000_0000 + PAGE）不会撞任何人。
+    let si_want = 0x2_5000_0000 + crate::mm::PAGE as u64;
+    crate::user::begin_session_load(1);
+    f.rax = SYS_ASPACE_MAP; f.rdi = si_h.0; f.rsi = 0; f.rdx = hp.0; f.r10 = si_want;
+    syscall_dispatch(&mut f);
+    crate::user::end_session_load();
+    let si_va = f.rax;
+    // 16 号：rdi=proc, rsi=thread, rdx=si_vmo, r10=si_va（子 AS 里映射的 VA）。
+    // 16 号前体检：-5 多来源，先分清是哪个句柄（ADR-098 风格）。
+    // 四个描述符的 TRANSFER 探测：谁 Stale/NoSuch 一眼定位。
+    f.rax = SYS_PROCESS_START; f.rdi = hp.0; f.rsi = ht.0; f.rdx = si_h.0; f.r10 = si_va;
+    syscall_dispatch(&mut f);
+    if f.rax != 0 {
+        if cfg!(feature = "a2-exec-bad") {
+            // 负样本判据：校验拒必须点名 E_INVALID(-1)。
+            crate::log_info!("a2-exec-bad: argv 校验拒 ret={:#x}（期望 {:#x}）", f.rax as i64, E_INVALID as i64);
+            if f.rax as i64 != E_INVALID as i64 {
+                crate::log_fatal!("a2-exec-bad: 校验没有拒成 E_INVALID ⇒ 负样本闸没咬");
+            }
+            return;
+        }
+        crate::log_warn!("a2-exec: process_start 失败 ret={:#x}", f.rax);
+        return;
+    }
+    if cfg!(feature = "a2-exec-bad") {
+        crate::log_fatal!("a2-exec-bad: 越界 argv 竟然通过了校验 ⇒ ADR-130 决策 2 没生效");
+        return;
+    }
+    // 等收工（sched::wait_for_proc 直回退出码，与 17 号同一实体）。execprobe 会 exit(7)。
+    let _ = apic::timer_start();
+    let code = apic::with_interrupts(|| sched::wait_for_proc(pid, crate::clock::window_cycles(32)));
+    // 双锚点第二锚：串口里必须有 execprobe 自己打出的 argv 行（stdout 来自**继承句柄**）。
+    // 期望的退出码按档：a2-exec 是探针自己的判定码 7；a3-exec 走完装载器全链后正常收尾（0）。
+    let want = if cfg!(feature = "a3-exec") { Some(0u32) } else { Some(7u32) };
+    crate::log_info!(
+        "a2-exec: execprobe 收工 退出码={:?}（期望 {:?}）args_off={} args_len={}",
+        code, want, args_off, args_len
+    );
+
 }
 
 /// 起一个 shell 会话：`sid` 决定它拿到的控制台句柄属于哪个会话（0 号兼作 init）。
@@ -1321,6 +1569,18 @@ fn stage_init_user(sid: u8) -> Option<usize> {
     if cfg!(feature = "console-probe") {
         hdr[12..16].copy_from_slice(&512u32.to_le_bytes());
         hdr[16..20].copy_from_slice(&8u32.to_le_bytes());
+    }
+    // A3 验收档（ADR-131）：给 shell 一条**启动命令**（`sh -c` 语义）。偏移取 280：
+    // 描述表最多 4 条（24 + 4×16 = 88），280 在页内且不与表重叠（ADR-130 决策 2 的校验）。
+    #[cfg(feature = "a3-shell")]
+    {
+        const A3_CMD: &[u8] = b"run /HELLO.ELF\0";
+        hdr[12..16].copy_from_slice(&280u32.to_le_bytes());
+        hdr[16..20].copy_from_slice(&(A3_CMD.len() as u32).to_le_bytes());
+        if vmo::vmo_write(si, 280, A3_CMD) != Ok(A3_CMD.len()) {
+            crate::log_warn!("init-user: a3-shell 的 argv 写失败");
+            bail!(1275, led, led_n, owner);
+        }
     }
     if vmo::vmo_write(si, 0, &hdr) != Ok(hdr.len()) { crate::log_warn!("init-user: si 头写失败"); bail!(1274, led, led_n, owner); }
     let mut d = [0u8; SI_DESC_BYTES];

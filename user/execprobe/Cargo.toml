@@ -1,0 +1,24 @@
+[package]
+name = "aurora-user-execprobe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# A2 切片（ADR-130，2026-11-16）：第一个经 **A2 语义**（argv 区 + std 句柄继承）被启动的
+# 外部 ELF。与 fileprobe 同一条构建纪律：只在 `a2-exec` 构建里被内核 include_bytes!，
+# 不进签名链；构建入口只有 `python tools/aurora.py`。
+[[bin]]
+name = "execprobe"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+aurora-user-runtime = { path = "../runtime" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

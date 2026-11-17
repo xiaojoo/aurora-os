@@ -20,7 +20,12 @@ use crate::mm::{self, AspaceHandle, AspaceMapping, MmError, ModuleId, PageFlags,
 pub const MOD_VMO: ModuleId = ModuleId(19);
 /// 定长容量。与 `MAX_LAZY_REGIONS`/`MAX_ADDR_SPACES` 同一口径：接缝够用，欠 workload 依据
 /// （ADR-074 未决 1：P5 真起进程之后按"一个进程几个 VMO、每个几页"重量）。
-pub const MAX_VMOS: usize = 8;
+// ADR-131（A3 切片）：8 → 16。用户态装载器要求**父子同时**持有 VMO：
+// 父（命令解释器）持子进程的每段一份 + 栈 + si；子（被启动的 ELF）自己已有
+// 装载器给的段 VMO。两代 3 段 ELF 就要 6 格，再算 si/栈/临时，8 格必满
+// （2026-11-17 实测：execprobe 建第 3 个段 VMO 时 -6）。VmoEntry 每条 152 字节，
+// 表从 1.2 KiB 涨到 2.4 KiB——对"堆上限 2048"的约束无影响（静态表不在堆上）。
+pub const MAX_VMOS: usize = 16;
 pub const MAX_VMO_PAGES: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

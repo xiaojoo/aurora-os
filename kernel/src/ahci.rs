@@ -1549,6 +1549,10 @@ fn transfer_inner(num: u8, lba: u64, count: u16, write: bool) -> Result<Xfer, Ah
         hash = fnv1a_step(hash, b);
         untouched += (b == 0xEE) as u32;
     }
+    // 逐次取证行：默认照打（它是既有判据的时序环境，见 Cargo.toml 的 `quiet-ahci` 注释）；
+    // 显式开 `quiet-ahci` 时静音，给"窗口紧"的档腾出串口预算。值本身仍留在 `Xfer` 里，
+    // 用例与宿主机对账照旧用它（`hash`/`dw1`/`untouched` 都是结构体字段，不是日志专用）。
+    #[cfg(not(feature = "quiet-ahci"))]
     crate::log_info!(
         "ahci: 取证 口{} tfd={:#06x} 表头DW1={:#010x} ci落定={:#010x} 中断态={:#010x} 哨兵剩={} 表内FIS={:#018x} 接收区FIS={:#018x} 哈希={:#018x} 编程计数={} 回执计数={} PRDT字节={}",
         num,

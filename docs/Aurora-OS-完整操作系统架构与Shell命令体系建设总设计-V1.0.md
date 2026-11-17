@@ -147,11 +147,29 @@
 | 14 | `SYS_ASPACE_MAP` | 地址空间映射（handles feature） |
 | 15 | `SYS_THREAD_CREATE` | 创建线程（handles feature） |
 | 16 | `SYS_PROCESS_START` | 启动已准备线程/进程（handles feature） |
+| 17 | `SYS_PROCESS_WAIT` | 等进程收工，返回 `(observed<<32)\|退出码`（handles feature） |
 | 18 | `SYS_PROCESS_KILL` | 终止进程（handles feature） |
+| 19 | `SYS_OBJECT_WAIT` | 通用对象等待（今天只支持 Proc；17 号是它的薄壳） |
 | 20 | `SYS_CONSOLE_WRITE` | 控制台输出 |
 | 21 | `SYS_CONSOLE_READ` | 控制台输入 |
+| 22 | `SYS_FILE_OPEN` | 打开卷上路径（fs-open feature） |
+| 24 | `SYS_FILE_SEEK` | 移动文件游标（fs-open feature） |
+| 25 | `SYS_FILE_STAT` | 取 StatV1 固定记录（fs-open feature） |
+| 26 | `SYS_DIR_READ` | 读 DirentV1 目录记录（fs-open feature） |
 
 此表是当前源码快照的调用号清单，不代表所有 feature 在默认构建中都启用。用户程序必须先通过 `SYS_ABI_INFO` 读取 ABI 版本与能力位，再使用对应接口。新增调用必须登记、测试和版本化；不得自行选择空号后就视为已批准。
+
+**两处必须连读的事实**（否则会拿这张表去挑空号而撞车）：
+
+- **`23` 已被 ADR-110/111 的方向占住**（块设备写方向的 `write`），任何新调用都不得取它。
+- **`2` 从来没用过**、`17/19/22/24/25/26` 在本表早前版本里漏登（本轮补齐，依据 `kernel/src/user.rs`
+  的 `pub const SYS_*` 逐条核对，2026-11-17，HEAD `8a20947`）。漏登的后果不是"少一行文档"：
+  AGENTS.md 明确"新增调用不得自行选空号"，一张不全的表会让下一个人把已占的号当成空的。
+- A4（进程观测）**尚未分配号**：备选形状与判据见 `docs/design/A4-进程观测API-草案.md`，
+  落地需先批准（新增号属"停下来问"清单）。
+
+**基线快照**：本节的号表与结论按 `feat/wb-dev` 的 `8a20947`（A3 装载器落地）核对；
+此后的新增号只以 `kernel/src/user.rs` 为准，本表随 ADR 更新。
 
 ## 2.2 现阶段不得误判为已完成的能力
 
@@ -886,6 +904,20 @@ aurora-os/
 必须按依赖关系推进。建议将路线分为基础内核、系统服务、命令工具、生态能力四个大阶段。
 
 ## 阶段 A：基础内核与用户程序运行环境
+
+> **实施记录（2026-11-17，按代码与判定表实测更新；本表是"做到哪了"，不改上面的验收句）**
+>
+> | 阶段 | 状态 | 依据 |
+> |---|---|---|
+> | A0 基线 | ✅ | `check` 17 道门禁、判定表整链可复现；配方记在 COORD.md §8 |
+> | A1 VFS/文件系统 | 部分 | FS-01~FS-10 的**读方向**已交付（ADR-108/109）；写方向由 qoder 推进（ADR-110/111，`fs-rw`） |
+> | A2 用户运行时 | ✅ 前后两半都落地 | `user/runtime` 库 + argv 区/std 句柄/退出码（ADR-130）；判定行 `A2 argv/std…`、`A2越界argv…` |
+> | A3 Shell 解析器与外部命令 | ✅ 解析器与 `run` 已落地，交互判据待量具 | 解析器/注册表（A3 首片）、**用户态装载器**（ADR-131，判定行 `A3 用户态装载器执行卷上ELF`）、shell `run <path>`；交互端到端被 `t_fs_open_ring3` 的 160 ms 窗口挡住（原因见 ADR-131 补记） |
+> | A4 进程观测 | ⬜ 未开工 | 方案草案 `docs/design/A4-进程观测API-草案.md`，**需批准新增号** |
+>
+> 三条与上表配套的事实：① `ps/top/free` 仍不存在——A4 未批号之前不实现；
+> ② `run` 的退出码显示路径已实现但缺"会自己退出的样例命令"（卷上的 hello 是内核探针，不写 FLAG_EXIT 就自旋）；
+> ③ 重定向/管道/`ls -lah` 属 A3 的后续片，尚未开始（A3 验收句的 `ls/cat/grep` 那半未达成）。
 
 ### A0：仓库与现状基线冻结
 

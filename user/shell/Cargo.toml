@@ -14,6 +14,11 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+# A2 接线（总设计切片，2026-11-16）：第一个调用方接线——shell 的 syscall 底座
+# （int 0x80 入口、console 读写、find_console）迁到 runtime，本 crate 只剩交互逻辑。
+[dependencies]
+aurora-user-runtime = { path = "../runtime" }
+
 [profile.dev]
 panic = "abort"
 

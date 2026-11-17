@@ -14848,3 +14848,33 @@ kernel 栈/地址窗口上的脆弱）。下一刀先定位它：用同一段包
 - 同 ELF `2be35a65b450` 单跑 **PASS(33) 83/83** ⇒ 环境形状，**不归因**，判据未改、不重跑整链。
 - 本轮的 `virtio 两台并存` 行（含新的 `msix=true` 格）PASS；`FS写方向`、`块请求层` 两行也 PASS。
 - 备注：q2 峰值采样今天在长链里已多次出现（§376 一次两格、这里一格），宿主负载敏感是已知的。
+## 382. 合并 feat/wb-dev（A2/A3：用户运行时、外部 ELF、shell 自跑外部命令）（2026-11-17）
+
+- 合并对象：`feat/wb-dev` @ `5b78591`（ADR-130 argv 区/标准句柄、ADR-131 用户态装载器与外部 ELF、
+  `user/runtime`、`user/execprobe`、shell `parser/registry`、A2/A3 四行）并入 `main` @ `86b646a`。
+  结果 68 行判定表（main 64 + wb 4），无一行被删改。
+- 冲突 9 份。`user.rs` 与根 `Cargo.toml` 的冲突是**整文件**的：wb 侧把这两个文件转成了 CRLF，
+  逐行 diff 全红。处置：按 EOL 归一再 `git merge-file`，净 hunk 很小（user.rs 保住 ABI 14 +
+  handles/fs-rw 两侧分派臂；Cargo.toml 保住 workspace 成员并加 `user/runtime`、`user/execprobe`）。
+  `fs_open.rs` 两侧都改了挂载根：保住 main 的运行期 `port()/set_port`（A3 切根用）与 wb 的
+  `MOUNTS` 最长老前缀表，`open()` 对 `/` 前缀取 `port()`、其余取表项端口。`ktests/fs.rs` 的
+  `Want` 仍按 `HELLO_ELF.len()`；`tools/aurora.py` 两侧行集取并集（main 三段 + wb 四段 + 新门禁分支）。
+- 登记与口径合并：`module-interfaces.toml`/`crates.toml` 两侧条目并存；unsafe 重新对账到
+  **464 处**（U1 83 · U2 116 · U3 13 · U4 129 · U5 87 · U6 36；virtio 的 U4 合回 8），
+  依赖口径仍 **41 边/422 点**。`check` **17/17**。
+- **工具链漂移（新发现的风险）**：`.tools/rustup` 的 stable 实为 **1.100.0**，而
+  `tools/versions.toml` 钉的是 **1.99.1**；在用 1.100.0 构建时 `hello.elf` 变成 `4e4682…`，
+  与 FAT 卷上登记的字节不符。把 1.99.1 放回 `.tools`（旧目录留作 `stable-1.100.0-old`）后，
+  所有**钉住**的夹具字节回归（hello `8e39…`、probe 754048/`4951…`、fileprobe 9202a42941c9）。
+  结论：钉住的夹具 sha 只有在**同一工具链**下才是判据；shell/execprobe 是新源码，sha 本来就变。
+- **A3 两行首跑红，成因是写死的 ABI minor**：`execprobe` 与 `runtime/exec.rs` 各自把 SI 头的
+  minor 写死 12，而合并后内核 `ABI_MINOR=14` 且 16 号是**逐位相等**校验 ⇒ `spawn` 回 -1
+  （串口 `error=-1`，shell 直接"启动期即收工"）。两处都改成运行期 `abi_info() >> 16` 取值
+  （与 probe 的既有写法同口径）。修后 a3-shell 串口两锚 `run: /HELLO.ELF`、`(timeout)` 都成立；
+  夹具：execprobe **27408 / `f4e5e2aa9759`**、shell **30960 / `63651d5aa17f`**。
+- 整链：**68 行 67 符合 / 1 不符合**。唯一不符合 = 默认档的 `t_q2_workload_slots` `peak=false`
+  （§342/§344/§376 记过的峰值采样易碎）。同 ELF `2cc12dddf0f6` 单跑 **PASS(33) 82/82**、
+  q2 峰值成立 ⇒ 环境形状，**不归因**，判据未改。
+- 取证备注：a3-shell 串口里的四行 `[kill] unexpected #PF` 分别是 `t_user`（坏帧）、
+  `t_user_pointer_checks`（坏指针）、`t_demand_zero`（两路）的**期望负样本**，每行后面紧跟
+  `-> ok`，不是回归。
