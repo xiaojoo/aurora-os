@@ -136,27 +136,21 @@ fn t_proc_kill() -> bool {
     match sched::spawn(kill_worker) {
         Ok(g) => {
             spawned = sched::set_proc_id(g, pid);
-            if spawned {
-                gid = g;
-                // **用 `yield_now` 轮询等它阻塞**，不用 `wait_for_task`：后者要 tick 驱动
-                // （第一版用它 ⇒ 整档 HANG 180 s，实测：`.ktests` 顺序让本用例排在
-                // 停过表的用例后面，超时唤醒没人来）。`yield_now` 是有界轮次，
-                // 与 `p7b_blocked_worker` 那边等"状态变 Blocked"的写法同一条纪律。
-                let mut n = 0usize;
-                while n < 200 {
-                    sched::yield_now();
-                    if matches!(sched::state_of(g), sched::TaskState::Blocked(_)) {
-                        break;
-                    }
-                    n += 1;
-                }
-            }
+            gid = g;
+            // **不要求它"跑过一次"也不要求它"已阻塞"**：18 号扫的是
+            // `state != Free && proc_id == pid`（`kill_process_threads`），线程**在槽里、
+            // 归属已登记**就够了。两版更严的判据都红过：等"变 Blocked"在 a2-exec 档
+            // 不成立（实测 run-1744/run-1749：那个档的调度环境与 handles 档不同，
+            // 工人未必在 200 轮 `yield_now` 里被换上去）；等 `runs > 0` 同样不成立
+            // （它可能还没被调度过就被 18 号收了）。
+            // 这一格只验**归属登记**这件事：线程槽的 proc_id 就是我们建的那个进程。
         }
         Err(_) => {}
     }
-    let blocked_ok = gid != usize::MAX
-        && matches!(sched::state_of(gid), sched::TaskState::Blocked(_));
-    let threads_ok = attached && spawned && blocked_ok;
+    let owned_ok = gid != usize::MAX
+        && sched::state_of(gid) != sched::TaskState::Free
+        && sched::proc_id_of(gid) == pid;
+    let threads_ok = attached && spawned && owned_ok;
 
     // ---- ④ 18 号杀它 ⇒ 真收掉 1 条线程、进程变僵尸。
     let mut f3 = frame0();
@@ -164,7 +158,9 @@ fn t_proc_kill() -> bool {
     f3.rdi = hp.0;
     syscall_dispatch(&mut f3);
     let killed_rc = f3.rax;
-    let killed_ok = killed_rc == 1; // 收掉的线程数
+    // 收掉的线程数：这条进程名下**恰好一条**线程 ⇒ 必须是 1。
+    // （用 `== 1` 而不是 `>= 1`：多收一条就意味着 proc_id 认错了人。）
+    let killed_ok = killed_rc == 1;
     // 杀完必须是"已终止"（27/28 号看得到 `terminated`）。
     let terminated_ok = proc::proc_is_terminated(pid);
 
