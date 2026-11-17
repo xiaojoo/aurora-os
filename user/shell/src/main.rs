@@ -38,35 +38,35 @@ mod registry;
 /// （hello/probe 的模块头都记过这个坑，本轮实测又撞一次）。改成 RIP 相对 lea 取基址 + 常量偏移。
 /// S6u：横幅的前导 `\x0a` 去掉了——那是当年为了跟上面的内核日志隔开留的，
 /// ADR-096 之后画面正文只有会话输出，前面什么都没有，那一格就成了纯粹的空行。
-static MSGS: [u8; 262] = *b"commands: help | echo <text> | ping | abi | exit\x0aAurora shell (S5c). type 'help'.\x0aAURORA:/ > \x0aline too long, discarded\x0aunknown command:  (try help)\x0aping=abi_info=bye\x0a\x08 \x08^C\x0aAurora OS 6.1.0-aurora (tty1)\x0aaurora@os:~$ run:  exit= (timeout) error=usage: run <path>\x0a-";
+static MSGS: [u8; 316] = *b"commands: help | echo <text> | ping | abi | ps | free | exit\x0aAurora OS 6.1.0-aurora (tty1)\x0aaurora@os:~$ \x0aline too long, discarded\x0aunknown command:  (try help)\x0aping=abi_info=bye\x0a\x08 \x08^C\x0arun:  exit= (timeout) error=usage: run <path>\x0a-PID GEN THR ST PAGES\x0aps: no job handle\x0alivedead ps: error=free: procs= threads= pages=";
 
-const M_HELP: (usize, usize) = (0, 49);
-const M_BANNER: (usize, usize) = (172, 30);
-const M_PROMPT: (usize, usize) = (202, 13);
-const M_NL: (usize, usize) = (93, 1);
-const M_TOOLONG: (usize, usize) = (94, 25);
-const M_UNKNOWN: (usize, usize) = (119, 17);
-const M_TRYHELP: (usize, usize) = (136, 12);
-const M_PING: (usize, usize) = (148, 5);
-const M_ABI: (usize, usize) = (153, 9);
-const M_BYE: (usize, usize) = (162, 4);
-const M_BS: (usize, usize) = (166, 3);
-/// Ctrl+C 的回显串（S6q）。**追加在 blob 末尾**：这样前面那 11 条偏移一个都不用动。
-const M_INT: (usize, usize) = (169, 3);
-// ---- A3 外部命令（`run`）：**追加在 blob 末尾**，前面 12 条偏移一个不动 ----
-/// `run: `
-const M_RUN_PREFIX: (usize, usize) = (215, 5);
-/// ` exit=`
-const M_RUN_EXIT: (usize, usize) = (220, 6);
-/// ` (timeout)`
-const M_RUN_TIMEOUT: (usize, usize) = (226, 10);
-/// ` error=`
-const M_RUN_ERR: (usize, usize) = (236, 7);
-/// `usage: run <path>\n`
-const M_RUN_USAGE: (usize, usize) = (243, 18);
-/// `-`（负错误码的符号位）
-const M_MINUS: (usize, usize) = (261, 1);
-
+const M_HELP: (usize, usize) = (0, 61);
+const M_BANNER: (usize, usize) = (61, 30);
+const M_PROMPT: (usize, usize) = (91, 13);
+const M_NL: (usize, usize) = (104, 1);
+const M_TOOLONG: (usize, usize) = (105, 25);
+const M_UNKNOWN: (usize, usize) = (130, 17);
+const M_TRYHELP: (usize, usize) = (147, 12);
+const M_PING: (usize, usize) = (159, 5);
+const M_ABI: (usize, usize) = (164, 9);
+const M_BYE: (usize, usize) = (173, 4);
+const M_BS: (usize, usize) = (177, 3);
+const M_INT: (usize, usize) = (180, 3);
+const M_RUN_PREFIX: (usize, usize) = (183, 5);
+const M_RUN_EXIT: (usize, usize) = (188, 6);
+const M_RUN_TIMEOUT: (usize, usize) = (194, 10);
+const M_RUN_ERR: (usize, usize) = (204, 7);
+const M_RUN_USAGE: (usize, usize) = (211, 18);
+const M_MINUS: (usize, usize) = (229, 1);
+const M_PS_HDR: (usize, usize) = (230, 21);
+const M_PS_NOJOB: (usize, usize) = (251, 18);
+const M_LIVE: (usize, usize) = (269, 4);
+const M_DEAD: (usize, usize) = (273, 4);
+const M_SP: (usize, usize) = (277, 1);
+const M_PS_ERR: (usize, usize) = (278, 10);
+const M_FREE_PFX: (usize, usize) = (288, 12);
+const M_FREE_THR: (usize, usize) = (300, 9);
+const M_FREE_PAGES: (usize, usize) = (309, 7);
 /// blob 的真实基址（RIP 相对 lea，不产生 32 位绝对重定位）。
 fn msgs_base() -> u64 {
     let b: u64;
@@ -94,6 +94,25 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
     loop {
         unsafe { core::arch::asm!("2: jmp 2b", options(nomem, nostack, noreturn)) };
     }
+}
+
+/// 去掉首尾的空格/Tab（脚本模式下 `;` 两侧常带空格）。
+fn trim_ascii(mut b: &[u8]) -> &[u8] {
+    while let Some((&c, rest)) = b.split_first() {
+        if c == b' ' || c == b'\t' {
+            b = rest;
+        } else {
+            break;
+        }
+    }
+    while let Some((&c, rest)) = b.split_last() {
+        if c == b' ' || c == b'\t' {
+            b = rest;
+        } else {
+            break;
+        }
+    }
+    b
 }
 
 /// 往控制台写一段字节。
@@ -180,12 +199,22 @@ pub extern "C" fn _start(si_va: u64) -> ! {
     // 有 argv 时不打印提示符——脚本模式不该等输入。
     // SAFETY: si_va 契约同 `find_console`（内核 process_start 校验并映射、user+只读）。
     if let Some(argv) = unsafe { rt::args_at(si_va) } {
-        let cmd = argv.split(|&b| b == 0).next().unwrap_or(&[]);
-        if !cmd.is_empty() {
+        let line = argv.split(|&b| b == 0).next().unwrap_or(&[]);
+        // **`;` 分隔多条**：脚本模式（argv）与交互模式的差别只在这里——交互一次一行，
+        // 脚本一行可以带几条。空段（`;;`、末尾 `;`）跳过，不产生输出。
+        let mut any = false;
+        for part in line.split(|&b| b == b';') {
+            let cmd = trim_ascii(part);
+            if cmd.is_empty() {
+                continue;
+            }
+            any = true;
             con_write(console, cmd);
             con_write(console, msg(M_NL));
             let parsed = parser::parse(cmd);
             let _ = registry::dispatch(console, si_va, &parsed);
+        }
+        if any {
             rt::exit(0);
         }
     }

@@ -20,8 +20,9 @@ use aurora_user_runtime as rt;
 
 use crate::{con_write, msg, put_u64};
 use crate::{
-    M_ABI, M_BYE, M_HELP, M_MINUS, M_NL, M_PING, M_RUN_ERR, M_RUN_EXIT, M_RUN_PREFIX,
-    M_RUN_TIMEOUT, M_RUN_USAGE, M_TRYHELP, M_UNKNOWN,
+    M_ABI, M_BYE, M_DEAD, M_FREE_PAGES, M_FREE_PFX, M_FREE_THR, M_HELP, M_LIVE, M_MINUS, M_NL,
+    M_PING, M_PS_ERR, M_PS_HDR, M_PS_NOJOB, M_RUN_ERR, M_RUN_EXIT, M_RUN_PREFIX, M_RUN_TIMEOUT,
+    M_RUN_USAGE, M_SP, M_TRYHELP, M_UNKNOWN,
 };
 
 /// 控制台句柄（内核按角色 `ROLE_LOG` 转移给 shell 的那个 u64）。
@@ -45,6 +46,8 @@ const CMD_PING: [u8; 4] = [b'p', b'i', b'n', b'g'];
 const CMD_ABI: [u8; 3] = [b'a', b'b', b'i'];
 const CMD_EXIT: [u8; 4] = [b'e', b'x', b'i', b't'];
 const CMD_RUN: [u8; 3] = [b'r', b'u', b'n'];
+const CMD_PS: [u8; 2] = [b'p', b's'];
+const CMD_FREE: [u8; 4] = [b'f', b'r', b'e', b'e'];
 
 /// 命令词比较。走 `&[u8] == &[u8]`，LLVM 折成 immediate 比较（旧 dispatch 同款）。
 fn streq(a: &[u8], b: &[u8]) -> bool {
@@ -181,6 +184,106 @@ fn cmd_run(c: &Ctx) -> bool {
     true
 }
 
+/// 按角色取 Job 句柄（`ps`/`free` 共用）。没有就打印一句并返回 None。
+fn job_of(c: &Ctx) -> Option<rt::Handle> {
+    // SAFETY: si_va 契约同 `find_console`（内核校验并映射、user+只读、存活期不解映射）。
+    match unsafe { rt::handle_of_role(c.si_va, rt::ROLE_JOB) } {
+        Some(h) => Some(h),
+        None => {
+            con_write(c.h, msg(M_PS_NOJOB));
+            None
+        }
+    }
+}
+
+/// ADR-132：`ps` —— 枚举自己 Job 名下的进程（27 号）。
+///
+/// **看得见的范围就是自己 Job**：内核按句柄里的 Job 过滤，所以这里不需要（也不该）
+/// 扫全表。列宽不做对齐（无堆、无格式化库）：`PID GEN THR ST PAGES` 五列以单空格分隔。
+fn cmd_ps(c: &Ctx) -> bool {
+    con_write(c.h, msg(M_PS_HDR));
+    let Some(job) = job_of(c) else { return true };
+    let mut buf = [0u8; rt::PROC_RECORD_LEN * 4];
+    let mut cursor = 0u32;
+    loop {
+        match rt::proc_enum(job, cursor, &mut buf) {
+            Ok((next, n)) => {
+                let mut i = 0usize;
+                while i < n as usize {
+                    if let Some(e) = rt::proc_enum_at(&buf, i) {
+                        put_u64(c.h, u64::from(e.pid));
+                        con_write(c.h, msg(M_SP));
+                        put_u64(c.h, u64::from(e.gen));
+                        con_write(c.h, msg(M_SP));
+                        put_u64(c.h, u64::from(e.threads));
+                        con_write(c.h, msg(M_SP));
+                        con_write(c.h, if e.terminated { msg(M_DEAD) } else { msg(M_LIVE) });
+                        con_write(c.h, msg(M_SP));
+                        put_u64(c.h, u64::from(e.pages));
+                        con_write(c.h, msg(M_NL));
+                    }
+                    i += 1;
+                }
+                if next == 0 {
+                    break;
+                }
+                cursor = next;
+            }
+            Err(e) => {
+                con_write(c.h, msg(M_PS_ERR));
+                put_i64(c.h, e.0);
+                con_write(c.h, msg(M_NL));
+                break;
+            }
+        }
+    }
+    true
+}
+
+/// ADR-132：`free` —— 自己 Job 的**用量读数**（27 号的聚合）。
+///
+/// **口径**：`pages` 是"名下 AS 当前映射着的页数"，不是物理常驻页（后者没有量具）；
+/// 全机空闲帧数在内核里，用户态今天读不到——`free` 不假装知道它。
+fn cmd_free(c: &Ctx) -> bool {
+    let Some(job) = job_of(c) else { return true };
+    let mut buf = [0u8; rt::PROC_RECORD_LEN * 4];
+    let mut cursor = 0u32;
+    let (mut procs, mut threads, mut pages) = (0u64, 0u64, 0u64);
+    loop {
+        match rt::proc_enum(job, cursor, &mut buf) {
+            Ok((next, n)) => {
+                let mut i = 0usize;
+                while i < n as usize {
+                    if let Some(e) = rt::proc_enum_at(&buf, i) {
+                        procs += 1;
+                        threads += u64::from(e.threads);
+                        pages += u64::from(e.pages);
+                    }
+                    i += 1;
+                }
+                if next == 0 {
+                    break;
+                }
+                cursor = next;
+            }
+            Err(e) => {
+                con_write(c.h, msg(M_PS_ERR));
+                put_i64(c.h, e.0);
+                con_write(c.h, msg(M_NL));
+                return true;
+            }
+        }
+    }
+    con_write(c.h, msg(M_FREE_PFX));
+    put_u64(c.h, procs);
+    con_write(c.h, msg(M_FREE_THR));
+    put_u64(c.h, threads);
+    con_write(c.h, msg(M_FREE_PAGES));
+    put_u64(c.h, pages);
+    con_write(c.h, msg(M_NL));
+    true
+}
+
 /// 有符号十进制（负数先打 `-`，再打绝对值）。`put_u64` 只处理非负。
 fn put_i64(h: ConsoleHandle, v: i64) {
     if v < 0 {
@@ -221,6 +324,12 @@ pub fn dispatch(h: ConsoleHandle, si_va: u64, p: &Parsed) -> bool {
     }
     if streq(p.cmd, &CMD_RUN) {
         return cmd_run(&c);
+    }
+    if streq(p.cmd, &CMD_PS) {
+        return cmd_ps(&c);
+    }
+    if streq(p.cmd, &CMD_FREE) {
+        return cmd_free(&c);
     }
     // unknown：三段输出与旧实现逐字节一致——词原样回显（借用不拷贝，全长不截断）。
     con_write(c.h, msg(M_UNKNOWN));

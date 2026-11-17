@@ -165,7 +165,7 @@ pub fn abi_word() -> u64 {
     }
     #[cfg(feature = "handles")]
     {
-        f |= F_HANDLES | F_VMO | F_PROC | F_WAIT | F_CONSOLE;
+        f |= F_HANDLES | F_VMO | F_PROC | F_WAIT | F_CONSOLE | F_PROCINFO;
     }
     #[cfg(feature = "fs-open")]
     {
@@ -917,6 +917,19 @@ pub const F_FS_OPEN: u64 = 512;
 /// 17：`rdi` = Proc 句柄（要 `READ`），`rsi` = 时限毫秒（0 = 只查一次不阻塞）→
 /// `rax` = `(observed << 32) | 退出码`；**0 = 超时**（不升 L4，"目标永远不收工"是业务事实）。
 pub const SYS_PROCESS_WAIT: u64 = 17;
+/// 27（ADR-132）：**枚举自己 Job 名下的进程**。`rdi` = Job 句柄（要 `RIGHT_READ`）、
+/// `rsi` = 游标（0 起）、`rdx` = 用户缓冲、`r10` = 缓冲字节数。
+/// 返回 `rax = (下一个游标 << 32) | 本次写入条数`；**下一个游标为 0 = 扫完了**。
+/// 每条是 32 字节的 `ProcEnumV1`（见 `proc_enum_record`）。**不是一致快照**：
+/// 扫描期间表在变，调用方按游标重试即可。
+pub const SYS_PROC_ENUM: u64 = 27;
+/// 28（ADR-132）：**取一个进程的统计**。`rdi` = Proc 句柄（要 `RIGHT_READ`）、
+/// `rsi` = 用户缓冲、`rdx` = 缓冲字节数 → `rax` = 0（记录已写）或负错误码。
+/// 记录是 32 字节的 `ProcStatV1`（见 `proc_stat_record`）。
+pub const SYS_PROC_STAT: u64 = 28;
+/// ADR-132 的能力位：27/28 在这份构建里可用（与 `F_WAIT` 同一条件：依赖句柄表）。
+pub const F_PROCINFO: u64 = 1024;
+
 /// 19：`rdi` = 对象句柄，`rsi` = 要等的信号位图（今天只有 bit0 = 已终止），
 /// `rdx` = 时限毫秒 → 与 17 同一个返回形状。它是通用原语，17 是它的薄壳（Q3 裁决）。
 /// **今天只支持 Proc 对象**：Thread 的等待留给后面（设计 §10.6 第 3 条"由用例逼出来再定"），
@@ -1169,6 +1182,128 @@ fn vfs_err_ret(e: crate::filesystem::vfs_ro::VfsError) -> u64 {
         V::DirTooLong => E_IO,
         V::Fs(FsError::NoEntry) => E_NOT_FOUND,
         V::Fs(_) => E_IO,
+    }
+}
+
+#[cfg(feature = "handles")]
+/// `ProcEnumV1` 的定长（ADR-132）。字段按小端写死，用户侧 `runtime` 独立声明同一组偏移。
+const PROC_ENUM_LEN: usize = 32;
+/// `ProcStatV1` 的定长。
+const PROC_STAT_LEN: usize = 32;
+/// 记录魔数（"AUP1" / "AUS1"）：用户侧先核它，再按版本解析。
+const PROC_ENUM_MAGIC: u32 = 0x3150_5541;
+const PROC_STAT_MAGIC: u32 = 0x3153_5541;
+
+/// 把一个 u32 写到记录的 `off` 处（小端）。缓冲长度由调用方保证（常量 32）。
+#[cfg(feature = "handles")]
+fn put_u32(rec: &mut [u8], off: usize, v: u32) {
+    if let Some(s) = rec.get_mut(off..off + 4) {
+        s.copy_from_slice(&v.to_le_bytes());
+    }
+}
+
+/// 一张枚举记录（32 字节）：见 ADR-132 §2.2 的布局。
+#[cfg(feature = "handles")]
+fn proc_enum_record(info: &crate::proc::ProcInfo, pages: u32) -> [u8; PROC_ENUM_LEN] {
+    let mut r = [0u8; PROC_ENUM_LEN];
+    put_u32(&mut r, 0, PROC_ENUM_MAGIC);
+    r[4] = 1; // version
+    r[5] = 1; // kind：枚举条目
+    put_u32(&mut r, 6, PROC_ENUM_LEN as u32); // 本记录字节数（自描述，便于将来加字段）
+    put_u32(&mut r, 8, u32::from(info.pid));
+    put_u32(&mut r, 12, info.gen);
+    put_u32(&mut r, 16, u32::from(info.threads));
+    put_u32(&mut r, 20, u32::from(info.terminated)); // state：0=活，1=已终止
+    put_u32(&mut r, 24, pages);
+    put_u32(&mut r, 28, u32::from(info.job));
+    r
+}
+
+/// 一张统计记录（32 字节）：比枚举多一个退出码。
+#[cfg(feature = "handles")]
+fn proc_stat_record(info: &crate::proc::ProcInfo, pages: u32) -> [u8; PROC_STAT_LEN] {
+    let mut r = [0u8; PROC_STAT_LEN];
+    put_u32(&mut r, 0, PROC_STAT_MAGIC);
+    r[4] = 1;
+    r[5] = 2; // kind：统计
+    put_u32(&mut r, 6, PROC_STAT_LEN as u32);
+    put_u32(&mut r, 8, u32::from(info.pid));
+    put_u32(&mut r, 12, info.gen);
+    put_u32(&mut r, 16, u32::from(info.threads));
+    put_u32(&mut r, 20, u32::from(info.terminated));
+    put_u32(&mut r, 24, info.exit_code);
+    put_u32(&mut r, 28, pages);
+    r
+}
+
+/// 27：枚举。见 [`SYS_PROC_ENUM`] 的形状说明。
+#[cfg(feature = "handles")]
+fn sys_proc_enum(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let len = frame.r10 as usize;
+    if len < PROC_ENUM_LEN || len > COPY_MAX {
+        return E_TOO_LONG;
+    }
+    let cap = len / PROC_ENUM_LEN;
+    let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
+    let (job, jgen) = match crate::handle::resolve(crate::handle::Handle(frame.rdi), owner, crate::handle::RIGHT_READ) {
+        Ok((crate::handle::ObjRef::Job { slot, gen }, _)) => (slot, gen),
+        Ok(_) => return E_DENIED,   // 类型不符按 -4：别把"拿错句柄"读成"没有进程"
+        Err(e) => return handle_err(e),
+    };
+    if !crate::proc::job_live(job, jgen) {
+        return E_BAD_HANDLE;
+    }
+    let mut cursor = frame.rsi as usize;
+    let slots = crate::proc::proc_slots();
+    let mut n = 0usize;
+    while n < cap && cursor < slots {
+        let idx = cursor;
+        cursor += 1;
+        let Some(info) = crate::proc::proc_info(idx) else { continue };
+        if info.job != job {
+            continue;
+        }
+        // 页数在锁外查（`aspace_mapped_pages` 自己要取 VMM）。
+        let pages = crate::mm::aspace_mapped_pages(info.aspace).unwrap_or(0);
+        let rec = proc_enum_record(&info, pages);
+        let at = frame.rdx + (n * PROC_ENUM_LEN) as u64;
+        match copy_to_user(&rec, at) {
+            Ok(k) if k == PROC_ENUM_LEN => n += 1,
+            _ => {
+                BAD_PTRS.fetch_add(1, Ordering::Relaxed);
+                return E_FAULT;
+            }
+        }
+    }
+    let next = if cursor >= slots { 0u64 } else { cursor as u64 };
+    (next << 32) | n as u64
+}
+
+/// 28：单进程统计。见 [`SYS_PROC_STAT`]。
+#[cfg(feature = "handles")]
+fn sys_proc_stat(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let len = frame.rdx as usize;
+    if len < PROC_STAT_LEN || len > COPY_MAX {
+        return E_TOO_LONG;
+    }
+    let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
+    let (pid, pgen) = match crate::handle::resolve(crate::handle::Handle(frame.rdi), owner, crate::handle::RIGHT_READ) {
+        Ok((crate::handle::ObjRef::Proc { slot, gen }, _)) => (slot, gen),
+        Ok(_) => return E_DENIED,
+        Err(e) => return handle_err(e),
+    };
+    if !crate::proc::proc_live(pid, pgen) {
+        return E_BAD_HANDLE;
+    }
+    let Some(info) = crate::proc::proc_info(usize::from(pid)) else { return E_BAD_HANDLE };
+    let pages = crate::mm::aspace_mapped_pages(info.aspace).unwrap_or(0);
+    let rec = proc_stat_record(&info, pages);
+    match copy_to_user(&rec, frame.rsi) {
+        Ok(k) if k == PROC_STAT_LEN => 0,
+        _ => {
+            BAD_PTRS.fetch_add(1, Ordering::Relaxed);
+            E_FAULT
+        }
     }
 }
 
@@ -1948,6 +2083,10 @@ pub fn syscall_dispatch(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> boo
         SYS_FILE_STAT => sys_file_stat(frame),
         #[cfg(feature = "fs-open")]
         SYS_DIR_READ => sys_dir_read(frame),
+        #[cfg(feature = "handles")]
+        SYS_PROC_ENUM => sys_proc_enum(frame),
+        #[cfg(feature = "handles")]
+        SYS_PROC_STAT => sys_proc_stat(frame),
         SYS_POKE_BUF => {
             // 内核 → 用户。写成 `Ok(n)` 而不是布尔：`n != want` 就是"中途被接住的故障"，
             // 程序核对字节时看得见的差异与内核报回的数必须一致（两台仪器不能各说各话）。

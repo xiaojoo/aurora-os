@@ -85,12 +85,14 @@ expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe
 # 数目对账：463+2=465、82+1=83、85+1=86。
 # 2026-11-17 A3 收尾（shell 的 argv 一次性命令）：user/shell U5 2→3（`rt::args_at` 那一次）。
 # 数目对账：465+1=466、86+1=87。
-total = 466
+# 2026-11-17 A4（ADR-132）：+user/runtime U5 35→37（27/28 两个调用块）、
+# +user/shell/registry U5 1→2（`job_of` 的 handle_of_role）。对账：466+3=469、87+3=90。
+total = 469
 U1 = 83
 U2 = 116
 U3 = 13
 U4 = 131
-U5 = 87
+U5 = 90
 U6 = 36
 
 [modules."acpi"]
@@ -338,7 +340,7 @@ U4 = 2
 # 不变量 = ABI 约定（号 rax、参数 rdi/rsi/rdx/r10、返回 rax 负值错误码）与 safe 层
 # 长度/枚举编码检查；生命周期 = 调用栈内；并发 = 无共享可变状态（库无全局）。
 U1 = 5
-U5 = 35
+U5 = 37
 
 
 [modules."user/execprobe"]
@@ -368,4 +370,4 @@ U1 = 1
 [modules."user/shell/registry"]
 # A3 收尾：`run` 命令。U5 一处 = `rt::handle_of_role(si_va, ROLE_JOB)` 那一次调用——
 # si_va 由内核 `process_start` 校验并映射（user+只读），契约原文在 runtime 侧。
-U5 = 1
+U5 = 2

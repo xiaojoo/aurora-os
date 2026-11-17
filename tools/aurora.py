@@ -8219,9 +8219,13 @@ def do_test(timeout: int) -> int:
     print("=== A3 验收：shell 执行 argv 里的外部命令（--features a3-shell）===")
     IMAGE.unlink(missing_ok=True)
     ashv, ashrc, ashlog = do_run(["a3-shell", "fat32-probe"], timeout)
+    # `;` 分隔三条：外部命令（A3）+ ps/free（A4 的 27 号）。一条 argv 覆盖两片。
     ash_ok = ashv == "PASS" and all((
         "run: /HELLO.ELF" in ashlog,
         "(timeout)" in ashlog,
+        "PID GEN THR ST PAGES" in ashlog,   # ps 的表头
+        "live " in ashlog,                  # ps 至少一行活进程（含页数）
+        "free: procs=" in ashlog,           # free 的聚合读数
     ))
     ash_verdict = "CONTENT-MISMATCH" if (ashv == "PASS" and not ash_ok) else ashv
     IMAGE.unlink(missing_ok=True)
@@ -8371,7 +8375,7 @@ def do_test(timeout: int) -> int:
         # A3：用户态装载器（22 号卷路径 + 段表解析 + 14 号映射 + 11/15/16/17）
         ("A3 用户态装载器执行卷上ELF", r3_verdict, r3rc, "PASS", 33),
         # A3 验收句的后半："命令输出和退出码返回 Shell"——shell 自己装载并等收工。
-        ("A3 shell执行argv里的外部命令", ash_verdict, ashrc, "PASS", 33),
+        ("A3 shell执行argv命令并ps/free读数", ash_verdict, ashrc, "PASS", 33),
     ]
     # 每一行对应那一跑的串口：不符时把红的那几格打出来。
     # 单独一张表而不是把日志塞进 `rows` 的元组里：元组要保持成"名字/期望/实际"这种
@@ -8430,7 +8434,7 @@ def do_test(timeout: int) -> int:
         "A2 argv/std经继承句柄启动外部ELF": axlog,
         "A2越界argv被校验拒": ablog,
         "A3 用户态装载器执行卷上ELF": r3log,
-        "A3 shell执行argv里的外部命令": ashlog,
+        "A3 shell执行argv命令并ps/free读数": ashlog,
     }
     all_ok = True
     print()

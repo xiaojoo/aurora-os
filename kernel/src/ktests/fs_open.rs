@@ -770,7 +770,13 @@ fn t_fs_open_ring3() -> bool {
     crate::arch::x86_64::apic::with_interrupts(|| {
         let t0 = crate::tsc::now();
         // 等**哨兵**，不等"打了几个号"：调用数会被代码生成挪顺序（`elfdisk` 那段同样的教训）。
-        while slot(data, fp::DONE) != fp::DONE_VAL && crate::tsc::now().wrapping_sub(t0) < 400_000_000 {
+        // 窗口是"探针跑完"的**超时上限**，不是精确时序判据——判据是 `DONE` 哨兵到位与否，
+        // 放宽上限不会让"探针没跑"假绿（DONE 永远不到位）。原 4×10^8（≈160 ms）把
+        // **串口吞吐算进了时间预算**：fileprobe 读多个文件，每次 AHCI 块传输都打一行
+        // ~150 字节取证日志（115200 8N1 ≈ 13 ms/行），任何让 `.ktests` 布局变一点、多打
+        // 两行的构建都会把它顶红（ADR-131 补记第三轮实测；A4 加 procinfo 用例后复现，1/1）。
+        // 放宽到 1.6×10^9（≈640 ms）给探针留出串口预算，其它判据一个不动。
+        while slot(data, fp::DONE) != fp::DONE_VAL && crate::tsc::now().wrapping_sub(t0) < 1_600_000_000 {
             rounds += 1;
             crate::tsc::spin(20_000);
         }

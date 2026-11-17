@@ -7,6 +7,13 @@ name = "aurora-kernel"
 version = "0.0.0"
 
 [[package]]
+name = "aurora-user-execprobe"
+version = "0.0.0"
+dependencies = [
+ "aurora-user-runtime",
+]
+
+[[package]]
 name = "aurora-user-fileprobe"
 version = "0.0.0"
 
@@ -19,5 +26,12 @@ name = "aurora-user-probe"
 version = "0.0.0"
 
 [[package]]
+name = "aurora-user-runtime"
+version = "0.0.0"
+
+[[package]]
 name = "aurora-user-shell"
 version = "0.0.0"
+dependencies = [
+ "aurora-user-runtime",
+]
