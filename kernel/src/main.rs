@@ -659,6 +659,13 @@ struct BootPkgCell(UnsafeCell<[u8; sign::PKG_BYTES]>);
 unsafe impl Sync for BootPkgCell {}
 static BOOT_PKG_BUF: BootPkgCell = BootPkgCell(UnsafeCell::new([0u8; sign::PKG_BYTES]));
 
+/// 覆盖名字段的定长拷贝（`publish_cover` 要的是数组，不是切片）。
+fn path_field_of(pkg: &[u8]) -> [u8; sign::PATH_BYTES] {
+    let mut f = [0u8; sign::PATH_BYTES];
+    f.copy_from_slice(&pkg[sign::PATH_OFF..sign::PATH_OFF + sign::PATH_BYTES]);
+    f
+}
+
 /// Stage3c（W4 S3，ADR-080）：验签**进启动决策**，但口径是**只检测、不拒启**。
 ///
 /// 为什么现在只检测：拒启（"验不过 ⇒ BOOT-INVALID(37)"）要等装载侧身份 + A/B 槽位 +
@@ -693,14 +700,26 @@ fn stage_signature_check() {
         reads += 1;
     }
     match sign::check_package(buf, &sign::PK_ANCHOR) {
-        Ok(n) => crate::log_info!(
-            "sign-boot: 验签通过 载荷字节={} 读盘次数={} 包字节={} 起始LBA={} 拒启=false",
-            n, reads, sign::PKG_BYTES, sign::PKG_START_LBA
-        ),
-        Err(e) => crate::log_warn!(
-            "sign-boot: 验签被拒 理由={} 附带={} 读盘次数={} 包字节={} 起始LBA={} 拒启=false（ADR-080：只检测不拒启）",
-            sign::reason(e), sign::reason_arg(e), reads, sign::PKG_BYTES, sign::PKG_START_LBA
-        ),
+        Ok(n) => {
+            // S2（ADR-115）：把"已验证记录"发布给 16 号。16 不再重读这一包：
+            // 签名在这里对**同一块盘上的字节**验过，之后只读记录比文件（ADR-115 补记三）。
+            let pay_digest = sign::digest(&buf[sign::PAY_OFF..sign::PAY_OFF + n]);
+            sign::publish_cover(sign::COVER_VERIFIED, &path_field_of(buf), n, &pay_digest);
+            crate::log_info!(
+                "sign-boot: 验签通过 载荷字节={} 读盘次数={} 包字节={} 起始LBA={} 拒启=false",
+                n, reads, sign::PKG_BYTES, sign::PKG_START_LBA
+            )
+        }
+        Err(e) => {
+            // 包形坏但名字读得出来 ⇒ 记成 Invalid：16 号对这个名字 fail-closed。
+            if sign::covered_path(buf).is_some() {
+                sign::publish_cover(sign::COVER_INVALID, &path_field_of(buf), 0, &[0u8; sign::DIGEST_BYTES]);
+            }
+            crate::log_warn!(
+                "sign-boot: 验签被拒 理由={} 附带={} 读盘次数={} 包字节={} 起始LBA={} 拒启=false（ADR-080：只检测不拒启）",
+                sign::reason(e), sign::reason_arg(e), reads, sign::PKG_BYTES, sign::PKG_START_LBA
+            )
+        }
     }
 }
 

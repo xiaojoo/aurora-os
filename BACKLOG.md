@@ -15004,3 +15004,24 @@ kernel 栈/地址窗口上的脆弱）。下一刀先定位它：用同一段包
 - 所以 S2 的第一刀在用户侧：`load(path)` 把路径写成子进程 SI 页的 argv[0]（ADR-130 约定），
   内核 16 号才有比较对象。它会改 `shell.elf` 等产物字节与两块 `.img.zz` 卷里的副本，
   按"夹具级改动"单开。**S2 未开工**；本条只把前置写下来（S1b 已收口，`f730871`）。
+
+## 391. 验签 S2：16 号闸门落地（ADR-115 补记三；ABI 0.16）（2026-11-17）
+
+- 用户侧：`user/runtime/src/exec.rs::launch` 把 `load` 同一条路径写成子进程 argv[0]
+  （SI 页 280 起、NUL 结尾、≤512）。此前 `(0,0)`（§390）。
+- 内核：16 号在 `fs-open` 构建里读首串；形状不合"内核绝对路径" ⇒ 无覆盖放行 + `unsigned_exec`；
+  名字 == 覆盖名 ⇒ 比盘上文件（大小 + 流式摘要）与 **BOOT 阶段发布的一次性记录**（签名绑定的
+  名 + 载荷长 + 载荷摘要），任一不符 ⇒ `-1` + `exec_denied`。签名不在执行路径上重验：理由与
+  取舍写在 ADR-115 补记三（要重验得给每个 CPU 一份 24 KiB 静态区或新增一把锁）。
+- ABI minor 15 → 16、`F_FS_VERIFY_EXEC = 4096`（只在 `fs-open`）；`ktests/fs_open.rs`/
+  `fs_rw.rs` 的断言同步；`user::exec_verify_counters()` 给三本账。
+- 新读数：`sha: 判据 … 流式同=true`（`Hasher` 按 1/63/64/65 切分与 `digest()` 同数）；
+  `pkg: 覆盖记录 状态=2 名=Some("/HELLO.ELF") 载荷长=17288/17288 摘要同=true`。
+- 产品路径两档过闸且通过：`a3-exec`/`a3-shell`（都带 `fat32-probe`）串口各一行
+  `exec-verify: 判=通过 名=/HELLO.ELF 字节=17288`；a3-shell 照旧 `(timeout)`。
+  （单独跑 `--features a3-shell` 不带卷会报 `error=-7`——根口 3 没挂盘，不是闸门；这是命令形状。）
+- 读数：`sig-check` PASS(33) 84/84（`c16f1d917175`）；`check` 17/17；整链 **68/68 符合**
+  （`build/s2-matrix.log`，默认档 `1d09ae8d2dd2`）。`kernel/fixtures/shell.elf` 因 argv 写入刷新
+  （`3136a6395acd`）。
+- 未做/边界：**拒启那一路的证红（宿主改盘 ⇒ 该格红）按 ADR-115 仍是 S3**；执行的字节仍来自
+  调用方的段 VMO，闸门不防"撒谎的装载器"；启动阶段读盘失败时记录为 Absent、闸门不生效。

@@ -57,15 +57,39 @@ fn t_sha256() -> bool {
         .count();
     let again = sign::digest(&orig) == sign::digest(&orig);
     let endian_ok = (ew[0] >> 16) as u16 == u16::from_be_bytes([empty[0], empty[1]]);
+    // 流式 vs 一次算完：同一段 128 字节按 1/63/64/65 字节切分喂，摘要必须同数。
+    // 这一格盯的是 `Hasher` 的缓冲拼接与补位边界；`digest()` 仍是参照。
+    let stream_same = {
+        let mut msg = [0u8; 128];
+        for i in 0..128 {
+            msg[i] = payload_byte(i);
+        }
+        let want = sign::digest(&msg);
+        let mut same = true;
+        for step in [1usize, 63, 64, 65] {
+            let mut h = sign::Hasher::new();
+            let mut i = 0usize;
+            while i < msg.len() {
+                let n = core::cmp::min(step, msg.len() - i);
+                h.update(&msg[i..i + n]);
+                i += n;
+            }
+            if h.finish() != want {
+                same = false;
+            }
+        }
+        same
+    };
     crate::log_info!(
-        "sha: 判据 长度向量互不相同={} 空串形状={} 雪崩字节={}/32 幂等={} 端序自洽={}",
+        "sha: 判据 长度向量互不相同={} 空串形状={} 雪崩字节={}/32 幂等={} 端序自洽={} 流式同={}",
         distinct,
         shape_ok,
         avalanche,
         again,
-        endian_ok
+        endian_ok,
+        stream_same
     );
-    let ok = distinct && shape_ok && avalanche >= 8 && again && endian_ok;
+    let ok = distinct && shape_ok && avalanche >= 8 && again && endian_ok && stream_same;
     if !ok {
         crate::log_fatal!("sha: SHA-256 判据不成立（上面十四行是全部读数）");
     }
@@ -190,7 +214,23 @@ fn t_sig_package() -> bool {
         ahci_still_ok,
         covered
     );
-    let ok = load_ok && hdr_ok && verify_ok && payload_same && tamper_ok && ahci_still_ok && path_ok;
+    // 启动阶段发布的覆盖记录：名字、载荷长、摘要都要对上内核手上那份夹具。
+    let cov = sign::cover();
+    let cov_name = sign::path_in_field(&cov.path_field);
+    let cov_digest_same = cov.pay_digest == sign::digest(HELLO_ELF);
+    let cover_ok = cov.state == sign::COVER_VERIFIED
+        && cov_name == Some(&b"/HELLO.ELF"[..])
+        && cov.pay_len == HELLO_ELF.len()
+        && cov_digest_same;
+    crate::log_info!(
+        "pkg: 覆盖记录 状态={} 名={:?} 载荷长={}/{} 摘要同={}",
+        cov.state,
+        cov_name.and_then(|p| core::str::from_utf8(p).ok()),
+        cov.pay_len,
+        HELLO_ELF.len(),
+        cov_digest_same
+    );
+    let ok = load_ok && hdr_ok && verify_ok && payload_same && tamper_ok && ahci_still_ok && path_ok && cover_ok;
     if !ok {
         crate::log_fatal!("pkg: 签名包判据不成立（上面的取证、十二条篡改与判据行是全部读数）");
     }

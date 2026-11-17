@@ -183,7 +183,7 @@ pub fn load(path: &[u8]) -> Result<Loaded, RTError> {
 ///
 /// `console` 是调用方自己的控制台句柄：内部分配一个**副本**（带 `RIGHT_TRANSFER`）
 /// 以 `ROLE_LOG` 转移给子进程——既有产物（hello/shell）认的就是这个角色号。
-pub fn launch(l: &Loaded, console: Handle, job: Handle) -> Result<Handle, RTError> {
+pub fn launch(l: &Loaded, console: Handle, job: Handle, argv0: &[u8]) -> Result<Handle, RTError> {
     let proc = process_create(job)?;
     // 逐段映射（14 号；VA 对账在 map_segs 里，内核给了别的地址就明确拒）。
     elf::map_segs(proc, &l.img, &l.segs)?;
@@ -205,7 +205,21 @@ pub fn launch(l: &Loaded, console: Handle, job: Handle) -> Result<Handle, RTErro
     hdr[6] = ((crate::abi_info() >> 16) & 0xFF) as u8;
     hdr[7] = 0;
     put_u32(&mut hdr, 8, 1); // nhandles
+    // S2（ADR-115）：子进程的 argv[0] = 这条路径。内核 16 号拿它和签名包的覆盖名比；
+    // 不写的话子进程拿到 `(0,0)`，闸门永远走"无覆盖"（BACKLOG 390 的前置勘误）。
+    const ARGS_OFF: u64 = 280;
+    if argv0.is_empty() {
+        return Err(RTError::INVALID);
+    }
+    if argv0.len() + 1 > 512 {
+        return Err(RTError::TOOLONG);
+    }
+    put_u32(&mut hdr, 12, ARGS_OFF as u32);
+    put_u32(&mut hdr, 16, (argv0.len() + 1) as u32);
     vmo_write(si, 0, &hdr)?;
+    vmo_write(si, ARGS_OFF, argv0)?;
+    let nul = [0u8; 1];
+    vmo_write(si, ARGS_OFF + argv0.len() as u64, &nul)?;
     let mut desc = [0u8; SI_DESC_BYTES];
     put_u32(&mut desc, 0, ROLE_LOG);
     put_u64(&mut desc, 8, con_dup);
@@ -232,6 +246,6 @@ pub fn wait_exit(proc: Handle, timeout_ms: u64) -> Result<Option<u32>, RTError> 
 /// "还在跑"，而不是替使用者开枪——18 号杀进程是个独立决定）。
 pub fn run(path: &[u8], console: Handle, job: Handle, timeout_ms: u64) -> Result<Option<u32>, RTError> {
     let l = load(path)?;
-    let proc = launch(&l, console, job)?;
+    let proc = launch(&l, console, job, path)?;
     wait_exit(proc, timeout_ms)
 }

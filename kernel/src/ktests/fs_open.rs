@@ -314,8 +314,8 @@ fn syscall_cells(fs: &ReadOnlyFs<'_>, small: &vfs_ro::Entry, direct: &[u8; 100])
     let counters = handle::counters();
     // ABI 0.13（ADR-108 补记八）：写意图位只在 `fs-rw` 置位。
     let abi = user::abi_word();
-    let abi_ok = abi & user::F_FS_OPEN != 0
-        && user::ABI_MINOR == 15
+    let abi_ok = abi & user::F_FS_OPEN != 0 && abi & user::F_FS_VERIFY_EXEC != 0
+        && user::ABI_MINOR == 16
         && if cfg!(feature = "fs-rw") {
             abi & user::F_FS_WRITE_OPEN != 0 && abi & user::F_FS_WRITE_ROOT != 0
         } else {

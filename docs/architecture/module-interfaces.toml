@@ -398,7 +398,7 @@ public_api = [
   "user::syscall_dispatch",
 ]
 allowed_callers = ["integration"]
-dependencies = ["arch", "boot", "capability", "diagnostics", "input", "memory", "storage", "sync", "time"]
+dependencies = ["arch", "boot", "capability", "diagnostics", "input", "memory", "security", "storage", "sync", "time"]
 forbidden_dependencies = []
 known_violations = []
 context = ["KERNEL", "IRQ_OFF", "ISR_TOP"]
@@ -801,15 +801,29 @@ source_modules = ["sign"]
 public_api = [
   "sign::PKG_BYTES",
   "sign::PKG_PAYLOAD_BYTES",
-  "sign::check_package",
-  "sign::digest",
   "sign::PKG_START_LBA",
   "sign::PK_ANCHOR",
   "sign::SECTOR_BYTES",
+  "sign::PAY_OFF",
+  "sign::PATH_OFF",
+  "sign::PATH_BYTES",
+  "sign::DIGEST_BYTES",
+  "sign::check_package",
+  "sign::covered_path",
+  "sign::path_in_field",
+  "sign::signed_msg",
+  "sign::signed_msg_from_digest",
+  "sign::digest",
+  "sign::Hasher",
+  "sign::COVER_ABSENT",
+  "sign::COVER_INVALID",
+  "sign::COVER_VERIFIED",
+  "sign::publish_cover",
+  "sign::cover",
   "sign::reason",
   "sign::reason_arg",
 ]
-allowed_callers = ["integration"]
+allowed_callers = ["integration", "sched"]
 dependencies = []
 forbidden_dependencies = []
 known_violations = []

@@ -69,7 +69,7 @@ pub const F_CONSOLE: u64 = 256;
 /// minor=15：9 号 `dup` 改为**共享读取位置**（ADR-108 补记二，2026-11-17 使用者裁决）。
 /// 号只追加不复用（Q1）。
 pub const ABI_MAJOR: u64 = 0;
-pub const ABI_MINOR: u64 = 15;
+pub const ABI_MINOR: u64 = 16;
 pub const F_FASTPATH: u64 = 1;
 pub const F_SMAP: u64 = 2;
 pub const F_SMEP: u64 = 4;
@@ -173,7 +173,7 @@ pub fn abi_word() -> u64 {
     }
     #[cfg(feature = "fs-open")]
     {
-        f |= F_FS_OPEN;
+        f |= F_FS_OPEN | F_FS_VERIFY_EXEC;
     }
     #[cfg(feature = "fs-rw")]
     {
@@ -707,6 +707,115 @@ fn undo_start(
     }
 }
 
+
+
+// ---------------------------------------------------------------- S2：16 号的验签闸（ADR-115）
+
+#[cfg(feature = "fs-open")]
+static EXEC_VERIFIED: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "fs-open")]
+static EXEC_DENIED: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "fs-open")]
+static EXEC_UNSIGNED: AtomicU64 = AtomicU64::new(0);
+
+/// 三本账：通过 / 拒启 / 无覆盖放行。S3 的判定行与宿主注入读的就是这三个数。
+#[cfg(feature = "fs-open")]
+#[must_use]
+pub fn exec_verify_counters() -> (u64, u64, u64) {
+    (
+        EXEC_VERIFIED.load(Ordering::Relaxed),
+        EXEC_DENIED.load(Ordering::Relaxed),
+        EXEC_UNSIGNED.load(Ordering::Relaxed),
+    )
+}
+
+#[cfg(feature = "fs-open")]
+fn exec_deny(name: &str, why: &str) -> u64 {
+    EXEC_DENIED.fetch_add(1, Ordering::Relaxed);
+    crate::log_warn!("exec-verify: 判=拒 原因={} 名={}", why, name);
+    E_INVALID
+}
+
+/// args 区首串（argv[0]）。形状：非空、NUL 结尾、可打印 ASCII、以 '/' 开头。
+/// 不满足 ⇒ `None`：它不可能等于内核绝对覆盖名，按"无覆盖"处理（ADR-115 未决 1）。
+#[cfg(feature = "fs-open")]
+fn argv0_of(args: &[u8]) -> Option<&str> {
+    let end = args.iter().position(|b| *b == 0)?;
+    if end == 0 || end > crate::sign::PATH_BYTES - 1 {
+        return None;
+    }
+    let name = &args[..end];
+    if name[0] != b'/' || !name.iter().all(|b| (0x21..=0x7e).contains(b)) {
+        return None;
+    }
+    core::str::from_utf8(name).ok()
+}
+
+/// 包在且包名 == argv[0] ⇒ 按内核路径开文件、流式摘要、与已验证记录比；任一不符 ⇒ `Some(-1)`。
+/// `None` = 放行（通过，或这名字不被任何包覆盖）。
+///
+/// 签名本身在 BOOT 阶段对同一块盘上的包验过（`sign::publish_cover`）；这里比的是它承诺的
+/// 名字与载荷摘要。**不重读 24 KiB 公钥/签名**：那需要每个 CPU 一份静态区，而"验的与跑的是
+/// 同一块盘"的性质由启动阶段那一次验签已经给出（ADR-115 补记三记这笔取舍）。
+#[cfg(feature = "fs-open")]
+#[inline(never)]
+fn exec_gate(name: &str) -> Option<u64> {
+    use crate::filesystem::fs_open::{self, Opened};
+    use crate::filesystem::vfs::AhciDisk;
+    use crate::filesystem::vfs_ro::ReadOnlyFs;
+
+    let cov = crate::sign::cover();
+    let covered = cov.state != crate::sign::COVER_ABSENT
+        && crate::sign::path_in_field(&cov.path_field) == Some(name.as_bytes());
+    if !covered {
+        EXEC_UNSIGNED.fetch_add(1, Ordering::Relaxed);
+        crate::log_info!("exec-verify: 判=无覆盖 名={}", name);
+        return None;
+    }
+    if cov.state != crate::sign::COVER_VERIFIED {
+        return Some(exec_deny(name, "包无效"));
+    }
+    let (port, mut cursor, size) = match fs_open::open(name, fs_open::OPEN_READ_ONLY) {
+        Ok(Opened::File { port, cursor, stat }) => (port, cursor, stat.size as usize),
+        Ok(Opened::Dir { .. }) => return Some(exec_deny(name, "不是文件")),
+        Err(e) => {
+            crate::log_warn!("exec-verify: 打开失败 tag={}", e.tag());
+            return Some(exec_deny(name, "打不开"));
+        }
+    };
+    if size != cov.pay_len {
+        return Some(exec_deny(name, "大小不符"));
+    }
+    let disk = AhciDisk { port };
+    let fs = match ReadOnlyFs::mount(&disk) {
+        Ok(f) => f,
+        Err(_) => return Some(exec_deny(name, "挂载失败")),
+    };
+    let mut h = crate::sign::Hasher::new();
+    let mut chunk = [0u8; 512];
+    let mut got = 0usize;
+    loop {
+        match fs.read(&mut cursor, &mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                h.update(&chunk[..n]);
+                got += n;
+                if got > cov.pay_len {
+                    return Some(exec_deny(name, "超长"));
+                }
+            }
+            Err(_) => return Some(exec_deny(name, "读盘失败")),
+        }
+    }
+    let d = h.finish();
+    if got != cov.pay_len || d != cov.pay_digest {
+        return Some(exec_deny(name, "摘要不符"));
+    }
+    EXEC_VERIFIED.fetch_add(1, Ordering::Relaxed);
+    crate::log_info!("exec-verify: 判=通过 名={} 字节={}", name, got);
+    None
+}
+
 /// 16：校验 → 转移 → 回填 → 放线程跑（ADR-075 决策 3 的四步，顺序不可换）。
 ///
 /// **不是真原子**（使用者裁决 2026-11-10）：②③之间另一个 CPU 能看到"句柄已转移但表还没填"。
@@ -792,6 +901,31 @@ fn sys_process_start(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
             || args_len > ARGS_MAX
         {
             return E_INVALID;
+        }
+    }
+    // S2（ADR-115）：argv[0] 若被签名包覆盖，执行前先比盘上文件；不过 ⇒ -1。
+    // 无 argv（`0/0`）只计数不记日志：内核自己起的那些任务全都走这条路，逐条打会把串口淹掉。
+    #[cfg(feature = "fs-open")]
+    {
+        if (args_off, args_len) == (0, 0) {
+            EXEC_UNSIGNED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            let mut name = [0u8; crate::sign::PATH_BYTES];
+            let take = core::cmp::min(args_len, crate::sign::PATH_BYTES);
+            if crate::vmo::vmo_read(vid, args_off, &mut name[..take]) != Ok(take) {
+                return E_FAULT;
+            }
+            match argv0_of(&name[..take]) {
+                Some(argv0) => {
+                    if let Some(ret) = exec_gate(argv0) {
+                        return ret;
+                    }
+                }
+                None => {
+                    EXEC_UNSIGNED.fetch_add(1, Ordering::Relaxed);
+                    crate::log_info!("exec-verify: 判=无覆盖 原因=名字不是内核绝对路径");
+                }
+            }
         }
     }
     let mut area = [0u8; MAX_STARTUP_HANDLES * SI_DESC_BYTES];
@@ -926,6 +1060,8 @@ pub const F_WAIT: u64 = 128;
 /// FS-03（ADR-108）：22/24/25/26 与 VFS 句柄对象在这份构建里可用。
 /// 它只在 `fs-open` 置位；`handles`/`wm` 不得从这一位推断文件 API 存在。
 pub const F_FS_OPEN: u64 = 512;
+/// S2（ADR-115）：16 号会按"包名 == argv[0]"比盘上文件，不过就 `-1`。只在 `fs-open` 置位。
+pub const F_FS_VERIFY_EXEC: u64 = 4096;
 /// ADR-111 决策 1（2026-11-17 裁决）：22 号的 `flags=1`（写意图）在这份构建里可用。
 /// 只在 `fs-rw` 置位：**只读构建里写意图 open 一律 `-15`**，不能从 `F_FS_OPEN` 推断它可用。
 /// 置位时写意图 open 路由到可写卷（口 4）并授 `READ|WRITE`；读意图仍走只读根（口 5）。

@@ -5,6 +5,8 @@
 //! 逐字对账；摘要本身另有一台仪器（宿主机的 `hashlib`，矩阵第 25 行）。两道独立：
 //! 表错了 ⇒ 门禁红；轮函数错了 ⇒ 对账红；两边一起错才可能瞒过去，而那正是可以审的。
 
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+
 /// 初始哈希值（前 8 个素数平方根的小数前 32 位）
 pub const IV: [u32; 8] = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
 
@@ -115,6 +117,61 @@ pub fn words(d: &[u8; DIGEST_BYTES]) -> [u32; 8] {
     w
 }
 
+/// 流式 SHA-256：按块喂。`digest()` 那条一次算完的路保持原样（它是所有判据的参照）；
+/// 这一条给"按分块读一个盘上文件"用：文件不整块进内存，也不整块进栈。
+/// 两条实现必须给同一个数：`sig-check` 里有一格按 1/63/64/65 字节切分的喂法与 `digest()` 对账。
+pub struct Hasher {
+    h: [u32; 8],
+    buf: [u8; BLOCK],
+    fill: usize,
+    total: u64,
+}
+
+impl Hasher {
+    pub fn new() -> Self {
+        Hasher { h: IV, buf: [0; BLOCK], fill: 0, total: 0 }
+    }
+
+    pub fn update(&mut self, mut data: &[u8]) {
+        self.total = self.total.wrapping_add(data.len() as u64);
+        if self.fill > 0 {
+            let take = core::cmp::min(BLOCK - self.fill, data.len());
+            self.buf[self.fill..self.fill + take].copy_from_slice(&data[..take]);
+            self.fill += take;
+            data = &data[take..];
+            if self.fill == BLOCK {
+                compress(&mut self.h, &self.buf);
+                self.fill = 0;
+            }
+        }
+        while data.len() >= BLOCK {
+            compress(&mut self.h, &data[..BLOCK]);
+            data = &data[BLOCK..];
+        }
+        if !data.is_empty() {
+            self.buf[..data.len()].copy_from_slice(data);
+            self.fill = data.len();
+        }
+    }
+
+    pub fn finish(mut self) -> [u8; DIGEST_BYTES] {
+        let bits = self.total.wrapping_mul(8);
+        let mut blk = [0u8; BLOCK];
+        blk[..self.fill].copy_from_slice(&self.buf[..self.fill]);
+        blk[self.fill] = 0x80;
+        if self.fill >= BLOCK - 8 {
+            compress(&mut self.h, &blk);
+            blk = [0u8; BLOCK];
+        }
+        blk[BLOCK - 8..].copy_from_slice(&bits.to_be_bytes());
+        compress(&mut self.h, &blk);
+        let mut out = [0u8; DIGEST_BYTES];
+        for (j, w) in self.h.iter().enumerate() {
+            out[j * 4..j * 4 + 4].copy_from_slice(&w.to_be_bytes());
+        }
+        out
+    }
+}
 
 // ==================================================== M9-a②：一次性签名（Lamport）与签名包
 
@@ -305,12 +362,84 @@ pub fn covered_path(pkg: &[u8]) -> Option<&[u8]> {
     Some(&pkg[PATH_OFF..PATH_OFF + end])
 }
 
+/// 覆盖记录的三态（ADR-115 S2）。
+pub const COVER_ABSENT: u8 = 0;
+pub const COVER_INVALID: u8 = 1;
+pub const COVER_VERIFIED: u8 = 2;
+
+const PATH_WORDS: usize = PATH_BYTES / 8;
+const DG_WORDS: usize = DIGEST_BYTES / 8;
+
+static COVER_PATH: [AtomicU64; PATH_WORDS] = [const { AtomicU64::new(0) }; PATH_WORDS];
+static COVER_PAY_DIGEST: [AtomicU64; DG_WORDS] = [const { AtomicU64::new(0) }; DG_WORDS];
+static COVER_PAY_LEN: AtomicU32 = AtomicU32::new(0);
+static COVER_STATE: AtomicU8 = AtomicU8::new(COVER_ABSENT);
+
+/// 启动阶段验完包把"已验证记录"发布一次：名字字段 + 载荷长 + 载荷摘要。
+/// 单写者：BOOT 阶段一次，在 AP 释放与任何 ring3 之前；之后整机只读。
+/// `state` 用 Release 存：先写字段、后立旗，读者看到旗就一定看到字段。
+pub fn publish_cover(state: u8, path_field: &[u8; PATH_BYTES], pay_len: usize, pay_digest: &[u8; DIGEST_BYTES]) {
+    for (i, w) in path_field.chunks_exact(8).enumerate() {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(w);
+        COVER_PATH[i].store(u64::from_le_bytes(b), Ordering::Relaxed);
+    }
+    for (i, w) in pay_digest.chunks_exact(8).enumerate() {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(w);
+        COVER_PAY_DIGEST[i].store(u64::from_le_bytes(b), Ordering::Relaxed);
+    }
+    COVER_PAY_LEN.store(pay_len.min(u32::MAX as usize) as u32, Ordering::Relaxed);
+    COVER_STATE.store(state, Ordering::Release);
+}
+
+/// 已发布的那份记录。状态是 ABSENT 时其余字段无意义。
+#[derive(Clone, Copy)]
+pub struct Cover {
+    pub state: u8,
+    pub path_field: [u8; PATH_BYTES],
+    pub pay_len: usize,
+    pub pay_digest: [u8; DIGEST_BYTES],
+}
+
+pub fn cover() -> Cover {
+    let state = COVER_STATE.load(Ordering::Acquire);
+    let mut path_field = [0u8; PATH_BYTES];
+    for i in 0..PATH_WORDS {
+        path_field[i * 8..i * 8 + 8].copy_from_slice(&COVER_PATH[i].load(Ordering::Relaxed).to_le_bytes());
+    }
+    let mut pay_digest = [0u8; DIGEST_BYTES];
+    for i in 0..DG_WORDS {
+        pay_digest[i * 8..i * 8 + 8].copy_from_slice(&COVER_PAY_DIGEST[i].load(Ordering::Relaxed).to_le_bytes());
+    }
+    Cover {
+        state,
+        path_field,
+        pay_len: COVER_PAY_LEN.load(Ordering::Relaxed) as usize,
+        pay_digest,
+    }
+}
+
+/// 覆盖名字段里读出的那个名字（NUL 之前）。空名 ⇒ None。
+pub fn path_in_field(field: &[u8; PATH_BYTES]) -> Option<&[u8]> {
+    let end = path_end(field)?;
+    if end == 0 {
+        return None;
+    }
+    Some(&field[..end])
+}
+
 /// 签名承诺的那 32 个字节：`sha256(覆盖名 64 字节定长字段 ‖ sha256(载荷))`。
 /// 名字也进签名：S2 的开关是"包名 == argv[0]"——名字不被签住的话，把包名从 /A 改成 /B，A 就变成"无覆盖包"而按放行计数启动，验签只挡得住"写坏了一个包"（ADR-115 S1b）。
 pub fn signed_msg(path_field: &[u8; PATH_BYTES], payload: &[u8]) -> [u8; DIGEST_BYTES] {
+    signed_msg_from_digest(path_field, &digest(payload))
+}
+
+/// 同一式的另一个入口：手里只有载荷摘要的时候（16 号边读边算，不把文件再拼一遍）。
+pub fn signed_msg_from_digest(path_field: &[u8; PATH_BYTES], pay: &[u8; DIGEST_BYTES]) -> [u8; DIGEST_BYTES] {
     let mut buf = [0u8; PATH_BYTES + DIGEST_BYTES];
     buf[..PATH_BYTES].copy_from_slice(path_field);
-    buf[PATH_BYTES..].copy_from_slice(&digest(payload));
+    buf[PATH_BYTES..].copy_from_slice(pay);
     digest(&buf)
 }
 
