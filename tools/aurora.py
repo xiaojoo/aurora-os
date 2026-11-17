@@ -8555,6 +8555,10 @@ def do_test(timeout: int) -> int:
         # 排序口径：每帧的 pages 列必须**非升**（pages 降序，并列按 pid 升序，
         # pid 升序 ⇒ 同 pages 时行序稳定）。负样本：把 top_cmp 翻转 ⇒ 这格红。
         _top_pages_nondecreasing(ashlog),
+        # kill（ADR-134）：argv 末尾 `kill 9999`（必不存在的 pid）⇒ 29 号按
+        # 调用者名下的 Proc 句柄反查不到 ⇒ -5。这验 kill 命令接线 + capability
+        # 语义；真正"能杀"由内核侧 t_proc_kill 的按 pid 杀那格覆盖。
+        re.search(r"kill 9999\n-5\n", ashlog) is not None,
     ))
     _tot = EXEC_TOTAL_RE.search(ashlog)
     if not _tot or int(_tot.group(1)) < 1 or int(_tot.group(2)) != 0:

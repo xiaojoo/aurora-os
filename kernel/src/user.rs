@@ -98,6 +98,10 @@ pub const SYS_THREAD_CREATE: u64 = 15;
 /// **枚举方式是全文扫 72 格按 `proc_id` 认**（使用者裁决 2026-11-10），不新加每进程线程名单。
 /// 杀自己的进程一律 `-4`：那条路要交给 `SYS_EXIT`，在 syscall 里把自己标 Free 会让返回路径踩空槽。
 pub const SYS_PROCESS_KILL: u64 = 18;
+/// ADR-134 (29): rdi=pid -> rax = threads killed.
+/// pid is only an address; authority comes from a RIGHT_WRITE Proc handle
+/// found in the CALLER OWN name table, then the same kill path as syscall 18.
+pub const SYS_PROC_KILL_BY_PID: u64 = 29;
 /// 16：`rdi` = Proc 句柄、`rsi` = Thread 句柄、`rdx` = StartupInfo 那一页的 VMO 句柄、
 /// `r10` = 它在**子 AS** 里的只读 VA → 成功返回 0。顺序固定：校验 → 转移 → 回填 → 放线程跑。
 pub const SYS_PROCESS_START: u64 = 16;
@@ -1171,7 +1175,30 @@ fn sys_object_wait(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
 #[inline(never)]
 fn sys_process_kill(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
-    let (obj, _) = match crate::handle::resolve(crate::handle::Handle(frame.rdi), owner, crate::handle::RIGHT_WRITE) {
+    sys_process_kill_core(crate::handle::Handle(frame.rdi), owner)
+}
+
+/// ADR-134 (29): rdi=pid. Find a RIGHT_WRITE Proc handle in the CALLER OWN
+/// name table, then take the same kill path as syscall 18. pid is only an
+/// address; authority still comes from the capability.
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_proc_kill_by_pid(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
+    let pid = frame.rdi as u16;
+    let Some(gen) = crate::proc::proc_gen(pid) else { return E_BAD_HANDLE };
+    let h = match crate::handle::find_proc(owner, pid, gen, crate::handle::RIGHT_WRITE) {
+        Ok(h) => h,
+        Err(e) => return handle_err(e),
+    };
+    sys_process_kill_core(h, owner)
+}
+
+/// Shared tail of 18 and 29: the part after a Proc handle is resolved.
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_process_kill_core(h: crate::handle::Handle, owner: (usize, u32)) -> u64 {
+    let (obj, _) = match crate::handle::resolve(h, owner, crate::handle::RIGHT_WRITE) {
         Ok(v) => v,
         Err(e) => return handle_err(e),
     };
@@ -1182,7 +1209,6 @@ fn sys_process_kill(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     if !crate::proc::proc_live(pid, pgen) {
         return E_BAD_HANDLE;
     }
-    // 自杀不在这里做：syscall 返回路径还要用当前槽，把自己标 Free 就是踩空
     let me = crate::sched::current_id();
     if crate::sched::proc_id_of(me) == pid {
         return E_DENIED;
@@ -2303,6 +2329,8 @@ pub fn syscall_dispatch(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> boo
         SYS_OBJECT_WAIT => sys_object_wait(frame),
         #[cfg(feature = "handles")]
         SYS_PROCESS_KILL => sys_process_kill(frame),
+        #[cfg(feature = "handles")]
+        SYS_PROC_KILL_BY_PID => sys_proc_kill_by_pid(frame),
         #[cfg(feature = "handles")]
         SYS_CONSOLE_WRITE => sys_console_io(frame, true),
         #[cfg(feature = "handles")]

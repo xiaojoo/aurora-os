@@ -15153,3 +15153,38 @@ PASS(33)、`ours峰值=7`**（run-1664）⇒ 采样窗口漏一拍的形状，�
 §383 的"peak=false 要当红查"已照办：查过，单跑复现不了，判据未改。
 （A4 验收句剩 `kill`：18 号内核面就绪，缺"按 pid 找 Proc 句柄"的角色语义，
 归 ADR-132 §未做 2。）
+
+
+## 396. ADR-134 `kill`：29 号与 capability 语义（workbuddy，2026-11-18）
+
+使用者裁决：新增 29 号 `SYS_PROC_KILL_BY_PID`（23 号被 ADR-110/111 占住不可用）。
+**pid 只是寻址，授权仍靠 capability**：内核只在调用者自己名下的句柄表里反查
+`(pid, 当前 gen, RIGHT_WRITE)` 的 Proc 句柄，找到后走与 18 号**同一个**杀实现
+（`sys_process_kill_core`），权限/自杀/杀线程的逻辑只有一份，不分叉。
+
+裁决的技术依据（查实的事实链）：11 号只返回句柄不给 pid；句柄值 = 句柄表槽+世代，
+不含进程 pid；27 号枚举给 pid 但给不出对应句柄；内核句柄表里存着
+`ObjRef::Proc { slot, gen }`（slot=pid）⇒ 只有内核能反查。用户态自己记
+`(pid,句柄)` 那条路**不通**（ADR 初稿曾以为可行，读码后否掉）。
+
+落地时撞的坑（实测）：
+1. 无线程的进程"杀不掉"（`proc_thread_exited` 没人调用 ⇒ 不变僵尸）⇒ 判据起真线程；
+2. 自旋工人拖成 HANG 180 s（run-1668）⇒ 改阻塞在等待队列；
+3. `wait_for_task` 靠 tick 唤醒，跨档 HANG ⇒ 改 `yield_now` 轮询；
+4. **`find_proc` 的 ABA**（run-1831~1835：pid 复用后旧句柄先被命中 ⇒ -5）⇒
+   接口加 `gen` 参数，调用方从 `proc::proc_gen(pid)` 取当前世代精确匹配。
+
+判据：内核 `t_proc_kill` 十格（句柄带 WRITE / 收窄权限必须拒 / Job 句柄 -4 /
+真线程 / 杀掉=1 / 已终止 / 句柄失效 -5 / **按 pid 杀** / **无句柄拒** / 自清），
+handles 档 run-1836 全绿 PASS(33)。变异证红：把 18 号的 `RIGHT_WRITE` 改成
+`RIGHT_READ` ⇒ "收窄拒"那格红、FAIL(35)（run-1671），还原后绿。
+shell `kill <pid>` 接进 a3 判据：argv 末尾 `kill 9999`（必不存在的 pid）⇒
+串口 `kill 9999\n-5\n`，验命令接线 + capability 拒（真"能杀"由内核侧覆盖）。
+
+读数：`check` **17/17**（unsafe runtime U5 37→38、census 468→469；
+module-interfaces 登记 `handle::find_proc`）；四档复验
+handles/a2-exec/a3-shell/fs-open 全部 PASS(33)。
+整链 65 行 68/69（唯一不符 = `-trace events` 那跑的 q2 采样漏一拍，
+同 ELF `83dd11a58f1a` 单跑 PASS ⇒ 不归因，与 kill 无关）。
+
+A4 验收句四条命令 `ps`/`top`/`kill`/`free` 至此全部有真实数据。

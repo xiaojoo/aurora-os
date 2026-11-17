@@ -904,6 +904,7 @@ public_api = [
   "handle::RIGHT_CREATE",
   "handle::grant_job",
   "handle::grant_proc",
+  "handle::find_proc",
   "handle::grant_aspace",
   "handle::grant_thread",
   "handle::resolve",

@@ -22,7 +22,7 @@ use crate::{con_write, msg, put_u64};
 use crate::{
     M_ABI, M_BYE, M_DEAD, M_FREE_PAGES, M_FREE_PFX, M_FREE_THR, M_HELP, M_LIVE, M_MINUS, M_NL,
     M_PING, M_PS_ERR, M_PS_HDR, M_PS_NOJOB, M_RUN_ERR, M_RUN_EXIT, M_RUN_PREFIX, M_RUN_TIMEOUT,
-    M_RUN_USAGE, M_SP, M_TOP_FRAME, M_TOP_USAGE, M_TRYHELP, M_UNKNOWN,
+    M_KILLED, M_KILL_USAGE, M_RUN_USAGE, M_SP, M_TOP_FRAME, M_TOP_USAGE, M_TRYHELP, M_UNKNOWN,
 };
 
 /// 控制台句柄（内核按角色 `ROLE_LOG` 转移给 shell 的那个 u64）。
@@ -49,6 +49,7 @@ const CMD_RUN: [u8; 3] = [b'r', b'u', b'n'];
 const CMD_PS: [u8; 2] = [b'p', b's'];
 const CMD_FREE: [u8; 4] = [b'f', b'r', b'e', b'e'];
 const CMD_TOP: [u8; 3] = [b't', b'o', b'p'];
+const CMD_KILL: [u8; 4] = [b'k', b'i', b'l', b'l'];
 
 /// 命令词比较。走 `&[u8] == &[u8]`，LLVM 折成 immediate 比较（旧 dispatch 同款）。
 fn streq(a: &[u8], b: &[u8]) -> bool {
@@ -525,6 +526,37 @@ fn parse_u64(b: &[u8]) -> Option<u64> {
     Some(v)
 }
 
+/// ADR-134：`kill <pid>` —— 按 pid 杀进程（29 号）。
+///
+/// pid 只是寻址，授权由内核按"调用者名下的 RIGHT_WRITE Proc 句柄"判
+/// （内核反查、走与 18 号同一条杀路径）。shell 这层只解析参数、打结果。
+/// `kill` 无参 / 非十进制 / pid 超 u16 ⇒ usage；不静默吞错。
+fn cmd_kill(c: &Ctx) -> bool {
+    let arg = match (c.p.err.is_none(), c.p.args.get(0)) {
+        (true, Some(a)) => a,
+        _ => {
+            con_write(c.h, msg(M_KILL_USAGE));
+            return true;
+        }
+    };
+    let pid = match parse_u64(arg) {
+        Some(v) if v <= u64::from(u16::MAX) => v as u16,
+        _ => {
+            con_write(c.h, msg(M_KILL_USAGE));
+            return true;
+        }
+    };
+    match rt::process_kill_pid(pid) {
+        Ok(n) => {
+            con_write(c.h, msg(M_KILLED));
+            put_u64(c.h, n);
+        }
+        Err(e) => put_i64(c.h, e.0),
+    }
+    con_write(c.h, msg(M_NL));
+    true
+}
+
 /// 分派一条已解析的命令。返回 false = 退出 shell。
 ///
 /// 每个分支都是"名字 immediate 比较 → 直接调用处理器"，不写 `match lookup()`：
@@ -564,6 +596,9 @@ pub fn dispatch(h: ConsoleHandle, si_va: u64, p: &Parsed) -> bool {
     }
     if streq(p.cmd, &CMD_TOP) {
         return cmd_top(&c);
+    }
+    if streq(p.cmd, &CMD_KILL) {
+        return cmd_kill(&c);
     }
     // unknown：三段输出与旧实现逐字节一致——词原样回显（借用不拷贝，全长不截断）。
     con_write(c.h, msg(M_UNKNOWN));

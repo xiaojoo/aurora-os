@@ -1,6 +1,6 @@
 # unsafe 逐处审计表（U1–U6）
 
-总计 468 处。U1 83 · U2 116 · U3 13 · U4 129 · U5 91 · U6 36
+总计 469 处。U1 83 · U2 116 · U3 13 · U4 129 · U5 92 · U6 36
 
 本表由 `tools/aurora.py` 的 `unsafe_sites()` 从源码逐处生成，**不是手写的**。
 机器可读的权威来源是 `docs/security/unsafe-whitelist.toml` 的 `[modules.*]` 段（模块×类别→处数），

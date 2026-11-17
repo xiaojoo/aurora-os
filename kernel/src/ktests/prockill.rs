@@ -173,6 +173,34 @@ fn t_proc_kill() -> bool {
     syscall_dispatch(&mut f4);
     let stale_ok = reaped && f4.rax == crate::user::E_BAD_HANDLE;
 
+    // ---- ⑤ 29 号 `SYS_PROC_KILL_BY_PID`：pid 只是寻址，授权靠 capability。
+    //     造第二个 Job/Proc，按 pid 打 29 号（调用者名下有带 WRITE 的句柄）⇒ 能杀。
+    let mut by_pid_ok = false;
+    let mut no_cap_ok = false;
+    if let Some((hj2, hp2, pid2, js2)) = make_job_proc(owner) {
+        // ⑤a 正样本：29 号按 pid 杀（那个进程没线程，杀掉 0 条也算成功返回 0）。
+        let mut f5 = frame0();
+        f5.rax = user::SYS_PROC_KILL_BY_PID;
+        f5.rdi = u64::from(pid2);
+        syscall_dispatch(&mut f5);
+        by_pid_ok = f5.rax == 0; // 没线程 ⇒ kill_process_threads 返回 0
+
+        // ⑤b 负样本：**把唯一带 WRITE 的句柄关掉**之后，29 号按同一个 pid
+        //     必须 -5（而不是照样能杀）——这证明 29 号不是"按 pid 直接操作"的旁路。
+        //     进程还在（没线程 ⇒ 杀不掉也还在），所以这里只测句柄反查这一格。
+        let closed = handle::close(hp2, owner).is_ok();
+        let mut f6 = frame0();
+        f6.rax = user::SYS_PROC_KILL_BY_PID;
+        f6.rdi = u64::from(pid2);
+        syscall_dispatch(&mut f6);
+        no_cap_ok = closed && f6.rax == crate::user::E_BAD_HANDLE;
+
+        // 清理第二组（进程没线程 ⇒ 走 discard；Job 销毁；句柄关掉）。
+        let _ = proc::proc_discard(pid2);
+        let _ = proc::job_destroy(js2);
+        let _ = handle::close(hj2, owner);
+    }
+
     // ---- 清理：Job 销掉、两个句柄关掉。收尾不变量会点名"还有进程记录没交出去"
     //     与"还有句柄没关"，所以清理失败也要红。
     let mut cleaned = true;
@@ -182,10 +210,11 @@ fn t_proc_kill() -> bool {
     }
 
     let ok = writable_ok && narrow_denied && type_ok && threads_ok && killed_ok && terminated_ok
-        && stale_ok && cleaned;
+        && stale_ok && by_pid_ok && no_cap_ok && cleaned;
     crate::log_info!(
-        "prockill: 判据={} 句柄带WRITE={} 收窄拒={} 类型拒={} 有线程={} 杀掉={} 已终止={} 句柄失效={} 清理={}",
-        ok, writable_ok, narrow_denied, type_ok, threads_ok, killed_ok, terminated_ok, stale_ok, cleaned
+        "prockill: 判据={} 句柄带WRITE={} 收窄拒={} 类型拒={} 有线程={} 杀掉={} 已终止={} 句柄失效={} 按pid杀={} 无句柄拒={} 清理={}",
+        ok, writable_ok, narrow_denied, type_ok, threads_ok, killed_ok, terminated_ok, stale_ok,
+        by_pid_ok, no_cap_ok, cleaned
     );
     ok
 }

@@ -58,6 +58,9 @@ pub const SYS_PROCESS_START: u64 = 16;
 pub const SYS_PROCESS_WAIT: u64 = 17;
 /// 18 收掉一个进程的全部线程（user.rs:96；实现 user.rs:958）。
 pub const SYS_PROCESS_KILL: u64 = 18;
+/// ADR-134 (29): rdi=pid -> threads killed. pid is only an address; the kernel
+/// still requires a RIGHT_WRITE Proc handle in the caller own name table.
+pub const SYS_PROC_KILL_BY_PID: u64 = 29;
 /// 19 通用对象等待，今天只支持 Proc（user.rs:879；实现 user.rs:946）。
 pub const SYS_OBJECT_WAIT: u64 = 19;
 /// 20 控制台写（user.rs:51；实现 `sys_console_io` user.rs:1006）。
@@ -844,6 +847,19 @@ pub fn process_wait(proc_h: Handle, timeout_ms: u64) -> Result<Option<WaitOutcom
 pub fn process_kill(proc_h: Handle) -> Result<u64, RTError> {
     // SAFETY: 18 号 `rdi` = Proc 句柄（要 WRITE），其余参数位无语义。
     let ret = unsafe { syscall_abi(SYS_PROCESS_KILL, proc_h, 0, 0, 0) };
+    if ret < 0 {
+        Err(RTError(ret))
+    } else {
+        Ok(ret as u64)
+    }
+}
+
+/// 29 号：按 pid 杀进程。pid 只是寻址——内核只在**调用者自己名下**反查带
+/// `RIGHT_WRITE` 的 Proc 句柄，再走与 18 号同一个杀路径（ADR-134）。
+/// 成功返回真收掉的线程数；没有对应句柄/权限不够 ⇒ `Err(-5)`。
+pub fn process_kill_pid(pid: u16) -> Result<u64, RTError> {
+    // SAFETY: 29 号 rdi = pid，其余参数无语义（runtime 的 syscall_abi 统一置零）。
+    let ret = unsafe { syscall_abi(SYS_PROC_KILL_BY_PID, u64::from(pid), 0, 0, 0) };
     if ret < 0 {
         Err(RTError(ret))
     } else {

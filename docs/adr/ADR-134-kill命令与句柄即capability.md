@@ -1,6 +1,8 @@
 # ADR-134：`kill` 命令——句柄是 capability，"按 pid 杀"必须先有句柄
 
-状态：提议（2026-11-17，证据来源 / A4 阶段收官片 / ADR-132 §未做 2）
+状态：采纳（2026-11-18，使用者裁决新增 29 号；证据来源 / A4 阶段收官片 / ADR-132 §未做 2）
+**落地**：29 号 `SYS_PROC_KILL_BY_PID` 已实现并接进 shell `kill <pid>`；
+`t_proc_kill` 判据十格全绿、变异证红；总设计 §2.1 与 module-interfaces 已同步登记。
 **内核侧判据已落地并通过**（`t_proc_kill` 八格绿 + 变异证红）；**shell 侧 `kill` 命令
 卡在“未决 1”（pid↔句柄的通路，需使用者裁决）**。
 关联：手册 §10.4（capability 句柄）、ADR-007（capability 第一刀）、ADR-075（handle kind 与
