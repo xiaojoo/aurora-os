@@ -15115,3 +15115,41 @@ ET_EXEC 的 `p_vaddr` 每个进程都从 `0x1_0000_0000` 起；14 号原来把�
   `demand-zero四路有真输家`，那一跑 `t_ap_released_and_ticking` 红（cpu_ticks 三 AP 都在涨）；
   同 ELF `4eb4d8a9805e` 单跑该档 **PASS(33)**，且 BACKLOG 已记过它"复跑 PASS、不连续复现"
   ⇒ 环境形状，**不归因**；判据未改。
+
+## 347. ADR-133 `top`：纯用户态定期刷新进程表（workbuddy，2026-11-17）
+
+ADR-132 §未做 1 的两个待拍板点在本片定案：**排序口径 = pages 降序、并列 pid 升序**
+（与 `free` 聚合同源，行序确定宿主机判定器才写得出来）；**定时 = 19 号带时限等待的
+薄壳** `rt::sleep_ms(h, 0, ms)`——内核零改动，等一个永不置位的信号图，超时路径走
+`TASK_WAITERS` + `task_wake_tick` 的定时器唤醒，任务真阻塞不让 CPU 空转。
+
+交付：runtime `sleep_ms`、shell `top`（无参 3 帧 / `top N` 2..5，帧间隔 1 s）、
+a3 判据 argv 扩成 `run /HELLO.ELF; ps; free; top 2`、宿主机 a3 行三格追加
+（argv 带 top / 双 frame 表头 / `_top_pages_nondecreasing` 逐帧排序对账）。
+串口原文（run-1587，PASS 33，12.1 s）：两帧 `PID GEN THR ST PAGES` 均为
+`0 8 1 live 9 / 1 6 1 live 7`，与 `ps` 逐值同、聚合 9+7=16 与 `free` 同。
+**变异证红**：`top_cmp` 翻转 ⇒ 升序 `7` 在 `9` 前 ⇒ checker False ⇒
+CONTENT-MISMATCH；还原后 True。27 号从此有第二个真实调用方。
+
+三条量具课，全部本轮实测（复用价值高）：
+
+1. **shell 的栈只有一页，且已贴近上限**。8 行 × 40 B 的行数组上栈 ⇒
+   run-1584 `#PF rip=0x10000397e cr2=0x100100fb8 err=0x6`（栈顶 0x100101ff0，
+   cr2 在栈顶页下一页，穿出 ≈0x48 B）。给 shell 加局部大缓冲的改动都会重演；
+   行数上限 4 由单 Job 判据形状（q2 至多 4 条）给出，不是拍的。
+2. **static 在 4 GiB+ 用户镜像里同样不可用**：地址被取成 `R_X86_32S out of range`
+   （`.bss.TOP_ROWS` 那次实测），与 MSGS/`ctrl_c` 注释记的第三族事故同源。
+   一页栈 + 静态定位都堵死后，缓冲位只剩"按形状收缩"一条路。
+3. **`.text` 窗口是夹具级常量**：16 KiB 挡住第一版（`0x100004804 > .rodata 起点`），
+   link.ld 提到 20 KiB（`.rodata` 0x100005000、`.data` 0x100007000）。回滚 top
+   但留窗口无害；留 top 回滚窗口 = 链接期挡住。
+
+unsafe：registry U5 2→3（`cmd_top` 取 ROLE_SELF_THREAD 的 handle_of_role）、
+census 467→468 / U5 91；`sleep_ms` 是 safe fn 薄壳，runtime 零新增。
+
+读数：`check` **17/17**；整链 **65 行 64 符合**，唯一不符合 = `改包头被拒仍启动`
+那一跑的 `q2 ours峰值=6`（run-1642，FAIL 35）——**同 ELF `83dd11a58f1a` 单跑
+PASS(33)、`ours峰值=7`**（run-1664）⇒ 采样窗口漏一拍的形状，不归因。
+§383 的"peak=false 要当红查"已照办：查过，单跑复现不了，判据未改。
+（A4 验收句剩 `kill`：18 号内核面就绪，缺"按 pid 找 Proc 句柄"的角色语义，
+归 ADR-132 §未做 2。）
