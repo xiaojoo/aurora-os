@@ -14878,3 +14878,11 @@ kernel 栈/地址窗口上的脆弱）。下一刀先定位它：用同一段包
 - 取证备注：a3-shell 串口里的四行 `[kill] unexpected #PF` 分别是 `t_user`（坏帧）、
   `t_user_pointer_checks`（坏指针）、`t_demand_zero`（两路）的**期望负样本**，每行后面紧跟
   `-> ok`，不是回归。
+## 383. 合并后的 main 整链：68/68 全符合（2026-11-17）
+
+- `merge/wb` (`e1e23c0`) 以 fast-forward 并入 `main`（`main` 前一点 `86b646a`）。
+- `build/merge-main-matrix.log`：**68 行 68 符合**，无 CONTENT-MISMATCH / SEQ-BROKEN / HANG。
+  上一轮在合并工作树上的唯一不符合（默认档 `t_q2_workload_slots peak=false`）本轮未复现 ⇒
+  维持 §382 的"环境形状、不归因"结论，判据未改。
+- A2/A3 四行均符合；`FS-03`/写方向/块请求层/virtio 两台（含 msix 格）全部符合。
+- 默认档 ELF `2cc12dddf0f6`（与 §382 的同 ELF 单跑是同一份）。`check` **17/17**。
