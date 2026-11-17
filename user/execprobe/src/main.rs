@@ -261,6 +261,22 @@ fn run_image(name: &[u8], out: rt::Handle, si_va: u64) -> ! {
     hdr[9] = 0;
     hdr[10] = 0;
     hdr[11] = 0;
+    // S2（ADR-115）：子进程的 argv[0] = 这条目标路径（页内 280 起、NUL 结尾）。
+    if name.is_empty() || name.len() + 1 > 512 {
+        fail(out, M_ERR, -1, 90);
+    }
+    hdr[12] = 280u32 as u8;
+    hdr[13] = (280u32 >> 8) as u8;
+    hdr[14] = 0;
+    hdr[15] = 0;
+    hdr[16] = (name.len() + 1) as u8;
+    hdr[17] = ((name.len() + 1) >> 8) as u8;
+    hdr[18] = 0;
+    hdr[19] = 0;
+    let nul = [0u8; 1];
+    if rt::vmo_write(si, 280, name).is_err() || rt::vmo_write(si, 280 + name.len() as u64, &nul).is_err() {
+        fail(out, M_ERR, -1, 91);
+    }
     if rt::vmo_write(si, 0, &hdr).is_err() {
         fail(out, M_ERR, -7, 93);
     }
@@ -316,6 +332,25 @@ fn first_arg(args: &[u8]) -> &[u8] {
     }
 }
 
+/// 第 `n` 个参数（0 起）。越界返回空串。
+fn nth_arg(args: &[u8], n: usize) -> &[u8] {
+    let mut rest = args;
+    let mut i = 0usize;
+    loop {
+        let a = first_arg(rest);
+        if i == n {
+            return a;
+        }
+        match rest.iter().position(|&b| b == 0) {
+            Some(e) => {
+                rest = rest.get(e + 1..).unwrap_or(&[]);
+            }
+            None => return &[],
+        }
+        i += 1;
+    }
+}
+
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     // 用户态 panic 就停在这一核上自旋（与 fileprobe/shell 同一形状）。
@@ -338,14 +373,18 @@ pub extern "C" fn _start(si_va: u64) -> ! {
         Some(a) if !a.is_empty() => a,
         _ => rt::exit(22),
     };
+    // argv[0] 是**自己**的名字（A2 语义）；A3 的目标是 argv[1]。
+    // 把目标路径当自己的名字用，会让 16 号的验签闸把这个进程当成那个文件（S4 实测）。
     let name = first_arg(args);
+    let target = nth_arg(args, 1);
+    let target = if target.is_empty() { name } else { target };
     let _ = rt::console_write(stdout, msg(M_ARGV));
     let _ = rt::console_write(stdout, name);
     let _ = rt::console_write(stdout, msg(M_NL));
     // A3：目标是 ELF 文件 ⇒ 装载并运行；否则 A2 行为（打印后 exit(7)）。
-    let tail = name.len().checked_sub(4).and_then(|i| name.get(i..));
+    let tail = target.len().checked_sub(4).and_then(|i| target.get(i..));
     if tail == Some(msg(M_ELF)) {
-        run_image(name, stdout, si_va);
+        run_image(target, stdout, si_va);
     }
     rt::exit(7);
 }

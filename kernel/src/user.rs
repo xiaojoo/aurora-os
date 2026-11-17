@@ -709,6 +709,150 @@ fn undo_start(
 
 
 
+// ---------------------------------------------------------------- S4：执行字节的绑定（ADR-116）
+
+/// 一条 `PT_LOAD` 的"文件偏移 ↔ 用户 VA"对：绑定比对按它把盘上字节映射到子 AS 的地址上。
+#[cfg(feature = "fs-open")]
+#[derive(Clone, Copy)]
+struct LoadSeg {
+    off: u64,
+    va: u64,
+    len: u64,
+}
+
+#[cfg(feature = "fs-open")]
+const LOAD_SEGS_MAX: usize = 8;
+/// 用户 PTE 里的物理帧号掩码（4 KiB 粒度）。与 `mm.rs` 的页表常量同源，这里只借它取帧。
+#[cfg(feature = "fs-open")]
+const PTE_FRAME: u64 = 0x000F_FFFF_FFFF_F000;
+
+/// 从镜像前缀（磁盘上的 `ehdr` + 程序头表）读出 `PT_LOAD` 段表（只收可执行段）。
+/// 只吃前缀、**不要求整份镜像在内存**（16 号是流式读的）；任何越界/畸形都给 `None`。
+#[cfg(feature = "fs-open")]
+fn exec_segments(prefix: &[u8], file_len: usize) -> Option<([LoadSeg; LOAD_SEGS_MAX], usize)> {
+    fn le16(b: &[u8], at: usize) -> Option<u16> {
+        let s = b.get(at..at + 2)?;
+        Some(u16::from_le_bytes([s[0], s[1]]))
+    }
+    fn le32(b: &[u8], at: usize) -> Option<u32> {
+        let s = b.get(at..at + 4)?;
+        Some(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    }
+    fn le64(b: &[u8], at: usize) -> Option<u64> {
+        let s = b.get(at..at + 8)?;
+        let mut a = [0u8; 8];
+        a.copy_from_slice(s);
+        Some(u64::from_le_bytes(a))
+    }
+    if prefix.len() < 64 || prefix[0..4] != [0x7f, b'E', b'L', b'F'] || prefix[4] != 2 {
+        return None;
+    }
+    let phoff = le64(prefix, 32)? as usize;
+    let phentsize = le16(prefix, 54)? as usize;
+    let phnum = le16(prefix, 56)? as usize;
+    if phentsize < 56 {
+        return None;
+    }
+    let table_end = phoff.checked_add(phnum.checked_mul(phentsize)?)?;
+    if table_end > prefix.len() {
+        return None;
+    }
+    let mut segs = [LoadSeg { off: 0, va: 0, len: 0 }; LOAD_SEGS_MAX];
+    let mut n = 0usize;
+    for i in 0..phnum {
+        let at = phoff + i * phentsize;
+        if le32(prefix, at)? != 1 {
+            continue;
+        }
+        // 只比**可执行段**：绑定管的是"指令流"，数据段在运行期本来就会被合法改写
+        // （装载器写标志、将来的重定位），拿它当"换字节"会把正常装载判成撒谎。
+        let flags = le32(prefix, at + 4)?;
+        if flags & 1 == 0 {
+            continue;
+        }
+        let off = le64(prefix, at + 8)?;
+        let va = le64(prefix, at + 16)?;
+        let filesz = le64(prefix, at + 32)?;
+        if filesz == 0 {
+            continue;
+        }
+        let end = off.checked_add(filesz)?;
+        if end > file_len as u64 {
+            return None;
+        }
+        if va < crate::mm::USER_VA_BASE || va.checked_add(filesz)? > crate::mm::USER_VA_TOP {
+            return None;
+        }
+        if n >= LOAD_SEGS_MAX {
+            return None;
+        }
+        segs[n] = LoadSeg { off, va, len: filesz };
+        n += 1;
+    }
+    Some((segs, n))
+}
+
+/// 子 AS 里 `[va, va+bytes.len())` 与给定字节逐个相等？逐页取叶子、要 present+user、
+/// 走 HHDM 别名读物理帧；未映射、巨页、字节不同都返回 `false`。
+#[cfg(feature = "fs-open")]
+fn child_bytes_eq(as_slot: u8, mut va: u64, mut want: &[u8]) -> bool {
+    while !want.is_empty() {
+        let off_in_page = (va & (crate::mm::PAGE as u64 - 1)) as usize;
+        let take = core::cmp::min(crate::mm::PAGE - off_in_page, want.len());
+        let Some(pte) = crate::mm::aspace_leaf_slot(as_slot, crate::mm::VirtAddr(va)) else {
+            crate::log_warn!("exec-verify: 绑定叶子缺 va={:#x} slot={}", va, as_slot);
+            return false;
+        };
+        if pte & 1 == 0 || pte & (1 << 2) == 0 || pte & (1 << 7) != 0 {
+            return false;
+        }
+        let phys = crate::mm::PhysAddr((pte & PTE_FRAME) + off_in_page as u64);
+        // SAFETY: 帧号来自**目标 AS 的叶子 PTE**（present|user、非巨页），加了页内偏移的物理地址
+        //         仍在这一页内；HHDM 覆盖全部物理内存（RW 恒等映射），`take` 不超过页内剩余字节。
+        //         借用只在本次比较内活着，不解引用出 `want` 的长度。
+        let got = unsafe { core::slice::from_raw_parts(phys.via_hhdm().0 as *const u8, take) };
+        if got != &want[..take] {
+            let mut k = 0usize;
+            while k < take && got[k] == want[k] {
+                k += 1;
+            }
+            crate::log_warn!(
+                "exec-verify: 绑定字节不符 va={:#x} 差在第 {} 字节",
+                va + k as u64, k
+            );
+            return false;
+        }
+        va += take as u64;
+        want = &want[take..];
+    }
+    true
+}
+
+/// 一段盘上字节（文件偏移 `file_off` 起）与它落在的每个 `PT_LOAD` 在子 AS 里的副本比。
+#[cfg(feature = "fs-open")]
+fn exec_binding_chunk(as_slot: u8, segs: &[LoadSeg], file_off: u64, data: &[u8]) -> bool {
+    let end = match file_off.checked_add(data.len() as u64) {
+        Some(e) => e,
+        None => return false,
+    };
+    for s in segs {
+        let a = core::cmp::max(file_off, s.off);
+        let b = core::cmp::min(end, s.off + s.len);
+        if a >= b {
+            continue;
+        }
+        let va = s.va + (a - s.off);
+        let slice = &data[(a - file_off) as usize..(b - file_off) as usize];
+        if !child_bytes_eq(as_slot, va, slice) {
+            crate::log_warn!(
+                "exec-verify: 绑定段 seg_va={:#x} seg_len={} 块 file_off={:#x}",
+                s.va, s.len, file_off
+            );
+            return false;
+        }
+    }
+    true
+}
 // ---------------------------------------------------------------- S2：16 号的验签闸（ADR-115）
 
 #[cfg(feature = "fs-open")]
@@ -759,7 +903,7 @@ fn argv0_of(args: &[u8]) -> Option<&str> {
 /// 同一块盘"的性质由启动阶段那一次验签已经给出（ADR-115 补记三记这笔取舍）。
 #[cfg(feature = "fs-open")]
 #[inline(never)]
-fn exec_gate(name: &str) -> Option<u64> {
+fn exec_gate(name: &str, as_slot: u8) -> Option<u64> {
     use crate::filesystem::fs_open::{self, Opened};
     use crate::filesystem::vfs::AhciDisk;
     use crate::filesystem::vfs_ro::ReadOnlyFs;
@@ -791,14 +935,40 @@ fn exec_gate(name: &str) -> Option<u64> {
         Ok(f) => f,
         Err(_) => return Some(exec_deny(name, "挂载失败")),
     };
+    // S4（ADR-116）：一个 512 字节缓冲走两遍用途——头/程序头表在这一块里解析，
+    // 之后原地复用为流式块（16 号的栈只剩 4 页，缓冲按 512 起步，不再开第二块）。
+    let mut buf = [0u8; 512];
+    let mut plen = 0usize;
+    while plen < buf.len() {
+        match fs.read(&mut cursor, &mut buf[plen..]) {
+            Ok(0) => break,
+            Ok(n) => plen += n,
+            Err(_) => return Some(exec_deny(name, "读盘失败")),
+        }
+    }
     let mut h = crate::sign::Hasher::new();
-    let mut chunk = [0u8; 512];
-    let mut got = 0usize;
+    h.update(&buf[..plen]);
+    let Some((segs, nseg)) = exec_segments(&buf[..plen], size) else {
+        return Some(exec_deny(name, "镜像头不符"));
+    };
+    if !exec_binding_chunk(as_slot, &segs[..nseg], 0, &buf[..plen]) {
+        return Some(exec_deny(name, "映射不符"));
+    }
+    let mut got = plen;
+    if got > cov.pay_len {
+        return Some(exec_deny(name, "超长"));
+    }
+    if fs.seek(&mut cursor, plen as u32).is_err() {
+        return Some(exec_deny(name, "读盘失败"));
+    }
     loop {
-        match fs.read(&mut cursor, &mut chunk) {
+        match fs.read(&mut cursor, &mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                h.update(&chunk[..n]);
+                h.update(&buf[..n]);
+                if !exec_binding_chunk(as_slot, &segs[..nseg], got as u64, &buf[..n]) {
+                    return Some(exec_deny(name, "映射不符"));
+                }
                 got += n;
                 if got > cov.pay_len {
                     return Some(exec_deny(name, "超长"));
@@ -917,7 +1087,7 @@ fn sys_process_start(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
             }
             match argv0_of(&name[..take]) {
                 Some(argv0) => {
-                    if let Some(ret) = exec_gate(argv0) {
+                    if let Some(ret) = exec_gate(argv0, aslot) {
                         return ret;
                     }
                 }

@@ -15115,3 +15115,27 @@ ET_EXEC 的 `p_vaddr` 每个进程都从 `0x1_0000_0000` 起；14 号原来把�
   `demand-zero四路有真输家`，那一跑 `t_ap_released_and_ticking` 红（cpu_ticks 三 AP 都在涨）；
   同 ELF `4eb4d8a9805e` 单跑该档 **PASS(33)**，且 BACKLOG 已记过它"复跑 PASS、不连续复现"
   ⇒ 环境形状，**不归因**；判据未改。
+
+## 395. ADR-116 S4a：执行字节的绑定——16 号比子 AS 里的可执行段（2026-11-17）
+
+- 动机：S2/S3 只证明"盘上文件 == 签名载荷"，**跑的字节仍来自调用方 VMO**；14 号允许调用方
+  指定目标 VA ⇒ 一个撒谎的装载器可以交合法报告、铺别的字节。子 AS 是唯一能回答
+  "将要执行的是什么"的地方。
+- 机制：16 号在覆盖名 + 摘要通过后，解析盘上 ELF 的前缀取**可执行 `PT_LOAD`**，把
+  `[p_offset,+p_filesz)` 与子 AS `[p_vaddr,+p_filesz)` 逐页比（`aspace_leaf_slot` → 帧号 →
+  HHDM；要 present+user、非巨页）。不符/未映射 ⇒ `-1`，原因 `映射不符`。
+  **只比可执行段**：数据段运行期本来会被合法改写（装载器写标志、将来重定位）。
+- 栈的教训（当场撞到）：16 号的内核栈只有 4 页（`sched::STACK_PAGES`）。第一版"1 KiB 前缀 +
+  512 块"两块缓冲在 a3-shell 上直接 **#DF(8) 风暴**（`cr2 == rsp-8`，`rip` 在 `tsc::spin` 之外的
+  读取路径）；收成**单个 512 字节缓冲**（头/程序头表同块解析、之后原地复用作流式块）后消失。
+- 顺带抓出夹具撒谎：a3-exec 以前把目标路径当 execprobe 的 argv[0]，S4a 一落地就判
+  `映射不符`（子 AS 里是 execprobe 的代码）。改成 A2 语义：argv[0]=`execprobe`、目标=argv[1]
+  （`/HELLO.ELF`）；execprobe 并把目标写成**子进程**的 argv[0] ⇒ a3-exec 也真走闸门。
+- 读数：a3-exec / a3-shell（带 fat32-probe）各一行 `exec-verify: 判=通过 名=/HELLO.ELF
+  字节=17288`，合计 `通过=1 拒=0 无覆盖=3`；`check` **17/17**（unsafe census 468：U2 117）；
+  整链 **68/69**（默认档 `b9ff50256e61`）——唯一不符合 `virtio 取证十格证人全过`，那一跑
+  `t_q2_workload_slots` 的 `rollback=false`（`请求=7 成功=7 拒绝=0`），同 ELF
+  `bb862810404a` 单跑 **PASS(33)** ⇒ 环境形状，**不归因**。
+- 夹具：`execprobe.elf` 27408 / `efeb719a9ec5`（argv 与子进程 argv[0] 两处改动）。
+- **S4b 未做**：这条规则还没有"故意改代码"的负样本（计划 `a3-exec-bad` + argv[2]=`lie`）；
+  TOCTOU（16 返回后父进程仍能改共享帧）也未封。两者都写进 ADR-116"没做到的"。

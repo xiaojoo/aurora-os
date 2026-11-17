@@ -1379,7 +1379,9 @@ fn stage_a2_exec() {
     let (args_off, args_len) = if cfg!(feature = "a2-exec-bad") {
         (SI_OFF_HANDLES, 4096usize)
     } else if cfg!(feature = "a3-exec") {
-        (280usize, 11usize) // "/HELLO.ELF" + NUL（vfs 要求绝对路径，实测 NotAbsolute）
+        // S4（ADR-116）：argv[0] 是 execprobe 自己的名字，目标是 argv[1]。
+        // 把目标当自己的名字，16 号的验签闸会把它当成那个文件（实测：映射不符）。
+        (280usize, 21usize) // "execprobe\0/HELLO.ELF\0"
     } else {
         (280usize, 10usize)
     };
@@ -1415,7 +1417,7 @@ fn stage_a2_exec() {
         // a3-exec 档的目标是卷上 /HELLO.ELF（**绝对路径**：vfs_ro::lookup 拒相对路径，
         // 内核侧诊断实测 NotAbsolute）；execprobe 见 ".ELF" 后缀就走 A3 装载器分支。
         let target: &[u8] = if cfg!(feature = "a3-exec") {
-            b"/HELLO.ELF"
+            b"execprobe\0/HELLO.ELF"
         } else {
             b"execprobe"
         };

@@ -87,9 +87,9 @@ expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe
 # 数目对账：465+1=466、86+1=87。
 # 2026-11-17 A4（ADR-132）：+user/runtime U5 35→37（27/28 两个调用块）、
 # +user/shell/registry U5 1→2（`job_of` 的 handle_of_role）。对账：466+3=469、87+3=90。
-total = 467
+total = 468
 U1 = 83
-U2 = 116
+U2 = 117
 U3 = 13
 U4 = 129
 U5 = 90
@@ -267,7 +267,7 @@ U1 = 1
 
 [modules."user"]
 U1 = 1
-U2 = 8
+U2 = 9
 U4 = 8
 U5 = 6
 

@@ -1,6 +1,6 @@
 # unsafe 逐处审计表（U1–U6）
 
-总计 467 处。U1 83 · U2 116 · U3 13 · U4 129 · U5 90 · U6 36
+总计 468 处。U1 83 · U2 117 · U3 13 · U4 129 · U5 90 · U6 36
 
 本表由 `tools/aurora.py` 的 `unsafe_sites()` 从源码逐处生成，**不是手写的**。
 机器可读的权威来源是 `docs/security/unsafe-whitelist.toml` 的 `[modules.*]` 段（模块×类别→处数），
@@ -740,6 +740,8 @@
 
 - `kernel/src/user.rs:294` [impl] **U4** fn=`sys_file_read`
   > unsafe impl Sync for ProgCell {} static PROG_PTR: ProgCell = ProgCell(core::cell::UnsafeCell::new(None));  
+- `kernel/src/user.rs:806` [{] **U2** fn=`child_bytes_eq`
+  > let got = unsafe { core::slice::from_raw_parts(phys.via_hhdm().0 as *const u8, take) };  
 - `kernel/src/user.rs:368` [{] **U2** fn=`ensure_trampoline`
   > unsafe { core::ptr::write_bytes(f.base().via_hhdm().0 as *mut u8, 0, mm::PAGE); core::ptr::write_volatile( 
 - `kernel/src/user.rs:458` [{] **U4** fn=`init`
