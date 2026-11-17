@@ -1904,21 +1904,43 @@ ktest!(KT_PERCPU_QUEUES, t_percpu_queues);
 // M6 收工处不减线程计数 ⇒ ③的收尸数红；M7 让 proc_discard 也放行已终止的进程 ⇒
 // ③"哪些走 reap、哪些走 discard"这条分界红。
 static Q2_RELEASE: AtomicUsize = AtomicUsize::new(0);
+/// 阶段门：工人从**采样开始**才起算有界等待。合并日那次 43 s 的跑里，spawn 循环本身
+/// 就烧掉 27e9 周期（宿主机停顿），六条工人在"还没开始采样"时就撞上兜底收工，
+/// 进程被提前置僵尸 ⇒ 后续 attach 失败、峰值读成 0（§383）。环境的慢不是"发令丢了"。
+static Q2_ARMED: AtomicUsize = AtomicUsize::new(0);
 static Q2_LIVE: AtomicUsize = AtomicUsize::new(0);
 static Q2_PEAK_LIVE: AtomicUsize = AtomicUsize::new(0);
 static Q2_PEAK_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+/// 底盘（别的用例留下的任务）的峰值：只进日志，不参与判定（§383）。
+static Q2_PEAK_AMBIENT: AtomicUsize = AtomicUsize::new(0);
+// 诊断（§383）：采样里我方线程处在 Done/Blocked 的最大条数，以及采样总周期。
+static Q2_MAX_DONE: AtomicUsize = AtomicUsize::new(0);
+static Q2_MAX_BLOCKED: AtomicUsize = AtomicUsize::new(0);
+static Q2_SAMPLE_CYCLES: AtomicUsize = AtomicUsize::new(0);
 
 /// 参考形状里的一条线程：就位、**让出**等发令、有界超时兜底，然后正常收工。
 fn q2_worker() -> ! {
     Q2_LIVE.fetch_add(1, Ordering::AcqRel);
+    // 先等阶段门（不计预算）：门只在采样开始前开，开了之后才是有界等待。
+    // 门本身留一个远大于任何正常阶段的兜底，免得用例没走到就把槽永远占住。
+    let a0 = tsc::now();
+    while Q2_ARMED.load(Ordering::Acquire) == 0 {
+        if tsc::now().wrapping_sub(a0) > 200_000_000_000 {
+            break;
+        }
+        core::hint::spin_loop();
+    }
     let t0 = tsc::now();
     // 有界：发令丢了也不能永远占着槽（这个上限比用例的采样轮数大一个量级）。
     // 等的时候**自旋**而不是让出：七条线程一起 `int 0xF0` 在挂 `-d int` 的矩阵行里是中断风暴
     // （每条中断都要写宿主机日志，实测烧穿 120 s 预算）。换人交给 tick，时钟由用例自己保证在跑。
     while Q2_RELEASE.load(Ordering::Acquire) == 0
-        && tsc::now().wrapping_sub(t0) < 20_000_000_000
+        && tsc::now().wrapping_sub(t0) < 60_000_000_000
     {
         core::hint::spin_loop();
+    }
+    if Q2_RELEASE.load(Ordering::Acquire) == 0 {
+        crate::log_warn!("q2: 工人超时 走={} t0={:#x}", tsc::now().wrapping_sub(t0), t0);
     }
     sched::finish_current();
     // 让出**一次**把 CPU 立刻还给等待方（一条中断，不是风暴）；换不动就靠自旋等 tick。
@@ -1928,25 +1950,64 @@ fn q2_worker() -> ! {
     }
 }
 
-/// 采样：在开着的窗口里**按 tick 逐轮**取样，把"同时活着的工人数"与"可调度任务数"的最大值取回来。
-/// 一轮一个 tick：轮转是按 tick 换人的，所以 `线程数+3` 轮足够每条线程被选中一次。
+/// 采样：在开着的窗口里**按 tick 逐轮**取样，把"同时活着的工人数"与"本 Job 可调度线程数"的
+/// 最大值取回来。一轮一个 tick：轮转是按 tick 换人的，所以 `线程数+3` 轮足够每条线程被选中一次。
 /// 不用 `yield_now` 逐轮换人——工人等发令时是自旋的，让出过去要等满一个 tick 才回得来，
 /// 那样每轮都花一个 tick 却只走一格，白等（本轮实测 P4 总量因此涨了 50 %）。
-fn q2_sample(rounds: usize) {
+///
+/// **判据只数本 Job 的线程**（§383）：`tasks_active()` 含别的用例留下的底噪，而底噪会在窗口里
+/// 自己收工 —— 旧判据 `active峰值 == 基线 + 成功数` 因此把"底噪少了一条"读成"漏峰"，
+/// 长链里反复报 `peak=false` 而单跑又绿。基线读数与底噪峰值仍打进日志，但不再参与判定。
+fn q2_ours_active(pids: &[u16; 4]) -> usize {
+    (0..sched::MAX_TASKS_TOTAL)
+        .filter(|&i| {
+            matches!(
+                sched::state_of(i),
+                sched::TaskState::Runnable | sched::TaskState::Running
+            ) && pids.contains(&sched::proc_id_of(i))
+        })
+        .count()
+}
+
+/// 我方线程里落在某个状态的条数（诊断用）。
+fn q2_ours_in(pids: &[u16; 4], want: fn(sched::TaskState) -> bool) -> usize {
+    (0..sched::MAX_TASKS_TOTAL)
+        .filter(|&i| pids.contains(&sched::proc_id_of(i)) && want(sched::state_of(i)))
+        .count()
+}
+
+fn q2_sample(rounds: usize, pids: &[u16; 4]) {
+    let t_s0 = tsc::now();
     apic::with_interrupts(|| {
         for _ in 0..rounds {
             let b = apic::ticks();
             apic::wait_ticks(b, 1, clock::window_cycles(2));
             let live = Q2_LIVE.load(Ordering::Acquire);
-            let active = sched::tasks_active();
+            let active = q2_ours_active(pids);
+            let ambient = sched::tasks_active();
             if live > Q2_PEAK_LIVE.load(Ordering::Acquire) {
                 Q2_PEAK_LIVE.store(live, Ordering::Release);
             }
             if active > Q2_PEAK_ACTIVE.load(Ordering::Acquire) {
                 Q2_PEAK_ACTIVE.store(active, Ordering::Release);
             }
+            if ambient > Q2_PEAK_AMBIENT.load(Ordering::Acquire) {
+                Q2_PEAK_AMBIENT.store(ambient, Ordering::Release);
+            }
+            let done = q2_ours_in(pids, |s| matches!(s, sched::TaskState::Done));
+            let blocked = q2_ours_in(pids, |s| matches!(s, sched::TaskState::Blocked(_)));
+            if done > Q2_MAX_DONE.load(Ordering::Acquire) {
+                Q2_MAX_DONE.store(done, Ordering::Release);
+            }
+            if blocked > Q2_MAX_BLOCKED.load(Ordering::Acquire) {
+                Q2_MAX_BLOCKED.store(blocked, Ordering::Release);
+            }
         }
     });
+    Q2_SAMPLE_CYCLES.store(
+        tsc::now().wrapping_sub(t_s0) as usize,
+        Ordering::Release,
+    );
 }
 
 fn t_q2_workload_slots() -> bool {
@@ -1957,9 +2018,14 @@ fn t_q2_workload_slots() -> bool {
     sched::init_boot_task();
     sched::start_workers();
     Q2_RELEASE.store(0, Ordering::Relaxed);
+    Q2_ARMED.store(0, Ordering::Relaxed);
     Q2_LIVE.store(0, Ordering::Relaxed);
     Q2_PEAK_LIVE.store(0, Ordering::Relaxed);
     Q2_PEAK_ACTIVE.store(0, Ordering::Relaxed);
+    Q2_PEAK_AMBIENT.store(0, Ordering::Relaxed);
+    Q2_MAX_DONE.store(0, Ordering::Relaxed);
+    Q2_MAX_BLOCKED.store(0, Ordering::Relaxed);
+    Q2_SAMPLE_CYCLES.store(0, Ordering::Relaxed);
 
     // 前提：表是空的（本用例不假设别的用例收过尾）
     let (pc0, _) = proc::proc_residual();
@@ -2017,11 +2083,18 @@ fn t_q2_workload_slots() -> bool {
                         proc_with_thread[pi] = true;
                     } else {
                         // 登记没成 ⇒ 这条线程不算进任何进程，槽位当场交回去
+                        crate::log_warn!("q2: 登记失败 pid={} g={} 状态={:?}", pids[pi], g, sched::state_of(g));
                         let _ = sched::terminate_task(g);
                         refused += 1;
                     }
                 }
-                Err(_) => refused += 1,
+                Err(e) => {
+                    let occ: usize = (0..sched::MAX_TASKS)
+                        .filter(|&sl| sched::state_of(sched::gidx(me_cpu, sl)) != sched::TaskState::Free)
+                        .count();
+                    crate::log_warn!("q2: spawn 拒绝 {:?} 占格={}/{}", e, occ, sched::MAX_TASKS);
+                    refused += 1
+                }
             }
         }
     }
@@ -2049,11 +2122,16 @@ fn t_q2_workload_slots() -> bool {
 
     // 采样轮数必须容纳"每条活线程至少被选中一次"再加 boot 自己与 idle 的份；
     // 给少了峰值必然偏低，那是量具不成立而不是被测代码。
-    q2_sample(ok_n + 3);
+    Q2_ARMED.store(1, Ordering::Release);
+    q2_sample(ok_n + 3, &pids);
     let peak_live = Q2_PEAK_LIVE.load(Ordering::Acquire);
     let peak_active = Q2_PEAK_ACTIVE.load(Ordering::Acquire);
-    // active 里含跑用例的 boot 上下文自己（它也是 Running），所以基线用 act0 而不是 1
-    let peak_ok = peak_live == ok_n && peak_active == act0 + ok_n && ok_n >= 2;
+    let peak_ambient = Q2_PEAK_AMBIENT.load(Ordering::Acquire);
+    let max_done = Q2_MAX_DONE.load(Ordering::Acquire);
+    let max_blocked = Q2_MAX_BLOCKED.load(Ordering::Acquire);
+    let sample_cycles = Q2_SAMPLE_CYCLES.load(Ordering::Acquire);
+    // 只对本 Job 的线程判"同时可调度"（§383）：底噪会自己收工，混进等式就会假红。
+    let peak_ok = peak_live == ok_n && peak_active == ok_n && ok_n >= 2;
 
     // 发令 → 逐条等收工。工人收工后自己让出，所以一次有界等待就够（不等 tick）。
     Q2_RELEASE.store(1, Ordering::Release);
@@ -2094,6 +2172,7 @@ fn t_q2_workload_slots() -> bool {
     let f1 = mm::free_frames();
     let va1 = mm::reservation_count();
     let active1 = sched::tasks_active();
+    let ours_end = q2_ours_active(&pids);
     // drain_reap 要的正是 tick，所以停表放在它之后
     if !was_running {
         apic::timer_stop().ok();
@@ -2101,13 +2180,15 @@ fn t_q2_workload_slots() -> bool {
     // ④ 被拒的那几次 spawn 各已经发过一段 VA 窗口和 4 个页框：它们必须原样回来。
     //    这一格本来只是读数，实测 `va23->23 / free 不变` ⇒ 升成判据（去回滚它就红）。
     let rollback_ok = f1 == f0 && va1 == va0;
-    // ⑤ 收尾：进程/Job 清零、回收发生、活跃任务数回基线（含别的用例留下的底噪，所以对读数）
-    let baseline_ok = drained && jd.is_ok() && pc1 == 0 && jc1 == 0 && active1 == act0;
+    // ⑤ 收尾：进程/Job 清零、回收发生、**本 Job 的线程一条都不剩**（§383：底噪会自己走，
+    //    所以不拿全局 `active1 == act0` 当判据，只把它打进日志）。
+    let baseline_ok = drained && jd.is_ok() && pc1 == 0 && jc1 == 0 && ours_end == 0;
 
     crate::log_info!(
-        "q2(P3): 请求={} 成功={} 拒绝={} 峰值同活={} active基线={} active峰值={} 收工={} 收尸={} 回滚={} 全装得下={} 每CPU槽上限={} 本CPU先占={}(其中Done待收={}) 参考需线程+boot+idle={} 回基线=(drained{} free{}->{} va{}->{} active{})",
-        total_req, ok_n, refused, peak_live, act0, peak_active, ended, reaped, rolled_back,
-        full_ok, sched::MAX_TASKS, slots_used0, slots_done0, total_req + 2, drained, f0, f1, va0, va1, active1);
+        "q2(P3): 请求={} 成功={} 拒绝={} 峰值同活={} active基线={} ours峰值={} 底噪峰值={} 采样周期={} 我方Done={} 我方Blocked={} 收工={} 收尸={} 回滚={} 全装得下={} 每CPU槽上限={} 本CPU先占={}(其中Done待收={}) 参考需线程+boot+idle={} 回基线=(drained{} free{}->{} va{}->{} oursEnd{} ambient{})",
+        total_req, ok_n, refused, peak_live, act0, peak_active, peak_ambient, sample_cycles,
+        max_done, max_blocked, ended, reaped, rolled_back,
+        full_ok, sched::MAX_TASKS, slots_used0, slots_done0, total_req + 2, drained, f0, f1, va0, va1, ours_end, active1);
     let ok = cap_ok && full_ok && peak_ok && done_ok && rollback_ok && baseline_ok;
     if !ok {
         crate::log_fatal!(
