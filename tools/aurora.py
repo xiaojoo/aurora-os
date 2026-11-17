@@ -432,6 +432,9 @@ FAT_FAULT_FEATURES = {"fault-fat32-tail"}
 # "只有盘不同"由构造保证。门禁反过来要求这两个名字既不在 Cargo.toml 里、也不在内核源码里。
 FAT_HOST_FAULTS = {
     "fault-fat32-exec-byte": "fat32-small",
+    # S3（ADR-115）：同一个注入点（代码段里那一个立即数），换一条证人——
+    # 这一档要看的是 16 号闸门拒启，而不是 fat32-exec 的 elfdisk 判据。
+    "fault-a3-file-byte": "fat32-small",
     "fault-fat32-cluster-hi": "fat32-wide",
 }
 FAT_FEATURES = FAT_DISK_FEATURES | FAT_FAULT_FEATURES
@@ -1457,6 +1460,51 @@ def apply_fat_host_fault(kind: str) -> list[str]:
     return []
 
 
+EXEC_TOTAL_RE = re.compile(r"exec-verify: 合计 通过=(\d+) 拒=(\d+) 无覆盖=(\d+)")
+
+
+def check_exec_denied(log: str) -> list[str]:
+    """ADR-115 S3 的证人：盘上文件改一格、包不动 ⇒ 16 号必须**点名**拒启。
+
+    不是"整跑红了就算数"（第 37 行同一条纪律）：四件互相独立的事要同时成立——
+    1 build/ 里那块卷与配方只差**计划中的那一字节**（宿主机自己比，不信串口）；
+    2 串口点名预注册的拒因 `判=拒 原因=摘要不符 名=/HELLO.ELF`；
+    3 同一跑里**没有** `判=通过`（正样本那一格不许在这一跑出现）；
+    4 合计行 通过=0 / 拒=1 / 无覆盖≥1，且 shell 打出 ` error=-1`（子进程真没起）。
+    最后把卷还原：这一行是这块盘最后一个读者。
+    """
+    bad: list[str] = []
+    import zlib
+    try:
+        name, off, old, new = fat_host_fault_plan("fault-a3-file-byte")
+    except ValueError as e:
+        bad.append(f"注入点定位不成，这一行的证人无从算起：{e}")
+    else:
+        pristine = zlib.decompress(FAT_ZZ[name].read_bytes())
+        got = FAT_IMG[name].read_bytes()
+        if len(got) != len(pristine):
+            bad.append(f"{name} 镜像长度变了：{len(got)} 对配方 {len(pristine)}")
+        else:
+            diff = [i for i in range(len(got)) if got[i] != pristine[i]]
+            if diff != [off] or bytes(got[off:off + 1]) != new:
+                bad.append(f"盘上不是「只差计划中那一格」：差异偏移 {diff[:8]}（共 {len(diff)} 处）")
+    if "exec-verify: 判=拒 原因=摘要不符 名=/HELLO.ELF" not in log:
+        bad.append("串口没有预注册的拒因 `判=拒 原因=摘要不符 名=/HELLO.ELF`")
+    if "exec-verify: 判=通过" in log:
+        bad.append("同一跑里出现了 `exec-verify: 判=通过` ⇒ 闸门没拒")
+    m = EXEC_TOTAL_RE.search(log)
+    if not m:
+        bad.append("串口没有 `exec-verify: 合计 …` 那一行")
+    else:
+        ok_n, deny_n, uns_n = (int(x) for x in m.groups())
+        if ok_n != 0 or deny_n != 1 or uns_n < 1:
+            bad.append(f"合计 通过={ok_n} 拒={deny_n} 无覆盖={uns_n}"
+                       "（期望 通过=0 拒=1 无覆盖≥1）")
+    if " error=-1" not in log:
+        bad.append("shell 没打出 ` error=-1` ⇒ 子进程没被拒，或拒成了别的码")
+    return bad
+
+
 def check_fat32_exec_byte(log: str) -> list[str]:
     """第 38 行的证人：盘上真被改了一格，而 ④ 的槽读数跟着变、"字节同"那格红。
 
@@ -2012,6 +2060,7 @@ def check_virtio_two(log: str) -> list[str]:
 
 FAT_HOST_WITNESS = {
     "fault-fat32-exec-byte": check_fat32_exec_byte,
+    "fault-a3-file-byte": check_exec_denied,
     "fault-fat32-cluster-hi": check_fat32_cluster_hi,
     # ADR-109 的两条：改的是多级真卷，证人仍是同一套"读改过的盘 + 与 pristine 比差异"。
     "fault-deep-lfn-sum": check_deep_lfn_sum,
@@ -3719,7 +3768,7 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
             bad = apply_fat_host_fault(host_fault)
             if bad:
                 sys.exit("多级真卷宿主机侧注入不成立：" + " / ".join(bad))
-        elif host_fault:
+        elif host_fault and host_fault not in FAT_HOST_FAULTS:
             sys.exit(f"{host_fault} 改的是 FAT 卷，与 `fs-open` 挂的多级真卷无关"
                      "（要注入 FAT 卷得同时带 fat32-probe，别挂一块没人读的盘）")
     if GPT_FEATURES & set(features):
@@ -8465,8 +8514,24 @@ def do_test(timeout: int) -> int:
     ash_ok = ashv == "PASS" and all((
         "run: /HELLO.ELF" in ashlog,
         "(timeout)" in ashlog,
+        "exec-verify: 判=通过 名=/HELLO.ELF" in ashlog,
     ))
+    _tot = EXEC_TOTAL_RE.search(ashlog)
+    if not _tot or int(_tot.group(1)) < 1 or int(_tot.group(2)) != 0:
+        ash_ok = False
     ash_verdict = "CONTENT-MISMATCH" if (ashv == "PASS" and not ash_ok) else ashv
+    IMAGE.unlink(missing_ok=True)
+
+    # =====================================================================
+    # S3（ADR-115）：**负样本**——只改盘上 HELLO.ELF 的一个字节，包一个字不动。
+    # 闸门必须点名拒启（`判=拒 原因=摘要不符`），且同一跑里不许出现 `判=通过`；
+    # 判定级照旧 FAIL(35)：同一块卷上的 FAT 用例也会读到那一格，这与第 38 行同形。
+    print("=== A3 闸门负样本：改盘上 HELLO.ELF 一个字节（包不动）===")
+    IMAGE.unlink(missing_ok=True)
+    edv, edrc, edlog = do_run(["a3-shell", "fat32-probe"], timeout,
+                              host_fault="fault-a3-file-byte")
+    ed_bad = fat_host_witness("fault-a3-file-byte", edlog)
+    ed_verdict = edv if edv != "PASS" else ("PASS" if not ed_bad else "CONTENT-MISMATCH")
     IMAGE.unlink(missing_ok=True)
 
     rows = [
@@ -8621,6 +8686,8 @@ def do_test(timeout: int) -> int:
         ("A3 用户态装载器执行卷上ELF", r3_verdict, r3rc, "PASS", 33),
         # A3 验收句的后半："命令输出和退出码返回 Shell"——shell 自己装载并等收工。
         ("A3 shell执行argv里的外部命令", ash_verdict, ashrc, "PASS", 33),
+        # S3（ADR-115）：闸门的拒启那一格——宿主改盘、包不动。
+        ("A3改盘一字节⇒16号拒启", ed_verdict, edrc, "FAIL", 35),
     ]
     # 每一行对应那一跑的串口：不符时把红的那几格打出来。
     # 单独一张表而不是把日志塞进 `rows` 的元组里：元组要保持成"名字/期望/实际"这种
@@ -8683,6 +8750,7 @@ def do_test(timeout: int) -> int:
         "A2越界argv被校验拒": ablog,
         "A3 用户态装载器执行卷上ELF": r3log,
         "A3 shell执行argv里的外部命令": ashlog,
+        "A3改盘一字节⇒16号拒启": edlog,
     }
     all_ok = True
     print()

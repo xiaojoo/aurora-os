@@ -1074,6 +1074,12 @@ fn run_ktests_and_finish() -> ! {
     #[cfg(feature = "framebuffer")]
     stage_fbcon_tail(s.total as usize, s.failed as usize, s.table_invalid);
 
+    // S3（ADR-115）：三本账的合计。判定行读它——拒启那格与「无包放行」的计数都在这里。
+    #[cfg(feature = "fs-open")]
+    {
+        let (ok_n, deny_n, uns_n) = crate::user::exec_verify_counters();
+        crate::log_info!("exec-verify: 合计 通过={} 拒={} 无覆盖={}", ok_n, deny_n, uns_n);
+    }
     // 判定必须同时满足：表可用且非空、无失败、异常确实被取到过、且 P3 的量具真的收到过样本
     let clean = !s.table_invalid
         && s.total > 0

@@ -294,6 +294,7 @@ layer = "service"
 source_modules = ["sched", "proc", "user", "elf"]
 public_api = [
   "sched::record_exit_code",
+  "user::exec_verify_counters",
   "elf::ElfError",
   "elf::Program",
   "elf::USER_VA_TOP",
