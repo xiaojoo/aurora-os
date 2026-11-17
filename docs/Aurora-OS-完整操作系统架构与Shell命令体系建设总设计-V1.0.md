@@ -981,6 +981,21 @@ aurora-os/
 
 ## 阶段 B：设备、网络与系统服务
 
+> **实施记录（2026-11-18，按代码与判定表实测更新；本表是"做到哪了"，不改上面的验收句）**
+>
+> | 阶段 | 状态 | 依据 |
+> |---|---|---|
+> | B1 设备模型 | 部分 | PCI ECAM/CAM 枚举 `pci.rs`、统一 `DriverCtx`、AHCI 错误恢复、virtio 设备表（ADR-030/112）；**缺** Device/Driver trait、设备树、`lspci`/`lsdev`/`devctl` |
+> | B2 网络协议栈 | 部分（只到以太网帧 + 单次 DHCP） | virtio-net + 手搓 Ethernet 实验帧 + DHCP DISCOVER 回包解析（ADR-032，判定行 网卡第一帧/第一条协议往返）；**缺** ARP/ICMP/TCP/Socket API/路由/DNS 与 `ip`/`ping` 命令 |
+> | B3 时间电源 | 部分 | TSC/PIT 标定、LAPIC/PIT 定时器、健康标记、停机（ADR-036）；**缺** 墙钟/RTC/时区、ACPI 电源状态、重启、init/service manager 与 `date`/`uptime`/`service`/`reboot` |
+> | B4 日志诊断 | 部分（内核侧交付、shell 侧未归因） | 环 4096B + 整行规则、持久日志尾、crash dump V2 及 3 条既有判定行；ADR-135 新增 **30 号 `SYS_LOG_READ`** 与内核判据 `t_log_read`（十格全绿 + 变异证红）；**`dmesg` 命令已接线但端到端输出未归因**（见 ADR-135 §未归因），故未进判定行；`journalctl` 未做 |
+>
+> 与上表配套的事实：① B 阶段四片里只有 B4 的**内核底座与判据已经就位**（环、持久尾、
+> dump 与三条判定行都在跑），其余三片都要先建设备树 / 协议栈 / 电源状态机；
+> ② 新增的两个调用号 **29（kill）/ 30（log_read）** 均已按"先裁决、后实现、再登记"走完
+> （总设计 §2.1、`module-interfaces`、unsafe 白名单/审计表同步）；
+> ③ `dmesg` 的端到端缺陷是本阶段**唯一已知且未归因**的项，候选方向写进了 ADR-135。
+
 ### B1：设备模型完善
 
 - 统一 Device/Driver API。
