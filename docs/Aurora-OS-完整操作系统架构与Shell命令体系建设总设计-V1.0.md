@@ -988,13 +988,14 @@ aurora-os/
 > | B1 设备模型 | 部分 | PCI ECAM/CAM 枚举 `pci.rs`、统一 `DriverCtx`、AHCI 错误恢复、virtio 设备表（ADR-030/112）；**缺** Device/Driver trait、设备树、`lspci`/`lsdev`/`devctl` |
 > | B2 网络协议栈 | 部分（只到以太网帧 + 单次 DHCP） | virtio-net + 手搓 Ethernet 实验帧 + DHCP DISCOVER 回包解析（ADR-032，判定行 网卡第一帧/第一条协议往返）；**缺** ARP/ICMP/TCP/Socket API/路由/DNS 与 `ip`/`ping` 命令 |
 > | B3 时间电源 | 部分 | TSC/PIT 标定、LAPIC/PIT 定时器、健康标记、停机（ADR-036）；**缺** 墙钟/RTC/时区、ACPI 电源状态、重启、init/service manager 与 `date`/`uptime`/`service`/`reboot` |
-> | B4 日志诊断 | 部分（内核侧交付、shell 侧未归因） | 环 4096B + 整行规则、持久日志尾、crash dump V2 及 3 条既有判定行；ADR-135 新增 **30 号 `SYS_LOG_READ`** 与内核判据 `t_log_read`（十格全绿 + 变异证红）；**`dmesg` 命令已接线但端到端输出未归因**（见 ADR-135 §未归因），故未进判定行；`journalctl` 未做 |
+> | B4 日志诊断 | **`dmesg` 已达成** | 环 4096B + 整行规则、持久日志尾、crash dump V2 及 3 条既有判定行；ADR-135 新增 **30 号 `SYS_LOG_READ`**（内核判据 `t_log_read` 十格全绿 + 变异证红）与 shell `dmesg`（判定格 `_dmesg_repeats`：表头后首行必须在表头前出现过 ⇒ 真打了一遍内核日志；变异证红已做）；`journalctl` 未做 |
 >
-> 与上表配套的事实：① B 阶段四片里只有 B4 的**内核底座与判据已经就位**（环、持久尾、
-> dump 与三条判定行都在跑），其余三片都要先建设备树 / 协议栈 / 电源状态机；
+> 与上表配套的事实：① B 阶段四片里 B4 已把**内核底座 + 判据 + 用户态出口**三件都凑齐
+> （环、持久尾、dump、30 号、`dmesg`），其余三片仍要先建设备树 / 协议栈 / 电源状态机；
 > ② 新增的两个调用号 **29（kill）/ 30（log_read）** 均已按"先裁决、后实现、再登记"走完
 > （总设计 §2.1、`module-interfaces`、unsafe 白名单/审计表同步）；
-> ③ `dmesg` 的端到端缺陷是本阶段**唯一已知且未归因**的项，候选方向写进了 ADR-135。
+> ③ 本阶段曾把 `dmesg` 误判成「输出为零」（量具骗人，复盘见 BACKLOG §398）；
+> 纪律已补：判据不能用「看起来像」来定位。
 
 ### B1：设备模型完善
 
