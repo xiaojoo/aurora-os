@@ -937,6 +937,10 @@ fn exec_gate(name: &str, as_slot: u8) -> Option<u64> {
     use crate::filesystem::vfs_ro::ReadOnlyFs;
 
     let cov = crate::sign::cover();
+    // 裁决（2026-11-18）：读不到包 ⇒ 无法证明覆盖 ⇒ 对任何绝对名字 fail-closed。
+    if cov.state == crate::sign::COVER_UNKNOWN {
+        return Some(exec_deny(name, "包读不到"));
+    }
     let covered = cov.state != crate::sign::COVER_ABSENT
         && crate::sign::path_in_field(&cov.path_field) == Some(name.as_bytes());
     if !covered {

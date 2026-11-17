@@ -8528,6 +8528,26 @@ def do_test(timeout: int) -> int:
     IMAGE.unlink(missing_ok=True)
 
     # =====================================================================
+    # S5（裁决 2026-11-18）：**读不到包 ⇒ 覆盖未知 ⇒ 对绝对名字 fail-closed**
+    # （不是"无包放行"）。注入是内核侧特性 fault-pkg-read，不改盘。
+    print("=== A3 闸门：读包失败必须拒启（fault-pkg-read）===")
+    IMAGE.unlink(missing_ok=True)
+    r6v, r6rc, r6log = do_run(["a3-shell", "fat32-probe", "fault-pkg-read"], timeout)
+    r6_ok = r6v == "PASS" and all((
+        "sign-boot: 按注入跳过读包" in r6log,
+        "exec-verify: 判=拒 原因=包读不到 名=/HELLO.ELF" in r6log,
+        "exec-verify: 判=通过" not in r6log,
+        " error=-1" in r6log,
+    ))
+    _t6 = EXEC_TOTAL_RE.search(r6log)
+    if not _t6 or int(_t6.group(1)) != 0 or int(_t6.group(2)) != 1:
+        r6_ok = False
+    r6_verdict = "CONTENT-MISMATCH" if (r6v == "PASS" and not r6_ok) else r6v
+    for x in ([] if r6_ok else ["S5 证人：注入行 / 判=拒 包读不到 / 无 判=通过 / error=-1 / 合计 有一格不成立"]):
+        print("    对账:", x)
+    IMAGE.unlink(missing_ok=True)
+
+    # =====================================================================
     # S4c（ADR-116）：**TOCTOU 封存**——16 号通过后父进程再写段 VMO，必须被拒（`seal=denied`）。
     print("=== A3 闸门：启动后父进程再写段 VMO 必须被拒（封存）===")
     IMAGE.unlink(missing_ok=True)
@@ -8733,6 +8753,8 @@ def do_test(timeout: int) -> int:
         ("A3换代码字节⇒16号拒启", r4_verdict, r4rc, "PASS", 33),
         # S4c（ADR-116）：16 返回后父进程再写段 VMO ⇒ 封存拒绝。
         ("A3启动后写段VMO必须拒", r5_verdict, r5rc, "PASS", 33),
+        # S5（裁决 2026-11-18）：读不到包 ⇒ 覆盖未知 ⇒ 拒启（不是无包放行）。
+        ("A3包读不到⇒16号拒启", r6_verdict, r6rc, "PASS", 33),
 
     ]
     # 每一行对应那一跑的串口：不符时把红的那几格打出来。
@@ -8799,6 +8821,7 @@ def do_test(timeout: int) -> int:
         "A3改盘一字节⇒16号拒启": edlog,
         "A3换代码字节⇒16号拒启": r4log,
         "A3启动后写段VMO必须拒": r5log,
+        "A3包读不到⇒16号拒启": r6log,
 
     }
     all_ok = True

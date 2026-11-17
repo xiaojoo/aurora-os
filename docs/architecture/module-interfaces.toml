@@ -824,6 +824,7 @@ public_api = [
   "sign::COVER_ABSENT",
   "sign::COVER_INVALID",
   "sign::COVER_VERIFIED",
+  "sign::COVER_UNKNOWN",
   "sign::publish_cover",
   "sign::cover",
   "sign::reason",

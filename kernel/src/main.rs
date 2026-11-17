@@ -675,10 +675,26 @@ fn path_field_of(pkg: &[u8]) -> [u8; sign::PATH_BYTES] {
 /// 读失败也只记录：那是设备/存储的问题，不是"这份包不可信"的证据，两者不许混成一个结论。
 fn stage_signature_check() {
     const CHUNK: usize = 4096;
+    fn publish_unknown() {
+        sign::publish_cover(
+            sign::COVER_UNKNOWN,
+            &[0u8; sign::PATH_BYTES],
+            0,
+            &[0u8; sign::DIGEST_BYTES],
+        );
+    }
+    // 内核侧注入（cargo 特性，不是改盘）：模拟"读包失败"，走 fail-closed 那一支。
+    #[cfg(feature = "fault-pkg-read")]
+    {
+        publish_unknown();
+        crate::log_warn!("sign-boot: 按注入跳过读包 ⇒ 覆盖未知 拒启=false（fault-pkg-read）");
+        return;
+    }
     let port = match ahci::boot_port() {
         Ok(p) => p,
         Err(e) => {
-            crate::log_warn!("sign-boot: 找不到引导口 {:?} ⇒ 验签没跑 拒启=false（ADR-080）", e);
+            publish_unknown();
+            crate::log_warn!("sign-boot: 找不到引导口 {:?} ⇒ 覆盖未知（读不到包按拒启）", e);
             return;
         }
     };
@@ -690,8 +706,9 @@ fn stage_signature_check() {
         let n = CHUNK.min(sign::PKG_BYTES - off);
         let lba = sign::PKG_START_LBA + (off / sign::SECTOR_BYTES) as u64;
         if let Err(e) = ahci::read_bytes(port, lba, &mut buf[off..off + n]) {
+            publish_unknown();
             crate::log_warn!(
-                "sign-boot: 读包失败 lba={} 长={} 第{}次 {:?} ⇒ 验签没跑完 拒启=false（ADR-080）",
+                "sign-boot: 读包失败 lba={} 长={} 第{}次 {:?} ⇒ 覆盖未知（读不到包按拒启）",
                 lba, n, reads, e
             );
             return;

@@ -366,6 +366,9 @@ pub fn covered_path(pkg: &[u8]) -> Option<&[u8]> {
 pub const COVER_ABSENT: u8 = 0;
 pub const COVER_INVALID: u8 = 1;
 pub const COVER_VERIFIED: u8 = 2;
+/// 裁决（2026-11-18）：**读不到包**既不是"没有包"也不是"验不过"——无法证明覆盖。
+/// 这一态下 16 号对任何绝对路径一律拒（`包读不到`），不按"无包放行"处理。
+pub const COVER_UNKNOWN: u8 = 3;
 
 const PATH_WORDS: usize = PATH_BYTES / 8;
 const DG_WORDS: usize = DIGEST_BYTES / 8;
