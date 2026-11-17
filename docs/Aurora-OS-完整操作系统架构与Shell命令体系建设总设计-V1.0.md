@@ -916,10 +916,10 @@ aurora-os/
 > | A1 VFS/文件系统 | 部分 | FS-01~FS-10 的**读方向**已交付（ADR-108/109）；写方向由 qoder 推进（ADR-110/111，`fs-rw`） |
 > | A2 用户运行时 | ✅ 前后两半都落地 | `user/runtime` 库 + argv 区/std 句柄/退出码（ADR-130）；判定行 `A2 argv/std…`、`A2越界argv…` |
 > | A3 Shell 解析器与外部命令 | ✅ 解析器与 `run` 已落地，交互判据待量具 | 解析器/注册表（A3 首片）、**用户态装载器**（ADR-131，判定行 `A3 用户态装载器执行卷上ELF`）、shell `run <path>`；交互端到端被 `t_fs_open_ring3` 的 160 ms 窗口挡住（原因见 ADR-131 补记） |
-> | A4 进程观测 | ✅ 数据面落地（`ps`/`free`/`top`；`kill` 见下） | ADR-132：27 号枚举 + 28 号统计 + 按 AS 的映射页计数；用户态 `rt::proc_enum/proc_stat` 与 shell 的 `ps`/`free`；ADR-133：shell `top`（27 号第二个调用方，pages 降序 + 19 号薄壳 `rt::sleep_ms` 定时，纯用户态内核零改动）；判定行 `A3 shell执行argv命令并ps/free读数`（argv `run/ps/free/top 2`，串口原文见 ADR-132 §决策 5 与 ADR-133 §验收） |
+> | A4 进程观测 | ✅ 四条命令全部落地（`ps`/`free`/`top`/`kill`） | ADR-132：27 号枚举 + 28 号统计 + 按 AS 的映射页计数；用户态 `rt::proc_enum/proc_stat` 与 shell 的 `ps`/`free`；ADR-133：shell `top`（27 号第二个调用方，pages 降序 + 19 号薄壳 `rt::sleep_ms` 定时，纯用户态内核零改动）；ADR-134：shell `kill <pid>`（**29 号** `SYS_PROC_KILL_BY_PID`，pid 只寻址、授权靠调用者名下的 `RIGHT_WRITE` Proc 句柄，内核反查后走与 18 号同一实现）；判定行 `A3 shell执行argv命令并ps/free读数`（argv `run/ps/free/top 2; kill 9999`，串口原文见 ADR-132 §决策 5、ADR-133 §验收、ADR-134 §落地） |
 >
-> 三条与上表配套的事实：① `ps`/`free`/`top` 已有真实数据（27 号的聚合），`kill` 尚无命令——
-> 18 号内核面早就在，缺的是 shell 侧"按 pid 找 Proc 句柄"的角色语义（ADR-132 §未做 2）；
+> 三条与上表配套的事实：① `ps`/`free`/`top`/`kill` 均有真实数据（27 号的聚合）；
+> `kill` 走 29 号，capability 语义不变（ADR-134）；
 > ② `run` 的退出码显示路径已实现但缺"会自己退出的样例命令"（卷上的 hello 是内核探针，不写 FLAG_EXIT 就自旋）；
 > ③ 重定向/管道/`ls -lah` 属 A3 的后续片，尚未开始（A3 验收句的 `ls/cat/grep` 那半未达成）。
 
