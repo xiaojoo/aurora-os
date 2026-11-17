@@ -85,16 +85,17 @@ unsafe impl Sync for PkgScratch {}
 #[cfg(feature = "sig-check")]
 static PKG_BUF: PkgScratch = PkgScratch(UnsafeCell::new([0u8; sign::PKG_BYTES]));
 
-/// M9-a②：盘上那份签名包的读取与验证。判据六格：
+/// M9-a②：盘上那份签名包的读取与验证。判据七格：
 /// 1 从固定 LBA 分块读满一整包（`sign::PKG_BYTES` 个字节一次不少，读失败就直接红）
 /// 2 头自洽：魔数、版本、三个长度字段各按自身宽度读，并且**先验上界再用**（§10.3 那条）
 /// 3 真包验签通过（`check_package` 回 `Ok`）
 /// 4 包里的载荷与内核手上那份夹具是同一段字节：长度同数、两条摘要同数
 ///    （一个来自盘上 15 次分块读，一个来自镜像里 `include_bytes!` 的那份）
-/// 5 八种篡改**每一种都必须被拒**，并把拒绝理由与附带的数字打出来 —— 宿主机用自己的实现
+/// 5 十二种篡改**每一种都必须被拒**，并把拒绝理由与附带的数字打出来 —— 宿主机用自己的实现
 ///    对同一批输入算同一份答案，两边逐条相同（这就是"协议 fuzz"的第一个形状：畸形输入
 ///    必须被定性拒绝，不许崩、不许静默接受）
 /// 6 走完这一大包之后，引导盘的 LBA 1 仍读得到 `EFI PART`：读盘 15 次不许把别的读者弄坏
+/// 7 覆盖名读得出来，且就是 `/HELLO.ELF`（`覆盖=Some(...)` 进判据行；宿主机另有一台仪器拿 `esp_image.PKG_PATH` 对这一个读数）
 #[cfg(feature = "sig-check")]
 fn t_sig_package() -> bool {
     const CHUNK: usize = 4096;
@@ -149,7 +150,7 @@ fn t_sig_package() -> bool {
             sign::PK_ANCHOR[3]
         ])
     );
-    // 八种篡改：改一个字节 → 必须被拒 → 打回理由 → 还原。还原是必须的，
+    // 十二种篡改：改一个字节 → 必须被拒 → 打回理由 → 还原。还原是必须的，
     // 否则下一格测的就不是"那一种篡改"而是前一种的残留（用例自己污染现场，与 ㊻ 同形）
     let mut rejected = 0usize;
     for (i, t) in sign::TAMPERS.iter().enumerate() {
@@ -176,19 +177,22 @@ fn t_sig_package() -> bool {
     // 大包读完之后引导盘那条路仍然完好
     let mut head = [0u8; 512];
     let ahci_still_ok = ahci::read_bytes(port, 1, &mut head).is_ok() && &head[0..8] == b"EFI PART";
+    let covered = sign::covered_path(buf).and_then(|p| core::str::from_utf8(p).ok());
+    let path_ok = covered == Some("/HELLO.ELF");
     crate::log_info!(
-        "pkg: 判据 读满={} 头自洽={} 验签={} 载荷同={} 篡改全拒={}/{} AHCI照常={}",
+        "pkg: 判据 读满={} 头自洽={} 验签={} 载荷同={} 篡改全拒={}/{} AHCI照常={} 覆盖={:?}",
         load_ok,
         hdr_ok,
         verify_ok,
         payload_same,
         rejected,
         sign::TAMPERS.len(),
-        ahci_still_ok
+        ahci_still_ok,
+        covered
     );
-    let ok = load_ok && hdr_ok && verify_ok && payload_same && tamper_ok && ahci_still_ok;
+    let ok = load_ok && hdr_ok && verify_ok && payload_same && tamper_ok && ahci_still_ok && path_ok;
     if !ok {
-        crate::log_fatal!("pkg: 签名包判据不成立（上面十行是全部读数）");
+        crate::log_fatal!("pkg: 签名包判据不成立（上面的取证、十二条篡改与判据行是全部读数）");
     }
     ok
 }

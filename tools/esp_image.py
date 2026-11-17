@@ -218,6 +218,8 @@ PKG_SEED = hashlib.sha256(b"aurora-os M9-a test anchor 2026-11-06").digest()
 PKG_MAGIC = b"PKGA"
 PKG_VERSION = 2
 PKG_PATH = b"/HELLO.ELF"      # 版本 2：头 20..84 的覆盖名（ADR-115 S1）
+PATH_OFF = 20                     # 覆盖名在头里的偏移/宽度（与内核 sign::PATH_OFF/PATH_BYTES 同数）
+PATH_BYTES = 64
 PKG_HDR_BYTES = 512
 PK_ITEMS = 512                    # 256 个比特 ⇒ 256 对
 PK_BYTES = PK_ITEMS * 32          # 16 KiB
@@ -256,8 +258,17 @@ def pkg_anchor() -> bytes:
     return hashlib.sha256(lamport_pk()).digest()
 
 
+def signed_msg(path_field: bytes, payload: bytes) -> bytes:
+    """签名承诺的那 32 个字节：sha256(覆盖名 64 字节定长字段 + sha256(载荷))。
+
+    与内核 `sign::signed_msg` 同一式。名字必须进签名：否则把包名从 /A 改成 /B，A 就变成"无覆盖包"而按放行启动（ADR-115 S1b）。
+    """
+    assert len(path_field) == PATH_BYTES, len(path_field)
+    return hashlib.sha256(path_field + hashlib.sha256(payload).digest()).digest()
+
+
 def pkg_build(payload: bytes) -> bytes:
-    """头 + 公钥 + 签名 + 载荷。签名承诺的是**载荷那 `payload_len` 个字节**。"""
+    """头 + 公钥 + 签名 + 载荷。签名承诺的是 `signed_msg`：覆盖名 + **载荷那 `payload_len` 个字节**。"""
     assert len(payload) <= PKG_PAYLOAD_BYTES, f"载荷超出包上限 {len(payload)} > {PKG_PAYLOAD_BYTES}"
     hdr = bytearray(PKG_HDR_BYTES)
     hdr[0:4] = PKG_MAGIC
@@ -265,37 +276,12 @@ def pkg_build(payload: bytes) -> bytes:
     hdr[8:12] = PK_BYTES.to_bytes(4, "little")
     hdr[12:16] = SIG_BYTES.to_bytes(4, "little")
     hdr[16:20] = len(payload).to_bytes(4, "little")
-    hdr[20:20 + len(PKG_PATH)] = PKG_PATH
+    hdr[PATH_OFF:PATH_OFF + len(PKG_PATH)] = PKG_PATH
     body = payload + bytes(PKG_PAYLOAD_BYTES - len(payload))
-    pkg = bytes(hdr) + lamport_pk() + lamport_sign(payload) + body
+    msg = signed_msg(bytes(hdr[PATH_OFF:PATH_OFF + PATH_BYTES]), payload)
+    pkg = bytes(hdr) + lamport_pk() + lamport_sign(msg) + body
     assert len(pkg) == PKG_BYTES, (len(pkg), PKG_BYTES)
     return pkg
-
-
-def pkg_verify(pkg: bytes) -> tuple[bool, str]:
-    """宿主机自己的那一条实现：内核说通过/内核说哪一格拒绝，这里必须给同一个答案。"""
-    if len(pkg) != PKG_BYTES:
-        return False, f"BadLen({len(pkg)})"
-    if pkg[0:4] != PKG_MAGIC or int.from_bytes(pkg[4:8], "little") != PKG_VERSION:
-        return False, "BadHeader"
-    n = int.from_bytes(pkg[16:20], "little")
-    if n > PKG_PAYLOAD_BYTES:
-        return False, f"PayloadTooLong({n})"
-    field = pkg[20:20 + 64]
-    e = field.find(b"\0")
-    if e is None or e == 0 or any(b < 0x21 or b > 0x7E for b in field[:e]):
-        return False, "BadHeader"
-    pk, sig = pkg[PK_OFF:PK_OFF + PK_BYTES], pkg[SIG_OFF:SIG_OFF + SIG_BYTES]
-    payload = pkg[PAY_OFF:PAY_OFF + n]
-    if hashlib.sha256(pk).digest() != pkg_anchor():
-        return False, "AnchorMismatch"
-    d = hashlib.sha256(payload).digest()
-    for i, b in enumerate(lamport_bits(d)):
-        given = sig[i * 32:(i + 1) * 32]
-        want = pk[(i * 2 + b) * 32:(i * 2 + b + 1) * 32]
-        if hashlib.sha256(given).digest() != want:
-            return False, f"BitMismatch({i})"
-    return True, "ok"
 
 
 def package_payload() -> bytes:
@@ -325,10 +311,14 @@ def pkg_reason(pkg: bytes) -> tuple[str, int]:
         return "BadLen", max(pk_len, sig_len)
     if pay_len > PKG_PAYLOAD_BYTES or PAY_OFF + pay_len > len(pkg):
         return "PayloadTooLong", pay_len
+    field = pkg[PATH_OFF:PATH_OFF + PATH_BYTES]
+    e = field.find(b"\0")
+    if e is None or e == 0 or any(b < 0x21 or b > 0x7E for b in field[:e]):
+        return "BadHeader", -1
     pk, sig = pkg[PK_OFF:PK_OFF + PK_BYTES], pkg[SIG_OFF:SIG_OFF + SIG_BYTES]
     if hashlib.sha256(pk).digest() != pkg_anchor():
         return "AnchorMismatch", -1
-    d = hashlib.sha256(pkg[PAY_OFF:PAY_OFF + pay_len]).digest()
+    d = hashlib.sha256(signed_msg(field, pkg[PAY_OFF:PAY_OFF + pay_len])).digest()
     for i, b in enumerate(lamport_bits(d)):
         given = sig[i * 32:(i + 1) * 32]
         want = pk[(i * 2 + b) * 32:(i * 2 + b + 1) * 32]
@@ -355,6 +345,11 @@ TAMPERS = [
     (19, 0xFF),
     (8, 0xFF),
     (0, 0xFF),
+    # 覆盖名必须被签名罩住：翻成另一个仍合法的名字（/hELLO.ELF）⇒ 形状过得去，拒绝只能来自签名（BitMismatch）
+    (PATH_OFF + 1, 0x20),
+    # 形状那一格：首个 '/' 翻成 NUL ⇒ 空名，走 BadHeader（不经签名）
+    (PATH_OFF, 0x2F),    # 可打印那一格：翻成不可打印（形状仍不空）
+    (PATH_OFF + 1, 0x80),
 ]
 
 

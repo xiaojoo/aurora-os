@@ -5765,7 +5765,8 @@ def kernel_sig_constants() -> tuple[dict[str, int], list[tuple[int, int]], bytes
     bad: list[str] = []
     names = ["DIGEST_BYTES", "PK_ITEMS", "PK_BYTES", "SIG_ITEMS", "SIG_BYTES",
              "PKG_VERSION", "PKG_HDR_BYTES", "PK_OFF", "SIG_OFF", "PAY_OFF", "PKG_PAYLOAD_BYTES",
-             "PKG_BYTES", "PKG_START_LBA", "SECTOR_BYTES", "PKG_SECTORS"]
+             "PKG_BYTES", "PKG_START_LBA", "SECTOR_BYTES", "PKG_SECTORS",
+             "PATH_OFF", "PATH_BYTES"]
     vals: dict[str, int] = {}
     for n in names:
         m = re.search(rf"pub const {n}: [^=]+= (.*);", src)
@@ -5819,6 +5820,7 @@ def check_sig_anchor() -> list[str]:
         "PKG_PAYLOAD_BYTES": esp_image.PKG_PAYLOAD_BYTES, "PKG_BYTES": esp_image.PKG_BYTES,
         "PKG_START_LBA": esp_image.PKG_START_LBA, "SECTOR_BYTES": esp_image.SECTOR,
         "PKG_SECTORS": esp_image.PKG_SECTORS,
+        "PATH_OFF": esp_image.PATH_OFF, "PATH_BYTES": esp_image.PATH_BYTES,
     }
     for n, exp in want.items():
         if vals.get(n) != exp:
@@ -5849,6 +5851,8 @@ PKG_TAMPER_RE = re.compile(
     r"理由=(?P<why2>[A-Za-z]+) 附带=(?P<arg>\d+)")
 PKG_FORENSIC_RE = re.compile(
     r"pkg: 取证 读满=(\d+) 次 字节=(\d+) 头自洽=(\w+) 验签=(\w+) 载荷长=(\d+)/(\d+) 载荷同=(\w+)")
+PKG_VERDICT_RE = re.compile(
+    r"pkg: 判据 读满=(\w+) 头自洽=(\w+) 验签=(\w+) 载荷同=(\w+) 篡改全拒=(\d+)/(\d+) AHCI照常=(\w+) 覆盖=([^\r\n]*)")
 
 
 def check_sig_package(log: str) -> list[str]:
@@ -5886,6 +5890,20 @@ def check_sig_package(log: str) -> list[str]:
     if hashlib.sha256((ROOT / "kernel" / "fixtures" / "hello.elf").read_bytes()).hexdigest() \
             != hashlib.sha256(pkg[esp_image.PAY_OFF:esp_image.PAY_OFF + want_len]).hexdigest():
         bad.append("宿主机自己也比出不同：盘上的载荷不是那份 ELF")
+    mv = PKG_VERDICT_RE.search(log)
+    if mv is None:
+        bad.append("有 `pkg: 判据` 却解析不出覆盖名那一格（读数缺了 = 这一格没测）")
+    else:
+        load_ok, hdr_s, ver_s, pay_s, rej_n, rej_tot, ahci_s, cov = mv.groups()
+        want_cov = f'Some("{esp_image.PKG_PATH.decode()}")'
+        if cov.strip() != want_cov:
+            bad.append(f"串口覆盖名 {cov.strip()} ≠ 生成器写进包里的 {want_cov}")
+        for name, v in (("读满", load_ok), ("头自洽", hdr_s), ("验签", ver_s),
+                        ("载荷同", pay_s), ("AHCI照常", ahci_s)):
+            if v != "true":
+                bad.append(f"内核判据 {name}={v}")
+        if int(rej_n) != int(rej_tot) or int(rej_tot) != len(esp_image.TAMPERS):
+            bad.append(f"篡改全拒={rej_n}/{rej_tot}，生成器这张表 {len(esp_image.TAMPERS)} 条")
     rows = list(PKG_TAMPER_RE.finditer(log))
     if len(rows) != len(esp_image.TAMPERS):
         bad.append(f"内核打了 {len(rows)} 条篡改，生成器这张表有 {len(esp_image.TAMPERS)} 条")

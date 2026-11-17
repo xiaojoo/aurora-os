@@ -207,7 +207,7 @@ pub fn bits(d: &[u8; DIGEST_BYTES]) -> [u8; SIG_ITEMS] {
     b
 }
 
-/// 验一份签名包：`anchor` 是内核内置的那 32 字节，`pk`/`sig` 随包交付，`msg` 是载荷字节。
+/// 验一份签名包：`anchor` 是内核内置的那 32 字节，`pk`/`sig` 随包交付，`msg` 是签名承诺的那段字节（包这边传 `signed_msg`）。
 /// 顺序是"先贵后便宜"还是"先能判的"？——按**能定性的顺序**：锚点先过（不过就没什么好看的），
 /// 再逐比特（这是签名本体），最后才把载荷的摘要与签名承诺的对上。
 /// 每一步都返回**不同的错误**，因为"红了"要能说清是哪一类篡改
@@ -271,17 +271,19 @@ pub fn check_package(pkg: &[u8], anchor: &[u8; DIGEST_BYTES]) -> Result<usize, P
         return Err(PkgError::PayloadTooLong(pay_len));
     }
     // 覆盖名：NUL 结尾、非空、可打印 ASCII（形状不对与"头坏了"同一级，暂时共用 BadHeader）
-    let Some(end) = path_end(&pkg[PATH_OFF..PATH_OFF + PATH_BYTES]) else {
+    let Some(path) = covered_path(pkg) else {
         return Err(PkgError::BadHeader);
     };
-    if end == 0 || !pkg[PATH_OFF..PATH_OFF + end].iter().all(|b| (0x21..=0x7e).contains(b)) {
+    if !path.iter().all(|b| (0x21..=0x7e).contains(b)) {
         return Err(PkgError::BadHeader);
     }
+    let mut path_field = [0u8; PATH_BYTES];
+    path_field.copy_from_slice(&pkg[PATH_OFF..PATH_OFF + PATH_BYTES]);
     verify(
         anchor,
         &pkg[PK_OFF..PK_OFF + PK_BYTES],
         &pkg[SIG_OFF..SIG_OFF + SIG_BYTES],
-        &pkg[PAY_OFF..PAY_OFF + pay_len],
+        &signed_msg(&path_field, &pkg[PAY_OFF..PAY_OFF + pay_len]),
     )
     .map_err(PkgError::Sig)?;
     Ok(pay_len)
@@ -303,6 +305,15 @@ pub fn covered_path(pkg: &[u8]) -> Option<&[u8]> {
     Some(&pkg[PATH_OFF..PATH_OFF + end])
 }
 
+/// 签名承诺的那 32 个字节：`sha256(覆盖名 64 字节定长字段 ‖ sha256(载荷))`。
+/// 名字也进签名：S2 的开关是"包名 == argv[0]"——名字不被签住的话，把包名从 /A 改成 /B，A 就变成"无覆盖包"而按放行计数启动，验签只挡得住"写坏了一个包"（ADR-115 S1b）。
+pub fn signed_msg(path_field: &[u8; PATH_BYTES], payload: &[u8]) -> [u8; DIGEST_BYTES] {
+    let mut buf = [0u8; PATH_BYTES + DIGEST_BYTES];
+    buf[..PATH_BYTES].copy_from_slice(path_field);
+    buf[PATH_BYTES..].copy_from_slice(&digest(payload));
+    digest(&buf)
+}
+
 /// 一次篡改：包内第 `at` 个字节异或 `mask`。表在两边各写一份（宿主机自己算同一批理由），
 /// `check-sig-anchor` 逐条对账 —— 一边的表变了，另一边就会给出不同的答案
 #[derive(Clone, Copy, Debug)]
@@ -313,7 +324,7 @@ pub struct Tamper {
     pub why: &'static str,
 }
 
-pub const TAMPERS: [Tamper; 9] = [
+pub const TAMPERS: [Tamper; 12] = [
     Tamper { at: PK_OFF, mask: 0x01, why: "public key first byte" },
     Tamper { at: PK_OFF + PK_BYTES - 1, mask: 0x80, why: "public key last byte" },
     Tamper { at: SIG_OFF, mask: 0x01, why: "signature first byte" },
@@ -325,6 +336,12 @@ pub const TAMPERS: [Tamper; 9] = [
     Tamper { at: 19, mask: 0xFF, why: "payload length high byte" },
     Tamper { at: 8, mask: 0xFF, why: "public key length field" },
     Tamper { at: 0, mask: 0xFF, why: "magic" },
+    // 覆盖名必须被签名罩住：翻成另一个**同样合法**的名字（/hELLO.ELF），形状检查过得去，拒绝只能来自签名（BitMismatch）——名字不被签住的话，改包名就能让被覆盖的文件变成"无覆盖包"而按放行启动（ADR-115 S1b）
+    Tamper { at: PATH_OFF + 1, mask: 0x20, why: "covered path byte (still printable)" },
+    // 形状那一格：首个 '/' 翻成 NUL ⇒ 空名，走 BadHeader（不经签名）
+    Tamper { at: PATH_OFF, mask: 0x2F, why: "covered path NUL (empty name)" },
+    // 可打印那一格：翻成不可打印（形状仍不空）⇒ 走 BadHeader，与签名那一格分开
+    Tamper { at: PATH_OFF + 1, mask: 0x80, why: "covered path byte (non-printable)" },
 ];
 
 /// 拒绝理由的稳定文本：日志与宿主机比的是这个名字，不是 `Debug` 的排版。

@@ -14974,3 +14974,24 @@ kernel 栈/地址窗口上的脆弱）。下一刀先定位它：用同一段包
   `check` **17/17**；整链 **68 行 68 符合**（`build/matrix-s1a.log`）。
 - **没做（S1b）**：第十条篡改（改覆盖名一个字节 ⇒ 必须拒）与串口 `覆盖=Some("/HELLO.ELF")` 读数。
   也就是说 v2 字段现在**有形状校验、还没有自己的负样本**——S1 不算完，S2 不许开工。
+
+## 389. 验签 S1b：覆盖名进签名 + 三条名字篡改（ADR-115 S1b）（2026-11-17）
+
+- 签名承诺从"载荷"扩到 `sha256(覆盖名 64 字节定长字段 ‖ sha256(载荷))`：内核 `sign::signed_msg`
+  与 `esp_image.signed_msg` 同式。理由：名字不被签住 ⇒ 改包名就能让被覆盖的文件变成"无覆盖包"
+  而按放行计数启动（S2 的开关是"包名 == argv[0]"），验签只剩"挡住写坏的包"。
+- 篡改表 9 → 12：新增 `(PATH_OFF+1, 0x20)` ⇒ `BitMismatch(0)`、`(PATH_OFF, 0x2F)` ⇒ `BadHeader`、
+  `(PATH_OFF+1, 0x80)` ⇒ `BadHeader`；`check-sig-anchor` 增钉 `PATH_OFF/PATH_BYTES`。
+- 判据行新增读数 `覆盖=Some("/HELLO.ELF")`；宿主 `check_sig_package` 用它当第二台仪器对
+  `esp_image.PKG_PATH`，并逐格要求 读满/头自洽/验签/载荷同/AHCI照常=true、篡改全拒=12/12。
+- 量具错一处：`esp_image.py` 原有两份 `pkg_verify`（后者覆盖前者），S1a 的形状检查落在死代码上；
+  已删死的那份，形状检查进 `pkg_reason`。
+- 变异证红（都还原）：①两边同时去掉名字入签 ⇒ 第 9 格 `ACCEPTED`、`篡改全拒=11/12`、rc=35；
+  ②只删内核"可打印"检查 ⇒ 内核单跑仍 PASS（换成分支 `BitMismatch`），宿主门红：
+  `第 11 条（covered path byte (non-printable)）两份实现答案不同：内核 BitMismatch/0，宿主机 BadHeader/4294967295`。
+- 读数：`run --features sig-check` **PASS(33) 84/84**（`dc48285b07c2`；判据行 `篡改全拒=12/12` +
+  `覆盖=Some("/HELLO.ELF")`）；`check` **17/17**；整链两遍：第一遍 67/68（唯一不符合 =
+  `安全模式健康后退回正常`，强制 Safe 那一遍 120 s 预算耗尽、串口尾行 `q2: 工人超时`，
+  同 ELF `bca6c02d1f2d`），第二遍 **68/68 符合**（`build/s1b-matrix2.log`，默认档 `bca6c02d1f2d`）
+  ⇒ 第一遍那一格按环境形状**不归因**。
+- **S2（16 号闸门）未开工**，按使用者裁决不许先开。
