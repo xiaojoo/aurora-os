@@ -216,7 +216,8 @@ KEY_LABEL = b"aurora-lamport"
 # 测试锚点的种子。生产要换成离线保管的真钥匙（那一半没做，写在 BACKLOG 61）
 PKG_SEED = hashlib.sha256(b"aurora-os M9-a test anchor 2026-11-06").digest()
 PKG_MAGIC = b"PKGA"
-PKG_VERSION = 1
+PKG_VERSION = 2
+PKG_PATH = b"/HELLO.ELF"      # 版本 2：头 20..84 的覆盖名（ADR-115 S1）
 PKG_HDR_BYTES = 512
 PK_ITEMS = 512                    # 256 个比特 ⇒ 256 对
 PK_BYTES = PK_ITEMS * 32          # 16 KiB
@@ -264,6 +265,7 @@ def pkg_build(payload: bytes) -> bytes:
     hdr[8:12] = PK_BYTES.to_bytes(4, "little")
     hdr[12:16] = SIG_BYTES.to_bytes(4, "little")
     hdr[16:20] = len(payload).to_bytes(4, "little")
+    hdr[20:20 + len(PKG_PATH)] = PKG_PATH
     body = payload + bytes(PKG_PAYLOAD_BYTES - len(payload))
     pkg = bytes(hdr) + lamport_pk() + lamport_sign(payload) + body
     assert len(pkg) == PKG_BYTES, (len(pkg), PKG_BYTES)
@@ -279,6 +281,10 @@ def pkg_verify(pkg: bytes) -> tuple[bool, str]:
     n = int.from_bytes(pkg[16:20], "little")
     if n > PKG_PAYLOAD_BYTES:
         return False, f"PayloadTooLong({n})"
+    field = pkg[20:20 + 64]
+    e = field.find(b"\0")
+    if e is None or e == 0 or any(b < 0x21 or b > 0x7E for b in field[:e]):
+        return False, "BadHeader"
     pk, sig = pkg[PK_OFF:PK_OFF + PK_BYTES], pkg[SIG_OFF:SIG_OFF + SIG_BYTES]
     payload = pkg[PAY_OFF:PAY_OFF + n]
     if hashlib.sha256(pk).digest() != pkg_anchor():

@@ -143,7 +143,11 @@ pub const SIG_ITEMS: usize = 256;
 /// `check-sig-anchor` 逐字对账——两边各写一份而不对账，就会有一天"内核读的偏移"与
 /// "生成器写的偏移"分家，而那表现为一枚永远验不过的签名）
 pub const PKG_MAGIC: [u8; 4] = *b"PKGA";
-pub const PKG_VERSION: u32 = 1;
+pub const PKG_VERSION: u32 = 2;
+/// 版本 2：头 20..84 是这条包覆盖的文件名（NUL 结尾、可打印 ASCII、非空）。
+/// 没有它就无法区分"被改过的 hello"与"另一个未签名文件"（ADR-115 S1）。
+pub const PATH_OFF: usize = 20;
+pub const PATH_BYTES: usize = 64;
 pub const PKG_HDR_BYTES: usize = 512;
 pub const PK_OFF: usize = PKG_HDR_BYTES;
 pub const SIG_OFF: usize = PK_OFF + PK_BYTES;
@@ -266,6 +270,13 @@ pub fn check_package(pkg: &[u8], anchor: &[u8; DIGEST_BYTES]) -> Result<usize, P
     if pay_len > PKG_PAYLOAD_BYTES || PAY_OFF + pay_len > pkg.len() {
         return Err(PkgError::PayloadTooLong(pay_len));
     }
+    // 覆盖名：NUL 结尾、非空、可打印 ASCII（形状不对与"头坏了"同一级，暂时共用 BadHeader）
+    let Some(end) = path_end(&pkg[PATH_OFF..PATH_OFF + PATH_BYTES]) else {
+        return Err(PkgError::BadHeader);
+    };
+    if end == 0 || !pkg[PATH_OFF..PATH_OFF + end].iter().all(|b| (0x21..=0x7e).contains(b)) {
+        return Err(PkgError::BadHeader);
+    }
     verify(
         anchor,
         &pkg[PK_OFF..PK_OFF + PK_BYTES],
@@ -274,6 +285,22 @@ pub fn check_package(pkg: &[u8], anchor: &[u8; DIGEST_BYTES]) -> Result<usize, P
     )
     .map_err(PkgError::Sig)?;
     Ok(pay_len)
+}
+
+fn path_end(field: &[u8]) -> Option<usize> {
+    field.iter().position(|b| *b == 0)
+}
+
+/// 包覆盖的文件名（ADR-115 S1）。字段形状不合法时返回 `None`——调用方再决定这算不算拒绝。
+pub fn covered_path(pkg: &[u8]) -> Option<&[u8]> {
+    if pkg.len() < PATH_OFF + PATH_BYTES {
+        return None;
+    }
+    let end = path_end(&pkg[PATH_OFF..PATH_OFF + PATH_BYTES])?;
+    if end == 0 {
+        return None;
+    }
+    Some(&pkg[PATH_OFF..PATH_OFF + end])
 }
 
 /// 一次篡改：包内第 `at` 个字节异或 `mask`。表在两边各写一份（宿主机自己算同一批理由），

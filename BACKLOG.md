@@ -14963,3 +14963,14 @@ kernel 栈/地址窗口上的脆弱）。下一刀先定位它：用同一段包
   无覆盖包 ⇒ 放行 + `unsigned_exec`；S3 判定行 + 宿主注入（改盘不改包）证红。
   ABI minor 15 → 16 与 `F_FS_VERIFY_EXEC` 位随 S2 落。
 - 明确不做：信任根/轮换/吊销（ADR-011）；不声称"安全启动"。下一步从 S1（包格式 v2）开工。
+## 388. 验签 S1a：包格式 v2，头 20..84 的覆盖名（ADR-115）（2026-11-17）
+
+- 两侧同步：`sign.rs` 的 `PKG_VERSION=2` + `PATH_OFF/PATH_BYTES`（20/64），`check_package`
+  先验覆盖名形状（NUL 结尾、非空、可打印 ASCII；形状不符暂与坏头同级 `BadHeader`），
+  新增 `pub fn covered_path()` 供 S2 用；`esp_image.py` 写 `PKG_PATH="/HELLO.ELF"`，
+  `pkg_verify` 同步校验。
+- 读数：`run --features sig-check` **PASS(33) 84/84**（`6e546e5bb726`），
+  `pkg: 判据 读满=true 头自洽=true 验签=true 载荷同=true 篡改全拒=9/9 AHCI照常=true`；
+  `check` **17/17**；整链 **68 行 68 符合**（`build/matrix-s1a.log`）。
+- **没做（S1b）**：第十条篡改（改覆盖名一个字节 ⇒ 必须拒）与串口 `覆盖=Some("/HELLO.ELF")` 读数。
+  也就是说 v2 字段现在**有形状校验、还没有自己的负样本**——S1 不算完，S2 不许开工。
