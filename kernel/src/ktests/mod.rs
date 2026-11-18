@@ -26,6 +26,14 @@ mod mm;
 mod net;
 #[cfg(feature = "handles")]
 mod procinfo;
+#[cfg(feature = "handles")]
+mod prockill;
+#[cfg(feature = "handles")]
+mod logread;
+#[cfg(feature = "handles")]
+mod pcienum;
+#[cfg(feature = "handles")]
+mod uptime;
 mod resource;
 mod sched;
 #[cfg(feature = "sig-check")]

@@ -87,12 +87,15 @@ expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe
 # 数目对账：465+1=466、86+1=87。
 # 2026-11-17 A4（ADR-132）：+user/runtime U5 35→37（27/28 两个调用块）、
 # +user/shell/registry U5 1→2（`job_of` 的 handle_of_role）。对账：466+3=469、87+3=90。
-total = 470
+# 2026-11-17 ADR-133（top）：+user/shell/registry U5 2→3（`cmd_top` 取 ROLE_SELF_THREAD
+# 的 handle_of_role）。runtime 零新增——`sleep_ms` 是 safe fn `object_wait` 的薄壳，
+# 自身没有 unsafe 块。对账：467+1=468、U5 90+1=91。
+total = 483
 U1 = 83
 U2 = 119
 U3 = 13
-U4 = 129
-U5 = 90
+U4 = 133
+U5 = 99
 U6 = 36
 
 [modules."acpi"]
@@ -214,7 +217,6 @@ U4 = 5
 # 所以子进程跑起来之后"启动那棵树"与"硬件真正在用的树"不是同一张。用户缓冲校验
 # （user::validate_range）要的是后者。不取锁，与 effective_flags 同一纪律，可在 with_vmm_lock 内调用。
 U1 = 6
-# S4c（ADR-116）：frame_seal / frame_sealed 两处 FrameInfo 读写（PMM 锁内，只动一个 u8）。
 # P1a/P1b/P1c（ADR-063）共 7 处 FrameInfo unsafe：引导写入（bootstrap_frame_info）、
 # 读 refcnt（fi_refcnt）、读 owner（fi_owner）、写 used（fi_set_used）、refcnt 加一（fi_inc_refcnt）、
 # refcnt 减一（fi_dec_refcnt）、最终归还毒化（fi_final_free）。指针来自 phys_alloc_locked 分出的
@@ -314,7 +316,11 @@ U1 = 2
 U5 = 3
 
 [modules."virtio"]
-U4 = 8
+# ADR-142：ARP ç¼å­ãæéæ¥æº = æ¬æ¨¡åéæ `ArpCell(UnsafeCell<ArpTable>)` ç `get()`ï¼
+# å°åèå´åºå®å¨è¿ä¸ä¸ªéæå¯¹è±¡ï¼åºå® 8 é¡¹ï¼ï¼å¯¹é½ç±ç¼è¯å¨ï¼çå½å¨æ 'staticï¼
+# å¹¶åè§åï¼è°ç¨ç¹é½å¨åæ ¸ä¸²è¡ä¸ä¸æï¼ktest/å¤æ®ï¼ï¼ä¸ `bn` åæ¬¾åæ ¸è®ºè¯ï¼
+# ä¸åéï¼n ä¸ items ç´§æï¼ç± arp_learn/arp_lookup/arp_stats ä¸ä¸ªå¥å£å±åç»´æã
+U4 = 12
 
 [modules."vmo"]
 # W3 P4（ADR-074）：VMO 对象表。指针来源有两类——
@@ -341,7 +347,7 @@ U4 = 2
 # 不变量 = ABI 约定（号 rax、参数 rdi/rsi/rdx/r10、返回 rax 负值错误码）与 safe 层
 # 长度/枚举编码检查；生命周期 = 调用栈内；并发 = 无共享可变状态（库无全局）。
 U1 = 5
-U5 = 37
+U5 = 44
 
 
 [modules."user/execprobe"]
@@ -369,6 +375,9 @@ U2 = 2
 U1 = 1
 
 [modules."user/shell/registry"]
-# A3 收尾：`run` 命令。U5 一处 = `rt::handle_of_role(si_va, ROLE_JOB)` 那一次调用——
-# si_va 由内核 `process_start` 校验并映射（user+只读），契约原文在 runtime 侧。
-U5 = 2
+# A3 收尾：`run` 命令。U5 两处 = `rt::handle_of_role(si_va, ROLE_JOB)` 两次调用
+# （cmd_run 与 job_of，ps/free 共用后者）——si_va 由内核 `process_start` 校验并映射
+# （user+只读），契约原文在 runtime 侧。
+# ADR-133（top）：U5 2→3 = `cmd_top` 里取 ROLE_SELF_THREAD 的那一次 handle_of_role
+# （同一份 si_va 契约；16 号回填的 SELF_* 句柄，内核自动 grant）。
+U5 = 4

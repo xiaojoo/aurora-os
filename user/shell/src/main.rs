@@ -38,49 +38,83 @@ mod registry;
 /// （hello/probe 的模块头都记过这个坑，本轮实测又撞一次）。改成 RIP 相对 lea 取基址 + 常量偏移。
 /// S6u：横幅的前导 `\x0a` 去掉了——那是当年为了跟上面的内核日志隔开留的，
 /// ADR-096 之后画面正文只有会话输出，前面什么都没有，那一格就成了纯粹的空行。
-static MSGS: [u8; 428] = *b"commands: help | echo <text> | ping | abi | ps | free | exit\x0aAurora OS 6.1.0-aurora (tty1)\x0aaurora@os:~$ \x0aline too long, discarded\x0aunknown command:  (try help)\x0aping=abi_info=bye\x0a\x08 \x08^C\x0arun:  exit= (timeout) error=usage: run <path>\x0a-PID GEN THR ST PAGES\x0aps: no job handle\x0alivedead ps: error=free: procs= threads= pages=ls: cat: d f  entries bytes= fnv=usage: cat <path> ls | catpwd: cd:  not a directoryusage: cd <path> | cd | pwd\x0a";
+static MSGS: [u8; 659] = *b"dmesg: usage\x0admesg: err=\x0admesg: tail\x0acommands: help | echo <text> | ping | abi | ps | free | top | kill | exit\x0aAurora OS 6.1.0-aurora (tty1)\x0aaurora@os:~$ \x0aline too long, discarded\x0aunknown command:  (try help)\x0aping=abi_info=bye\x0a\x08 \x08^C\x0arun:  exit= (timeout) error=usage: run <path>\x0a-PID GEN THR ST PAGES\x0aps: no job handle\x0alivedead ps: error=free: procs= threads= pages=#\x0atop: usage\x0aframe kill: usage\x0akilled=dmesg: usage\x0admesg: err=dmesg: tail\x0alspci: usage\x0auptime: sleep <ms>\x0aping <ip>\x0afrom \x20\x0ap\x2e\x0a: seq=\x0atimeout\x0aip: usage\x0alink addr mtu=state=up\x0adown\x0amac gw dns \x3als: cat: d f  entries bytes= fnv=pwd: cd:  not a directoryusage: cd <path>usage: cat <path> | cd | pwd";
 
-const M_HELP: (usize, usize) = (0, 61);
-const M_BANNER: (usize, usize) = (61, 30);
-const M_PROMPT: (usize, usize) = (91, 13);
-const M_NL: (usize, usize) = (104, 1);
-const M_TOOLONG: (usize, usize) = (105, 25);
-const M_UNKNOWN: (usize, usize) = (130, 17);
-const M_TRYHELP: (usize, usize) = (147, 12);
-const M_PING: (usize, usize) = (159, 5);
-const M_ABI: (usize, usize) = (164, 9);
-const M_BYE: (usize, usize) = (173, 4);
-const M_BS: (usize, usize) = (177, 3);
-const M_INT: (usize, usize) = (180, 3);
-const M_RUN_PREFIX: (usize, usize) = (183, 5);
-const M_RUN_EXIT: (usize, usize) = (188, 6);
-const M_RUN_TIMEOUT: (usize, usize) = (194, 10);
-const M_RUN_ERR: (usize, usize) = (204, 7);
-const M_RUN_USAGE: (usize, usize) = (211, 18);
-const M_MINUS: (usize, usize) = (229, 1);
-const M_PS_HDR: (usize, usize) = (230, 21);
-const M_PS_NOJOB: (usize, usize) = (251, 18);
-const M_LIVE: (usize, usize) = (269, 4);
-const M_DEAD: (usize, usize) = (273, 4);
-const M_SP: (usize, usize) = (277, 1);
-const M_PS_ERR: (usize, usize) = (278, 10);
-const M_FREE_PFX: (usize, usize) = (288, 12);
-const M_FREE_THR: (usize, usize) = (300, 9);
-const M_LS: (usize, usize) = (316, 4);
-const M_FREE_PAGES: (usize, usize) = (309, 7);
-const M_CAT: (usize, usize) = (320, 5);
-const M_D: (usize, usize) = (325, 2);
-const M_F: (usize, usize) = (327, 2);
-const M_ENTRIES: (usize, usize) = (329, 8);
-const M_BYTES: (usize, usize) = (337, 7);
-const M_FNV: (usize, usize) = (344, 5);
-const M_CAT_USAGE: (usize, usize) = (349, 17);
-const M_HELP2: (usize, usize) = (366, 9);
-const M_PWD: (usize, usize) = (376, 5);
-const M_CD: (usize, usize) = (381, 4);
-const M_NOTDIR: (usize, usize) = (385, 16);
-const M_CD_USAGE: (usize, usize) = (401, 16);
-const M_HELP3: (usize, usize) = (417, 11);
+const M_HELP: (usize, usize) = (37, 14);
+const M_BANNER: (usize, usize) = (111, 30);
+const M_PROMPT: (usize, usize) = (141, 13);
+const M_NL: (usize, usize) = (110, 1);
+const M_TOOLONG: (usize, usize) = (155, 25);
+const M_UNKNOWN: (usize, usize) = (180, 17);
+const M_TRYHELP: (usize, usize) = (197, 12);
+const M_PING: (usize, usize) = (209, 5);
+const M_ABI: (usize, usize) = (214, 9);
+const M_BYE: (usize, usize) = (223, 4);
+const M_BS: (usize, usize) = (227, 3);
+const M_INT: (usize, usize) = (230, 3);
+const M_RUN_PREFIX: (usize, usize) = (233, 5);
+const M_RUN_EXIT: (usize, usize) = (238, 6);
+const M_RUN_TIMEOUT: (usize, usize) = (244, 10);
+const M_RUN_ERR: (usize, usize) = (254, 7);
+const M_RUN_USAGE: (usize, usize) = (261, 18);
+const M_MINUS: (usize, usize) = (279, 1);
+const M_PS_HDR: (usize, usize) = (280, 21);
+const M_PS_NOJOB: (usize, usize) = (301, 18);
+const M_LIVE: (usize, usize) = (319, 4);
+const M_DEAD: (usize, usize) = (323, 4);
+const M_SP: (usize, usize) = (327, 1);
+const M_PS_ERR: (usize, usize) = (328, 10);
+const M_FREE_PFX: (usize, usize) = (338, 12);
+const M_FREE_THR: (usize, usize) = (350, 9);
+const M_FREE_PAGES: (usize, usize) = (359, 7);
+// `top`（ADR-133）：表头与 ps 同列名，另加"快照序号"前缀行与 usage。
+const M_TOP_USAGE: (usize, usize) = (368, 11);
+const M_TOP_FRAME: (usize, usize) = (379, 6);
+// `kill`（ADR-134）：usage 与成功后的收掉线程数。
+const M_KILL_USAGE: (usize, usize) = (385, 12);
+const M_KILLED: (usize, usize) = (397, 7);
+// `lspci`（ADR-136）：usage。
+const M_LSPCI_USAGE: (usize, usize) = (440, 13);
+// `uptime`（ADR-137）：参数被拒时的提示；成功路径打数字（put_u64）+ 换行。
+const M_UPTIME_USAGE: (usize, usize) = (453, 8);
+// `sleep`（ADR-137 续）：usage。
+const M_SLEEP_USAGE: (usize, usize) = (461, 11);
+// `ping`（ADR-143）：usage。
+const M_PING_USAGE: (usize, usize) = (472, 10);
+// `ping` 的输出件：来自/点/序号/超时。
+const M_PING_FROM: (usize, usize) = (482, 5);
+const M_PING_DOT: (usize, usize) = (490, 1);  // "." 单字节（带\n 的那个是坑位）
+const M_PING_SEQ: (usize, usize) = (492, 6);
+const M_PING_TIMEOUT: (usize, usize) = (499, 7);
+// `ip link` / `ip addr`（ADR-144）：子命令与显示件。
+const M_IP_USAGE: (usize, usize) = (507, 10);
+const M_IP_LINK: (usize, usize) = (517, 5);
+const M_IP_ADDR: (usize, usize) = (522, 5);
+const M_IP_MTU: (usize, usize) = (527, 4);
+const M_IP_STATE: (usize, usize) = (531, 6);
+const M_IP_UP: (usize, usize) = (537, 3);
+const M_IP_DOWN: (usize, usize) = (540, 5);
+const M_IP_MAC: (usize, usize) = (545, 4);
+const M_IP_GW: (usize, usize) = (549, 3);
+const M_IP_DNS: (usize, usize) = (552, 4);
+const M_COLON: (usize, usize) = (556, 1);
+// `dmesg`（ADR-135）：usage 与读取失败前缀。
+const M_LS: (usize, usize) = (557, 4);
+const M_CAT: (usize, usize) = (561, 5);
+const M_D: (usize, usize) = (566, 2);
+const M_F: (usize, usize) = (568, 2);
+const M_ENTRIES: (usize, usize) = (570, 8);
+const M_BYTES: (usize, usize) = (578, 7);
+const M_FNV: (usize, usize) = (585, 5);
+const M_PWD: (usize, usize) = (590, 5);
+const M_CD: (usize, usize) = (595, 4);
+const M_NOTDIR: (usize, usize) = (599, 16);
+const M_CD_USAGE: (usize, usize) = (615, 16);
+const M_CAT_USAGE: (usize, usize) = (631, 17);
+const M_HELP2: (usize, usize) = (648, 11);
+const M_DMESG_USAGE: (usize, usize) = (0, 13);
+const M_DMESG_ERR: (usize, usize) = (13, 11);
+const M_DMESG_HDR: (usize, usize) = (25, 12);
 /// blob 的真实基址（RIP 相对 lea，不产生 32 位绝对重定位）。
 fn msgs_base() -> u64 {
     let b: u64;

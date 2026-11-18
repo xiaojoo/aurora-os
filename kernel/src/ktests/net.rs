@@ -229,3 +229,284 @@ fn t_net_rx() -> bool {
 #[cfg(feature = "virtio-net")]
 ktest!(KT_NET_RX, t_net_rx);
 
+
+/// B2 第一刀（ADR-139）：ARP 往返——问网关要 MAC，对端是真服务器（slirp）。
+/// 判据五格：①request 发出去（TX 回执）②RX 有界等待内收到 ③解得开
+/// （ethertype=0x0806、opcode=2）④**内容对**（sender_ip=网关、sender_mac 是个能用的
+/// 地址——第二台仪器 = slirp 自己答的，不是我们自己回环）⑤target_ip=我们、used_id=0。
+#[cfg(feature = "virtio-net")]
+fn t_net_arp() -> bool {
+    if let Err(e) = virtio::bind_net() {
+        crate::log_fatal!("arp: 绑定/握手失败 {:?}", e);
+        return false;
+    }
+    let i = match virtio::net_info() {
+        Some(v) => v,
+        None => {
+            crate::log_fatal!("arp: 绑定之后拿不到读数");
+            return false;
+        }
+    };
+    let (frame, want_hash) = virtio::build_arp_request(&i.mac);
+    match virtio::send_raw(&frame) {
+        Ok(f) => crate::log_info!(
+            "arp: 发 REQUEST 长={} 哈希={:#018x} 自算={:#018x} 回执idx={} id={}",
+            f.len, f.hash, want_hash, f.used_idx, f.used_id
+        ),
+        Err(e) => {
+            crate::log_fatal!("arp: REQUEST 发不出去 {:?}", e);
+            return false;
+        }
+    }
+    let (buf, n, used_idx, used_len, used_id) = match virtio::receive(3000) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_fatal!("arp: 有界等待之内没等到 reply {:?}", e);
+            return false;
+        }
+    };
+    let r = match virtio::parse_arp_reply(&buf[..n], used_idx, used_len, used_id) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_fatal!("arp: 收到的那包解不开（长 {}）{:?} 前十六字节={:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x}",
+                n, e, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+                buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]);
+            return false;
+        }
+    };
+    let shape_ok = r.sender_mac != [0u8; 6] && r.sender_mac != [0xFF; 6] && r.sender_mac[0] & 0x01 == 0;
+    let ip_ok = r.sender_ip == virtio::NET_GATEWAY_IP;
+    let ask_ok = r.target_ip == virtio::DHCP_GUEST_IP;
+    let id_ok = r.used_id == 0;
+    crate::log_info!(
+        "arp: 收到 长={} 哈希={:#018x} opcode={} sender_mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} sender_ip={}.{}.{}.{} target_ip={}.{}.{}.{} used.id={}",
+        r.len, r.hash, r.opcode,
+        r.sender_mac[0], r.sender_mac[1], r.sender_mac[2], r.sender_mac[3], r.sender_mac[4], r.sender_mac[5],
+        r.sender_ip[0], r.sender_ip[1], r.sender_ip[2], r.sender_ip[3],
+        r.target_ip[0], r.target_ip[1], r.target_ip[2], r.target_ip[3],
+        r.used_id
+    );
+    crate::log_info!(
+        "arp: 判据 发出={} 解得开={} 网关ip={} mac形状={} 问的是我们={} 缓冲对={}",
+        true, true, ip_ok, shape_ok, ask_ok, id_ok
+    );
+    let ok = ip_ok && shape_ok && ask_ok && id_ok;
+    if !ok {
+        crate::log_fatal!("arp: ARP 往返判据不成立（上面两行是全部读数）");
+    }
+    ok
+}
+#[cfg(feature = "virtio-net")]
+ktest!(KT_NET_ARP, t_net_arp);
+
+/// B2 ç¬¬äºåï¼ADR-140ï¼ï¼ICMP ping é­ç¯ââä¸ä¸ªç¨ä¾éå®æ"ARP è§£åºç½å³ MAC â ç¨å®ååæ­ ICMP echo â ç­ reply"。
+/// **MAC ä»çº¿ä¸è¯»**ï¼ARP reply ç sender_macï¼ï¼ä¸æ¯ç¡¬ç¼ç ââå¤å®ä¸åè®¾å¯¹ç«¯æ¯è°ã
+/// å¤æ®å­æ ¼ï¼ARP å¾è¿ãICMP ååºãæ¶å°ãè§£å¾å¼ï¼type=0ï¼ã
+/// **åçæ¯æä»¬åçé£ä¸ª**ï¼id/seq/payload å¯¹è´¦ââslirp ææä»¬ç echo åæ ·è¿åï¼ãsrc_ip=ç½å³ã
+#[cfg(feature = "virtio-net")]
+fn t_net_ping() -> bool {
+    if let Err(e) = virtio::bind_net() {
+        crate::log_fatal!("ping: ç»å®/æ¡æå¤±è´¥ {:?}", e);
+        return false;
+    }
+    let i = match virtio::net_info() {
+        Some(v) => v,
+        None => {
+            crate::log_fatal!("ping: ç»å®ä¹åæ¿ä¸å°è¯»æ°");
+            return false;
+        }
+    };
+    // ---- ç¬¬ä¸åï¼ARP è§£åºç½å³ç MACã**åæ¥ç¼å­**ï¼ADR-142ï¼ï¼miss æå¹¿æ­ã
+    let stats_before = virtio::arp_stats();  // **å¨ lookup ä¹å**ï¼lookup ä¼æ miss/hit è®°è¿å»
+    let gw_mac_opt = virtio::arp_lookup(&virtio::NET_GATEWAY_IP);
+    let (arp_req, _h) = virtio::build_arp_request(&i.mac);
+    let broadcast = gw_mac_opt.is_none();
+    if broadcast && virtio::send_raw(&arp_req).is_err() {
+        crate::log_fatal!("ping: ARP REQUEST åä¸åºå»");
+        return false;
+    }
+    let (buf, n, uidx, ulen, uid) = match virtio::receive(3000) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_fatal!("ping: ARP reply ç­ä¸å° {:?}", e);
+            return false;
+        }
+    };
+    let a = match virtio::parse_arp_reply(&buf[..n], uidx, ulen, uid) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_fatal!("ping: ARP reply è§£ä¸å¼ {:?}", e);
+            return false;
+        }
+    };
+    let arp_ok = a.sender_ip == virtio::NET_GATEWAY_IP && a.used_id == 0;
+    if !arp_ok {
+        crate::log_fatal!("ping: ARP reply ä¸æ¯ç½å³çé£ä¸å¥");
+        return false;
+    }
+    virtio::arp_learn(&a.sender_ip, &a.sender_mac);
+    let gw_mac = a.sender_mac;
+    let stats_after = virtio::arp_stats();
+    let learned = stats_after.learns == stats_before.learns + 1;
+    let miss_accounted = stats_after.misses == stats_before.misses + u32::from(broadcast);
+    let hit_ok = if broadcast { stats_after.hits == stats_before.hits } else { stats_after.hits == stats_before.hits + 1 };
+    crate::log_info!(
+        "ping: ARP å¹¿æ­={} å­¦ä¹ ={} misses={}/{} learns={}/{} hits={}/{}",
+        broadcast, learned,
+        stats_before.misses, stats_after.misses,
+        stats_before.learns, stats_after.learns,
+        stats_before.hits, stats_after.hits
+    );
+    // ---- ç¬¬äºåï¼ç¨åè§£åºç MAC ååæ­ ICMP echo requestã
+    let seq: u16 = 1;
+    let (ping, _ph) = virtio::build_icmp_echo_request(&gw_mac, &i.mac, &virtio::DHCP_GUEST_IP, seq);
+    match virtio::send_raw(&ping) {
+        Ok(f) => crate::log_info!(
+            "ping: å echo é¿={} åå¸={:#018x} åæ§idx={} id={}",
+            f.len, f.hash, f.used_idx, f.used_id
+        ),
+        Err(e) => {
+            crate::log_fatal!("ping: ICMP åä¸åºå» {:?}", e);
+            return false;
+        }
+    }
+    // ---- ç­ replyï¼æçç­å¾ï¼slirp ä¼æ echo åæ ·è¿åï¼ã
+    let (buf2, n2, uidx2, ulen2, uid2) = match virtio::receive(3000) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_fatal!("ping: reply ç­ä¸å° {:?}", e);
+            return false;
+        }
+    };
+    let r = match virtio::parse_icmp_reply(&buf2[..n2], uidx2, ulen2, uid2) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_fatal!("ping: reply è§£ä¸å¼ {:?} åå­å­è={:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x}",
+                e, buf2[0], buf2[1], buf2[2], buf2[3], buf2[4], buf2[5]);
+            return false;
+        }
+    };
+    let type_ok = r.icmp_type == virtio::ICMP_ECHO_REPLY;
+    let echo_ok = r.icmp_id == virtio::ICMP_ECHO_ID && r.icmp_seq == seq;
+    let src_ok = r.src_ip == virtio::NET_GATEWAY_IP;
+    let id_ok = r.used_id == 0;
+    crate::log_info!(
+        "ping: æ¶å° reply é¿={} åå¸={:#018x} type={} id={:#06x} seq={} src={}.{}.{}.{} used.id={}",
+        r.len, r.hash, r.icmp_type, r.icmp_id, r.icmp_seq,
+        r.src_ip[0], r.src_ip[1], r.src_ip[2], r.src_ip[3], r.used_id
+    );
+    crate::log_info!(
+        "ping: å¤æ® ARPå¾è¿={} ååº=true æ¶å°=true è§£å¾å¼={} åæ ·è¿å={} srcç½å³={} ç¼å²å¯¹={}",
+        arp_ok, type_ok, echo_ok, src_ok, id_ok
+    );
+    let ok = arp_ok && type_ok && echo_ok && src_ok && id_ok
+        && learned && miss_accounted && hit_ok;  // ADR-142ï¼ç¼å­çè´¦è¦åä¸
+    if !ok {
+        crate::log_fatal!("ping: ICMP å¾è¿å¤æ®ä¸æç«ï¼ä¸é¢ä¸¤è¡æ¯å¨é¨è¯»æ°ï¼");
+    }
+    ok
+}
+#[cfg(feature = "virtio-net")]
+ktest!(KT_NET_PING, t_net_ping);
+
+/// B2 ç¬¬ä¸åï¼ADR-141ï¼ï¼UDP å¾è¿ââDNS æ¥è¯¢âé® slirp ç DNSï¼10.0.2.3ï¼localhostã
+/// å¤æ®äºæ ¼ï¼ARP å¾è¿ãUDP ååºãæ¶å°ãè§£å¾å¼ï¼**txid å¯¹è´¦**ââåçæ¯æä»¬åçé£ä¸ªæ¥è¯¢ï¼ãsrc=10.0.2.3ã
+/// é® localhostï¼slirp ç DNS å¯¹å®ææ¬å°ç­æ¡ï¼127.0.0.1ï¼ï¼**ä¸ä¾èµå¤ç½**ã
+#[cfg(feature = "virtio-net")]
+fn t_net_udp() -> bool {
+    if let Err(e) = virtio::bind_net() {
+        crate::log_fatal!("udp: ç»å®/æ¡æå¤±è´¥ {:?}", e);
+        return false;
+    }
+    let i = match virtio::net_info() {
+        Some(v) => v,
+        None => {
+            crate::log_fatal!("udp: ç»å®ä¹åæ¿ä¸å°è¯»æ°");
+            return false;
+        }
+    };
+    // ---- ç¬¬ä¸åï¼ARP è§£ç½å³ MACï¼DNS å¨å«çå­ç½ï¼åè§£ç½å³ï¼ã
+    let (arp_req, _h) = virtio::build_arp_request(&i.mac);
+    if virtio::send_raw(&arp_req).is_err() {
+        crate::log_fatal!("udp: ARP REQUEST åä¸åºå»");
+        return false;
+    }
+    let (buf, n, uidx, ulen, uid) = match virtio::receive(3000) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_fatal!("udp: ARP reply ç­ä¸å° {:?}", e);
+            return false;
+        }
+    };
+    let a = match virtio::parse_arp_reply(&buf[..n], uidx, ulen, uid) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_fatal!("udp: ARP reply è§£ä¸å¼ {:?}", e);
+            return false;
+        }
+    };
+    let arp_ok = a.sender_ip == virtio::NET_GATEWAY_IP && a.used_id == 0;
+    if !arp_ok {
+        crate::log_fatal!("udp: ARP reply ä¸æ¯ç½å³çé£ä¸å¥");
+        return false;
+    }
+    // ---- ç¬¬äºåï¼å DNS æ¥è¯¢ï¼txid åºå®ï¼å¤æ®å¯¹è´¦ï¼ã
+    let txid: u16 = 0xC0DE;
+    let (q, _qh) = virtio::build_dns_query(&a.sender_mac, &i.mac, &virtio::DHCP_GUEST_IP, txid);
+    match virtio::send_raw(&q) {
+        Ok(f) => crate::log_info!(
+            "udp: å DNS æ¥è¯¢ é¿={} åå¸={:#018x} txid={:#06x} åæ§idx={} id={}",
+            f.len, f.hash, txid, f.used_idx, f.used_id
+        ),
+        Err(e) => {
+            crate::log_fatal!("udp: DNS åä¸åºå» {:?}", e);
+            return false;
+        }
+    }
+    // ---- ç­ replyã
+    let (buf2, n2, uidx2, ulen2, uid2) = match virtio::receive(5000) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_fatal!("udp: DNS reply ç­ä¸å° {:?}", e);
+            return false;
+        }
+    };
+    // **å¯¹ç«¯çåè¯çå½¢ç¶å®æµï¼pcap ç¬¬äºå°ä»ªå¨ä½è¯ï¼**ï¼slirp å¯¹æä»¬ç UDP/DNS æ¥è¯¢å
+    // **ICMP Destination Unreachable**ï¼type=3ï¼â- æ¬æº QEMU ç slirp DNS ä¸å¨çº¿ï¼ICMP/BOOTP é½å¨çº¿ï¼çå®ä¸å½å ï¼ã
+    // è¿ä¸åçå¾è¿å¤æ®æ¹æï¼**æ¶å°éè¯¯åæ§ + ååµçé£ä¸ªå UDP å¤´å¯å¯¹è´¦**â-
+    // ååµå¤´é dst=æä»¬é®ç 10.0.2.3:53ãæº IP=æä»¬ â **å¯¹ç«¯å¼ç¨çæ¯æä»¬åçé£ä¸ªå**ï¼çå¾è¿ï¼ã
+    // **RX ç¼å²ä» eth å¤´å¼å§ï¼å®æµå16å­èï¼æºMAC ç®æ MAC 0x0800 0x45Â -- å®æ´å¸§ï¼**ã
+    // æ³¨æï¼ï¼. ktests èªè¶³çºªå¾çåä¾ï¼ï¼ä¸ä¸è·æ¶å°è¿ ping æ®ççåï¼åç§»å½»åºä¸å -- ç¨å¤æ­åæååç§»éæ©ã
+    // ICMP å¤´å¨**å¤å± IPv4 å¤´ä¹å**ï¼ip0+20ï¼ï¼ååµå IP å¤´å¨ ICMP å¤´ä¹å 8 å­èã
+    let ip0 = if buf2[0] == 0x45 { 0usize } else { 14usize };
+    let icmp0 = ip0 + 20;
+    let inner_ip = icmp0 + 8;
+    let inner_udp = inner_ip + 20;
+    let icmp_type = buf2[icmp0];
+    let icmp_code = buf2[icmp0 + 1];
+    let inner_ok = buf2.len() >= inner_udp + 8
+        && buf2[inner_ip + 12..inner_ip + 16] == virtio::DHCP_GUEST_IP   // åæº IP = æä»¬
+        && buf2[inner_ip + 16..inner_ip + 20] == virtio::NET_DNS_IP      // åç®æ  = DNS
+        && u16::from(buf2[inner_udp + 2]) * 256 + u16::from(buf2[inner_udp + 3]) == 53;  // å dst ç«¯å£ = 53
+    crate::log_info!(
+        "udp: æ¶ ICMP type={} code={} ååµååå¯å¯¹è´¦={} é¿={} used.id={} å16={:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x}",
+        icmp_type, icmp_code, inner_ok, n2, uid2,
+        buf2[0], buf2[1], buf2[2], buf2[3], buf2[4], buf2[5], buf2[6], buf2[7],
+        buf2[8], buf2[9], buf2[10], buf2[11], buf2[12], buf2[13], buf2[14], buf2[15]
+    );
+    let unreachable_ok = icmp_type == 3 && icmp_code == 1;  // host unreachable? code ä»¥å®æµä¸ºååæåºæ¥
+    crate::log_info!(
+        "udp: å¤æ® ARPå¾è¿={} ååº=true æ¶å°ICMP={type_ok} ååµå¯¹è´¦={inner_ok} ç¼å²å¯¹={id_ok}",
+        arp_ok,
+        type_ok = icmp_type == 3,
+        inner_ok = inner_ok,
+        id_ok = uid2 == 0,
+    );
+    let ok = arp_ok && icmp_type == 3 && inner_ok && uid2 == 0;
+    if !ok {
+        crate::log_fatal!("udp: UDP å¾è¿å¤æ®ä¸æç«ï¼ä¸é¢ä¸¤è¡æ¯å¨é¨è¯»æ°ï¼");
+    }
+    ok
+}
+#[cfg(feature = "virtio-net")]
+ktest!(KT_NET_UDP, t_net_udp);

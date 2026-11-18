@@ -15258,3 +15258,508 @@ ET_EXEC 的 `p_vaddr` 每个进程都从 `0x1_0000_0000` 起；14 号原来把�
 - 管道裁决：先做 **shell 级**（临时文件中转，依赖 create/unlink），不做内核 Pipe 对象。
 - **代码未开始**：FAT32 簇分配/释放、两份 FAT、目录项写、三号分派、ktest 与宿主机镜像对账
   是下一刀；本 ADR 只是先有决策后写实现（ADR-111 决策 4 的原话）。
+
+> 编号勘误（2026-11-18 合并）：wb 分支的 §395–§411 与 main 已推送的 §395–§402 撞号，
+> 本合并把它整体顺延 **+8**（原 §395–§411 → 现 §403–§419）；正文里对旧号的引用按此换算。
+
+## 403. ADR-133 `top`：纯用户态定期刷新进程表（workbuddy，2026-11-17）
+
+ADR-132 §未做 1 的两个待拍板点在本片定案：**排序口径 = pages 降序、并列 pid 升序**
+（与 `free` 聚合同源，行序确定宿主机判定器才写得出来）；**定时 = 19 号带时限等待的
+薄壳** `rt::sleep_ms(h, 0, ms)`——内核零改动，等一个永不置位的信号图，超时路径走
+`TASK_WAITERS` + `task_wake_tick` 的定时器唤醒，任务真阻塞不让 CPU 空转。
+
+交付：runtime `sleep_ms`、shell `top`（无参 3 帧 / `top N` 2..5，帧间隔 1 s）、
+a3 判据 argv 扩成 `run /HELLO.ELF; ps; free; top 2`、宿主机 a3 行三格追加
+（argv 带 top / 双 frame 表头 / `_top_pages_nondecreasing` 逐帧排序对账）。
+串口原文（run-1587，PASS 33，12.1 s）：两帧 `PID GEN THR ST PAGES` 均为
+`0 8 1 live 9 / 1 6 1 live 7`，与 `ps` 逐值同、聚合 9+7=16 与 `free` 同。
+**变异证红**：`top_cmp` 翻转 ⇒ 升序 `7` 在 `9` 前 ⇒ checker False ⇒
+CONTENT-MISMATCH；还原后 True。27 号从此有第二个真实调用方。
+
+三条量具课，全部本轮实测（复用价值高）：
+
+1. **shell 的栈只有一页，且已贴近上限**。8 行 × 40 B 的行数组上栈 ⇒
+   run-1584 `#PF rip=0x10000397e cr2=0x100100fb8 err=0x6`（栈顶 0x100101ff0，
+   cr2 在栈顶页下一页，穿出 ≈0x48 B）。给 shell 加局部大缓冲的改动都会重演；
+   行数上限 4 由单 Job 判据形状（q2 至多 4 条）给出，不是拍的。
+2. **static 在 4 GiB+ 用户镜像里同样不可用**：地址被取成 `R_X86_32S out of range`
+   （`.bss.TOP_ROWS` 那次实测），与 MSGS/`ctrl_c` 注释记的第三族事故同源。
+   一页栈 + 静态定位都堵死后，缓冲位只剩"按形状收缩"一条路。
+3. **`.text` 窗口是夹具级常量**：16 KiB 挡住第一版（`0x100004804 > .rodata 起点`），
+   link.ld 提到 20 KiB（`.rodata` 0x100005000、`.data` 0x100007000）。回滚 top
+   但留窗口无害；留 top 回滚窗口 = 链接期挡住。
+
+unsafe：registry U5 2→3（`cmd_top` 取 ROLE_SELF_THREAD 的 handle_of_role）、
+census 467→468 / U5 91；`sleep_ms` 是 safe fn 薄壳，runtime 零新增。
+
+读数：`check` **17/17**；整链 **65 行 64 符合**，唯一不符合 = `改包头被拒仍启动`
+那一跑的 `q2 ours峰值=6`（run-1642，FAIL 35）——**同 ELF `83dd11a58f1a` 单跑
+PASS(33)、`ours峰值=7`**（run-1664）⇒ 采样窗口漏一拍的形状，不归因。
+§383 的"peak=false 要当红查"已照办：查过，单跑复现不了，判据未改。
+（A4 验收句剩 `kill`：18 号内核面就绪，缺"按 pid 找 Proc 句柄"的角色语义，
+归 ADR-132 §未做 2。）
+
+## 404. ADR-134 `kill`：29 号与 capability 语义（workbuddy，2026-11-18）
+
+使用者裁决：新增 29 号 `SYS_PROC_KILL_BY_PID`（23 号被 ADR-110/111 占住不可用）。
+**pid 只是寻址，授权仍靠 capability**：内核只在调用者自己名下的句柄表里反查
+`(pid, 当前 gen, RIGHT_WRITE)` 的 Proc 句柄，找到后走与 18 号**同一个**杀实现
+（`sys_process_kill_core`），权限/自杀/杀线程的逻辑只有一份，不分叉。
+
+裁决的技术依据（查实的事实链）：11 号只返回句柄不给 pid；句柄值 = 句柄表槽+世代，
+不含进程 pid；27 号枚举给 pid 但给不出对应句柄；内核句柄表里存着
+`ObjRef::Proc { slot, gen }`（slot=pid）⇒ 只有内核能反查。用户态自己记
+`(pid,句柄)` 那条路**不通**（ADR 初稿曾以为可行，读码后否掉）。
+
+落地时撞的坑（实测）：
+1. 无线程的进程"杀不掉"（`proc_thread_exited` 没人调用 ⇒ 不变僵尸）⇒ 判据起真线程；
+2. 自旋工人拖成 HANG 180 s（run-1668）⇒ 改阻塞在等待队列；
+3. `wait_for_task` 靠 tick 唤醒，跨档 HANG ⇒ 改 `yield_now` 轮询；
+4. **`find_proc` 的 ABA**（run-1831~1835：pid 复用后旧句柄先被命中 ⇒ -5）⇒
+   接口加 `gen` 参数，调用方从 `proc::proc_gen(pid)` 取当前世代精确匹配。
+
+判据：内核 `t_proc_kill` 十格（句柄带 WRITE / 收窄权限必须拒 / Job 句柄 -4 /
+真线程 / 杀掉=1 / 已终止 / 句柄失效 -5 / **按 pid 杀** / **无句柄拒** / 自清），
+handles 档 run-1836 全绿 PASS(33)。变异证红：把 18 号的 `RIGHT_WRITE` 改成
+`RIGHT_READ` ⇒ "收窄拒"那格红、FAIL(35)（run-1671），还原后绿。
+shell `kill <pid>` 接进 a3 判据：argv 末尾 `kill 9999`（必不存在的 pid）⇒
+串口 `kill 9999\n-5\n`，验命令接线 + capability 拒（真"能杀"由内核侧覆盖）。
+
+读数：`check` **17/17**（unsafe runtime U5 37→38、census 468→469；
+module-interfaces 登记 `handle::find_proc`）；四档复验
+handles/a2-exec/a3-shell/fs-open 全部 PASS(33)。
+整链 65 行 68/69（唯一不符 = `-trace events` 那跑的 q2 采样漏一拍，
+同 ELF `83dd11a58f1a` 单跑 PASS ⇒ 不归因，与 kill 无关）。
+
+A4 验收句四条命令 `ps`/`top`/`kill`/`free` 至此全部有真实数据。
+
+## 405. ADR-135 B4 日志出口：30 号 SYS_LOG_READ（workbuddy，2026-11-18）
+
+使用者裁决：新增 30 号 `SYS_LOG_READ`（23 占、29 已用于 kill）。内核侧**已交付**：
+把串口日志环最近的一段**整行**拷进用户缓冲，继承 `recent_tail` 的整行规则
+（开头/结尾半行都丢掉，绝不截半行），走 `copy_to_user`（与 5/6 号同一条校验），
+返回 `(lines<<32)|bytes`，**0 行是成功**。
+
+判据 `t_log_read` 十格（有内容 / 只给整行 / 行数自洽 / 与环原始字节逐字节同 /
+半行丢掉 / 零长-1 / 超长-3 / 只读页-2 / 自清 / 总体），handles 档全绿。
+
+### 两条值得留下的量具教训
+
+1. **别拿被测物自己对账**。初版判据用 `recent_tail` 给出的行数/字节数去核 30 号，
+   而 30 号本来就调 `recent_tail`——把整行规则改坏时两边同时坏、反而自洽为绿，
+   变异咬不动（实测）。改成**从环的原始字节独立算**：新增只读诊断
+   `serial::ring_byte_for_test(abs)`，判据自己逐字节比对"返回段是否环的真后缀"。
+   这一改之后变异立刻咬住（`半行丢掉=false` ⇒ FAIL 35）。
+2. **正常时序下"丢掉结尾半行"的规则不被触发**。内核日志写完就换行，环尾本来就是
+   `\n`；所以还要**主动造半行**（`write_bytes` 一段不含换行的字节进环）才能稳定证红。
+
+### 内核栈的一个实测边界
+
+30 号最初按 `COPY_MAX`(4096) 开局部数组 ⇒ 用户态 `log_read` 返回后该任务后续的
+`con_write` **全部静默失败**；1024 仍复现；**256 才稳**。内核任务栈 4 页 = 16 KiB
+（`sched.rs:39`），扣掉 trap 帧与调用链后 4 KiB 局部数组会踩坏返回路径（推断，
+但"256 稳 / 1024+ 不稳"是可复现事实）。代价：一次只给最近一屏。
+
+### 未归因（本片唯一欠账）
+
+shell 的 `dmesg` 已接线，但端到端**打不出内容**：`log_read` 返回 `Ok((_, 215))`、
+用户缓冲里确实写进了 `[info] ...`（实测打印出 `215 [info] 0`），而把那段 215 字节
+交给 `con_write` 时串口**一个字都没有**，同时 shell 退出码仍是 0。
+已排除：消息偏移（把表头挪到 blob 偏移 0 附近）、缓冲大小（256/1024）、
+分块写（单块 256）、`static` 取址 32S、内核栈（降到 256）、串口行锁争用（加 8 次重试）。
+候选方向写在 ADR-135 §未归因：① `write_bytes_sid` 的会话环/`SESSION_LIMIT` 是否
+把这段吃进镜像却不发串口；② `int 0x80` 的 asm 未声明 clobber，若 trap 入口漏存
+某一被调用者保存寄存器，`log_read` 之后的任务上下文会被污染。
+⇒ `dmesg` **不进 argv 判定行**，命令保留、缺陷记在 ADR。
+
+读数：`check` **17/17**（unsafe runtime U5 38→39、census 469→470）；
+整链 **69 行 69 符合 rc=0**。
+
+## 406. B4 dmesg 端到端接通：一次量具误判的复盘（workbuddy，2026-11-18）
+
+**结论：`dmesg` 从头到尾都是正常的**，§405 记的"输出为零、根因未归因"是**误判**。
+
+### 我怎么会看错
+
+`dmesg` 打出来的**就是内核自己打过的那些行**。我用"在串口日志里找 `dmesg`
+回显、再看它后面紧跟什么"来判定，而脚本命中的是**后面另一处** `dmesg` 字样
+（QEMU 退出前内核重打日志时也出现这个词），它后面紧跟内核日志、没有表头
+⇒ 我判成"表头没打出来"。真实现场（同一次跑）：
+
+```
+dmesg              <- shell 回显
+dmesg: tail        <- 表头（一直在）
+[info] 0x000006df exec-verify: ...
+[info] 0x000006e0 init-user(S4b-3): ...
+```
+
+**铁证**：dmesg 打的那些行在串口里**出现了两次**（一次内核打、一次 dmesg 打），
+`occurrences = 2`。**决定性一步**：给 `console_write` 返回值加一行诊断，
+看到 **`214`**（`log_read` 返回 `bytes=215`、实写 214），写入成功——有了这个数
+才回头核对"是不是我找错了位置"。
+
+### 作废的七个假设
+
+§405 列的"已排除：消息偏移/缓冲大小/分块写/32S/内核栈/串口行锁/寄存器污染"
+**全部作废**——它们排除的都是**不存在的问题**。其中唯一真实遇到并已修的是
+**内核栈 4 KiB ⇒ 降到 256**（`sys_log_read` 的局部数组），那是独立发现，
+与"dmesg 打不出内容"无关。
+
+### 判定格 `_dmesg_repeats`
+
+判据：`dmesg: tail` 表头之后的第一行非空内容，必须在表头**之前**的日志里
+已经出现过一次。**不判"有输出"**——紧随其后的内核日志会冒充它（正是我踩的坑）；
+也**不依赖任何具体日志文本或行号**，换构建/换档都成立。
+**变异证红**：只打表头不打正文 ⇒ `False` ⇒ FAIL(35)；还原 ⇒ `True` ⇒ PASS(33)。
+
+### 纪律（新增一条，接在 §383 那族后面）
+
+> **判据不能用"看起来像"来定位。** 当被测物的输出与被测对象本身同形时
+> （dmesg 的输出 = 内核日志），"在日志里找位置 + 肉眼看相邻行"会**稳定地找错**。
+> 要么给输出加一个**只属于它**的标记（表头），要么用**结构性关系**当判据
+> （"这一行在它之前已经出现过"）。这也是 §405 那条"别拿被测物自己对账"的孪生兄弟：
+> 那条讲的是**度量对象**要独立，这条讲的是**定位对象**要独立。
+
+读数：`check` **17/17**；整链 **69 行 69 符合 rc=0**；a3-shell 判定含 dmesg 格 PASS(33)。
+
+## 407. ADR-136 B1 第一刀：31 号 SYS_PCI_ENUM + shell lspci（workbuddy，2026-11-18）
+
+使用者裁决：新增 31 号（23 占、29 kill、30 log_read 已用）。形状照抄 27 号
+proc_enum 同族（32 字节定长记录 `APC1` 魔数、游标分页、`(next<<32)|n`）。
+PCI 表是启动快照（BSP 单写后全读），**无 capability** 但要求任务身份。
+
+判据 `t_pci_enum` 七格：全量 / 与内核表逐字段一致 / 魔数版本自洽 / 游标续读 /
+短长-3 / 超长-3 / 只读页-2。**为什么"与内核表对账"不违反 §405 那条
+"别拿被测物自己对账"**：31 号走 syscall→打包→copy_to_user→用户缓冲→读回这条
+长路径，`pci::dev(i)` 是直读表的另一条路径——两条路径共享的只有源数据本身；
+logread 初版那次连源读法都是同一份函数，才是真违反。
+
+**变异证红**：bdf 错位（`d.bdf ^ 0x100`）⇒ 字段一致红 ⇒ FAIL35；还原绿。
+shell `lspci` 每台一行 `bus dev func vendor device class`（全十进制，
+shell 无十六进制打印），q35 实测 6 台真实数据；判定格 `_lspci_rows`
+（六数字行 ×≥2，结构性、不依赖机型），变异证红（破坏行形状 ⇒ False）。
+
+### 两条落地教训
+
+1. **syscall_abi 第 4 位才映射 r10**。31 号内核读 `r10` 当 len，runtime 初版
+   把 `buf.len()` 传到第 3 位（`rdx`）⇒ 内核见 `r10=0` ⇒ `-3`，shell 打出
+   `-3`+usage。**27 号同族的 len 永远走 r10**（`SYS_PROC_ENUM` 注释里写着），
+   照抄形状时连参数位次也要照抄。
+2. **27 号同族的长度字段与 bdf 共用 2 字节**（user.rs:1515/1516 同位），
+   用户侧一直按 16 位读。初版判据按 32 位核 ⇒ 红；按 16 位口径 ⇒ 绿。
+   照抄既有布局时，**共用字段的口径也要照抄**。
+
+module-interfaces：登记 **sched→pci** 依赖边（31 号在 user.rs 里读 `pci::info/dev`，
+而 user 归 sched 层）与 pci 的 `allowed_callers += sched`；unsafe runtime
+U5 39→40、census 470→471。
+
+读数：`check` **17/17**；整链 68/69（唯一不符 = a2-exec 档 q2 超时 HANG，
+同 ELF 单跑 PASS 33、**93/93 用例全绿** ⇒ §405 已记的 q2 已知偶发，不归因）。
+B1 剩余：`lsdev`/`devctl`（要 Device/Driver trait）、桥后设备递归扫描
+（今天的扫描不下桥，q35 上不咬，真机欠账）、十六进制输出。
+
+## 408. ADR-137 B3 第一刀：启动锚点 + 32 号 SYS_CLOCK_UPTIME + shell uptime（workbuddy，2026-11-18）
+
+使用者裁决：**新增号不再逐个询问**（"下次都直接新增，不要询问了"）——本轮直接落
+32 号。底座：`clock.rs` 的 PIT 标定与 `micros` 换算早就在（没标定回 None、绝不编
+默认值的纪律写在函数头）；缺 ①启动锚点 ②用户态出口。
+
+**交付**：`clock::record_boot`（kmain 的 boot-ok 之后，只允许一次，重锚计数可查）+
+`clock::uptime_micros` + 32 号（无参数无缓冲无 capability，没锚/没标定 ⇒ `-1`）+
+`rt::uptime_us` + shell `uptime`（无参打微秒；`-1` 原样打出，**不把错误读成 0**）。
+
+**判据** `t_clock_uptime` 四格：单调不减 / 与 ticks 对账 / 与 TSC 上界对账 / 无重锚；
+**变异证红**（32 号恒 42 ⇒ 对 ticks 红 ⇒ FAIL35）。shell 判定格 `_uptime_row`
+（回显后首行纯十进制正数；恒 -1 ⇒ 红）。
+
+### 判据的数学错误（跨档才暴露，与 §407 prockill 同族）
+
+初版把"等 2 个 tick"的下界写成 2 个整周期（20 ms）。`wait_ticks(t, 2, ..)` 等的是
+**计数 ≥ 2**，它可能在 tick 边界中途开始 ⇒ 实际等待在 [1, 2] 个周期之间。
+handles 档侥幸绿、a3-shell 档实测增量 19023 µs < 20000 ⇒ 红。
+修订：下界 = 1 个完整周期；上界 = 窗口 cycles **+ 1 个周期余量**
+（`t1` 在返回之后才读，实测差 44 µs——中间的指令又跨了半个边界）。
+
+### dispatch 的 32S：≥5 字节命令名的 memcmp 取址（第三族实锤）
+
+加 `uptime`(6 字节) 后链接报三处 `R_X86_64_32S`——全是 dispatch 的
+`streq(p.cmd, &CMD_xxx)` 对 `.rodata` 数组的取址（lspci/dmesg 5 字节 + uptime 6 字节）。
+机理：`streq` 的 `a == b` 对 **≤4 字节**数组折叠成 immediate（dispatch 老分支全走
+这条，不取址）；**≥5 字节折叠不动** ⇒ LLVM 降成 memcmp 并对 `.rodata` 32 位绝对取址
+⇒ 4 GiB+ 基址必炸（MSGS/`put_u64` 那族同根）。lspci/dmesg 加入时侥幸没炸——
+**分支数改变折叠决策**（11 → 12 分支时三个数组全走 memcmp）。
+`black_box` 挡 memcmp 不行（循环展开后仍取址）。
+**正解**：新形状 `cmd_is(cmd, name)`（长度 + 逐字节 immediate 比较，`.rodata`
+不落数组），三个 ≥5 字节命令全换用。
+**纪律**：dispatch 加 ≥5 字节命令名一律 `cmd_is`；`streq` 只留给 ≤4 字节。
+
+`.text` 窗口第三次涨：`cmd_is` 真循环让 dispatch 再涨 ~1.5 KiB ⇒
+20 KiB → **24 KiB**（.rodata@0x100006000、.data@0x100008000）。
+
+读数：`check` **17/17**（unsafe runtime U5 40→41、census 471→472；
+module-interfaces 登记 clock::record_boot/uptime_micros）；
+handles 档 94/94、a3-shell 档 **108/108** 用例全绿、判定 PASS(33)。
+B3 剩余：`sleep <ms>`（最薄，19 号薄壳已在）、`date`（RTC+时区，旧账 RTC 游标
+不可用）、`reboot`/`poweroff`（要单独 ADR）。
+
+## 409. B3 第二刀：shell sleep + 两个装载器的栈扩容（workbuddy，2026-11-18）
+
+使用者上一轮裁决"新增号不再询问"——本片**零新号**（19 号已有的形状，`signals=0`
+等一个永不置位的信号图 = 睡满超时）。
+
+**交付**：shell `sleep <ms>`（1..=WAIT_MAX_MS，成功无输出）+ 判据 `_sleep_gap`
+（argv 形状 `uptime; sleep 1100; uptime`，两读数差 ∈ [1.1s, 3.1s] ⇒ 真阻塞；
+**32 号做第二台仪器**，不依赖具体数值）+ 变异证红（ms/100 ⇒ False）。
+实测：4677530 → 5782617，差 1105087 µs。
+
+### 撞到的两件事
+
+1. **19 号只支持 Proc**（`wait_on_proc` 非 Proc 一律 -4）：`sleep` 初版用
+   `ROLE_SELF_THREAD` ⇒ 实测打 `-4`。改 `ROLE_SELF_PROC`（等自己 terminate 永不
+   发生 ⇒ 正好睡满）。**连带发现既有欠账**：`cmd_top` 的 `sleep_ms` 一直在静默失败
+   （SELF_THREAD + 忽略错误 ⇒ top 从没真正睡过，帧间隔实际是忙转）——归 ADR-133
+   的后续修，不在本片。
+2. **两个装载器的栈 1 页穿出**（shell 43.9 KB 后 `dispatch → cmd_run →
+   elf::parse` 帧深超一页）：`load` 路径 rip=0x4ade 落 `elf::parse`
+   （cr2=0x100100fe8 写）；`load_into` 路径 rip/cr2=0x100103000（err=0x15 取指）。
+   **`load` 必须保持 2 页原样**——`t_task_exit`/`t_user_roundtrip`/hello 的 VA
+   布局依赖它的分配顺序，改成 5 页窗口时三个 ktest 的负样本帧地址全部移位
+   （实测 HANG，已回退）；**只扩 `load_into` 的固定地址窗**（`USER_MMAP_BASE`
+   起 8 页：guard + 7 数据，guard 判据形状不变）。教训：**改装载器布局前先查
+   谁在依赖它的地址顺序**——判据里显式引用 VA 的用例是布局的隐形契约。
+
+读数：`check` **17/17**（registry U5 3→4、census 472→473）；三个关键档同 ELF
+单跑全 PASS；整链一轮 5 条不符（正向 HANG/split OOM/FS-03/两个 a3）——**同 ELF
+单跑复现不了**，判宿主机批量抖动（27 分钟窗口内 QEMU 多跑叠加），不归因。
+B3 剩余：`date`（RTC+时区）、`service`（init/IPC）、`reboot`/`poweroff`（单独 ADR）。
+
+## 410. §409 欠账的修复 + adopt_asmaps 容量事故（workbuddy，2026-11-18）
+
+**top 的帧间睡眠修复**（§409 发现的既有欠账）：`cmd_top` 的睡眠句柄从
+`ROLE_SELF_THREAD`（19 号拒成 -4 ⇒ 静默失败 ⇒ "每秒刷新"实际忙转连打）改成
+`ROLE_SELF_PROC`（等自己 terminate 永不发生 ⇒ 睡满 1 s、真阻塞）。
+**修复已验但判定格暂撤**：`_top_sleep_gap`（argv `top 2; uptime` 三连 + uptime
+读数对差 ∈ [1.0s, 3.1s] 且中间隔着 frame 1）变异证红已做
+（SELF_THREAD ⇒ False，qemu 用时 9.9s vs 7.9s）；**撤格原因**：三连形状会让
+12 条 argv 的 shell 会话在 run 之后异常退出（8 页块下 -6 已消、run 本身成功、
+run 之后的命令不再执行，根因未归因），10 条 argv 全绿——查清后再接回。
+
+**adopt_asmaps 容量事故**（本片最大的新发现）：`load_into` 的栈扩到 7 页时，
+初版按**单页 7 条 AsMap** 登记 ⇒ 16 号 `adopt_asmaps` 把父会话名下属于这张 AS
+的 AsMap 整批过继给子任务，预检 `child.owned.count() + n > MAX_OWNED(16)`
+撞上限 ⇒ 16 号回 **-6**（cmd_run 打出 `error=-6`，run 读卷成功但起不了子进程）。
+**修法**：7 页栈一次 `phys_alloc(3)`（8 页块）+ 一次 `aspace_map_slot`
+（pas[..7]）⇒ AsMap 条目=1 条。**教训**：**AS 内映射的登记粒度是 16 号过继
+路径的隐形契约**——把 N 页栈拆成 N 条登记会吃掉任务名下的 OwnedSet 配额；
+连续区域一律块分配+单条登记。顺带：块清零（原单页循环的 write_volatile 清零
+由 `write_bytes(块, 0, 8*PAGE)` 代替，unsafe 计数 U2-1/U4+1 相抵）。
+
+**另一个未归因**：11 号 Exhausted 诊断（proc_create/aspace_new/set_aspace 三处
+log_info）在 -6 复现跑里都没触发 ⇒ -6 确实来自 16 号 adopt_asmaps（推断证实）；
+诊断行保留（无害）。
+
+读数：`check` **17/17**；整链 **69 行 69 符合 rc=0**；三个关键档同 ELF 单跑 PASS。
+
+## 411. §410 暂撤格接回：12 条 argv 早停是宿主机抖动（workbuddy，2026-11-18）
+
+§410 的 `_top_sleep_gap` 判定格（`top 2; uptime` 三连 + uptime 读数对差
+∈ [1.0s, 3.1s] 且中间隔着 frame 1）**接回判定行**。暂撤的原因（"12 条 argv
+的 shell 会话 run 之后异常退出"）**复现不了**：同内核同 argv 单跑，12 条全部
+执行完（dmesg×2 回显、uptime×6、`_top_sleep_gap=True`、qemu 用时 15.1s），
+且 err-6=False、exec pass=True、timeout=True 全对。
+⇒ 那次早停与 §383/§405/§407 的批量抖动同族，不归因。
+
+读数：`check` **17/17**；整链 **69 行 69 符合 rc=0**（含 top 睡眠格）。
+
+## 412. C2 第一刀：包清单（ADR-138 草案，tools 侧数据层）（workbuddy，2026-11-18）
+
+**零新号、零内核改动**。交付：
+- `tools/pkg_manifest.py`（CRLF）：`verify`（读整盘镜像包区 → 解析头 → 载荷
+  SHA-256 与 `kernel/fixtures/hello.elf` 对账、覆盖名/锚点与 `esp_image.py`
+  常量对账、Lamport 签名复算 → 与 `docs/pkg/manifest.json` 逐字段比）/ `--expect`
+  （build 前也能跑）/ `--write` / `--tamper`（负样本注入工具：翻包区覆盖名一字节）。
+- `check` 门禁 **+1 = `check-pkg-manifest`**（共 18 道）：镜像存在时跑 verify，
+  不存在时生成期望清单。
+- `docs/pkg/manifest.json`：三向对账通过（包区读数 = 产地期望 = 清单）。
+
+**变异证红**：`--tamper` 翻覆盖名一字节 ⇒ covers 变 / signature_ok=False /
+BadHeader 三格红；重造镜像 ⇒ 绿。宿主机侧改盘注入（与 S3 同形状）。
+
+**顺带观察（真故障被证人咬住）**：本会话内 `t_fat32` 的"两卷同哈希"格
+**三次**在整链（长跑）里红、单跑全绿——失败跑的卷 A 哈希 `0x1ada…` 与正确值
+`0xb46b…` 不同 ⇒ **卷 A 读链的瞬时字节错**（FNV 走链抓到）。这格本来就是
+"读错字节必须红"的证人，它咬住是真故障不是量具错。复现率影响开发时再查
+AHCI 的重发/恢复路径（`发射被吞 ⇒ 恢复后重发一次` 已有，但看来不够）。
+
+C2 剩余：包版本/依赖关系/安装事务/卸载回滚/A-B（都要先有"第二个包"与写方向）。
+
+## 413. B3 验收句盘点收口 + C2 清单加 depends 形状（workbuddy，2026-11-18）
+
+**B3 验收句 6 条的现状**（总设计 §阶段 B3）：
+- `uptime` ✓（32 号 + 判据，ADR-137）；`sleep` ✓（19 号薄壳 + 判据，§409）
+- `date`：**本机做不了**——`apic.rs:46` 与 BACKLOG 76d 记着"实测这台 OVMF/QEMU 上
+  0x70/0x71 走不到 RTC 设备"（写进去读回来不等，trace 里 mc146818 一条不产出）。
+  墙钟在 QEMU 上没有硬件来源；真机 bring-up（M7）时重测。
+- `service status`：依赖**进程名**（ADR-132 §未做 3——argv 不落内核 ⇒ ps 只有 pid
+  没有名字），服务视图没有名字可打。前置是 argv 设计（A3 后续片）。
+- `reboot`/`poweroff`：ACPI 电源状态 + 停机语义（exit.rs），要单独 ADR。
+
+**C2 清单形状续**（ADR-138 未决 3 的半步）：manifest.json 加 `"depends": []`
+字段（read_pkg 与 expected 双侧），三向对账照常绿——第二个包出现时就有
+依赖边的落点，不用改结构。
+
+读数：`check` 18/18；三向对账 ok。
+
+## 414. ADR-139 B2 第一刀：ARP 往返（workbuddy，2026-11-18）
+
+**零新号**。`build_arp_request`（广播"谁是网关 10.0.2.2？告诉 10.0.2.15"，
+sender_mac 填自己、帧垫满 60）+ `parse_arp_reply`（ethertype=0x0806、opcode=2、
+逐字段先验长度）+ ktest `t_net_arp` 五格。
+**实测**：`sender_mac=52:55:0a:00:02:02`（slirp 网关真 MAC）、sender_ip=10.0.2.2、
+target_ip=10.0.2.15——**对端是真服务器**，PASS(33) 5.9s。
+**变异证红**：④ 期望网关改成自己 ⇒ `网关ip=false` ⇒ FAIL35，还原绿。
+
+### 一个 RX 长度教训（§10.3 的现场版）
+
+初版 `fnv1a64(&buf[..used_len])` 用**设备写的字节数**切我们的缓冲 ⇒ panic
+（virtio.rs:1248）。修：`(used_len).min(buf.len())`。**RX 的每一个长度字段
+都来自对端，取界前先夹**——`parse_reply` 的逐字段先验长度是同一句话在
+DHCP 侧的形状，ARP 侧第一版漏了它。
+
+读数：`check` 18/18；整链 69/69 rc=0。
+B2 剩余：ARP 表（缓存+老化）、`ip link`/`ip addr` 命令、ICMP ping（ARP 之后
+最短路径）、UDP/TCP、路由/DNS/DHCP 客户端化（现在是夹具单次握手）。
+
+## 415. ADR-140 B2 第二刀：ICMP ping 闭环（workbuddy，2026-11-18）
+
+**零新号**。一个 ktest 完成"ARP 解网关 MAC → 用它发单播 ICMP echo → 等 reply"
+闭环，**MAC 从线上读**（ARP reply 的 sender_mac），判定不假设对端是谁。
+六格：ARP 往返 / 发出 / 收到 / 解得开（type=0）/ **原样返回**（id=0xA5A5
+seq=1——slirp 把 echo 原样返回，这两格证明"回的是我们发的那个"）/ src_ip=网关。
+**实测**：`type=0 id=0xa5a5 seq=1 src=10.0.2.2`，六格全绿 PASS(33) 6.0s。
+**变异证红**：id 期望改 0xBEEF ⇒ FAIL35，还原绿。
+
+### IPv4 头偏移写反的教训（凭记忆写偏移表的又一例）
+
+初版 `f[30..34].copy_from_slice(our_ip)`——把**源地址**写到了**目标地址**的位
+（IPv4 头 `26..30 源 | 30..34 目标`），网关 IP 再把那 4 字节盖掉 ⇒ 帧的源 IP
+变成网关自己 ⇒ **slirp 丢包**（`reply 等不到 UsedTimeout`）。**修**：
+源 → `f[26..30]`。**教训**：协议头偏移必须由对端行为作证（发不出去就是实测在
+纠偏），不能凭记忆——与本仓库"布局表必须由设备自己作证"的第一纪律同根。
+
+读数：`check` 18/18；整链 69/69 rc=0。
+B2 剩余：ARP 缓存+老化、`ping` shell 命令、payload 回环校验、UDP/TCP、路由/DNS。
+
+## 416. ADR-141 B2 第三刀：UDP 发送 + 对端错误回执（workbuddy，2026-11-18）
+
+**零新号**。`build_dns_query`（UDP/IPv4/eth 单播 DNS A 查询问 localhost）
++ `parse_dns_reply`（逐字段先验长度）+ `t_net_udp` 四格。
+
+**pcap 第二台仪器的实测发现**：本机 QEMU 的 slirp **DNS 不在线**——包 5 帧正确
+上线（src=1053 dst=53），slirp 回 **ICMP type=3 code=3（Port Unreachable）**；
+同一跑里 ICMP echo（包 9/10）与 BOOTP（包 11/12）都在线 ⇒ DNS 独缺，真实
+不归因。**判据改成"发送 + 错误回执 + 内嵌原包对账"**：ICMP unreachable 的
+内嵌部分就是我们的原包（RFC 1122），内嵌 源IP=我们 / 目标=10.0.2.3 /
+dst端口=53 三字段 ⇒ **对端引用的是我们发的那个包**（真往返）。
+**实测** PASS(33) 6.0s。**变异证红**：内嵌端口 53→9999 ⇒ FAIL35，还原绿。
+
+### 三个实测教训
+
+1. **DNS 查询塞不进 60 字节最小帧**（69 字节）⇒ 帧长按内容垫 72——
+   "60 字节"模板只对最小帧成立。
+2. **UDP 源端口 0 被拒**：<1024 是特权号，slirp 直接 unreachable ⇒
+   `DNS_QUERY_PORT=1053`。
+3. **RX 队列不保证干净**（.ktests 自足纪律的网络版）：同跑里 ping 的残留包
+   被本用例收走（实测收过一个 0x45 开头的无 eth 头残包）⇒ **用首字节判断
+   偏移基准**（buf[0]==0x45 ⇒ 无 eth 头）。网络用例对"队列里有什么"零假设。
+   另：**ICMP type 在外层 IP 头之后**（ip0+20），初版把 IP 头 0x45 当成
+   ICMP type 又读出 69——偏移链 14/IP20/ICMP8/inner20 逐层都要对齐。
+
+读数：`check` 18/18；整链 69/69 rc=0。
+B2 剩余：ARP 缓存+老化（每帧广播不可持续）、"成功应答"的 UDP 往返
+（等在线对端）、DNS answer 解析、TCP、`ping`/`ip` 命令。
+
+## 417. ADR-142 B2 第四刀：ARP 缓存（workbuddy，2026-11-18）
+
+**零新号**。`arp_lookup`/`arp_learn`/`arp_stats`（**无堆、固定 8 项、线性查找**，
+RFC 826 的 merge 规则：已有则覆盖、满则 FIFO 挤第 0 条；`hits/misses/learns/
+evicts` 是判据读数）+ `t_net_ping` 接缓存：**先 lookup，miss 才广播**；
+判据加三格——`learned`（learns +1）、`miss_accounted`（misses 按 broadcast
+增量核）、`hit_ok`（hit 按 lookup 增量核），**全接进 ok**。
+**实测**：`misses=0/1 learns=0/1 hits=0/0`（lookup 的 miss 计入 after），
+六格+三格全绿 PASS(33) 6.1s。**变异证红**：`arp_learn` 不学（提前 return）⇒
+FAIL35，还原绿。
+
+### 两个实测教训
+
+1. **`stats_before` 必须在 lookup 之前取**：lookup 自己会记 miss/hit——
+   先 lookup 后取基线，增量的分子分母就错位（实测 FAIL，读数
+   `misses=1/1` 被误读成"广播了但没核上"）。
+2. **net.rs 的格式串引号写错**（`"..." 参数 ...`）⇒ 295 个编译错误的雪崩；
+   另有一次**直接调 cargo.exe 丢 PATH**（`rustc -vV` not found，295 个错误
+   全是它级联）——构建一律走 `aurora.py build`。
+
+unsafe：virtio U4 8→12（ARP 表三入口的 `UnsafeCell` 访问 + Sync 论证，
+登记补注释：地址范围固定在单一静态对象、调用点全在内核串行上下文）。
+读数：`check` 18/18；virtio-net 档 87/87；整链 67 符合 + 2 条不符
+（`两卷同哈希` 本会话第 4 次长跑红/单跑绿——§412 已记录的读链瞬时错，
+连累 FS-03 与签名包两行；不归因）。
+
+## 418. ADR-143 B2 第五刀：网卡三原语 33/34/35 + shell ping（workbuddy，2026-11-18）
+
+**新增 3 个号**（使用者裁决"下次都直接新增"）。33 `SYS_NET_SEND`、34 `SYS_NET_RECV`
+（超时回 0 不是错误）、35 `SYS_NET_INFO`（18 字节：MAC6+IP4+网关4+DNS4）。
+**不做"一个 ping 号"**：协议身份留在用户态，内核只发/收/读读数。
+runtime 加 `net_send/net_recv/net_info/net_build_arp/net_build_icmp`；
+shell `cmd_ping` 接管旧名（旧的 1 号服务计数语义并入 `abi`）。
+
+**实测**：`ping 10.0.2.2` → `from 10.0.2.2: seq=1`，七格（ping/top-sleep/sleep/
+uptime/lspci/dmesg/top 排序）全绿、PASS(33) 14.8s。
+**变异证红**：runtime 的 `net_build_icmp` 去掉 IPv4 头校验和 ⇒ `_ping_row=False`
+（slirp 静默丢包）；还原 ⇒ True。
+
+### 六件实测坑（都记进 ADR）
+
+1. `copy_to_user(src, va)` 参数顺序写反 ⇒ E0308。
+2. **35 号成功回写入字节数 18 而非 0** ⇒ runtime 按 `ret==0` 判会把成功读成 Err(18)
+   （shell 打出 `18`）。**改成按符号位判**。
+3. **`cmd_ping` 早就存在**（A2 的 1 号服务计数，打 `ping=<n>`）——加命令前先 grep 名字。
+4. `.text` 窗口**第四次涨**：24 → **32 KiB**。
+5. **`buf[i]` 直接索引 = 32S**：panic location 是 24 字节匿名 `.rodata`（`.Lanon` 尺寸
+   0x18 是识别特征）。全部改 `get()`/`iter_mut().zip()`。
+6. **IPv4 头校验和漏算**是本片最大的功能 bug（pcap 里只有我们发的 t=8，永远等不到 t=0）。
+
+**顺带**：QEMU 网卡接线从"只在 virtio-net 档"扩到"**a3-shell 档也挂**"
+（否则 shell 的 ping 找不到设备 ⇒ `NoDevice`）；33/34/35 各自惰性 `bind_net()`。
+
+读数：`check` 18/18（virtio 公开接口 +8 行、runtime U5 41→44、census 477→480）；
+a3-shell 单跑七格全绿；整链一轮 66 符合 + 3 条不符（`两卷同哈希` 卷抖动连累两条
++ `多级首簇高半抹零` 的 EXCEPTION）——**三条都单跑复验**：fat32-probe PASS、
+`fs-open --host-fault fault-deep-hi-cluster` FAIL(35) 符合期望、witness 报
+"盘上不是只差计划中那 1 格"（宿主机侧注入没生效，属长链批量抖动同族）。
+
+## 419. ADR-144 B2 第六刀：`ip link` / `ip addr`（workbuddy，2026-11-18）
+
+**零新号**（35 号同会话内扩形状）。读数块 18→**24 字节**：尾部加 `mtu2 | link2`
+（`22..24` 预留对齐）。**不猜默认值**：读不到就回错误码，不填 0。
+shell 加 `ip` 命令（2 字节名，`streq` 分派）+ `link`/`addr` 两个子命令。
+
+**实测**：
+```
+link mac 52:54:00:12:34:56 mtu=65535 state=up
+addr 10.0.2.15 gw 10.0.2.2 dns 10.0.2.3
+```
+判定格 `_ip_rows`（严格形状、不依赖具体数值）；**变异证红**：去掉 `mtu=` 前缀
+⇒ False，还原 ⇒ True。**八格全绿** PASS(33) 15.5s。
+
+### 三个坑
+
+1. **MSGS 的 declared/actual 又对不上**（564 vs 556）：`\xNN` 解码后 1 字节，
+   手算必错——用 `unicode_escape` 解码后数 `len`。
+2. `*sub == b'l'` 不成立（`&[u8]` 解引用是 `[u8]`，不能与 `u8` 比）
+   ⇒ `matches!(sub.first(), Some(b'l'))`。
+3. MAC 的 `:` 分隔符得新加进 MSGS（`M_COLON`，1 字节）。
+
+读数：`check` 18/18；**整链 69/69 rc=0**。
+B2 剩余：`ip neigh`（ARP 表出口）、`ip route`、DNS 解析器、TCP。

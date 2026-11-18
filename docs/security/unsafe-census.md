@@ -1,6 +1,6 @@
 # unsafe 逐处审计表（U1–U6）
 
-总计 470 处。U1 83 · U2 119 · U3 13 · U4 129 · U5 90 · U6 36
+总计 483 处。U1 83 · U2 119 · U3 13 · U4 133 · U5 99 · U6 36
 
 本表由 `tools/aurora.py` 的 `unsafe_sites()` 从源码逐处生成，**不是手写的**。
 机器可读的权威来源是 `docs/security/unsafe-whitelist.toml` 的 `[modules.*]` 段（模块×类别→处数），
@@ -475,11 +475,6 @@
 
 ### mm
 
-- `kernel/src/mm.rs:2781` [{] **U2** fn=`frame_seal`
-  > let e = &mut *arr.add(frame as usize);  
-- `kernel/src/mm.rs:2799` [{] **U2** fn=`frame_sealed`
-  > unsafe { (*arr.add(frame as usize)).flags & FI_SEALED != 0 }  
-
 - `kernel/src/mm.rs:313` [impl] **U4** fn=`—`
   > unsafe impl Sync for StateCell {}  static S: StateCell = StateCell(UnsafeCell::new(State {
 - `kernel/src/mm.rs:344` [impl] **U4** fn=`—`
@@ -745,8 +740,6 @@
 
 - `kernel/src/user.rs:294` [impl] **U4** fn=`sys_file_read`
   > unsafe impl Sync for ProgCell {} static PROG_PTR: ProgCell = ProgCell(core::cell::UnsafeCell::new(None));  
-- `kernel/src/user.rs:806` [{] **U2** fn=`child_bytes_eq`
-  > let got = unsafe { core::slice::from_raw_parts(phys.via_hhdm().0 as *const u8, take) };  
 - `kernel/src/user.rs:368` [{] **U2** fn=`ensure_trampoline`
   > unsafe { core::ptr::write_bytes(f.base().via_hhdm().0 as *mut u8, 0, mm::PAGE); core::ptr::write_volatile( 
 - `kernel/src/user.rs:458` [{] **U4** fn=`init`
@@ -893,6 +886,8 @@
 - `user/shell/src/registry.rs:160` [{] **U5** fn=`cmd_run`
 
 - `user/shell/src/registry.rs:190` [{] **U5** fn=`job_of`
+
+- `user/shell/src/registry.rs:470` [{] **U5** fn=`cmd_top`
 
 ### user/shell
 

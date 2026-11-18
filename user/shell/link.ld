@@ -3,12 +3,14 @@
  *   2) 段地址落在低半区且在内核加载器窗口里（mm::USER_VA_BASE = 4 GiB 起）；
  *   3) 每段 p_vaddr 与 p_offset 对 4 KiB 同余，且不允许 W+X 同段。
  * 与 hello 的差别：①**没有 .slots 哨兵段**——shell 的结果走控制台，不走内存信箱，
- * 所以不需要"内核按固定偏移读回"那套契约；②**.text 留 16 KiB**（hello 只留 4 KiB）——
- * shell 的代码比 hello 大，第一版按 4 KiB 排直接撞 `section .text virtual address range
- * overlaps with .rodata`（本轮实测）。段仍各自 ALIGN(4K)，窗口约束不变。
- * S6（2026-11-18）：接上 ls/cat 后 .text 到 0x4114，又把 16 KiB 撞穿一次 —— 这次把
- * .text 预算放到 20 KiB（.rodata 挪到 0x100005000、.data 0x100007000），不是再挤代码。
- * 2026-11-18 接 cd/pwd 后 .text 到 0x54F4 ⇒ 再放到 24 KiB（.rodata 0x100006000、.data 0x100008000）。
+ * 所以不需要"内核按固定偏移读回"那套契约；②**.text 留 20 KiB**（hello 只留 4 KiB）——
+ * shell 的代码比 hello 大：第一版按 4 KiB 排直接撞 `section .text virtual address range
+ * overlaps with .rodata`（S5c 实测）；ADR-133 的 `top`（排序 + 帧打印 + sleep）再涨
+ * ~2.5 KiB，提到 20 KiB。ADR-136/137 的 lspci/uptime 再涨 ~2 KiB，
+ * 20 KiB 又不够（本轮实测：dispatch 的 32S 重定位 out of range），提到 24 KiB。
+ * ADR-143 的 ping（点分十进制解析 + 两次收发循环）再涨 ~2 KiB，24 KiB 又不够
+ * （本轮实测：.text 结束 0x100006xxx > .rodata 起点），提到 32 KiB。
+ * 段仍各自 ALIGN(4K)，窗口约束不变。
  */
 
 OUTPUT_FORMAT(elf64-x86-64)
@@ -29,13 +31,13 @@ SECTIONS {
     *(.text .text.*)
   } :text
 
-  . = 0x100006000;
+  . = 0x100008000;
   .rodata ALIGN(4K) : {
     *(.rodata .rodata.*)
     *(.rdata)
   } :rodata
 
-  . = 0x100008000;
+  . = 0x100009000;
   .data ALIGN(4K) : {
     *(.data .data.*)
   } :data

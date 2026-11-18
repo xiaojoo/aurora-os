@@ -58,6 +58,18 @@ pub const SYS_PROCESS_START: u64 = 16;
 pub const SYS_PROCESS_WAIT: u64 = 17;
 /// 18 收掉一个进程的全部线程（user.rs:96；实现 user.rs:958）。
 pub const SYS_PROCESS_KILL: u64 = 18;
+/// ADR-134 (29): rdi=pid -> threads killed. pid is only an address; the kernel
+/// still requires a RIGHT_WRITE Proc handle in the caller own name table.
+pub const SYS_PROC_KILL_BY_PID: u64 = 29;
+/// ADR-135 (30): log_read(buf,len) -> (lines<<32)|bytes. Reads the serial log ring
+/// as whole lines only (half lines are dropped by the kernel). 0 means success.
+pub const SYS_LOG_READ: u64 = 30;
+/// ADR-136 (31): pci_enum(buf,cap,cursor) -> (next<<32)|n. Fixed 32-byte records,
+/// magic "APC1". PCI table is a boot snapshot; no capability required.
+pub const SYS_PCI_ENUM: u64 = 31;
+/// ADR-137 (32): clock_uptime() -> micros since boot (u64). No args, no buffer,
+/// no capability. Unanchored/uncalibrated => -1 (never a guessed default).
+pub const SYS_CLOCK_UPTIME: u64 = 32;
 /// 19 通用对象等待，今天只支持 Proc（user.rs:879；实现 user.rs:946）。
 pub const SYS_OBJECT_WAIT: u64 = 19;
 /// 20 控制台写（user.rs:51；实现 `sys_console_io` user.rs:1006）。
@@ -972,6 +984,76 @@ pub fn process_kill(proc_h: Handle) -> Result<u64, RTError> {
     }
 }
 
+/// 29 号：按 pid 杀进程。pid 只是寻址——内核只在**调用者自己名下**反查带
+/// `RIGHT_WRITE` 的 Proc 句柄，再走与 18 号同一个杀路径（ADR-134）。
+/// 成功返回真收掉的线程数；没有对应句柄/权限不够 ⇒ `Err(-5)`。
+pub fn process_kill_pid(pid: u16) -> Result<u64, RTError> {
+    // SAFETY: 29 号 rdi = pid，其余参数无语义（runtime 的 syscall_abi 统一置零）。
+    let ret = unsafe { syscall_abi(SYS_PROC_KILL_BY_PID, u64::from(pid), 0, 0, 0) };
+    if ret < 0 {
+        Err(RTError(ret))
+    } else {
+        Ok(ret as u64)
+    }
+}
+
+/// 30 号：把**串口日志环**的最近整行读进 `buf`。返回 `(行数, 字节数)`。
+///
+/// 内核侧保证：只给整行（开头/结尾的半行丢掉），所以拿回来的段一定以 `\n` 结尾
+/// 或为空。**0 行是成功**（环里还没有完整行），不是错误。
+/// `buf` 长度必须 ≥ 1 且 ≤ `COPY_MAX`（内核 user.rs 的容量边界）。
+pub fn log_read(buf: &mut [u8]) -> Result<(u32, u32), RTError> {
+    if buf.is_empty() || buf.len() > COPY_MAX {
+        return Err(RTError::TOOLONG);
+    }
+    // SAFETY: 30 号 rdi = 用户缓冲、rsi = 字节数；缓冲由调用方给出，长度已在上行校验，
+    // 内核侧还有 COPY_MAX 与 copy_to_user 的窗口校验。
+    let ret = unsafe {
+        syscall_abi(SYS_LOG_READ, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0)
+    };
+    if ret < 0 {
+        return Err(RTError(ret));
+    }
+    let v = ret as u64;
+    Ok(((v >> 32) as u32, (v & 0xffff_ffff) as u32))
+}
+
+/// 31 号：PCI 设备清单。`cursor` 从 0 起逐页取，返回 `(next, n)`。
+/// 每条 32 字节定长记录（魔数 `APC1`），布局见 ADR-136：
+/// bdf@8、vendor|device@12、cfg08@16、hdr@20（低 8 位）、bar0@24。
+/// 长度字段在 6..10 且与 bdf 共用 8..10 两字节（27 号同族形状），按 16 位读。
+pub fn pci_enum(buf: &mut [u8], cursor: u64) -> Result<(u32, u32), RTError> {
+    if buf.is_empty() || buf.len() > COPY_MAX || buf.len() % PCI_ENUM_REC != 0 {
+        return Err(RTError::TOOLONG);
+    }
+    // SAFETY: 31 号 rdi=缓冲、rsi=游标、r10=字节长度（与 27 号同族：len 走 r10，
+    // 不是 rdx——syscall_abi 的第 4 个参数才映射到 r10）。缓冲由调用方给出，
+    // 长度已在上行校验，内核侧还有 COPY_MAX 与 copy_to_user 的窗口校验。
+    let ret = unsafe {
+        syscall_abi(SYS_PCI_ENUM, buf.as_mut_ptr() as u64, cursor, 0, buf.len() as u64)
+    };
+    if ret < 0 {
+        return Err(RTError(ret));
+    }
+    let v = ret as u64;
+    Ok(((v >> 32) as u32, (v & 0xffff_ffff) as u32))
+}
+
+/// 32 号：启动以来的微秒数。**没锚点/没标定 ⇒ `Err(-1)`**（内核不编默认值）。
+/// 单调不减；两次调用相等是可能的（间隔小于 1 µs）。
+pub fn uptime_us() -> Result<u64, RTError> {
+    // SAFETY: 32 号无参数语义（四个参数位全置零）；无缓冲、无 capability。
+    let ret = unsafe { syscall_abi(SYS_CLOCK_UPTIME, 0, 0, 0, 0) };
+    if ret < 0 {
+        Err(RTError(ret))
+    } else {
+        Ok(ret as u64)
+    }
+}
+
+/// 31 号记录的定长。
+pub const PCI_ENUM_REC: usize = 32;
+
 /// 打 19 号（`SYS_OBJECT_WAIT`，user.rs:879）：通用对象等待。今天只支持 Proc 对象，
 /// 拿别的 kind 来等内核回 [`RTError::DENIED`]（user.rs:877-878）。
 /// 返回 `None` = 超时。
@@ -988,6 +1070,32 @@ pub fn object_wait(h: Handle, signals: u64, timeout_ms: u64) -> Result<Option<Wa
     // SAFETY: 19 号 `rdi` = 对象句柄、`rsi` = 信号位图、`rdx` = 时限毫秒。
     let ret = unsafe { syscall_abi(SYS_OBJECT_WAIT, h, signals, timeout_ms, 0) };
     decode_wait(ret)
+}
+
+// ---------------------------------------------------------------------------
+// 定时等待（`top` 的睡眠原语，不新增调用号）
+// ---------------------------------------------------------------------------
+
+/// `signals = 0` 的 [`object_wait`]：等一个**永远不会置位**的信号图，唯一出路是
+/// `timeout_ms` 到期。语义上这就是"睡指定毫秒"——返回值只有两种：
+/// `Ok(None)` = 睡满了，`Ok(Some(_))` = 提前醒来（只可能发生在被等对象真是 Proc
+/// 且已终止时；拿 Thread/ASpace 句柄来睡时内核 resolve 到非 Proc 直接 `-4`，
+/// 永远不会走到这一支）。`Err(_)` = 句柄不能等（`-4`）或参数形状不对。
+///
+/// **为什么不用忙等**：内核的 19 号带时限等待走 `TASK_WAITERS` 槽 + `task_wake_tick`
+/// 的超时唤醒（sched.rs:1748），等待期间任务真阻塞，不让 CPU 空转——这正是
+/// `top` 每秒刷新需要的形状。**时限上限**沿用 [`WAIT_MAX_MS`]（内核 user.rs:885
+/// 与本库 108 行同数），调用方传更大的毫秒回 [`RTError::INVALID`]。
+///
+/// `h` 通常传 16 号回填进 SI 表的 `ROLE_SELF_THREAD` 句柄（Thread 对象，永不终止）；
+/// 传 Proc 句柄则退化为"最多睡 ms 毫秒、提前醒来当真醒了"的形状，调用方自行判别。
+pub fn sleep_ms(h: Handle, ms: u64) -> Result<(), RTError> {
+    match object_wait(h, 0, ms) {
+        // 超时 = 睡满；提前醒来（拿到信号）也按"睡到了"交付——本原语的语义是
+        // "至少间隔 ms 毫秒后才继续"，不是"精确睡满"。
+        Ok(_) => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1025,4 +1133,100 @@ pub unsafe fn find_console(si_va: u64) -> Option<Handle> {
         }
     }
     None
+}
+
+/// 33/34/35（ADR-143）：网卡三原语（帧收发 + 读数包）。
+pub const SYS_NET_SEND: u64 = 33;
+pub const SYS_NET_RECV: u64 = 34;
+pub const SYS_NET_INFO: u64 = 35;
+/// 网卡读数包（18 字节定长）：MAC6 + 本机 IP4 + 网关4 + DNS4。
+/// 读数包 24 字节（ADR-144 从 18 扩到 24）：MAC6 + 本机IP4 + 网关4 + DNS4 + mtu2 + link2。
+pub const NET_INFO_BYTES: usize = 24;
+
+
+/// 33：把一帧交给网卡。`frame` ≤ 1514；成功 Ok(())，形状/IO 错误如实回。
+pub fn net_send(frame: &[u8]) -> Result<(), RTError> {
+    if frame.is_empty() || frame.len() > 1514 {
+        return Err(RTError::INVALID);
+    }
+    // SAFETY: 33 号 rdi=帧指针、rsi=len（内核 copy_from_user 校验用户半区）。
+    let ret = unsafe { syscall_abi(SYS_NET_SEND, frame.as_ptr() as u64, frame.len() as u64, 0, 0) };
+    if ret == 0 { Ok(()) } else { Err(RTError(ret as i64)) }
+}
+
+/// 34：有界等一帧。`Ok(0)` = 超时；`Ok(n)` = 收到 n 字节（写进 `buf`，帧从 eth 头起）。
+pub fn net_recv(buf: &mut [u8], timeout_ms: u64) -> Result<usize, RTError> {
+    if buf.is_empty() || buf.len() > 2048 || timeout_ms > 60_000 {
+        return Err(RTError::INVALID);
+    }
+    // SAFETY: 34 号 rdi=buf、rsi=cap、rdx=timeout_ms（内核 copy_to_user 写回）。
+    let ret = unsafe { syscall_abi(SYS_NET_RECV, buf.as_mut_ptr() as u64, buf.len() as u64, timeout_ms, 0) };
+    Ok(ret as usize)
+}
+
+/// 35：读网卡读数包（MAC/本机 IP/网关/DNS，18 字节）。
+pub fn net_info() -> Result<[u8; NET_INFO_BYTES], RTError> {
+    let mut blk = [0u8; NET_INFO_BYTES];
+    // SAFETY: 35 号 rdi=buf（内核 copy_to_user 写回 18 字节定长）。
+    // 检查用**符号位**（实测 35 号成功回写入字节数 18 而不是 0，按 ret==0 判会把成功读成 Err(18)）。
+    let ret = unsafe { syscall_abi(SYS_NET_INFO, blk.as_mut_ptr() as u64, 0, 0, 0) } as i64;
+    if ret < 0 { Err(RTError(ret)) } else { Ok(blk) }
+}
+
+/// 构造一帧 ICMP echo request（ADR-140 的内核形状在用户库的镜像）。
+/// `gw_mac` 来自 ARP（用户态自己发 request 解），填到 60（最小帧）。
+pub fn net_build_icmp(gw_mac: &[u8; 6], our_mac: &[u8; 6], our_ip: &[u8; 4], dst_ip: &[u8; 4], seq: u16) -> [u8; 60] {
+    let mut f = [0u8; 60];
+    f[0..6].copy_from_slice(gw_mac);
+    f[6..12].copy_from_slice(our_mac);
+    f[12..14].copy_from_slice(&[0x08, 0x00]);
+    f[14] = 0x45;
+    f[16] = 0; f[17] = 40;
+    f[20] = 0x40; f[22] = 64; f[23] = 1;
+    f[26..30].copy_from_slice(our_ip);
+    f[30..34].copy_from_slice(dst_ip);
+    // **IPv4 头校验和必须算**（实测：漏掉它的帧→slirp 丢弃，永远等不到 echo reply；pcap 里只有发出的 t=8）。
+    let mut isum: u32 = 0;
+    let mut ik = 14usize;
+    while ik < 34 {
+        isum += u32::from(f[ik]) << 8 | u32::from(f[ik + 1]);
+        ik += 2;
+    }
+    isum = (isum >> 16) + (isum & 0xFFFF);
+    isum = (isum >> 16) + (isum & 0xFFFF);
+    let icks = !(isum as u16);
+    f[24] = (icks >> 8) as u8;
+    f[25] = icks as u8;
+    let ic = 34;
+    f[ic] = 8;
+    f[ic+4..ic+6].copy_from_slice(&0xA5A5u16.to_be_bytes());
+    f[ic+6..ic+8].copy_from_slice(&seq.to_be_bytes());
+    for k in 0..16 { f[ic+8+k] = 0xA5; }
+    let mut sum: u32 = 0;
+    let mut k = 0usize;
+    while k + 1 < 20 {
+        sum += u32::from(f[ic+k]) << 8 | u32::from(f[ic+k+1]);
+        k += 2;
+    }
+    sum = (sum >> 16) + (sum & 0xFFFF);
+    let cks = !(sum as u16);
+    f[ic+2] = (cks >> 8) as u8;
+    f[ic+3] = cks as u8;
+    f
+}
+
+/// 构造一帧 ARP request（问谁有 `target_ip`）。42 字节。
+pub fn net_build_arp(our_mac: &[u8; 6], our_ip: &[u8; 4], target_ip: &[u8; 4]) -> [u8; 42] {
+    let mut f = [0u8; 42];
+    f[0..6].copy_from_slice(&[0xFF; 6]);
+    f[6..12].copy_from_slice(our_mac);
+    f[12..14].copy_from_slice(&[0x08, 0x06]);
+    f[14..16].copy_from_slice(&1u16.to_be_bytes());
+    f[16..18].copy_from_slice(&0x0800u16.to_be_bytes());
+    f[18] = 6; f[19] = 4;
+    f[20..22].copy_from_slice(&1u16.to_be_bytes());
+    f[22..28].copy_from_slice(our_mac);
+    f[28..32].copy_from_slice(our_ip);
+    f[38..42].copy_from_slice(target_ip);
+    f
 }

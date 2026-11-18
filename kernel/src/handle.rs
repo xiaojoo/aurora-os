@@ -635,6 +635,37 @@ pub fn grant_proc(owner: (usize, u32), proc_id: u16, gen: u32, rights: u32) -> R
     insert(g.get(), owner, rights, ObjRef::Proc { slot: proc_id, gen })
 }
 
+/// **按 `(owner, pid)` 反查一张带 `need` 权限的 Proc 句柄**（ADR-134 的 29 号接缝）。
+///
+/// **为什么是 capability 而不是"按 pid 直接操作"**：这里只在**调用者自己名下**的
+/// 句柄里找——`owner` 两格必须与表项一致（`check` 用的同一组判据）。别人名下的
+/// 同名进程句柄不算数：`pid` 只是寻址，授权仍由"你手里得有一张带 `RIGHT_WRITE`
+/// 的句柄"决定。没有 ⇒ `NoSuch`（在用户侧是 `-5`），与 18 号对失效句柄的口径一致。
+///
+/// 世代不匹配（进程已被 reap 又复用槽）的句柄不算：`gen` 由调用方从
+/// `proc::proc_gen(pid)` 取当前值传进来，旧的 gen 对不上就跳过（ABA）。
+pub fn find_proc(owner: (usize, u32), pid: u16, gen: u32, need: u32) -> Result<Handle, HErr> {
+    let mut g = TABLE.lock();
+    let t = g.get();
+    for (i, e) in t.slots.iter().enumerate() {
+        if !e.used
+            || e.owner_gidx as usize != owner.0
+            || e.owner_id != owner.1
+            || e.rights & need != need
+        {
+            continue;
+        }
+        if let Some(ObjRef::Proc { slot, gen: obj_gen }) = e.obj {
+            // 世代必须对上：进程槽号会复用，旧句柄的 gen 是上一任的（ABA）。
+            if slot == pid && obj_gen == gen {
+                return Ok(Handle::pack(i as u16, e.gen));
+            }
+        }
+    }
+    t.c.no_such += 1;
+    Err(HErr::NoSuch)
+}
+
 /// 给一个地址空间发句柄。形状同 `grant_job`，活性判据换成 `mm::aspace_live`。
 pub fn grant_aspace(owner: (usize, u32), slot: u8, rights: u32) -> Result<Handle, HErr> {
     let Some(gen) = crate::mm::aspace_gen(slot) else { return Err(note(HErr::NoSuch)) };

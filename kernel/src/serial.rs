@@ -110,6 +110,22 @@ pub fn ring_total() -> u64 {
     RING_POS.load(Ordering::Relaxed)
 }
 
+/// 只给用例：环里**逻辑序号** `abs`（从 0 起的累计写位置）那一格的字节。
+/// 越界（早于窗口或还没写到）回 `None`。它让判据能**自己**从环的原始字节
+/// 算"最后一行是不是完整行"，而不是拿 `recent_tail` 的结论对自己的结论
+/// ——后者是同一台仪器量两遍，变异咬不动（本轮实测：改 `recent_tail` 的
+/// 整行规则时，30 号与它的对账格同时坏、反而自洽为绿）。
+pub fn ring_byte_for_test(abs: u64) -> Option<u8> {
+    let total = RING_POS.load(Ordering::Relaxed);
+    if abs >= total {
+        return None;
+    }
+    let oldest = total.saturating_sub(RING_LEN as u64);
+    if abs < oldest {
+        return None;
+    }
+    Some(RING[(abs as usize) % RING_LEN].load(Ordering::Relaxed))
+}
 /// 只给用例：把环清零，好让"我打了 N 行"这件事与前面整个启动的日志分开。
 pub fn ring_reset_for_test() {
     RING_POS.store(0, Ordering::Relaxed);

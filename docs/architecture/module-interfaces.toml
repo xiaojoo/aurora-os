@@ -404,7 +404,7 @@ public_api = [
   "user::syscall_dispatch",
 ]
 allowed_callers = ["integration"]
-dependencies = ["arch", "boot", "capability", "diagnostics", "input", "memory", "security", "storage", "sync", "time"]
+dependencies = ["arch", "boot", "capability", "diagnostics", "input", "memory", "pci", "security", "storage", "sync", "time"]
 forbidden_dependencies = []
 known_violations = []
 context = ["KERNEL", "IRQ_OFF", "ISR_TOP"]
@@ -558,7 +558,7 @@ public_api = [
   "pci::init",
   "hw::MmioRegion",
 ]
-allowed_callers = ["arch", "diagnostics", "display", "driver", "input", "integration", "storage"]
+allowed_callers = ["arch", "diagnostics", "display", "driver", "input", "integration", "sched", "storage"]
 dependencies = ["memory"]
 forbidden_dependencies = ["storage"]
 known_violations = []
@@ -678,6 +678,15 @@ public_api = [
   "virtio::write_block",
   "virtio::read_block_at",
   "virtio::write_block_at",
+  # ADR-143：网卡三原语的用户态出口（33/34/35 号）与帧构造常量
+  "virtio::NET_TX_MAX",
+  "virtio::DHCP_GUEST_IP",
+  "virtio::NET_GATEWAY_IP",
+  "virtio::NET_DNS_IP",
+  "virtio::bind_net",
+  "virtio::send_raw",
+  "virtio::receive",
+  "virtio::net_info",
 ]
 allowed_callers = ["capability", "diagnostics", "integration", "sched"]
 dependencies = ["arch", "boot", "driver", "irq", "memory", "pci", "time"]
@@ -856,6 +865,8 @@ public_api = [
   "clock::from_pit_window",
   "clock::hz",
   "clock::micros",
+  "clock::record_boot",
+  "clock::uptime_micros",
   "tsc::elapsed",
   "tsc::now",
   "tsc::rdtscp_available",
@@ -907,6 +918,7 @@ public_api = [
   "handle::RIGHT_CREATE",
   "handle::grant_job",
   "handle::grant_proc",
+  "handle::find_proc",
   "handle::grant_aspace",
   "handle::grant_thread",
   "handle::resolve",

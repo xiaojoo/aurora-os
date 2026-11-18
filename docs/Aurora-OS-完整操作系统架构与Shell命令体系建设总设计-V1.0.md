@@ -158,6 +158,10 @@
 | 26 | `SYS_DIR_READ` | 读 DirentV1 目录记录（fs-open feature） |
 | 27 | `SYS_PROC_ENUM` | 游标式枚举自己 Job 名下的进程（handles feature，ADR-132） |
 | 28 | `SYS_PROC_STAT` | 取一个进程的 ProcStatV1 统计（handles feature，ADR-132） |
+| 29 | `SYS_PROC_KILL_BY_PID` | 按 pid 杀进程：内核在调用者名下反查带 WRITE 的 Proc 句柄后走 18 号同一路径（handles feature，ADR-134） |
+| 30 | `SYS_LOG_READ` | 把串口日志环的最近整行拷进用户缓冲（handles feature，ADR-135） |
+| 31 | `SYS_PCI_ENUM` | PCI 设备清单按 32 字节定长记录拷给用户（handles feature，ADR-136） |
+| 32 | `SYS_CLOCK_UPTIME` | 返回启动以来的微秒数（锚点+PIT 标定，没标定回 -1；handles feature，ADR-137） |
 
 此表是当前源码快照的调用号清单，不代表所有 feature 在默认构建中都启用。用户程序必须先通过 `SYS_ABI_INFO` 读取 ABI 版本与能力位，再使用对应接口。新增调用必须登记、测试和版本化；不得自行选择空号后就视为已批准。
 
@@ -915,10 +919,10 @@ aurora-os/
 > | A1 VFS/文件系统 | 部分 | FS-01~FS-10 的**读方向**已交付（ADR-108/109）；写方向由 qoder 推进（ADR-110/111，`fs-rw`） |
 > | A2 用户运行时 | ✅ 前后两半都落地 | `user/runtime` 库 + argv 区/std 句柄/退出码（ADR-130）；判定行 `A2 argv/std…`、`A2越界argv…` |
 > | A3 Shell 解析器与外部命令 | ✅ 解析器与 `run` 已落地，交互判据待量具 | 解析器/注册表（A3 首片）、**用户态装载器**（ADR-131，判定行 `A3 用户态装载器执行卷上ELF`）、shell `run <path>`；交互端到端被 `t_fs_open_ring3` 的 160 ms 窗口挡住（原因见 ADR-131 补记） |
-> | A4 进程观测 | ✅ 数据面落地（`ps`/`free`；`top`/`kill` 见下） | ADR-132：27 号枚举 + 28 号统计 + 按 AS 的映射页计数；用户态 `rt::proc_enum/proc_stat` 与 shell 的 `ps`/`free`；判定行 `A3 shell执行argv命令并ps/free读数`（串口原文见 ADR-132 §决策 5） |
+> | A4 进程观测 | ✅ 四条命令全部落地（`ps`/`free`/`top`/`kill`） | ADR-132：27 号枚举 + 28 号统计 + 按 AS 的映射页计数；用户态 `rt::proc_enum/proc_stat` 与 shell 的 `ps`/`free`；ADR-133：shell `top`（27 号第二个调用方，pages 降序 + 19 号薄壳 `rt::sleep_ms` 定时，纯用户态内核零改动）；ADR-134：shell `kill <pid>`（**29 号** `SYS_PROC_KILL_BY_PID`，pid 只寻址、授权靠调用者名下的 `RIGHT_WRITE` Proc 句柄，内核反查后走与 18 号同一实现）；判定行 `A3 shell执行argv命令并ps/free读数`（argv `run/ps/free/top 2; kill 9999`，串口原文见 ADR-132 §决策 5、ADR-133 §验收、ADR-134 §落地） |
 >
-> 三条与上表配套的事实：① `ps`/`free` 已有真实数据（27 号的聚合），`top` 与 `kill` 尚无命令——
-> `kill` 的内核面（18 号）早就在，缺的是 shell 侧取句柄的角色号；`top` 要定排序口径（ADR-132 §未做 1）；
+> 三条与上表配套的事实：① `ps`/`free`/`top`/`kill` 均有真实数据（27 号的聚合）；
+> `kill` 走 29 号，capability 语义不变（ADR-134）；
 > ② `run` 的退出码显示路径已实现但缺"会自己退出的样例命令"（卷上的 hello 是内核探针，不写 FLAG_EXIT 就自旋）；
 > ③ 重定向/管道/`ls -lah` 属 A3 的后续片，尚未开始（A3 验收句的 `ls/cat/grep` 那半未达成）。
 
@@ -978,6 +982,22 @@ aurora-os/
 **验收：** `ps`、`top`、`kill`、`free` 有真实数据，不直接暴露内核结构。
 
 ## 阶段 B：设备、网络与系统服务
+
+> **实施记录（2026-11-18，按代码与判定表实测更新；本表是"做到哪了"，不改上面的验收句）**
+>
+> | 阶段 | 状态 | 依据 |
+> |---|---|---|
+> | B1 设备模型 | 部分（`lspci` 已达成） | PCI ECAM/CAM 枚举 `pci.rs`、统一 `DriverCtx`、AHCI 错误恢复、virtio 设备表（ADR-030/112）；ADR-136 新增 **31 号 `SYS_PCI_ENUM`**（内核判据 `t_pci_enum` 七格全绿 + 变异证红）与 shell `lspci`（判定格 `_lspci_rows`，变异证红；q35 实测 6 台真实数据）；**缺** Device/Driver trait、设备树、`lsdev`/`devctl`（B1 后续片） |
+> | B2 网络协议栈 | 部分（只到以太网帧 + 单次 DHCP） | virtio-net + 手搓 Ethernet 实验帧 + DHCP DISCOVER 回包解析（ADR-032，判定行 网卡第一帧/第一条协议往返）；**缺** ARP/ICMP/TCP/Socket API/路由/DNS 与 `ip`/`ping` 命令 |
+> | B3 时间电源 | 部分（`uptime` 已达成） | TSC/PIT 标定、LAPIC/PIT 定时器、健康标记、停机（ADR-036）；ADR-137 新增 **启动锚点 + 32 号 `SYS_CLOCK_UPTIME`**（内核判据 `t_clock_uptime` 四格 + 变异证红）与 shell `uptime`（判定格 `_uptime_row`，变异证红）；**缺** 墙钟/RTC/时区（`date`）、`sleep`/`service`/ACPI 电源/重启 |
+> | B4 日志诊断 | **`dmesg` 已达成** | 环 4096B + 整行规则、持久日志尾、crash dump V2 及 3 条既有判定行；ADR-135 新增 **30 号 `SYS_LOG_READ`**（内核判据 `t_log_read` 十格全绿 + 变异证红）与 shell `dmesg`（判定格 `_dmesg_repeats`：表头后首行必须在表头前出现过 ⇒ 真打了一遍内核日志；变异证红已做）；`journalctl` 未做 |
+>
+> 与上表配套的事实：① B 阶段四片里 B4 已把**内核底座 + 判据 + 用户态出口**三件都凑齐
+> （环、持久尾、dump、30 号、`dmesg`），其余三片仍要先建设备树 / 协议栈 / 电源状态机；
+> ② 新增的两个调用号 **29（kill）/ 30（log_read）** 均已按"先裁决、后实现、再登记"走完
+> （总设计 §2.1、`module-interfaces`、unsafe 白名单/审计表同步）；
+> ③ 本阶段曾把 `dmesg` 误判成「输出为零」（量具骗人，复盘见 BACKLOG §398）；
+> 纪律已补：判据不能用「看起来像」来定位。
 
 ### B1：设备模型完善
 

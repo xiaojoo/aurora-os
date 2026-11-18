@@ -17,7 +17,7 @@
 //!    今天至少把"几个样本"报出来，不给单一数字冒充精确。
 //! 3. 换算全部用整数定点，内核里不引浮点（`check-nofloat` 门禁会数指令）。
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// PIT 输入振荡器，单位 Hz（1.193182 MHz，Intel 8253/8254 常量）
 pub const PIT_HZ: u64 = 1_193_182;
@@ -173,6 +173,34 @@ pub fn current() -> Option<Calibration> {
         interval_n: n as usize,
         invariant: false,
     })
+}
+
+/// **启动锚点**：`kmain` 里最早一次 `tsc::now()`（serial 起来之后立刻记）。
+/// `uptime` 的一切换算都从它起算；没记录（0）时 `uptime_micros` 回 `None`，
+/// **不编数字**——与 `micros()` 没标定回 `None` 是同一条纪律。
+static BOOT_TSC: AtomicU64 = AtomicU64::new(0);
+static BOOT_REANCHOR: AtomicUsize = AtomicUsize::new(0);
+
+/// 在启动序列早段记录锚点。**只允许调一次**（重复调用忽略并计数，
+/// 用例可以借计数发现有人重锚——重锚会把 uptime 拉回 0，那就是骗人）。
+pub fn record_boot(t: u64) {
+    if BOOT_TSC.swap(t, Ordering::AcqRel) != 0 {
+        BOOT_REANCHOR.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// 重锚次数（正常必须为 0）。
+pub fn reanchors() -> usize {
+    BOOT_REANCHOR.load(Ordering::Relaxed)
+}
+
+/// 启动以来的微秒数。锚点没记 / 频率没标定 ⇒ `None`，绝不回退成默认值。
+pub fn uptime_micros() -> Option<u64> {
+    let boot = BOOT_TSC.load(Ordering::Acquire);
+    if boot == 0 {
+        return None;
+    }
+    micros(crate::tsc::now().wrapping_sub(boot))
 }
 
 /// cycles -> 微秒。**没有标定就返回 None**，绝不回退成"假设 1 GHz"那种方便但骗人的默认值。

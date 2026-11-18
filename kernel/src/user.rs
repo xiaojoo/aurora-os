@@ -98,6 +98,33 @@ pub const SYS_THREAD_CREATE: u64 = 15;
 /// **枚举方式是全文扫 72 格按 `proc_id` 认**（使用者裁决 2026-11-10），不新加每进程线程名单。
 /// 杀自己的进程一律 `-4`：那条路要交给 `SYS_EXIT`，在 syscall 里把自己标 Free 会让返回路径踩空槽。
 pub const SYS_PROCESS_KILL: u64 = 18;
+/// ADR-134 (29): rdi=pid -> rax = threads killed.
+/// pid is only an address; authority comes from a RIGHT_WRITE Proc handle
+/// found in the CALLER OWN name table, then the same kill path as syscall 18.
+pub const SYS_PROC_KILL_BY_PID: u64 = 29;
+/// 30 `log_read(buf, len) -> (lines<<32)|bytes`（ADR-135，`handles` 档）。
+/// 把**串口日志环**里最近的一段**整行**日志拷进用户缓冲区（`serial::recent_tail` 的
+/// 同一份规则：开头半行丢掉、结尾半行丢掉，绝不截半行）。
+/// 返回 0 行是**成功**（环里还没有完整行），不是错误——调用方不该把它读成失败。
+/// len 0 ⇒ -1、len > COPY_MAX ⇒ -3；用户页不可写 ⇒ -2（与 5/6 号同口径）。
+pub const SYS_LOG_READ: u64 = 30;
+/// 31 `pci_enum(buf, cap) -> (next<<32)|n`（ADR-136，`handles` 档）。
+/// 把启动时扫好的 PCI 设备清单按 32 字节定长记录拷给用户（`APC1` 魔数）。
+/// 形状与 27 号 `proc_enum` 同族：rdi=用户缓冲、rsi=容量字节、r10=字节长度。
+/// PCI 表是启动设施（`pci::info()/dev(i)` 只读快照），**无 capability 要求**，
+/// 但仍要求调用者有任务身份（与 27 号同口径）。
+pub const SYS_PCI_ENUM: u64 = 31;
+/// 32 `clock_uptime() -> micros`（ADR-137，`handles` 档）。
+/// 返回启动以来的微秒数（u64）。无参数、无缓冲、无 capability——纯读数。
+/// 锚点没记 / 频率没标定 ⇒ `-1`：**绝不回退成默认频率**（clock.rs 的纪律：
+/// "返回一个差不多的默认值会让读数看起来是测出来的，而它其实是猜的"）。
+pub const SYS_CLOCK_UPTIME: u64 = 32;
+/// 33ï¼ä¸å¸§äº¤ç»ç½å¡ï¼virtio-net TXï¼ãrdi=å¸§æéãrsi=é¿ï¼â¤ 1514ï¼ãè¿å 0 / éè¯¯ç ãï¼ADR-143ï¼
+pub const SYS_NET_SEND: u64 = 33;
+/// 34ï¼æçç­å¾ä¸å¸§ï¼virtio-net RXï¼ãrdi=bufãrsi=lenãrdx=timeout_msï¼è¿åæ¶å°çå­èæ°ï¼0=è¶æ¶ï¼ãè¿å 0 / éè¯¯ç ãï¼ADR-143ï¼
+pub const SYS_NET_RECV: u64 = 34;
+/// 35ï¼ç½å¡è¯»æ°ä¸åè¯»åãrdi=bufï¼åºå® 18 å­èï¼MAC6+guest_ip4+gateway4+dns4ï¼ãè¿å 0 / éè¯¯ç ãï¼ADR-143ï¼
+pub const SYS_NET_INFO: u64 = 35;
 /// 16：`rdi` = Proc 句柄、`rsi` = Thread 句柄、`rdx` = StartupInfo 那一页的 VMO 句柄、
 /// `r10` = 它在**子 AS** 里的只读 VA → 成功返回 0。顺序固定：校验 → 转移 → 回填 → 放线程跑。
 pub const SYS_PROCESS_START: u64 = 16;
@@ -584,20 +611,20 @@ fn sys_process_create(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     }
     let pid = match crate::proc::proc_create(job) {
         Ok(p) => p,
-        Err(_) => return E_EXHAUSTED,
+        Err(_) => { crate::log_info!("11: proc_create Exhausted"); return E_EXHAUSTED; }
     };
     let pgen = crate::proc::proc_gen(pid).unwrap_or(0);
     let (aslot, agen) = match crate::mm::aspace_new_kernel() {
         Some(v) => v,
         None => {
             let _ = crate::proc::proc_discard(pid);
-            return E_EXHAUSTED;
+            crate::log_info!("11: aspace_new Exhausted"); return E_EXHAUSTED;
         }
     };
     if crate::proc::proc_set_aspace(pid, aslot, agen).is_err() {
         crate::mm::aspace_destroy(aslot);
         let _ = crate::proc::proc_discard(pid);
-        return E_EXHAUSTED;
+        crate::log_info!("11: set_aspace fail Exhausted"); return E_EXHAUSTED;
     }
     let rights = crate::handle::RIGHT_READ | crate::handle::RIGHT_WRITE | crate::handle::RIGHT_MAP
         | crate::handle::RIGHT_DUP | crate::handle::RIGHT_TRANSFER;
@@ -1377,7 +1404,30 @@ fn sys_object_wait(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
 #[inline(never)]
 fn sys_process_kill(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
-    let (obj, _) = match crate::handle::resolve(crate::handle::Handle(frame.rdi), owner, crate::handle::RIGHT_WRITE) {
+    sys_process_kill_core(crate::handle::Handle(frame.rdi), owner)
+}
+
+/// ADR-134 (29): rdi=pid. Find a RIGHT_WRITE Proc handle in the CALLER OWN
+/// name table, then take the same kill path as syscall 18. pid is only an
+/// address; authority still comes from the capability.
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_proc_kill_by_pid(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
+    let pid = frame.rdi as u16;
+    let Some(gen) = crate::proc::proc_gen(pid) else { return E_BAD_HANDLE };
+    let h = match crate::handle::find_proc(owner, pid, gen, crate::handle::RIGHT_WRITE) {
+        Ok(h) => h,
+        Err(e) => return handle_err(e),
+    };
+    sys_process_kill_core(h, owner)
+}
+
+/// Shared tail of 18 and 29: the part after a Proc handle is resolved.
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_process_kill_core(h: crate::handle::Handle, owner: (usize, u32)) -> u64 {
+    let (obj, _) = match crate::handle::resolve(h, owner, crate::handle::RIGHT_WRITE) {
         Ok(v) => v,
         Err(e) => return handle_err(e),
     };
@@ -1388,12 +1438,200 @@ fn sys_process_kill(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     if !crate::proc::proc_live(pid, pgen) {
         return E_BAD_HANDLE;
     }
-    // 自杀不在这里做：syscall 返回路径还要用当前槽，把自己标 Free 就是踩空
     let me = crate::sched::current_id();
     if crate::sched::proc_id_of(me) == pid {
         return E_DENIED;
     }
     crate::sched::kill_process_threads(pid) as u64
+}
+
+/// ADR-135（30 号）：把串口日志环的"最近整行"拷进用户缓冲区。
+///
+/// **为什么不给用户态一个指向环的指针**：环是内核静态数组，用户态拿到它的 VA
+/// 就等于拿到一段可读内核内存；而且环是**滑动**的，指针语义会随写入漂移。
+/// 这里走既有的 `copy_to_user` 通道（与 5/6 号同一条校验：目标页必须可写、
+/// 跨页逐页校验、一次不超过 `COPY_MAX`），方向是内核→用户。
+///
+/// **`recent_tail` 的整行规则在这里被继承而不是重写**：半行日志会伪装成一条
+/// 没打完的记录，所以开头/结尾的半行一律丢掉。
+///
+/// 返回 `(lines << 32) | bytes`。**0 行是成功**（环里还没有完整行）。
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_log_read(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let len = frame.rsi as usize;
+    if len == 0 {
+        return E_INVALID;
+    }
+    if len > COPY_MAX {
+        return E_TOO_LONG;
+    }
+    // 借一段内核栈缓冲（`COPY_MAX` = 4096 与环等长）。**不上堆、不 static**：
+    // 本函数是 `#[inline(never)]` 的独立帧，4 KiB 在 BSP 内核栈里是既有量的同阶
+    // （`sys_file_read` 的落盘块与它同尺寸）。
+    // **1024 而不是 COPY_MAX(4096)**：本函数的内核栈预算只有几 KiB（sched.rs 的
+    // STACK_PAGES = 4 = 16 KiB，扣掉 trap 帧与调用链），4 KiB 局部数组实测把返回
+    // 路径踩坏——用户态 log_read 返回后该任务的 con_write 全部静默失败
+    // （本轮实测：shell 正常退出码 0、dmesg 一个字都打不出来）。
+    // 1024 够 dmesg 用（环 4096，最近 1 KiB 的整行本来就够读一屏）。
+    const LOG_READ_MAX: usize = 256;
+    let mut buf = [0u8; LOG_READ_MAX];
+    let want = len.min(LOG_READ_MAX);
+    let slice = match buf.get_mut(..want) {
+        Some(s) => s,
+        None => return E_INVALID,
+    };
+    let t = crate::serial::recent_tail(slice);
+    if t.bytes == 0 {
+        return 0; // 0 行 / 0 字节：成功，环里还没有完整行
+    }
+    let Some(src) = buf.get(..t.bytes as usize) else { return E_INVALID };
+    match copy_to_user(src, frame.rdi) {
+        Ok(n) if n == src.len() => (u64::from(t.lines) << 32) | n as u64,
+        Ok(_) => E_FAULT,
+        Err(e) => ptr_err_to_ret(e),
+    }
+}
+
+// ---- PCI 枚举（ADR-136，31 号）----
+/// `PciDevV1` 的定长。字段按小端写死，用户侧 runtime 独立声明同一组偏移。
+#[cfg(feature = "handles")]
+const PCI_ENUM_LEN: usize = 32;
+/// 记录魔数（"APC1"）：用户侧先核它，再按版本解析。
+#[cfg(feature = "handles")]
+const PCI_ENUM_MAGIC: u32 = 0x3150_4341;
+
+/// 一张 PCI 枚举记录（32 字节）：bdf/vendor/device/class 三元组/hdr/bar0。
+#[cfg(feature = "handles")]
+fn pci_enum_record(d: &crate::pci::Dev) -> [u8; PCI_ENUM_LEN] {
+    let mut r = [0u8; PCI_ENUM_LEN];
+    put_u32(&mut r, 0, PCI_ENUM_MAGIC);
+    r[4] = 1; // version
+    r[5] = 1; // kind：枚举条目
+    put_u32(&mut r, 6, PCI_ENUM_LEN as u32);
+    put_u32(&mut r, 8, d.bdf);
+    put_u32(&mut r, 12, u32::from(d.vendor) | (u32::from(d.device) << 16));
+    put_u32(&mut r, 16, d.cfg08);
+    put_u32(&mut r, 20, u32::from(d.hdr));
+    put_u32(&mut r, 24, d.bar0);
+    // 28..32 保留（对齐到 32）
+    r
+}
+
+/// 31：PCI 枚举。见 [`SYS_PCI_ENUM`] 的形状说明。
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_pci_enum(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let len = frame.r10 as usize;
+    if len < PCI_ENUM_LEN || len > COPY_MAX {
+        return E_TOO_LONG;
+    }
+    if crate::sched::current_identity().is_none() {
+        return E_BAD_HANDLE;
+    }
+    let Some(info) = crate::pci::info() else { return 0 }; // PCI 还没初始化：0 台，不是错误
+    let cap = len / PCI_ENUM_LEN;
+    let cursor = frame.rsi as usize;
+    let mut n = 0usize;
+    let mut idx = cursor;
+    while n < cap && idx < info.n {
+        let Some(d) = crate::pci::dev(idx) else { idx += 1; continue };
+        let rec = pci_enum_record(&d);
+        let at = frame.rdi + (n * PCI_ENUM_LEN) as u64;
+        match copy_to_user(&rec, at) {
+            Ok(k) if k == PCI_ENUM_LEN => n += 1,
+            _ => {
+                BAD_PTRS.fetch_add(1, Ordering::Relaxed);
+                return E_FAULT;
+            }
+        }
+        idx += 1;
+    }
+    let next = if idx >= info.n { 0u64 } else { idx as u64 };
+    (next << 32) | n as u64
+}
+
+/// 32：uptime。见 [`SYS_CLOCK_UPTIME`] 的形状说明。
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_clock_uptime(_frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    match crate::clock::uptime_micros() {
+        Some(us) => us,
+        None => E_INVALID, // æ²¡éç¹/æ²¡æ å® â -1ï¼ä¸ç¼æ°å­
+    }
+}
+
+/// 33（ADR-143）：帧交给网卡。形状检查在 safe 层（长≤ 1514、指针在用户半区），不检内容——内容是协议层的事。
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_net_send(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    // 惰性 bind（幂等）：shell 会话里没有人先调 bind_net（实测 35 号回 -5）。
+    if crate::virtio::bind_net().is_err() {
+        return E_IO;
+    }
+    let len = frame.rsi as usize;
+    if len == 0 || len > crate::virtio::NET_TX_MAX {
+        return E_INVALID;
+    }
+    let mut buf = [0u8; crate::virtio::NET_TX_MAX];
+    match copy_from_user(frame.rdi, &mut buf[..len]) {
+        Ok(n) if n == len => {}
+        _ => return E_FAULT,
+    }
+    match crate::virtio::send_raw(&buf[..len]) {
+        Ok(_) => 0,
+        Err(_) => E_IO,
+    }
+}
+
+/// 34（ADR-143）：有界等一帧。超时回 0，收到回字节数（帧从 eth 头起，与 pcap 同形）。
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_net_recv(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    if crate::virtio::bind_net().is_err() {
+        return E_IO;
+    }
+    let cap = frame.rsi as usize;
+    if cap == 0 || cap > 2048 { return E_INVALID; }
+    let ms = frame.rdx;
+    if ms > 60_000 { return E_INVALID; }
+    match crate::virtio::receive(ms) {
+        Ok((data, n, uidx, ulen, uid)) => {
+            let n = n.min(cap).min(data.len());
+            match copy_to_user(&data[..n], frame.rdi) {
+                Ok(w) => w as u64,
+                Err(_) => E_FAULT,
+            }
+        }
+        Err(_) => 0, // 超时
+    }
+}
+
+/// 35（ADR-143，ADR-144 扩到 24 字节）：网卡读数写回用户。
+///
+/// 布局（小端，24 字节定长）：`MAC6 | 本机IP4 | 网关4 | DNS4 | mtu2 | link2`。
+/// `mtu`/`link` 是 `net_info()` 的原始读数（`ip link` 要打它们）——
+/// **不猜默认值**：设备说多少就是多少，读不到时 handler 直接返回错误而不是填 0。
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_net_info(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    if let Err(e) = crate::virtio::bind_net() {
+        crate::log_info!("net-info: bind 失败 {:?}", e);
+        return E_IO;
+    }
+    let Some(v) = crate::virtio::net_info() else { return E_BAD_HANDLE };
+    let mut blk = [0u8; 24];
+    blk[0..6].copy_from_slice(&v.mac);
+    blk[6..10].copy_from_slice(&crate::virtio::DHCP_GUEST_IP);
+    blk[10..14].copy_from_slice(&crate::virtio::NET_GATEWAY_IP);
+    blk[14..18].copy_from_slice(&crate::virtio::NET_DNS_IP);
+    blk[18..20].copy_from_slice(&v.mtu.to_le_bytes());
+    blk[20..22].copy_from_slice(&v.link.to_le_bytes());
+    // 22..24 预留（保持 8 字节对齐的读数块）
+    match copy_to_user(&blk, frame.rdi) {
+        Ok(w) => w as u64,
+        Err(_) => E_FAULT,
+    }
 }
 
 /// 键盘字符的读取入口。拆成小函数是为了让上面那条 `or_else` 在没开 `ps2-kbd` 时
@@ -2510,6 +2748,20 @@ pub fn syscall_dispatch(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> boo
         #[cfg(feature = "handles")]
         SYS_PROCESS_KILL => sys_process_kill(frame),
         #[cfg(feature = "handles")]
+        SYS_PROC_KILL_BY_PID => sys_proc_kill_by_pid(frame),
+        #[cfg(feature = "handles")]
+        SYS_LOG_READ => sys_log_read(frame),
+        #[cfg(feature = "handles")]
+        SYS_PCI_ENUM => sys_pci_enum(frame),
+        #[cfg(feature = "handles")]
+        SYS_CLOCK_UPTIME => sys_clock_uptime(frame),
+        #[cfg(feature = "handles")]
+        SYS_NET_SEND => sys_net_send(frame),
+        #[cfg(feature = "handles")]
+        SYS_NET_RECV => sys_net_recv(frame),
+        #[cfg(feature = "handles")]
+        SYS_NET_INFO => sys_net_info(frame),
+        #[cfg(feature = "handles")]
         SYS_CONSOLE_WRITE => sys_console_io(frame, true),
         #[cfg(feature = "handles")]
         SYS_CONSOLE_READ => sys_console_io(frame, false),
@@ -3008,7 +3260,7 @@ pub fn load(bytes: &[u8]) -> Result<Loaded, LoadError> {
     }
     let stack_va = swin.0 + mm::PAGE as u64;
     let sf = mm::phys_alloc(0, MOD_USER).map_err(LoadError::Mm)?;
-    // SAFETY: 同 `init()` 里那条——HHDM 别名、恰好一页、还没有别的主人
+    // SAFETY: å `init()` éé£æ¡ââHHDM å«åãæ°å¥½ä¸é¡µãè¿æ²¡æå«çä¸»äºº
     unsafe { core::ptr::write_volatile(sf.base().via_hhdm().0 as *mut u64, 0) };
     let m = mm::map(VirtAddr(stack_va), sf, PageFlags::USER_RW).map_err(LoadError::Mm)?;
     owned.push(m).map_err(LoadError::Mm)?;
@@ -3112,19 +3364,31 @@ pub fn load_into(aslot: u8, bytes: &[u8]) -> Result<Loaded, LoadError> {
         }
     }
 
-    // 用户栈：动态区第一段的第二页（第一页当 guard，永不映射）。
-    let stack_va = mm::USER_MMAP_BASE + mm::PAGE as u64;
-    let sf = mm::phys_alloc(0, MOD_USER).map_err(LoadError::Mm)?;
-    // SAFETY: HHDM 别名、恰好一页、还没有别的主人（与 load() 里那条同形状）。
-    unsafe { core::ptr::write_volatile(sf.base().via_hhdm().0 as *mut u64, 0) };
-    let m = mm::aspace_map_slot(aslot, &[sf.base().0 / mm::PAGE as u64], VirtAddr(stack_va), PageFlags::USER_RW, MOD_USER)
+    // 用户栈：动态区第一段起 3 页数据 + guard（第一页永不映射）。
+    // **从 1 页涨到 3 页**（ADR-137 续实测）：shell 43.9 KB 后
+    // `dispatch → cmd_run → elf::parse` 的帧深把一页栈穿出
+    // （rip/cr2=0x100103000 栈区取指，err=0x15）——与 load() 同一轮的事故。
+    // aspace_map_slot 逐页映射；guard 页永远不映射，判据形状不变。
+    let stack_va = mm::USER_MMAP_BASE + 7 * mm::PAGE as u64;
+    // **æ ä¸æ¬¡ååé + ä¸æ¬¡ AsMap**ï¼adopt_asmaps çé¢æ£æ¯
+    // child.owned.count() + n > MAX_OWNED(16)ï¼æ æåé¡µæ¡ç®æä¸é â 16 å·å -6ï¼ã
+    let stack_frames = mm::phys_alloc(3, MOD_USER).map_err(LoadError::Mm)?;
+    // SAFETY: HHDM å«åï¼æ°å¥½ 8 é¡µãæ²¡æå«çä¸»äººï¼phys_alloc ååï¼ã
+    // æ¸é¶æ´åï¼æ ä¸ä¸è½çå«çä»»å¡çæ®å­ï¼;è¿æ¯ååé¡µå¾ªç¯é write_volatile æ¸é¶çæ¿ä»£ã
+    unsafe { core::ptr::write_bytes(stack_frames.base().via_hhdm().0 as *mut u8, 0, 8 * mm::PAGE) };
+    let mut pas: [u64; 8] = [0; 8];
+    for j in 0..7u64 {
+        pas[j as usize] = stack_frames.base().0 / mm::PAGE as u64 + j;
+    }
+    let m = mm::aspace_map_slot(aslot, &pas[..7],
+        VirtAddr(stack_va - 6 * mm::PAGE as u64), PageFlags::USER_RW, MOD_USER)
         .map_err(LoadError::Mm)?;
     owned.push_asmap(m).map_err(LoadError::Mm)?;
 
     Ok(Loaded {
         entry: p.entry,
         data_va,
-        stack_top: stack_va + mm::PAGE as u64 - 16,
+        stack_top: stack_va - 16,
         segs: p.n,
         pages: image_pages,
         image_lo,

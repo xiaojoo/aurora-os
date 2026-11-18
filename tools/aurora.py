@@ -3855,7 +3855,8 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
         ]
     # 一次性实验用的附加参数（例如 `-device intel-iommu,intremap=on` 去真正解析 DMAR）。
     # 走环境变量而不是加一堆子命令开关：这类实验今天要做、明天可能就废，不该进判定链的默认路径。
-    if NET_FEATURES & set(features):
+    # ADR-143ï¼ç½å¡è®¾å¤**æ æ¡ä»¶æç» QEMU**ï¼ä¹ååªæ virtio-net æ¡£æãå®æµ a3-shell æ¡£ç ping æ¾ä¸å°è®¾å¤ â NoDeviceï¼ãè®¾å¤å¨ä½æ²¡äºº claim å¯¹å¶å®æ¡£æ å®³ã
+    if NET_FEATURES & set(features) or "a3-shell" in set(features):
         # 抓包文件每次重开：上一跑的包会被读成这一跑发出去的（实测那类"旧证据冒充新事实"
         # 在 scratch 夹具上已经栽过一次，这里不重复）
         PCAP.unlink(missing_ok=True)
@@ -5904,6 +5905,40 @@ PKG_VERDICT_RE = re.compile(
     r"pkg: 判据 读满=(\w+) 头自洽=(\w+) 验签=(\w+) 载荷同=(\w+) 篡改全拒=(\d+)/(\d+) AHCI照常=(\w+) 覆盖=([^\r\n]*)")
 
 
+def check_pkg_manifest() -> list[str]:
+    """C2 第一刀（ADR-138）：**包清单**与盘上签名包的双向对账。
+
+    `tools/pkg_manifest.py verify` 做四件事：
+      ① 从测试镜像的包区读出签名包（魔数/版本/覆盖名/载荷长）；
+      ② 载荷 SHA-256 与 `kernel/fixtures/hello.elf` 对账（同一份东西的两个来源）；
+      ③ 覆盖名/锚点与 `esp_image.py` 的期望对账（esp_image 自己就是包的产地）；
+      ④ 签名复算（Lamport 逐比特）必须过。
+
+    清单 JSON 缺失时自动生成；不一致 ⇒ 门禁红。变异证红：用 --tamper 把盘上
+    包的覆盖名翻一字节 ⇒ ②/③ 红还原绿（宿主机侧注入，与 S3 同形状）。
+    """
+    script = ROOT / "tools" / "pkg_manifest.py"
+    if not script.exists():
+        return [f"缺少 {script}"]
+    img = ROOT / "build" / "aurora.img"
+    if not img.exists():
+        # 镜像由 `build`/`image` 生成；check 在 build 之前跑时没有镜像可读——
+        # 此时清单不存在就生成期望清单（与 esp_image 常量同源），存在就只校验 JSON 形状。
+        json_path = ROOT / "docs" / "pkg" / "manifest.json"
+        r = subprocess.run([sys.executable, str(script), "expect",
+                            "--out", str(json_path)], capture_output=True, text=True,
+                           env=env(), cwd=ROOT)
+        if r.returncode != 0:
+            return [f"expect 生成失败：{r.stdout} {r.stderr}"]
+        return []
+    r = subprocess.run([sys.executable, str(script), "verify",
+                        "--img", str(img)], capture_output=True, text=True,
+                       env=env(), cwd=ROOT)
+    if r.returncode != 0:
+        return [f"verify 失败：{r.stdout} {r.stderr}"]
+    return []
+
+
 def check_sig_package(log: str) -> list[str]:
     """盘上那份签名包：宿主机用自己的实现把它读一遍、验一遍、再按同一批篡改各验一遍。
 
@@ -7047,6 +7082,7 @@ def do_check(elf: Path | None) -> int:
         "check-net-pattern": lambda: check_net_pattern(),
         "check-sha-primitives": lambda: check_sha_primitives(),
         "check-sig-anchor": lambda: check_sig_anchor(),
+        "check-pkg-manifest": lambda: check_pkg_manifest(),
         "check-sbom": lambda: check_sbom(),
         "check-matrix-wiring": lambda: check_matrix_wiring(),
         "check-verdict": lambda: check_verdict_contract(),
@@ -7838,6 +7874,195 @@ def check_gpt(log: str) -> list[str]:
         bad.append(f"点名负样本={mn.group(1)}/{mn.group(2)}（必须全中且分母非零，否则那批闸是空转）")
     return bad
 
+def _lspci_rows(log: str) -> bool:
+    """`lspci` 的输出必须是「bus dev func vendor device class」行（ADR-136）。
+
+    结构性判据：回显 `lspci` 之后的首个非空行必须是**六个十进制数字**，
+    且至少再跟一行同样形状（本档 PCI 表 >= 2 台）。不依赖具体 vendor/device
+    值，换 QEMU 机型也成立；更不依赖十六进制格式（shell 只有十进制打印）。
+    """
+    import re
+    row = re.compile(r"^(\d+ \d+ \d+ \d+ \d+ \d+)$")
+    lines = log.split("\n")
+    for i, ln in enumerate(lines):
+        if ln.strip() != "lspci":
+            continue
+        body = [x.strip() for x in lines[i + 1 : i + 9] if x.strip()]
+        if not body:
+            continue
+        if row.match(body[0]) and len(body) >= 2 and row.match(body[1]):
+            return True
+    return False
+
+
+def _ip_rows(log: str) -> bool:
+    """`ip link` / `ip addr` çæ¾ç¤ºå±å¤æ®ï¼ADR-144ï¼ã
+
+    ä¸¤æ¡å½ä»¤åèªè¦ä¸è¡ä¸¥æ ¼å½¢ç¶ï¼
+      `link mac <6 ç» 2 ä½åå­è¿å¶ç¨ : åé> mtu=<digits> state=(up|down)`
+      `addr <a.b.c.d> gw <a.b.c.d> dns <a.b.c.d>`
+    ä¸ä¾èµå·ä½æ°å¼ï¼MAC/mtu/IP é½æ¯ç¯å¢çäºå®ï¼ã
+    """
+    import re
+    lines = log.split("\n")
+    link_ok = False
+    addr_ok = False
+    for k, ln in enumerate(lines):
+        if ln.strip() == "ip link":
+            for j in range(k + 1, min(k + 4, len(lines))):
+                s = lines[j].strip()
+                if re.match(r"link mac ([0-9a-f]{2}:){5}[0-9a-f]{2} mtu=\d+ state=(up|down)$", s):
+                    link_ok = True
+                    break
+        if ln.strip() == "ip addr":
+            for j in range(k + 1, min(k + 4, len(lines))):
+                s = lines[j].strip()
+                octet = r"(?:25[0-5]|2[0-4]\d|1?\d?\d)"
+                pat = r"addr " + octet + r"(?:\." + octet + r"){3} gw " + octet + r"(?:\." + octet + r"){3} dns " + octet + r"(?:\." + octet + r"){3}$"
+                if re.match(pat, s):
+                    addr_ok = True
+                    break
+    return link_ok and addr_ok
+
+
+def _ping_row(log: str) -> bool:
+    """`ping 10.0.2.2` ççå¾è¿å¤æ®ï¼ADR-143ï¼ã
+
+    åæ¾ `ping 10.0.2.2` ä¹åï¼å¿é¡»åºç° `from 10.0.2.2: seq=<æ°>`
+    ï¼è¯´æ echo reply ççåæ¥äºï¼ãusage ä¸ `timeout` é½ä¸ç®éã
+    """
+    import re
+    lines = log.split("\n")
+    for k, ln in enumerate(lines):
+        if ln.strip() != "ping 10.0.2.2":
+            continue
+        for j in range(k + 1, min(k + 6, len(lines))):
+            if re.match(r"from 10\.0\.2\.2: seq=\d+$", lines[j].strip()):
+                return True
+    return False
+
+
+def _top_sleep_gap(log: str) -> bool:
+    """`top 2` 的帧间睡眠必须真阻塞（ADR-133 的欠账，§401 修）。
+
+    argv 形状 `... top 2; uptime`：top 2 打两帧（帧间睡 1 s），随后 uptime。
+    取全部 uptime 读数，存在一对差值 ∈ [1.0s, 3.1s] 且日志里 `frame 1` 出现在
+    这一对**之间**（即 top 的第二帧在两个读数之间打印过）⇒ 帧间真睡了。
+    变异证红：睡眠句柄改回 SELF_THREAD ⇒ top 忙转连打 ⇒ 差值 < 1 s ⇒ 红。
+    """
+    import re
+    lines = log.split("\n")
+    vals = []
+    for k, ln in enumerate(lines):
+        if ln.strip() != "uptime":
+            continue
+        body = next((x.strip() for x in lines[k + 1 : k + 4] if x.strip()), "")
+        if re.fullmatch(r"\d+", body):
+            vals.append((int(body), k))
+    frame1_lines = [k for k, ln in enumerate(lines) if ln.strip() == "frame 1"]
+    for (a, ka), (b2, kb) in zip(vals, vals[1:]):
+        if not (1_000_000 <= b2 - a <= 3_100_000):
+            continue
+        if any(ka < f < kb for f in frame1_lines):
+            return True
+    return False
+
+
+def _sleep_gap(log: str) -> bool:
+    """`sleep <ms>` 的真阻塞必须由两个 uptime 读数对账（ADR-137 续）。
+
+    argv 形状 `uptime; sleep 1100; uptime`：取全部 uptime 读数，若存在相邻一对
+    差值落在 [1100000, 1100000 + 2_000_000] µs（1.1 s 到 3.1 s）⇒ 睡真了。
+    下界挡"没睡/睡太短"；上界挡"死循环误判"（窗口超时的 HANG 是另一个判定值）。
+    不依赖具体读数。
+    """
+    import re
+    lines = log.split("\n")
+    vals = []
+    for k, ln in enumerate(lines):
+        if ln.strip() != "uptime":
+            continue
+        body = next((x.strip() for x in lines[k + 1 : k + 4] if x.strip()), "")
+        if re.fullmatch(r"\d+", body):
+            vals.append(int(body))
+    for a, b2 in zip(vals, vals[1:]):
+        if 1_100_000 <= b2 - a <= 3_100_000:
+            return True
+    return False
+
+
+def _uptime_row(log: str) -> bool:
+    """`uptime` 的输出必须是「纯十进制正数」（ADR-137）。
+
+    回显 `uptime` 之后的首个非空行必须是纯十进制数字且 > 0。打 `-1`（内核没锚点/
+    没标定）或任何非数字 ⇒ 红。不依赖具体数值。
+    """
+    import re
+    lines = log.split("\n")
+    for i, ln in enumerate(lines):
+        if ln.strip() != "uptime":
+            continue
+        body = next((x.strip() for x in lines[i + 1 : i + 4] if x.strip()), "")
+        if re.fullmatch(r"\d+", body) and int(body) > 0:
+            return True
+    return False
+
+
+def _dmesg_repeats(log: str) -> bool:
+    """`dmesg` 的输出必须是内核日志的**重复**（ADR-135）。
+
+    为什么用"重复"当判据：`dmesg` 打出来的就是内核自己打过的那些行，所以只要它
+    工作，串口里必然出现**同一行的第二次**。这比"有输出"强——后者会被紧随其后的
+    内核日志冒充（本片实测踩过：一度以为 dmesg 不出，其实是它的输出与内核日志
+    长得一样、被肉眼当成内核自己打的）。也不依赖具体日志文本或行号。
+
+    形状：`dmesg: tail` 之后的第一行，必须在它**之前**的日志里已经出现过一次。
+    """
+    lines = log.split("\n")
+    for i, ln in enumerate(lines):
+        if ln.strip() != "dmesg: tail":
+            continue
+        body = ""
+        for cand in lines[i + 1 : i + 4]:
+            if cand.strip():
+                body = cand
+                break
+        if not body:
+            continue
+        # 该行必须在表头**之前**出现过（= 内核原来打的那一次）
+        if body in lines[:i]:
+            return True
+    return False
+
+
+
+
+def _top_pages_nondecreasing(log: str) -> bool:
+    """ADR-133 `top` 的排序对账：把串口里每个 `frame N` 快照的表行抽出来，
+    逐帧核 pages 列**非升**（pages 降序，同 pages 时按 pid 升序 ⇒ 同值行序稳定）。
+    行形状与内核打印严格同构：五列单空格分隔、第五列是十进制页数。解析不出
+    每帧至少一行 ⇒ 判不成立（空表也该报出来，不是静默绿）。"""
+    ok_any = False
+    # 每个 frame 块：frame N 之后到下一个 frame/日志行为止的表行。
+    frames = re.split(r"frame \d+\n", log)[1:]
+    for body in frames:
+        rows = []
+        for ln in body.splitlines():
+            m = re.match(r"^(\d+) (\d+) (\d+) (live|dead) (\d+)$", ln)
+            if m:
+                rows.append((int(m.group(1)), int(m.group(5))))  # (pid, pages)
+            elif rows:
+                break  # 表行后面是别的输出，这一帧抽完了
+        if not rows:
+            return False
+        for a, b in zip(rows, rows[1:]):
+            if b[1] > a[1]:          # 后一行 pages 更大 ⇒ 违反降序
+                return False
+            if b[1] == a[1] and b[0] < a[0]:  # 同 pages 时 pid 必须升
+                return False
+        ok_any = True
+    return ok_any
+
 
 def do_test(timeout: int) -> int:
     """正向必须 33、负样本必须 35。只跑正向的话，永远分不清“代码没问题”
@@ -8511,7 +8736,8 @@ def do_test(timeout: int) -> int:
     print("=== A3 验收：shell 执行 argv 里的外部命令（--features a3-shell）===")
     IMAGE.unlink(missing_ok=True)
     ashv, ashrc, ashlog = do_run(["a3-shell", "fat32-probe"], timeout)
-    # `;` 分隔五条：外部命令（A3）+ ls/cat（26/22+24）+ ps/free（A4 的 27 号）。
+    # `;` 分隔：外部命令（A3）+ ls/cat（26/22+24）+ ps/free（A4 的 27 号）+ top 2 / kill /
+    # lspci / uptime / sleep / ping / ip / dmesg（ADR-133…144）——合并后一条 argv 覆盖全部。
     # ls 与 cat 的期望值由宿主机**独立解析卷A**得到（第二台仪器）：三个名字/大小，
     # 以及 NOTES 的 FNV-1a 64——与 shell 在串口上打的那条尾巴必须同数。
     _a_vol = __import__("zlib").decompress(FAT_ZZ["fat32-small"].read_bytes())
@@ -8524,12 +8750,58 @@ def do_test(timeout: int) -> int:
         "PID GEN THR ST PAGES" in ashlog,   # ps 的表头
         "live " in ashlog,                  # ps 至少一行活进程（含页数）
         "free: procs=" in ashlog,           # free 的聚合读数
+        # ---- top（ADR-133）三格 ----
+        "top 2" in ashlog,                  # argv 确实把 top 带进来了
+        # 两帧快照都在（"定期刷新"的最低语义：frame 0 + frame 1）
+        re.search(r"frame 0\nPID GEN THR ST PAGES", ashlog) is not None,
+        re.search(r"frame 1\nPID GEN THR ST PAGES", ashlog) is not None,
+        # 排序口径：每帧的 pages 列必须**非升**（pages 降序，并列按 pid 升序，
+        # pid 升序 ⇒ 同 pages 时行序稳定）。负样本：把 top_cmp 翻转 ⇒ 这格红。
+        _top_pages_nondecreasing(ashlog),
+        # kill（ADR-134）：argv 末尾 `kill 9999`（必不存在的 pid）⇒ 29 号按
+        # 调用者名下的 Proc 句柄反查不到 ⇒ -5。这验 kill 命令接线 + capability
+        # 语义；真正"能杀"由内核侧 t_proc_kill 的按 pid 杀那格覆盖。
+        re.search(r"kill 9999\n-5\n", ashlog) is not None,
+        # dmesg（ADR-135）：表头之后必须紧跟内核日志的**重复**内容。
+        # 判据用"重复"而不是"有输出"：dmesg 打出来的就是内核自己打过的那些行，
+        # 所以只要它工作，串口里必然出现同一行的第二次。这一格不依赖任何
+        # 具体日志文本，也不依赖 dmesg 打到第几行。
+        _dmesg_repeats(ashlog),
+        # lspci（ADR-136）：回显后必须是「bus dev func vendor device class」六数字行，
+        # 且至少两行（本档 PCI 表 ≥ 2 台；单台判据退化为首行数字行本身）。
+        # 结构性判据：不依赖任何具体 vendor/device 值，换 QEMU 机型也成立。
+        _lspci_rows(ashlog),
+        # uptime（ADR-137）：回显后首行必须是**纯十进制正数**（微秒）。
+        # 不依赖具体数值（不同机器/时长都成立）；打 -1（内核没锚点/没标定）
+        # 或非数字 ⇒ 这格红。
+        _uptime_row(ashlog),
+        # sleep（ADR-137 续）：argv 里 `uptime; sleep 1100; uptime`——两个读数之差
+        # 必须 ≥ 1100000 µs（sleep 真阻塞的第二台仪器 = 32 号自己的读数）。
+        # 上界给余量（sleep 不会精确等于 1100 ms，调度+syscall 开销都算进去），
+        # 也不依赖具体数值——"睡了至少 1.1 秒"对任何机器都成立。
+        _sleep_gap(ashlog),
+        # top 的帧间睡眠真阻塞（§401 修的既有欠账）：argv 形状 `top 2; uptime`——
+        # top 2 的第二帧与收尾 uptime 之间隔着 1 s 的睡眠。取 uptime 读数对：
+        # 存在一对差值 ∈ [1.0s, 3.1s] 且中间隔着 top 的第二帧（frame 1 表头）⇒ 真睡。
+        # 变异证红：睡眠句柄改回 SELF_THREAD（-4 ⇒ 忙转连打）⇒ 红（已做）。
+        # §402 曾因"12 条 argv 早停"暂撤本格；§403 复跑证实那次是宿主机抖动
+        # （同内核同 argv 单跑全 12 条执行完、15.1s），格子接回。
+        _top_sleep_gap(ashlog),
+        # pingï¼ADR-143ï¼ï¼argv é `ping 10.0.2.2`
+        # å¤æ®å½¢ç¶ï¼åæ¾ä¹åå¿é¡»åºç°ä¸è¡ `from 10.0.2.2: seq=æ°`
+        # ï¼ç ICMP å¾è¿çè¯»æ°ï¼ï¼usage/è¶æ¶é½ä¸ç®éã
+        _ping_row(ashlog),
+        # ip link / ip addrï¼ADR-144ï¼ï¼35 å·è¯»æ°çæ¾ç¤ºå±
+        # å¤æ®å½¢ç¶ï¼`link mac <MAC> mtu=<æ°> state=<up|down>` ä¸
+        # `addr <a.b.c.d> gw <a.b.c.d> dns <a.b.c.d>`ââä¸ä¾èµå·ä½æ°å¼ã
+        _ip_rows(ashlog),
+
+        # ---- ls / cat（2026-11-18）----
         "ls: /" in ashlog,
         f"ls: {len(_a_root)} entries" in ashlog,
         all(ln in ashlog for ln in _ls_lines),
         "cat: /NOTES" in ashlog,
-        f"cat: {_a_root['NOTES']['size']} bytes= fnv={_a_root['NOTES']['fnv']}" in ashlog,
-    ))
+        f"cat: {_a_root['NOTES']['size']} bytes= fnv={_a_root['NOTES']['fnv']}" in ashlog,    ))
     _tot = EXEC_TOTAL_RE.search(ashlog)
     if not _tot or int(_tot.group(1)) < 1 or int(_tot.group(2)) != 0:
         ash_ok = False
