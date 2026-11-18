@@ -66,6 +66,7 @@ def read_pkg(img_path: Path) -> dict:
         "sig_bytes": sig_len,
         "signature_ok": ok,
         "signature_reason": reason,
+        "depends": [],
     }
 
 
@@ -85,6 +86,7 @@ def expected() -> dict:
         "sig_bytes": esp_image.SIG_BYTES,
         "signature_ok": True,
         "signature_reason": "ok",
+        "depends": [],
     }
 
 

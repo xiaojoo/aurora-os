@@ -1,6 +1,7 @@
 {
   "anchor_sha256": "7a085e9cf4821e139e7cc4191b0dbfc9444f68200a1f4a747ae44f830135b46d",
   "covers": "/HELLO.ELF",
+  "depends": [],
   "magic": "PKGA",
   "payload_len": 17288,
   "payload_sha256": "8e3972a8a788b2d6e8c96aac46d5c522fe9a00d513e42db0b32fad53cd09e447",
