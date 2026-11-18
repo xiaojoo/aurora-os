@@ -604,20 +604,20 @@ fn sys_process_create(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     }
     let pid = match crate::proc::proc_create(job) {
         Ok(p) => p,
-        Err(_) => return E_EXHAUSTED,
+        Err(_) => { crate::log_info!("11: proc_create Exhausted"); return E_EXHAUSTED; }
     };
     let pgen = crate::proc::proc_gen(pid).unwrap_or(0);
     let (aslot, agen) = match crate::mm::aspace_new_kernel() {
         Some(v) => v,
         None => {
             let _ = crate::proc::proc_discard(pid);
-            return E_EXHAUSTED;
+            crate::log_info!("11: aspace_new Exhausted"); return E_EXHAUSTED;
         }
     };
     if crate::proc::proc_set_aspace(pid, aslot, agen).is_err() {
         crate::mm::aspace_destroy(aslot);
         let _ = crate::proc::proc_discard(pid);
-        return E_EXHAUSTED;
+        crate::log_info!("11: set_aspace fail Exhausted"); return E_EXHAUSTED;
     }
     let rights = crate::handle::RIGHT_READ | crate::handle::RIGHT_WRITE | crate::handle::RIGHT_MAP
         | crate::handle::RIGHT_DUP | crate::handle::RIGHT_TRANSFER;
@@ -3079,15 +3079,20 @@ pub fn load_into(aslot: u8, bytes: &[u8]) -> Result<Loaded, LoadError> {
     // （rip/cr2=0x100103000 栈区取指，err=0x15）——与 load() 同一轮的事故。
     // aspace_map_slot 逐页映射；guard 页永远不映射，判据形状不变。
     let stack_va = mm::USER_MMAP_BASE + 7 * mm::PAGE as u64;
-    for k in (0..7u64).rev() {
-        let sf = mm::phys_alloc(0, MOD_USER).map_err(LoadError::Mm)?;
-        // SAFETY: HHDM 别名、恰好一页、还没有别的主人（与 load() 里那条同形状）。
-        unsafe { core::ptr::write_volatile(sf.base().via_hhdm().0 as *mut u64, 0) };
-        let m = mm::aspace_map_slot(aslot, &[sf.base().0 / mm::PAGE as u64],
-            VirtAddr(stack_va - k * mm::PAGE as u64), PageFlags::USER_RW, MOD_USER)
-            .map_err(LoadError::Mm)?;
-        owned.push_asmap(m).map_err(LoadError::Mm)?;
+    // **æ ä¸æ¬¡ååé + ä¸æ¬¡ AsMap**ï¼adopt_asmaps çé¢æ£æ¯
+    // child.owned.count() + n > MAX_OWNED(16)ï¼æ æåé¡µæ¡ç®æä¸é â 16 å·å -6ï¼ã
+    let stack_frames = mm::phys_alloc(3, MOD_USER).map_err(LoadError::Mm)?;
+    // SAFETY: HHDM å«åï¼æ°å¥½ 8 é¡µãæ²¡æå«çä¸»äººï¼phys_alloc ååï¼ã
+    // æ¸é¶æ´åï¼æ ä¸ä¸è½çå«çä»»å¡çæ®å­ï¼;è¿æ¯ååé¡µå¾ªç¯é write_volatile æ¸é¶çæ¿ä»£ã
+    unsafe { core::ptr::write_bytes(stack_frames.base().via_hhdm().0 as *mut u8, 0, 8 * mm::PAGE) };
+    let mut pas: [u64; 8] = [0; 8];
+    for j in 0..7u64 {
+        pas[j as usize] = stack_frames.base().0 / mm::PAGE as u64 + j;
     }
+    let m = mm::aspace_map_slot(aslot, &pas[..7],
+        VirtAddr(stack_va - 6 * mm::PAGE as u64), PageFlags::USER_RW, MOD_USER)
+        .map_err(LoadError::Mm)?;
+    owned.push_asmap(m).map_err(LoadError::Mm)?;
 
     Ok(Loaded {
         entry: p.entry,

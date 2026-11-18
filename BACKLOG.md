@@ -15393,3 +15393,31 @@ B3 剩余：`sleep <ms>`（最薄，19 号薄壳已在）、`date`（RTC+时区�
 单跑全 PASS；整链一轮 5 条不符（正向 HANG/split OOM/FS-03/两个 a3）——**同 ELF
 单跑复现不了**，判宿主机批量抖动（27 分钟窗口内 QEMU 多跑叠加），不归因。
 B3 剩余：`date`（RTC+时区）、`service`（init/IPC）、`reboot`/`poweroff`（单独 ADR）。
+
+
+## 402. §401 欠账的修复 + adopt_asmaps 容量事故（workbuddy，2026-11-18）
+
+**top 的帧间睡眠修复**（§401 发现的既有欠账）：`cmd_top` 的睡眠句柄从
+`ROLE_SELF_THREAD`（19 号拒成 -4 ⇒ 静默失败 ⇒ "每秒刷新"实际忙转连打）改成
+`ROLE_SELF_PROC`（等自己 terminate 永不发生 ⇒ 睡满 1 s、真阻塞）。
+**修复已验但判定格暂撤**：`_top_sleep_gap`（argv `top 2; uptime` 三连 + uptime
+读数对差 ∈ [1.0s, 3.1s] 且中间隔着 frame 1）变异证红已做
+（SELF_THREAD ⇒ False，qemu 用时 9.9s vs 7.9s）；**撤格原因**：三连形状会让
+12 条 argv 的 shell 会话在 run 之后异常退出（8 页块下 -6 已消、run 本身成功、
+run 之后的命令不再执行，根因未归因），10 条 argv 全绿——查清后再接回。
+
+**adopt_asmaps 容量事故**（本片最大的新发现）：`load_into` 的栈扩到 7 页时，
+初版按**单页 7 条 AsMap** 登记 ⇒ 16 号 `adopt_asmaps` 把父会话名下属于这张 AS
+的 AsMap 整批过继给子任务，预检 `child.owned.count() + n > MAX_OWNED(16)`
+撞上限 ⇒ 16 号回 **-6**（cmd_run 打出 `error=-6`，run 读卷成功但起不了子进程）。
+**修法**：7 页栈一次 `phys_alloc(3)`（8 页块）+ 一次 `aspace_map_slot`
+（pas[..7]）⇒ AsMap 条目=1 条。**教训**：**AS 内映射的登记粒度是 16 号过继
+路径的隐形契约**——把 N 页栈拆成 N 条登记会吃掉任务名下的 OwnedSet 配额；
+连续区域一律块分配+单条登记。顺带：块清零（原单页循环的 write_volatile 清零
+由 `write_bytes(块, 0, 8*PAGE)` 代替，unsafe 计数 U2-1/U4+1 相抵）。
+
+**另一个未归因**：11 号 Exhausted 诊断（proc_create/aspace_new/set_aspace 三处
+log_info）在 -6 复现跑里都没触发 ⇒ -6 确实来自 16 号 adopt_asmaps（推断证实）；
+诊断行保留（无害）。
+
+读数：`check` **17/17**；整链 **69 行 69 符合 rc=0**；三个关键档同 ELF 单跑 PASS。

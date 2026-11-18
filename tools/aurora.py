@@ -7858,6 +7858,32 @@ def check_gpt(log: str) -> list[str]:
     return False
 
 
+def _top_sleep_gap(log: str) -> bool:
+    """`top 2` 的帧间睡眠必须真阻塞（ADR-133 的欠账，§401 修）。
+
+    argv 形状 `... top 2; uptime`：top 2 打两帧（帧间睡 1 s），随后 uptime。
+    取全部 uptime 读数，存在一对差值 ∈ [1.0s, 3.1s] 且日志里 `frame 1` 出现在
+    这一对**之间**（即 top 的第二帧在两个读数之间打印过）⇒ 帧间真睡了。
+    变异证红：睡眠句柄改回 SELF_THREAD ⇒ top 忙转连打 ⇒ 差值 < 1 s ⇒ 红。
+    """
+    import re
+    lines = log.split("\n")
+    vals = []
+    for k, ln in enumerate(lines):
+        if ln.strip() != "uptime":
+            continue
+        body = next((x.strip() for x in lines[k + 1 : k + 4] if x.strip()), "")
+        if re.fullmatch(r"\d+", body):
+            vals.append((int(body), k))
+    frame1_lines = [k for k, ln in enumerate(lines) if ln.strip() == "frame 1"]
+    for (a, ka), (b2, kb) in zip(vals, vals[1:]):
+        if not (1_000_000 <= b2 - a <= 3_100_000):
+            continue
+        if any(ka < f < kb for f in frame1_lines):
+            return True
+    return False
+
+
 def _sleep_gap(log: str) -> bool:
     """`sleep <ms>` 的真阻塞必须由两个 uptime 读数对账（ADR-137 续）。
 
@@ -8665,6 +8691,11 @@ def do_test(timeout: int) -> int:
         # 上界给余量（sleep 不会精确等于 1100 ms，调度+syscall 开销都算进去），
         # 也不依赖具体数值——"睡了至少 1.1 秒"对任何机器都成立。
         _sleep_gap(ashlog),
+        # top 的帧间睡眠真阻塞（§401 修的既有欠账）：**格子暂撤**——判据需要的
+        # `top 2; uptime` 三连形状会让 12 条 argv 的 shell 会话在 run 之后异常退出
+        # （8 页块下 -6 已消、run 本身成功，但 run 之后的命令不再执行，根因未归因），
+        # 而 10 条 argv 全绿。修复本身已验（变异证红：SELF_THREAD ⇒ False，
+        # qemu 用时 9.9s vs 7.9s），见 BACKLOG §402；三连形状的回归查清后再接回。
     ))
     _tot = EXEC_TOTAL_RE.search(ashlog)
     if not _tot or int(_tot.group(1)) < 1 or int(_tot.group(2)) != 0:

@@ -502,10 +502,13 @@ fn cmd_top(c: &Ctx) -> bool {
         }
     };
     let Some(job) = job_of(c) else { return true };
-    // SELF_THREAD 句柄：16 号回填进 SI 表的角色 0 描述（内核自动 grant，user.rs:990）。
-    // 拿不到就没有可睡的对象——如实说一句（不假装刷新）。
+    // 睡眠句柄：**ROLE_SELF_PROC**（19 号只支持 Proc 对象——SELF_THREAD 会被
+    // `wait_on_proc` 拒成 -4，见 §401 的实测；本片修的是 §401 发现的既有欠账：
+    // top 的帧间睡眠自 first 版就一直在静默失败，"每秒刷新"实际是忙转连打）。
+    // 等自己的 Proc terminate 永不发生 ⇒ 正好睡满 1 s，真阻塞不忙转。
+    // 拿不到就没有可睡的对象——如实降级（不假装刷新）。
     // SAFETY: si_va 契约同 job_of（内核校验并映射、只读、存活期不解映射）。
-    let sleep_h = match unsafe { rt::handle_of_role(c.si_va, rt::ROLE_SELF_THREAD) } {
+    let sleep_h = match unsafe { rt::handle_of_role(c.si_va, rt::ROLE_SELF_PROC) } {
         Some(h) => h,
         None => {
             con_write(c.h, msg(M_TOP_USAGE));
