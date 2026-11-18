@@ -985,7 +985,7 @@ aurora-os/
 >
 > | 阶段 | 状态 | 依据 |
 > |---|---|---|
-> | B1 设备模型 | 部分 | PCI ECAM/CAM 枚举 `pci.rs`、统一 `DriverCtx`、AHCI 错误恢复、virtio 设备表（ADR-030/112）；**缺** Device/Driver trait、设备树、`lspci`/`lsdev`/`devctl` |
+> | B1 设备模型 | 部分（`lspci` 已达成） | PCI ECAM/CAM 枚举 `pci.rs`、统一 `DriverCtx`、AHCI 错误恢复、virtio 设备表（ADR-030/112）；ADR-136 新增 **31 号 `SYS_PCI_ENUM`**（内核判据 `t_pci_enum` 七格全绿 + 变异证红）与 shell `lspci`（判定格 `_lspci_rows`，变异证红；q35 实测 6 台真实数据）；**缺** Device/Driver trait、设备树、`lsdev`/`devctl`（B1 后续片） |
 > | B2 网络协议栈 | 部分（只到以太网帧 + 单次 DHCP） | virtio-net + 手搓 Ethernet 实验帧 + DHCP DISCOVER 回包解析（ADR-032，判定行 网卡第一帧/第一条协议往返）；**缺** ARP/ICMP/TCP/Socket API/路由/DNS 与 `ip`/`ping` 命令 |
 > | B3 时间电源 | 部分 | TSC/PIT 标定、LAPIC/PIT 定时器、健康标记、停机（ADR-036）；**缺** 墙钟/RTC/时区、ACPI 电源状态、重启、init/service manager 与 `date`/`uptime`/`service`/`reboot` |
 > | B4 日志诊断 | **`dmesg` 已达成** | 环 4096B + 整行规则、持久日志尾、crash dump V2 及 3 条既有判定行；ADR-135 新增 **30 号 `SYS_LOG_READ`**（内核判据 `t_log_read` 十格全绿 + 变异证红）与 shell `dmesg`（判定格 `_dmesg_repeats`：表头后首行必须在表头前出现过 ⇒ 真打了一遍内核日志；变异证红已做）；`journalctl` 未做 |

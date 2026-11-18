@@ -15279,3 +15279,40 @@ dmesg: tail        <- 表头（一直在）
 > 那条讲的是**度量对象**要独立，这条讲的是**定位对象**要独立。
 
 读数：`check` **17/17**；整链 **69 行 69 符合 rc=0**；a3-shell 判定含 dmesg 格 PASS(33)。
+
+
+## 399. ADR-136 B1 第一刀：31 号 SYS_PCI_ENUM + shell lspci（workbuddy，2026-11-18）
+
+使用者裁决：新增 31 号（23 占、29 kill、30 log_read 已用）。形状照抄 27 号
+proc_enum 同族（32 字节定长记录 `APC1` 魔数、游标分页、`(next<<32)|n`）。
+PCI 表是启动快照（BSP 单写后全读），**无 capability** 但要求任务身份。
+
+判据 `t_pci_enum` 七格：全量 / 与内核表逐字段一致 / 魔数版本自洽 / 游标续读 /
+短长-3 / 超长-3 / 只读页-2。**为什么"与内核表对账"不违反 §397 那条
+"别拿被测物自己对账"**：31 号走 syscall→打包→copy_to_user→用户缓冲→读回这条
+长路径，`pci::dev(i)` 是直读表的另一条路径——两条路径共享的只有源数据本身；
+logread 初版那次连源读法都是同一份函数，才是真违反。
+
+**变异证红**：bdf 错位（`d.bdf ^ 0x100`）⇒ 字段一致红 ⇒ FAIL35；还原绿。
+shell `lspci` 每台一行 `bus dev func vendor device class`（全十进制，
+shell 无十六进制打印），q35 实测 6 台真实数据；判定格 `_lspci_rows`
+（六数字行 ×≥2，结构性、不依赖机型），变异证红（破坏行形状 ⇒ False）。
+
+### 两条落地教训
+
+1. **syscall_abi 第 4 位才映射 r10**。31 号内核读 `r10` 当 len，runtime 初版
+   把 `buf.len()` 传到第 3 位（`rdx`）⇒ 内核见 `r10=0` ⇒ `-3`，shell 打出
+   `-3`+usage。**27 号同族的 len 永远走 r10**（`SYS_PROC_ENUM` 注释里写着），
+   照抄形状时连参数位次也要照抄。
+2. **27 号同族的长度字段与 bdf 共用 2 字节**（user.rs:1515/1516 同位），
+   用户侧一直按 16 位读。初版判据按 32 位核 ⇒ 红；按 16 位口径 ⇒ 绿。
+   照抄既有布局时，**共用字段的口径也要照抄**。
+
+module-interfaces：登记 **sched→pci** 依赖边（31 号在 user.rs 里读 `pci::info/dev`，
+而 user 归 sched 层）与 pci 的 `allowed_callers += sched`；unsafe runtime
+U5 39→40、census 470→471。
+
+读数：`check` **17/17**；整链 68/69（唯一不符 = a2-exec 档 q2 超时 HANG，
+同 ELF 单跑 PASS 33、**93/93 用例全绿** ⇒ §397 已记的 q2 已知偶发，不归因）。
+B1 剩余：`lsdev`/`devctl`（要 Device/Driver trait）、桥后设备递归扫描
+（今天的扫描不下桥，q35 上不咬，真机欠账）、十六进制输出。
