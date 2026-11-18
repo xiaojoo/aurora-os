@@ -129,6 +129,17 @@ pub const SYS_NET_INFO: u64 = 35;
 pub const SYS_NET_ARP_LEN: u64 = 36;
 /// 37（ADR-145）：ARP 表按游标读项（rdi=cursor、rsi=buf、rdx=len、r10=宽度）。
 pub const SYS_NET_ARP_ENUM: u64 = 37;
+/// 38（ADR-150）：读**当前任务**的凭据。`rdi`=buf（28 字节定长）。
+/// 返回 0 / 错误码。任务没有凭据（内核任务）⇒ `E_BAD_HANDLE`。
+pub const SYS_CRED_SELF: u64 = 38;
+/// 39（ADR-150）：凭据表按游标读项。`rdi`=cursor、`rsi`=want、`r10`=写入地址。
+/// 返回 `(next<<32)|n`（与 27/31/37 同族）。
+pub const SYS_CRED_LIST: u64 = 39;
+/// 40（ADR-150）：授权判定。`rdi`=cap 位、返回 1=允许 / 0=拒绝 / 负=错误。
+/// **这是"可验证的授权差异"的判据入口**。
+pub const SYS_CRED_ALLOWS: u64 = 40;
+/// 41（ADR-150）：凭据判据读数（四计数，4×4=16 字节）。
+pub const SYS_CRED_STATS: u64 = 41;
 /// 每条 ARP 表项的定长记录（10 字节：IP4 + MAC6）。与 27/31 号的 32 字节记录不同：这里的内容就是 10 字节，不垫到 32。
 pub const ARP_RECORD_LEN: usize = 10;
 /// 16：`rdi` = Proc 句柄、`rsi` = Thread 句柄、`rdx` = StartupInfo 那一页的 VMO 句柄、
@@ -1288,6 +1299,17 @@ fn sys_process_start(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
         undo_start(&newvals, done, &granted, ng, child, parent);
         return E_EXHAUSTED;
     }
+    // ADR-150：子进程**继承父的凭据 id**。凭据是对象、任务只存引用——
+    // 继承同一个 id 意味着父子共享权限，销毁由凭据表统一管（未决 2：
+    // 引用计数与"最后一个持有者退出"还没做）。
+    #[cfg(feature = "handles")]
+    {
+        if let Some(pid_of_child) = crate::sched::proc_id_of(gidx).into() {
+            let _ = pid_of_child;
+        }
+        let parent_cred = crate::sched::current_cred();
+        let _ = crate::sched::set_cred(gidx, parent_cred);
+    }
     if !crate::sched::wake_task(gidx, start_token(gidx, tid)) {
         undo_start(&newvals, done, &granted, ng, child, parent);
         return E_EXHAUSTED;
@@ -1681,6 +1703,87 @@ fn sys_net_arp_enum(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     }
     let next = cursor.saturating_add(n as u32);
     (u64::from(next) << 32) | (n as u64)
+}
+
+/// 38（ADR-150）：读当前任务的凭据。
+///
+/// 凭据**不放在 Task 里**（那是身份标签不是对象）：任务持有 `CredId`，
+/// 这里按 id 查表。查不到（内核任务 / 凭据已销毁）⇒ `E_BAD_HANDLE`，
+/// **不返回一个"默认 root"**。
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_cred_self(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let Some(id) = crate::sched::current_cred() else { return E_BAD_HANDLE };
+    let Some(c) = crate::cred::cred_lookup(id) else { return E_BAD_HANDLE };
+    let mut blk = [0u8; crate::cred::CRED_RECORD_LEN];
+    blk[0] = c.id.slot;
+    blk[1..5].copy_from_slice(&c.id.gen.to_le_bytes());
+    blk[5..9].copy_from_slice(&c.uid.to_le_bytes());
+    blk[9..13].copy_from_slice(&c.gid.to_le_bytes());
+    blk[13..17].copy_from_slice(&c.caps.to_le_bytes());
+    blk[17] = c.name_len;
+    let mut k = 0usize;
+    while k < crate::cred::NAME_MAX {
+        blk[18 + k] = c.name[k];
+        k += 1;
+    }
+    match copy_to_user(&blk, frame.rdi) {
+        Ok(w) => w as u64,
+        Err(_) => E_FAULT,
+    }
+}
+
+/// 39（ADR-150）：凭据表分页读。
+///
+/// **约定与 37 号一致**：返 `(next, n)`，`n == 0` 是表尾（`next` 此时等于 cursor）。
+/// （31 号是 `next == 0`——两个号的约定不同，抄之前先看那个号自己的注释。）
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_cred_list(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let cursor = frame.rdi as u32;
+    let want = frame.rsi as usize;
+    if want == 0 || want > 256 || want % crate::cred::CRED_RECORD_LEN != 0 {
+        return E_INVALID;
+    }
+    let mut buf = [0u8; 256];
+    let n = crate::cred::cred_read_from(cursor, &mut buf[..want]);
+    let got = n * crate::cred::CRED_RECORD_LEN;
+    if got > 0 {
+        match copy_to_user(&buf[..got], frame.r10) {
+            Ok(w) if w == got => {}
+            _ => return E_FAULT,
+        }
+    }
+    let next = cursor.saturating_add(n as u32);
+    (u64::from(next) << 32) | (n as u64)
+}
+
+/// 40（ADR-150）：授权判定。返回 1=允许 / 0=拒绝。
+///
+/// **拒绝不是错误**：0 与负错误码是两种不同的结果（前者是策略，后者是故障）。
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_cred_allows(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let cap = frame.rdi as u32;
+    if cap == 0 { return E_INVALID; }
+    let Some(id) = crate::sched::current_cred() else { return E_BAD_HANDLE };
+    u64::from(crate::cred::cred_allows(id, cap))
+}
+
+/// 41（ADR-150）：凭据判据读数（16 字节：lookups/hits/misses/denies）。
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_cred_stats(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let s = crate::cred::cred_stats();
+    let mut blk = [0u8; 16];
+    blk[0..4].copy_from_slice(&s.lookups.to_le_bytes());
+    blk[4..8].copy_from_slice(&s.hits.to_le_bytes());
+    blk[8..12].copy_from_slice(&s.misses.to_le_bytes());
+    blk[12..16].copy_from_slice(&s.denies.to_le_bytes());
+    match copy_to_user(&blk, frame.rdi) {
+        Ok(w) => w as u64,
+        Err(_) => E_FAULT,
+    }
 }
 
 /// 键盘字符的读取入口。拆成小函数是为了让上面那条 `or_else` 在没开 `ps2-kbd` 时
@@ -2814,6 +2917,14 @@ pub fn syscall_dispatch(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> boo
         SYS_NET_ARP_LEN => sys_net_arp_len(frame),
         #[cfg(feature = "handles")]
         SYS_NET_ARP_ENUM => sys_net_arp_enum(frame),
+        #[cfg(feature = "handles")]
+        SYS_CRED_SELF => sys_cred_self(frame),
+        #[cfg(feature = "handles")]
+        SYS_CRED_LIST => sys_cred_list(frame),
+        #[cfg(feature = "handles")]
+        SYS_CRED_ALLOWS => sys_cred_allows(frame),
+        #[cfg(feature = "handles")]
+        SYS_CRED_STATS => sys_cred_stats(frame),
         #[cfg(feature = "handles")]
         SYS_CONSOLE_WRITE => sys_console_io(frame, true),
         #[cfg(feature = "handles")]

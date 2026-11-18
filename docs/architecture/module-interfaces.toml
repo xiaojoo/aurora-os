@@ -402,6 +402,8 @@ public_api = [
   "user::WAIT_MAX_MS",
   "user::park_current",
   "user::syscall_dispatch",
+  "sched::current_cred",
+  "sched::set_cred",
 ]
 allowed_callers = ["integration"]
 dependencies = ["arch", "boot", "capability", "diagnostics", "input", "memory", "pci", "security", "storage", "sync", "time"]
@@ -816,7 +818,7 @@ status = "部分落地"
 module_id = "security"
 owner = "security"
 layer = "service"
-source_modules = ["sign"]
+source_modules = ["sign", "cred"]
 public_api = [
   "sign::PKG_BYTES",
   "sign::PKG_PAYLOAD_BYTES",
@@ -842,6 +844,27 @@ public_api = [
   "sign::cover",
   "sign::reason",
   "sign::reason_arg",
+  # ADR-150：凭据对象与身份（C1）
+  "cred::CAP_ADMIN",
+  "cred::CAP_ALL",
+  "cred::CAP_DEV",
+  "cred::CAP_KILL",
+  "cred::CAP_LOG",
+  "cred::CAP_NONE",
+  "cred::CAP_READ",
+  "cred::CAP_WRITE",
+  "cred::CRED_MAX",
+  "cred::CRED_RECORD_LEN",
+  "cred::Cred",
+  "cred::CredId",
+  "cred::CredStats",
+  "cred::NAME_MAX",
+  "cred::cred_allows",
+  "cred::cred_create",
+  "cred::cred_len",
+  "cred::cred_lookup",
+  "cred::cred_read_from",
+  "cred::cred_stats",
 ]
 allowed_callers = ["integration", "sched"]
 dependencies = []

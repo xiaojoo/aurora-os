@@ -1142,6 +1142,62 @@ pub const SYS_NET_INFO: u64 = 35;
 /// 网卡读数包（18 字节定长）：MAC6 + 本机 IP4 + 网关4 + DNS4。
 /// 读数包 24 字节（ADR-144 从 18 扩到 24）：MAC6 + 本机IP4 + 网关4 + DNS4 + mtu2 + link2。
 pub const NET_INFO_BYTES: usize = 28;
+/// 38-41（ADR-150）：凭据与授权。
+pub const SYS_CRED_SELF: u64 = 38;
+pub const SYS_CRED_LIST: u64 = 39;
+pub const SYS_CRED_ALLOWS: u64 = 40;
+pub const SYS_CRED_STATS: u64 = 41;
+/// 一条凭据记录的定长（slot1+gen4+uid4+gid4+caps4+name_len1+name8+pad2）。
+pub const CRED_RECORD_LEN: usize = 28;
+/// 登录名上限。
+pub const CRED_NAME_MAX: usize = 8;
+
+/// 能力位（与内核 `cred::CAP_*` 同值）。
+pub const CAP_READ: u32 = 1 << 8;
+pub const CAP_WRITE: u32 = 1 << 9;
+pub const CAP_KILL: u32 = 1 << 10;
+pub const CAP_LOG: u32 = 1 << 11;
+pub const CAP_DEV: u32 = 1 << 12;
+pub const CAP_ADMIN: u32 = 1 << 13;
+
+/// 38：读当前任务凭据（28 字节记录）。
+pub fn cred_self() -> Result<[u8; CRED_RECORD_LEN], RTError> {
+    let mut blk = [0u8; CRED_RECORD_LEN];
+    // SAFETY: 38 号 rdi=buf（内核 copy_to_user 写回 28 字节定长）。
+    let ret = unsafe { syscall_abi(SYS_CRED_SELF, blk.as_mut_ptr() as u64, 0, 0, 0) } as i64;
+    if ret < 0 { Err(RTError(ret)) } else { Ok(blk) }
+}
+
+/// 39：凭据表按游标读。返回 `(next, n)`；`n == 0` 是表尾（与 37 号同约定）。
+pub fn cred_list(cursor: u32, buf: &mut [u8]) -> Result<(u32, u32), RTError> {
+    if buf.is_empty() || buf.len() > 256 || buf.len() % CRED_RECORD_LEN != 0 {
+        return Err(RTError::INVALID);
+    }
+    // SAFETY: 39 号 rdi=cursor、rsi=want、r10=写入地址。
+    let ret = unsafe {
+        syscall_abi(SYS_CRED_LIST, u64::from(cursor), buf.len() as u64, 0, buf.as_mut_ptr() as u64)
+    };
+    if ret < 0 { return Err(RTError(ret)); }
+    let v = ret as u64;
+    Ok(((v >> 32) as u32, (v & 0xFFFF_FFFF) as u32))
+}
+
+/// 40：授权判定。`Ok(true)` = 允许，`Ok(false)` = 拒绝（**拒绝不是错误**）。
+pub fn cred_allows(cap: u32) -> Result<bool, RTError> {
+    if cap == 0 { return Err(RTError::INVALID); }
+    // SAFETY: 40 号 rdi=cap 位，无缓冲。
+    let ret = unsafe { syscall_abi(SYS_CRED_ALLOWS, u64::from(cap), 0, 0, 0) } as i64;
+    if ret < 0 { Err(RTError(ret)) } else { Ok(ret != 0) }
+}
+
+/// 41：凭据判据读数（16 字节：lookups/hits/misses/denies）。
+pub fn cred_stats() -> Result<[u8; 16], RTError> {
+    let mut blk = [0u8; 16];
+    // SAFETY: 41 号 rdi=buf（内核 copy_to_user 写回 16 字节）。
+    let ret = unsafe { syscall_abi(SYS_CRED_STATS, blk.as_mut_ptr() as u64, 0, 0, 0) } as i64;
+    if ret < 0 { Err(RTError(ret)) } else { Ok(blk) }
+}
+
 /// 36/37（ADR-145）：ARP 表的两个读口（`ip neigh`）。
 pub const SYS_NET_ARP_LEN: u64 = 36;
 pub const SYS_NET_ARP_ENUM: u64 = 37;

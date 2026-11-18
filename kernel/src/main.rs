@@ -23,6 +23,7 @@ mod ahci;
 mod boot_guard;
 mod clock;
 mod crash;
+mod cred;
 mod driver;
 mod elf;
 mod filesystem;
@@ -1633,7 +1634,7 @@ fn stage_init_user(sid: u8) -> Option<usize> {
     // 描述表最多 4 条（24 + 4×16 = 88），280 在页内且不与表重叠（ADR-130 决策 2 的校验）。
     #[cfg(feature = "a3-shell")]
     {
-        const A3_CMD: &[u8] = b"run /HELLO.ELF; ls; cat /NOTES; ps; free; top 2; kill 9999; lspci; uptime; sleep 1100; uptime; top 2; uptime; ping 10.0.2.2; ip link; ip addr; ip neigh; ip route; lsdev; devctl status; dmesg ";
+        const A3_CMD: &[u8] = b"run /HELLO.ELF; ls; cat /NOTES; ps; free; top 2; kill 9999; lspci; uptime; sleep 1100; uptime; top 2; uptime; ping 10.0.2.2; ip link; ip addr; ip neigh; ip route; lsdev; devctl status; whoami; id; dmesg ";
         const A3_CMD_DEEP: &[u8] = b"pwd; cd /PROJECT; pwd; ls DOCS; cat DOCS/NESTED.TXT; cd ..; ls; ps; free ";
         let cmd: &[u8] = if cfg!(feature = "a3-ls-deep") { A3_CMD_DEEP } else { A3_CMD };
         hdr[12..16].copy_from_slice(&280u32.to_le_bytes());
@@ -1755,6 +1756,19 @@ fn stage_init_user(sid: u8) -> Option<usize> {
             "新建: 会话 {} 起好 创建者还 hp/ht 句柄表={}/{}",
             sid, handle::used(), handle::MAX_HANDLES
         );
+    }
+    // ADR-150：会话起来之后**建一个 root 凭据并授给这个线程**。
+    // 凭据是对象（表里一项），任务只存 id；`whoami`/`id` 按 id 查表，
+    // 查不到就打 `no cred`——不编一个默认身份。
+    #[cfg(feature = "handles")]
+    if started == 0 {
+        match crate::cred::cred_create(0, 0, crate::cred::CAP_ALL, b"root") {
+            Some(cid) => {
+                let _ = sched::set_cred(gidx, Some(cid));
+                crate::log_info!("init-user: 授凭据 会话={} slot={} gen={}", sid, cid.slot, cid.gen);
+            }
+            None => crate::log_warn!("init-user: 凭据表满 ⇒ 会话 {} 无凭据", sid),
+        }
     }
     // 诊断（S5c）：子进程在入口就 #PF（rip=entry cr2=0 err=4），而三格生效位都对。
     // 只打**原值**：叶子表项（地址位+标志位）与首帧地址，不 deref 任何东西。

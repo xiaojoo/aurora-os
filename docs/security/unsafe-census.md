@@ -1,6 +1,6 @@
 # unsafe 逐处审计表（U1–U6）
 
-总计 487 处。U1 83 · U2 119 · U3 13 · U4 135 · U5 101 · U6 36
+总计 498 处。U1 83 · U2 119 · U3 13 · U4 142 · U5 105 · U6 36
 
 本表由 `tools/aurora.py` 的 `unsafe_sites()` 从源码逐处生成，**不是手写的**。
 机器可读的权威来源是 `docs/security/unsafe-whitelist.toml` 的 `[modules.*]` 段（模块×类别→处数），
@@ -1131,6 +1131,12 @@
   > unsafe { *NET_DEV.0.get() = Some(net) }; Ok(()) } 
 - `kernel/src/virtio.rs:982` [{] **U4** fn=`net_info`
   > unsafe { (*NET_DEV.0.get()).as_ref().map(|d| NetInfo { bdf: d.bdf, 
+
+### cred
+
+| 处 | 类别 | 说明 |
+|---|---|---|
+| 7 | U4 | 凭据表：`Cell(UnsafeCell<Table>)` 的 `get()` 访问（5 个入口）与 `unsafe impl Sync`。地址范围固定、生命周期 static、调用点在内核串行上下文（ADR-150）。 |
 
 ### vmo
 

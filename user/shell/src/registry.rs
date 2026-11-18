@@ -26,6 +26,7 @@ use crate::{
     M_PS_ERR, M_PS_HDR, M_PS_NOJOB, M_RUN_ERR, M_RUN_EXIT, M_RUN_PREFIX, M_RUN_TIMEOUT,
     M_CLASS_PREFIX,
     M_CLASS_PCI, M_COUNT, M_DEVCTL_STATUS, M_DEVCTL_USAGE, M_DMESG_ERR, M_DMESG_HDR,
+    M_CRED_CAPS, M_CRED_GID, M_CRED_NONE, M_CRED_UID, M_ID_PFX, M_WHOAMI_PFX, M_WHOAMI_USAGE,
     M_DMESG_USAGE, M_KILLED, M_KILL_USAGE, M_LSDEV_USAGE, M_LSPCI_USAGE,
     M_IP_ADDR, M_IP_DNS, M_IP_DOWN, M_IP_GW, M_IP_LINK, M_IP_MAC, M_IP_MTU, M_IP_STATE, M_IP_UP,
     M_COLON, M_IP_USAGE, M_NEIGH_EMPTY, M_PING_DOT, M_PING_FROM, M_PING_SEQ,
@@ -57,6 +58,8 @@ const CMD_ECHO: [u8; 4] = [b'e', b'c', b'h', b'o'];
 const CMD_PING: [u8; 4] = [b'p', b'i', b'n', b'g'];
 const CMD_LSDEV: [u8; 5] = [b'l', b's', b'd', b'e', b'v'];
 const CMD_DEVCTL: [u8; 6] = [b'd', b'e', b'v', b'c', b't', b'l'];
+const CMD_WHOAMI: [u8; 6] = [b'w', b'h', b'o', b'a', b'm', b'i'];
+const CMD_ID: [u8; 2] = [b'i', b'd'];
 const CMD_IP: [u8; 2] = [b'i', b'p'];
 const CMD_ABI: [u8; 3] = [b'a', b'b', b'i'];
 const CMD_EXIT: [u8; 4] = [b'e', b'x', b'i', b't'];
@@ -1470,6 +1473,73 @@ fn cmd_devctl(c: &Ctx) -> bool {
     cmd_devctl_status(c)
 }
 
+/// ADR-150：`whoami` —— 当前凭据的登录名。
+///
+/// **没有凭据就说没有**（`no cred`），不编一个 `root`：
+/// 身份来自 38 号读回的凭据对象，不是 shell 自己猜的。
+#[inline(never)]
+fn cmd_whoami(c: &Ctx) -> bool {
+    if c.p.err.is_some() || c.p.args.count() != 0 {
+        con_write(c.h, msg(M_WHOAMI_USAGE));
+        return true;
+    }
+    let rec = match rt::cred_self() {
+        Ok(v) => v,
+        Err(_) => {
+            con_write(c.h, msg(M_CRED_NONE));
+            con_write(c.h, msg(M_NL));
+            return true;
+        }
+    };
+    con_write(c.h, msg(M_WHOAMI_PFX));
+    let n = rec.get(17).copied().unwrap_or(0) as usize;
+    let mut k = 0usize;
+    while k < n && k < rt::CRED_NAME_MAX {
+        let ch = rec.get(18 + k).copied().unwrap_or(0);
+        con_write(c.h, core::slice::from_ref(&ch));
+        k += 1;
+    }
+    con_write(c.h, msg(M_NL));
+    true
+}
+
+/// ADR-150：`id` —— uid/gid/caps 与凭据槽位。
+///
+/// 形状：`id: uid=<n> gid=<n> caps=0x<十进制>`。caps 打**十进制**是仓库纪律
+/// （shell 只有十进制打印），十六进制由前缀 `0x` 标明它是位图。
+#[inline(never)]
+fn cmd_id(c: &Ctx) -> bool {
+    if c.p.err.is_some() || c.p.args.count() != 0 {
+        con_write(c.h, msg(M_WHOAMI_USAGE));
+        return true;
+    }
+    let rec = match rt::cred_self() {
+        Ok(v) => v,
+        Err(_) => {
+            con_write(c.h, msg(M_CRED_NONE));
+            con_write(c.h, msg(M_NL));
+            return true;
+        }
+    };
+    let u32at = |off: usize| -> u32 {
+        u32::from_le_bytes([
+            rec.get(off).copied().unwrap_or(0),
+            rec.get(off + 1).copied().unwrap_or(0),
+            rec.get(off + 2).copied().unwrap_or(0),
+            rec.get(off + 3).copied().unwrap_or(0),
+        ])
+    };
+    con_write(c.h, msg(M_ID_PFX));
+    con_write(c.h, msg(M_CRED_UID));
+    put_u64(c.h, u64::from(u32at(5)));
+    con_write(c.h, msg(M_CRED_GID));
+    put_u64(c.h, u64::from(u32at(9)));
+    con_write(c.h, msg(M_CRED_CAPS));
+    put_u64(c.h, u64::from(u32at(13)));
+    con_write(c.h, msg(M_NL));
+    true
+}
+
 /// 分派一条已解析的命令。返回 false = 退出 shell。
 ///
 /// 每个分支都是"名字 immediate 比较 → 直接调用处理器"，不写 `match lookup()`：
@@ -1500,6 +1570,12 @@ pub fn dispatch(h: ConsoleHandle, si_va: u64, p: &Parsed, st: &mut ShellState) -
     }
     if cmd_is(p.cmd, &CMD_DEVCTL) {
         return cmd_devctl(&c);
+    }
+    if cmd_is(p.cmd, &CMD_WHOAMI) {
+        return cmd_whoami(&c);
+    }
+    if streq(p.cmd, &CMD_ID) {
+        return cmd_id(&c);
     }
     if streq(p.cmd, &CMD_ABI) {
         return cmd_abi(&c);

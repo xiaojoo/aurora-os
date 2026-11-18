@@ -7895,6 +7895,38 @@ def _lspci_rows(log: str) -> bool:
     return False
 
 
+def _cred_rows(log: str) -> bool:
+    """`whoami` / `id` 的显示层判据（ADR-150）。
+
+    `whoami`：回显后出现 `whoami: <非空名字>`（名字不能是空的、也不能是 `no cred`）。
+    `id`：回显后出现 `id: uid=<n> gid=<n> caps=<n>`，且 caps 不能是 0
+    （有凭据就必须有能力位；caps=0 说明授权表没接上）。
+    """
+    import re
+    who = re.compile(r"^whoami: [A-Za-z][A-Za-z0-9_]{0,7}$")
+    idp = re.compile(r"^id: uid=\d+ gid=\d+ caps=\d+$")
+    lines = log.split("\n")
+    who_ok = False
+    id_ok = False
+    for k, ln in enumerate(lines):
+        s = ln.strip()
+        if s == "whoami":
+            for j in range(k + 1, min(k + 3, len(lines))):
+                if who.match(lines[j].strip()):
+                    who_ok = True
+                    break
+        if s == "id":
+            for j in range(k + 1, min(k + 3, len(lines))):
+                b = lines[j].strip()
+                if idp.match(b):
+                    # caps 不能是 0
+                    caps = int(b.rsplit("caps=", 1)[1])
+                    if caps != 0:
+                        id_ok = True
+                    break
+    return who_ok and id_ok
+
+
 def _lsdev_rows(log: str) -> bool:
     """`lsdev` / `devctl status` 的显示层判据（ADR-149）。
 
@@ -8897,6 +8929,10 @@ def do_test(timeout: int) -> int:
         # lsdev / devctl statusï¼ADR-149ï¼ï¼è®¾å¤ç±»åªè¯»è§å¾
         # å¤æ®å½¢ç¶ï¼`class 0x<k> count=<n>` è³å°ä¸è¡ + `devctl status count=<n>`
         _lsdev_rows(ashlog),
+        # whoami / idï¼ADR-150ï¼ï¼å­æ®å¯¹è±¡çæ¾ç¤ºå±
+        # å¤æ®å½¢ç¶ï¼`whoami: <å>` ä¸ `id: uid=<æ°> gid=<æ°> caps=<æ°>`
+        # ââåå­ä¸è½æ¯ç©ºãcaps ä¸è½ä¸º 0ï¼æå­æ®å°±å¾æè½åï¼
+        _cred_rows(ashlog),
 
         # ---- ls / cat（2026-11-18）----
         "ls: /" in ashlog,

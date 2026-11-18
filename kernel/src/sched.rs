@@ -98,6 +98,10 @@ pub struct Task {
     pub proc_id: u16,
     /// 这个任务跑在哪个地址空间里（`NO_ASPACE` = 内核那份）。W3 P5b（ADR-075 决策 2）。
     pub as_slot: u8,
+    /// 这个任务持有的凭据 id（ADR-150）。`None` = 内核任务 / 还没授凭据。
+    /// **不存 `Cred` 本体**：凭据是对象（可授受、可销毁），任务只存引用。
+    #[cfg(feature = "handles")]
+    pub cred: Option<crate::cred::CredId>,
     /// 登记时缓存下来的根表物理地址（0 = 内核 AS）。**换人时只比较它，不查表**：
     /// 查表要取 VMM，而换人点 IF=0，持 VMM 等别的 CPU 回执会把两边绑死（ADR-047 决策 2）。
     pub as_pml4: u64,
@@ -513,6 +517,8 @@ const EMPTY_TASK: Task = Task {
     resident: false,
     proc_id: crate::proc::NO_PROC,
     as_slot: NO_ASPACE,
+    #[cfg(feature = "handles")]
+    cred: None,
     as_pml4: 0,
     on_cpu: 0,
     runs: 0,
@@ -733,6 +739,37 @@ pub fn current_identity() -> Option<(usize, u32)> {
     } else {
         Some((gi, t.id))
     }
+}
+
+/// 当前任务的凭据 id（ADR-150）。`None` = 内核任务 / 还没授凭据。
+///
+/// **不返回"默认 root"**：没有凭据就是没有，调用方（38 号）据此回 `E_BAD_HANDLE`。
+#[cfg(feature = "handles")]
+pub fn current_cred() -> Option<crate::cred::CredId> {
+    let cpu = crate::arch::x86_64::cpu::self_slot();
+    let gi = current_of(cpu);
+    let slot = slot_of(gi);
+    let s = rq(cpu);
+    let t = &s.tasks[slot];
+    if t.state == TaskState::Free {
+        None
+    } else {
+        t.cred
+    }
+}
+
+/// 给某个任务授凭据（装载器在建进程时调）。返回旧值便于回滚。
+#[cfg(feature = "handles")]
+pub fn set_cred(gidx: usize, id: Option<crate::cred::CredId>) -> Option<crate::cred::CredId> {
+    if gidx >= MAX_TASKS_TOTAL {
+        return None;
+    }
+    let cpu = cpu_of(gidx);
+    let slot = slot_of(gidx);
+    let mut s = rq(cpu);
+    let old = s.tasks[slot].cred;
+    s.tasks[slot].cred = id;
+    old
 }
 
 /// 按**全局下标**查 `(gidx, Task::id)`。装载器用它把句柄授给"这个容器"，
@@ -1119,6 +1156,8 @@ pub fn init_boot_task() {
         resident: true, // 每 CPU 的启动/空闲上下文：设计上不退出（名单见 Task::resident）
         proc_id: crate::proc::NO_PROC,
         as_slot: NO_ASPACE,
+        #[cfg(feature = "handles")]
+        cred: None,
         as_pml4: 0,
         on_cpu: cpu as u8,
         runs: 1,
@@ -1152,6 +1191,8 @@ pub fn init_idle_task(stack_lo: u64, stack_hi: u64, guarded: bool) {
         resident: true, // 每 CPU 的启动/空闲上下文：设计上不退出（名单见 Task::resident）
         proc_id: crate::proc::NO_PROC,
         as_slot: NO_ASPACE,
+        #[cfg(feature = "handles")]
+        cred: None,
         as_pml4: 0,
         on_cpu: cpu as u8,
         runs: 1,
@@ -1393,6 +1434,8 @@ pub fn init_idle() -> bool {
         resident: true, // 兜底 idle 永不退出（ADR-051）：它是"没人可换"时的最后一格
         proc_id: crate::proc::NO_PROC,
         as_slot: NO_ASPACE,
+        #[cfg(feature = "handles")]
+        cred: None,
         as_pml4: 0,
         on_cpu: cpu as u8,
         runs: 0,
@@ -1470,6 +1513,8 @@ fn spawn_inner(entry: fn() -> !, resident: bool) -> Result<usize, mm::MmError> {
         resident,
         proc_id: crate::proc::NO_PROC,
         as_slot: NO_ASPACE,
+        #[cfg(feature = "handles")]
+        cred: None,
         as_pml4: 0,
         on_cpu: cpu as u8,
         runs: 0,
@@ -1532,6 +1577,8 @@ pub fn spawn_user(entry_rip: u64, user_stack_top: u64, arg: u64, mut res: OwnedS
         resident: false, // 用户任务永远不进常驻名单：收尾判据对它本来就点名（ADR-050）
         proc_id: crate::proc::NO_PROC,
         as_slot: NO_ASPACE,
+        #[cfg(feature = "handles")]
+        cred: None,
         as_pml4: 0,
         on_cpu: cpu as u8,
         runs: 0,

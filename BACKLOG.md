@@ -15983,3 +15983,47 @@ class 名字由用户看数字（PCI 规范常识）。
 读数：`check` **18/18**；整链 68 符合 + 5 条不符（**全部单跑复验通过**：
 virtio-net PASS / fat32-probe PASS / 默认档 PASS 82/82 模式 Normal，不归因）。
 B1 剩余：Device/Driver trait 与设备树、`devctl` 写操作。
+
+
+## 426. ADR-150：C1 第一片——凭据对象 + whoami/id（workbuddy，2026-11-19）
+
+**使用者裁决 ①C**（完整凭据对象 + 登录会话 + 审计，分多片）。本片做第一片：
+**凭据对象 + 身份读数 + 授权判定入口**。
+
+**新增 4 个号**：38 `SYS_CRED_SELF`（读自己凭据，28 字节记录）、
+39 `SYS_CRED_LIST`（按游标枚举，`(next<<32)|n`）、
+40 `SYS_CRED_ALLOWS`（授权判定，1=允许/0=拒绝/负=错误——**拒绝不是错误**）、
+41 `SYS_CRED_STATS`（四计数判据读数）。
+
+`kernel/src/cred.rs`（新）：**无堆、16 项定长、线性查找**，
+`CredId{slot,gen}` 代次防 ABA，能力位 `CAP_*`（1<<8..1<<13）
+**与句柄 `RIGHT_*` 高位错开**（混读会得到荒谬值而不是悄悄通过）。
+`Task` 加 `cred: Option<CredId>`（**只存引用不存本体**——凭据要能授受/共享/销毁）。
+子进程**继承父凭据 id**（`sys_process_start` 里 `set_cred`）。
+
+**实测**（a3-shell PASS33 15.0s）：
+```
+whoami → whoami: root
+id     → id: uid=0 gid=0 caps=16128      (16128 = 0x3F00 = 六位 CAP_ALL)
+```
+串口另有 `init-user: 授凭据 会话=0 slot=0 gen=1`。
+**变异证红**：授予点改 `None`（不授凭据）⇒ `_cred_rows=False`，还原 True。
+
+### 四个坑
+
+1. **授予点放错路径**：先加在 `stage_init_user` 的 `load()+spawn_user()` 分支，
+   但 a3-shell 走的是 `load_into` + 15/16 号那条 ⇒ `whoami` 一直 `no cred`。
+   移到 `SYS_PROCESS_START` 之后 `started==0` 分支。**同一功能在启动路径上
+   可能有两条实现，加钩子前先确认哪条真的在跑**。
+2. **记录宽度算错**：`1+4+4+4+4+1+8=26` 却写 `REC=24` ⇒ 越界。改 28（对齐垫片）。
+3. `M_CRED_CAPS` 无前导空格 ⇒ `gid=0caps=` 粘连。改 `" caps="`，后续偏移 -1。
+4. caps 打 `0x` 前缀却是十进制 ⇒ 误导。去掉 `0x`，只打十进制。
+5. 默认档（无 handles）编译失败 E0560：`Task.cred` 字段被 cfg 掉但字面量还在
+   ⇒ 6 处 `cred: None` 也要加 `#[cfg(feature = "handles")]`。
+
+读数：`check` **18/18**（cred 模块 7 处 U4 登记、runtime U5 46→50、census 498）；
+整链 **72 符合 + 1 条不符**（`FAT32簇号高半抹零必须红` HANG——单跑 FAIL(35)
+正是期望值，长链抖动不归因）。
+
+**C1 剩余**：`passwd`、登录会话/`su`、**把 `cred_allows` 接进每个命令**
+（现在零调用者——验收句"授权差异"尚未达成）、引用计数与销毁、审计日志。
