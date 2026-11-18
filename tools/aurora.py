@@ -8691,11 +8691,13 @@ def do_test(timeout: int) -> int:
         # 上界给余量（sleep 不会精确等于 1100 ms，调度+syscall 开销都算进去），
         # 也不依赖具体数值——"睡了至少 1.1 秒"对任何机器都成立。
         _sleep_gap(ashlog),
-        # top 的帧间睡眠真阻塞（§401 修的既有欠账）：**格子暂撤**——判据需要的
-        # `top 2; uptime` 三连形状会让 12 条 argv 的 shell 会话在 run 之后异常退出
-        # （8 页块下 -6 已消、run 本身成功，但 run 之后的命令不再执行，根因未归因），
-        # 而 10 条 argv 全绿。修复本身已验（变异证红：SELF_THREAD ⇒ False，
-        # qemu 用时 9.9s vs 7.9s），见 BACKLOG §402；三连形状的回归查清后再接回。
+        # top 的帧间睡眠真阻塞（§401 修的既有欠账）：argv 形状 `top 2; uptime`——
+        # top 2 的第二帧与收尾 uptime 之间隔着 1 s 的睡眠。取 uptime 读数对：
+        # 存在一对差值 ∈ [1.0s, 3.1s] 且中间隔着 top 的第二帧（frame 1 表头）⇒ 真睡。
+        # 变异证红：睡眠句柄改回 SELF_THREAD（-4 ⇒ 忙转连打）⇒ 红（已做）。
+        # §402 曾因"12 条 argv 早停"暂撤本格；§403 复跑证实那次是宿主机抖动
+        # （同内核同 argv 单跑全 12 条执行完、15.1s），格子接回。
+        _top_sleep_gap(ashlog),
     ))
     _tot = EXEC_TOTAL_RE.search(ashlog)
     if not _tot or int(_tot.group(1)) < 1 or int(_tot.group(2)) != 0:

@@ -15421,3 +15421,15 @@ log_info）在 -6 复现跑里都没触发 ⇒ -6 确实来自 16 号 adopt_asma
 诊断行保留（无害）。
 
 读数：`check` **17/17**；整链 **69 行 69 符合 rc=0**；三个关键档同 ELF 单跑 PASS。
+
+
+## 403. §402 暂撤格接回：12 条 argv 早停是宿主机抖动（workbuddy，2026-11-18）
+
+§402 的 `_top_sleep_gap` 判定格（`top 2; uptime` 三连 + uptime 读数对差
+∈ [1.0s, 3.1s] 且中间隔着 frame 1）**接回判定行**。暂撤的原因（"12 条 argv
+的 shell 会话 run 之后异常退出"）**复现不了**：同内核同 argv 单跑，12 条全部
+执行完（dmesg×2 回显、uptime×6、`_top_sleep_gap=True`、qemu 用时 15.1s），
+且 err-6=False、exec pass=True、timeout=True 全对。
+⇒ 那次早停与 §383/§397/§399 的批量抖动同族，不归因。
+
+读数：`check` **17/17**；整链 **69 行 69 符合 rc=0**（含 top 睡眠格）。
