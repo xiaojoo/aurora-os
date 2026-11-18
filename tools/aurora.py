@@ -5904,6 +5904,40 @@ PKG_VERDICT_RE = re.compile(
     r"pkg: 判据 读满=(\w+) 头自洽=(\w+) 验签=(\w+) 载荷同=(\w+) 篡改全拒=(\d+)/(\d+) AHCI照常=(\w+) 覆盖=([^\r\n]*)")
 
 
+def check_pkg_manifest() -> list[str]:
+    """C2 第一刀（ADR-138）：**包清单**与盘上签名包的双向对账。
+
+    `tools/pkg_manifest.py verify` 做四件事：
+      ① 从测试镜像的包区读出签名包（魔数/版本/覆盖名/载荷长）；
+      ② 载荷 SHA-256 与 `kernel/fixtures/hello.elf` 对账（同一份东西的两个来源）；
+      ③ 覆盖名/锚点与 `esp_image.py` 的期望对账（esp_image 自己就是包的产地）；
+      ④ 签名复算（Lamport 逐比特）必须过。
+
+    清单 JSON 缺失时自动生成；不一致 ⇒ 门禁红。变异证红：用 --tamper 把盘上
+    包的覆盖名翻一字节 ⇒ ②/③ 红还原绿（宿主机侧注入，与 S3 同形状）。
+    """
+    script = ROOT / "tools" / "pkg_manifest.py"
+    if not script.exists():
+        return [f"缺少 {script}"]
+    img = ROOT / "build" / "aurora.img"
+    if not img.exists():
+        # 镜像由 `build`/`image` 生成；check 在 build 之前跑时没有镜像可读——
+        # 此时清单不存在就生成期望清单（与 esp_image 常量同源），存在就只校验 JSON 形状。
+        json_path = ROOT / "docs" / "pkg" / "manifest.json"
+        r = subprocess.run([sys.executable, str(script), "--expect",
+                            "--out", str(json_path)], capture_output=True, text=True,
+                           env=env(), cwd=ROOT)
+        if r.returncode != 0:
+            return [f"--expect 生成失败：{r.stdout} {r.stderr}"]
+        return []
+    r = subprocess.run([sys.executable, str(script), "verify",
+                        "--img", str(img)], capture_output=True, text=True,
+                       env=env(), cwd=ROOT)
+    if r.returncode != 0:
+        return [f"verify 失败：{r.stdout} {r.stderr}"]
+    return []
+
+
 def check_sig_package(log: str) -> list[str]:
     """盘上那份签名包：宿主机用自己的实现把它读一遍、验一遍、再按同一批篡改各验一遍。
 
@@ -7047,6 +7081,7 @@ def do_check(elf: Path | None) -> int:
         "check-net-pattern": lambda: check_net_pattern(),
         "check-sha-primitives": lambda: check_sha_primitives(),
         "check-sig-anchor": lambda: check_sig_anchor(),
+        "check-pkg-manifest": lambda: check_pkg_manifest(),
         "check-sbom": lambda: check_sbom(),
         "check-matrix-wiring": lambda: check_matrix_wiring(),
         "check-verdict": lambda: check_verdict_contract(),
