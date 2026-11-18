@@ -15516,3 +15516,33 @@ seq=1——slirp 把 echo 原样返回，这两格证明"回的是我们发的�
 
 读数：`check` 18/18；整链 69/69 rc=0。
 B2 剩余：ARP 缓存+老化、`ping` shell 命令、payload 回环校验、UDP/TCP、路由/DNS。
+
+
+## 408. ADR-141 B2 第三刀：UDP 发送 + 对端错误回执（workbuddy，2026-11-18）
+
+**零新号**。`build_dns_query`（UDP/IPv4/eth 单播 DNS A 查询问 localhost）
++ `parse_dns_reply`（逐字段先验长度）+ `t_net_udp` 四格。
+
+**pcap 第二台仪器的实测发现**：本机 QEMU 的 slirp **DNS 不在线**——包 5 帧正确
+上线（src=1053 dst=53），slirp 回 **ICMP type=3 code=3（Port Unreachable）**；
+同一跑里 ICMP echo（包 9/10）与 BOOTP（包 11/12）都在线 ⇒ DNS 独缺，真实
+不归因。**判据改成"发送 + 错误回执 + 内嵌原包对账"**：ICMP unreachable 的
+内嵌部分就是我们的原包（RFC 1122），内嵌 源IP=我们 / 目标=10.0.2.3 /
+dst端口=53 三字段 ⇒ **对端引用的是我们发的那个包**（真往返）。
+**实测** PASS(33) 6.0s。**变异证红**：内嵌端口 53→9999 ⇒ FAIL35，还原绿。
+
+### 三个实测教训
+
+1. **DNS 查询塞不进 60 字节最小帧**（69 字节）⇒ 帧长按内容垫 72——
+   "60 字节"模板只对最小帧成立。
+2. **UDP 源端口 0 被拒**：<1024 是特权号，slirp 直接 unreachable ⇒
+   `DNS_QUERY_PORT=1053`。
+3. **RX 队列不保证干净**（.ktests 自足纪律的网络版）：同跑里 ping 的残留包
+   被本用例收走（实测收过一个 0x45 开头的无 eth 头残包）⇒ **用首字节判断
+   偏移基准**（buf[0]==0x45 ⇒ 无 eth 头）。网络用例对"队列里有什么"零假设。
+   另：**ICMP type 在外层 IP 头之后**（ip0+20），初版把 IP 头 0x45 当成
+   ICMP type 又读出 69——偏移链 14/IP20/ICMP8/inner20 逐层都要对齐。
+
+读数：`check` 18/18；整链 69/69 rc=0。
+B2 剩余：ARP 缓存+老化（每帧广播不可持续）、"成功应答"的 UDP 往返
+（等在线对端）、DNS answer 解析、TCP、`ping`/`ip` 命令。

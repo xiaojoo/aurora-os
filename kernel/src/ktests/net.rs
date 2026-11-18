@@ -392,3 +392,105 @@ fn t_net_ping() -> bool {
 }
 #[cfg(feature = "virtio-net")]
 ktest!(KT_NET_PING, t_net_ping);
+
+/// B2 ç¬¬ä¸åï¼ADR-141ï¼ï¼UDP å¾è¿ââDNS æ¥è¯¢âé® slirp ç DNSï¼10.0.2.3ï¼localhostã
+/// å¤æ®äºæ ¼ï¼ARP å¾è¿ãUDP ååºãæ¶å°ãè§£å¾å¼ï¼**txid å¯¹è´¦**ââåçæ¯æä»¬åçé£ä¸ªæ¥è¯¢ï¼ãsrc=10.0.2.3ã
+/// é® localhostï¼slirp ç DNS å¯¹å®ææ¬å°ç­æ¡ï¼127.0.0.1ï¼ï¼**ä¸ä¾èµå¤ç½**ã
+#[cfg(feature = "virtio-net")]
+fn t_net_udp() -> bool {
+    if let Err(e) = virtio::bind_net() {
+        crate::log_fatal!("udp: ç»å®/æ¡æå¤±è´¥ {:?}", e);
+        return false;
+    }
+    let i = match virtio::net_info() {
+        Some(v) => v,
+        None => {
+            crate::log_fatal!("udp: ç»å®ä¹åæ¿ä¸å°è¯»æ°");
+            return false;
+        }
+    };
+    // ---- ç¬¬ä¸åï¼ARP è§£ç½å³ MACï¼DNS å¨å«çå­ç½ï¼åè§£ç½å³ï¼ã
+    let (arp_req, _h) = virtio::build_arp_request(&i.mac);
+    if virtio::send_raw(&arp_req).is_err() {
+        crate::log_fatal!("udp: ARP REQUEST åä¸åºå»");
+        return false;
+    }
+    let (buf, n, uidx, ulen, uid) = match virtio::receive(3000) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_fatal!("udp: ARP reply ç­ä¸å° {:?}", e);
+            return false;
+        }
+    };
+    let a = match virtio::parse_arp_reply(&buf[..n], uidx, ulen, uid) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_fatal!("udp: ARP reply è§£ä¸å¼ {:?}", e);
+            return false;
+        }
+    };
+    let arp_ok = a.sender_ip == virtio::NET_GATEWAY_IP && a.used_id == 0;
+    if !arp_ok {
+        crate::log_fatal!("udp: ARP reply ä¸æ¯ç½å³çé£ä¸å¥");
+        return false;
+    }
+    // ---- ç¬¬äºåï¼å DNS æ¥è¯¢ï¼txid åºå®ï¼å¤æ®å¯¹è´¦ï¼ã
+    let txid: u16 = 0xC0DE;
+    let (q, _qh) = virtio::build_dns_query(&a.sender_mac, &i.mac, &virtio::DHCP_GUEST_IP, txid);
+    match virtio::send_raw(&q) {
+        Ok(f) => crate::log_info!(
+            "udp: å DNS æ¥è¯¢ é¿={} åå¸={:#018x} txid={:#06x} åæ§idx={} id={}",
+            f.len, f.hash, txid, f.used_idx, f.used_id
+        ),
+        Err(e) => {
+            crate::log_fatal!("udp: DNS åä¸åºå» {:?}", e);
+            return false;
+        }
+    }
+    // ---- ç­ replyã
+    let (buf2, n2, uidx2, ulen2, uid2) = match virtio::receive(5000) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_fatal!("udp: DNS reply ç­ä¸å° {:?}", e);
+            return false;
+        }
+    };
+    // **å¯¹ç«¯çåè¯çå½¢ç¶å®æµï¼pcap ç¬¬äºå°ä»ªå¨ä½è¯ï¼**ï¼slirp å¯¹æä»¬ç UDP/DNS æ¥è¯¢å
+    // **ICMP Destination Unreachable**ï¼type=3ï¼â- æ¬æº QEMU ç slirp DNS ä¸å¨çº¿ï¼ICMP/BOOTP é½å¨çº¿ï¼çå®ä¸å½å ï¼ã
+    // è¿ä¸åçå¾è¿å¤æ®æ¹æï¼**æ¶å°éè¯¯åæ§ + ååµçé£ä¸ªå UDP å¤´å¯å¯¹è´¦**â-
+    // ååµå¤´é dst=æä»¬é®ç 10.0.2.3:53ãæº IP=æä»¬ â **å¯¹ç«¯å¼ç¨çæ¯æä»¬åçé£ä¸ªå**ï¼çå¾è¿ï¼ã
+    // **RX ç¼å²ä» eth å¤´å¼å§ï¼å®æµå16å­èï¼æºMAC ç®æ MAC 0x0800 0x45Â -- å®æ´å¸§ï¼**ã
+    // æ³¨æï¼ï¼. ktests èªè¶³çºªå¾çåä¾ï¼ï¼ä¸ä¸è·æ¶å°è¿ ping æ®ççåï¼åç§»å½»åºä¸å -- ç¨å¤æ­åæååç§»éæ©ã
+    // ICMP å¤´å¨**å¤å± IPv4 å¤´ä¹å**ï¼ip0+20ï¼ï¼ååµå IP å¤´å¨ ICMP å¤´ä¹å 8 å­èã
+    let ip0 = if buf2[0] == 0x45 { 0usize } else { 14usize };
+    let icmp0 = ip0 + 20;
+    let inner_ip = icmp0 + 8;
+    let inner_udp = inner_ip + 20;
+    let icmp_type = buf2[icmp0];
+    let icmp_code = buf2[icmp0 + 1];
+    let inner_ok = buf2.len() >= inner_udp + 8
+        && buf2[inner_ip + 12..inner_ip + 16] == virtio::DHCP_GUEST_IP   // åæº IP = æä»¬
+        && buf2[inner_ip + 16..inner_ip + 20] == virtio::NET_DNS_IP      // åç®æ  = DNS
+        && u16::from(buf2[inner_udp + 2]) * 256 + u16::from(buf2[inner_udp + 3]) == 53;  // å dst ç«¯å£ = 53
+    crate::log_info!(
+        "udp: æ¶ ICMP type={} code={} ååµååå¯å¯¹è´¦={} é¿={} used.id={} å16={:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x}",
+        icmp_type, icmp_code, inner_ok, n2, uid2,
+        buf2[0], buf2[1], buf2[2], buf2[3], buf2[4], buf2[5], buf2[6], buf2[7],
+        buf2[8], buf2[9], buf2[10], buf2[11], buf2[12], buf2[13], buf2[14], buf2[15]
+    );
+    let unreachable_ok = icmp_type == 3 && icmp_code == 1;  // host unreachable? code ä»¥å®æµä¸ºååæåºæ¥
+    crate::log_info!(
+        "udp: å¤æ® ARPå¾è¿={} ååº=true æ¶å°ICMP={type_ok} ååµå¯¹è´¦={inner_ok} ç¼å²å¯¹={id_ok}",
+        arp_ok,
+        type_ok = icmp_type == 3,
+        inner_ok = inner_ok,
+        id_ok = uid2 == 0,
+    );
+    let ok = arp_ok && icmp_type == 3 && inner_ok && uid2 == 0;
+    if !ok {
+        crate::log_fatal!("udp: UDP å¾è¿å¤æ®ä¸æç«ï¼ä¸é¢ä¸¤è¡æ¯å¨é¨è¯»æ°ï¼");
+    }
+    ok
+}
+#[cfg(feature = "virtio-net")]
+ktest!(KT_NET_UDP, t_net_udp);

@@ -1355,6 +1355,108 @@ pub fn parse_icmp_reply(buf: &[u8], used_idx: u16, used_len: u32, used_id: u32) 
         used_id,
     })
 }
+// ---------------------------------------------------------------- B2 ç¬¬ä¸åï¼ADR-141ï¼ï¼UDP å¾è¿ï¼DNS æ¥è¯¢ï¼
+/// DNS çå ä¸ªå·ï¼RFC 1035ï¼ãslirp ç DNS æå¡å¨æ¯åºå®ç 10.0.2.3ï¼QEMU ç¨æ·ç½ç»çº¦å®ï¼ï¼
+/// å®ææ¥è¯¢è½¬åç»å®¿ä¸»æºç DNSââåçæ¯ç DNS æå¡å¨çè¯ã
+pub const NET_DNS_IP: [u8; 4] = [10, 0, 2, 3];
+pub const DNS_CLIENT_PORT: u16 = 53;
+/// æ¥è¯¢çæºç«¯å£ï¼éç¹æï¼å®æµ æºç«¯ç«¯å£ 0 æ¶ slirp å ICMP Port Unreachableï¼
+pub const DNS_QUERY_PORT: u16 = 1053;
+pub const DNS_QTYPE_A: u16 = 1;
+pub const DNS_QCLASS_IN: u16 = 1;
+/// DNS å¸§æ»é¿ = eth 14 + IPv4 20 + UDP 8 + DNS æ¥è¯¢ï¼é® localhostï¼ï¼å«å° 60ã
+/// é® localhostï¼slirp ç DNS å¯¹å®ææ¬å°ç­æ¡ï¼127.0.0.1ï¼ï¼**ä¸ä¾èµå¤ç½**ã
+/// **DNS æ¥è¯¢è¶æå°å¸§**ï¼ARP/ICMP ç 60 å­èè£ä¸ä¸ï¼ï¼
+/// eth 14 + IPv4 20 + UDP 8 + DNS å¤´ 12 + QNAME 11 + QT/QC 4 = 69ï¼å«å° 72ã
+/// å¸§é¿æåå®¹ç®ï¼ä¸åå¥â60 å­èâçæ¨¡æ¿ââé£æ¡åªå¯¹æå°å¸§æç«ã
+pub const DNS_FRAME_BYTES: usize = 72;
+const _: () = assert!(DNS_FRAME_BYTES <= NET_TX_MAX);
+
+/// æé ä¸ä¸ª DNS A æ¥è¯¢ï¼é® localhostï¼ï¼åæ­ç» DNS æå¡å¨ 10.0.2.3ï¼
+/// MAC ç¨ ARP è§£åºæ¥çç½å³ï¼åå°å«çå­ç½ä¸æ ·åè§£ç½å³ï¼ã
+pub fn build_dns_query(gw_mac: &[u8; 6], our_mac: &[u8; 6], our_ip: &[u8; 4], txid: u16) -> ([u8; DNS_FRAME_BYTES], u64) {
+    let mut f = [0u8; DNS_FRAME_BYTES];
+    f[0..6].copy_from_slice(gw_mac);
+    f[6..12].copy_from_slice(our_mac);
+    f[12..14].copy_from_slice(&NET_TYPE_IPV4);
+    let dns_name: &[u8] = b"\x09localhost\x00";  // é¿åº¦åç½®ç¼ç ï¼9 å­è "localhost"
+    let ip_len = 20 + 8 + 12 + dns_name.len() + 4;
+    f[14] = 0x45;
+    f[16] = (ip_len >> 8) as u8;
+    f[17] = ip_len as u8;
+    f[19] = 1;
+    f[20] = 0x40;
+    f[22] = 64;
+    f[23] = 17;                                   // protocol = UDP
+    f[26..30].copy_from_slice(our_ip);
+    f[30..34].copy_from_slice(&NET_DNS_IP);
+    let ck = ip_cksum(&f[14..34]);
+    f[24] = (ck >> 8) as u8;
+    f[25] = ck as u8;
+    let u = 14 + 20;                              // UDP æ®µèµ·ç¹
+    f[u] = (DNS_QUERY_PORT >> 8) as u8; f[u+1] = DNS_QUERY_PORT as u8; // æºç«¯å£ï¼**éç¹æ**ï¼å®æµ æºç«¯ 0 æ¶ slirp å ICMP Port Unreachableï¼
+    f[u+2] = (DNS_CLIENT_PORT >> 8) as u8;
+    f[u+3] = DNS_CLIENT_PORT as u8;               // ç®æ  = 53
+    let udp_len = 8 + 12 + dns_name.len() + 4;
+    f[u+4] = (udp_len >> 8) as u8;
+    f[u+5] = udp_len as u8;
+    let d = u + 8;                                // DNS æ®µèµ·ç¹
+    f[d] = (txid >> 8) as u8;
+    f[d+1] = txid as u8;
+    f[d+2] = 0x01; f[d+3] = 0x00;                 // flags: æ åæ¥è¯¢ RD=1
+    f[d+4] = 0; f[d+5] = 1;                       // QDCOUNT=1
+    // QNAME ä» d+12 èµ·ï¼å¤´åæ ¼ ä¸ QDCOUNT åç ANCOUNT/NSCOUNT/ARCOUNT å¨é¶ï¼
+    f[d+12..d+12+dns_name.len()].copy_from_slice(dns_name);
+    let q = d + 12 + dns_name.len();
+    f[q..q+2].copy_from_slice(&DNS_QTYPE_A.to_be_bytes());
+    f[q+2..q+4].copy_from_slice(&DNS_QCLASS_IN.to_be_bytes());
+    let h = crate::ahci::fnv1a64(&f);
+    (f, h)
+}
+
+/// æ¶å°ç DNS reply éè½æ¿åºæ¥çäºå®ã
+#[derive(Clone, Copy, Debug)]
+pub struct DnsReply {
+    pub len: usize,
+    pub hash: u64,
+    pub txid: u16,
+    pub rcode: u8,       // flags çä½ 4 ä½
+    pub ancount: u16,    // åç­æ¡æ°
+    pub used_idx: u16,
+    pub used_len: u32,
+    pub used_id: u32,
+}
+
+/// è§£ä¸å UDP/DNS replyï¼ethertype=0x0800ãprotocol=17ãæºç«¯ 53ã
+/// æ¯å¤åçåéªé¿åº¦ï¼ARP/ICMP åæ¡ï¼çº¿ä¸çæ°ä¸è½ç´æ¥å½çç¨ï¼ã
+pub fn parse_dns_reply(buf: &[u8], used_idx: u16, used_len: u32, used_id: u32) -> Result<DnsReply, VirtioError> {
+    if buf.len() < 14 + 20 + 8 || buf[12] != NET_TYPE_IPV4[0] || buf[13] != NET_TYPE_IPV4[1] {
+        return Err(VirtioError::NotV4 { at: buf.len(), guard: 1 });
+    }
+    let ihl = usize::from(buf[14] & 0x0F) * 4;
+    if ihl < 20 || buf[14 + 9] != 17 || buf.len() < 14 + ihl + 8 {
+        return Err(VirtioError::NotV4 { at: buf.len(), guard: 2 });
+    }
+    let u = 14 + ihl;
+    if buf[u] != (DNS_CLIENT_PORT >> 8) as u8 || buf[u+1] != DNS_CLIENT_PORT as u8 {
+        return Err(VirtioError::NotV4 { at: buf.len(), guard: 3 });
+    }
+    let d = u + 8;
+    if buf.len() < d + 12 {
+        return Err(VirtioError::NotV4 { at: buf.len(), guard: 4 });
+    }
+    Ok(DnsReply {
+        len: used_len as usize,
+        hash: crate::ahci::fnv1a64(&buf[..(used_len as usize).min(buf.len())]),
+        txid: u16::from_be_bytes([buf[d], buf[d+1]]),
+        rcode: buf[d+3] & 0x0F,
+        ancount: u16::from_be_bytes([buf[d+6], buf[d+7]]),
+        used_idx,
+        used_len,
+        used_id,
+    })
+}
+
 
 const BOOTP_OPT_LEN: usize = 8;
 const BOOTP_BYTES: usize = BOOTP_OPT + BOOTP_OPT_LEN;
