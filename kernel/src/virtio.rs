@@ -1164,9 +1164,9 @@ pub const DHCP_GUEST_IP: [u8; 4] = [10, 0, 2, 15];
 /// 所以这条只能靠**对端自己写下来的那四个字节**来纠正：真机上的服务器会直接丢掉这一份请求。
 pub const DHCP_MAGIC: [u8; 4] = [99, 130, 83, 99];
 pub const OPT_MSG_TYPE: u8 = 53;
-/// DHCP option 1ï¼å­ç½æ©ç ï¼ADR-147 çè·¯ç±å¤æ®ï¼ã
+/// DHCP option 1：子网掩码（ADR-147 的路由判据）。
 pub const OPT_SUBNET_MASK: u8 = 1;
-/// DHCP option 3ï¼è·¯ç±å¨åè¡¨ï¼åç¬¬ä¸ä¸ª = é»è®¤ç½å³ï¼ã
+/// DHCP option 3：路由器列表（取第一个 = 默认网关）。
 pub const OPT_ROUTER: u8 = 3;
 pub const OPT_END: u8 = 255;
 pub const OPT_PAD: u8 = 0;
@@ -1450,11 +1450,11 @@ pub fn arp_stats() -> ArpStats {
     ArpStats { hits: t.hits, misses: t.misses, learns: t.learns, evicts: t.evicts }
 }
 
-/// `arp_stats` çåæå¥å£ï¼ææ¸¸æ æ**è¡¨é¡¹**è¯»åºæ¥ï¼ADR-145ï¼`ip neigh` çè¯»æ°ééï¼ã
-/// æ¯æ¡**å®é¿ 10 å­è**ï¼IP4 + MAC6ï¼ç´§æåå° `out`ã
-/// è¿ååå¥çæ¡æ°ï¼`cursor` è¶è¿è¡¨é¿æ¶è¿ 0ï¼åé¡µçç»ç¹ï¼ã
+/// `arp_stats` 的同族入口：按游标把**表项**读出来（ADR-145：`ip neigh` 的读数通道）。
+/// 每条**定长 10 字节**：IP4 + MAC6，紧排写到 `out`。
+/// 返回写入的条数；`cursor` 超过表长时返 0（分页的终点）。
 pub fn arp_read_from(cursor: u32, out: &mut [u8]) -> usize {
-    // SAFETY: å `arp_lookup`ã
+    // SAFETY: 同 `arp_lookup`。
     let t = unsafe { &*ARP.0.get() };
     let mut n = 0usize;
     let mut i = cursor as usize;
@@ -1468,9 +1468,9 @@ pub fn arp_read_from(cursor: u32, out: &mut [u8]) -> usize {
     n
 }
 
-/// è¡¨éå½åæå¤å°é¡¹ï¼`ip neigh` åé¡µçä¸çï¼ã
+/// 表里当前有多少项（`ip neigh` 分页的上界）。
 pub fn arp_len() -> u32 {
-    // SAFETY: å `arp_lookup`ã
+    // SAFETY: 同 `arp_lookup`。
     let t = unsafe { &*ARP.0.get() };
     t.n as u32
 }
@@ -1507,19 +1507,19 @@ pub fn next_hop(our_ip: &[u8; 4], mask: &[u8; 4], dst: &[u8; 4]) -> [u8; 4] {
     if is_local_subnet(our_ip, mask, dst) { *dst } else { NET_GATEWAY_IP }
 }
 
-/// RFC 826 çè¢«å¨å­¦ä¹ ï¼ADR-146ï¼ï¼æ¶å°ä¸å¸§å°±çå®æ¯ä¸æ¯ ARPï¼
-/// æ¯å°±æ sender é£ä¸å¯¹ (ip, mac) æ merge è§åå½è¿è¡¨ã
+/// RFC 826 的被动学习（ADR-146）：收到一帧就看它是不是 ARP，
+/// 是就把 sender 那一对 (ip, mac) 按 merge 规则归进表。
 ///
-/// **ä¸ºä»ä¹å¨æ¶å¸§è·¯å¾ä¸å­¦**ï¼ç¨æ·æ `ping` èªå·±åå¹¿æ­ ARPï¼
-/// å®ä¸ä¼ä¸æ¥ââå¨æ¶å¸§å¤è¢«å¨å­¦ï¼ä¸¤æ¡ ARP å®ç°å°±ä¸åæ¯"åèªç®¡èªå·±"ã
-/// è¡ä¸ºå½¢ç¶ä¸è¯»çæ¯**åå¸§**ï¼ä» eth å¤´èµ·ï¼ï¼`ethertype==0x0806` ä¸é¿åº¦>=42ã
-/// ä¸ç®¡æ¯ request è¿æ¯ replyï¼ä¸¤èç sender å­æ®µå¨åä¸ä¸ªåç§»ä¸ã
-/// è¿å `true` = è¿ä¸å¸§è®¤çè¢«å­¦äºï¼å¤æ®è¯»æ°ï¼ã
+/// **为什么在收帧路径上学**：用户态 `ping` 自己发广播 ARP，
+/// 它不会上报——在收帧处被动学，两条 ARP 实现就不再是"各自管自己"。
+/// 行为形状与读的是**原帧**（从 eth 头起）：`ethertype==0x0806` 且长度>=42。
+/// 不管是 request 还是 reply：两者的 sender 字段在同一个偏移上。
+/// 返回 `true` = 这一帧认真被学了（判据读数）。
 pub fn arp_learn_from_frame(f: &[u8]) -> bool {
     if f.len() < 42 { return false; }
-    // ethertype å¨ 12..14ï¼ARP æ¯ 0x0806
+    // ethertype 在 12..14；ARP 是 0x0806
     if f[12] != 0x08 || f[13] != 0x06 { return false; }
-    // éªè¯åæï¼htype=1(Ethernet)ãptype=0x0800(IPv4)ãhlen=6ãplen=4
+    // 验证前提：htype=1(Ethernet)、ptype=0x0800(IPv4)、hlen=6、plen=4
     if f[14] != 0 || f[15] != 1 { return false; }
     if f[16] != 0x08 || f[17] != 0x00 { return false; }
     if f[18] != 6 || f[19] != 4 { return false; }
@@ -1527,9 +1527,9 @@ pub fn arp_learn_from_frame(f: &[u8]) -> bool {
     ip.copy_from_slice(&f[28..32]);
     let mut mac = [0u8; 6];
     mac.copy_from_slice(&f[22..28]);
-    // å¨é¶ sender ä¸å­¦ï¼é£æ¯æ¢é/æªåå§åçå½¢ç¶ï¼
+    // 全零 sender 不学（那是探针/未初始化的形状）
     if mac == [0u8; 6] || ip == [0u8; 4] { return false; }
-    // ä¸å­¦èªå·±ï¼èªå·±ç IP/MAC ä¸æ¯"é»å±"ï¼
+    // 不学自己（自己的 IP/MAC 不是"邻居"）
     if ip == DHCP_GUEST_IP { return false; }
     arp_learn(&ip, &mac);
     true
