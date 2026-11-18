@@ -676,6 +676,15 @@ public_api = [
   "virtio::write_block",
   "virtio::read_block_at",
   "virtio::write_block_at",
+  # ADR-143：网卡三原语的用户态出口（33/34/35 号）与帧构造常量
+  "virtio::NET_TX_MAX",
+  "virtio::DHCP_GUEST_IP",
+  "virtio::NET_GATEWAY_IP",
+  "virtio::NET_DNS_IP",
+  "virtio::bind_net",
+  "virtio::send_raw",
+  "virtio::receive",
+  "virtio::net_info",
 ]
 allowed_callers = ["capability", "diagnostics", "integration", "sched"]
 dependencies = ["arch", "boot", "driver", "irq", "memory", "pci", "time"]

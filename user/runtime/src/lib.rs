@@ -1013,3 +1013,97 @@ pub unsafe fn find_console(si_va: u64) -> Option<Handle> {
     }
     None
 }
+
+/// 33/34/35（ADR-143）：网卡三原语（帧收发 + 读数包）。
+pub const SYS_NET_SEND: u64 = 33;
+pub const SYS_NET_RECV: u64 = 34;
+pub const SYS_NET_INFO: u64 = 35;
+/// 网卡读数包（18 字节定长）：MAC6 + 本机 IP4 + 网关4 + DNS4。
+pub const NET_INFO_BYTES: usize = 18;
+
+/// 33：把一帧交给网卡。`frame` ≤ 1514；成功 Ok(())，形状/IO 错误如实回。
+pub fn net_send(frame: &[u8]) -> Result<(), RTError> {
+    if frame.is_empty() || frame.len() > 1514 {
+        return Err(RTError::INVALID);
+    }
+    // SAFETY: 33 号 rdi=帧指针、rsi=len（内核 copy_from_user 校验用户半区）。
+    let ret = unsafe { syscall_abi(SYS_NET_SEND, frame.as_ptr() as u64, frame.len() as u64, 0, 0) };
+    if ret == 0 { Ok(()) } else { Err(RTError(ret as i64)) }
+}
+
+/// 34：有界等一帧。`Ok(0)` = 超时；`Ok(n)` = 收到 n 字节（写进 `buf`，帧从 eth 头起）。
+pub fn net_recv(buf: &mut [u8], timeout_ms: u64) -> Result<usize, RTError> {
+    if buf.is_empty() || buf.len() > 2048 || timeout_ms > 60_000 {
+        return Err(RTError::INVALID);
+    }
+    // SAFETY: 34 号 rdi=buf、rsi=cap、rdx=timeout_ms（内核 copy_to_user 写回）。
+    let ret = unsafe { syscall_abi(SYS_NET_RECV, buf.as_mut_ptr() as u64, buf.len() as u64, timeout_ms, 0) };
+    Ok(ret as usize)
+}
+
+/// 35：读网卡读数包（MAC/本机 IP/网关/DNS，18 字节）。
+pub fn net_info() -> Result<[u8; NET_INFO_BYTES], RTError> {
+    let mut blk = [0u8; NET_INFO_BYTES];
+    // SAFETY: 35 号 rdi=buf（内核 copy_to_user 写回 18 字节定长）。
+    // 检查用**符号位**（实测 35 号成功回写入字节数 18 而不是 0，按 ret==0 判会把成功读成 Err(18)）。
+    let ret = unsafe { syscall_abi(SYS_NET_INFO, blk.as_mut_ptr() as u64, 0, 0, 0) } as i64;
+    if ret < 0 { Err(RTError(ret)) } else { Ok(blk) }
+}
+
+/// 构造一帧 ICMP echo request（ADR-140 的内核形状在用户库的镜像）。
+/// `gw_mac` 来自 ARP（用户态自己发 request 解），填到 60（最小帧）。
+pub fn net_build_icmp(gw_mac: &[u8; 6], our_mac: &[u8; 6], our_ip: &[u8; 4], dst_ip: &[u8; 4], seq: u16) -> [u8; 60] {
+    let mut f = [0u8; 60];
+    f[0..6].copy_from_slice(gw_mac);
+    f[6..12].copy_from_slice(our_mac);
+    f[12..14].copy_from_slice(&[0x08, 0x00]);
+    f[14] = 0x45;
+    f[16] = 0; f[17] = 40;
+    f[20] = 0x40; f[22] = 64; f[23] = 1;
+    f[26..30].copy_from_slice(our_ip);
+    f[30..34].copy_from_slice(dst_ip);
+    // **IPv4 头校验和必须算**（实测：漏掉它的帧→slirp 丢弃，永远等不到 echo reply；pcap 里只有发出的 t=8）。
+    let mut isum: u32 = 0;
+    let mut ik = 14usize;
+    while ik < 34 {
+        isum += u32::from(f[ik]) << 8 | u32::from(f[ik + 1]);
+        ik += 2;
+    }
+    isum = (isum >> 16) + (isum & 0xFFFF);
+    isum = (isum >> 16) + (isum & 0xFFFF);
+    let icks = !(isum as u16);
+    f[24] = (icks >> 8) as u8;
+    f[25] = icks as u8;
+    let ic = 34;
+    f[ic] = 8;
+    f[ic+4..ic+6].copy_from_slice(&0xA5A5u16.to_be_bytes());
+    f[ic+6..ic+8].copy_from_slice(&seq.to_be_bytes());
+    for k in 0..16 { f[ic+8+k] = 0xA5; }
+    let mut sum: u32 = 0;
+    let mut k = 0usize;
+    while k + 1 < 20 {
+        sum += u32::from(f[ic+k]) << 8 | u32::from(f[ic+k+1]);
+        k += 2;
+    }
+    sum = (sum >> 16) + (sum & 0xFFFF);
+    let cks = !(sum as u16);
+    f[ic+2] = (cks >> 8) as u8;
+    f[ic+3] = cks as u8;
+    f
+}
+
+/// 构造一帧 ARP request（问谁有 `target_ip`）。42 字节。
+pub fn net_build_arp(our_mac: &[u8; 6], our_ip: &[u8; 4], target_ip: &[u8; 4]) -> [u8; 42] {
+    let mut f = [0u8; 42];
+    f[0..6].copy_from_slice(&[0xFF; 6]);
+    f[6..12].copy_from_slice(our_mac);
+    f[12..14].copy_from_slice(&[0x08, 0x06]);
+    f[14..16].copy_from_slice(&1u16.to_be_bytes());
+    f[16..18].copy_from_slice(&0x0800u16.to_be_bytes());
+    f[18] = 6; f[19] = 4;
+    f[20..22].copy_from_slice(&1u16.to_be_bytes());
+    f[22..28].copy_from_slice(our_mac);
+    f[28..32].copy_from_slice(our_ip);
+    f[38..42].copy_from_slice(target_ip);
+    f
+}

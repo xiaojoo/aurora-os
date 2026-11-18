@@ -23,7 +23,7 @@ use crate::{
     M_ABI, M_BYE, M_DEAD, M_FREE_PAGES, M_FREE_PFX, M_FREE_THR, M_HELP, M_LIVE, M_MINUS, M_NL,
     M_PING, M_PS_ERR, M_PS_HDR, M_PS_NOJOB, M_RUN_ERR, M_RUN_EXIT, M_RUN_PREFIX, M_RUN_TIMEOUT,
     M_DMESG_ERR, M_DMESG_HDR, M_DMESG_USAGE, M_KILLED, M_KILL_USAGE, M_LSPCI_USAGE,
-    M_RUN_USAGE, M_SLEEP_USAGE, M_SP, M_TOP_FRAME, M_UPTIME_USAGE,
+    M_PING_DOT, M_PING_FROM, M_PING_SEQ, M_PING_TIMEOUT, M_PING_USAGE, M_RUN_USAGE, M_SLEEP_USAGE, M_SP, M_TOP_FRAME, M_UPTIME_USAGE,
     M_TOP_USAGE, M_TRYHELP, M_UNKNOWN,
 };
 
@@ -110,12 +110,130 @@ fn cmd_echo(c: &Ctx) -> bool {
     true
 }
 
+#[inline(never)]
 fn cmd_ping(c: &Ctx) -> bool {
-    // A2 接线：1 号调用迁到 `rt::ping()`（返回值同义：内核服务计数）。
-    let n = rt::ping();
-    con_write(c.h, msg(M_PING));
-    put_u64(c.h, n);
+    // ADR-143：`ping <ip>` —— 用户态 ICMP 往返（帧构造在 runtime，收发走 33/34 号）。
+    // 旧的 1 号服务计数语义并入 `abi`（同一读数，A2 时代的形状不再独占一个命令名）。
+    let arg = match (c.p.err.is_none(), c.p.args.get(0)) {
+        (true, Some(a)) => a,
+        _ => {
+            con_write(c.h, msg(M_PING_USAGE));
+            return true;
+        }
+    };
+    // 点分十进制：四段，每段 1..3 位数字、0..=255（越界/缺段 ⇒ usage）。
+    let mut ip = [0u8; 4];
+    let mut seg = 0usize;
+    let mut val: u32 = 0;
+    let mut digits = 0usize;
+    let mut ok_parse = true;
+    let mut k = 0usize;
+    while k < arg.len() {
+        let ch = match arg.get(k) {
+            Some(v) => *v,
+            None => break,
+        };
+        if ch >= b'0' && ch <= b'9' {
+            val = val * 10 + u32::from(ch - b'0');
+            digits += 1;
+            if digits > 3 || val > 255 { ok_parse = false; break; }
+        } else if ch == b'.' {
+            if digits == 0 || seg >= 3 { ok_parse = false; break; }
+            match ip.get_mut(seg) { Some(s) => *s = val as u8, None => {} }
+            seg += 1; val = 0; digits = 0;
+        } else {
+            ok_parse = false; break;
+        }
+        k += 1;
+    }
+    if !ok_parse || digits == 0 || seg != 3 {
+        con_write(c.h, msg(M_PING_USAGE));
+        return true;
+    }
+    match ip.get_mut(3) { Some(s) => *s = val as u8, None => {} }
+    let info = match rt::net_info() {
+        Ok(v) => v,
+        Err(e) => {
+            put_i64(c.h, e.0);
+            con_write(c.h, msg(M_NL));
+            return true;
+        }
+    };
+    let mut our_mac = [0u8; 6];
+    for (d, s) in our_mac.iter_mut().zip(info.get(0..6).unwrap_or(&[]).iter()) { *d = *s; }
+    let mut our_ip = [0u8; 4];
+    for (d, s) in our_ip.iter_mut().zip(info.get(6..10).unwrap_or(&[]).iter()) { *d = *s; }
+    // ARP request（42 字节，构造在 runtime）。**RX 队列不保证干净**（ADR-141
+    // 教训）：循环等到 opcode=2 的 ARP reply，最多 4 包。
+    let arp = rt::net_build_arp(&our_mac, &our_ip, &ip);
+    if rt::net_send(&arp).is_err() {
+        con_write(c.h, msg(M_PING_USAGE));
+        return true;
+    }
+    let mut rbuf = [0u8; 512];
+    let mut arp_ok = false;
+    let mut tries = 0usize;
+    while tries < 4 {
+        tries += 1;
+        match rt::net_recv(&mut rbuf, 1500) {
+            Ok(n) if n > 20 => {
+                let op = match (rbuf.get(20), rbuf.get(21)) { (Some(a), Some(c)) => u16::from(*a) * 256 + u16::from(*c), _ => 0 };
+                if op == 2 {
+                    arp_ok = true;
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    if !arp_ok {
+        con_write(c.h, msg(M_PING_TIMEOUT));
+        con_write(c.h, msg(M_NL));
+        return true;
+    }
+    let mut gw_mac = [0u8; 6];
+    for (d, s) in gw_mac.iter_mut().zip(rbuf.get(22..28).unwrap_or(&[]).iter()) { *d = *s; }
+    let f = rt::net_build_icmp(&gw_mac, &our_mac, &our_ip, &ip, 1);
+    if rt::net_send(&f).is_err() {
+        con_write(c.h, msg(M_PING_USAGE));
+        return true;
+    }
+    let mut icmp_ok = false;
+    let mut rn2 = 0usize;
+    let mut tries2 = 0usize;
+    while tries2 < 4 {
+        tries2 += 1;
+        match rt::net_recv(&mut rbuf, 1500) {
+            Ok(n) if n > 40 => {
+                rn2 = n;
+                let t34 = rbuf.get(34).copied().unwrap_or(0xFF);
+                if t34 == 0 {
+                    icmp_ok = true;
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    if !icmp_ok {
+        con_write(c.h, msg(M_PING_TIMEOUT));
+        con_write(c.h, msg(M_NL));
+        return true;
+    }
+    // reply：IP 头 14..34（src 26..30），ICMP 段 34..（type 34、id 38..40、seq 40..42）。
+    let reply_type = rbuf.get(34).copied().unwrap_or(0xFF);
+    let reply_id = match (rbuf.get(38), rbuf.get(39)) { (Some(a), Some(c)) => u16::from(*a) * 256 + u16::from(*c), _ => 0 };
+    let reply_seq = match (rbuf.get(40), rbuf.get(41)) { (Some(a), Some(c)) => u16::from(*a) * 256 + u16::from(*c), _ => 0 };
+    let _ = reply_id;
+    con_write(c.h, msg(M_PING_FROM));
+    put_u64(c.h, u64::from(ip[0])); con_write(c.h, msg(M_PING_DOT));
+    put_u64(c.h, u64::from(ip[1])); con_write(c.h, msg(M_PING_DOT));
+    put_u64(c.h, u64::from(ip[2])); con_write(c.h, msg(M_PING_DOT));
+    put_u64(c.h, u64::from(ip[3]));
+    con_write(c.h, msg(M_PING_SEQ));
+    put_u64(c.h, u64::from(reply_seq));
     con_write(c.h, msg(M_NL));
+    let _ = reply_type;
     true
 }
 

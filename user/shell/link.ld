@@ -8,6 +8,8 @@
  * overlaps with .rodata`（S5c 实测）；ADR-133 的 `top`（排序 + 帧打印 + sleep）再涨
  * ~2.5 KiB，提到 20 KiB。ADR-136/137 的 lspci/uptime 再涨 ~2 KiB，
  * 20 KiB 又不够（本轮实测：dispatch 的 32S 重定位 out of range），提到 24 KiB。
+ * ADR-143 的 ping（点分十进制解析 + 两次收发循环）再涨 ~2 KiB，24 KiB 又不够
+ * （本轮实测：.text 结束 0x100006xxx > .rodata 起点），提到 32 KiB。
  * 段仍各自 ALIGN(4K)，窗口约束不变。
  */
 
@@ -29,13 +31,13 @@ SECTIONS {
     *(.text .text.*)
   } :text
 
-  . = 0x100006000;
+  . = 0x100008000;
   .rodata ALIGN(4K) : {
     *(.rodata .rodata.*)
     *(.rdata)
   } :rodata
 
-  . = 0x100008000;
+  . = 0x100009000;
   .data ALIGN(4K) : {
     *(.data .data.*)
   } :data

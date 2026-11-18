@@ -3855,7 +3855,8 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
         ]
     # 一次性实验用的附加参数（例如 `-device intel-iommu,intremap=on` 去真正解析 DMAR）。
     # 走环境变量而不是加一堆子命令开关：这类实验今天要做、明天可能就废，不该进判定链的默认路径。
-    if NET_FEATURES & set(features):
+    # ADR-143ï¼ç½å¡è®¾å¤**æ æ¡ä»¶æç» QEMU**ï¼ä¹ååªæ virtio-net æ¡£æãå®æµ a3-shell æ¡£ç ping æ¾ä¸å°è®¾å¤ â NoDeviceï¼ãè®¾å¤å¨ä½æ²¡äºº claim å¯¹å¶å®æ¡£æ å®³ã
+    if NET_FEATURES & set(features) or "a3-shell" in set(features):
         # 抓包文件每次重开：上一跑的包会被读成这一跑发出去的（实测那类"旧证据冒充新事实"
         # 在 scratch 夹具上已经栽过一次，这里不重复）
         PCAP.unlink(missing_ok=True)
@@ -7893,6 +7894,23 @@ def check_gpt(log: str) -> list[str]:
     return False
 
 
+def _ping_row(log: str) -> bool:
+    """`ping 10.0.2.2` ççå¾è¿å¤æ®ï¼ADR-143ï¼ã
+
+    åæ¾ `ping 10.0.2.2` ä¹åï¼å¿é¡»åºç° `from 10.0.2.2: seq=<æ°>`
+    ï¼è¯´æ echo reply ççåæ¥äºï¼ãusage ä¸ `timeout` é½ä¸ç®éã
+    """
+    import re
+    lines = log.split("\n")
+    for k, ln in enumerate(lines):
+        if ln.strip() != "ping 10.0.2.2":
+            continue
+        for j in range(k + 1, min(k + 6, len(lines))):
+            if re.match(r"from 10\.0\.2\.2: seq=\d+$", lines[j].strip()):
+                return True
+    return False
+
+
 def _top_sleep_gap(log: str) -> bool:
     """`top 2` 的帧间睡眠必须真阻塞（ADR-133 的欠账，§401 修）。
 
@@ -8733,6 +8751,10 @@ def do_test(timeout: int) -> int:
         # §402 曾因"12 条 argv 早停"暂撤本格；§403 复跑证实那次是宿主机抖动
         # （同内核同 argv 单跑全 12 条执行完、15.1s），格子接回。
         _top_sleep_gap(ashlog),
+        # pingï¼ADR-143ï¼ï¼argv é `ping 10.0.2.2`
+        # å¤æ®å½¢ç¶ï¼åæ¾ä¹åå¿é¡»åºç°ä¸è¡ `from 10.0.2.2: seq=æ°`
+        # ï¼ç ICMP å¾è¿çè¯»æ°ï¼ï¼usage/è¶æ¶é½ä¸ç®éã
+        _ping_row(ashlog),
     ))
     _tot = EXEC_TOTAL_RE.search(ashlog)
     if not _tot or int(_tot.group(1)) < 1 or int(_tot.group(2)) != 0:

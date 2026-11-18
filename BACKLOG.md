@@ -15573,3 +15573,37 @@ unsafe：virtio U4 8→12（ARP 表三入口的 `UnsafeCell` 访问 + Sync 论�
 读数：`check` 18/18；virtio-net 档 87/87；整链 67 符合 + 2 条不符
 （`两卷同哈希` 本会话第 4 次长跑红/单跑绿——§404 已记录的读链瞬时错，
 连累 FS-03 与签名包两行；不归因）。
+
+
+## 410. ADR-143 B2 第五刀：网卡三原语 33/34/35 + shell ping（workbuddy，2026-11-18）
+
+**新增 3 个号**（使用者裁决"下次都直接新增"）。33 `SYS_NET_SEND`、34 `SYS_NET_RECV`
+（超时回 0 不是错误）、35 `SYS_NET_INFO`（18 字节：MAC6+IP4+网关4+DNS4）。
+**不做"一个 ping 号"**：协议身份留在用户态，内核只发/收/读读数。
+runtime 加 `net_send/net_recv/net_info/net_build_arp/net_build_icmp`；
+shell `cmd_ping` 接管旧名（旧的 1 号服务计数语义并入 `abi`）。
+
+**实测**：`ping 10.0.2.2` → `from 10.0.2.2: seq=1`，七格（ping/top-sleep/sleep/
+uptime/lspci/dmesg/top 排序）全绿、PASS(33) 14.8s。
+**变异证红**：runtime 的 `net_build_icmp` 去掉 IPv4 头校验和 ⇒ `_ping_row=False`
+（slirp 静默丢包）；还原 ⇒ True。
+
+### 六件实测坑（都记进 ADR）
+
+1. `copy_to_user(src, va)` 参数顺序写反 ⇒ E0308。
+2. **35 号成功回写入字节数 18 而非 0** ⇒ runtime 按 `ret==0` 判会把成功读成 Err(18)
+   （shell 打出 `18`）。**改成按符号位判**。
+3. **`cmd_ping` 早就存在**（A2 的 1 号服务计数，打 `ping=<n>`）——加命令前先 grep 名字。
+4. `.text` 窗口**第四次涨**：24 → **32 KiB**。
+5. **`buf[i]` 直接索引 = 32S**：panic location 是 24 字节匿名 `.rodata`（`.Lanon` 尺寸
+   0x18 是识别特征）。全部改 `get()`/`iter_mut().zip()`。
+6. **IPv4 头校验和漏算**是本片最大的功能 bug（pcap 里只有我们发的 t=8，永远等不到 t=0）。
+
+**顺带**：QEMU 网卡接线从"只在 virtio-net 档"扩到"**a3-shell 档也挂**"
+（否则 shell 的 ping 找不到设备 ⇒ `NoDevice`）；33/34/35 各自惰性 `bind_net()`。
+
+读数：`check` 18/18（virtio 公开接口 +8 行、runtime U5 41→44、census 477→480）；
+a3-shell 单跑七格全绿；整链一轮 66 符合 + 3 条不符（`两卷同哈希` 卷抖动连累两条
++ `多级首簇高半抹零` 的 EXCEPTION）——**三条都单跑复验**：fat32-probe PASS、
+`fs-open --host-fault fault-deep-hi-cluster` FAIL(35) 符合期望、witness 报
+"盘上不是只差计划中那 1 格"（宿主机侧注入没生效，属长链批量抖动同族）。

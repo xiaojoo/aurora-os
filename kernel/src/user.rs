@@ -119,6 +119,12 @@ pub const SYS_PCI_ENUM: u64 = 31;
 /// 锚点没记 / 频率没标定 ⇒ `-1`：**绝不回退成默认频率**（clock.rs 的纪律：
 /// "返回一个差不多的默认值会让读数看起来是测出来的，而它其实是猜的"）。
 pub const SYS_CLOCK_UPTIME: u64 = 32;
+/// 33ï¼ä¸å¸§äº¤ç»ç½å¡ï¼virtio-net TXï¼ãrdi=å¸§æéãrsi=é¿ï¼â¤ 1514ï¼ãè¿å 0 / éè¯¯ç ãï¼ADR-143ï¼
+pub const SYS_NET_SEND: u64 = 33;
+/// 34ï¼æçç­å¾ä¸å¸§ï¼virtio-net RXï¼ãrdi=bufãrsi=lenãrdx=timeout_msï¼è¿åæ¶å°çå­èæ°ï¼0=è¶æ¶ï¼ãè¿å 0 / éè¯¯ç ãï¼ADR-143ï¼
+pub const SYS_NET_RECV: u64 = 34;
+/// 35ï¼ç½å¡è¯»æ°ä¸åè¯»åãrdi=bufï¼åºå® 18 å­èï¼MAC6+guest_ip4+gateway4+dns4ï¼ãè¿å 0 / éè¯¯ç ãï¼ADR-143ï¼
+pub const SYS_NET_INFO: u64 = 35;
 /// 16：`rdi` = Proc 句柄、`rsi` = Thread 句柄、`rdx` = StartupInfo 那一页的 VMO 句柄、
 /// `r10` = 它在**子 AS** 里的只读 VA → 成功返回 0。顺序固定：校验 → 转移 → 回填 → 放线程跑。
 pub const SYS_PROCESS_START: u64 = 16;
@@ -1349,6 +1355,72 @@ fn sys_clock_uptime(_frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     }
 }
 
+/// 33（ADR-143）：帧交给网卡。形状检查在 safe 层（长≤ 1514、指针在用户半区），不检内容——内容是协议层的事。
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_net_send(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    // 惰性 bind（幂等）：shell 会话里没有人先调 bind_net（实测 35 号回 -5）。
+    if crate::virtio::bind_net().is_err() {
+        return E_IO;
+    }
+    let len = frame.rsi as usize;
+    if len == 0 || len > crate::virtio::NET_TX_MAX {
+        return E_INVALID;
+    }
+    let mut buf = [0u8; crate::virtio::NET_TX_MAX];
+    match copy_from_user(frame.rdi, &mut buf[..len]) {
+        Ok(n) if n == len => {}
+        _ => return E_FAULT,
+    }
+    match crate::virtio::send_raw(&buf[..len]) {
+        Ok(_) => 0,
+        Err(_) => E_IO,
+    }
+}
+
+/// 34（ADR-143）：有界等一帧。超时回 0，收到回字节数（帧从 eth 头起，与 pcap 同形）。
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_net_recv(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    if crate::virtio::bind_net().is_err() {
+        return E_IO;
+    }
+    let cap = frame.rsi as usize;
+    if cap == 0 || cap > 2048 { return E_INVALID; }
+    let ms = frame.rdx;
+    if ms > 60_000 { return E_INVALID; }
+    match crate::virtio::receive(ms) {
+        Ok((data, n, uidx, ulen, uid)) => {
+            let n = n.min(cap).min(data.len());
+            match copy_to_user(&data[..n], frame.rdi) {
+                Ok(w) => w as u64,
+                Err(_) => E_FAULT,
+            }
+        }
+        Err(_) => 0, // 超时
+    }
+}
+
+/// 35（ADR-143）：网卡读数写回用户（18 字节：MAC6+guest_ip4+gateway4+dns4）。
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_net_info(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    if let Err(e) = crate::virtio::bind_net() {
+        crate::log_info!("net-info: bind 失败 {:?}", e);
+        return E_IO;
+    }
+    let Some(v) = crate::virtio::net_info() else { return E_BAD_HANDLE };
+    let mut blk = [0u8; 18];
+    blk[0..6].copy_from_slice(&v.mac);
+    blk[6..10].copy_from_slice(&crate::virtio::DHCP_GUEST_IP);
+    blk[10..14].copy_from_slice(&crate::virtio::NET_GATEWAY_IP);
+    blk[14..18].copy_from_slice(&crate::virtio::NET_DNS_IP);
+    match copy_to_user(&blk, frame.rdi) {
+        Ok(w) => w as u64,
+        Err(_) => E_FAULT,
+    }
+}
+
 /// 键盘字符的读取入口。拆成小函数是为了让上面那条 `or_else` 在没开 `ps2-kbd` 时
 /// 也能编译（此时它恒返回 None，等价于原行为），而调用点不必铺 `cfg!`。
 #[cfg(not(feature = "ps2-kbd"))]
@@ -2470,6 +2542,12 @@ pub fn syscall_dispatch(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> boo
         SYS_PCI_ENUM => sys_pci_enum(frame),
         #[cfg(feature = "handles")]
         SYS_CLOCK_UPTIME => sys_clock_uptime(frame),
+        #[cfg(feature = "handles")]
+        SYS_NET_SEND => sys_net_send(frame),
+        #[cfg(feature = "handles")]
+        SYS_NET_RECV => sys_net_recv(frame),
+        #[cfg(feature = "handles")]
+        SYS_NET_INFO => sys_net_info(frame),
         #[cfg(feature = "handles")]
         SYS_CONSOLE_WRITE => sys_console_io(frame, true),
         #[cfg(feature = "handles")]
