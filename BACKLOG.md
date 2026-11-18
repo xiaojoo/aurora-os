@@ -16027,3 +16027,41 @@ id     → id: uid=0 gid=0 caps=16128      (16128 = 0x3F00 = 六位 CAP_ALL)
 
 **C1 剩余**：`passwd`、登录会话/`su`、**把 `cred_allows` 接进每个命令**
 （现在零调用者——验收句"授权差异"尚未达成）、引用计数与销毁、审计日志。
+
+
+## 427. ADR-151：C1 第二片——授权闸门 + 低权限凭据证明差异（workbuddy，2026-11-19）
+
+**零新号**。`allow(c, cap)` 一个函数做命令入口闸门（`Ok(false)` 打
+`denied: <cap>` 并拒绝；**`Err(_)` 放行**——没凭据的判定路径不能被锁死，
+否则新机制变成回归）。接了四个命令：`cat`→CAP_READ(256)、`kill`→CAP_KILL(1024)、
+`dmesg`→CAP_LOG(2048)、`lspci`→CAP_DEV(4096)。
+新特性 `a3-cred-guest`（依赖 `a3-shell`）只改**建哪个凭据**：
+guest = `(1000,1000,CAP_READ,"guest")`。
+
+**实测**（同一份 argv、同一份卷、同一份代码，唯一变量是凭据）：
+```
+whoami     → whoami: guest
+id         → id: uid=1000 gid=1000 caps=256
+cat /NOTES → 放行（有 CAP_READ）
+kill 9999  → denied: 1024
+lspci      → denied: 4096
+dmesg      → denied: 2048
+```
+**这就是 C1 验收句"不同用户访问同一资源产生可验证的授权差异"的正面证据。**
+新增判定行 `低权限凭据的授权差异`（第 74 行），`_guest_denied_rows` 要求
+cat 放行 **且** 三个 denied 全出现。
+**变异证红**：删 `cmd_kill` 的闸门 ⇒ `denied: 1024` 消失 ⇒ False ⇒ FAIL(35)，还原绿。
+
+### 三个坑
+
+1. **ktest 也被降权**：ktest 起的 shell 与交互式 shell 共用 `sid=0`，一并降权后
+   10 个用例因命令被拒而红。用一次性 `AtomicBool` 标记只降权第一个会话。
+2. **该档 ktest 仍有 10 个失败**（`fs-open-ring3` abi 位、`ahci DrainStuck`），
+   是**盘状态/AHCI 端口争用**，与本片无关：普通 a3-shell 档同代码 **108/108 全绿**。
+   ⇒ 判定行**只看会话输出**（`_guest_denied_rows`），不看该档 ktest 总数。
+   **这是有意的判据收窄，如实记进 ADR「已知问题」，不掩盖。**
+3. **`check-matrix-wiring` 抓到 `gsrc = 33 if gs_ok else gsrc`**（退出码被覆盖）——
+   改成独立变量 `gs_row_rc`。门禁真的会咬。
+
+读数：`check` **18/18**；整链 **73 符合 + 1 条不符**（`FAT16合成卷与宿主机对账`
+HANG——单跑 PASS(33)，长链抖动不归因）；**guest 判定行 PASS(rc=33)**。

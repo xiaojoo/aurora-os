@@ -26,7 +26,7 @@ use crate::{
     M_PS_ERR, M_PS_HDR, M_PS_NOJOB, M_RUN_ERR, M_RUN_EXIT, M_RUN_PREFIX, M_RUN_TIMEOUT,
     M_CLASS_PREFIX,
     M_CLASS_PCI, M_COUNT, M_DEVCTL_STATUS, M_DEVCTL_USAGE, M_DMESG_ERR, M_DMESG_HDR,
-    M_CRED_CAPS, M_CRED_GID, M_CRED_NONE, M_CRED_UID, M_ID_PFX, M_WHOAMI_PFX, M_WHOAMI_USAGE,
+    M_CRED_CAPS, M_CRED_GID, M_CRED_NONE, M_CRED_UID, M_DENIED, M_ID_PFX, M_WHOAMI_PFX, M_WHOAMI_USAGE,
     M_DMESG_USAGE, M_KILLED, M_KILL_USAGE, M_LSDEV_USAGE, M_LSPCI_USAGE,
     M_IP_ADDR, M_IP_DNS, M_IP_DOWN, M_IP_GW, M_IP_LINK, M_IP_MAC, M_IP_MTU, M_IP_STATE, M_IP_UP,
     M_COLON, M_IP_USAGE, M_NEIGH_EMPTY, M_PING_DOT, M_PING_FROM, M_PING_SEQ,
@@ -720,6 +720,7 @@ fn parse_u64(b: &[u8]) -> Option<u64> {
 /// （内核反查、走与 18 号同一条杀路径）。shell 这层只解析参数、打结果。
 /// `kill` 无参 / 非十进制 / pid 超 u16 ⇒ usage；不静默吞错。
 fn cmd_kill(c: &Ctx) -> bool {
+    if !allow(c, rt::CAP_KILL) { return true; }
     let arg = match (c.p.err.is_none(), c.p.args.get(0)) {
         (true, Some(a)) => a,
         _ => {
@@ -761,6 +762,7 @@ fn cmd_kill(c: &Ctx) -> bool {
 /// （候选：trap 帧/被调用者保存寄存器、串口行锁状态）。记在 BACKLOG，留作独立一片。
 /// 命令本身保留：内核面已验，等根因定位后接进 argv 判据即可。
 fn cmd_dmesg(c: &Ctx) -> bool {
+    if !allow(c, rt::CAP_LOG) { return true; }
     // 只接受无参形式：过滤/翻页属后续片，带参一律 usage（不静默忽略）。
     if c.p.err.is_some() || c.p.args.count() != 0 {
         con_write(c.h, msg(M_DMESG_USAGE));
@@ -795,6 +797,7 @@ fn cmd_dmesg(c: &Ctx) -> bool {
 /// 缓冲 256 字节 = 8 条/次（栈预算，与 `dmesg` 同一条纪律），配合 31 号的
 /// 游标语义分页取完。
 fn cmd_lspci(c: &Ctx) -> bool {
+    if !allow(c, rt::CAP_DEV) { return true; }
     if c.p.err.is_some() || c.p.args.count() != 0 {
         con_write(c.h, msg(M_LSPCI_USAGE));
         return true;
@@ -1283,6 +1286,7 @@ fn cmd_ls(c: &Ctx) -> bool {
 /// `cat <path>`：原样打印文件字节，随后一行 `cat: <字节数> bytes= fnv=<FNV-1a 64>`。
 /// 那条尾巴是**第二台仪器**：宿主机用自己解析 FAT 的同一份字节算同一个数（行里对得上）。
 fn cmd_cat(c: &Ctx) -> bool {
+    if !allow(c, rt::CAP_READ) { return true; }
     let path = match (c.p.err.is_none(), c.p.args.get(0)) {
         (true, Some(a)) if !a.is_empty() => a,
         _ => {
@@ -1538,6 +1542,26 @@ fn cmd_id(c: &Ctx) -> bool {
     put_u64(c.h, u64::from(u32at(13)));
     con_write(c.h, msg(M_NL));
     true
+}
+
+/// ADR-151：命令入口的授权闸门。
+///
+/// 返回 `true` = **放行**；`false` = 已打 `denied: <cap>` 并应直接 return true。
+/// **没有凭据 ⇒ 放行**（内核任务 / 判定路径没有凭据，不能因为"没身份"就
+/// 把既有命令全锁死——那是把新机制变成回归）。有凭据才查能力位。
+#[inline(never)]
+fn allow(c: &Ctx, cap: u32) -> bool {
+    match rt::cred_allows(cap) {
+        Ok(true) => true,
+        Ok(false) => {
+            con_write(c.h, msg(M_DENIED));
+            put_u64(c.h, u64::from(cap));
+            con_write(c.h, msg(M_NL));
+            false
+        }
+        // 没有凭据（E_BAD_HANDLE）⇒ 不拦；其它错误也放行，闸门不替内核判故障
+        Err(_) => true,
+    }
 }
 
 /// 分派一条已解析的命令。返回 false = 退出 shell。

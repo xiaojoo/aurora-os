@@ -1762,7 +1762,21 @@ fn stage_init_user(sid: u8) -> Option<usize> {
     // 查不到就打 `no cred`——不编一个默认身份。
     #[cfg(feature = "handles")]
     if started == 0 {
-        match crate::cred::cred_create(0, 0, crate::cred::CAP_ALL, b"root") {
+        // ADR-151：`a3-cred-guest` 档建**低权限**凭据（只有 READ），
+        // 用它证明"不同凭据访问同一资源产生授权差异"——验收句的正面证据。
+        // **只降权一次**：ktest 起的 shell 与交互式 shell 共用 sid=0（实测 10 个用例
+        // 因命令被拒而红），所以按 sid 区分不够。用"本档是否已经建过 guest 凭据"
+        // 这个一次性标记：第一个走这条路的会话是产品路径的 shell。
+        static GUEST_DONE: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
+        let guest = cfg!(feature = "a3-cred-guest")
+            && !GUEST_DONE.swap(true, core::sync::atomic::Ordering::Relaxed);
+        let (uid, gid, caps, nm): (u32, u32, u32, &[u8]) = if guest {
+            (1000, 1000, crate::cred::CAP_READ, b"guest")
+        } else {
+            (0, 0, crate::cred::CAP_ALL, b"root")
+        };
+        match crate::cred::cred_create(uid, gid, caps, nm) {
             Some(cid) => {
                 let _ = sched::set_cred(gidx, Some(cid));
                 crate::log_info!("init-user: 授凭据 会话={} slot={} gen={}", sid, cid.slot, cid.gen);

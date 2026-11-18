@@ -44,6 +44,7 @@ a3-ls-deep = ["a3-shell"]
 # 之后的 init 会话装不进去（实测：`#PF rip=0x100000060` + "第 1 页仍已映射"）。
 # 本档自己认领盘、自己切口 3，只起一个会话。
 a3-shell = ["fs-open"]
+a3-cred-guest = ["a3-shell"]
 # M5-g① 取证：把每台设备的 MSI/MSI-X 块与 INTx pin/line 读成一张证人表。
 # 只读不改，也不进四把尺子的构建：量具的开销不能算进产品基线（与 sig-check 同一形状）。
 irq-probe = []
