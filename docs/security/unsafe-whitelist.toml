@@ -90,12 +90,12 @@ expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe
 # 2026-11-17 ADR-133（top）：+user/shell/registry U5 2→3（`cmd_top` 取 ROLE_SELF_THREAD
 # 的 handle_of_role）。runtime 零新增——`sleep_ms` 是 safe fn `object_wait` 的薄壳，
 # 自身没有 unsafe 块。对账：467+1=468、U5 90+1=91。
-total = 483
+total = 487
 U1 = 83
 U2 = 119
 U3 = 13
-U4 = 133
-U5 = 99
+U4 = 135
+U5 = 101
 U6 = 36
 
 [modules."acpi"]
@@ -316,11 +316,11 @@ U1 = 2
 U5 = 3
 
 [modules."virtio"]
-# ADR-142：ARP ç¼å­ãæéæ¥æº = æ¬æ¨¡åéæ `ArpCell(UnsafeCell<ArpTable>)` ç `get()`ï¼
-# å°åèå´åºå®å¨è¿ä¸ä¸ªéæå¯¹è±¡ï¼åºå® 8 é¡¹ï¼ï¼å¯¹é½ç±ç¼è¯å¨ï¼çå½å¨æ 'staticï¼
-# å¹¶åè§åï¼è°ç¨ç¹é½å¨åæ ¸ä¸²è¡ä¸ä¸æï¼ktest/å¤æ®ï¼ï¼ä¸ `bn` åæ¬¾åæ ¸è®ºè¯ï¼
-# ä¸åéï¼n ä¸ items ç´§æï¼ç± arp_learn/arp_lookup/arp_stats ä¸ä¸ªå¥å£å±åç»´æã
-U4 = 12
+# ADR-142ARP 缓存。指针来源 = 本模块静态 `ArpCell(UnsafeCell<ArpTable>)` 的 `get()`，
+# 地址范围固定在这一个静态对象（固定 8 项），对齐由编译器，生命周期 'static；
+# 并发规则：调用点都在内核串行上下文（ktest/判据），与 `bn` 同款单核论证；
+# 不变量（n 与 items 紧排）由 arp_learn/arp_lookup/arp_stats 三个入口共同维持。
+U4 = 14
 
 [modules."vmo"]
 # W3 P4（ADR-074）：VMO 对象表。指针来源有两类——
@@ -347,7 +347,7 @@ U4 = 2
 # 不变量 = ABI 约定（号 rax、参数 rdi/rsi/rdx/r10、返回 rax 负值错误码）与 safe 层
 # 长度/枚举编码检查；生命周期 = 调用栈内；并发 = 无共享可变状态（库无全局）。
 U1 = 5
-U5 = 44
+U5 = 46
 
 
 [modules."user/execprobe"]

@@ -687,6 +687,8 @@ public_api = [
   "virtio::send_raw",
   "virtio::receive",
   "virtio::net_info",
+  "virtio::arp_len",
+  "virtio::arp_read_from",
 ]
 allowed_callers = ["capability", "diagnostics", "integration", "sched"]
 dependencies = ["arch", "boot", "driver", "irq", "memory", "pci", "time"]

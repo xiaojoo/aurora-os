@@ -15814,3 +15814,48 @@ test   : 73 行 70 符合 + 3 条，逐条同 ELF 复跑清账
 **仍然没做**：没有一道门禁把"实际用的 rustc"与 `versions.toml` 对账（现在的探测靠夹具比对，
 报的是症状不是病因）——记为候选下一刀；`.tools/limine-src`、`limine-1141`、`qemu-src`
 是参考源码副本，本轮未重建（构建不读它们）。
+
+
+## 421. ADR-145：`ip neigh`（36/37 号）+ 全仓中文注释双重编码修复（workbuddy，2026-11-18）
+
+合并后的 main 上继续 B2 未完成项。**新增 2 个号**：
+- **36 `SYS_NET_ARP_LEN`**：ARP 表当前项数（`ip neigh` 分页的上界）。
+- **37 `SYS_NET_ARP_ENUM`**：按游标读表项，**每条定长 10 字节**（IP4+MAC6），
+  返回 `(next<<32)|n`——与 27 号 pros / 31 号 lspci 同族，但**记录宽度是 10
+  不是 32**（表项的内容就是 10 字节，垫到 32 是浪费）。
+
+`virtio::arp_read_from(cursor, buf)` / `arp_len()` 是内核侧读数；
+runtime 加 `arp_len()`/`arp_enum()`；shell `cmd_ip` 加 `neigh` 子命令
+（5 字节子命令名）。判据格 `_ip_neigh_row`：回显后 3 行内必须是
+`neigh: empty` 或 `<a.b.c.d> <MAC>` 形状行；`-1`/usage 都不算过。
+**变异证红**：删掉空表提示 ⇒ `_ip_neigh_row=False` ⇒ FAIL(35)；还原 ⇒ 绿。
+
+**本片实测**：`ip neigh` → `neigh: empty`——**因为 shell 的 ping 走用户态自带
+ARP，不填内核缓存**（ADR-142 未决 3）。这一格证明的是"36/37 号可用 + 形状对"，
+不是"表里有内容"；表里会不会有内容要等 shell 的 ping 改走内核 ARP（下一片）。
+
+### 顺带修掉的历史损伤：中文注释双重编码
+
+合并前的几次 Python 写入把六个文件的中文注释写成了 UTF-8→latin-1 双重编码
+（`kernel/src/virtio.rs` 703 处、`ktests/net.rs` 681、`user.rs` 198、
+`tools/aurora.py` 190、`unsafe-whitelist.toml` 94、`registry.rs` 90）。
+**功能无影响**（都在注释里），但文档质量是仓库纪律。**修法**：按行做
+`line.encode('latin-1').decode('utf-8')` 逆转（仅对能干净逆转的行）；
+不可逆的碎片（断掉的 em-dash/箭头三字节序列）按语义替换。
+**六文件全部清零**，构建与 `check` 均绿。
+
+### 三条落地教训
+
+1. **`user.rs` 的 dispatch 用 LF，其它地方是 CRLF**——我按 CRLF 写的
+   锚点连续 miss 三次，36/37 的分派臂一度根本没进去（`ip neigh` 打 `-1` 而
+   没有任何诊断行）。**教训**：改文件前先看那一段的真实行尾。
+2. **`U4 = 12` 这种短替换会打中别的模块**：我把 `arch/x86_64/smp` 的
+   `U4 = 12` 一并改成了 14，`check-unsafe` 立刻报"登记 14 / 算出 12"。
+   **教训**：白名单改数要带模块锚点。
+3. `.text` 窗口**第五次涨**：32 → **40 KiB**（`cmd_ip_neigh` 的分页循环 +
+   `cmd_ip` 的子命令分派）。
+
+读数：`check` **18/18**（census 487 · U4 135 · U5 101）；a3-shell 单跑
+**九格全绿** PASS(33) 15.1s；整链 **72 符合 + 1 条不符**
+（`启动验签通过不拒启` 的 HANG——同 ELF 单跑 PASS(33)、108/108，
+链里那次是 `t_fat32` 的老抖动，按环境形状不归因）。

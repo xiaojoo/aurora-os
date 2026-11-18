@@ -26,7 +26,8 @@ use crate::{
     M_PING, M_PS_ERR, M_PS_HDR, M_PS_NOJOB, M_RUN_ERR, M_RUN_EXIT, M_RUN_PREFIX, M_RUN_TIMEOUT,
     M_DMESG_ERR, M_DMESG_HDR, M_DMESG_USAGE, M_KILLED, M_KILL_USAGE, M_LSPCI_USAGE,
     M_IP_ADDR, M_IP_DNS, M_IP_DOWN, M_IP_GW, M_IP_LINK, M_IP_MAC, M_IP_MTU, M_IP_STATE, M_IP_UP,
-    M_COLON, M_IP_USAGE, M_PING_DOT, M_PING_FROM, M_PING_SEQ, M_PING_TIMEOUT, M_PING_USAGE, M_RUN_USAGE,
+    M_COLON, M_IP_USAGE, M_NEIGH, M_NEIGH_EMPTY, M_PING_DOT, M_PING_FROM, M_PING_SEQ,
+    M_PING_TIMEOUT, M_PING_USAGE, M_RUN_USAGE,
     M_SLEEP_USAGE, M_SP, M_TOP_FRAME, M_UPTIME_USAGE,
     M_TOP_USAGE, M_TRYHELP, M_UNKNOWN,
 };
@@ -881,11 +882,11 @@ fn cmd_sleep(c: &Ctx) -> bool {
     true
 }
 
-/// ADR-144ï¼`ip link` / `ip addr` ââ 35 å·è¯»æ°çæ¾ç¤ºå±ã
+/// ADR-144：`ip link` / `ip addr` —— 35 号读数的显示层。
 ///
-/// ä¸¤ä¸ªå­å½ä»¤åæä¸è¡ï¼æ å ãæ æ ¼å¼åºï¼ï¼
-/// `link` â MAC + mtu + stateï¼`addr` â æ¬æº IP + ç½å³ + DNSã
-/// è¯»æ°åç mtu/link æ¯**è®¾å¤çåå§è¯»æ°**ï¼ä¸çé»è®¤å¼ã
+/// 两个子命令各打一行（无堆、无格式库）：
+/// `link` → MAC + mtu + state；`addr` → 本机 IP + 网关 + DNS。
+/// 读数包的 mtu/link 是**设备的原始读数**，不猜默认值。
 #[inline(never)]
 fn cmd_ip(c: &Ctx) -> bool {
     let sub = match (c.p.err.is_none(), c.p.args.get(0)) {
@@ -897,8 +898,12 @@ fn cmd_ip(c: &Ctx) -> bool {
     };
     let is_link = sub.len() == 4 && matches!(sub.first(), Some(b'l'));
     let is_addr = sub.len() == 4 && matches!(sub.first(), Some(b'a'));
+    let is_neigh = sub.len() == 5 && matches!(sub.first(), Some(b'n'));
     let want_link = is_link;
     let want_addr = is_addr;
+    if is_neigh {
+        return cmd_ip_neigh(c);
+    }
     if !want_link && !want_addr {
         con_write(c.h, msg(M_IP_USAGE));
         return true;
@@ -947,7 +952,50 @@ fn cmd_ip(c: &Ctx) -> bool {
     true
 }
 
-/// æ `a.b.c.d`ï¼çææ¯æ®µéå¤çç¹å·ï¼ã
+/// ADR-145ï¼`ip neigh` ââ åæ ¸ ARP è¡¨çåªè¯»å±ç¤ºã
+///
+/// åé¡µå½¢ç¶ä¸ 31 å· lspci / 27 å· ps åæï¼`cursor` ä» 0 å¼å§ï¼
+/// æ¯æ¬¡è¯»å `(next, n)`ï¼`n == 0` å³å°å°¾ãæ¯æ¡æä¸è¡ `IP  MAC`ï¼MAC åºå®ä¸¤ä½åå­è¿å¶å°åï¼ã
+#[inline(never)]
+fn cmd_ip_neigh(c: &Ctx) -> bool {
+    let mut buf = [0u8; 80];   // 8 æ¡ Ã 10 å­è
+    let mut cursor = 0u32;
+    let mut total = 0u32;
+    loop {
+        match rt::arp_enum(cursor, &mut buf) {
+            Ok((next, n)) => {
+                if n == 0 { break; }
+                let mut k = 0usize;
+                while k < n as usize {
+                    let at = k * rt::ARP_RECORD_LEN;
+                    put_dotted(c.h, buf.get(at..at + 4));
+                    con_write(c.h, msg(M_SP));
+                    let mut z = at + 4;
+                    while z < at + 10 {
+                        put_hex8(c.h, buf.get(z).copied().unwrap_or(0));
+                        if z + 1 < at + 10 { con_write(c.h, msg(M_COLON)); }
+                        z += 1;
+                    }
+                    con_write(c.h, msg(M_NL));
+                    total += 1;
+                    k += 1;
+                }
+                cursor = next;
+            }
+            Err(e) => {
+                put_i64(c.h, e.0);
+                con_write(c.h, msg(M_NL));
+                return true;
+            }
+        }
+    }
+    if total == 0 {
+        con_write(c.h, msg(M_NEIGH_EMPTY));
+    }
+    true
+}
+
+/// 打 `a.b.c.d`（省掉每段重复的点号）。
 fn put_dotted(h: rt::Handle, src: Option<&[u8]>) {
     let mut k = 0usize;
     while k < 4 {
@@ -958,7 +1006,7 @@ fn put_dotted(h: rt::Handle, src: Option<&[u8]>) {
     }
 }
 
-/// ä¸å­èåå­è¿å¶ï¼**åºå®ä¸¤ä½**ï¼MAC çæ¾ç¤ºå½¢ç¶ï¼ã
+/// 一字节十六进制，**固定两位**（MAC 的显示形状）。
 fn put_hex8(h: rt::Handle, v: u8) {
     let hi = (v >> 4) & 0x0F;
     let lo = v & 0x0F;

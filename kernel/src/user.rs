@@ -119,12 +119,18 @@ pub const SYS_PCI_ENUM: u64 = 31;
 /// 锚点没记 / 频率没标定 ⇒ `-1`：**绝不回退成默认频率**（clock.rs 的纪律：
 /// "返回一个差不多的默认值会让读数看起来是测出来的，而它其实是猜的"）。
 pub const SYS_CLOCK_UPTIME: u64 = 32;
-/// 33ï¼ä¸å¸§äº¤ç»ç½å¡ï¼virtio-net TXï¼ãrdi=å¸§æéãrsi=é¿ï¼â¤ 1514ï¼ãè¿å 0 / éè¯¯ç ãï¼ADR-143ï¼
+/// 33：一帧交给网卡（virtio-net TX）。rdi=帧指针、rsi=长（≤ 1514）。返回 0 / 错误码。（ADR-143）
 pub const SYS_NET_SEND: u64 = 33;
-/// 34ï¼æçç­å¾ä¸å¸§ï¼virtio-net RXï¼ãrdi=bufãrsi=lenãrdx=timeout_msï¼è¿åæ¶å°çå­èæ°ï¼0=è¶æ¶ï¼ãè¿å 0 / éè¯¯ç ãï¼ADR-143ï¼
+/// 34：有界等待一帧（virtio-net RX）。rdi=buf、rsi=len、rdx=timeout_ms；返回收到的字节数（0=超时）。返回 0 / 错误码。（ADR-143）
 pub const SYS_NET_RECV: u64 = 34;
-/// 35ï¼ç½å¡è¯»æ°ä¸åè¯»åãrdi=bufï¼åºå® 18 å­èï¼MAC6+guest_ip4+gateway4+dns4ï¼ãè¿å 0 / éè¯¯ç ãï¼ADR-143ï¼
+/// 35：网卡读数一包读回。rdi=buf（固定 18 字节：MAC6+guest_ip4+gateway4+dns4）。返回 0 / 错误码。（ADR-143）
 pub const SYS_NET_INFO: u64 = 35;
+/// 36ï¼ADR-145ï¼ï¼ARP è¡¨è¡¨é¡¹è®¡æ°ï¼`ip neigh` åé¡µçä¸çï¼ã
+pub const SYS_NET_ARP_LEN: u64 = 36;
+/// 37ï¼ADR-145ï¼ï¼ARP è¡¨ææ¸¸æ è¯»é¡¹ï¼rdi=cursorãrsi=bufãrdx=lenãr10=å®½åº¦ï¼ã
+pub const SYS_NET_ARP_ENUM: u64 = 37;
+/// æ¯æ¡ ARP è¡¨é¡¹çå®é¿è®°å½ï¼10 å­èï¼IP4 + MAC6ï¼ãä¸ 27/31 å·ç 32 å­èè®°å½ä¸åï¼è¿éçåå®¹å°±æ¯ 10 å­èï¼ä¸å«å° 32ã
+pub const ARP_RECORD_LEN: usize = 10;
 /// 16：`rdi` = Proc 句柄、`rsi` = Thread 句柄、`rdx` = StartupInfo 那一页的 VMO 句柄、
 /// `r10` = 它在**子 AS** 里的只读 VA → 成功返回 0。顺序固定：校验 → 转移 → 回填 → 放线程跑。
 pub const SYS_PROCESS_START: u64 = 16;
@@ -1557,7 +1563,7 @@ fn sys_pci_enum(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
 fn sys_clock_uptime(_frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     match crate::clock::uptime_micros() {
         Some(us) => us,
-        None => E_INVALID, // æ²¡éç¹/æ²¡æ å® â -1ï¼ä¸ç¼æ°å­
+        None => E_INVALID, // 没锚点/没标定 ⇒ -1，不编数字
     }
 }
 
@@ -1632,6 +1638,42 @@ fn sys_net_info(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
         Ok(w) => w as u64,
         Err(_) => E_FAULT,
     }
+}
+
+/// 36ï¼ADR-145ï¼ï¼ARP è¡¨é¡¹æ°ï¼`ip neigh` çä¸çï¼ã
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_net_arp_len(_frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    if crate::virtio::bind_net().is_err() {
+        return E_IO;
+    }
+    u64::from(crate::virtio::arp_len())
+}
+
+/// 37ï¼ADR-145ï¼ï¼ARP è¡¨ææ¸¸æ è¯»é¡¹ãè¿åä¸ 27 å·åå½¢ï¼`(ä¸æ¸¸æ¸¸æ  << 32) | æ¬æ¬¡æ¡æ°`ã
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_net_arp_enum(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    if crate::virtio::bind_net().is_err() {
+        return E_IO;
+    }
+    let cursor = frame.rdi as u32;
+    let cap = frame.rsi as usize;
+    let want = frame.rdx as usize;
+    if want == 0 || want > 128 || cap < want {
+        return E_INVALID;
+    }
+    let mut buf = [0u8; 128];
+    let n = crate::virtio::arp_read_from(cursor, &mut buf[..want]);
+    let got = n * ARP_RECORD_LEN;
+    if got > 0 {
+        match copy_to_user(&buf[..got], frame.r10) {
+            Ok(w) if w == got => {}
+            _ => return E_FAULT,
+        }
+    }
+    let next = cursor.saturating_add(n as u32);
+    (u64::from(next) << 32) | (n as u64)
 }
 
 /// 键盘字符的读取入口。拆成小函数是为了让上面那条 `or_else` 在没开 `ps2-kbd` 时
@@ -2762,6 +2804,10 @@ pub fn syscall_dispatch(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> boo
         #[cfg(feature = "handles")]
         SYS_NET_INFO => sys_net_info(frame),
         #[cfg(feature = "handles")]
+        SYS_NET_ARP_LEN => sys_net_arp_len(frame),
+        #[cfg(feature = "handles")]
+        SYS_NET_ARP_ENUM => sys_net_arp_enum(frame),
+        #[cfg(feature = "handles")]
         SYS_CONSOLE_WRITE => sys_console_io(frame, true),
         #[cfg(feature = "handles")]
         SYS_CONSOLE_READ => sys_console_io(frame, false),
@@ -3260,7 +3306,7 @@ pub fn load(bytes: &[u8]) -> Result<Loaded, LoadError> {
     }
     let stack_va = swin.0 + mm::PAGE as u64;
     let sf = mm::phys_alloc(0, MOD_USER).map_err(LoadError::Mm)?;
-    // SAFETY: å `init()` éé£æ¡ââHHDM å«åãæ°å¥½ä¸é¡µãè¿æ²¡æå«çä¸»äºº
+    // SAFETY: 同 `init()` 里那条——HHDM 别名、恰好一页、还没有别的主人
     unsafe { core::ptr::write_volatile(sf.base().via_hhdm().0 as *mut u64, 0) };
     let m = mm::map(VirtAddr(stack_va), sf, PageFlags::USER_RW).map_err(LoadError::Mm)?;
     owned.push(m).map_err(LoadError::Mm)?;
@@ -3370,11 +3416,11 @@ pub fn load_into(aslot: u8, bytes: &[u8]) -> Result<Loaded, LoadError> {
     // （rip/cr2=0x100103000 栈区取指，err=0x15）——与 load() 同一轮的事故。
     // aspace_map_slot 逐页映射；guard 页永远不映射，判据形状不变。
     let stack_va = mm::USER_MMAP_BASE + 7 * mm::PAGE as u64;
-    // **æ ä¸æ¬¡ååé + ä¸æ¬¡ AsMap**ï¼adopt_asmaps çé¢æ£æ¯
-    // child.owned.count() + n > MAX_OWNED(16)ï¼æ æåé¡µæ¡ç®æä¸é â 16 å·å -6ï¼ã
+    // **栈一次块分配 + 一次 AsMap**（adopt_asmaps 的预检是
+    // child.owned.count() + n > MAX_OWNED(16)；栈拆单页条目撞上限 ⇒ 16 号回 -6）。
     let stack_frames = mm::phys_alloc(3, MOD_USER).map_err(LoadError::Mm)?;
-    // SAFETY: HHDM å«åï¼æ°å¥½ 8 é¡µãæ²¡æå«çä¸»äººï¼phys_alloc ååï¼ã
-    // æ¸é¶æ´åï¼æ ä¸ä¸è½çå«çä»»å¡çæ®å­ï¼;è¿æ¯ååé¡µå¾ªç¯é write_volatile æ¸é¶çæ¿ä»£ã
+    // SAFETY: HHDM 别名，恰好 8 页、没有别的主人（phys_alloc 刚发）。
+    // 清零整块（栈上不能留别的任务的残字）;这是原单页循环里 write_volatile 清零的替代。
     unsafe { core::ptr::write_bytes(stack_frames.base().via_hhdm().0 as *mut u8, 0, 8 * mm::PAGE) };
     let mut pas: [u64; 8] = [0; 8];
     for j in 0..7u64 {

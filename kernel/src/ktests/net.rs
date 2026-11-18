@@ -299,49 +299,49 @@ fn t_net_arp() -> bool {
 #[cfg(feature = "virtio-net")]
 ktest!(KT_NET_ARP, t_net_arp);
 
-/// B2 ç¬¬äºåï¼ADR-140ï¼ï¼ICMP ping é­ç¯ââä¸ä¸ªç¨ä¾éå®æ"ARP è§£åºç½å³ MAC â ç¨å®ååæ­ ICMP echo â ç­ reply"。
-/// **MAC ä»çº¿ä¸è¯»**ï¼ARP reply ç sender_macï¼ï¼ä¸æ¯ç¡¬ç¼ç ââå¤å®ä¸åè®¾å¯¹ç«¯æ¯è°ã
-/// å¤æ®å­æ ¼ï¼ARP å¾è¿ãICMP ååºãæ¶å°ãè§£å¾å¼ï¼type=0ï¼ã
-/// **åçæ¯æä»¬åçé£ä¸ª**ï¼id/seq/payload å¯¹è´¦ââslirp ææä»¬ç echo åæ ·è¿åï¼ãsrc_ip=ç½å³ã
+/// B2 第二刀（ADR-140）：ICMP ping 闭环——一个用例里完成"ARP 解出网关 MAC → 用它发单播 ICMP echo → 等 reply"。
+/// **MAC 从线上读**（ARP reply 的 sender_mac），不是硬编码——判定不假设对端是谁。
+/// 判据六格：ARP 往返、ICMP 发出、收到、解得开（type=0）、
+/// **回的是我们发的那个**（id/seq/payload 对账——slirp 把我们的 echo 原样返回）、src_ip=网关。
 #[cfg(feature = "virtio-net")]
 fn t_net_ping() -> bool {
     if let Err(e) = virtio::bind_net() {
-        crate::log_fatal!("ping: ç»å®/æ¡æå¤±è´¥ {:?}", e);
+        crate::log_fatal!("ping: 绑定/握手失败 {:?}", e);
         return false;
     }
     let i = match virtio::net_info() {
         Some(v) => v,
         None => {
-            crate::log_fatal!("ping: ç»å®ä¹åæ¿ä¸å°è¯»æ°");
+            crate::log_fatal!("ping: 绑定之后拿不到读数");
             return false;
         }
     };
-    // ---- ç¬¬ä¸åï¼ARP è§£åºç½å³ç MACã**åæ¥ç¼å­**ï¼ADR-142ï¼ï¼miss æå¹¿æ­ã
-    let stats_before = virtio::arp_stats();  // **å¨ lookup ä¹å**ï¼lookup ä¼æ miss/hit è®°è¿å»
+    // ---- 第一刀：ARP 解出网关的 MAC。**先查缓存**（ADR-142）：miss 才广播。
+    let stats_before = virtio::arp_stats();  // **在 lookup 之前**：lookup 会把 miss/hit 记进去
     let gw_mac_opt = virtio::arp_lookup(&virtio::NET_GATEWAY_IP);
     let (arp_req, _h) = virtio::build_arp_request(&i.mac);
     let broadcast = gw_mac_opt.is_none();
     if broadcast && virtio::send_raw(&arp_req).is_err() {
-        crate::log_fatal!("ping: ARP REQUEST åä¸åºå»");
+        crate::log_fatal!("ping: ARP REQUEST 发不出去");
         return false;
     }
     let (buf, n, uidx, ulen, uid) = match virtio::receive(3000) {
         Ok(v) => v,
         Err(e) => {
-            crate::log_fatal!("ping: ARP reply ç­ä¸å° {:?}", e);
+            crate::log_fatal!("ping: ARP reply 等不到 {:?}", e);
             return false;
         }
     };
     let a = match virtio::parse_arp_reply(&buf[..n], uidx, ulen, uid) {
         Ok(v) => v,
         Err(e) => {
-            crate::log_fatal!("ping: ARP reply è§£ä¸å¼ {:?}", e);
+            crate::log_fatal!("ping: ARP reply 解不开 {:?}", e);
             return false;
         }
     };
     let arp_ok = a.sender_ip == virtio::NET_GATEWAY_IP && a.used_id == 0;
     if !arp_ok {
-        crate::log_fatal!("ping: ARP reply ä¸æ¯ç½å³çé£ä¸å¥");
+        crate::log_fatal!("ping: ARP reply 不是网关的那一句");
         return false;
     }
     virtio::arp_learn(&a.sender_ip, &a.sender_mac);
@@ -351,37 +351,37 @@ fn t_net_ping() -> bool {
     let miss_accounted = stats_after.misses == stats_before.misses + u32::from(broadcast);
     let hit_ok = if broadcast { stats_after.hits == stats_before.hits } else { stats_after.hits == stats_before.hits + 1 };
     crate::log_info!(
-        "ping: ARP å¹¿æ­={} å­¦ä¹ ={} misses={}/{} learns={}/{} hits={}/{}",
+        "ping: ARP 广播={} 学习={} misses={}/{} learns={}/{} hits={}/{}",
         broadcast, learned,
         stats_before.misses, stats_after.misses,
         stats_before.learns, stats_after.learns,
         stats_before.hits, stats_after.hits
     );
-    // ---- ç¬¬äºåï¼ç¨åè§£åºç MAC ååæ­ ICMP echo requestã
+    // ---- 第二刀：用刚解出的 MAC 发单播 ICMP echo request。
     let seq: u16 = 1;
     let (ping, _ph) = virtio::build_icmp_echo_request(&gw_mac, &i.mac, &virtio::DHCP_GUEST_IP, seq);
     match virtio::send_raw(&ping) {
         Ok(f) => crate::log_info!(
-            "ping: å echo é¿={} åå¸={:#018x} åæ§idx={} id={}",
+            "ping: 发 echo 长={} 哈希={:#018x} 回执idx={} id={}",
             f.len, f.hash, f.used_idx, f.used_id
         ),
         Err(e) => {
-            crate::log_fatal!("ping: ICMP åä¸åºå» {:?}", e);
+            crate::log_fatal!("ping: ICMP 发不出去 {:?}", e);
             return false;
         }
     }
-    // ---- ç­ replyï¼æçç­å¾ï¼slirp ä¼æ echo åæ ·è¿åï¼ã
+    // ---- 等 reply（有界等待；slirp 会把 echo 原样返回）。
     let (buf2, n2, uidx2, ulen2, uid2) = match virtio::receive(3000) {
         Ok(v) => v,
         Err(e) => {
-            crate::log_fatal!("ping: reply ç­ä¸å° {:?}", e);
+            crate::log_fatal!("ping: reply 等不到 {:?}", e);
             return false;
         }
     };
     let r = match virtio::parse_icmp_reply(&buf2[..n2], uidx2, ulen2, uid2) {
         Ok(v) => v,
         Err(e) => {
-            crate::log_fatal!("ping: reply è§£ä¸å¼ {:?} åå­å­è={:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x}",
+            crate::log_fatal!("ping: reply 解不开 {:?} 前六字节={:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x}",
                 e, buf2[0], buf2[1], buf2[2], buf2[3], buf2[4], buf2[5]);
             return false;
         }
@@ -391,93 +391,93 @@ fn t_net_ping() -> bool {
     let src_ok = r.src_ip == virtio::NET_GATEWAY_IP;
     let id_ok = r.used_id == 0;
     crate::log_info!(
-        "ping: æ¶å° reply é¿={} åå¸={:#018x} type={} id={:#06x} seq={} src={}.{}.{}.{} used.id={}",
+        "ping: 收到 reply 长={} 哈希={:#018x} type={} id={:#06x} seq={} src={}.{}.{}.{} used.id={}",
         r.len, r.hash, r.icmp_type, r.icmp_id, r.icmp_seq,
         r.src_ip[0], r.src_ip[1], r.src_ip[2], r.src_ip[3], r.used_id
     );
     crate::log_info!(
-        "ping: å¤æ® ARPå¾è¿={} ååº=true æ¶å°=true è§£å¾å¼={} åæ ·è¿å={} srcç½å³={} ç¼å²å¯¹={}",
+        "ping: 判据 ARP往返={} 发出=true 收到=true 解得开={} 原样返回={} src网关={} 缓冲对={}",
         arp_ok, type_ok, echo_ok, src_ok, id_ok
     );
     let ok = arp_ok && type_ok && echo_ok && src_ok && id_ok
-        && learned && miss_accounted && hit_ok;  // ADR-142ï¼ç¼å­çè´¦è¦åä¸
+        && learned && miss_accounted && hit_ok;  // ADR-142：缓存的账要合上
     if !ok {
-        crate::log_fatal!("ping: ICMP å¾è¿å¤æ®ä¸æç«ï¼ä¸é¢ä¸¤è¡æ¯å¨é¨è¯»æ°ï¼");
+        crate::log_fatal!("ping: ICMP 往返判据不成竏（上面两行是全部读数）");
     }
     ok
 }
 #[cfg(feature = "virtio-net")]
 ktest!(KT_NET_PING, t_net_ping);
 
-/// B2 ç¬¬ä¸åï¼ADR-141ï¼ï¼UDP å¾è¿ââDNS æ¥è¯¢âé® slirp ç DNSï¼10.0.2.3ï¼localhostã
-/// å¤æ®äºæ ¼ï¼ARP å¾è¿ãUDP ååºãæ¶å°ãè§£å¾å¼ï¼**txid å¯¹è´¦**ââåçæ¯æä»¬åçé£ä¸ªæ¥è¯¢ï¼ãsrc=10.0.2.3ã
-/// é® localhostï¼slirp ç DNS å¯¹å®ææ¬å°ç­æ¡ï¼127.0.0.1ï¼ï¼**ä¸ä¾èµå¤ç½**ã
+/// B2 第三刀（ADR-141）：UDP 往返——DNS 查询—�问 slirp 的 DNS（10.0.2.3）localhost。
+/// 判据五格：ARP 往返、UDP 发出、收到、解得开（**txid 对账**——回的是我们发的那个查询）、src=10.0.2.3。
+/// 问 localhost：slirp 的 DNS 对它有本地答案（127.0.0.1），**不依赖外网**。
 #[cfg(feature = "virtio-net")]
 fn t_net_udp() -> bool {
     if let Err(e) = virtio::bind_net() {
-        crate::log_fatal!("udp: ç»å®/æ¡æå¤±è´¥ {:?}", e);
+        crate::log_fatal!("udp: 绑定/握手失败 {:?}", e);
         return false;
     }
     let i = match virtio::net_info() {
         Some(v) => v,
         None => {
-            crate::log_fatal!("udp: ç»å®ä¹åæ¿ä¸å°è¯»æ°");
+            crate::log_fatal!("udp: 绑定之后拿不到读数");
             return false;
         }
     };
-    // ---- ç¬¬ä¸åï¼ARP è§£ç½å³ MACï¼DNS å¨å«çå­ç½ï¼åè§£ç½å³ï¼ã
+    // ---- 第一刀：ARP 解网关 MAC（DNS 在别的子网，先解网关）。
     let (arp_req, _h) = virtio::build_arp_request(&i.mac);
     if virtio::send_raw(&arp_req).is_err() {
-        crate::log_fatal!("udp: ARP REQUEST åä¸åºå»");
+        crate::log_fatal!("udp: ARP REQUEST 发不出去");
         return false;
     }
     let (buf, n, uidx, ulen, uid) = match virtio::receive(3000) {
         Ok(v) => v,
         Err(e) => {
-            crate::log_fatal!("udp: ARP reply ç­ä¸å° {:?}", e);
+            crate::log_fatal!("udp: ARP reply 等不到 {:?}", e);
             return false;
         }
     };
     let a = match virtio::parse_arp_reply(&buf[..n], uidx, ulen, uid) {
         Ok(v) => v,
         Err(e) => {
-            crate::log_fatal!("udp: ARP reply è§£ä¸å¼ {:?}", e);
+            crate::log_fatal!("udp: ARP reply 解不开 {:?}", e);
             return false;
         }
     };
     let arp_ok = a.sender_ip == virtio::NET_GATEWAY_IP && a.used_id == 0;
     if !arp_ok {
-        crate::log_fatal!("udp: ARP reply ä¸æ¯ç½å³çé£ä¸å¥");
+        crate::log_fatal!("udp: ARP reply 不是网关的那一句");
         return false;
     }
-    // ---- ç¬¬äºåï¼å DNS æ¥è¯¢ï¼txid åºå®ï¼å¤æ®å¯¹è´¦ï¼ã
+    // ---- 第二刀：发 DNS 查询（txid 固定，判据对账）。
     let txid: u16 = 0xC0DE;
     let (q, _qh) = virtio::build_dns_query(&a.sender_mac, &i.mac, &virtio::DHCP_GUEST_IP, txid);
     match virtio::send_raw(&q) {
         Ok(f) => crate::log_info!(
-            "udp: å DNS æ¥è¯¢ é¿={} åå¸={:#018x} txid={:#06x} åæ§idx={} id={}",
+            "udp: 发 DNS 查询 长={} 哈希={:#018x} txid={:#06x} 回执idx={} id={}",
             f.len, f.hash, txid, f.used_idx, f.used_id
         ),
         Err(e) => {
-            crate::log_fatal!("udp: DNS åä¸åºå» {:?}", e);
+            crate::log_fatal!("udp: DNS 发不出去 {:?}", e);
             return false;
         }
     }
-    // ---- ç­ replyã
+    // ---- 等 reply。
     let (buf2, n2, uidx2, ulen2, uid2) = match virtio::receive(5000) {
         Ok(v) => v,
         Err(e) => {
-            crate::log_fatal!("udp: DNS reply ç­ä¸å° {:?}", e);
+            crate::log_fatal!("udp: DNS reply 等不到 {:?}", e);
             return false;
         }
     };
-    // **å¯¹ç«¯çåè¯çå½¢ç¶å®æµï¼pcap ç¬¬äºå°ä»ªå¨ä½è¯ï¼**ï¼slirp å¯¹æä»¬ç UDP/DNS æ¥è¯¢å
-    // **ICMP Destination Unreachable**ï¼type=3ï¼â- æ¬æº QEMU ç slirp DNS ä¸å¨çº¿ï¼ICMP/BOOTP é½å¨çº¿ï¼çå®ä¸å½å ï¼ã
-    // è¿ä¸åçå¾è¿å¤æ®æ¹æï¼**æ¶å°éè¯¯åæ§ + ååµçé£ä¸ªå UDP å¤´å¯å¯¹è´¦**â-
-    // ååµå¤´é dst=æä»¬é®ç 10.0.2.3:53ãæº IP=æä»¬ â **å¯¹ç«¯å¼ç¨çæ¯æä»¬åçé£ä¸ªå**ï¼çå¾è¿ï¼ã
-    // **RX ç¼å²ä» eth å¤´å¼å§ï¼å®æµå16å­èï¼æºMAC ç®æ MAC 0x0800 0x45Â -- å®æ´å¸§ï¼**ã
-    // æ³¨æï¼ï¼. ktests èªè¶³çºªå¾çåä¾ï¼ï¼ä¸ä¸è·æ¶å°è¿ ping æ®ççåï¼åç§»å½»åºä¸å -- ç¨å¤æ­åæååç§»éæ©ã
-    // ICMP å¤´å¨**å¤å± IPv4 å¤´ä¹å**ï¼ip0+20ï¼ï¼ååµå IP å¤´å¨ ICMP å¤´ä¹å 8 å­èã
+    // **对端真回话的形状实测（pcap 第二台仪器作证）**：slirp 对我们的 UDP/DNS 查询回
+    // **ICMP Destination Unreachable**（type=3）—- 本机 QEMU 的 slirp DNS 不在线（ICMP/BOOTP 都在线，真实不归因）。
+    // 这一刀的往返判据改成：**收到错误回执 + 内嵌的那个原 UDP 头可对账**—-
+    // 内嵌头里 dst=我们问的 10.0.2.3:53、源 IP=我们 ⇒ **对端引用的是我们发的那个包**（真往返）。
+    // **RX 缓冲从 eth 头开始（实测前16字节：源MAC 目标MAC 0x0800 0x45 -- 完整帧）**。
+    // 注意（�. ktests 自足纪律的反例）：上一跑收到过 ping 残留的包，偏移彻底不同 -- 用判断后才做偏移选择。
+    // ICMP 头在**外层 IPv4 头之后**（ip0+20）；内嵌原 IP 头在 ICMP 头之后 8 字节。
     let ip0 = if buf2[0] == 0x45 { 0usize } else { 14usize };
     let icmp0 = ip0 + 20;
     let inner_ip = icmp0 + 8;
@@ -485,18 +485,18 @@ fn t_net_udp() -> bool {
     let icmp_type = buf2[icmp0];
     let icmp_code = buf2[icmp0 + 1];
     let inner_ok = buf2.len() >= inner_udp + 8
-        && buf2[inner_ip + 12..inner_ip + 16] == virtio::DHCP_GUEST_IP   // åæº IP = æä»¬
-        && buf2[inner_ip + 16..inner_ip + 20] == virtio::NET_DNS_IP      // åç®æ  = DNS
-        && u16::from(buf2[inner_udp + 2]) * 256 + u16::from(buf2[inner_udp + 3]) == 53;  // å dst ç«¯å£ = 53
+        && buf2[inner_ip + 12..inner_ip + 16] == virtio::DHCP_GUEST_IP   // 原源 IP = 我们
+        && buf2[inner_ip + 16..inner_ip + 20] == virtio::NET_DNS_IP      // 原目标 = DNS
+        && u16::from(buf2[inner_udp + 2]) * 256 + u16::from(buf2[inner_udp + 3]) == 53;  // 原 dst 端口 = 53
     crate::log_info!(
-        "udp: æ¶ ICMP type={} code={} ååµååå¯å¯¹è´¦={} é¿={} used.id={} å16={:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x}",
+        "udp: 收 ICMP type={} code={} 内嵌原包可对账={} 长={} used.id={} 前16={:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x}",
         icmp_type, icmp_code, inner_ok, n2, uid2,
         buf2[0], buf2[1], buf2[2], buf2[3], buf2[4], buf2[5], buf2[6], buf2[7],
         buf2[8], buf2[9], buf2[10], buf2[11], buf2[12], buf2[13], buf2[14], buf2[15]
     );
-    let unreachable_ok = icmp_type == 3 && icmp_code == 1;  // host unreachable? code ä»¥å®æµä¸ºååæåºæ¥
+    let unreachable_ok = icmp_type == 3 && icmp_code == 1;  // host unreachable? code 以实测为准先打出来
     crate::log_info!(
-        "udp: å¤æ® ARPå¾è¿={} ååº=true æ¶å°ICMP={type_ok} ååµå¯¹è´¦={inner_ok} ç¼å²å¯¹={id_ok}",
+        "udp: 判据 ARP往返={} 发出=true 收到ICMP={type_ok} 内嵌对账={inner_ok} 缓冲对={id_ok}",
         arp_ok,
         type_ok = icmp_type == 3,
         inner_ok = inner_ok,
@@ -504,7 +504,7 @@ fn t_net_udp() -> bool {
     );
     let ok = arp_ok && icmp_type == 3 && inner_ok && uid2 == 0;
     if !ok {
-        crate::log_fatal!("udp: UDP å¾è¿å¤æ®ä¸æç«ï¼ä¸é¢ä¸¤è¡æ¯å¨é¨è¯»æ°ï¼");
+        crate::log_fatal!("udp: UDP 往返判据不成竏（上面两行是全部读数）");
     }
     ok
 }

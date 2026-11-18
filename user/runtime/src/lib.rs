@@ -1142,6 +1142,30 @@ pub const SYS_NET_INFO: u64 = 35;
 /// 网卡读数包（18 字节定长）：MAC6 + 本机 IP4 + 网关4 + DNS4。
 /// 读数包 24 字节（ADR-144 从 18 扩到 24）：MAC6 + 本机IP4 + 网关4 + DNS4 + mtu2 + link2。
 pub const NET_INFO_BYTES: usize = 24;
+/// 36/37ï¼ADR-145ï¼ï¼ARP è¡¨çä¸¤ä¸ªè¯»å£ï¼`ip neigh`ï¼ã
+pub const SYS_NET_ARP_LEN: u64 = 36;
+pub const SYS_NET_ARP_ENUM: u64 = 37;
+/// æ¯æ¡è¡¨é¡¹çå®é¿è®°å½ï¼IP4 + MAC6ï¼ã
+pub const ARP_RECORD_LEN: usize = 10;
+
+/// 36ï¼ARP è¡¨é¡¹æ°ã
+pub fn arp_len() -> Result<u32, RTError> {
+    // SAFETY: 36 å·æ åæ°ã
+    let ret = unsafe { syscall_abi(SYS_NET_ARP_LEN, 0, 0, 0, 0) } as i64;
+    if ret < 0 { Err(RTError(ret)) } else { Ok(ret as u32) }
+}
+
+/// 37ï¼ææ¸¸æ è¯»é¡¹ãè¿å `(n, next)`ï¼`n` æ¬æ¬¡æ¡æ°ï¼`next` ä¸æ¸¸æ¸¸æ ï¼ä¸ 27/31 å·åå½¢ï¼ã
+pub fn arp_enum(cursor: u32, buf: &mut [u8]) -> Result<(u32, u32), RTError> {
+    if buf.is_empty() || buf.len() > 128 || buf.len() % ARP_RECORD_LEN != 0 {
+        return Err(RTError::INVALID);
+    }
+    // SAFETY: 37 å· rdi=cursorãrsi=bufãrdx=lenãr10=ååå°åã
+    let ret = unsafe { syscall_abi(SYS_NET_ARP_ENUM, u64::from(cursor), buf.len() as u64, buf.len() as u64, buf.as_mut_ptr() as u64) } as i64;
+    if ret < 0 { return Err(RTError(ret)); }
+    Ok((((ret as u64) >> 32) as u32, (ret as u64 & 0xFFFF_FFFF) as u32))
+}
+
 
 
 /// 33：把一帧交给网卡。`frame` ≤ 1514；成功 Ok(())，形状/IO 错误如实回。

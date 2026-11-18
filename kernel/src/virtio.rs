@@ -1256,24 +1256,24 @@ pub fn parse_arp_reply(buf: &[u8], used_idx: u16, used_len: u32, used_id: u32) -
         used_id,
     })
 }
-// ---------------------------------------------------------------- B2 ç¬¬äºåï¼ADR-140ï¼ï¼ICMP echo
-/// ICMP çå ä¸ªå·ï¼RFC 792ï¼ãping çå¯¹è±¡ = slirp ç½å³ï¼10.0.2.2ï¼ä¸ ARP åä¸ä¸ªå¯¹ç«¯ï¼ã
+// ---------------------------------------------------------------- B2 第二刀（ADR-140）：ICMP echo
+/// ICMP 的几个号（RFC 792）。ping 的对象 = slirp 网关（10.0.2.2，与 ARP 同一个对端）。
 pub const NET_TYPE_ICMP: [u8; 2] = [0x08, 0x00];
 pub const ICMP_ECHO_REQUEST: u8 = 8;
 pub const ICMP_ECHO_REPLY: u8 = 0;
 pub const ICMP_ECHO_ID: u16 = 0xA5A5;
 pub const ICMP_PAYLOAD: [u8; 16] = [0xA5; 16];
-/// ICMP å¸§æ»é¿ = eth 14 + IPv4 20 + ICMP å¤´ 4 + payload 16ï¼å«å°æå°å¸§ 60ã
+/// ICMP 帧总长 = eth 14 + IPv4 20 + ICMP 头 4 + payload 16，垫到最小帧 60。
 pub const ICMP_FRAME_BYTES: usize = NET_FRAME_BYTES;
 const _: () = assert!(ICMP_FRAME_BYTES <= NET_TX_MAX);
 
-/// ICMP æ®µçæ ¡éªåï¼ä¸ `ip_cksum` åä¸æ¡ 16 ä½åç åï¼ICMP æ ¡éªåè¦çæ´ä¸ª ICMP æ®µï¼ã
+/// ICMP 段的校验和：与 `ip_cksum` 同一条 16 位反码和（ICMP 校验和覆盖整个 ICMP 段）。
 fn icmp_cksum(seg: &[u8]) -> u16 {
     ip_cksum(seg)
 }
 
-/// æé ä¸ä¸ª ICMP echo requestï¼åæ­ç» `gw_mac`ï¼ä¸ä¸å ARP æ¿å°çç½å³ MACï¼
-/// **ä»çº¿ä¸è¯»çèä¸æ¯ç¡¬ç¼ç **ï¼ï¼é®ç½å³ãè¿åå¸§ä¸èªç®åå¸ã
+/// 构造一个 ICMP echo request：单播给 `gw_mac`（上一刀 ARP 拿到的网关 MAC，
+/// **从线上读的而不是硬编码**），问网关。返回帧与自算哈希。
 pub fn build_icmp_echo_request(
     gw_mac: &[u8; 6],
     our_mac: &[u8; 6],
@@ -1281,26 +1281,26 @@ pub fn build_icmp_echo_request(
     seq: u16,
 ) -> ([u8; ICMP_FRAME_BYTES], u64) {
     let mut f = [0u8; ICMP_FRAME_BYTES];
-    f[0..6].copy_from_slice(gw_mac);            // åæ­ï¼ARP å·²æç½å³ç MAC è§£åºæ¥äº
+    f[0..6].copy_from_slice(gw_mac);            // 单播：ARP 已把网关的 MAC 解出来了
     f[6..12].copy_from_slice(our_mac);
     f[12..14].copy_from_slice(&NET_TYPE_IPV4);
-    let ip_len = 20 + 4 + ICMP_PAYLOAD.len();   // IPv4 å¤´ + ICMP æ®µ
+    let ip_len = 20 + 4 + ICMP_PAYLOAD.len();   // IPv4 头 + ICMP 段
     f[14] = 0x45;
     f[16] = (ip_len >> 8) as u8;
     f[17] = ip_len as u8;
-    f[18] = 0; f[19] = 1;                       // æ è¯/seqï¼ååå°± 0/1
+    f[18] = 0; f[19] = 1;                       // 标识/seq：单发就 0/1
     f[20] = 0x40;                               // DF
     f[22] = 64;                                 // TTL
     f[23] = 1;                                  // protocol = ICMP
-    f[26..30].copy_from_slice(our_ip);           // æºå°åï¼IPv4 å¤´ç 26..30ï¼
-    f[30..34].copy_from_slice(&NET_GATEWAY_IP); // ç®çå°åï¼IPv4 å¤´ç 30..34ï¼ // åæ­ç®æ  = ç½å³
+    f[26..30].copy_from_slice(our_ip);           // 源地址（IPv4 头的 26..30）
+    f[30..34].copy_from_slice(&NET_GATEWAY_IP); // 目的地址（IPv4 头的 30..34） // 单播目标 = 网关
     let ck = ip_cksum(&f[14..34]);
     f[24] = (ck >> 8) as u8;
     f[25] = ck as u8;
-    let ic = 14 + 20;                           // ICMP æ®µèµ·ç¹
+    let ic = 14 + 20;                           // ICMP 段起点
     f[ic] = ICMP_ECHO_REQUEST;
     f[ic + 1] = 0;                              // code
-    // æ ¡éªååç½®é¶åç®æ´æ®µ
+    // 校验和先置零再算整段
     f[ic + 2] = 0; f[ic + 3] = 0;
     f[ic + 4..ic + 6].copy_from_slice(&ICMP_ECHO_ID.to_be_bytes());
     f[ic + 6..ic + 8].copy_from_slice(&seq.to_be_bytes());
@@ -1313,7 +1313,7 @@ pub fn build_icmp_echo_request(
     (f, h)
 }
 
-/// æ¶å°ç ICMP echo reply éè½æ¿åºæ¥çäºå®ãå­æ®µå¨ä»**æ¶å°çå­è**éè¯»ã
+/// 收到的 ICMP echo reply 里能拿出来的事实。字段全从**收到的字节**里读。
 #[derive(Clone, Copy, Debug)]
 pub struct IcmpReply {
     pub len: usize,
@@ -1327,8 +1327,8 @@ pub struct IcmpReply {
     pub used_id: u32,
 }
 
-/// è§£ä¸å ICMP echo replyï¼ethertype=0x0800ãprotocol=1ãtype=0ã
-/// æ¯å¤åçåéªé¿åº¦ï¼`parse_reply` åæ¡ï¼çº¿ä¸çæ°ä¸è½ç´æ¥å½çç¨ï¼ã
+/// 解一包 ICMP echo reply：ethertype=0x0800、protocol=1、type=0。
+/// 每处切片先验长度（`parse_reply` 同条：线上的数不能直接当界用）。
 pub fn parse_icmp_reply(buf: &[u8], used_idx: u16, used_len: u32, used_id: u32) -> Result<IcmpReply, VirtioError> {
     if buf.len() < 14 + 20 + 4 || buf[12] != NET_TYPE_IPV4[0] || buf[13] != NET_TYPE_IPV4[1] {
         return Err(VirtioError::NotV4 { at: buf.len(), guard: 1 });
@@ -1355,17 +1355,17 @@ pub fn parse_icmp_reply(buf: &[u8], used_idx: u16, used_len: u32, used_id: u32) 
         used_id,
     })
 }
-// ---------------------------------------------------------------- B2 ç¬¬ä¸åï¼ADR-141ï¼ï¼UDP å¾è¿ï¼DNS æ¥è¯¢ï¼
-/// DNS çå ä¸ªå·ï¼RFC 1035ï¼ãslirp ç DNS æå¡å¨æ¯åºå®ç 10.0.2.3ï¼QEMU ç¨æ·ç½ç»çº¦å®ï¼ï¼
-/// å®ææ¥è¯¢è½¬åç»å®¿ä¸»æºç DNSââåçæ¯ç DNS æå¡å¨çè¯ã
+// ---------------------------------------------------------------- B2 第三刀（ADR-141）：UDP 往返（DNS 查询）
+/// DNS 的几个号（RFC 1035）。slirp 的 DNS 服务器是固定的 10.0.2.3（QEMU 用户网络约定），
+/// 它把查询转发给宿主机的 DNS——回的是真 DNS 服务器的话。
 pub const NET_DNS_IP: [u8; 4] = [10, 0, 2, 3];
 pub const DNS_CLIENT_PORT: u16 = 53;
-/// æ¥è¯¢çæºç«¯å£ï¼éç¹æï¼å®æµ æºç«¯ç«¯å£ 0 æ¶ slirp å ICMP Port Unreachableï¼
+/// 查询的源端口：非特权（实测 源端端口 0 时 slirp 回 ICMP Port Unreachable）
 pub const DNS_QUERY_PORT: u16 = 1053;
 
-// ---------------------------------------------------------------- B2 ç¬¬ååï¼ADR-142ï¼ï¼ARP ç¼å­
-/// ARP ç¼å­ï¼RFC 826 ç"merge" è§åï¼ï¼æ¯æ¬¡åæ­ååæ¥è¡¨ï¼miss æå¹¿æ­ã
-/// **æ å ãåºå® 8 é¡¹ãçº¿æ§æ¥æ¾**ï¼ä¸å¼å ãä¸å¼åå¸ï¼ã`hits`/`misses` æ¯å¤æ®è¯»æ°ã
+// ---------------------------------------------------------------- B2 第四刀（ADR-142）：ARP 缓存
+/// ARP 缓存（RFC 826 的"merge" 规则）：每次单播前先查表，miss 才广播。
+/// **无堆、固定 8 项、线性查找**（不引堆、不引哈希）。`hits`/`misses` 是判据读数。
 pub const ARP_TABLE_MAX: usize = 8;
 pub struct ArpStats {
     pub hits: u32,
@@ -1373,9 +1373,9 @@ pub struct ArpStats {
     pub learns: u32,
     pub evicts: u32,
 }
-static ARP_TABLE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0); // 0=æªåå§å 1=å·²åå§å
+static ARP_TABLE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0); // 0=未初始化 1=已初始化
 struct ArpTable {
-    // çº¿æ§æ°ç»ï¼`ips[i]==0` è¡¨ç¤ºç©ºæ§½ï¼IP 0.0.0.0 ä¸ä¼æ¯åæ³é»å±ï¼
+    // 线性数组，`ips[i]==0` 表示空槽（IP 0.0.0.0 不会是合法邻居）
     ips: [[u8; 4]; ARP_TABLE_MAX],
     macs: [[u8; 6]; ARP_TABLE_MAX],
     n: usize,
@@ -1392,9 +1392,9 @@ static ARP: ArpCell = ArpCell(core::cell::UnsafeCell::new(ArpTable {
     n: 0, hits: 0, misses: 0, learns: 0, evicts: 0,
 }));
 
-/// æ¥ç¼å­ãhit â MACï¼miss â Noneï¼è°ç¨æ¹å¹¿æ­ï¼ã
+/// 查缓存。hit ⇒ MAC，miss ⇒ None（调用方广播）。
 pub fn arp_lookup(ip: &[u8; 4]) -> Option<[u8; 6]> {
-    // SAFETY: è§ `bn` åæ¬¾-- åæ ¸åæåæ ¸ãè°ç¨ç¹é½å¨åæ ¸ä¸²è¡ä¸ä¸æï¼æ å¹¶ååã
+    // SAFETY: 见 `bn` 同款-- 单核初期内核、调用点都在内核串行上下文，无并发写。
     let t = unsafe { &mut *ARP.0.get() };
     let mut i = 0usize;
     while i < t.n {
@@ -1408,9 +1408,9 @@ pub fn arp_lookup(ip: &[u8; 4]) -> Option<[u8; 6]> {
     None
 }
 
-/// å­¦ä¸æ¡ï¼ARP reply ç senderï¼ãå·²æåè¦çï¼RFC 826 mergeï¼ï¼æ»¡åæ¤ç¬¬ä¸æ¡ï¼FIFOï¼æç®èä¸æµå¾åºï¼ã
+/// 学一条（ARP reply 的 sender）。已有则覆盖（RFC 826 merge），满则挤第一条（FIFO，最简而且测得出）。
 pub fn arp_learn(ip: &[u8; 4], mac: &[u8; 6]) {
-    // SAFETY: å `arp_lookup`ã
+    // SAFETY: 同 `arp_lookup`。
     let t = unsafe { &mut *ARP.0.get() };
     t.learns += 1;
     let mut i = 0usize;
@@ -1428,7 +1428,7 @@ pub fn arp_learn(ip: &[u8; 4], mac: &[u8; 6]) {
         return;
     }
     t.evicts += 1;
-    // æ»¡è¡¨ï¼æ¤ç¬¬ 0 æ¡ï¼å¶ä½åç§»ï¼FIFOï¼ã
+    // 满表：挤第 0 条，其余前移（FIFO）。
     let mut k = 0usize;
     while k + 1 < ARP_TABLE_MAX {
         t.ips[k] = t.ips[k + 1];
@@ -1439,30 +1439,55 @@ pub fn arp_learn(ip: &[u8; 4], mac: &[u8; 6]) {
     t.macs[ARP_TABLE_MAX - 1] = *mac;
 }
 
-/// ç¼å­è¯»æ°ï¼å¤æ®ç¨ï¼ã
+/// 缓存读数（判据用）。
 pub fn arp_stats() -> ArpStats {
-    // SAFETY: å `arp_lookup`ã
+    // SAFETY: 同 `arp_lookup`。
     let t = unsafe { &*ARP.0.get() };
     ArpStats { hits: t.hits, misses: t.misses, learns: t.learns, evicts: t.evicts }
 }
+
+/// `arp_stats` çåæå¥å£ï¼ææ¸¸æ æ**è¡¨é¡¹**è¯»åºæ¥ï¼ADR-145ï¼`ip neigh` çè¯»æ°ééï¼ã
+/// æ¯æ¡**å®é¿ 10 å­è**ï¼IP4 + MAC6ï¼ç´§æåå° `out`ã
+/// è¿ååå¥çæ¡æ°ï¼`cursor` è¶è¿è¡¨é¿æ¶è¿ 0ï¼åé¡µçç»ç¹ï¼ã
+pub fn arp_read_from(cursor: u32, out: &mut [u8]) -> usize {
+    // SAFETY: å `arp_lookup`ã
+    let t = unsafe { &*ARP.0.get() };
+    let mut n = 0usize;
+    let mut i = cursor as usize;
+    while i < t.n && (n + 1) * 10 <= out.len() {
+        let at = n * 10;
+        out[at..at + 4].copy_from_slice(&t.ips[i]);
+        out[at + 4..at + 10].copy_from_slice(&t.macs[i]);
+        n += 1;
+        i += 1;
+    }
+    n
+}
+
+/// è¡¨éå½åæå¤å°é¡¹ï¼`ip neigh` åé¡µçä¸çï¼ã
+pub fn arp_len() -> u32 {
+    // SAFETY: å `arp_lookup`ã
+    let t = unsafe { &*ARP.0.get() };
+    t.n as u32
+}
 pub const DNS_QTYPE_A: u16 = 1;
 pub const DNS_QCLASS_IN: u16 = 1;
-/// DNS å¸§æ»é¿ = eth 14 + IPv4 20 + UDP 8 + DNS æ¥è¯¢ï¼é® localhostï¼ï¼å«å° 60ã
-/// é® localhostï¼slirp ç DNS å¯¹å®ææ¬å°ç­æ¡ï¼127.0.0.1ï¼ï¼**ä¸ä¾èµå¤ç½**ã
-/// **DNS æ¥è¯¢è¶æå°å¸§**ï¼ARP/ICMP ç 60 å­èè£ä¸ä¸ï¼ï¼
-/// eth 14 + IPv4 20 + UDP 8 + DNS å¤´ 12 + QNAME 11 + QT/QC 4 = 69ï¼å«å° 72ã
-/// å¸§é¿æåå®¹ç®ï¼ä¸åå¥â60 å­èâçæ¨¡æ¿ââé£æ¡åªå¯¹æå°å¸§æç«ã
+/// DNS 帧总长 = eth 14 + IPv4 20 + UDP 8 + DNS 查询（问 localhost），垫到 60。
+/// 问 localhost：slirp 的 DNS 对它有本地答案（127.0.0.1），**不依赖外网**。
+/// **DNS 查询超最小帧**（ARP/ICMP 的 60 字节装不下）：
+/// eth 14 + IPv4 20 + UDP 8 + DNS 头 12 + QNAME 11 + QT/QC 4 = 69，垫到 72。
+/// 帧长按内容算，不再套“60 字节”的模板——那条只对最小帧成立。
 pub const DNS_FRAME_BYTES: usize = 72;
 const _: () = assert!(DNS_FRAME_BYTES <= NET_TX_MAX);
 
-/// æé ä¸ä¸ª DNS A æ¥è¯¢ï¼é® localhostï¼ï¼åæ­ç» DNS æå¡å¨ 10.0.2.3ï¼
-/// MAC ç¨ ARP è§£åºæ¥çç½å³ï¼åå°å«çå­ç½ä¸æ ·åè§£ç½å³ï¼ã
+/// 构造一个 DNS A 查询（问 localhost）：单播给 DNS 服务器 10.0.2.3，
+/// MAC 用 ARP 解出来的网关（发到别的子网一样先解网关）。
 pub fn build_dns_query(gw_mac: &[u8; 6], our_mac: &[u8; 6], our_ip: &[u8; 4], txid: u16) -> ([u8; DNS_FRAME_BYTES], u64) {
     let mut f = [0u8; DNS_FRAME_BYTES];
     f[0..6].copy_from_slice(gw_mac);
     f[6..12].copy_from_slice(our_mac);
     f[12..14].copy_from_slice(&NET_TYPE_IPV4);
-    let dns_name: &[u8] = b"\x09localhost\x00";  // é¿åº¦åç½®ç¼ç ï¼9 å­è "localhost"
+    let dns_name: &[u8] = b"\x09localhost\x00";  // 长度前置编码：9 字节 "localhost"
     let ip_len = 20 + 8 + 12 + dns_name.len() + 4;
     f[14] = 0x45;
     f[16] = (ip_len >> 8) as u8;
@@ -1476,19 +1501,19 @@ pub fn build_dns_query(gw_mac: &[u8; 6], our_mac: &[u8; 6], our_ip: &[u8; 4], tx
     let ck = ip_cksum(&f[14..34]);
     f[24] = (ck >> 8) as u8;
     f[25] = ck as u8;
-    let u = 14 + 20;                              // UDP æ®µèµ·ç¹
-    f[u] = (DNS_QUERY_PORT >> 8) as u8; f[u+1] = DNS_QUERY_PORT as u8; // æºç«¯å£ï¼**éç¹æ**ï¼å®æµ æºç«¯ 0 æ¶ slirp å ICMP Port Unreachableï¼
+    let u = 14 + 20;                              // UDP 段起点
+    f[u] = (DNS_QUERY_PORT >> 8) as u8; f[u+1] = DNS_QUERY_PORT as u8; // 源端口：**非特权**（实测 源端 0 时 slirp 回 ICMP Port Unreachable）
     f[u+2] = (DNS_CLIENT_PORT >> 8) as u8;
-    f[u+3] = DNS_CLIENT_PORT as u8;               // ç®æ  = 53
+    f[u+3] = DNS_CLIENT_PORT as u8;               // 目标 = 53
     let udp_len = 8 + 12 + dns_name.len() + 4;
     f[u+4] = (udp_len >> 8) as u8;
     f[u+5] = udp_len as u8;
-    let d = u + 8;                                // DNS æ®µèµ·ç¹
+    let d = u + 8;                                // DNS 段起点
     f[d] = (txid >> 8) as u8;
     f[d+1] = txid as u8;
-    f[d+2] = 0x01; f[d+3] = 0x00;                 // flags: æ åæ¥è¯¢ RD=1
+    f[d+2] = 0x01; f[d+3] = 0x00;                 // flags: 标准查询 RD=1
     f[d+4] = 0; f[d+5] = 1;                       // QDCOUNT=1
-    // QNAME ä» d+12 èµ·ï¼å¤´åæ ¼ ä¸ QDCOUNT åç ANCOUNT/NSCOUNT/ARCOUNT å¨é¶ï¼
+    // QNAME 从 d+12 起（头四格 与 QDCOUNT 后的 ANCOUNT/NSCOUNT/ARCOUNT 全零）
     f[d+12..d+12+dns_name.len()].copy_from_slice(dns_name);
     let q = d + 12 + dns_name.len();
     f[q..q+2].copy_from_slice(&DNS_QTYPE_A.to_be_bytes());
@@ -1497,21 +1522,21 @@ pub fn build_dns_query(gw_mac: &[u8; 6], our_mac: &[u8; 6], our_ip: &[u8; 4], tx
     (f, h)
 }
 
-/// æ¶å°ç DNS reply éè½æ¿åºæ¥çäºå®ã
+/// 收到的 DNS reply 里能拿出来的事实。
 #[derive(Clone, Copy, Debug)]
 pub struct DnsReply {
     pub len: usize,
     pub hash: u64,
     pub txid: u16,
-    pub rcode: u8,       // flags çä½ 4 ä½
-    pub ancount: u16,    // åç­æ¡æ°
+    pub rcode: u8,       // flags 的低 4 位
+    pub ancount: u16,    // 回答条数
     pub used_idx: u16,
     pub used_len: u32,
     pub used_id: u32,
 }
 
-/// è§£ä¸å UDP/DNS replyï¼ethertype=0x0800ãprotocol=17ãæºç«¯ 53ã
-/// æ¯å¤åçåéªé¿åº¦ï¼ARP/ICMP åæ¡ï¼çº¿ä¸çæ°ä¸è½ç´æ¥å½çç¨ï¼ã
+/// 解一包 UDP/DNS reply：ethertype=0x0800、protocol=17、源端 53。
+/// 每处切片先验长度（ARP/ICMP 同条：线上的数不能直接当界用）。
 pub fn parse_dns_reply(buf: &[u8], used_idx: u16, used_len: u32, used_id: u32) -> Result<DnsReply, VirtioError> {
     if buf.len() < 14 + 20 + 8 || buf[12] != NET_TYPE_IPV4[0] || buf[13] != NET_TYPE_IPV4[1] {
         return Err(VirtioError::NotV4 { at: buf.len(), guard: 1 });

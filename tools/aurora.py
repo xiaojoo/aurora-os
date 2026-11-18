@@ -3855,7 +3855,7 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
         ]
     # 一次性实验用的附加参数（例如 `-device intel-iommu,intremap=on` 去真正解析 DMAR）。
     # 走环境变量而不是加一堆子命令开关：这类实验今天要做、明天可能就废，不该进判定链的默认路径。
-    # ADR-143ï¼ç½å¡è®¾å¤**æ æ¡ä»¶æç» QEMU**ï¼ä¹ååªæ virtio-net æ¡£æãå®æµ a3-shell æ¡£ç ping æ¾ä¸å°è®¾å¤ â NoDeviceï¼ãè®¾å¤å¨ä½æ²¡äºº claim å¯¹å¶å®æ¡£æ å®³ã
+    # ADR-143：网卡设备**无条件挂给 QEMU**（之前只有 virtio-net 档有。实测 a3-shell 档的 ping 找不到设备 ⇒ NoDevice）。设备在但没人 claim 对其它档无害。
     if NET_FEATURES & set(features) or "a3-shell" in set(features):
         # 抓包文件每次重开：上一跑的包会被读成这一跑发出去的（实测那类"旧证据冒充新事实"
         # 在 scratch 夹具上已经栽过一次，这里不重复）
@@ -7895,13 +7895,35 @@ def _lspci_rows(log: str) -> bool:
     return False
 
 
-def _ip_rows(log: str) -> bool:
-    """`ip link` / `ip addr` çæ¾ç¤ºå±å¤æ®ï¼ADR-144ï¼ã
+def _ip_neigh_row(log: str) -> bool:
+    """`ip neigh` çæ¾ç¤ºå±å¤æ®ï¼ADR-145ï¼ã
 
-    ä¸¤æ¡å½ä»¤åèªè¦ä¸è¡ä¸¥æ ¼å½¢ç¶ï¼
-      `link mac <6 ç» 2 ä½åå­è¿å¶ç¨ : åé> mtu=<digits> state=(up|down)`
+    åæ¾ä¹åå¿é¡»åºç°ä¸¤ç§å½¢ç¶ä¹ä¸ï¼
+      â  `neigh: empty`ï¼è¡¨ç©ºï¼
+      â¡ `<a.b.c.d> <6 ç» 2 ä½åå­è¿å¶ç¨ : åé>`ï¼æè¡¨é¡¹ï¼
+    ä¸¤ç§é½æ²¡æ â çº¢ï¼`-1`ï¼æªç¥å·/usageï¼ä¹ä¸ç®éã
+    """
+    import re
+    lines = log.split("\n")
+    octet = r"(?:25[0-5]|2[0-4]\d|1?\d?\d)"
+    row_pat = re.compile(r"^" + octet + r"(?:\." + octet + r"){3} ([0-9a-f]{2}:){5}[0-9a-f]{2}$")
+    for k, ln in enumerate(lines):
+        if ln.strip() != "ip neigh":
+            continue
+        for j in range(k + 1, min(k + 4, len(lines))):
+            s = lines[j].strip()
+            if s == "neigh: empty" or row_pat.match(s):
+                return True
+    return False
+
+
+def _ip_rows(log: str) -> bool:
+    """`ip link` / `ip addr` 的显示层判据（ADR-144）。
+
+    两条命令各自要一行严格形状：
+      `link mac <6 组 2 位十六进制用 : 分隔> mtu=<digits> state=(up|down)`
       `addr <a.b.c.d> gw <a.b.c.d> dns <a.b.c.d>`
-    ä¸ä¾èµå·ä½æ°å¼ï¼MAC/mtu/IP é½æ¯ç¯å¢çäºå®ï¼ã
+    不依赖具体数值（MAC/mtu/IP 都是环境的事实）。
     """
     import re
     lines = log.split("\n")
@@ -7926,10 +7948,10 @@ def _ip_rows(log: str) -> bool:
 
 
 def _ping_row(log: str) -> bool:
-    """`ping 10.0.2.2` ççå¾è¿å¤æ®ï¼ADR-143ï¼ã
+    """`ping 10.0.2.2` 的真往返判据（ADR-143）。
 
-    åæ¾ `ping 10.0.2.2` ä¹åï¼å¿é¡»åºç° `from 10.0.2.2: seq=<æ°>`
-    ï¼è¯´æ echo reply ççåæ¥äºï¼ãusage ä¸ `timeout` é½ä¸ç®éã
+    回显 `ping 10.0.2.2` 之后，必须出现 `from 10.0.2.2: seq=<数>`
+    （说明 echo reply 真的回来了）。usage 与 `timeout` 都不算通。
     """
     import re
     lines = log.split("\n")
@@ -8787,14 +8809,18 @@ def do_test(timeout: int) -> int:
         # §402 曾因"12 条 argv 早停"暂撤本格；§403 复跑证实那次是宿主机抖动
         # （同内核同 argv 单跑全 12 条执行完、15.1s），格子接回。
         _top_sleep_gap(ashlog),
-        # pingï¼ADR-143ï¼ï¼argv é `ping 10.0.2.2`
-        # å¤æ®å½¢ç¶ï¼åæ¾ä¹åå¿é¡»åºç°ä¸è¡ `from 10.0.2.2: seq=æ°`
-        # ï¼ç ICMP å¾è¿çè¯»æ°ï¼ï¼usage/è¶æ¶é½ä¸ç®éã
+        # ping（ADR-143）：argv 里 `ping 10.0.2.2`
+        # 判据形状：回显之后必须出现一行 `from 10.0.2.2: seq=数`
+        # （真 ICMP 往返的读数）；usage/超时都不算通。
         _ping_row(ashlog),
-        # ip link / ip addrï¼ADR-144ï¼ï¼35 å·è¯»æ°çæ¾ç¤ºå±
-        # å¤æ®å½¢ç¶ï¼`link mac <MAC> mtu=<æ°> state=<up|down>` ä¸
-        # `addr <a.b.c.d> gw <a.b.c.d> dns <a.b.c.d>`ââä¸ä¾èµå·ä½æ°å¼ã
+        # ip link / ip addr（ADR-144）：35 号读数的显示层
+        # 判据形状：`link mac <MAC> mtu=<数> state=<up|down>` 与
+        # `addr <a.b.c.d> gw <a.b.c.d> dns <a.b.c.d>`——不依赖具体数值。
         _ip_rows(ashlog),
+        # ip neighï¼ADR-145ï¼ï¼36/37 å·çåªè¯»å±ç¤º；
+        # shell ç ping èµ°ç¨æ·æèªå¸¦ ARPï¼ä¸å¡«åæ ¸è¡¨，
+        # æä»¥æ¬ççå°çæ¯ "neigh: empty"ï¼è¡¨ç©ºä¹æ¯åæ³å½¢ç¶）ã
+        _ip_neigh_row(ashlog),
 
         # ---- ls / cat（2026-11-18）----
         "ls: /" in ashlog,

@@ -38,7 +38,7 @@ mod registry;
 /// （hello/probe 的模块头都记过这个坑，本轮实测又撞一次）。改成 RIP 相对 lea 取基址 + 常量偏移。
 /// S6u：横幅的前导 `\x0a` 去掉了——那是当年为了跟上面的内核日志隔开留的，
 /// ADR-096 之后画面正文只有会话输出，前面什么都没有，那一格就成了纯粹的空行。
-static MSGS: [u8; 659] = *b"dmesg: usage\x0admesg: err=\x0admesg: tail\x0acommands: help | echo <text> | ping | abi | ps | free | top | kill | exit\x0aAurora OS 6.1.0-aurora (tty1)\x0aaurora@os:~$ \x0aline too long, discarded\x0aunknown command:  (try help)\x0aping=abi_info=bye\x0a\x08 \x08^C\x0arun:  exit= (timeout) error=usage: run <path>\x0a-PID GEN THR ST PAGES\x0aps: no job handle\x0alivedead ps: error=free: procs= threads= pages=#\x0atop: usage\x0aframe kill: usage\x0akilled=dmesg: usage\x0admesg: err=dmesg: tail\x0alspci: usage\x0auptime: sleep <ms>\x0aping <ip>\x0afrom \x20\x0ap\x2e\x0a: seq=\x0atimeout\x0aip: usage\x0alink addr mtu=state=up\x0adown\x0amac gw dns \x3als: cat: d f  entries bytes= fnv=pwd: cd:  not a directoryusage: cd <path>usage: cat <path> | cd | pwd";
+static MSGS: [u8; 688] = *b"dmesg: usage\x0admesg: err=\x0admesg: tail\x0acommands: help | echo <text> | ping | abi | ps | free | top | kill | exit\x0aAurora OS 6.1.0-aurora (tty1)\x0aaurora@os:~$ \x0aline too long, discarded\x0aunknown command:  (try help)\x0aping=abi_info=bye\x0a\x08 \x08^C\x0arun:  exit= (timeout) error=usage: run <path>\x0a-PID GEN THR ST PAGES\x0aps: no job handle\x0alivedead ps: error=free: procs= threads= pages=#\x0atop: usage\x0aframe kill: usage\x0akilled=dmesg: usage\x0admesg: err=dmesg: tail\x0alspci: usage\x0auptime: sleep <ms>\x0aping <ip>\x0afrom \x20\x0ap\x2e\x0a: seq=\x0atimeout\x0aip: usage\x0alink addr mtu=state=up\x0adown\x0amac gw dns \x3als: cat: d f  entries bytes= fnv=pwd: cd:  not a directoryusage: cd <path>usage: cat <path> | cd | pwdneigh neigh: empty\x0aip: usage\x0a";
 
 const M_HELP: (usize, usize) = (37, 14);
 const M_BANNER: (usize, usize) = (111, 30);
@@ -98,6 +98,10 @@ const M_IP_MAC: (usize, usize) = (545, 4);
 const M_IP_GW: (usize, usize) = (549, 3);
 const M_IP_DNS: (usize, usize) = (552, 4);
 const M_COLON: (usize, usize) = (556, 1);
+// `ip neigh`（ADR-145）：子命令 + 空表提示。
+const M_NEIGH: (usize, usize) = (659, 6);
+const M_NEIGH_EMPTY: (usize, usize) = (665, 13);
+const M_IP_USAGE2: (usize, usize) = (678, 10);
 // `dmesg`（ADR-135）：usage 与读取失败前缀。
 const M_LS: (usize, usize) = (557, 4);
 const M_CAT: (usize, usize) = (561, 5);
