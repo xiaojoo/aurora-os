@@ -15895,3 +15895,37 @@ MAC 与 ADR-139 实测的网关 MAC 逐字节一致。
 读数：`check` **18/18**；a3-shell 单跑九格全绿；整链 **71 符合 + 2 条不符**
 （FS-03 两条，都是 `t_fat32` 卷抖动的连带——单跑 fat32-probe **86/86、
 两卷同哈希=true**，按环境形状不归因）。
+
+
+## 423. ADR-147：B2 收官——路由判据 + ip route + DHCP 掩码/网关（workbuddy，2026-11-18）
+
+**零新号**。DHCP `parse_reply` 解析 option 1（子网掩码）与 option 3（默认网关），
+长度不合形状就不学（保持 0.0.0.0，不猜）。内核加纯函数
+`is_local_subnet`/`next_hop`（同子网 ⇒ 下一跳是目标；外部 ⇒ 网关），
+用户态 runtime 加同形状镜像，`cmd_ping` 用 `next_hop` 决定 ARP 谁
+（此前硬编码网关，跨子网/同子网分不出来）。`ip route` 打一行
+`route default via 10.0.2.2`。
+
+**为什么不做 SYS_NET_ROUTE 号**：为一个 6 行按位与开 syscall 是过度设计；
+内核已有算术，用户态镜像由同一个 ktest 与掩码常量作证。
+
+**实测**（a3-shell PASS33 14.9s）：ping 往返、`ip neigh` 表项、
+`ip route` 默认路由三行都对，**`ip` 四子命令全齐**。
+`t_net_route` 六格（同子网/跨子网/自己/广播/全0掩码/32掩码）全 true、88/88。
+
+### 两次变异证红
+
+1. `next_hop` 恒返回网关 ⇒ `自己=false` ⇒ FAIL35，还原绿。
+2. 删 `ip route` 输出行 ⇒ 整链 `CONTENT-MISMATCH`，还原绿。
+   **教训**：判据的"会红"要在**整链判定级**证，不能只看辅助函数返回值——
+   我第一次只看 `_ip_route_row` 的返回值，误以为接上了。
+
+### 三条教训
+
+1. `ip route` 分支写在 `info` 取值之前 ⇒ E0425；移到之后并把 usage 守卫也放开。
+2. Python 写入**第三次**把中文注释写成双重编码，按行 latin-1→utf-8 逆转清零。
+3. 掩码用户态仍硬编码（DHCP 解析了但 35 号没带）——列进 ADR 未决 1。
+
+读数：`check` **18/18**；整链 **70 符合 + 3 条不符**（全是已知抖动族：日志尾
+HANG 因那跑串口无 fail/fatal 行、FS-03 两条因卷抖动）——**单跑复验全部通过**：
+`fault-crash-oops` EXCEPTION39 + log tail 4/4 逐行相符、`fat32-probe` PASS。

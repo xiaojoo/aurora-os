@@ -1240,6 +1240,27 @@ pub fn net_build_icmp(gw_mac: &[u8; 6], our_mac: &[u8; 6], our_ip: &[u8; 4], dst
 }
 
 /// 构造一帧 ARP request（问谁有 `target_ip`）。42 字节。
+/// 路由判据的用户态镜像（ADR-147）：内核侧 `virtio::is_local_subnet` 的同形状。
+/// **两份实现**是有意的：用户态 ping 自己决定 ARP 谁，不为此多开一个号；
+/// 两侧由同一个 ktest（`t_net_route`）与同一份掩码常量作证。
+pub fn is_local_subnet(our_ip: &[u8; 4], mask: &[u8; 4], dst: &[u8; 4]) -> bool {
+    let mut i = 0usize;
+    while i < 4 {
+        let m = match mask.get(i) { Some(v) => *v, None => return false };
+        let a = match our_ip.get(i) { Some(v) => *v, None => return false };
+        let d = match dst.get(i) { Some(v) => *v, None => return false };
+        if (a & m) != (d & m) { return false; }
+        i += 1;
+    }
+    if *mask == [0u8; 4] { return *our_ip == *dst; }
+    true
+}
+
+/// 下一跳（ADR-147）：目标该去解谁的 MAC。本子网 -> 目标；外部 -> 网关。
+pub fn next_hop(our_ip: &[u8; 4], mask: &[u8; 4], dst: &[u8; 4], gateway: &[u8; 4]) -> [u8; 4] {
+    if is_local_subnet(our_ip, mask, dst) { *dst } else { *gateway }
+}
+
 pub fn net_build_arp(our_mac: &[u8; 6], our_ip: &[u8; 4], target_ip: &[u8; 4]) -> [u8; 42] {
     let mut f = [0u8; 42];
     f[0..6].copy_from_slice(&[0xFF; 6]);

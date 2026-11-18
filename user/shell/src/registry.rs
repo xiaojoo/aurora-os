@@ -27,6 +27,7 @@ use crate::{
     M_DMESG_ERR, M_DMESG_HDR, M_DMESG_USAGE, M_KILLED, M_KILL_USAGE, M_LSPCI_USAGE,
     M_IP_ADDR, M_IP_DNS, M_IP_DOWN, M_IP_GW, M_IP_LINK, M_IP_MAC, M_IP_MTU, M_IP_STATE, M_IP_UP,
     M_COLON, M_IP_USAGE, M_NEIGH, M_NEIGH_EMPTY, M_PING_DOT, M_PING_FROM, M_PING_SEQ,
+    M_ROUTE_DEFAULT, M_ROUTE_NL,
     M_PING_TIMEOUT, M_PING_USAGE, M_RUN_USAGE,
     M_SLEEP_USAGE, M_SP, M_TOP_FRAME, M_UPTIME_USAGE,
     M_TOP_USAGE, M_TRYHELP, M_UNKNOWN,
@@ -175,9 +176,16 @@ fn cmd_ping(c: &Ctx) -> bool {
     for (d, s) in our_mac.iter_mut().zip(info.get(0..6).unwrap_or(&[]).iter()) { *d = *s; }
     let mut our_ip = [0u8; 4];
     for (d, s) in our_ip.iter_mut().zip(info.get(6..10).unwrap_or(&[]).iter()) { *d = *s; }
+    // **路由（ADR-147）**：先算下一跳——
+    // 同子网解目标自己，外部解网关。
+    // 之前无条件解目标，所以 `ping 192.168.1.1` 会去问它的 MAC——那是错的。
+    let mask: [u8; 4] = [255, 255, 255, 0];
+    let mut gateway = [0u8; 4];
+    for (d, s) in gateway.iter_mut().zip(info.get(10..14).unwrap_or(&[]).iter()) { *d = *s; }
+    let hop = rt::next_hop(&our_ip, &mask, &ip, &gateway);
     // ARP request（42 字节，构造在 runtime）。**RX 队列不保证干净**（ADR-141
     // 教训）：循环等到 opcode=2 的 ARP reply，最多 4 包。
-    let arp = rt::net_build_arp(&our_mac, &our_ip, &ip);
+    let arp = rt::net_build_arp(&our_mac, &our_ip, &hop);
     if rt::net_send(&arp).is_err() {
         con_write(c.h, msg(M_PING_USAGE));
         return true;
@@ -899,12 +907,13 @@ fn cmd_ip(c: &Ctx) -> bool {
     let is_link = sub.len() == 4 && matches!(sub.first(), Some(b'l'));
     let is_addr = sub.len() == 4 && matches!(sub.first(), Some(b'a'));
     let is_neigh = sub.len() == 5 && matches!(sub.first(), Some(b'n'));
+    let is_route = sub.len() == 5 && matches!(sub.first(), Some(b'r'));
     let want_link = is_link;
     let want_addr = is_addr;
     if is_neigh {
         return cmd_ip_neigh(c);
     }
-    if !want_link && !want_addr {
+    if !want_link && !want_addr && !is_route {
         con_write(c.h, msg(M_IP_USAGE));
         return true;
     }
@@ -916,6 +925,13 @@ fn cmd_ip(c: &Ctx) -> bool {
             return true;
         }
     };
+    if is_route {
+        // ADR-147：今天只有一条默认路由，打出来就是全部内容。
+        con_write(c.h, msg(M_ROUTE_DEFAULT));
+        put_dotted(c.h, info.get(10..14));
+        con_write(c.h, msg(M_ROUTE_NL));
+        return true;
+    }
     if want_link {
         con_write(c.h, msg(M_IP_LINK));
         con_write(c.h, msg(M_IP_MAC));

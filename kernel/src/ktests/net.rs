@@ -510,3 +510,50 @@ fn t_net_udp() -> bool {
 }
 #[cfg(feature = "virtio-net")]
 ktest!(KT_NET_UDP, t_net_udp);
+
+
+/// B2 路由判据（ADR-147）：`is_local_subnet` / `next_hop` 的边界检查。
+///
+/// 纯函数判定，不发帧——路由是**算术**，用网络的用例判它反而会被网络抖动污染。
+/// 六格：
+///   ① 同子网（10.0.2.2 在 10.0.2.0/24 里）⇒ local，下一跳是目标自己
+///   ② 跨子网（192.168.1.1）⇒ 不 local，下一跳是网关
+///   ③ 本机自己 ⇒ local，下一跳是自己
+///   ④ 广播 255.255.255.255 ⇒ 不 local
+///   ⑤ 全 0 掩码 ⇒ 只有同一个 IP 算 local（退化分支）
+///   ⑥ /32 掩码 ⇒ 只有完全相等的 IP 算 local
+fn t_net_route() -> bool {
+    let our: [u8; 4] = virtio::DHCP_GUEST_IP;
+    let mask: [u8; 4] = virtio::NET_SUBNET_MASK;
+    let gw: [u8; 4] = virtio::NET_GATEWAY_IP;
+
+    let same_peer: [u8; 4] = [10, 0, 2, 2];
+    let far: [u8; 4] = [192, 168, 1, 1];
+    let bcast: [u8; 4] = [255, 255, 255, 255];
+    let zero_mask: [u8; 4] = [0, 0, 0, 0];
+    let host_mask: [u8; 4] = [255, 255, 255, 255];
+
+    let g1 = virtio::is_local_subnet(&our, &mask, &same_peer)
+        && virtio::next_hop(&our, &mask, &same_peer) == same_peer;
+    let g2 = !virtio::is_local_subnet(&our, &mask, &far)
+        && virtio::next_hop(&our, &mask, &far) == gw;
+    let g3 = virtio::is_local_subnet(&our, &mask, &our)
+        && virtio::next_hop(&our, &mask, &our) == our;
+    let g4 = !virtio::is_local_subnet(&our, &mask, &bcast);
+    let g5 = !virtio::is_local_subnet(&our, &zero_mask, &same_peer)
+        && virtio::is_local_subnet(&our, &zero_mask, &our);
+    let g6 = !virtio::is_local_subnet(&our, &host_mask, &same_peer)
+        && virtio::is_local_subnet(&our, &host_mask, &our);
+
+    crate::log_info!(
+        "route: 判据 同子网={} 跨子网走网关={} 自己={} 广播不在={} 全0掩码={} /32掩码={}",
+        g1, g2, g3, g4, g5, g6
+    );
+    let ok = g1 && g2 && g3 && g4 && g5 && g6;
+    if !ok {
+        crate::log_fatal!("route: 路由判据不成立（上面一行是全部读数）");
+    }
+    ok
+}
+#[cfg(feature = "virtio-net")]
+ktest!(KT_NET_ROUTE, t_net_route);

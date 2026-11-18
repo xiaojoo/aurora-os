@@ -1164,6 +1164,10 @@ pub const DHCP_GUEST_IP: [u8; 4] = [10, 0, 2, 15];
 /// 所以这条只能靠**对端自己写下来的那四个字节**来纠正：真机上的服务器会直接丢掉这一份请求。
 pub const DHCP_MAGIC: [u8; 4] = [99, 130, 83, 99];
 pub const OPT_MSG_TYPE: u8 = 53;
+/// DHCP option 1ï¼å­ç½æ©ç ï¼ADR-147 çè·¯ç±å¤æ®ï¼ã
+pub const OPT_SUBNET_MASK: u8 = 1;
+/// DHCP option 3ï¼è·¯ç±å¨åè¡¨ï¼åç¬¬ä¸ä¸ª = é»è®¤ç½å³ï¼ã
+pub const OPT_ROUTER: u8 = 3;
 pub const OPT_END: u8 = 255;
 pub const OPT_PAD: u8 = 0;
 pub const BOOTREQUEST: u8 = 1;
@@ -1471,6 +1475,38 @@ pub fn arp_len() -> u32 {
     t.n as u32
 }
 
+
+/// `10.0.2.0/24` 的默认子网掩码——没有 DHCP option 1 时的回退值。
+/// 这不是猜的：它是 QEMU `-netdev user,net=10.0.2.0/24` 的参数，与 `DHCP_GUEST_IP`
+/// 同一来源；内核不在运行期发明事实，所以在这里给出明确形状。
+pub const NET_SUBNET_MASK: [u8; 4] = [255, 255, 255, 0];
+
+/// 路由判据（ADR-147）：`dst` 在不在本子网里？
+///
+/// 本子网 -> 直接 ARP 目标；外部 -> ARP 网关。掩码两端都可以是 0（没分子网），
+/// 那时只有 [同一个 IP] 才算本子网——这是退化而不是"正确"：
+/// 掩码 0 的语义有两种读法，这里取「无子网 = 只能自己」这一支。
+pub fn is_local_subnet(our_ip: &[u8; 4], mask: &[u8; 4], dst: &[u8; 4]) -> bool {
+    let mut i = 0usize;
+    while i < 4 {
+        let m = match mask.get(i) { Some(v) => *v, None => return false };
+        let a = match our_ip.get(i) { Some(v) => *v, None => return false };
+        let d = match dst.get(i) { Some(v) => *v, None => return false };
+        if (a & m) != (d & m) { return false; }
+        i += 1;
+    }
+    // 全 0 掩码下只有同一个 IP 才算本子网
+    if *mask == [0u8; 4] { return *our_ip == *dst; }
+    true
+}
+
+/// 下一跳（ADR-147）：一个目标地址该去解谁的 MAC。
+/// 本子网 -> 目标自己；外部 -> 网关。这就是今天"路由"的全部内容：
+/// 一条默认路由，没有路由表、没有最长前缀匹配。
+pub fn next_hop(our_ip: &[u8; 4], mask: &[u8; 4], dst: &[u8; 4]) -> [u8; 4] {
+    if is_local_subnet(our_ip, mask, dst) { *dst } else { NET_GATEWAY_IP }
+}
+
 /// RFC 826 çè¢«å¨å­¦ä¹ ï¼ADR-146ï¼ï¼æ¶å°ä¸å¸§å°±çå®æ¯ä¸æ¯ ARPï¼
 /// æ¯å°±æ sender é£ä¸å¯¹ (ip, mac) æ merge è§åå½è¿è¡¨ã
 ///
@@ -1673,6 +1709,10 @@ pub struct Reply {
     pub msg_type: u8,
     pub xid: u32,
     pub yiaddr: [u8; 4],
+    /// option 1（ADR-147）：子网掩码；服务器没给就是 0.0.0.0
+    pub subnet_mask: [u8; 4],
+    /// option 3 的第一个地址（默认网关）；没给就是 0.0.0.0
+    pub router: [u8; 4],
     pub used_idx: u16,
     pub used_len: u32,
     /// `used.id`：设备说它写的是我们挂的那一条链（今天只挂得下一条，所以合法值只有 0）
@@ -1702,6 +1742,8 @@ pub fn parse_reply(buf: &[u8], used_idx: u16, used_len: u32, used_id: u32) -> Re
     // options 从固定段的 240 起，magic 在它前面（236..240），不要再跳 4 个字节
     let opts = b + BOOTP_OPT;
     let mut msg_type = 0u8;
+    let mut subnet_mask = [0u8; 4];
+    let mut router = [0u8; 4];
     let mut i = opts;
     // 有界走查：`PAD` 是单字节，其余是 `code + len + len 个字节`。
     // 长度说出去就越过这一包末尾时**停下来**，不猜——猜下去就是把畸形输入当合法，
@@ -1725,6 +1767,14 @@ pub fn parse_reply(buf: &[u8], used_idx: u16, used_len: u32, used_id: u32) -> Re
         if code == OPT_MSG_TYPE {
             msg_type = buf[i + 2];
         }
+        // ADR-147：子网掩码 / 路由器。**长度先验**：
+        // option 的 ln 是 4 才取，不合形状就当没给（不猜默认值）。
+        if code == OPT_SUBNET_MASK && ln == 4 {
+            subnet_mask = [buf[i + 2], buf[i + 3], buf[i + 4], buf[i + 5]];
+        }
+        if code == OPT_ROUTER && ln >= 4 {
+            router = [buf[i + 2], buf[i + 3], buf[i + 4], buf[i + 5]];
+        }
         i += 2 + ln;
     }
     Ok(Reply {
@@ -1735,6 +1785,8 @@ pub fn parse_reply(buf: &[u8], used_idx: u16, used_len: u32, used_id: u32) -> Re
         msg_type,
         xid: u32::from_be_bytes([buf[b + 4], buf[b + 5], buf[b + 6], buf[b + 7]]),
         yiaddr: [buf[b + 16], buf[b + 17], buf[b + 18], buf[b + 19]],
+        subnet_mask,
+        router,
         used_idx,
         used_len,
         used_id,

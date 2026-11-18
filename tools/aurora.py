@@ -7895,6 +7895,24 @@ def _lspci_rows(log: str) -> bool:
     return False
 
 
+def _ip_route_row(log: str) -> bool:
+    """`ip route` 的显示层判据（ADR-147）。
+
+    回显之后必须出现 `route default via <a.b.c.d>`——只验形状与“那是一个合法 IPv4”，
+    不验具体网关值（换 QEMU 网段也成立）。
+    """
+    import re
+    lines = log.split("\n")
+    octet = r"(?:25[0-5]|2[0-4]\d|1?\d?\d)"
+    pat = re.compile(r"^route default via " + octet + r"(?:\." + octet + r"){3}$")
+    for k, ln in enumerate(lines):
+        if ln.strip() != "ip route":
+            continue
+        for j in range(k + 1, min(k + 4, len(lines))):
+            if pat.match(lines[j].strip()):
+                return True
+    return False
+
 def _ip_neigh_row(log: str) -> bool:
     """`ip neigh` 的判据（ADR-145/146）。
 
@@ -8835,6 +8853,9 @@ def do_test(timeout: int) -> int:
         # ADR-146 的被动学习把 ping 过的邻居写进内核表，所以这里必须看到
         # `10.0.2.2 <mac>` 行（表空或 -1 都算红——判据不靠"有一行就行"）。
         _ip_neigh_row(ashlog),
+        # ip route（ADR-147）：默认路由的只读展示
+        # 判据形状：`route default via <a.b.c.d>`——不依赖具体网关值
+        _ip_route_row(ashlog),
 
         # ---- ls / cat（2026-11-18）----
         "ls: /" in ashlog,
