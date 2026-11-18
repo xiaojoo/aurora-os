@@ -15474,3 +15474,24 @@ C2 剩余：包版本/依赖关系/安装事务/卸载回滚/A-B（都要先有"
 依赖边的落点，不用改结构。
 
 读数：`check` 18/18；三向对账 ok。
+
+
+## 406. ADR-139 B2 第一刀：ARP 往返（workbuddy，2026-11-18）
+
+**零新号**。`build_arp_request`（广播"谁是网关 10.0.2.2？告诉 10.0.2.15"，
+sender_mac 填自己、帧垫满 60）+ `parse_arp_reply`（ethertype=0x0806、opcode=2、
+逐字段先验长度）+ ktest `t_net_arp` 五格。
+**实测**：`sender_mac=52:55:0a:00:02:02`（slirp 网关真 MAC）、sender_ip=10.0.2.2、
+target_ip=10.0.2.15——**对端是真服务器**，PASS(33) 5.9s。
+**变异证红**：④ 期望网关改成自己 ⇒ `网关ip=false` ⇒ FAIL35，还原绿。
+
+### 一个 RX 长度教训（§10.3 的现场版）
+
+初版 `fnv1a64(&buf[..used_len])` 用**设备写的字节数**切我们的缓冲 ⇒ panic
+（virtio.rs:1248）。修：`(used_len).min(buf.len())`。**RX 的每一个长度字段
+都来自对端，取界前先夹**——`parse_reply` 的逐字段先验长度是同一句话在
+DHCP 侧的形状，ARP 侧第一版漏了它。
+
+读数：`check` 18/18；整链 69/69 rc=0。
+B2 剩余：ARP 表（缓存+老化）、`ip link`/`ip addr` 命令、ICMP ping（ARP 之后
+最短路径）、UDP/TCP、路由/DNS/DHCP 客户端化（现在是夹具单次握手）。

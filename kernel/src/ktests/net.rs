@@ -229,3 +229,72 @@ fn t_net_rx() -> bool {
 #[cfg(feature = "virtio-net")]
 ktest!(KT_NET_RX, t_net_rx);
 
+
+/// B2 第一刀（ADR-139）：ARP 往返——问网关要 MAC，对端是真服务器（slirp）。
+/// 判据五格：①request 发出去（TX 回执）②RX 有界等待内收到 ③解得开
+/// （ethertype=0x0806、opcode=2）④**内容对**（sender_ip=网关、sender_mac 是个能用的
+/// 地址——第二台仪器 = slirp 自己答的，不是我们自己回环）⑤target_ip=我们、used_id=0。
+#[cfg(feature = "virtio-net")]
+fn t_net_arp() -> bool {
+    if let Err(e) = virtio::bind_net() {
+        crate::log_fatal!("arp: 绑定/握手失败 {:?}", e);
+        return false;
+    }
+    let i = match virtio::net_info() {
+        Some(v) => v,
+        None => {
+            crate::log_fatal!("arp: 绑定之后拿不到读数");
+            return false;
+        }
+    };
+    let (frame, want_hash) = virtio::build_arp_request(&i.mac);
+    match virtio::send_raw(&frame) {
+        Ok(f) => crate::log_info!(
+            "arp: 发 REQUEST 长={} 哈希={:#018x} 自算={:#018x} 回执idx={} id={}",
+            f.len, f.hash, want_hash, f.used_idx, f.used_id
+        ),
+        Err(e) => {
+            crate::log_fatal!("arp: REQUEST 发不出去 {:?}", e);
+            return false;
+        }
+    }
+    let (buf, n, used_idx, used_len, used_id) = match virtio::receive(3000) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_fatal!("arp: 有界等待之内没等到 reply {:?}", e);
+            return false;
+        }
+    };
+    let r = match virtio::parse_arp_reply(&buf[..n], used_idx, used_len, used_id) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_fatal!("arp: 收到的那包解不开（长 {}）{:?} 前十六字节={:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x}",
+                n, e, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+                buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]);
+            return false;
+        }
+    };
+    let shape_ok = r.sender_mac != [0u8; 6] && r.sender_mac != [0xFF; 6] && r.sender_mac[0] & 0x01 == 0;
+    let ip_ok = r.sender_ip == virtio::NET_GATEWAY_IP;
+    let ask_ok = r.target_ip == virtio::DHCP_GUEST_IP;
+    let id_ok = r.used_id == 0;
+    crate::log_info!(
+        "arp: 收到 长={} 哈希={:#018x} opcode={} sender_mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} sender_ip={}.{}.{}.{} target_ip={}.{}.{}.{} used.id={}",
+        r.len, r.hash, r.opcode,
+        r.sender_mac[0], r.sender_mac[1], r.sender_mac[2], r.sender_mac[3], r.sender_mac[4], r.sender_mac[5],
+        r.sender_ip[0], r.sender_ip[1], r.sender_ip[2], r.sender_ip[3],
+        r.target_ip[0], r.target_ip[1], r.target_ip[2], r.target_ip[3],
+        r.used_id
+    );
+    crate::log_info!(
+        "arp: 判据 发出={} 解得开={} 网关ip={} mac形状={} 问的是我们={} 缓冲对={}",
+        true, true, ip_ok, shape_ok, ask_ok, id_ok
+    );
+    let ok = ip_ok && shape_ok && ask_ok && id_ok;
+    if !ok {
+        crate::log_fatal!("arp: ARP 往返判据不成立（上面两行是全部读数）");
+    }
+    ok
+}
+#[cfg(feature = "virtio-net")]
+ktest!(KT_NET_ARP, t_net_arp);
