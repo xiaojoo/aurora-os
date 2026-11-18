@@ -15953,3 +15953,33 @@ runtime `NET_INFO_BYTES` 24→28；shell 的 `cmd_ping` 从 `info[24..28]` 读�
 
 读数：`check` **18/18**；整链 **71 符合 + 2 条不符**（FS-03 两条 = t_fat32 卷抖动
 连带，单跑 fat32-probe 86/86、两卷同哈希=true，不归因）。
+
+
+## 425. ADR-149：B1 验收句 `lsdev` / `devctl status`（workbuddy，2026-11-19）
+
+**零新号、零新 trait**（AGENTS 硬约束第 2 条：不建没有真实调用者的空 trait）。
+从 31 号 `pci_enum` 的 32 字节记录（已有 class code）派生两个只读视图：
+`lsdev` 打 class 直方图、`devctl status` 打同一份数据 + 总数（两处独立计数互为对账）。
+
+**实测**（a3-shell PASS33 15.1s）：6 台设备 = `0x0×3 + 0x1×1 + 0x6×1 + 0x5×1`，
+与 `lspci` 六行一致；`devctl status count=6`。
+**变异证红**：`cmd_lsdev` 提前返回 ⇒ `_lsdev_rows=False`，还原 ⇒ True。
+
+### 三个坑（都记进 ADR）
+
+1. **分页终止条件在两个号里语义不同**：31 号 `next==0` 到尾、37 号 `n==0` 到尾。
+   我批量把三处改成 `next==0` ⇒ `cmd_ip_neigh` 死循环（a3-shell 15s→31s 超时，
+   `ip route`/`lsdev` 全没跑）。**同族形状 ≠ 同族语义**。
+2. **终止判据位置**：放在打印之前 ⇒ 第一批就 break ⇒ `lsdev` 一行不打。
+3. **判定格段边界**：`_lsdev_rows` 最初扫 18 行，变异时把 `devctl status` 的输出
+   当成 `lsdev` 的 ⇒ **假绿**。修法：扫到下一个命令回显就停。
+
+### class 名字映射试了三种写法全炸
+
+`match` / `if-else 链` / 拆独立 `#[inline(never)]` 函数——三者都会被 LLVM
+降成 `.Lswitch.table` ⇒ `R_X86_64_32S`（4 GiB+ 基址）。**本片不做名字映射**，
+class 名字由用户看数字（PCI 规范常识）。
+
+读数：`check` **18/18**；整链 68 符合 + 5 条不符（**全部单跑复验通过**：
+virtio-net PASS / fat32-probe PASS / 默认档 PASS 82/82 模式 Normal，不归因）。
+B1 剩余：Device/Driver trait 与设备树、`devctl` 写操作。

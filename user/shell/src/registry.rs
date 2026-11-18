@@ -23,11 +23,13 @@ use crate::{
     M_ABI, M_BYE, M_DEAD, M_FREE_PAGES, M_FREE_PFX, M_FREE_THR, M_HELP, M_LIVE, M_MINUS, M_NL,
     M_LS, M_CAT, M_D, M_F, M_ENTRIES, M_BYTES, M_FNV, M_PWD, M_CD, M_NOTDIR, M_CD_USAGE,
     M_CAT_USAGE, M_HELP2,
-    M_PING, M_PS_ERR, M_PS_HDR, M_PS_NOJOB, M_RUN_ERR, M_RUN_EXIT, M_RUN_PREFIX, M_RUN_TIMEOUT,
-    M_DMESG_ERR, M_DMESG_HDR, M_DMESG_USAGE, M_KILLED, M_KILL_USAGE, M_LSPCI_USAGE,
+    M_PS_ERR, M_PS_HDR, M_PS_NOJOB, M_RUN_ERR, M_RUN_EXIT, M_RUN_PREFIX, M_RUN_TIMEOUT,
+    M_CLASS_PREFIX,
+    M_CLASS_PCI, M_COUNT, M_DEVCTL_STATUS, M_DEVCTL_USAGE, M_DMESG_ERR, M_DMESG_HDR,
+    M_DMESG_USAGE, M_KILLED, M_KILL_USAGE, M_LSDEV_USAGE, M_LSPCI_USAGE,
     M_IP_ADDR, M_IP_DNS, M_IP_DOWN, M_IP_GW, M_IP_LINK, M_IP_MAC, M_IP_MTU, M_IP_STATE, M_IP_UP,
-    M_COLON, M_IP_USAGE, M_NEIGH, M_NEIGH_EMPTY, M_PING_DOT, M_PING_FROM, M_PING_SEQ,
-    M_ROUTE_DEFAULT, M_ROUTE_MASK_EQ, M_ROUTE_NL, M_ROUTE_SLASH,
+    M_COLON, M_IP_USAGE, M_NEIGH_EMPTY, M_PING_DOT, M_PING_FROM, M_PING_SEQ,
+    M_ROUTE_DEFAULT, M_ROUTE_MASK_EQ, M_ROUTE_NL,
     M_PING_TIMEOUT, M_PING_USAGE, M_RUN_USAGE,
     M_SLEEP_USAGE, M_SP, M_TOP_FRAME, M_UPTIME_USAGE,
     M_TOP_USAGE, M_TRYHELP, M_UNKNOWN,
@@ -53,6 +55,8 @@ pub struct Ctx<'a> {
 const CMD_HELP: [u8; 4] = [b'h', b'e', b'l', b'p'];
 const CMD_ECHO: [u8; 4] = [b'e', b'c', b'h', b'o'];
 const CMD_PING: [u8; 4] = [b'p', b'i', b'n', b'g'];
+const CMD_LSDEV: [u8; 5] = [b'l', b's', b'd', b'e', b'v'];
+const CMD_DEVCTL: [u8; 6] = [b'd', b'e', b'v', b'c', b't', b'l'];
 const CMD_IP: [u8; 2] = [b'i', b'p'];
 const CMD_ABI: [u8; 3] = [b'a', b'b', b'i'];
 const CMD_EXIT: [u8; 4] = [b'e', b'x', b'i', b't'];
@@ -997,6 +1001,9 @@ fn cmd_ip_neigh(c: &Ctx) -> bool {
     loop {
         match rt::arp_enum(cursor, &mut buf) {
             Ok((next, n)) => {
+                // **37 号的约定与 31 号不同**：它回 (cursor+n, n)，表尾是 **n==0**
+                // （此时 next 仍等于 cursor，不是 0）。写成 next==0 会死循环——
+                // 实测 a3-shell 从 15s 拖到 31s 后超时，且 ip route/lsdev 全没跑。
                 if n == 0 { break; }
                 let mut k = 0usize;
                 while k < n as usize {
@@ -1328,6 +1335,141 @@ fn cmd_cat(c: &Ctx) -> bool {
     true
 }
 
+/// ADR-149：`lsdev` —— 设备类只读视图（31 号记录的分组统计）。
+///
+/// **不创建空的 Device/Driver trait**（AGENTS 硬约束）：今天唯一真实的设备
+/// 枚举出口就是 31 号 `pci_enum`，它的 32 字节记录里已经有 class code。
+/// 按 class 高字节分五类（01 存储 / 02 网络 / 03 显示 / 06 桥 / 其余），
+/// 每类打一行 `class 0x<高字节> count=<数>`——纯显示层、零新号。
+#[inline(never)]
+fn cmd_lsdev(c: &Ctx) -> bool {
+    if c.p.err.is_some() || c.p.args.count() != 0 {
+        con_write(c.h, msg(M_LSDEV_USAGE));
+        return true;
+    }
+    let mut classes = [0u32; 16];
+    let mut counts = [0u32; 16];
+    let mut kinds = 0usize;
+    const REC: usize = rt::PCI_ENUM_REC;
+    let mut buf = [0u8; 8 * REC];
+    let mut cursor = 0u64;
+    loop {
+        match rt::pci_enum(&mut buf, cursor) {
+            Ok((next, n)) => {
+                let mut i = 0usize;
+                while i < n as usize {
+                    let off = i * REC;
+                    let ch = match buf.get(off + 16..off + 20) {
+                        Some(s) => {
+                            let c08 = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
+                            (c08 >> 16) & 0xFF
+                        }
+                        None => 0xFF,
+                    };
+                    let mut k = 0usize;
+                    let mut slot = kinds;
+                    while k < kinds {
+                        if classes.get(k).copied().unwrap_or(0) == ch { slot = k; break; }
+                        k += 1;
+                    }
+                    if slot == kinds && kinds < 16 {
+                        classes[kinds] = ch;
+                        kinds += 1;
+                    }
+                    if let Some(v) = counts.get_mut(slot) { *v += 1; }
+                    i += 1;
+                }
+                // **31 号：到尾时 next==0**（最后一批仍有条目，所以判据在打印之后）。
+                // 放在打印之前会让第一批就 break——实测 lsdev 一行都不打。
+                if next == 0 { break; }
+                cursor = u64::from(next);
+            }
+            Err(_) => break,
+        }
+    }
+    let mut k = 0usize;
+    while k < kinds {
+        con_write(c.h, msg(M_CLASS_PREFIX));
+        put_u64(c.h, u64::from(classes.get(k).copied().unwrap_or(0)));
+        con_write(c.h, msg(M_COUNT));
+        put_u64(c.h, u64::from(counts.get(k).copied().unwrap_or(0)));
+        con_write(c.h, msg(M_NL));
+        k += 1;
+    }
+    true
+}
+
+/// ADR-149：`devctl status` —— 驱动认领概览。
+///
+/// 每类打一行 `class 0x<k> count=<n>`，末行 `devctl status count=<总数>`。
+/// **不做名字映射**：任何"选一个字符串"的形状都会让 LLVM 生成
+/// `.Lswitch.table`（R_X86_64_32S，4 GiB+ 基址下链接期就炸）。
+#[inline(never)]
+fn cmd_devctl_status(c: &Ctx) -> bool {
+    const REC: usize = rt::PCI_ENUM_REC;
+    let mut buf = [0u8; 8 * REC];
+    let mut cursor = 0u64;
+    // 每类计数（class 高字节 & 0x0F 落 16 格）——**不选字符串**，
+    // 所以不会被 LLVM 降成跳转表（那是 32S 的来源）。
+    let mut counts = [0u32; 16];
+    let mut total = 0u32;
+    loop {
+        match rt::pci_enum(&mut buf, cursor) {
+            Ok((next, n)) => {
+                let mut i = 0usize;
+                while i < n as usize {
+                    let off = i * REC;
+                    let ch = match buf.get(off + 16..off + 20) {
+                        Some(s) => (u32::from_le_bytes([s[0], s[1], s[2], s[3]]) >> 16) & 0xFF,
+                        None => 0xFF,
+                    };
+                    let k = (ch & 0x0F) as usize;
+                    if let Some(v) = counts.get_mut(k) { *v += 1; }
+                    total += 1;
+                    i += 1;
+                }
+                // **31 号：到尾时 next==0**（最后一批仍有条目，所以判据在打印之后）。
+                if next == 0 { break; }
+                cursor = u64::from(next);
+            }
+            Err(_) => break,
+        }
+    }
+    let mut k = 0usize;
+    while k < 16 {
+        if counts.get(k).copied().unwrap_or(0) != 0 {
+            con_write(c.h, msg(M_CLASS_PREFIX));
+            put_u64(c.h, k as u64);
+            con_write(c.h, msg(M_COUNT));
+            put_u64(c.h, u64::from(counts.get(k).copied().unwrap_or(0)));
+            con_write(c.h, msg(M_NL));
+        }
+        k += 1;
+    }
+    // 末行：`devctl status` + 设备总数（验收句要的"读到真实设备对象"的读数）
+    con_write(c.h, msg(M_DEVCTL_STATUS));
+    con_write(c.h, msg(M_COUNT));
+    put_u64(c.h, u64::from(total));
+    con_write(c.h, msg(M_NL));
+    true
+}
+
+/// `devctl` 薄壳：只做子命令解析，实际输出在 `cmd_devctl_status`。
+/// 拆开是为了不让解析分支的常量与输出常量被 LLVM 合并提升成一个 48 字节
+/// .rodata 数组（那会在 4 GiB+ 基址下产生 R_X86_64_32S）。
+#[inline(never)]
+fn cmd_devctl(c: &Ctx) -> bool {
+    let sub = match (c.p.err.is_none(), c.p.args.get(0)) {
+        (true, Some(a)) => a,
+        _ => { con_write(c.h, msg(M_DEVCTL_USAGE)); return true; }
+    };
+    if sub.len() != 6 || !matches!(sub.first(), Some(b's')) {
+        con_write(c.h, msg(M_DEVCTL_USAGE));
+        return true;
+    }
+    cmd_devctl_status(c)
+}
+
 /// 分派一条已解析的命令。返回 false = 退出 shell。
 ///
 /// 每个分支都是"名字 immediate 比较 → 直接调用处理器"，不写 `match lookup()`：
@@ -1352,6 +1494,12 @@ pub fn dispatch(h: ConsoleHandle, si_va: u64, p: &Parsed, st: &mut ShellState) -
     }
     if streq(p.cmd, &CMD_IP) {
         return cmd_ip(&c);
+    }
+    if cmd_is(p.cmd, &CMD_LSDEV) {
+        return cmd_lsdev(&c);
+    }
+    if cmd_is(p.cmd, &CMD_DEVCTL) {
+        return cmd_devctl(&c);
     }
     if streq(p.cmd, &CMD_ABI) {
         return cmd_abi(&c);

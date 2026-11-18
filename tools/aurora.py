@@ -7895,6 +7895,44 @@ def _lspci_rows(log: str) -> bool:
     return False
 
 
+def _lsdev_rows(log: str) -> bool:
+    """`lsdev` / `devctl status` 的显示层判据（ADR-149）。
+
+    **段边界要卡死**：`lsdev` 的输出只属于它自己那一段——扫到下一个回显
+    （argv 里的命令名）就必须停。否则变异（lsdev 不输出）会被 `devctl status`
+    的 `class 0x...` 行冒充成"通过"（实测踩过）。
+    """
+    import re
+    cls = re.compile(r"^class 0x(?:[0-9]|1[0-5]) count=[1-9][0-9]*$")
+    tot = re.compile(r"^devctl status count=[1-9][0-9]*$")
+    # argv 里的命令回显（出现即表示上一段结束）
+    echo = re.compile(r"^(lsdev|devctl status|dmesg|ip \w+|ping \S+|ps|free|top \d+|kill \d+|lspci|uptime|sleep \d+|run \S+|ls|cat \S+)$")
+    lines = log.split("\n")
+    ls_ok = False
+    dv_ok = False
+    for k, ln in enumerate(lines):
+        s = ln.strip()
+        if s == "lsdev":
+            for j in range(k + 1, min(k + 18, len(lines))):
+                b = lines[j].strip()
+                if not b:
+                    continue
+                if echo.match(b):
+                    break
+                if cls.match(b):
+                    ls_ok = True
+        if s == "devctl status":
+            for j in range(k + 1, min(k + 18, len(lines))):
+                b = lines[j].strip()
+                if not b:
+                    continue
+                if echo.match(b):
+                    break
+                if tot.match(b):
+                    dv_ok = True
+    return ls_ok and dv_ok
+
+
 def _ip_route_row(log: str) -> bool:
     """`ip route` 的显示层判据（ADR-147）。
 
@@ -8856,6 +8894,9 @@ def do_test(timeout: int) -> int:
         # ip route（ADR-147）：默认路由的只读展示
         # 判据形状：`route default via <a.b.c.d>`——不依赖具体网关值
         _ip_route_row(ashlog),
+        # lsdev / devctl statusï¼ADR-149ï¼ï¼è®¾å¤ç±»åªè¯»è§å¾
+        # å¤æ®å½¢ç¶ï¼`class 0x<k> count=<n>` è³å°ä¸è¡ + `devctl status count=<n>`
+        _lsdev_rows(ashlog),
 
         # ---- ls / cat（2026-11-18）----
         "ls: /" in ashlog,
