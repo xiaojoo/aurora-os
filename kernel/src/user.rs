@@ -140,6 +140,13 @@ pub const SYS_CRED_LIST: u64 = 39;
 pub const SYS_CRED_ALLOWS: u64 = 40;
 /// 41（ADR-150）：凭据判据读数（四计数，4×4=16 字节）。
 pub const SYS_CRED_STATS: u64 = 41;
+/// 42（ADR-152）：分区表只读查询。`rdi`=cursor、`rsi`=want、`r10`=写入地址。
+/// 返回 `(next<<32)|n`（与 27/31/37/39 同族，`n == 0` 是表尾）。
+pub const SYS_PART_ENUM: u64 = 42;
+/// 43（ADR-152）：分区表头读数（32 字节：entries4/used4/first_usable8/last_usable8/保留8）。
+pub const SYS_PART_INFO: u64 = 43;
+/// 一条分区记录的定长（index4 + first8 + last8 + attrs8 + type_guid16 = 44，垫到 48）。
+pub const PART_RECORD_LEN: usize = 48;
 /// 每条 ARP 表项的定长记录（10 字节：IP4 + MAC6）。与 27/31 号的 32 字节记录不同：这里的内容就是 10 字节，不垫到 32。
 pub const ARP_RECORD_LEN: usize = 10;
 /// 16：`rdi` = Proc 句柄、`rsi` = Thread 句柄、`rdx` = StartupInfo 那一页的 VMO 句柄、
@@ -1786,6 +1793,71 @@ fn sys_cred_stats(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     }
 }
 
+/// 42（ADR-152）：分区表只读枚举。
+///
+/// `rdx` = 端口号（`0xFF` = 用根卷那块盘）。**盘选择必须由调用方给**：
+/// 故障盘存在时"扫全盘找一个有 GPT 的"不是能终止的策略。
+///
+/// **约定与 37/39 号一致**：返 `(next, n)`，`n == 0` 是表尾。
+/// 扫不出表 ⇒ 错误码（**不返回"零个分区"**：那是把"读盘失败"伪装成"盘上没分区"）。
+#[cfg(all(feature = "handles", feature = "fs-open"))]
+#[inline(never)]
+fn sys_part_enum(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let cursor = frame.rdi as u32;
+    let want = frame.rsi as usize;
+    if want == 0 || want > 480 || want % PART_RECORD_LEN != 0 {
+        return E_INVALID;
+    }
+    let mut buf = [0u8; 480];
+    // rdx = 端口号（调用方给；不给就 0xFF = "用根卷的盘"）
+    let port = if frame.rdx == 0xFF {
+        crate::filesystem::fs_open::port()
+    } else {
+        frame.rdx as u8
+    };
+    match crate::filesystem::part::part_read_from(port, cursor, &mut buf[..want]) {
+        Ok((_info, n)) => {
+            let got = n * PART_RECORD_LEN;
+            if got > 0 {
+                match copy_to_user(&buf[..got], frame.r10) {
+                    Ok(w) if w == got => {}
+                    _ => return E_FAULT,
+                }
+            }
+            let next = cursor.saturating_add(n as u32);
+            (u64::from(next) << 32) | (n as u64)
+        }
+        Err(_) => E_IO,
+    }
+}
+
+/// 43（ADR-152）：分区表头读数（32 字节）。
+#[cfg(all(feature = "handles", feature = "fs-open"))]
+#[inline(never)]
+fn sys_part_info(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    // 用 cursor=0、want=0 的探针调用拿 info 会绕过 want 校验，所以单独走一次扫表。
+    let mut buf = [0u8; PART_RECORD_LEN];
+    let port = if frame.rsi == 0xFF {
+        crate::filesystem::fs_open::port()
+    } else {
+        frame.rsi as u8
+    };
+    match crate::filesystem::part::part_read_from(port, 0, &mut buf) {
+        Ok((info, _n)) => {
+            let mut blk = [0u8; 32];
+            blk[0..4].copy_from_slice(&info.entries.to_le_bytes());
+            blk[4..8].copy_from_slice(&info.used.to_le_bytes());
+            blk[8..16].copy_from_slice(&info.first_usable.to_le_bytes());
+            blk[16..24].copy_from_slice(&info.last_usable.to_le_bytes());
+            match copy_to_user(&blk, frame.rdi) {
+                Ok(w) => w as u64,
+                Err(_) => E_FAULT,
+            }
+        }
+        Err(_) => E_IO,
+    }
+}
+
 /// 键盘字符的读取入口。拆成小函数是为了让上面那条 `or_else` 在没开 `ps2-kbd` 时
 /// 也能编译（此时它恒返回 None，等价于原行为），而调用点不必铺 `cfg!`。
 #[cfg(not(feature = "ps2-kbd"))]
@@ -2925,6 +2997,10 @@ pub fn syscall_dispatch(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> boo
         SYS_CRED_ALLOWS => sys_cred_allows(frame),
         #[cfg(feature = "handles")]
         SYS_CRED_STATS => sys_cred_stats(frame),
+        #[cfg(all(feature = "handles", feature = "fs-open"))]
+        SYS_PART_ENUM => sys_part_enum(frame),
+        #[cfg(all(feature = "handles", feature = "fs-open"))]
+        SYS_PART_INFO => sys_part_info(frame),
         #[cfg(feature = "handles")]
         SYS_CONSOLE_WRITE => sys_console_io(frame, true),
         #[cfg(feature = "handles")]

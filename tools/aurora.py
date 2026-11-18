@@ -7895,6 +7895,38 @@ def _lspci_rows(log: str) -> bool:
     return False
 
 
+def _part_row(log: str) -> bool:
+    """`part` 的形状判据（ADR-152，C3 只读查询）。
+
+    两种合法形状：
+      ① `part: entries=<n> used=<n> usable=<a>-<b>` + 至少一行 ` lba=<a>-<b> type=0x<n>`
+      ② `part: no disk`（这块盘没有可读的 GPT）
+
+    **为什么接受 ②**：`part` 读的是根卷那块盘（FAT32，没有 GPT），而机器上
+    唯一有 GPT 的口在 `gpt-probe` 档才挂——本档打 `no disk` 是**正确结果**，
+    不是失败。真实 GPT 表读取由既有 `t_gpt` / `t_esp_file` 用例覆盖（它们直接
+    调 `gpt::scan`），本格只证"命令接通 + 形状对"。
+    """
+    import re
+    head = re.compile(r"^part: entries=\d+ used=\d+ usable=\d+-\d+$")
+    row = re.compile(r"^ lba=\d+-\d+ type=0x\d+$")
+    lines = log.split("\n")
+    for k, ln in enumerate(lines):
+        if ln.strip() != "part":
+            continue
+        for j in range(k + 1, min(k + 40, len(lines))):
+            s = lines[j].strip()
+            if s == "part: no disk":
+                return True
+            if head.match(s):
+                # 表头之后至少一行分区
+                for m in range(j + 1, min(j + 20, len(lines))):
+                    if row.match(lines[m].strip()):
+                        return True
+                return False
+    return False
+
+
 def _guest_denied_rows(log: str) -> bool:
     """低权限凭据的授权差异判据（ADR-151）。
 
@@ -8964,6 +8996,9 @@ def do_test(timeout: int) -> int:
         # å¤æ®å½¢ç¶ï¼`whoami: <å>` ä¸ `id: uid=<æ°> gid=<æ°> caps=<æ°>`
         # ââåå­ä¸è½æ¯ç©ºãcaps ä¸è½ä¸º 0ï¼æå­æ®å°±å¾æè½åï¼
         _cred_rows(ashlog),
+        # part（ADR-152）：**不在 argv 判定链里**——它会卡在故障盘上（口 0 被 wedge，
+        # 任何 I/O 重试到取证耗尽）。C3 的验收由内核 ktest `t_part_read`（合成盘）承担，
+        # 见 ADR-152「影响/负面 2」。
 
         # ---- ls / cat（2026-11-18）----
         "ls: /" in ashlog,

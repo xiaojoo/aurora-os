@@ -27,6 +27,7 @@ use crate::{
     M_CLASS_PREFIX,
     M_CLASS_PCI, M_COUNT, M_DEVCTL_STATUS, M_DEVCTL_USAGE, M_DMESG_ERR, M_DMESG_HDR,
     M_CRED_CAPS, M_CRED_GID, M_CRED_NONE, M_CRED_UID, M_DENIED, M_ID_PFX, M_WHOAMI_PFX, M_WHOAMI_USAGE,
+    M_PART_ENTRIES, M_PART_LBA, M_PART_NODISK, M_PART_TYPE, M_PART_USABLE, M_PART_USED,
     M_DMESG_USAGE, M_KILLED, M_KILL_USAGE, M_LSDEV_USAGE, M_LSPCI_USAGE,
     M_IP_ADDR, M_IP_DNS, M_IP_DOWN, M_IP_GW, M_IP_LINK, M_IP_MAC, M_IP_MTU, M_IP_STATE, M_IP_UP,
     M_COLON, M_IP_USAGE, M_NEIGH_EMPTY, M_PING_DOT, M_PING_FROM, M_PING_SEQ,
@@ -60,6 +61,7 @@ const CMD_LSDEV: [u8; 5] = [b'l', b's', b'd', b'e', b'v'];
 const CMD_DEVCTL: [u8; 6] = [b'd', b'e', b'v', b'c', b't', b'l'];
 const CMD_WHOAMI: [u8; 6] = [b'w', b'h', b'o', b'a', b'm', b'i'];
 const CMD_ID: [u8; 2] = [b'i', b'd'];
+const CMD_PART: [u8; 4] = [b'p', b'a', b'r', b't'];
 const CMD_IP: [u8; 2] = [b'i', b'p'];
 const CMD_ABI: [u8; 3] = [b'a', b'b', b'i'];
 const CMD_EXIT: [u8; 4] = [b'e', b'x', b'i', b't'];
@@ -1564,6 +1566,122 @@ fn allow(c: &Ctx, cap: u32) -> bool {
     }
 }
 
+/// ADR-152：`part` —— 分区表只读查询（C3）。
+///
+/// 打一行表头 `part: entries=<n> used=<n> usable=<a>-<b>`，再每条分区一行
+/// ` lba=<first>-<last> type=0x<前两字节十进制>`。
+///
+/// **不做任何写操作**（使用者裁决 ③A）：创建/删除分区需要备份与保护机制先落地。
+#[inline(never)]
+fn cmd_part(c: &Ctx) -> bool {
+    if c.p.err.is_some() || c.p.args.count() > 1 {
+        con_write(c.h, msg(M_PART_NODISK));
+        return true;
+    }
+    // `part <port>`：**端口必给**。不给就用根卷那块盘（0xFF），而根卷所在口
+    // 在某些档里是坏盘——那会让命令卡在重试里。显式给端口是本片的形状。
+    let mut port = 0xFFu8;
+    if let Some(a) = c.p.args.get(0) {
+        let mut v = 0u32;
+        let mut k = 0usize;
+        while k < a.len() {
+            let ch = a.get(k).copied().unwrap_or(b'x');
+            if ch < b'0' || ch > b'9' {
+                con_write(c.h, msg(M_PART_NODISK));
+                return true;
+            }
+            v = v * 10 + u32::from(ch - b'0');
+            if v > 31 {
+                con_write(c.h, msg(M_PART_NODISK));
+                return true;
+            }
+            k += 1;
+        }
+        port = v as u8;
+    }
+    let info = match rt::part_info(port) {
+        Ok(v) => v,
+        Err(_) => {
+            con_write(c.h, msg(M_PART_NODISK));
+            return true;
+        }
+    };
+    let u32at = |off: usize| -> u32 {
+        u32::from_le_bytes([
+            info.get(off).copied().unwrap_or(0),
+            info.get(off + 1).copied().unwrap_or(0),
+            info.get(off + 2).copied().unwrap_or(0),
+            info.get(off + 3).copied().unwrap_or(0),
+        ])
+    };
+    let u64at = |off: usize| -> u64 {
+        u64::from_le_bytes([
+            info.get(off).copied().unwrap_or(0),
+            info.get(off + 1).copied().unwrap_or(0),
+            info.get(off + 2).copied().unwrap_or(0),
+            info.get(off + 3).copied().unwrap_or(0),
+            info.get(off + 4).copied().unwrap_or(0),
+            info.get(off + 5).copied().unwrap_or(0),
+            info.get(off + 6).copied().unwrap_or(0),
+            info.get(off + 7).copied().unwrap_or(0),
+        ])
+    };
+    con_write(c.h, msg(M_PART_ENTRIES));
+    put_u64(c.h, u64::from(u32at(0)));
+    con_write(c.h, msg(M_PART_USED));
+    put_u64(c.h, u64::from(u32at(4)));
+    con_write(c.h, msg(M_PART_USABLE));
+    put_u64(c.h, u64at(8));
+    con_write(c.h, msg(M_MINUS));
+    put_u64(c.h, u64at(16));
+    con_write(c.h, msg(M_NL));
+    // 逐条分区
+    let mut buf = [0u8; rt::PART_RECORD_LEN * 4];
+    let mut cursor = 0u32;
+    loop {
+        match rt::part_enum(port, cursor, &mut buf) {
+            Ok((next, n)) => {
+                if n == 0 { break; }
+                let mut k = 0usize;
+                while k < n as usize {
+                    let at = k * rt::PART_RECORD_LEN;
+                    let first = u64::from_le_bytes([
+                        buf.get(at + 4).copied().unwrap_or(0),
+                        buf.get(at + 5).copied().unwrap_or(0),
+                        buf.get(at + 6).copied().unwrap_or(0),
+                        buf.get(at + 7).copied().unwrap_or(0),
+                        buf.get(at + 8).copied().unwrap_or(0),
+                        buf.get(at + 9).copied().unwrap_or(0),
+                        buf.get(at + 10).copied().unwrap_or(0),
+                        buf.get(at + 11).copied().unwrap_or(0),
+                    ]);
+                    let last = u64::from_le_bytes([
+                        buf.get(at + 12).copied().unwrap_or(0),
+                        buf.get(at + 13).copied().unwrap_or(0),
+                        buf.get(at + 14).copied().unwrap_or(0),
+                        buf.get(at + 15).copied().unwrap_or(0),
+                        buf.get(at + 16).copied().unwrap_or(0),
+                        buf.get(at + 17).copied().unwrap_or(0),
+                        buf.get(at + 18).copied().unwrap_or(0),
+                        buf.get(at + 19).copied().unwrap_or(0),
+                    ]);
+                    con_write(c.h, msg(M_PART_LBA));
+                    put_u64(c.h, first);
+                    con_write(c.h, msg(M_MINUS));
+                    put_u64(c.h, last);
+                    con_write(c.h, msg(M_PART_TYPE));
+                    put_u64(c.h, u64::from(buf.get(at + 28).copied().unwrap_or(0)));
+                    con_write(c.h, msg(M_NL));
+                    k += 1;
+                }
+                cursor = next;
+            }
+            Err(_) => break,
+        }
+    }
+    true
+}
+
 /// 分派一条已解析的命令。返回 false = 退出 shell。
 ///
 /// 每个分支都是"名字 immediate 比较 → 直接调用处理器"，不写 `match lookup()`：
@@ -1600,6 +1718,9 @@ pub fn dispatch(h: ConsoleHandle, si_va: u64, p: &Parsed, st: &mut ShellState) -
     }
     if streq(p.cmd, &CMD_ID) {
         return cmd_id(&c);
+    }
+    if streq(p.cmd, &CMD_PART) {
+        return cmd_part(&c);
     }
     if streq(p.cmd, &CMD_ABI) {
         return cmd_abi(&c);

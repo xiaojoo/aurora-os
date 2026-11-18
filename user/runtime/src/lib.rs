@@ -1142,6 +1142,48 @@ pub const SYS_NET_INFO: u64 = 35;
 /// 网卡读数包（18 字节定长）：MAC6 + 本机 IP4 + 网关4 + DNS4。
 /// 读数包 24 字节（ADR-144 从 18 扩到 24）：MAC6 + 本机IP4 + 网关4 + DNS4 + mtu2 + link2。
 pub const NET_INFO_BYTES: usize = 28;
+/// 42/43（ADR-152）：分区表只读查询（C3）。
+pub const SYS_PART_ENUM: u64 = 42;
+pub const SYS_PART_INFO: u64 = 43;
+/// 一条分区记录的定长。
+pub const PART_RECORD_LEN: usize = 48;
+
+/// 42：分区表按游标读。返回 `(next, n)`；`n == 0` 是表尾（与 37/39 号同约定）。
+pub fn part_enum(port: u8, cursor: u32, buf: &mut [u8]) -> Result<(u32, u32), RTError> {
+    if buf.is_empty() || buf.len() > 480 || buf.len() % PART_RECORD_LEN != 0 {
+        return Err(RTError::INVALID);
+    }
+    // SAFETY: 42 号 rdi=cursor、rsi=want、rdx=端口、r10=写入地址。
+    let ret = unsafe {
+        syscall_abi(
+            SYS_PART_ENUM,
+            u64::from(cursor),
+            buf.len() as u64,
+            u64::from(port),
+            buf.as_mut_ptr() as u64,
+        )
+    };
+    if ret < 0 {
+        return Err(RTError(ret));
+    }
+    let v = ret as u64;
+    Ok(((v >> 32) as u32, (v & 0xFFFF_FFFF) as u32))
+}
+
+/// 43：分区表头读数（32 字节：entries4/used4/first_usable8/last_usable8/保留8）。
+pub fn part_info(port: u8) -> Result<[u8; 32], RTError> {
+    let mut blk = [0u8; 32];
+    // SAFETY: 43 号 rdi=buf、rsi=端口（内核 copy_to_user 写回 32 字节定长）。
+    let ret = unsafe {
+        syscall_abi(SYS_PART_INFO, blk.as_mut_ptr() as u64, u64::from(port), 0, 0)
+    } as i64;
+    if ret < 0 {
+        Err(RTError(ret))
+    } else {
+        Ok(blk)
+    }
+}
+
 /// 38-41（ADR-150）：凭据与授权。
 pub const SYS_CRED_SELF: u64 = 38;
 pub const SYS_CRED_LIST: u64 = 39;

@@ -607,7 +607,7 @@ status = "部分落地"
 module_id = "storage"
 owner = "storage"
 layer = "service"
-source_modules = ["ahci", "virtio", "filesystem", "filesystem/block_io", "filesystem/fat32", "filesystem/fs_open", "filesystem/fs_rw", "filesystem/gpt", "filesystem/vfs", "filesystem/vfs_ro"]
+source_modules = ["ahci", "virtio", "filesystem", "filesystem/block_io", "filesystem/fat32", "filesystem/fs_open", "filesystem/fs_rw", "filesystem/gpt", "filesystem/vfs", "filesystem/vfs_ro", "filesystem/part"]
 public_api = [
   "ahci::REG_CAP",
   "ahci::REG_GHC",
@@ -693,6 +693,16 @@ public_api = [
   "virtio::arp_read_from",
   "virtio::arp_learn_from_frame",
   "virtio::NET_SUBNET_MASK",
+  "ahci::State",
+  "ahci::info",
+  "ahci::state",
+  "filesystem/part::PART_RECORD_LEN",
+  "filesystem/part::PartError",
+  "filesystem/part::PartInfo",
+  "filesystem/part::part_read_block",
+  "filesystem/part::part_read_from",
+  "filesystem::part",
+  "gpt::HEADER_LBA",
 ]
 allowed_callers = ["capability", "diagnostics", "integration", "sched"]
 dependencies = ["arch", "boot", "driver", "irq", "memory", "pci", "time"]

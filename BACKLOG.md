@@ -16065,3 +16065,44 @@ cat 放行 **且** 三个 denied 全出现。
 
 读数：`check` **18/18**；整链 **73 符合 + 1 条不符**（`FAT16合成卷与宿主机对账`
 HANG——单跑 PASS(33)，长链抖动不归因）；**guest 判定行 PASS(rc=33)**。
+
+
+## 428. ADR-152：C3 第一片——分区只读查询（workbuddy，2026-11-19）
+
+**使用者裁决 ③A**：只做只读查询，**不做分区写**。新增 2 个号：
+42 `SYS_PART_ENUM`（游标枚举，`(next<<32)|n`，`n==0` 表尾）、
+43 `SYS_PART_INFO`（32 字节表头读数）。记录定长 **48**
+（index4+first8+last8+attrs8+type_guid16=44 垫到 48，**不带 unique_guid**）。
+`PartError{NoDisk, Gpt(..)}` 把"盘不在"与"表读不出"分开。
+记录填充抽成 `fill_records(&dyn Block, ...)`——合成盘与真盘**共用一份形状**。
+
+### 内核 ktest `t_part_read` 四格（合成盘，不碰真盘）
+
+```
+part: 判据 表头=true 首条逐字节=true 分页=true 无GPT拒=true
+      读数 entries=4 used=1 n=1 first=2 last=2
+```
+**变异证红**：`fill_records` 不写 `type_guid` ⇒ `首条逐字节=false` ⇒ FAIL(35)，
+还原 ⇒ 105/105 全绿。
+
+### 五个坑（本片最贵的一课）
+
+1. **`ahci::boot_port()` 返回口 0**（不是引导盘），在口 0 上重试到取证耗尽。
+2. **`fs_open::port()` 在某些档返回 0**，同样卡死。
+3. **PI 位图里"有设备"≠"能读"**：wedge 过的盘仍在位图里，任何 I/O（含一次
+   512 字节扇区读）都重试到取证耗尽（实测刷几百行 ahci 取证、命令永不返回）
+   ⇒ **盘选择必须由调用方给**（端口是参数，`0xFF`=根卷那块），
+   **"扫全盘找一个有 GPT 的"在故障盘存在的机器上不是能终止的策略**。
+4. 探针（读 LBA1 比 `"EFI PART"`）必须在 `gpt::scan` 之前——scan 在无 GPT 盘上不返回。
+5. **`.text` 第六次溢出**：`user/shell/link.ld` 窗口 40 → **48 KiB**，
+   `.rodata` 移到 `0x10000C000`、`.data` 移到 `0x10000D000`。
+
+### 诚实的负面
+
+- **`part` 命令在多数档打 `part: no disk`**（根卷是 FAT32 没有 GPT；唯一有 GPT 的口
+  只在 `gpt-probe` 档挂）。这是**正确结果**，但意味着**用户态真实 GPT 读取尚未端到端证明**。
+- **`part` 已从 argv 判定链移除**（会卡在故障盘上）；C3 验收由内核 `t_part_read` 承担。
+- 没有写操作、`fsck`、镜像备份恢复、盘选择 UI。
+
+读数：`check` **18/18**（storage 模块补 ahci::State/info/state + part 五项、runtime U5 50→52、
+census 500）；整链 **74 符合 + 0 不符（全绿）**。

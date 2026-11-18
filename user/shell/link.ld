@@ -31,13 +31,13 @@ SECTIONS {
     *(.text .text.*)
   } :text
 
-  . = 0x10000A000;
+  . = 0x10000C000;
   .rodata ALIGN(4K) : {
     *(.rodata .rodata.*)
     *(.rdata)
   } :rodata
 
-  . = 0x10000B000;
+  . = 0x10000D000;
   .data ALIGN(4K) : {
     *(.data .data.*)
   } :data

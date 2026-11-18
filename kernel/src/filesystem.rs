@@ -9,6 +9,8 @@ pub mod fat32;
 #[cfg(any(feature = "gpt-probe", feature = "fs-ro"))]
 pub mod gpt;
 pub mod vfs;
+#[cfg(feature = "fs-open")]
+pub mod part;
 #[cfg(feature = "fs-ro")]
 pub mod vfs_ro;
 #[cfg(feature = "fs-open")]

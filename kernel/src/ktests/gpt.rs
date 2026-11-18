@@ -365,3 +365,73 @@ fn t_gpt() -> bool {
 }
 #[cfg(feature = "gpt-probe")]
 ktest!(KT_GPT, t_gpt);
+
+/// C3（ADR-152）：`part_read_block` 的记录形状。
+///
+/// 用**合成盘**（`build_tiny` 造的 4 扇区 GPT），不碰真盘——真盘在多数档里
+/// 是故障盘（口 0 被 wedge），任何 I/O 都会重试到取证耗尽。
+/// 四格：
+///   ① 表头读数：`entry_count >= 1`、`used >= 1`、写入条数 `n` 在 `[1, used]` 内
+///   ② 第一条记录的 `first_lba/last_lba/type_guid` 与 `gpt::scan` 的结果逐字节相等
+///   ③ 分页：`cursor=1` 时拿不到第一条（`n == 0` 或首条 index != 0）
+///   ④ 无 GPT 的盘（全零）⇒ `Err(NoDisk)`，**不是**"零个分区"
+#[cfg(all(feature = "gpt-probe", feature = "fs-open"))]
+fn t_part_read() -> bool {
+    let mut base = [0u8; 4 * SECTOR_BYTES];
+    build_tiny(&mut base);
+    let disk = MemDisk { img: &base };
+    // 先拿 scan 的真值
+    let mut want: Option<gpt::Entry> = None;
+    if gpt::scan(&disk, &mut |e| { if want.is_none() && !e.is_empty() { want = Some(*e); } }).is_err() {
+        crate::log_fatal!("part: 合成盘 scan 失败 ⇒ 这一格没有被测物");
+        return false;
+    }
+    let Some(w) = want else {
+        crate::log_fatal!("part: 合成盘没有条目 ⇒ 夹具不对");
+        return false;
+    };
+    // ① + ②
+    let mut out = [0u8; crate::filesystem::part::PART_RECORD_LEN * 2];
+    let (info, n) = match crate::filesystem::part::part_read_block(&disk, 0, &mut out) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_fatal!("part: 合成盘读取被拒 {:?}", e);
+            return false;
+        }
+    };
+    // 合成盘只有 4 扇区，`entry_count` 是夹具自己写的 4（不是规范上限 128）——
+    // 判据只要求"非零且与实际用到的条目相容"。
+    let g1 = info.entries >= 1 && info.used >= 1 && n >= 1 && n <= info.used as usize;
+    let first_lba = u64::from_le_bytes([
+        out[4], out[5], out[6], out[7], out[8], out[9], out[10], out[11],
+    ]);
+    let last_lba = u64::from_le_bytes([
+        out[12], out[13], out[14], out[15], out[16], out[17], out[18], out[19],
+    ]);
+    let mut tg = [0u8; 16];
+    tg.copy_from_slice(&out[28..44]);
+    let g2 = first_lba == w.first_lba && last_lba == w.last_lba && tg == w.type_guid;
+    // ③ 分页：跳过第一条
+    let mut out2 = [0u8; crate::filesystem::part::PART_RECORD_LEN * 2];
+    let g3 = match crate::filesystem::part::part_read_block(&disk, 1, &mut out2) {
+        Ok((_i, m)) => m == 0 || u32::from_le_bytes([out2[0], out2[1], out2[2], out2[3]]) != 0,
+        Err(_) => true,
+    };
+    // ④ 全零盘 ⇒ NoDisk
+    let zero = [0u8; 4 * SECTOR_BYTES];
+    let g4 = matches!(
+        crate::filesystem::part::part_read_block(&MemDisk { img: &zero }, 0, &mut out),
+        Err(crate::filesystem::part::PartError::NoDisk)
+    );
+    crate::log_info!(
+        "part: 判据 表头={} 首条逐字节={} 分页={} 无GPT拒={} 读数 entries={} used={} n={} first={} last={}",
+        g1, g2, g3, g4, info.entries, info.used, n, first_lba, last_lba
+    );
+    let ok = g1 && g2 && g3 && g4;
+    if !ok {
+        crate::log_fatal!("part: 记录形状不成立（上面一行是全部读数）");
+    }
+    ok
+}
+#[cfg(all(feature = "gpt-probe", feature = "fs-open"))]
+ktest!(KT_PART_READ, t_part_read);
