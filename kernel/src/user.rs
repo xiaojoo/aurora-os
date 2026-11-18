@@ -114,6 +114,11 @@ pub const SYS_LOG_READ: u64 = 30;
 /// PCI 表是启动设施（`pci::info()/dev(i)` 只读快照），**无 capability 要求**，
 /// 但仍要求调用者有任务身份（与 27 号同口径）。
 pub const SYS_PCI_ENUM: u64 = 31;
+/// 32 `clock_uptime() -> micros`（ADR-137，`handles` 档）。
+/// 返回启动以来的微秒数（u64）。无参数、无缓冲、无 capability——纯读数。
+/// 锚点没记 / 频率没标定 ⇒ `-1`：**绝不回退成默认频率**（clock.rs 的纪律：
+/// "返回一个差不多的默认值会让读数看起来是测出来的，而它其实是猜的"）。
+pub const SYS_CLOCK_UPTIME: u64 = 32;
 /// 16：`rdi` = Proc 句柄、`rsi` = Thread 句柄、`rdx` = StartupInfo 那一页的 VMO 句柄、
 /// `r10` = 它在**子 AS** 里的只读 VA → 成功返回 0。顺序固定：校验 → 转移 → 回填 → 放线程跑。
 pub const SYS_PROCESS_START: u64 = 16;
@@ -1334,6 +1339,16 @@ fn sys_pci_enum(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     (next << 32) | n as u64
 }
 
+/// 32：uptime。见 [`SYS_CLOCK_UPTIME`] 的形状说明。
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_clock_uptime(_frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    match crate::clock::uptime_micros() {
+        Some(us) => us,
+        None => E_INVALID, // æ²¡éç¹/æ²¡æ å® â -1ï¼ä¸ç¼æ°å­
+    }
+}
+
 /// 键盘字符的读取入口。拆成小函数是为了让上面那条 `or_else` 在没开 `ps2-kbd` 时
 /// 也能编译（此时它恒返回 None，等价于原行为），而调用点不必铺 `cfg!`。
 #[cfg(not(feature = "ps2-kbd"))]
@@ -2453,6 +2468,8 @@ pub fn syscall_dispatch(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> boo
         SYS_LOG_READ => sys_log_read(frame),
         #[cfg(feature = "handles")]
         SYS_PCI_ENUM => sys_pci_enum(frame),
+        #[cfg(feature = "handles")]
+        SYS_CLOCK_UPTIME => sys_clock_uptime(frame),
         #[cfg(feature = "handles")]
         SYS_CONSOLE_WRITE => sys_console_io(frame, true),
         #[cfg(feature = "handles")]

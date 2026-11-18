@@ -15316,3 +15316,48 @@ U5 39→40、census 470→471。
 同 ELF 单跑 PASS 33、**93/93 用例全绿** ⇒ §397 已记的 q2 已知偶发，不归因）。
 B1 剩余：`lsdev`/`devctl`（要 Device/Driver trait）、桥后设备递归扫描
 （今天的扫描不下桥，q35 上不咬，真机欠账）、十六进制输出。
+
+
+## 400. ADR-137 B3 第一刀：启动锚点 + 32 号 SYS_CLOCK_UPTIME + shell uptime（workbuddy，2026-11-18）
+
+使用者裁决：**新增号不再逐个询问**（"下次都直接新增，不要询问了"）——本轮直接落
+32 号。底座：`clock.rs` 的 PIT 标定与 `micros` 换算早就在（没标定回 None、绝不编
+默认值的纪律写在函数头）；缺 ①启动锚点 ②用户态出口。
+
+**交付**：`clock::record_boot`（kmain 的 boot-ok 之后，只允许一次，重锚计数可查）+
+`clock::uptime_micros` + 32 号（无参数无缓冲无 capability，没锚/没标定 ⇒ `-1`）+
+`rt::uptime_us` + shell `uptime`（无参打微秒；`-1` 原样打出，**不把错误读成 0**）。
+
+**判据** `t_clock_uptime` 四格：单调不减 / 与 ticks 对账 / 与 TSC 上界对账 / 无重锚；
+**变异证红**（32 号恒 42 ⇒ 对 ticks 红 ⇒ FAIL35）。shell 判定格 `_uptime_row`
+（回显后首行纯十进制正数；恒 -1 ⇒ 红）。
+
+### 判据的数学错误（跨档才暴露，与 §399 prockill 同族）
+
+初版把"等 2 个 tick"的下界写成 2 个整周期（20 ms）。`wait_ticks(t, 2, ..)` 等的是
+**计数 ≥ 2**，它可能在 tick 边界中途开始 ⇒ 实际等待在 [1, 2] 个周期之间。
+handles 档侥幸绿、a3-shell 档实测增量 19023 µs < 20000 ⇒ 红。
+修订：下界 = 1 个完整周期；上界 = 窗口 cycles **+ 1 个周期余量**
+（`t1` 在返回之后才读，实测差 44 µs——中间的指令又跨了半个边界）。
+
+### dispatch 的 32S：≥5 字节命令名的 memcmp 取址（第三族实锤）
+
+加 `uptime`(6 字节) 后链接报三处 `R_X86_64_32S`——全是 dispatch 的
+`streq(p.cmd, &CMD_xxx)` 对 `.rodata` 数组的取址（lspci/dmesg 5 字节 + uptime 6 字节）。
+机理：`streq` 的 `a == b` 对 **≤4 字节**数组折叠成 immediate（dispatch 老分支全走
+这条，不取址）；**≥5 字节折叠不动** ⇒ LLVM 降成 memcmp 并对 `.rodata` 32 位绝对取址
+⇒ 4 GiB+ 基址必炸（MSGS/`put_u64` 那族同根）。lspci/dmesg 加入时侥幸没炸——
+**分支数改变折叠决策**（11 → 12 分支时三个数组全走 memcmp）。
+`black_box` 挡 memcmp 不行（循环展开后仍取址）。
+**正解**：新形状 `cmd_is(cmd, name)`（长度 + 逐字节 immediate 比较，`.rodata`
+不落数组），三个 ≥5 字节命令全换用。
+**纪律**：dispatch 加 ≥5 字节命令名一律 `cmd_is`；`streq` 只留给 ≤4 字节。
+
+`.text` 窗口第三次涨：`cmd_is` 真循环让 dispatch 再涨 ~1.5 KiB ⇒
+20 KiB → **24 KiB**（.rodata@0x100006000、.data@0x100008000）。
+
+读数：`check` **17/17**（unsafe runtime U5 40→41、census 471→472；
+module-interfaces 登记 clock::record_boot/uptime_micros）；
+handles 档 94/94、a3-shell 档 **108/108** 用例全绿、判定 PASS(33)。
+B3 剩余：`sleep <ms>`（最薄，19 号薄壳已在）、`date`（RTC+时区，旧账 RTC 游标
+不可用）、`reboot`/`poweroff`（要单独 ADR）。

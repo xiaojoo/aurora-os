@@ -32,6 +32,8 @@ mod prockill;
 mod logread;
 #[cfg(feature = "handles")]
 mod pcienum;
+#[cfg(feature = "handles")]
+mod uptime;
 mod resource;
 mod sched;
 #[cfg(feature = "sig-check")]

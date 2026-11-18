@@ -6,7 +6,8 @@
  * 所以不需要"内核按固定偏移读回"那套契约；②**.text 留 20 KiB**（hello 只留 4 KiB）——
  * shell 的代码比 hello 大：第一版按 4 KiB 排直接撞 `section .text virtual address range
  * overlaps with .rodata`（S5c 实测）；ADR-133 的 `top`（排序 + 帧打印 + sleep）再涨
- * ~2.5 KiB，16 KiB 又不够（本轮实测 .text 结束 0x100004804 > .rodata 起点），提到 20 KiB。
+ * ~2.5 KiB，提到 20 KiB。ADR-136/137 的 lspci/uptime 再涨 ~2 KiB，
+ * 20 KiB 又不够（本轮实测：dispatch 的 32S 重定位 out of range），提到 24 KiB。
  * 段仍各自 ALIGN(4K)，窗口约束不变。
  */
 
@@ -28,13 +29,13 @@ SECTIONS {
     *(.text .text.*)
   } :text
 
-  . = 0x100005000;
+  . = 0x100006000;
   .rodata ALIGN(4K) : {
     *(.rodata .rodata.*)
     *(.rdata)
   } :rodata
 
-  . = 0x100007000;
+  . = 0x100008000;
   .data ALIGN(4K) : {
     *(.data .data.*)
   } :data

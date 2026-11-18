@@ -161,6 +161,9 @@ pub extern "C" fn kmain() -> ! {
         exit::finish(exit::Code::BootInvalid);
     }
     crate::log_info!("boot-ok: aurora stage0 serial up (com1 0x3f8)");
+    // B3（ADR-137）：uptime 的启动锚点。放在 stage0 自证之后：再早就可能在
+    // 串口失败退出的路径上白记一次，再晚就把 bootloader 那段算漏了。
+    clock::record_boot(tsc::now());
     tsc::stage("serial");
 
     // ---- Stage1：校验启动信息
@@ -1599,7 +1602,7 @@ fn stage_init_user(sid: u8) -> Option<usize> {
     // 描述表最多 4 条（24 + 4×16 = 88），280 在页内且不与表重叠（ADR-130 决策 2 的校验）。
     #[cfg(feature = "a3-shell")]
     {
-        const A3_CMD: &[u8] = b"run /HELLO.ELF; ps; free; top 2; kill 9999; lspci; dmesg\0";
+        const A3_CMD: &[u8] = b"run /HELLO.ELF; ps; free; top 2; kill 9999; lspci; uptime; dmesg\0";
         hdr[12..16].copy_from_slice(&280u32.to_le_bytes());
         hdr[16..20].copy_from_slice(&(A3_CMD.len() as u32).to_le_bytes());
         if vmo::vmo_write(si, 280, A3_CMD) != Ok(A3_CMD.len()) {

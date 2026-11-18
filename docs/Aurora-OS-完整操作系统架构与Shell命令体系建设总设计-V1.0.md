@@ -160,6 +160,8 @@
 | 28 | `SYS_PROC_STAT` | 取一个进程的 ProcStatV1 统计（handles feature，ADR-132） |
 | 29 | `SYS_PROC_KILL_BY_PID` | 按 pid 杀进程：内核在调用者名下反查带 WRITE 的 Proc 句柄后走 18 号同一路径（handles feature，ADR-134） |
 | 30 | `SYS_LOG_READ` | 把串口日志环的最近整行拷进用户缓冲（handles feature，ADR-135） |
+| 31 | `SYS_PCI_ENUM` | PCI 设备清单按 32 字节定长记录拷给用户（handles feature，ADR-136） |
+| 32 | `SYS_CLOCK_UPTIME` | 返回启动以来的微秒数（锚点+PIT 标定，没标定回 -1；handles feature，ADR-137） |
 
 此表是当前源码快照的调用号清单，不代表所有 feature 在默认构建中都启用。用户程序必须先通过 `SYS_ABI_INFO` 读取 ABI 版本与能力位，再使用对应接口。新增调用必须登记、测试和版本化；不得自行选择空号后就视为已批准。
 
@@ -987,7 +989,7 @@ aurora-os/
 > |---|---|---|
 > | B1 设备模型 | 部分（`lspci` 已达成） | PCI ECAM/CAM 枚举 `pci.rs`、统一 `DriverCtx`、AHCI 错误恢复、virtio 设备表（ADR-030/112）；ADR-136 新增 **31 号 `SYS_PCI_ENUM`**（内核判据 `t_pci_enum` 七格全绿 + 变异证红）与 shell `lspci`（判定格 `_lspci_rows`，变异证红；q35 实测 6 台真实数据）；**缺** Device/Driver trait、设备树、`lsdev`/`devctl`（B1 后续片） |
 > | B2 网络协议栈 | 部分（只到以太网帧 + 单次 DHCP） | virtio-net + 手搓 Ethernet 实验帧 + DHCP DISCOVER 回包解析（ADR-032，判定行 网卡第一帧/第一条协议往返）；**缺** ARP/ICMP/TCP/Socket API/路由/DNS 与 `ip`/`ping` 命令 |
-> | B3 时间电源 | 部分 | TSC/PIT 标定、LAPIC/PIT 定时器、健康标记、停机（ADR-036）；**缺** 墙钟/RTC/时区、ACPI 电源状态、重启、init/service manager 与 `date`/`uptime`/`service`/`reboot` |
+> | B3 时间电源 | 部分（`uptime` 已达成） | TSC/PIT 标定、LAPIC/PIT 定时器、健康标记、停机（ADR-036）；ADR-137 新增 **启动锚点 + 32 号 `SYS_CLOCK_UPTIME`**（内核判据 `t_clock_uptime` 四格 + 变异证红）与 shell `uptime`（判定格 `_uptime_row`，变异证红）；**缺** 墙钟/RTC/时区（`date`）、`sleep`/`service`/ACPI 电源/重启 |
 > | B4 日志诊断 | **`dmesg` 已达成** | 环 4096B + 整行规则、持久日志尾、crash dump V2 及 3 条既有判定行；ADR-135 新增 **30 号 `SYS_LOG_READ`**（内核判据 `t_log_read` 十格全绿 + 变异证红）与 shell `dmesg`（判定格 `_dmesg_repeats`：表头后首行必须在表头前出现过 ⇒ 真打了一遍内核日志；变异证红已做）；`journalctl` 未做 |
 >
 > 与上表配套的事实：① B 阶段四片里 B4 已把**内核底座 + 判据 + 用户态出口**三件都凑齐

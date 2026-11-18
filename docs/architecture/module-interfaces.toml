@@ -853,6 +853,8 @@ public_api = [
   "clock::from_pit_window",
   "clock::hz",
   "clock::micros",
+  "clock::record_boot",
+  "clock::uptime_micros",
   "tsc::elapsed",
   "tsc::now",
   "tsc::rdtscp_available",

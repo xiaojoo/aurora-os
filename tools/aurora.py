@@ -7858,6 +7858,23 @@ def check_gpt(log: str) -> list[str]:
     return False
 
 
+def _uptime_row(log: str) -> bool:
+    """`uptime` 的输出必须是「纯十进制正数」（ADR-137）。
+
+    回显 `uptime` 之后的首个非空行必须是纯十进制数字且 > 0。打 `-1`（内核没锚点/
+    没标定）或任何非数字 ⇒ 红。不依赖具体数值。
+    """
+    import re
+    lines = log.split("\n")
+    for i, ln in enumerate(lines):
+        if ln.strip() != "uptime":
+            continue
+        body = next((x.strip() for x in lines[i + 1 : i + 4] if x.strip()), "")
+        if re.fullmatch(r"\d+", body) and int(body) > 0:
+            return True
+    return False
+
+
 def _dmesg_repeats(log: str) -> bool:
     """`dmesg` 的输出必须是内核日志的**重复**（ADR-135）。
 
@@ -8616,6 +8633,10 @@ def do_test(timeout: int) -> int:
         # 且至少两行（本档 PCI 表 ≥ 2 台；单台判据退化为首行数字行本身）。
         # 结构性判据：不依赖任何具体 vendor/device 值，换 QEMU 机型也成立。
         _lspci_rows(ashlog),
+        # uptime（ADR-137）：回显后首行必须是**纯十进制正数**（微秒）。
+        # 不依赖具体数值（不同机器/时长都成立）；打 -1（内核没锚点/没标定）
+        # 或非数字 ⇒ 这格红。
+        _uptime_row(ashlog),
     ))
     _tot = EXEC_TOTAL_RE.search(ashlog)
     if not _tot or int(_tot.group(1)) < 1 or int(_tot.group(2)) != 0:

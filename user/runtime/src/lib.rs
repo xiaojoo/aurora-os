@@ -67,6 +67,9 @@ pub const SYS_LOG_READ: u64 = 30;
 /// ADR-136 (31): pci_enum(buf,cap,cursor) -> (next<<32)|n. Fixed 32-byte records,
 /// magic "APC1". PCI table is a boot snapshot; no capability required.
 pub const SYS_PCI_ENUM: u64 = 31;
+/// ADR-137 (32): clock_uptime() -> micros since boot (u64). No args, no buffer,
+/// no capability. Unanchored/uncalibrated => -1 (never a guessed default).
+pub const SYS_CLOCK_UPTIME: u64 = 32;
 /// 19 通用对象等待，今天只支持 Proc（user.rs:879；实现 user.rs:946）。
 pub const SYS_OBJECT_WAIT: u64 = 19;
 /// 20 控制台写（user.rs:51；实现 `sys_console_io` user.rs:1006）。
@@ -913,6 +916,18 @@ pub fn pci_enum(buf: &mut [u8], cursor: u64) -> Result<(u32, u32), RTError> {
     }
     let v = ret as u64;
     Ok(((v >> 32) as u32, (v & 0xffff_ffff) as u32))
+}
+
+/// 32 号：启动以来的微秒数。**没锚点/没标定 ⇒ `Err(-1)`**（内核不编默认值）。
+/// 单调不减；两次调用相等是可能的（间隔小于 1 µs）。
+pub fn uptime_us() -> Result<u64, RTError> {
+    // SAFETY: 32 号无参数语义（四个参数位全置零）；无缓冲、无 capability。
+    let ret = unsafe { syscall_abi(SYS_CLOCK_UPTIME, 0, 0, 0, 0) };
+    if ret < 0 {
+        Err(RTError(ret))
+    } else {
+        Ok(ret as u64)
+    }
 }
 
 /// 31 号记录的定长。

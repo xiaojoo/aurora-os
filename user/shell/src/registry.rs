@@ -23,7 +23,7 @@ use crate::{
     M_ABI, M_BYE, M_DEAD, M_FREE_PAGES, M_FREE_PFX, M_FREE_THR, M_HELP, M_LIVE, M_MINUS, M_NL,
     M_PING, M_PS_ERR, M_PS_HDR, M_PS_NOJOB, M_RUN_ERR, M_RUN_EXIT, M_RUN_PREFIX, M_RUN_TIMEOUT,
     M_DMESG_ERR, M_DMESG_HDR, M_DMESG_USAGE, M_KILLED, M_KILL_USAGE, M_LSPCI_USAGE,
-    M_RUN_USAGE, M_SP, M_TOP_FRAME,
+    M_RUN_USAGE, M_SP, M_TOP_FRAME, M_UPTIME_USAGE,
     M_TOP_USAGE, M_TRYHELP, M_UNKNOWN,
 };
 
@@ -54,10 +54,42 @@ const CMD_TOP: [u8; 3] = [b't', b'o', b'p'];
 const CMD_KILL: [u8; 4] = [b'k', b'i', b'l', b'l'];
 const CMD_DMESG: [u8; 5] = [b'd', b'm', b'e', b's', b'g'];
 const CMD_LSPCI: [u8; 5] = [b'l', b's', b'p', b'c', b'i'];
+const CMD_UPTIME: [u8; 6] = [b'u', b'p', b't', b'i', b'm', b'e'];
 
 /// 命令词比较。走 `&[u8] == &[u8]`，LLVM 折成 immediate 比较（旧 dispatch 同款）。
 fn streq(a: &[u8], b: &[u8]) -> bool {
     a == b
+}
+
+/// **按字节手写的命令名比较**（ADR-137 实测的 32S 事故的修法）。
+///
+/// `streq` 对**短数组**（≤4 字节）会被 LLVM 折叠成 immediate 比较，
+/// 不取址——dispatch 的老分支都走这条。但 **≥5 字节的数组折叠不动**：
+/// LLVM 降级成 `memcmp` 并对 `.rodata` 里的数组**32 位绝对取址**
+/// ⇒ 镜像基址在 4 GiB 之上，链接期 `R_X86_64_32S out of range`
+/// （与 MSGS/`put_u64` 那族同根：const 提升出来的对象一取址就炸）。
+/// 实测顺序：加 `dmesg`(5)/`lspci`(5) 时侥幸没炸，加 `uptime`(6)
+/// 之后 dispatch 的分支数改变折叠决策，三个数组全走 memcmp ⇒ 炸。
+///
+/// 这里用**首字节 switch + 长度 + 逐字节 immediate 比较**：比较数以
+/// immediate 出现在指令流里，`.rodata` 里不需要落数组，免疫 32S。
+/// `black_box` 那条路试过（挡住了 memcmp 但循环展开后仍取址），不行。
+fn cmd_is(cmd: &[u8], name: &[u8]) -> bool {
+    if cmd.len() != name.len() {
+        return false;
+    }
+    let mut i = 0usize;
+    let mut eq = true;
+    while i < name.len() {
+        // 用 match 把字节读成 immediate 比较（get 会引入边界检查路径，
+        // 在这个档里展开出的形状不稳定；直接 match on Option<&u8> 同样免疫）。
+        let (x, y) = (cmd.get(i), name.get(i));
+        if x != y {
+            eq = false;
+        }
+        i += 1;
+    }
+    eq
 }
 
 // ---- 五个处理器：统一签名，返回 false = 退出 shell ----
@@ -657,6 +689,24 @@ fn cmd_lspci(c: &Ctx) -> bool {
     true
 }
 
+/// ADR-137：`uptime` —— 启动以来的微秒数（32 号）。
+///
+/// 无参：打 `put_u64(微秒)` + 换行。带参一律 usage（不静默忽略）。
+/// 内核没锚点/没标定时回 `-1`，原样打出来——**不把错误读成 0**
+/// （0 会被读成"刚开机"，那是骗人的另一种形状）。
+fn cmd_uptime(c: &Ctx) -> bool {
+    if c.p.err.is_some() || c.p.args.count() != 0 {
+        con_write(c.h, msg(M_UPTIME_USAGE));
+        return true;
+    }
+    match rt::uptime_us() {
+        Ok(us) => put_u64(c.h, us),
+        Err(e) => put_i64(c.h, e.0),
+    }
+    con_write(c.h, msg(M_NL));
+    true
+}
+
 /// 分派一条已解析的命令。返回 false = 退出 shell。
 ///
 /// 每个分支都是"名字 immediate 比较 → 直接调用处理器"，不写 `match lookup()`：
@@ -700,11 +750,14 @@ pub fn dispatch(h: ConsoleHandle, si_va: u64, p: &Parsed) -> bool {
     if streq(p.cmd, &CMD_KILL) {
         return cmd_kill(&c);
     }
-    if streq(p.cmd, &CMD_DMESG) {
+    if cmd_is(p.cmd, &CMD_DMESG) {
         return cmd_dmesg(&c);
     }
-    if streq(p.cmd, &CMD_LSPCI) {
+    if cmd_is(p.cmd, &CMD_LSPCI) {
         return cmd_lspci(&c);
+    }
+    if cmd_is(p.cmd, &CMD_UPTIME) {
+        return cmd_uptime(&c);
     }
     // unknown：三段输出与旧实现逐字节一致——词原样回显（借用不拷贝，全长不截断）。
     con_write(c.h, msg(M_UNKNOWN));
