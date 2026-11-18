@@ -316,9 +316,12 @@ fn t_net_ping() -> bool {
             return false;
         }
     };
-    // ---- ç¬¬ä¸åï¼ARP è§£åºç½å³ç MACã
+    // ---- ç¬¬ä¸åï¼ARP è§£åºç½å³ç MACã**åæ¥ç¼å­**ï¼ADR-142ï¼ï¼miss æå¹¿æ­ã
+    let stats_before = virtio::arp_stats();  // **å¨ lookup ä¹å**ï¼lookup ä¼æ miss/hit è®°è¿å»
+    let gw_mac_opt = virtio::arp_lookup(&virtio::NET_GATEWAY_IP);
     let (arp_req, _h) = virtio::build_arp_request(&i.mac);
-    if virtio::send_raw(&arp_req).is_err() {
+    let broadcast = gw_mac_opt.is_none();
+    if broadcast && virtio::send_raw(&arp_req).is_err() {
         crate::log_fatal!("ping: ARP REQUEST åä¸åºå»");
         return false;
     }
@@ -341,7 +344,19 @@ fn t_net_ping() -> bool {
         crate::log_fatal!("ping: ARP reply ä¸æ¯ç½å³çé£ä¸å¥");
         return false;
     }
+    virtio::arp_learn(&a.sender_ip, &a.sender_mac);
     let gw_mac = a.sender_mac;
+    let stats_after = virtio::arp_stats();
+    let learned = stats_after.learns == stats_before.learns + 1;
+    let miss_accounted = stats_after.misses == stats_before.misses + u32::from(broadcast);
+    let hit_ok = if broadcast { stats_after.hits == stats_before.hits } else { stats_after.hits == stats_before.hits + 1 };
+    crate::log_info!(
+        "ping: ARP å¹¿æ­={} å­¦ä¹ ={} misses={}/{} learns={}/{} hits={}/{}",
+        broadcast, learned,
+        stats_before.misses, stats_after.misses,
+        stats_before.learns, stats_after.learns,
+        stats_before.hits, stats_after.hits
+    );
     // ---- ç¬¬äºåï¼ç¨åè§£åºç MAC ååæ­ ICMP echo requestã
     let seq: u16 = 1;
     let (ping, _ph) = virtio::build_icmp_echo_request(&gw_mac, &i.mac, &virtio::DHCP_GUEST_IP, seq);
@@ -384,7 +399,8 @@ fn t_net_ping() -> bool {
         "ping: å¤æ® ARPå¾è¿={} ååº=true æ¶å°=true è§£å¾å¼={} åæ ·è¿å={} srcç½å³={} ç¼å²å¯¹={}",
         arp_ok, type_ok, echo_ok, src_ok, id_ok
     );
-    let ok = arp_ok && type_ok && echo_ok && src_ok && id_ok;
+    let ok = arp_ok && type_ok && echo_ok && src_ok && id_ok
+        && learned && miss_accounted && hit_ok;  // ADR-142ï¼ç¼å­çè´¦è¦åä¸
     if !ok {
         crate::log_fatal!("ping: ICMP å¾è¿å¤æ®ä¸æç«ï¼ä¸é¢ä¸¤è¡æ¯å¨é¨è¯»æ°ï¼");
     }

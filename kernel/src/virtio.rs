@@ -1362,6 +1362,89 @@ pub const NET_DNS_IP: [u8; 4] = [10, 0, 2, 3];
 pub const DNS_CLIENT_PORT: u16 = 53;
 /// æ¥è¯¢çæºç«¯å£ï¼éç¹æï¼å®æµ æºç«¯ç«¯å£ 0 æ¶ slirp å ICMP Port Unreachableï¼
 pub const DNS_QUERY_PORT: u16 = 1053;
+
+// ---------------------------------------------------------------- B2 ç¬¬ååï¼ADR-142ï¼ï¼ARP ç¼å­
+/// ARP ç¼å­ï¼RFC 826 ç"merge" è§åï¼ï¼æ¯æ¬¡åæ­ååæ¥è¡¨ï¼miss æå¹¿æ­ã
+/// **æ å ãåºå® 8 é¡¹ãçº¿æ§æ¥æ¾**ï¼ä¸å¼å ãä¸å¼åå¸ï¼ã`hits`/`misses` æ¯å¤æ®è¯»æ°ã
+pub const ARP_TABLE_MAX: usize = 8;
+pub struct ArpStats {
+    pub hits: u32,
+    pub misses: u32,
+    pub learns: u32,
+    pub evicts: u32,
+}
+static ARP_TABLE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0); // 0=æªåå§å 1=å·²åå§å
+struct ArpTable {
+    // çº¿æ§æ°ç»ï¼`ips[i]==0` è¡¨ç¤ºç©ºæ§½ï¼IP 0.0.0.0 ä¸ä¼æ¯åæ³é»å±ï¼
+    ips: [[u8; 4]; ARP_TABLE_MAX],
+    macs: [[u8; 6]; ARP_TABLE_MAX],
+    n: usize,
+    hits: u32,
+    misses: u32,
+    learns: u32,
+    evicts: u32,
+}
+struct ArpCell(core::cell::UnsafeCell<ArpTable>);
+unsafe impl Sync for ArpCell {}
+static ARP: ArpCell = ArpCell(core::cell::UnsafeCell::new(ArpTable {
+    ips: [[0; 4]; ARP_TABLE_MAX],
+    macs: [[0; 6]; ARP_TABLE_MAX],
+    n: 0, hits: 0, misses: 0, learns: 0, evicts: 0,
+}));
+
+/// æ¥ç¼å­ãhit â MACï¼miss â Noneï¼è°ç¨æ¹å¹¿æ­ï¼ã
+pub fn arp_lookup(ip: &[u8; 4]) -> Option<[u8; 6]> {
+    // SAFETY: è§ `bn` åæ¬¾-- åæ ¸åæåæ ¸ãè°ç¨ç¹é½å¨åæ ¸ä¸²è¡ä¸ä¸æï¼æ å¹¶ååã
+    let t = unsafe { &mut *ARP.0.get() };
+    let mut i = 0usize;
+    while i < t.n {
+        if t.ips[i] == *ip {
+            t.hits += 1;
+            return Some(t.macs[i]);
+        }
+        i += 1;
+    }
+    t.misses += 1;
+    None
+}
+
+/// å­¦ä¸æ¡ï¼ARP reply ç senderï¼ãå·²æåè¦çï¼RFC 826 mergeï¼ï¼æ»¡åæ¤ç¬¬ä¸æ¡ï¼FIFOï¼æç®èä¸æµå¾åºï¼ã
+pub fn arp_learn(ip: &[u8; 4], mac: &[u8; 6]) {
+    // SAFETY: å `arp_lookup`ã
+    let t = unsafe { &mut *ARP.0.get() };
+    t.learns += 1;
+    let mut i = 0usize;
+    while i < t.n {
+        if t.ips[i] == *ip {
+            t.macs[i] = *mac;
+            return;
+        }
+        i += 1;
+    }
+    if t.n < ARP_TABLE_MAX {
+        t.ips[t.n] = *ip;
+        t.macs[t.n] = *mac;
+        t.n += 1;
+        return;
+    }
+    t.evicts += 1;
+    // æ»¡è¡¨ï¼æ¤ç¬¬ 0 æ¡ï¼å¶ä½åç§»ï¼FIFOï¼ã
+    let mut k = 0usize;
+    while k + 1 < ARP_TABLE_MAX {
+        t.ips[k] = t.ips[k + 1];
+        t.macs[k] = t.macs[k + 1];
+        k += 1;
+    }
+    t.ips[ARP_TABLE_MAX - 1] = *ip;
+    t.macs[ARP_TABLE_MAX - 1] = *mac;
+}
+
+/// ç¼å­è¯»æ°ï¼å¤æ®ç¨ï¼ã
+pub fn arp_stats() -> ArpStats {
+    // SAFETY: å `arp_lookup`ã
+    let t = unsafe { &*ARP.0.get() };
+    ArpStats { hits: t.hits, misses: t.misses, learns: t.learns, evicts: t.evicts }
+}
 pub const DNS_QTYPE_A: u16 = 1;
 pub const DNS_QCLASS_IN: u16 = 1;
 /// DNS å¸§æ»é¿ = eth 14 + IPv4 20 + UDP 8 + DNS æ¥è¯¢ï¼é® localhostï¼ï¼å«å° 60ã

@@ -15546,3 +15546,30 @@ dst端口=53 三字段 ⇒ **对端引用的是我们发的那个包**（真往�
 读数：`check` 18/18；整链 69/69 rc=0。
 B2 剩余：ARP 缓存+老化（每帧广播不可持续）、"成功应答"的 UDP 往返
 （等在线对端）、DNS answer 解析、TCP、`ping`/`ip` 命令。
+
+
+## 409. ADR-142 B2 第四刀：ARP 缓存（workbuddy，2026-11-18）
+
+**零新号**。`arp_lookup`/`arp_learn`/`arp_stats`（**无堆、固定 8 项、线性查找**，
+RFC 826 的 merge 规则：已有则覆盖、满则 FIFO 挤第 0 条；`hits/misses/learns/
+evicts` 是判据读数）+ `t_net_ping` 接缓存：**先 lookup，miss 才广播**；
+判据加三格——`learned`（learns +1）、`miss_accounted`（misses 按 broadcast
+增量核）、`hit_ok`（hit 按 lookup 增量核），**全接进 ok**。
+**实测**：`misses=0/1 learns=0/1 hits=0/0`（lookup 的 miss 计入 after），
+六格+三格全绿 PASS(33) 6.1s。**变异证红**：`arp_learn` 不学（提前 return）⇒
+FAIL35，还原绿。
+
+### 两个实测教训
+
+1. **`stats_before` 必须在 lookup 之前取**：lookup 自己会记 miss/hit——
+   先 lookup 后取基线，增量的分子分母就错位（实测 FAIL，读数
+   `misses=1/1` 被误读成"广播了但没核上"）。
+2. **net.rs 的格式串引号写错**（`"..." 参数 ...`）⇒ 295 个编译错误的雪崩；
+   另有一次**直接调 cargo.exe 丢 PATH**（`rustc -vV` not found，295 个错误
+   全是它级联）——构建一律走 `aurora.py build`。
+
+unsafe：virtio U4 8→12（ARP 表三入口的 `UnsafeCell` 访问 + Sync 论证，
+登记补注释：地址范围固定在单一静态对象、调用点全在内核串行上下文）。
+读数：`check` 18/18；virtio-net 档 87/87；整链 67 符合 + 2 条不符
+（`两卷同哈希` 本会话第 4 次长跑红/单跑绿——§404 已记录的读链瞬时错，
+连累 FS-03 与签名包两行；不归因）。

@@ -90,11 +90,11 @@ expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe
 # 2026-11-17 ADR-133（top）：+user/shell/registry U5 2→3（`cmd_top` 取 ROLE_SELF_THREAD
 # 的 handle_of_role）。runtime 零新增——`sleep_ms` 是 safe fn `object_wait` 的薄壳，
 # 自身没有 unsafe 块。对账：467+1=468、U5 90+1=91。
-total = 473
+total = 477
 U1 = 83
 U2 = 116
 U3 = 13
-U4 = 129
+U4 = 133
 U5 = 96
 U6 = 36
 
@@ -316,7 +316,11 @@ U1 = 2
 U5 = 3
 
 [modules."virtio"]
-U4 = 8
+# ADR-142：ARP ç¼å­ãæéæ¥æº = æ¬æ¨¡åéæ `ArpCell(UnsafeCell<ArpTable>)` ç `get()`ï¼
+# å°åèå´åºå®å¨è¿ä¸ä¸ªéæå¯¹è±¡ï¼åºå® 8 é¡¹ï¼ï¼å¯¹é½ç±ç¼è¯å¨ï¼çå½å¨æ 'staticï¼
+# å¹¶åè§åï¼è°ç¨ç¹é½å¨åæ ¸ä¸²è¡ä¸ä¸æï¼ktest/å¤æ®ï¼ï¼ä¸ `bn` åæ¬¾åæ ¸è®ºè¯ï¼
+# ä¸åéï¼n ä¸ items ç´§æï¼ç± arp_learn/arp_lookup/arp_stats ä¸ä¸ªå¥å£å±åç»´æã
+U4 = 12
 
 [modules."vmo"]
 # W3 P4（ADR-074）：VMO 对象表。指针来源有两类——
