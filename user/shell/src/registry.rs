@@ -23,7 +23,7 @@ use crate::{
     M_ABI, M_BYE, M_DEAD, M_FREE_PAGES, M_FREE_PFX, M_FREE_THR, M_HELP, M_LIVE, M_MINUS, M_NL,
     M_PING, M_PS_ERR, M_PS_HDR, M_PS_NOJOB, M_RUN_ERR, M_RUN_EXIT, M_RUN_PREFIX, M_RUN_TIMEOUT,
     M_DMESG_ERR, M_DMESG_HDR, M_DMESG_USAGE, M_KILLED, M_KILL_USAGE, M_LSPCI_USAGE,
-    M_RUN_USAGE, M_SP, M_TOP_FRAME, M_UPTIME_USAGE,
+    M_RUN_USAGE, M_SLEEP_USAGE, M_SP, M_TOP_FRAME, M_UPTIME_USAGE,
     M_TOP_USAGE, M_TRYHELP, M_UNKNOWN,
 };
 
@@ -55,6 +55,7 @@ const CMD_KILL: [u8; 4] = [b'k', b'i', b'l', b'l'];
 const CMD_DMESG: [u8; 5] = [b'd', b'm', b'e', b's', b'g'];
 const CMD_LSPCI: [u8; 5] = [b'l', b's', b'p', b'c', b'i'];
 const CMD_UPTIME: [u8; 6] = [b'u', b'p', b't', b'i', b'm', b'e'];
+const CMD_SLEEP: [u8; 5] = [b's', b'l', b'e', b'e', b'p'];
 
 /// 命令词比较。走 `&[u8] == &[u8]`，LLVM 折成 immediate 比较（旧 dispatch 同款）。
 fn streq(a: &[u8], b: &[u8]) -> bool {
@@ -707,6 +708,47 @@ fn cmd_uptime(c: &Ctx) -> bool {
     true
 }
 
+/// ADR-137 续：`sleep <ms>` —— 睡指定毫秒（19 号带时限等待的薄壳）。
+///
+/// **为什么这就是内核原语**：`signals = 0` 的 19 号等一个永不置位的信号图，
+/// 唯一出路是超时 ⇒ 真阻塞、不让 CPU 空转（`rt::sleep_ms` 的注释已记）。
+/// 句柄用 `ROLE_SELF_THREAD`（Thread 对象永不终止，与 `cmd_top` 同款）。
+/// 范围 1..=`rt::WAIT_MAX_MS`（60000）：0 毫秒没有语义（usage），超过上限
+/// 内核回 `-1`（WAIT_MAX_MS 双侧同数）。
+/// 成功**无输出**（Unix 惯例）；错误打码（-1/-4）。
+fn cmd_sleep(c: &Ctx) -> bool {
+    let ms = match (c.p.err.is_none(), c.p.args.get(0)) {
+        (true, Some(a)) => match parse_u64(a) {
+            Some(v) if v >= 1 && v <= rt::WAIT_MAX_MS => v,
+            _ => {
+                con_write(c.h, msg(M_SLEEP_USAGE));
+                return true;
+            }
+        },
+        _ => {
+            con_write(c.h, msg(M_SLEEP_USAGE));
+            return true;
+        }
+    };
+    // **ROLE_SELF_PROC 而不是 SELF_THREAD**：19 号今天只支持 Proc 对象
+    // （user.rs 的 wait_on_proc：非 Proc 一律 -4），Thread 句柄直接被拒——
+    // 实测 sleep 打出 -4。等**自己的 Proc** terminate 永不发生 ⇒ 正好睡满超时，
+    // 语义等价且真阻塞。（cmd_top 用 SELF_THREAD 睡失败但错误被忽略，
+    // 是它自己的既有欠账，不在本片。）
+    let h = match unsafe { rt::handle_of_role(c.si_va, rt::ROLE_SELF_PROC) } {
+        Some(h) => h,
+        None => {
+            con_write(c.h, msg(M_SLEEP_USAGE));
+            return true;
+        }
+    };
+    if let Err(e) = rt::sleep_ms(h, ms) {
+        put_i64(c.h, e.0);
+        con_write(c.h, msg(M_NL));
+    }
+    true
+}
+
 /// 分派一条已解析的命令。返回 false = 退出 shell。
 ///
 /// 每个分支都是"名字 immediate 比较 → 直接调用处理器"，不写 `match lookup()`：
@@ -758,6 +800,9 @@ pub fn dispatch(h: ConsoleHandle, si_va: u64, p: &Parsed) -> bool {
     }
     if cmd_is(p.cmd, &CMD_UPTIME) {
         return cmd_uptime(&c);
+    }
+    if cmd_is(p.cmd, &CMD_SLEEP) {
+        return cmd_sleep(&c);
     }
     // unknown：三段输出与旧实现逐字节一致——词原样回显（借用不拷贝，全长不截断）。
     con_write(c.h, msg(M_UNKNOWN));

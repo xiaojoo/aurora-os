@@ -2969,7 +2969,7 @@ pub fn load(bytes: &[u8]) -> Result<Loaded, LoadError> {
     }
     let stack_va = swin.0 + mm::PAGE as u64;
     let sf = mm::phys_alloc(0, MOD_USER).map_err(LoadError::Mm)?;
-    // SAFETY: 同 `init()` 里那条——HHDM 别名、恰好一页、还没有别的主人
+    // SAFETY: å `init()` éé£æ¡ââHHDM å«åãæ°å¥½ä¸é¡µãè¿æ²¡æå«çä¸»äºº
     unsafe { core::ptr::write_volatile(sf.base().via_hhdm().0 as *mut u64, 0) };
     let m = mm::map(VirtAddr(stack_va), sf, PageFlags::USER_RW).map_err(LoadError::Mm)?;
     owned.push(m).map_err(LoadError::Mm)?;
@@ -3073,19 +3073,26 @@ pub fn load_into(aslot: u8, bytes: &[u8]) -> Result<Loaded, LoadError> {
         }
     }
 
-    // 用户栈：动态区第一段的第二页（第一页当 guard，永不映射）。
-    let stack_va = mm::USER_MMAP_BASE + mm::PAGE as u64;
-    let sf = mm::phys_alloc(0, MOD_USER).map_err(LoadError::Mm)?;
-    // SAFETY: HHDM 别名、恰好一页、还没有别的主人（与 load() 里那条同形状）。
-    unsafe { core::ptr::write_volatile(sf.base().via_hhdm().0 as *mut u64, 0) };
-    let m = mm::aspace_map_slot(aslot, &[sf.base().0 / mm::PAGE as u64], VirtAddr(stack_va), PageFlags::USER_RW, MOD_USER)
-        .map_err(LoadError::Mm)?;
-    owned.push_asmap(m).map_err(LoadError::Mm)?;
+    // 用户栈：动态区第一段起 3 页数据 + guard（第一页永不映射）。
+    // **从 1 页涨到 3 页**（ADR-137 续实测）：shell 43.9 KB 后
+    // `dispatch → cmd_run → elf::parse` 的帧深把一页栈穿出
+    // （rip/cr2=0x100103000 栈区取指，err=0x15）——与 load() 同一轮的事故。
+    // aspace_map_slot 逐页映射；guard 页永远不映射，判据形状不变。
+    let stack_va = mm::USER_MMAP_BASE + 7 * mm::PAGE as u64;
+    for k in (0..7u64).rev() {
+        let sf = mm::phys_alloc(0, MOD_USER).map_err(LoadError::Mm)?;
+        // SAFETY: HHDM 别名、恰好一页、还没有别的主人（与 load() 里那条同形状）。
+        unsafe { core::ptr::write_volatile(sf.base().via_hhdm().0 as *mut u64, 0) };
+        let m = mm::aspace_map_slot(aslot, &[sf.base().0 / mm::PAGE as u64],
+            VirtAddr(stack_va - k * mm::PAGE as u64), PageFlags::USER_RW, MOD_USER)
+            .map_err(LoadError::Mm)?;
+        owned.push_asmap(m).map_err(LoadError::Mm)?;
+    }
 
     Ok(Loaded {
         entry: p.entry,
         data_va,
-        stack_top: stack_va + mm::PAGE as u64 - 16,
+        stack_top: stack_va - 16,
         segs: p.n,
         pages: image_pages,
         image_lo,

@@ -7858,6 +7858,29 @@ def check_gpt(log: str) -> list[str]:
     return False
 
 
+def _sleep_gap(log: str) -> bool:
+    """`sleep <ms>` 的真阻塞必须由两个 uptime 读数对账（ADR-137 续）。
+
+    argv 形状 `uptime; sleep 1100; uptime`：取全部 uptime 读数，若存在相邻一对
+    差值落在 [1100000, 1100000 + 2_000_000] µs（1.1 s 到 3.1 s）⇒ 睡真了。
+    下界挡"没睡/睡太短"；上界挡"死循环误判"（窗口超时的 HANG 是另一个判定值）。
+    不依赖具体读数。
+    """
+    import re
+    lines = log.split("\n")
+    vals = []
+    for k, ln in enumerate(lines):
+        if ln.strip() != "uptime":
+            continue
+        body = next((x.strip() for x in lines[k + 1 : k + 4] if x.strip()), "")
+        if re.fullmatch(r"\d+", body):
+            vals.append(int(body))
+    for a, b2 in zip(vals, vals[1:]):
+        if 1_100_000 <= b2 - a <= 3_100_000:
+            return True
+    return False
+
+
 def _uptime_row(log: str) -> bool:
     """`uptime` 的输出必须是「纯十进制正数」（ADR-137）。
 
@@ -8637,6 +8660,11 @@ def do_test(timeout: int) -> int:
         # 不依赖具体数值（不同机器/时长都成立）；打 -1（内核没锚点/没标定）
         # 或非数字 ⇒ 这格红。
         _uptime_row(ashlog),
+        # sleep（ADR-137 续）：argv 里 `uptime; sleep 1100; uptime`——两个读数之差
+        # 必须 ≥ 1100000 µs（sleep 真阻塞的第二台仪器 = 32 号自己的读数）。
+        # 上界给余量（sleep 不会精确等于 1100 ms，调度+syscall 开销都算进去），
+        # 也不依赖具体数值——"睡了至少 1.1 秒"对任何机器都成立。
+        _sleep_gap(ashlog),
     ))
     _tot = EXEC_TOTAL_RE.search(ashlog)
     if not _tot or int(_tot.group(1)) < 1 or int(_tot.group(2)) != 0:

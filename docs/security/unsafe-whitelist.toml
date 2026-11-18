@@ -90,12 +90,12 @@ expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe
 # 2026-11-17 ADR-133（top）：+user/shell/registry U5 2→3（`cmd_top` 取 ROLE_SELF_THREAD
 # 的 handle_of_role）。runtime 零新增——`sleep_ms` 是 safe fn `object_wait` 的薄壳，
 # 自身没有 unsafe 块。对账：467+1=468、U5 90+1=91。
-total = 472
+total = 473
 U1 = 83
 U2 = 116
 U3 = 13
 U4 = 129
-U5 = 95
+U5 = 96
 U6 = 36
 
 [modules."acpi"]
@@ -376,4 +376,4 @@ U1 = 1
 # （user+只读），契约原文在 runtime 侧。
 # ADR-133（top）：U5 2→3 = `cmd_top` 里取 ROLE_SELF_THREAD 的那一次 handle_of_role
 # （同一份 si_va 契约；16 号回填的 SELF_* 句柄，内核自动 grant）。
-U5 = 3
+U5 = 4
