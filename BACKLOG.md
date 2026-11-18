@@ -15763,3 +15763,54 @@ addr 10.0.2.15 gw 10.0.2.2 dns 10.0.2.3
 
 读数：`check` 18/18；**整链 69/69 rc=0**。
 B2 剩余：`ip neigh`（ARP 表出口）、`ip route`、DNS 解析器、TCP。
+
+## 420. `.tools` 被工作树清理挖空之后的恢复与工具链口径改判（2026-11-18）
+
+**事故形状**（记下来是为了不再踩）：`.tools/{rustup,cargo,qemu,limine-bin,limine-protocol}`
+是**指向仓库外的 junction**，而 `git worktree remove --force` 会**穿过 junction 删目标内容**。
+合并 wb 之后清理临时工作树，两次把主仓 `.tools` 的实体掏空（第一次捡回，第二次连
+`C:/Users/XIAOJOO/.rustup` 一起清空）。规则：
+1. 带 junction 的目录**不许**交给 `git worktree remove --force`；
+2. 要摘 junction 只用不带 `/s` 的 `cmd //c rmdir <名>`，**前后各列一次目标内容**对账
+   （本轮：摘 `.tools/rustup` 前 `~/.rustup/toolchains` 有 `stable-…`，摘完还在 ⇒ 只删了链）。
+
+**恢复清单**（每一件都带自己的证人）：
+- **rustc**：回收站里那份 `stable-…` 解出来是 **1.100.0**，不是钉住的版本——**捡回来的不等于对的**。
+  用仓库里已有的 `rustup-init.exe` 装进**真实目录** `.tools/rustup`（不再是 junction），
+  `rustc -vV` = `1.99.1 (58cf8f9c3 2026-10-13)`，与 `tools/versions.toml` 的
+  `channel`/`commit-hash` 逐字相同；`llvm-tools` 落点仍被 `check-nofloat` 那条 glob 找得到
+  （`toolchains/*/lib/rustlib/*/bin/llvm-objdump.exe`）。`x86_64-unknown-none` 已装。
+- **QEMU**：跑仓库里那份安装器前先算 sha512 = `5bcf9eed…bf543`，与 `versions.toml` 固定值**全等**
+  再静默安装；`qemu-system-x86_64 --version` = 11.1.0；OVMF 由 `aurora.py` 自己在
+  `share/` 下按候选名找（`edk2-x86_64-code.fd` 在，vars 模板取 `edk2-i386-vars.fd`）。
+- **Limine**：`git clone --depth 1 --branch v11.4.1-binary` ⇒ `BOOTX64.EFI` 319,488 字节
+  （sha256 前缀 `333f7a69379b1f47`）；`limine-protocol` trunk 重克隆（`include/limine.h` 540 行，
+  内核手写常量的逐字依据）。
+
+**口径改判**：`rust-toolchain.toml` 的 `channel` 从 `"stable"` 改成 `"1.99.1"`。
+原来那句理由（"版本号只做频道声明，真实锁定在 versions.toml + CI 镜像"）被本机实测否掉：
+`stable` 让 rustup 每次自解析，漂移成 1.100.0 之后**每一个用户 ELF 的字节都变**，
+而唯一的探测器是夹具比对——它报的是"夹具不一致"，读起来像代码坏了，不像编译器换了。
+
+**读数**（同一份代码状态，`main` = `56426fd` + 本轮 `rust-toolchain.toml` 一行改动）：
+```
+build  : 五个用户产物全部"与夹具一致"
+         hello 17288/8e3972a8a788  probe 754048/4951899204aa  shell 54056/4aae767ebdb5
+         fileprobe 12944/9202a42941c9  execprobe 27408/a41791f5a041
+         内核 6,033,384 字节 elf_sha256=e203729e4f4e…
+image  : 读回 6 条目，摘要全部一致
+check  : 18/18
+test   : 73 行 70 符合 + 3 条，逐条同 ELF 复跑清账
+```
+三条偏离的**具名成因**（都是老家族，本轮没有新红）：
+1. `ESP分区偏移真读文件` FAIL(35) —— 那一跑红在 **`t_clock_uptime`**（tick 窗口），
+   ESP 那格根本没动。同 ELF `6f6dcf0b4f34` 独跑 **PASS(33)**。
+2. `A3 shell执行argv命令并ps/free读数` FAIL(35) —— 红在 **`t_q2_workload_slots`**（§383 那族），
+   同 ELF `32d88504e221` 独跑 **PASS(33)**（`合计 通过=1 拒=0` 正常出现）。
+3. `崩溃现场来自真异常` SEQ-BROKEN(rc=-1) —— **链中段 HANG**，同 ELF `f81ee15de139`
+   独跑 **EXCEPTION(39)**（那一跑本来另外两次都是 39）。
+   三条一律按**环境形状**记账，**不归因**；判据不动、不改成"期望红"。
+
+**仍然没做**：没有一道门禁把"实际用的 rustc"与 `versions.toml` 对账（现在的探测靠夹具比对，
+报的是症状不是病因）——记为候选下一刀；`.tools/limine-src`、`limine-1141`、`qemu-src`
+是参考源码副本，本轮未重建（构建不读它们）。

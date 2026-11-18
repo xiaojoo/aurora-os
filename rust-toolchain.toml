@@ -1,10 +1,12 @@
 # 工具链固定（手册 §3.1）
 #
-# 这里写 "stable" 而不是 "1.99.1"：本机 rustup 安装的是 stable 频道
-# （当前解析为 rustc 1.99.1 / cargo 1.99.1，见 tools/versions.toml）。
-# 若写具体版本号，rustup 会尝试另下载一个同名工具链，而版本号的真实锁定
-# 由 tools/versions.toml + CI 容器镜像负责，rust-toolchain.toml 只做频道声明。
+# 这里写死 "1.99.1"（与 tools/versions.toml 同一个数）：曾经写 "stable"，
+# 理由是"版本号只做频道声明、真实锁定在 versions.toml + CI 镜像"。但本机实测
+# 否掉了这个理由：`stable` 让 rustup 每次自解析，2026-11-17 漂移成 1.100.0 之后
+# **每一个用户 ELF 的字节都变了**（串口打"夹具已更新"），而 `stable` 这个名字
+# 一旦本机重装工具链就会被重新填成新版本。写具体版本号，rustup 只认这一个，
+# 缺了就报错——报错比静默换编译器好。
 [toolchain]
-channel = "stable"
+channel = "1.99.1"
 components = ["rust-src", "clippy", "rustfmt", "llvm-tools"]
 targets = ["x86_64-unknown-none"]
