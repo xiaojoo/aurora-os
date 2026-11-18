@@ -15361,3 +15361,35 @@ module-interfaces 登记 clock::record_boot/uptime_micros）；
 handles 档 94/94、a3-shell 档 **108/108** 用例全绿、判定 PASS(33)。
 B3 剩余：`sleep <ms>`（最薄，19 号薄壳已在）、`date`（RTC+时区，旧账 RTC 游标
 不可用）、`reboot`/`poweroff`（要单独 ADR）。
+
+
+## 401. B3 第二刀：shell sleep + 两个装载器的栈扩容（workbuddy，2026-11-18）
+
+使用者上一轮裁决"新增号不再询问"——本片**零新号**（19 号已有的形状，`signals=0`
+等一个永不置位的信号图 = 睡满超时）。
+
+**交付**：shell `sleep <ms>`（1..=WAIT_MAX_MS，成功无输出）+ 判据 `_sleep_gap`
+（argv 形状 `uptime; sleep 1100; uptime`，两读数差 ∈ [1.1s, 3.1s] ⇒ 真阻塞；
+**32 号做第二台仪器**，不依赖具体数值）+ 变异证红（ms/100 ⇒ False）。
+实测：4677530 → 5782617，差 1105087 µs。
+
+### 撞到的两件事
+
+1. **19 号只支持 Proc**（`wait_on_proc` 非 Proc 一律 -4）：`sleep` 初版用
+   `ROLE_SELF_THREAD` ⇒ 实测打 `-4`。改 `ROLE_SELF_PROC`（等自己 terminate 永不
+   发生 ⇒ 正好睡满）。**连带发现既有欠账**：`cmd_top` 的 `sleep_ms` 一直在静默失败
+   （SELF_THREAD + 忽略错误 ⇒ top 从没真正睡过，帧间隔实际是忙转）——归 ADR-133
+   的后续修，不在本片。
+2. **两个装载器的栈 1 页穿出**（shell 43.9 KB 后 `dispatch → cmd_run →
+   elf::parse` 帧深超一页）：`load` 路径 rip=0x4ade 落 `elf::parse`
+   （cr2=0x100100fe8 写）；`load_into` 路径 rip/cr2=0x100103000（err=0x15 取指）。
+   **`load` 必须保持 2 页原样**——`t_task_exit`/`t_user_roundtrip`/hello 的 VA
+   布局依赖它的分配顺序，改成 5 页窗口时三个 ktest 的负样本帧地址全部移位
+   （实测 HANG，已回退）；**只扩 `load_into` 的固定地址窗**（`USER_MMAP_BASE`
+   起 8 页：guard + 7 数据，guard 判据形状不变）。教训：**改装载器布局前先查
+   谁在依赖它的地址顺序**——判据里显式引用 VA 的用例是布局的隐形契约。
+
+读数：`check` **17/17**（registry U5 3→4、census 472→473）；三个关键档同 ELF
+单跑全 PASS；整链一轮 5 条不符（正向 HANG/split OOM/FS-03/两个 a3）——**同 ELF
+单跑复现不了**，判宿主机批量抖动（27 分钟窗口内 QEMU 多跑叠加），不归因。
+B3 剩余：`date`（RTC+时区）、`service`（init/IPC）、`reboot`/`poweroff`（单独 ADR）。
