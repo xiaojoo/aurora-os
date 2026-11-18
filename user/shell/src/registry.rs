@@ -22,8 +22,8 @@ use crate::{con_write, msg, put_u64};
 use crate::{
     M_ABI, M_BYE, M_DEAD, M_FREE_PAGES, M_FREE_PFX, M_FREE_THR, M_HELP, M_LIVE, M_MINUS, M_NL,
     M_PING, M_PS_ERR, M_PS_HDR, M_PS_NOJOB, M_RUN_ERR, M_RUN_EXIT, M_RUN_PREFIX, M_RUN_TIMEOUT,
-    M_DMESG_ERR, M_DMESG_HDR, M_DMESG_USAGE, M_KILLED, M_KILL_USAGE, M_RUN_USAGE, M_SP,
-    M_TOP_FRAME,
+    M_DMESG_ERR, M_DMESG_HDR, M_DMESG_USAGE, M_KILLED, M_KILL_USAGE, M_LSPCI_USAGE,
+    M_RUN_USAGE, M_SP, M_TOP_FRAME,
     M_TOP_USAGE, M_TRYHELP, M_UNKNOWN,
 };
 
@@ -53,6 +53,7 @@ const CMD_FREE: [u8; 4] = [b'f', b'r', b'e', b'e'];
 const CMD_TOP: [u8; 3] = [b't', b'o', b'p'];
 const CMD_KILL: [u8; 4] = [b'k', b'i', b'l', b'l'];
 const CMD_DMESG: [u8; 5] = [b'd', b'm', b'e', b's', b'g'];
+const CMD_LSPCI: [u8; 5] = [b'l', b's', b'p', b'c', b'i'];
 
 /// 命令词比较。走 `&[u8] == &[u8]`，LLVM 折成 immediate 比较（旧 dispatch 同款）。
 fn streq(a: &[u8], b: &[u8]) -> bool {
@@ -603,6 +604,59 @@ fn cmd_dmesg(c: &Ctx) -> bool {
     true
 }
 
+/// ADR-136：`lspci` —— 把 PCI 设备清单按行打出来（31 号）。
+///
+/// 每台一行：`bus dev func vendor device class`，全部**十进制**（shell 只有
+/// 十进制打印，十六进制属后续片；判据比对的是数字本身，不是格式）。
+/// 缓冲 256 字节 = 8 条/次（栈预算，与 `dmesg` 同一条纪律），配合 31 号的
+/// 游标语义分页取完。
+fn cmd_lspci(c: &Ctx) -> bool {
+    if c.p.err.is_some() || c.p.args.count() != 0 {
+        con_write(c.h, msg(M_LSPCI_USAGE));
+        return true;
+    }
+    const REC: usize = rt::PCI_ENUM_REC; // 32
+    let mut buf = [0u8; 8 * REC]; // 8 条/次，栈预算内
+    let mut cursor = 0u64;
+    loop {
+        match rt::pci_enum(&mut buf, cursor) {
+            Ok((next, n)) => {
+                let mut i = 0usize;
+                while i < n as usize {
+                    let off = i * REC;
+                    if let Some(r) = buf.get(off..off + REC) {
+                        let bdf = u32::from_le_bytes([r[8], r[9], r[10], r[11]]);
+                        let vd = u32::from_le_bytes([r[12], r[13], r[14], r[15]]);
+                        let c08 = u32::from_le_bytes([r[16], r[17], r[18], r[19]]);
+                        put_u64(c.h, u64::from((bdf >> 16) & 0xFF));
+                        con_write(c.h, msg(M_SP));
+                        put_u64(c.h, u64::from((bdf >> 11) & 0x1F));
+                        con_write(c.h, msg(M_SP));
+                        put_u64(c.h, u64::from((bdf >> 8) & 0x7));
+                        con_write(c.h, msg(M_SP));
+                        put_u64(c.h, u64::from(vd & 0xFFFF));
+                        con_write(c.h, msg(M_SP));
+                        put_u64(c.h, u64::from((vd >> 16) & 0xFFFF));
+                        con_write(c.h, msg(M_SP));
+                        put_u64(c.h, u64::from((c08 >> 8) & 0xFFFFFF));
+                        con_write(c.h, msg(M_NL));
+                    }
+                    i += 1;
+                }
+                if next == 0 {
+                    break;
+                }
+                cursor = u64::from(next);
+            }
+            Err(_e) => {
+                con_write(c.h, msg(M_LSPCI_USAGE));
+                break;
+            }
+        }
+    }
+    true
+}
+
 /// 分派一条已解析的命令。返回 false = 退出 shell。
 ///
 /// 每个分支都是"名字 immediate 比较 → 直接调用处理器"，不写 `match lookup()`：
@@ -648,6 +702,9 @@ pub fn dispatch(h: ConsoleHandle, si_va: u64, p: &Parsed) -> bool {
     }
     if streq(p.cmd, &CMD_DMESG) {
         return cmd_dmesg(&c);
+    }
+    if streq(p.cmd, &CMD_LSPCI) {
+        return cmd_lspci(&c);
     }
     // unknown：三段输出与旧实现逐字节一致——词原样回显（借用不拷贝，全长不截断）。
     con_write(c.h, msg(M_UNKNOWN));

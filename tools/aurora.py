@@ -7837,7 +7837,28 @@ def check_gpt(log: str) -> list[str]:
     elif mn.group(1) != mn.group(2) or int(mn.group(2)) == 0:
         bad.append(f"点名负样本={mn.group(1)}/{mn.group(2)}（必须全中且分母非零，否则那批闸是空转）")
     return bad
-def _dmesg_repeats(log: str) -> bool:
+def _lspci_rows(log: str) -> bool:
+    """`lspci` 的输出必须是「bus dev func vendor device class」行（ADR-136）。
+
+    结构性判据：回显 `lspci` 之后的首个非空行必须是**六个十进制数字**，
+    且至少再跟一行同样形状（本档 PCI 表 >= 2 台）。不依赖具体 vendor/device
+    值，换 QEMU 机型也成立；更不依赖十六进制格式（shell 只有十进制打印）。
+    """
+    import re
+    row = re.compile(r"^(\d+ \d+ \d+ \d+ \d+ \d+)$")
+    lines = log.split("\n")
+    for i, ln in enumerate(lines):
+        if ln.strip() != "lspci":
+            continue
+        body = [x.strip() for x in lines[i + 1 : i + 9] if x.strip()]
+        if not body:
+            continue
+        if row.match(body[0]) and len(body) >= 2 and row.match(body[1]):
+            return True
+    return False
+
+
+def _dmesg_repeats(log: str) -> bool:
     """`dmesg` 的输出必须是内核日志的**重复**（ADR-135）。
 
     为什么用"重复"当判据：`dmesg` 打出来的就是内核自己打过的那些行，所以只要它
@@ -8591,6 +8612,10 @@ def do_test(timeout: int) -> int:
         # 所以只要它工作，串口里必然出现同一行的第二次。这一格不依赖任何
         # 具体日志文本，也不依赖 dmesg 打到第几行。
         _dmesg_repeats(ashlog),
+        # lspci（ADR-136）：回显后必须是「bus dev func vendor device class」六数字行，
+        # 且至少两行（本档 PCI 表 ≥ 2 台；单台判据退化为首行数字行本身）。
+        # 结构性判据：不依赖任何具体 vendor/device 值，换 QEMU 机型也成立。
+        _lspci_rows(ashlog),
     ))
     _tot = EXEC_TOTAL_RE.search(ashlog)
     if not _tot or int(_tot.group(1)) < 1 or int(_tot.group(2)) != 0:

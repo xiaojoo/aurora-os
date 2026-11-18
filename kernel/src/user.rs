@@ -108,6 +108,12 @@ pub const SYS_PROC_KILL_BY_PID: u64 = 29;
 /// 返回 0 行是**成功**（环里还没有完整行），不是错误——调用方不该把它读成失败。
 /// len 0 ⇒ -1、len > COPY_MAX ⇒ -3；用户页不可写 ⇒ -2（与 5/6 号同口径）。
 pub const SYS_LOG_READ: u64 = 30;
+/// 31 `pci_enum(buf, cap) -> (next<<32)|n`（ADR-136，`handles` 档）。
+/// 把启动时扫好的 PCI 设备清单按 32 字节定长记录拷给用户（`APC1` 魔数）。
+/// 形状与 27 号 `proc_enum` 同族：rdi=用户缓冲、rsi=容量字节、r10=字节长度。
+/// PCI 表是启动设施（`pci::info()/dev(i)` 只读快照），**无 capability 要求**，
+/// 但仍要求调用者有任务身份（与 27 号同口径）。
+pub const SYS_PCI_ENUM: u64 = 31;
 /// 16：`rdi` = Proc 句柄、`rsi` = Thread 句柄、`rdx` = StartupInfo 那一页的 VMO 句柄、
 /// `r10` = 它在**子 AS** 里的只读 VA → 成功返回 0。顺序固定：校验 → 转移 → 回填 → 放线程跑。
 pub const SYS_PROCESS_START: u64 = 16;
@@ -1270,6 +1276,64 @@ fn sys_log_read(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     }
 }
 
+// ---- PCI 枚举（ADR-136，31 号）----
+/// `PciDevV1` 的定长。字段按小端写死，用户侧 runtime 独立声明同一组偏移。
+#[cfg(feature = "handles")]
+const PCI_ENUM_LEN: usize = 32;
+/// 记录魔数（"APC1"）：用户侧先核它，再按版本解析。
+#[cfg(feature = "handles")]
+const PCI_ENUM_MAGIC: u32 = 0x3150_4341;
+
+/// 一张 PCI 枚举记录（32 字节）：bdf/vendor/device/class 三元组/hdr/bar0。
+#[cfg(feature = "handles")]
+fn pci_enum_record(d: &crate::pci::Dev) -> [u8; PCI_ENUM_LEN] {
+    let mut r = [0u8; PCI_ENUM_LEN];
+    put_u32(&mut r, 0, PCI_ENUM_MAGIC);
+    r[4] = 1; // version
+    r[5] = 1; // kind：枚举条目
+    put_u32(&mut r, 6, PCI_ENUM_LEN as u32);
+    put_u32(&mut r, 8, d.bdf);
+    put_u32(&mut r, 12, u32::from(d.vendor) | (u32::from(d.device) << 16));
+    put_u32(&mut r, 16, d.cfg08);
+    put_u32(&mut r, 20, u32::from(d.hdr));
+    put_u32(&mut r, 24, d.bar0);
+    // 28..32 保留（对齐到 32）
+    r
+}
+
+/// 31：PCI 枚举。见 [`SYS_PCI_ENUM`] 的形状说明。
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_pci_enum(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let len = frame.r10 as usize;
+    if len < PCI_ENUM_LEN || len > COPY_MAX {
+        return E_TOO_LONG;
+    }
+    if crate::sched::current_identity().is_none() {
+        return E_BAD_HANDLE;
+    }
+    let Some(info) = crate::pci::info() else { return 0 }; // PCI 还没初始化：0 台，不是错误
+    let cap = len / PCI_ENUM_LEN;
+    let cursor = frame.rsi as usize;
+    let mut n = 0usize;
+    let mut idx = cursor;
+    while n < cap && idx < info.n {
+        let Some(d) = crate::pci::dev(idx) else { idx += 1; continue };
+        let rec = pci_enum_record(&d);
+        let at = frame.rdi + (n * PCI_ENUM_LEN) as u64;
+        match copy_to_user(&rec, at) {
+            Ok(k) if k == PCI_ENUM_LEN => n += 1,
+            _ => {
+                BAD_PTRS.fetch_add(1, Ordering::Relaxed);
+                return E_FAULT;
+            }
+        }
+        idx += 1;
+    }
+    let next = if idx >= info.n { 0u64 } else { idx as u64 };
+    (next << 32) | n as u64
+}
+
 /// 键盘字符的读取入口。拆成小函数是为了让上面那条 `or_else` 在没开 `ps2-kbd` 时
 /// 也能编译（此时它恒返回 None，等价于原行为），而调用点不必铺 `cfg!`。
 #[cfg(not(feature = "ps2-kbd"))]
@@ -2387,6 +2451,8 @@ pub fn syscall_dispatch(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> boo
         SYS_PROC_KILL_BY_PID => sys_proc_kill_by_pid(frame),
         #[cfg(feature = "handles")]
         SYS_LOG_READ => sys_log_read(frame),
+        #[cfg(feature = "handles")]
+        SYS_PCI_ENUM => sys_pci_enum(frame),
         #[cfg(feature = "handles")]
         SYS_CONSOLE_WRITE => sys_console_io(frame, true),
         #[cfg(feature = "handles")]

@@ -30,6 +30,8 @@ mod procinfo;
 mod prockill;
 #[cfg(feature = "handles")]
 mod logread;
+#[cfg(feature = "handles")]
+mod pcienum;
 mod resource;
 mod sched;
 #[cfg(feature = "sig-check")]

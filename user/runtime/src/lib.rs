@@ -64,6 +64,9 @@ pub const SYS_PROC_KILL_BY_PID: u64 = 29;
 /// ADR-135 (30): log_read(buf,len) -> (lines<<32)|bytes. Reads the serial log ring
 /// as whole lines only (half lines are dropped by the kernel). 0 means success.
 pub const SYS_LOG_READ: u64 = 30;
+/// ADR-136 (31): pci_enum(buf,cap,cursor) -> (next<<32)|n. Fixed 32-byte records,
+/// magic "APC1". PCI table is a boot snapshot; no capability required.
+pub const SYS_PCI_ENUM: u64 = 31;
 /// 19 通用对象等待，今天只支持 Proc（user.rs:879；实现 user.rs:946）。
 pub const SYS_OBJECT_WAIT: u64 = 19;
 /// 20 控制台写（user.rs:51；实现 `sys_console_io` user.rs:1006）。
@@ -890,6 +893,30 @@ pub fn log_read(buf: &mut [u8]) -> Result<(u32, u32), RTError> {
     let v = ret as u64;
     Ok(((v >> 32) as u32, (v & 0xffff_ffff) as u32))
 }
+
+/// 31 号：PCI 设备清单。`cursor` 从 0 起逐页取，返回 `(next, n)`。
+/// 每条 32 字节定长记录（魔数 `APC1`），布局见 ADR-136：
+/// bdf@8、vendor|device@12、cfg08@16、hdr@20（低 8 位）、bar0@24。
+/// 长度字段在 6..10 且与 bdf 共用 8..10 两字节（27 号同族形状），按 16 位读。
+pub fn pci_enum(buf: &mut [u8], cursor: u64) -> Result<(u32, u32), RTError> {
+    if buf.is_empty() || buf.len() > COPY_MAX || buf.len() % PCI_ENUM_REC != 0 {
+        return Err(RTError::TOOLONG);
+    }
+    // SAFETY: 31 号 rdi=缓冲、rsi=游标、r10=字节长度（与 27 号同族：len 走 r10，
+    // 不是 rdx——syscall_abi 的第 4 个参数才映射到 r10）。缓冲由调用方给出，
+    // 长度已在上行校验，内核侧还有 COPY_MAX 与 copy_to_user 的窗口校验。
+    let ret = unsafe {
+        syscall_abi(SYS_PCI_ENUM, buf.as_mut_ptr() as u64, cursor, 0, buf.len() as u64)
+    };
+    if ret < 0 {
+        return Err(RTError(ret));
+    }
+    let v = ret as u64;
+    Ok(((v >> 32) as u32, (v & 0xffff_ffff) as u32))
+}
+
+/// 31 号记录的定长。
+pub const PCI_ENUM_REC: usize = 32;
 
 /// 打 19 号（`SYS_OBJECT_WAIT`，user.rs:879）：通用对象等待。今天只支持 Proc 对象，
 /// 拿别的 kind 来等内核回 [`RTError::DENIED`]（user.rs:877-878）。

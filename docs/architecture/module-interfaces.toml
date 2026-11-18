@@ -402,7 +402,7 @@ public_api = [
   "user::syscall_dispatch",
 ]
 allowed_callers = ["integration"]
-dependencies = ["arch", "boot", "capability", "diagnostics", "input", "memory", "security", "storage", "sync", "time"]
+dependencies = ["arch", "boot", "capability", "diagnostics", "input", "memory", "pci", "security", "storage", "sync", "time"]
 forbidden_dependencies = []
 known_violations = []
 context = ["KERNEL", "IRQ_OFF", "ISR_TOP"]
@@ -556,7 +556,7 @@ public_api = [
   "pci::init",
   "hw::MmioRegion",
 ]
-allowed_callers = ["arch", "diagnostics", "display", "driver", "input", "integration", "storage"]
+allowed_callers = ["arch", "diagnostics", "display", "driver", "input", "integration", "sched", "storage"]
 dependencies = ["memory"]
 forbidden_dependencies = ["storage"]
 known_violations = []
