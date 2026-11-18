@@ -15495,3 +15495,24 @@ DHCP 侧的形状，ARP 侧第一版漏了它。
 读数：`check` 18/18；整链 69/69 rc=0。
 B2 剩余：ARP 表（缓存+老化）、`ip link`/`ip addr` 命令、ICMP ping（ARP 之后
 最短路径）、UDP/TCP、路由/DNS/DHCP 客户端化（现在是夹具单次握手）。
+
+
+## 407. ADR-140 B2 第二刀：ICMP ping 闭环（workbuddy，2026-11-18）
+
+**零新号**。一个 ktest 完成"ARP 解网关 MAC → 用它发单播 ICMP echo → 等 reply"
+闭环，**MAC 从线上读**（ARP reply 的 sender_mac），判定不假设对端是谁。
+六格：ARP 往返 / 发出 / 收到 / 解得开（type=0）/ **原样返回**（id=0xA5A5
+seq=1——slirp 把 echo 原样返回，这两格证明"回的是我们发的那个"）/ src_ip=网关。
+**实测**：`type=0 id=0xa5a5 seq=1 src=10.0.2.2`，六格全绿 PASS(33) 6.0s。
+**变异证红**：id 期望改 0xBEEF ⇒ FAIL35，还原绿。
+
+### IPv4 头偏移写反的教训（凭记忆写偏移表的又一例）
+
+初版 `f[30..34].copy_from_slice(our_ip)`——把**源地址**写到了**目标地址**的位
+（IPv4 头 `26..30 源 | 30..34 目标`），网关 IP 再把那 4 字节盖掉 ⇒ 帧的源 IP
+变成网关自己 ⇒ **slirp 丢包**（`reply 等不到 UsedTimeout`）。**修**：
+源 → `f[26..30]`。**教训**：协议头偏移必须由对端行为作证（发不出去就是实测在
+纠偏），不能凭记忆——与本仓库"布局表必须由设备自己作证"的第一纪律同根。
+
+读数：`check` 18/18；整链 69/69 rc=0。
+B2 剩余：ARP 缓存+老化、`ping` shell 命令、payload 回环校验、UDP/TCP、路由/DNS。

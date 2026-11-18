@@ -298,3 +298,97 @@ fn t_net_arp() -> bool {
 }
 #[cfg(feature = "virtio-net")]
 ktest!(KT_NET_ARP, t_net_arp);
+
+/// B2 ç¬¬äºåï¼ADR-140ï¼ï¼ICMP ping é­ç¯ââä¸ä¸ªç¨ä¾éå®æ"ARP è§£åºç½å³ MAC â ç¨å®ååæ­ ICMP echo â ç­ reply"。
+/// **MAC ä»çº¿ä¸è¯»**ï¼ARP reply ç sender_macï¼ï¼ä¸æ¯ç¡¬ç¼ç ââå¤å®ä¸åè®¾å¯¹ç«¯æ¯è°ã
+/// å¤æ®å­æ ¼ï¼ARP å¾è¿ãICMP ååºãæ¶å°ãè§£å¾å¼ï¼type=0ï¼ã
+/// **åçæ¯æä»¬åçé£ä¸ª**ï¼id/seq/payload å¯¹è´¦ââslirp ææä»¬ç echo åæ ·è¿åï¼ãsrc_ip=ç½å³ã
+#[cfg(feature = "virtio-net")]
+fn t_net_ping() -> bool {
+    if let Err(e) = virtio::bind_net() {
+        crate::log_fatal!("ping: ç»å®/æ¡æå¤±è´¥ {:?}", e);
+        return false;
+    }
+    let i = match virtio::net_info() {
+        Some(v) => v,
+        None => {
+            crate::log_fatal!("ping: ç»å®ä¹åæ¿ä¸å°è¯»æ°");
+            return false;
+        }
+    };
+    // ---- ç¬¬ä¸åï¼ARP è§£åºç½å³ç MACã
+    let (arp_req, _h) = virtio::build_arp_request(&i.mac);
+    if virtio::send_raw(&arp_req).is_err() {
+        crate::log_fatal!("ping: ARP REQUEST åä¸åºå»");
+        return false;
+    }
+    let (buf, n, uidx, ulen, uid) = match virtio::receive(3000) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_fatal!("ping: ARP reply ç­ä¸å° {:?}", e);
+            return false;
+        }
+    };
+    let a = match virtio::parse_arp_reply(&buf[..n], uidx, ulen, uid) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_fatal!("ping: ARP reply è§£ä¸å¼ {:?}", e);
+            return false;
+        }
+    };
+    let arp_ok = a.sender_ip == virtio::NET_GATEWAY_IP && a.used_id == 0;
+    if !arp_ok {
+        crate::log_fatal!("ping: ARP reply ä¸æ¯ç½å³çé£ä¸å¥");
+        return false;
+    }
+    let gw_mac = a.sender_mac;
+    // ---- ç¬¬äºåï¼ç¨åè§£åºç MAC ååæ­ ICMP echo requestã
+    let seq: u16 = 1;
+    let (ping, _ph) = virtio::build_icmp_echo_request(&gw_mac, &i.mac, &virtio::DHCP_GUEST_IP, seq);
+    match virtio::send_raw(&ping) {
+        Ok(f) => crate::log_info!(
+            "ping: å echo é¿={} åå¸={:#018x} åæ§idx={} id={}",
+            f.len, f.hash, f.used_idx, f.used_id
+        ),
+        Err(e) => {
+            crate::log_fatal!("ping: ICMP åä¸åºå» {:?}", e);
+            return false;
+        }
+    }
+    // ---- ç­ replyï¼æçç­å¾ï¼slirp ä¼æ echo åæ ·è¿åï¼ã
+    let (buf2, n2, uidx2, ulen2, uid2) = match virtio::receive(3000) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_fatal!("ping: reply ç­ä¸å° {:?}", e);
+            return false;
+        }
+    };
+    let r = match virtio::parse_icmp_reply(&buf2[..n2], uidx2, ulen2, uid2) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_fatal!("ping: reply è§£ä¸å¼ {:?} åå­å­è={:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x}",
+                e, buf2[0], buf2[1], buf2[2], buf2[3], buf2[4], buf2[5]);
+            return false;
+        }
+    };
+    let type_ok = r.icmp_type == virtio::ICMP_ECHO_REPLY;
+    let echo_ok = r.icmp_id == virtio::ICMP_ECHO_ID && r.icmp_seq == seq;
+    let src_ok = r.src_ip == virtio::NET_GATEWAY_IP;
+    let id_ok = r.used_id == 0;
+    crate::log_info!(
+        "ping: æ¶å° reply é¿={} åå¸={:#018x} type={} id={:#06x} seq={} src={}.{}.{}.{} used.id={}",
+        r.len, r.hash, r.icmp_type, r.icmp_id, r.icmp_seq,
+        r.src_ip[0], r.src_ip[1], r.src_ip[2], r.src_ip[3], r.used_id
+    );
+    crate::log_info!(
+        "ping: å¤æ® ARPå¾è¿={} ååº=true æ¶å°=true è§£å¾å¼={} åæ ·è¿å={} srcç½å³={} ç¼å²å¯¹={}",
+        arp_ok, type_ok, echo_ok, src_ok, id_ok
+    );
+    let ok = arp_ok && type_ok && echo_ok && src_ok && id_ok;
+    if !ok {
+        crate::log_fatal!("ping: ICMP å¾è¿å¤æ®ä¸æç«ï¼ä¸é¢ä¸¤è¡æ¯å¨é¨è¯»æ°ï¼");
+    }
+    ok
+}
+#[cfg(feature = "virtio-net")]
+ktest!(KT_NET_PING, t_net_ping);

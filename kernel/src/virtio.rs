@@ -1256,6 +1256,106 @@ pub fn parse_arp_reply(buf: &[u8], used_idx: u16, used_len: u32, used_id: u32) -
         used_id,
     })
 }
+// ---------------------------------------------------------------- B2 ç¬¬äºåï¼ADR-140ï¼ï¼ICMP echo
+/// ICMP çå ä¸ªå·ï¼RFC 792ï¼ãping çå¯¹è±¡ = slirp ç½å³ï¼10.0.2.2ï¼ä¸ ARP åä¸ä¸ªå¯¹ç«¯ï¼ã
+pub const NET_TYPE_ICMP: [u8; 2] = [0x08, 0x00];
+pub const ICMP_ECHO_REQUEST: u8 = 8;
+pub const ICMP_ECHO_REPLY: u8 = 0;
+pub const ICMP_ECHO_ID: u16 = 0xA5A5;
+pub const ICMP_PAYLOAD: [u8; 16] = [0xA5; 16];
+/// ICMP å¸§æ»é¿ = eth 14 + IPv4 20 + ICMP å¤´ 4 + payload 16ï¼å«å°æå°å¸§ 60ã
+pub const ICMP_FRAME_BYTES: usize = NET_FRAME_BYTES;
+const _: () = assert!(ICMP_FRAME_BYTES <= NET_TX_MAX);
+
+/// ICMP æ®µçæ ¡éªåï¼ä¸ `ip_cksum` åä¸æ¡ 16 ä½åç åï¼ICMP æ ¡éªåè¦çæ´ä¸ª ICMP æ®µï¼ã
+fn icmp_cksum(seg: &[u8]) -> u16 {
+    ip_cksum(seg)
+}
+
+/// æé ä¸ä¸ª ICMP echo requestï¼åæ­ç» `gw_mac`ï¼ä¸ä¸å ARP æ¿å°çç½å³ MACï¼
+/// **ä»çº¿ä¸è¯»çèä¸æ¯ç¡¬ç¼ç **ï¼ï¼é®ç½å³ãè¿åå¸§ä¸èªç®åå¸ã
+pub fn build_icmp_echo_request(
+    gw_mac: &[u8; 6],
+    our_mac: &[u8; 6],
+    our_ip: &[u8; 4],
+    seq: u16,
+) -> ([u8; ICMP_FRAME_BYTES], u64) {
+    let mut f = [0u8; ICMP_FRAME_BYTES];
+    f[0..6].copy_from_slice(gw_mac);            // åæ­ï¼ARP å·²æç½å³ç MAC è§£åºæ¥äº
+    f[6..12].copy_from_slice(our_mac);
+    f[12..14].copy_from_slice(&NET_TYPE_IPV4);
+    let ip_len = 20 + 4 + ICMP_PAYLOAD.len();   // IPv4 å¤´ + ICMP æ®µ
+    f[14] = 0x45;
+    f[16] = (ip_len >> 8) as u8;
+    f[17] = ip_len as u8;
+    f[18] = 0; f[19] = 1;                       // æ è¯/seqï¼ååå°± 0/1
+    f[20] = 0x40;                               // DF
+    f[22] = 64;                                 // TTL
+    f[23] = 1;                                  // protocol = ICMP
+    f[26..30].copy_from_slice(our_ip);           // æºå°åï¼IPv4 å¤´ç 26..30ï¼
+    f[30..34].copy_from_slice(&NET_GATEWAY_IP); // ç®çå°åï¼IPv4 å¤´ç 30..34ï¼ // åæ­ç®æ  = ç½å³
+    let ck = ip_cksum(&f[14..34]);
+    f[24] = (ck >> 8) as u8;
+    f[25] = ck as u8;
+    let ic = 14 + 20;                           // ICMP æ®µèµ·ç¹
+    f[ic] = ICMP_ECHO_REQUEST;
+    f[ic + 1] = 0;                              // code
+    // æ ¡éªååç½®é¶åç®æ´æ®µ
+    f[ic + 2] = 0; f[ic + 3] = 0;
+    f[ic + 4..ic + 6].copy_from_slice(&ICMP_ECHO_ID.to_be_bytes());
+    f[ic + 6..ic + 8].copy_from_slice(&seq.to_be_bytes());
+    f[ic + 8..ic + 8 + ICMP_PAYLOAD.len()].copy_from_slice(&ICMP_PAYLOAD);
+    let seg_len = 4 + ICMP_PAYLOAD.len();
+    let cks = icmp_cksum(&f[ic..ic + seg_len]);
+    f[ic + 2] = (cks >> 8) as u8;
+    f[ic + 3] = cks as u8;
+    let h = crate::ahci::fnv1a64(&f);
+    (f, h)
+}
+
+/// æ¶å°ç ICMP echo reply éè½æ¿åºæ¥çäºå®ãå­æ®µå¨ä»**æ¶å°çå­è**éè¯»ã
+#[derive(Clone, Copy, Debug)]
+pub struct IcmpReply {
+    pub len: usize,
+    pub hash: u64,
+    pub icmp_type: u8,
+    pub icmp_id: u16,
+    pub icmp_seq: u16,
+    pub src_ip: [u8; 4],
+    pub used_idx: u16,
+    pub used_len: u32,
+    pub used_id: u32,
+}
+
+/// è§£ä¸å ICMP echo replyï¼ethertype=0x0800ãprotocol=1ãtype=0ã
+/// æ¯å¤åçåéªé¿åº¦ï¼`parse_reply` åæ¡ï¼çº¿ä¸çæ°ä¸è½ç´æ¥å½çç¨ï¼ã
+pub fn parse_icmp_reply(buf: &[u8], used_idx: u16, used_len: u32, used_id: u32) -> Result<IcmpReply, VirtioError> {
+    if buf.len() < 14 + 20 + 4 || buf[12] != NET_TYPE_IPV4[0] || buf[13] != NET_TYPE_IPV4[1] {
+        return Err(VirtioError::NotV4 { at: buf.len(), guard: 1 });
+    }
+    let ihl = usize::from(buf[14] & 0x0F) * 4;
+    if ihl < 20 || buf[14 + 9] != 1 || buf.len() < 14 + ihl + 4 {
+        return Err(VirtioError::NotV4 { at: buf.len(), guard: 2 });
+    }
+    let ic = 14 + ihl;
+    if buf[ic] != ICMP_ECHO_REPLY {
+        return Err(VirtioError::NotV4 { at: buf.len(), guard: 3 });
+    }
+    let mut src_ip = [0u8; 4];
+    src_ip.copy_from_slice(&buf[14 + 12..14 + 16]);
+    Ok(IcmpReply {
+        len: used_len as usize,
+        hash: crate::ahci::fnv1a64(&buf[..(used_len as usize).min(buf.len())]),
+        icmp_type: buf[ic],
+        icmp_id: u16::from_be_bytes([buf[ic + 4], buf[ic + 5]]),
+        icmp_seq: u16::from_be_bytes([buf[ic + 6], buf[ic + 7]]),
+        src_ip,
+        used_idx,
+        used_len,
+        used_id,
+    })
+}
+
 const BOOTP_OPT_LEN: usize = 8;
 const BOOTP_BYTES: usize = BOOTP_OPT + BOOTP_OPT_LEN;
 pub const DHCP_FRAME_BYTES: usize = BOOTP_OFF + BOOTP_BYTES;
