@@ -7896,24 +7896,38 @@ def _lspci_rows(log: str) -> bool:
 
 
 def _ip_neigh_row(log: str) -> bool:
-    """`ip neigh` çæ¾ç¤ºå±å¤æ®ï¼ADR-145ï¼ã
+    """`ip neigh` 的判据（ADR-145/146）。
 
-    åæ¾ä¹åå¿é¡»åºç°ä¸¤ç§å½¢ç¶ä¹ä¸ï¼
-      â  `neigh: empty`ï¼è¡¨ç©ºï¼
-      â¡ `<a.b.c.d> <6 ç» 2 ä½åå­è¿å¶ç¨ : åé>`ï¼æè¡¨é¡¹ï¼
-    ä¸¤ç§é½æ²¡æ â çº¢ï¼`-1`ï¼æªç¥å·/usageï¼ä¹ä¸ç®éã
+    **不是"有一行就算"，而是"表里有**我们刚刚 ping 过的那台**：
+    A3 的 argv 里 `ping 10.0.2.2` 在 `ip neigh` 之前，RFC 826 的被动学习应该
+    把它的 (ip, mac) 写进内核表。所以判据是：
+      ① 回显之后出现 `10.0.2.2 <mac>` 行（IP 是**刚 ping 过的那台**）
+      ② mac 不是全零、也不是广播地址（那说明学到的是垃圾）
+      ③ 不出现 `neigh: empty`（表不能是空的）
+    `-1`（未知号）也不算通。
     """
     import re
     lines = log.split("\n")
     octet = r"(?:25[0-5]|2[0-4]\d|1?\d?\d)"
-    row_pat = re.compile(r"^" + octet + r"(?:\." + octet + r"){3} ([0-9a-f]{2}:){5}[0-9a-f]{2}$")
+    row_pat = re.compile(r"^(?P<ip>" + octet + r"(?:\." + octet + r"){3}) (?P<mac>(?:[0-9a-f]{2}:){5}[0-9a-f]{2})$")
     for k, ln in enumerate(lines):
         if ln.strip() != "ip neigh":
             continue
+        saw_empty = False
         for j in range(k + 1, min(k + 4, len(lines))):
             s = lines[j].strip()
-            if s == "neigh: empty" or row_pat.match(s):
-                return True
+            if s == "neigh: empty":
+                saw_empty = True
+                continue
+            m = row_pat.match(s)
+            if not m:
+                continue
+            if m.group("ip") != "10.0.2.2":
+                continue
+            mac = m.group("mac")
+            if mac == "00:00:00:00:00:00" or mac == "ff:ff:ff:ff:ff:ff":
+                continue
+            return True
     return False
 
 
@@ -8817,9 +8831,9 @@ def do_test(timeout: int) -> int:
         # 判据形状：`link mac <MAC> mtu=<数> state=<up|down>` 与
         # `addr <a.b.c.d> gw <a.b.c.d> dns <a.b.c.d>`——不依赖具体数值。
         _ip_rows(ashlog),
-        # ip neighï¼ADR-145ï¼ï¼36/37 å·çåªè¯»å±ç¤º；
-        # shell ç ping èµ°ç¨æ·æèªå¸¦ ARPï¼ä¸å¡«åæ ¸è¡¨，
-        # æä»¥æ¬ççå°çæ¯ "neigh: empty"ï¼è¡¨ç©ºä¹æ¯åæ³å½¢ç¶）ã
+        # ip neigh（ADR-145/146）：36/37 号的只读展示。
+        # ADR-146 的被动学习把 ping 过的邻居写进内核表，所以这里必须看到
+        # `10.0.2.2 <mac>` 行（表空或 -1 都算红——判据不靠"有一行就行"）。
         _ip_neigh_row(ashlog),
 
         # ---- ls / cat（2026-11-18）----

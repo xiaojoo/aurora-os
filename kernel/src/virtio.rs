@@ -1470,6 +1470,34 @@ pub fn arp_len() -> u32 {
     let t = unsafe { &*ARP.0.get() };
     t.n as u32
 }
+
+/// RFC 826 çè¢«å¨å­¦ä¹ ï¼ADR-146ï¼ï¼æ¶å°ä¸å¸§å°±çå®æ¯ä¸æ¯ ARPï¼
+/// æ¯å°±æ sender é£ä¸å¯¹ (ip, mac) æ merge è§åå½è¿è¡¨ã
+///
+/// **ä¸ºä»ä¹å¨æ¶å¸§è·¯å¾ä¸å­¦**ï¼ç¨æ·æ `ping` èªå·±åå¹¿æ­ ARPï¼
+/// å®ä¸ä¼ä¸æ¥ââå¨æ¶å¸§å¤è¢«å¨å­¦ï¼ä¸¤æ¡ ARP å®ç°å°±ä¸åæ¯"åèªç®¡èªå·±"ã
+/// è¡ä¸ºå½¢ç¶ä¸è¯»çæ¯**åå¸§**ï¼ä» eth å¤´èµ·ï¼ï¼`ethertype==0x0806` ä¸é¿åº¦>=42ã
+/// ä¸ç®¡æ¯ request è¿æ¯ replyï¼ä¸¤èç sender å­æ®µå¨åä¸ä¸ªåç§»ä¸ã
+/// è¿å `true` = è¿ä¸å¸§è®¤çè¢«å­¦äºï¼å¤æ®è¯»æ°ï¼ã
+pub fn arp_learn_from_frame(f: &[u8]) -> bool {
+    if f.len() < 42 { return false; }
+    // ethertype å¨ 12..14ï¼ARP æ¯ 0x0806
+    if f[12] != 0x08 || f[13] != 0x06 { return false; }
+    // éªè¯åæï¼htype=1(Ethernet)ãptype=0x0800(IPv4)ãhlen=6ãplen=4
+    if f[14] != 0 || f[15] != 1 { return false; }
+    if f[16] != 0x08 || f[17] != 0x00 { return false; }
+    if f[18] != 6 || f[19] != 4 { return false; }
+    let mut ip = [0u8; 4];
+    ip.copy_from_slice(&f[28..32]);
+    let mut mac = [0u8; 6];
+    mac.copy_from_slice(&f[22..28]);
+    // å¨é¶ sender ä¸å­¦ï¼é£æ¯æ¢é/æªåå§åçå½¢ç¶ï¼
+    if mac == [0u8; 6] || ip == [0u8; 4] { return false; }
+    // ä¸å­¦èªå·±ï¼èªå·±ç IP/MAC ä¸æ¯"é»å±"ï¼
+    if ip == DHCP_GUEST_IP { return false; }
+    arp_learn(&ip, &mac);
+    true
+}
 pub const DNS_QTYPE_A: u16 = 1;
 pub const DNS_QCLASS_IN: u16 = 1;
 /// DNS 帧总长 = eth 14 + IPv4 20 + UDP 8 + DNS 查询（问 localhost），垫到 60。

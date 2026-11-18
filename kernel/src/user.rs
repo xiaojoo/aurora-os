@@ -1604,6 +1604,9 @@ fn sys_net_recv(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     match crate::virtio::receive(ms) {
         Ok((data, n, uidx, ulen, uid)) => {
             let n = n.min(cap).min(data.len());
+            // RFC 826 çè¢«å¨å­¦ä¹ ï¼ADR-146ï¼ï¼åå¸§éæ¯ ARP å°±æ sender å­¦è¿åæ ¸è¡¨ã
+            // è¿æ¯"ç¨æ·æåå¸§ãåæ ¸å­¦è¡¨"çé£ä¸åï¼ç¨æ·æä¸ç¨ä¸æ¥ï¼`ip neigh` å°±æåå®¹ã
+            let _ = crate::virtio::arp_learn_from_frame(&data[..n]);
             match copy_to_user(&data[..n], frame.rdi) {
                 Ok(w) => w as u64,
                 Err(_) => E_FAULT,
