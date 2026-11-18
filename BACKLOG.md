@@ -15929,3 +15929,27 @@ MAC 与 ADR-139 实测的网关 MAC 逐字节一致。
 读数：`check` **18/18**；整链 **70 符合 + 3 条不符**（全是已知抖动族：日志尾
 HANG 因那跑串口无 fail/fatal 行、FS-03 两条因卷抖动）——**单跑复验全部通过**：
 `fault-crash-oops` EXCEPTION39 + log tail 4/4 逐行相符、`fat32-probe` PASS。
+
+
+## 424. ADR-148：掩码进 35 号读数块（workbuddy，2026-11-18）
+
+**零新号**。35 号读数块 24→**28 字节**，尾部 24..28 写 `NET_SUBNET_MASK`
+（和内核路由判据**同一个常量**，来路 `-netdev user,net=10.0.2.0/24`，不猜）。
+runtime `NET_INFO_BYTES` 24→28；shell 的 `cmd_ping` 从 `info[24..28]` 读掩码，
+不再硬编码 `[255,255,255,0]`（ADR-147 未决 1 收口）。
+`ip route` 增加 `mask=<前缀>` 显示（逐 bit 数掩码里连续 1，get() 取值，
+不索引不取址——32S 纪律）；判定格 `_ip_route_row` 收紧为
+`route default via <IPv4> mask=<0..32>`，不依赖具体前缀 24。
+
+**实测**：`route default via 10.0.2.2 mask=24`（PASS33 15.0s），ping/neigh 保持正常。
+**变异证红**：删掉 `ip route` 的 `mask=` 显示 ⇒ 整链 A3 行 `CONTENT-MISMATCH`，还原绿。
+
+### 两条教训
+
+1. **我的 Python 写入第四次把四个文件写成双重编码**（user.rs 160 / virtio.rs 287 /
+   registry.rs 57 / runtime 69），按行 latin-1→utf-8 逆转清零。根因：中文写进
+   `b'...'` 报 SyntaxError 后改走 `.encode('utf-8')`，又在已编码文本上二次编码。
+2. `check-module-interfaces` 报 `NET_SUBNET_MASK` 未登记 ⇒ 补进白名单。
+
+读数：`check` **18/18**；整链 **71 符合 + 2 条不符**（FS-03 两条 = t_fat32 卷抖动
+连带，单跑 fat32-probe 86/86、两卷同哈希=true，不归因）。

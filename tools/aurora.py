@@ -7898,13 +7898,13 @@ def _lspci_rows(log: str) -> bool:
 def _ip_route_row(log: str) -> bool:
     """`ip route` 的显示层判据（ADR-147）。
 
-    回显之后必须出现 `route default via <a.b.c.d>`——只验形状与“那是一个合法 IPv4”，
+    回显之后必须出现 `route default via <a.b.c.d> mask=<0..32>`——只验形状与“那是一个合法 IPv4”，
     不验具体网关值（换 QEMU 网段也成立）。
     """
     import re
     lines = log.split("\n")
     octet = r"(?:25[0-5]|2[0-4]\d|1?\d?\d)"
-    pat = re.compile(r"^route default via " + octet + r"(?:\." + octet + r"){3}$")
+    pat = re.compile(r"^route default via " + octet + r"(?:\." + octet + r"){3} mask=(?:[0-9]|[12][0-9]|3[0-2])$")
     for k, ln in enumerate(lines):
         if ln.strip() != "ip route":
             continue

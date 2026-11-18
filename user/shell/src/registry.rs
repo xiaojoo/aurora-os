@@ -27,7 +27,7 @@ use crate::{
     M_DMESG_ERR, M_DMESG_HDR, M_DMESG_USAGE, M_KILLED, M_KILL_USAGE, M_LSPCI_USAGE,
     M_IP_ADDR, M_IP_DNS, M_IP_DOWN, M_IP_GW, M_IP_LINK, M_IP_MAC, M_IP_MTU, M_IP_STATE, M_IP_UP,
     M_COLON, M_IP_USAGE, M_NEIGH, M_NEIGH_EMPTY, M_PING_DOT, M_PING_FROM, M_PING_SEQ,
-    M_ROUTE_DEFAULT, M_ROUTE_NL,
+    M_ROUTE_DEFAULT, M_ROUTE_MASK_EQ, M_ROUTE_NL, M_ROUTE_SLASH,
     M_PING_TIMEOUT, M_PING_USAGE, M_RUN_USAGE,
     M_SLEEP_USAGE, M_SP, M_TOP_FRAME, M_UPTIME_USAGE,
     M_TOP_USAGE, M_TRYHELP, M_UNKNOWN,
@@ -179,7 +179,10 @@ fn cmd_ping(c: &Ctx) -> bool {
     // **路由（ADR-147）**：先算下一跳——
     // 同子网解目标自己，外部解网关。
     // 之前无条件解目标，所以 `ping 192.168.1.1` 会去问它的 MAC——那是错的。
-    let mask: [u8; 4] = [255, 255, 255, 0];
+    // ADR-148：掩码从 35 号读数包的 24..28 读，
+    // 不再在 shell 里硬编一份。
+    let mut mask = [0u8; 4];
+    for (d, s) in mask.iter_mut().zip(info.get(24..28).unwrap_or(&[]).iter()) { *d = *s; }
     let mut gateway = [0u8; 4];
     for (d, s) in gateway.iter_mut().zip(info.get(10..14).unwrap_or(&[]).iter()) { *d = *s; }
     let hop = rt::next_hop(&our_ip, &mask, &ip, &gateway);
@@ -929,6 +932,20 @@ fn cmd_ip(c: &Ctx) -> bool {
         // ADR-147：今天只有一条默认路由，打出来就是全部内容。
         con_write(c.h, msg(M_ROUTE_DEFAULT));
         put_dotted(c.h, info.get(10..14));
+        con_write(c.h, msg(M_ROUTE_MASK_EQ));
+        // 数掩码里连续的 1（从高到低）——255.255.255.0 -> 24。
+        let mut prefix = 0u32;
+        let mut m = 0usize;
+        while m < 4 {
+            let mut bit = 7usize;
+            while bit < 8 {
+                let byte = info.get(24 + m).copied().unwrap_or(0);
+                if (byte & (1u8 << bit)) != 0 { prefix += 1; } else { bit = 8; }
+                if bit < 8 { bit -= 1; }
+            }
+            m += 1;
+        }
+        put_u64(c.h, u64::from(prefix));
         con_write(c.h, msg(M_ROUTE_NL));
         return true;
     }
@@ -968,13 +985,13 @@ fn cmd_ip(c: &Ctx) -> bool {
     true
 }
 
-/// ADR-145ï¼`ip neigh` ââ åæ ¸ ARP è¡¨çåªè¯»å±ç¤ºã
+/// ADR-145：`ip neigh` —— 内核 ARP 表的只读展示。
 ///
-/// åé¡µå½¢ç¶ä¸ 31 å· lspci / 27 å· ps åæï¼`cursor` ä» 0 å¼å§ï¼
-/// æ¯æ¬¡è¯»å `(next, n)`ï¼`n == 0` å³å°å°¾ãæ¯æ¡æä¸è¡ `IP  MAC`ï¼MAC åºå®ä¸¤ä½åå­è¿å¶å°åï¼ã
+/// 分页形状与 31 号 lspci / 27 号 ps 同族：`cursor` 从 0 开始，
+/// 每次读回 `(next, n)`，`n == 0` 即到尾。每条打一行 `IP  MAC`（MAC 固定两位十六进制小写）。
 #[inline(never)]
 fn cmd_ip_neigh(c: &Ctx) -> bool {
-    let mut buf = [0u8; 80];   // 8 æ¡ Ã 10 å­è
+    let mut buf = [0u8; 80];   // 8 条 × 10 字节
     let mut cursor = 0u32;
     let mut total = 0u32;
     loop {

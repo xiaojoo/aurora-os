@@ -125,11 +125,11 @@ pub const SYS_NET_SEND: u64 = 33;
 pub const SYS_NET_RECV: u64 = 34;
 /// 35：网卡读数一包读回。rdi=buf（固定 18 字节：MAC6+guest_ip4+gateway4+dns4）。返回 0 / 错误码。（ADR-143）
 pub const SYS_NET_INFO: u64 = 35;
-/// 36ï¼ADR-145ï¼ï¼ARP è¡¨è¡¨é¡¹è®¡æ°ï¼`ip neigh` åé¡µçä¸çï¼ã
+/// 36（ADR-145）：ARP 表表项计数（`ip neigh` 分页的上界）。
 pub const SYS_NET_ARP_LEN: u64 = 36;
-/// 37ï¼ADR-145ï¼ï¼ARP è¡¨ææ¸¸æ è¯»é¡¹ï¼rdi=cursorãrsi=bufãrdx=lenãr10=å®½åº¦ï¼ã
+/// 37（ADR-145）：ARP 表按游标读项（rdi=cursor、rsi=buf、rdx=len、r10=宽度）。
 pub const SYS_NET_ARP_ENUM: u64 = 37;
-/// æ¯æ¡ ARP è¡¨é¡¹çå®é¿è®°å½ï¼10 å­èï¼IP4 + MAC6ï¼ãä¸ 27/31 å·ç 32 å­èè®°å½ä¸åï¼è¿éçåå®¹å°±æ¯ 10 å­èï¼ä¸å«å° 32ã
+/// 每条 ARP 表项的定长记录（10 字节：IP4 + MAC6）。与 27/31 号的 32 字节记录不同：这里的内容就是 10 字节，不垫到 32。
 pub const ARP_RECORD_LEN: usize = 10;
 /// 16：`rdi` = Proc 句柄、`rsi` = Thread 句柄、`rdx` = StartupInfo 那一页的 VMO 句柄、
 /// `r10` = 它在**子 AS** 里的只读 VA → 成功返回 0。顺序固定：校验 → 转移 → 回填 → 放线程跑。
@@ -1604,8 +1604,8 @@ fn sys_net_recv(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     match crate::virtio::receive(ms) {
         Ok((data, n, uidx, ulen, uid)) => {
             let n = n.min(cap).min(data.len());
-            // RFC 826 çè¢«å¨å­¦ä¹ ï¼ADR-146ï¼ï¼åå¸§éæ¯ ARP å°±æ sender å­¦è¿åæ ¸è¡¨ã
-            // è¿æ¯"ç¨æ·æåå¸§ãåæ ¸å­¦è¡¨"çé£ä¸åï¼ç¨æ·æä¸ç¨ä¸æ¥ï¼`ip neigh` å°±æåå®¹ã
+            // RFC 826 的被动学习（ADR-146）：原帧里是 ARP 就按 sender 学进内核表。
+            // 这是"用户态发帧、内核学表"的那一半：用户态不用上报，`ip neigh` 就有内容。
             let _ = crate::virtio::arp_learn_from_frame(&data[..n]);
             match copy_to_user(&data[..n], frame.rdi) {
                 Ok(w) => w as u64,
@@ -1629,7 +1629,7 @@ fn sys_net_info(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
         return E_IO;
     }
     let Some(v) = crate::virtio::net_info() else { return E_BAD_HANDLE };
-    let mut blk = [0u8; 24];
+    let mut blk = [0u8; 28];
     blk[0..6].copy_from_slice(&v.mac);
     blk[6..10].copy_from_slice(&crate::virtio::DHCP_GUEST_IP);
     blk[10..14].copy_from_slice(&crate::virtio::NET_GATEWAY_IP);
@@ -1637,13 +1637,17 @@ fn sys_net_info(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     blk[18..20].copy_from_slice(&v.mtu.to_le_bytes());
     blk[20..22].copy_from_slice(&v.link.to_le_bytes());
     // 22..24 预留（保持 8 字节对齐的读数块）
+    // 24..28：子网掩码（ADR-148）。来路是 QEMU -netdev user,net=10.0.2.0/24 的
+    // 启动参数，与 DHCP_GUEST_IP 同一份"不猜"的来源；DHCP option 1 学到的
+    // 动态掩码以后可以在这里覆盖，但形状与来路必须先有约定。
+    blk[24..28].copy_from_slice(&crate::virtio::NET_SUBNET_MASK);
     match copy_to_user(&blk, frame.rdi) {
         Ok(w) => w as u64,
         Err(_) => E_FAULT,
     }
 }
 
-/// 36ï¼ADR-145ï¼ï¼ARP è¡¨é¡¹æ°ï¼`ip neigh` çä¸çï¼ã
+/// 36（ADR-145）：ARP 表项数（`ip neigh` 的上界）。
 #[cfg(feature = "handles")]
 #[inline(never)]
 fn sys_net_arp_len(_frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
@@ -1653,7 +1657,7 @@ fn sys_net_arp_len(_frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     u64::from(crate::virtio::arp_len())
 }
 
-/// 37ï¼ADR-145ï¼ï¼ARP è¡¨ææ¸¸æ è¯»é¡¹ãè¿åä¸ 27 å·åå½¢ï¼`(ä¸æ¸¸æ¸¸æ  << 32) | æ¬æ¬¡æ¡æ°`ã
+/// 37（ADR-145）：ARP 表按游标读项。返回与 27 号同形：`(下游游标 << 32) | 本次条数`。
 #[cfg(feature = "handles")]
 #[inline(never)]
 fn sys_net_arp_enum(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
