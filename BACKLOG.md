@@ -15607,3 +15607,29 @@ a3-shell 单跑七格全绿；整链一轮 66 符合 + 3 条不符（`两卷同�
 + `多级首簇高半抹零` 的 EXCEPTION）——**三条都单跑复验**：fat32-probe PASS、
 `fs-open --host-fault fault-deep-hi-cluster` FAIL(35) 符合期望、witness 报
 "盘上不是只差计划中那 1 格"（宿主机侧注入没生效，属长链批量抖动同族）。
+
+
+## 411. ADR-144 B2 第六刀：`ip link` / `ip addr`（workbuddy，2026-11-18）
+
+**零新号**（35 号同会话内扩形状）。读数块 18→**24 字节**：尾部加 `mtu2 | link2`
+（`22..24` 预留对齐）。**不猜默认值**：读不到就回错误码，不填 0。
+shell 加 `ip` 命令（2 字节名，`streq` 分派）+ `link`/`addr` 两个子命令。
+
+**实测**：
+```
+link mac 52:54:00:12:34:56 mtu=65535 state=up
+addr 10.0.2.15 gw 10.0.2.2 dns 10.0.2.3
+```
+判定格 `_ip_rows`（严格形状、不依赖具体数值）；**变异证红**：去掉 `mtu=` 前缀
+⇒ False，还原 ⇒ True。**八格全绿** PASS(33) 15.5s。
+
+### 三个坑
+
+1. **MSGS 的 declared/actual 又对不上**（564 vs 556）：`\xNN` 解码后 1 字节，
+   手算必错——用 `unicode_escape` 解码后数 `len`。
+2. `*sub == b'l'` 不成立（`&[u8]` 解引用是 `[u8]`，不能与 `u8` 比）
+   ⇒ `matches!(sub.first(), Some(b'l'))`。
+3. MAC 的 `:` 分隔符得新加进 MSGS（`M_COLON`，1 字节）。
+
+读数：`check` 18/18；**整链 69/69 rc=0**。
+B2 剩余：`ip neigh`（ARP 表出口）、`ip route`、DNS 解析器、TCP。

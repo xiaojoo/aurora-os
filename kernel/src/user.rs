@@ -1401,7 +1401,11 @@ fn sys_net_recv(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     }
 }
 
-/// 35（ADR-143）：网卡读数写回用户（18 字节：MAC6+guest_ip4+gateway4+dns4）。
+/// 35（ADR-143，ADR-144 扩到 24 字节）：网卡读数写回用户。
+///
+/// 布局（小端，24 字节定长）：`MAC6 | 本机IP4 | 网关4 | DNS4 | mtu2 | link2`。
+/// `mtu`/`link` 是 `net_info()` 的原始读数（`ip link` 要打它们）——
+/// **不猜默认值**：设备说多少就是多少，读不到时 handler 直接返回错误而不是填 0。
 #[cfg(feature = "handles")]
 #[inline(never)]
 fn sys_net_info(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
@@ -1410,11 +1414,14 @@ fn sys_net_info(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
         return E_IO;
     }
     let Some(v) = crate::virtio::net_info() else { return E_BAD_HANDLE };
-    let mut blk = [0u8; 18];
+    let mut blk = [0u8; 24];
     blk[0..6].copy_from_slice(&v.mac);
     blk[6..10].copy_from_slice(&crate::virtio::DHCP_GUEST_IP);
     blk[10..14].copy_from_slice(&crate::virtio::NET_GATEWAY_IP);
     blk[14..18].copy_from_slice(&crate::virtio::NET_DNS_IP);
+    blk[18..20].copy_from_slice(&v.mtu.to_le_bytes());
+    blk[20..22].copy_from_slice(&v.link.to_le_bytes());
+    // 22..24 预留（保持 8 字节对齐的读数块）
     match copy_to_user(&blk, frame.rdi) {
         Ok(w) => w as u64,
         Err(_) => E_FAULT,

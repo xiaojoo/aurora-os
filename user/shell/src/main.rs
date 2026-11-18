@@ -38,7 +38,7 @@ mod registry;
 /// （hello/probe 的模块头都记过这个坑，本轮实测又撞一次）。改成 RIP 相对 lea 取基址 + 常量偏移。
 /// S6u：横幅的前导 `\x0a` 去掉了——那是当年为了跟上面的内核日志隔开留的，
 /// ADR-096 之后画面正文只有会话输出，前面什么都没有，那一格就成了纯粹的空行。
-static MSGS: [u8; 507] = *b"dmesg: usage\x0admesg: err=\x0admesg: tail\x0acommands: help | echo <text> | ping | abi | ps | free | top | kill | exit\x0aAurora OS 6.1.0-aurora (tty1)\x0aaurora@os:~$ \x0aline too long, discarded\x0aunknown command:  (try help)\x0aping=abi_info=bye\x0a\x08 \x08^C\x0arun:  exit= (timeout) error=usage: run <path>\x0a-PID GEN THR ST PAGES\x0aps: no job handle\x0alivedead ps: error=free: procs= threads= pages=#\x0atop: usage\x0aframe kill: usage\x0akilled=dmesg: usage\x0admesg: err=dmesg: tail\x0alspci: usage\x0auptime: sleep <ms>\x0aping <ip>\x0afrom \x20\x0ap\x2e\x0a: seq=\x0atimeout\x0a";
+static MSGS: [u8; 557] = *b"dmesg: usage\x0admesg: err=\x0admesg: tail\x0acommands: help | echo <text> | ping | abi | ps | free | top | kill | exit\x0aAurora OS 6.1.0-aurora (tty1)\x0aaurora@os:~$ \x0aline too long, discarded\x0aunknown command:  (try help)\x0aping=abi_info=bye\x0a\x08 \x08^C\x0arun:  exit= (timeout) error=usage: run <path>\x0a-PID GEN THR ST PAGES\x0aps: no job handle\x0alivedead ps: error=free: procs= threads= pages=#\x0atop: usage\x0aframe kill: usage\x0akilled=dmesg: usage\x0admesg: err=dmesg: tail\x0alspci: usage\x0auptime: sleep <ms>\x0aping <ip>\x0afrom \x20\x0ap\x2e\x0a: seq=\x0atimeout\x0aip: usage\x0alink addr mtu=state=up\x0adown\x0amac gw dns \x3a";
 
 const M_HELP: (usize, usize) = (37, 14);
 const M_BANNER: (usize, usize) = (111, 30);
@@ -86,6 +86,18 @@ const M_PING_FROM: (usize, usize) = (482, 5);
 const M_PING_DOT: (usize, usize) = (490, 1);  // "." 单字节（带\n 的那个是坑位）
 const M_PING_SEQ: (usize, usize) = (492, 6);
 const M_PING_TIMEOUT: (usize, usize) = (499, 7);
+// `ip link` / `ip addr`（ADR-144）：子命令与显示件。
+const M_IP_USAGE: (usize, usize) = (507, 10);
+const M_IP_LINK: (usize, usize) = (517, 5);
+const M_IP_ADDR: (usize, usize) = (522, 5);
+const M_IP_MTU: (usize, usize) = (527, 4);
+const M_IP_STATE: (usize, usize) = (531, 6);
+const M_IP_UP: (usize, usize) = (537, 3);
+const M_IP_DOWN: (usize, usize) = (540, 5);
+const M_IP_MAC: (usize, usize) = (545, 4);
+const M_IP_GW: (usize, usize) = (549, 3);
+const M_IP_DNS: (usize, usize) = (552, 4);
+const M_COLON: (usize, usize) = (556, 1);
 // `dmesg`（ADR-135）：usage 与读取失败前缀。
 const M_DMESG_USAGE: (usize, usize) = (0, 13);
 const M_DMESG_ERR: (usize, usize) = (13, 11);

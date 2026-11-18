@@ -1019,7 +1019,9 @@ pub const SYS_NET_SEND: u64 = 33;
 pub const SYS_NET_RECV: u64 = 34;
 pub const SYS_NET_INFO: u64 = 35;
 /// 网卡读数包（18 字节定长）：MAC6 + 本机 IP4 + 网关4 + DNS4。
-pub const NET_INFO_BYTES: usize = 18;
+/// 读数包 24 字节（ADR-144 从 18 扩到 24）：MAC6 + 本机IP4 + 网关4 + DNS4 + mtu2 + link2。
+pub const NET_INFO_BYTES: usize = 24;
+
 
 /// 33：把一帧交给网卡。`frame` ≤ 1514；成功 Ok(())，形状/IO 错误如实回。
 pub fn net_send(frame: &[u8]) -> Result<(), RTError> {

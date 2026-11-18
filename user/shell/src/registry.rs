@@ -23,7 +23,9 @@ use crate::{
     M_ABI, M_BYE, M_DEAD, M_FREE_PAGES, M_FREE_PFX, M_FREE_THR, M_HELP, M_LIVE, M_MINUS, M_NL,
     M_PING, M_PS_ERR, M_PS_HDR, M_PS_NOJOB, M_RUN_ERR, M_RUN_EXIT, M_RUN_PREFIX, M_RUN_TIMEOUT,
     M_DMESG_ERR, M_DMESG_HDR, M_DMESG_USAGE, M_KILLED, M_KILL_USAGE, M_LSPCI_USAGE,
-    M_PING_DOT, M_PING_FROM, M_PING_SEQ, M_PING_TIMEOUT, M_PING_USAGE, M_RUN_USAGE, M_SLEEP_USAGE, M_SP, M_TOP_FRAME, M_UPTIME_USAGE,
+    M_IP_ADDR, M_IP_DNS, M_IP_DOWN, M_IP_GW, M_IP_LINK, M_IP_MAC, M_IP_MTU, M_IP_STATE, M_IP_UP,
+    M_COLON, M_IP_USAGE, M_PING_DOT, M_PING_FROM, M_PING_SEQ, M_PING_TIMEOUT, M_PING_USAGE, M_RUN_USAGE,
+    M_SLEEP_USAGE, M_SP, M_TOP_FRAME, M_UPTIME_USAGE,
     M_TOP_USAGE, M_TRYHELP, M_UNKNOWN,
 };
 
@@ -45,6 +47,7 @@ pub struct Ctx<'a> {
 const CMD_HELP: [u8; 4] = [b'h', b'e', b'l', b'p'];
 const CMD_ECHO: [u8; 4] = [b'e', b'c', b'h', b'o'];
 const CMD_PING: [u8; 4] = [b'p', b'i', b'n', b'g'];
+const CMD_IP: [u8; 2] = [b'i', b'p'];
 const CMD_ABI: [u8; 3] = [b'a', b'b', b'i'];
 const CMD_EXIT: [u8; 4] = [b'e', b'x', b'i', b't'];
 const CMD_RUN: [u8; 3] = [b'r', b'u', b'n'];
@@ -870,6 +873,96 @@ fn cmd_sleep(c: &Ctx) -> bool {
     true
 }
 
+/// ADR-144ï¼`ip link` / `ip addr` ââ 35 å·è¯»æ°çæ¾ç¤ºå±ã
+///
+/// ä¸¤ä¸ªå­å½ä»¤åæä¸è¡ï¼æ å ãæ æ ¼å¼åºï¼ï¼
+/// `link` â MAC + mtu + stateï¼`addr` â æ¬æº IP + ç½å³ + DNSã
+/// è¯»æ°åç mtu/link æ¯**è®¾å¤çåå§è¯»æ°**ï¼ä¸çé»è®¤å¼ã
+#[inline(never)]
+fn cmd_ip(c: &Ctx) -> bool {
+    let sub = match (c.p.err.is_none(), c.p.args.get(0)) {
+        (true, Some(a)) => a,
+        _ => {
+            con_write(c.h, msg(M_IP_USAGE));
+            return true;
+        }
+    };
+    let is_link = sub.len() == 4 && matches!(sub.first(), Some(b'l'));
+    let is_addr = sub.len() == 4 && matches!(sub.first(), Some(b'a'));
+    let want_link = is_link;
+    let want_addr = is_addr;
+    if !want_link && !want_addr {
+        con_write(c.h, msg(M_IP_USAGE));
+        return true;
+    }
+    let info = match rt::net_info() {
+        Ok(v) => v,
+        Err(e) => {
+            put_i64(c.h, e.0);
+            con_write(c.h, msg(M_NL));
+            return true;
+        }
+    };
+    if want_link {
+        con_write(c.h, msg(M_IP_LINK));
+        con_write(c.h, msg(M_IP_MAC));
+        let mut k = 0usize;
+        while k < 6 {
+            let byte = info.get(k).copied().unwrap_or(0);
+            put_hex8(c.h, byte);
+            if k + 1 < 6 { con_write(c.h, msg(M_COLON)); }
+            k += 1;
+        }
+        con_write(c.h, msg(M_SP));
+        con_write(c.h, msg(M_IP_MTU));
+        let mtu = u16::from(info.get(18).copied().unwrap_or(0)) * 256
+            + u16::from(info.get(19).copied().unwrap_or(0));
+        put_u64(c.h, u64::from(mtu));
+        con_write(c.h, msg(M_SP));
+        con_write(c.h, msg(M_IP_STATE));
+        let link = u16::from(info.get(20).copied().unwrap_or(0)) * 256
+            + u16::from(info.get(21).copied().unwrap_or(0));
+        if link != 0 { con_write(c.h, msg(M_IP_UP)); } else { con_write(c.h, msg(M_IP_DOWN)); }
+        con_write(c.h, msg(M_NL));
+        return true;
+    }
+    // addr
+    con_write(c.h, msg(M_IP_ADDR));
+    put_dotted(c.h, info.get(6..10));
+    con_write(c.h, msg(M_SP));
+    con_write(c.h, msg(M_IP_GW));
+    put_dotted(c.h, info.get(10..14));
+    con_write(c.h, msg(M_SP));
+    con_write(c.h, msg(M_IP_DNS));
+    put_dotted(c.h, info.get(14..18));
+    con_write(c.h, msg(M_NL));
+    true
+}
+
+/// æ `a.b.c.d`ï¼çææ¯æ®µéå¤çç¹å·ï¼ã
+fn put_dotted(h: rt::Handle, src: Option<&[u8]>) {
+    let mut k = 0usize;
+    while k < 4 {
+        let b = src.and_then(|s| s.get(k)).copied().unwrap_or(0);
+        put_u64(h, u64::from(b));
+        if k + 1 < 4 { con_write(h, msg(M_PING_DOT)); }
+        k += 1;
+    }
+}
+
+/// ä¸å­èåå­è¿å¶ï¼**åºå®ä¸¤ä½**ï¼MAC çæ¾ç¤ºå½¢ç¶ï¼ã
+fn put_hex8(h: rt::Handle, v: u8) {
+    let hi = (v >> 4) & 0x0F;
+    let lo = v & 0x0F;
+    put_hex1(h, hi);
+    put_hex1(h, lo);
+}
+
+fn put_hex1(h: rt::Handle, d: u8) {
+    let ch = if d < 10 { b'0' + d } else { b'a' + (d - 10) };
+    con_write(h, core::slice::from_ref(&ch));
+}
+
 /// 分派一条已解析的命令。返回 false = 退出 shell。
 ///
 /// 每个分支都是"名字 immediate 比较 → 直接调用处理器"，不写 `match lookup()`：
@@ -891,6 +984,9 @@ pub fn dispatch(h: ConsoleHandle, si_va: u64, p: &Parsed) -> bool {
     }
     if streq(p.cmd, &CMD_PING) {
         return cmd_ping(&c);
+    }
+    if streq(p.cmd, &CMD_IP) {
+        return cmd_ip(&c);
     }
     if streq(p.cmd, &CMD_ABI) {
         return cmd_abi(&c);

@@ -7894,6 +7894,36 @@ def check_gpt(log: str) -> list[str]:
     return False
 
 
+def _ip_rows(log: str) -> bool:
+    """`ip link` / `ip addr` çæ¾ç¤ºå±å¤æ®ï¼ADR-144ï¼ã
+
+    ä¸¤æ¡å½ä»¤åèªè¦ä¸è¡ä¸¥æ ¼å½¢ç¶ï¼
+      `link mac <6 ç» 2 ä½åå­è¿å¶ç¨ : åé> mtu=<digits> state=(up|down)`
+      `addr <a.b.c.d> gw <a.b.c.d> dns <a.b.c.d>`
+    ä¸ä¾èµå·ä½æ°å¼ï¼MAC/mtu/IP é½æ¯ç¯å¢çäºå®ï¼ã
+    """
+    import re
+    lines = log.split("\n")
+    link_ok = False
+    addr_ok = False
+    for k, ln in enumerate(lines):
+        if ln.strip() == "ip link":
+            for j in range(k + 1, min(k + 4, len(lines))):
+                s = lines[j].strip()
+                if re.match(r"link mac ([0-9a-f]{2}:){5}[0-9a-f]{2} mtu=\d+ state=(up|down)$", s):
+                    link_ok = True
+                    break
+        if ln.strip() == "ip addr":
+            for j in range(k + 1, min(k + 4, len(lines))):
+                s = lines[j].strip()
+                octet = r"(?:25[0-5]|2[0-4]\d|1?\d?\d)"
+                pat = r"addr " + octet + r"(?:\." + octet + r"){3} gw " + octet + r"(?:\." + octet + r"){3} dns " + octet + r"(?:\." + octet + r"){3}$"
+                if re.match(pat, s):
+                    addr_ok = True
+                    break
+    return link_ok and addr_ok
+
+
 def _ping_row(log: str) -> bool:
     """`ping 10.0.2.2` ççå¾è¿å¤æ®ï¼ADR-143ï¼ã
 
@@ -8755,6 +8785,10 @@ def do_test(timeout: int) -> int:
         # å¤æ®å½¢ç¶ï¼åæ¾ä¹åå¿é¡»åºç°ä¸è¡ `from 10.0.2.2: seq=æ°`
         # ï¼ç ICMP å¾è¿çè¯»æ°ï¼ï¼usage/è¶æ¶é½ä¸ç®éã
         _ping_row(ashlog),
+        # ip link / ip addrï¼ADR-144ï¼ï¼35 å·è¯»æ°çæ¾ç¤ºå±
+        # å¤æ®å½¢ç¶ï¼`link mac <MAC> mtu=<æ°> state=<up|down>` ä¸
+        # `addr <a.b.c.d> gw <a.b.c.d> dns <a.b.c.d>`ââä¸ä¾èµå·ä½æ°å¼ã
+        _ip_rows(ashlog),
     ))
     _tot = EXEC_TOTAL_RE.search(ashlog)
     if not _tot or int(_tot.group(1)) < 1 or int(_tot.group(2)) != 0:
