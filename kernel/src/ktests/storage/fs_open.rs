@@ -720,6 +720,16 @@ fn t_fs_open_ring3() -> bool {
         crate::log_fatal!("fs-open-ring3: AHCI 未认领");
         return false;
     }
+    // 用例自足（AGENTS.md）：`.ktests` 顺序由链接器决定，本用例可能排在时钟标定之前。
+    // `apic::get_or_init` 只在 `calibrate_clock_once()` 里调，而那是惰性的 ⇒
+    // 不补这一下，`timer_start()` 会因 `NoLapic` 失败、被吞掉、定时器起不来。
+    //
+    // **必须放在装载之前**（实测教训）：放到 spawn 之后会夹在"探针已跑完"与
+    // "读信箱"之间，而标定内部的 `mm::map_device` 动页表，把容器那页的映射弄没
+    // ⇒ 之后 3292 次 `读用户页被拒`、29 格全 0。
+    if crate::clock::current().is_none() {
+        crate::calibrate_clock_once();
+    }
     let loaded = match user::load(FILEPROBE_ELF) {
         Ok(l) => l,
         Err(e) => {
@@ -747,9 +757,15 @@ fn t_fs_open_ring3() -> bool {
         return false;
     }
     let tick_in = crate::arch::x86_64::apic::ticks();
-    let timer_was_running =
-        crate::arch::x86_64::apic::wait_ticks(tick_in, 2, crate::clock::window_cycles(2)).ticks >= 2;
-    crate::arch::x86_64::apic::timer_start().ok();
+    let probe = crate::arch::x86_64::apic::wait_ticks(
+        tick_in, 2, crate::clock::window_cycles(2));
+    let timer_was_running = probe.ticks >= 2;
+    if !timer_was_running {
+        // 失败要看得见：`Err` 与「起来了但 tick 不进来」在日志里必须分得开。
+        if let Err(e) = crate::arch::x86_64::apic::timer_start() {
+            crate::log_warn!("fs-open-ring3: timer_start 失败 {:?}（tick 不会来）", e);
+        }
+    }
     let mut rounds = 0u64;
     let mut in_window = true;
     let mut box_ = [0u64; FP_CELLS];

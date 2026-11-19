@@ -16656,3 +16656,81 @@ testing/       QEMU硬件测试规范 / 真机测试规范 / 硬件兼容性矩�
   分属不同模块，是独立的调查工作。本轮只按要求"修 trace-switch + 跑整链"。
 - 12 条里 `崩溃记录跨重启读回` / `崩溃现场来自真异常` 报 `SEQ-BROKEN`，
   说明**多跑序列**没对上——这类要看那两跑的日志配对，不能只看单跑。
+
+
+## 442. 修 `t_fs_open_ring3`：两处叠加的缺失（2026-11-20）
+
+**起因**：§441 的 13 条不符合里，`fs-open-ring3` 一个根因牵动 5 行
+（FS-03 两行、FS 写方向、A3 shell、A3 长名）。按要求先修这一条。
+
+### 现场（都是实测读数，不是推断）
+
+修之前：`ktests total=104 passed=102 failed=2`，
+`fs-open-ring3: 不成立 done 哨兵（窗口内没等到）` + 29 格全 0，
+另有 **3292 条** `abi: 读用户页被拒 va=0x1000c20e0 —— 页表链没走完`。
+
+### 两处缺失
+
+**① `timer_start()` 失败被 `.ok()` 吞掉**
+
+诊断读数（把 `.ok()` 换成打印 `err`）：
+
+    fs-open-ring3: 定时器 was_running=false probe=0 err=Some(NoLapic) init=false
+
+`NoLapic` + `init=false` ⇒ 调 `timer_start()` 时 **APIC 还没初始化**。
+根因：`apic::get_or_init` 只在 `calibrate_clock_once()` 里调（`main.rs:3394`），
+而那是**惰性**的；`t_fs_open_ring3` 在 `.ktests` 段里排在时钟标定之前
+（实测它是 `0xb2`，`clock:` 那行原本在 `0x1b5`）。于是定时器没起来、tick 恒 0、
+第一段窗口等 640 ms 空转。
+
+**这不是新设计，是既有纪律漏了一处**：`mm.rs:817` 与 `elf.rs:1004` 早就有
+`if clock::current().is_none() { calibrate_clock_once(); }` 这个形状，
+`fs_open.rs` 缺了那一行（AGENTS.md：用例必须自足）。
+
+**② `USER_KSTACK_PAGES` 在后续重构里丢了**
+
+`spawn_user` 用 `STACK_PAGES = 4`（16 KiB）建用户任务内核栈，
+而 BACKLOG §335 记着 ring3 打 22 号那条链（trap 帧 → `syscall_dispatch` →
+`sys_file_open` → `fs_open::open` → `vfs_ro::lookup`）**实测用到 16,760 字节**，
+越过 4 页。§335 当年为此加了 `sched::USER_KSTACK_PAGES`（fs-open 档 8 页），
+但那个常量现在**搜不到了** —— 而 `fs_open.rs:139` 的注释还在引用它
+（**注释与代码分家**）。
+
+### 修的过程中自己引入过一次回归（记下来）
+
+第一刀把 `calibrate_clock_once()` 放在 `spawn_user` **之后**，结果：
+
+    0xb2  装载 eff=Some(user,writable,levels=4)      ← 映射好
+    0xb3  时序 spawn后 read_at=Some(0)                ← 读得通
+    0xb4..0xd5  大量 ahci 取证行                       ← 探针真的在跑
+    0xd6  clock: 6 ticks ...                          ← 标定在这里触发
+    0xd8  abi: 读用户页被拒 ...                       ← 从这一刻起读不到（3292 条）
+
+**标定内部的 `mm::map_device` 动页表，把容器那页的映射弄没了。**
+修法：把标定挪到**装载之前**。挪完之后 `读用户页被拒` 从 3292 降到 **0**。
+
+### 读数（修完）
+
+| 项 | 修前 | 修后 |
+|---|---|---|
+| `ktests total` | 104 / passed 102 / failed **2** | 104 / passed **103** / failed **1** |
+| `fs-open-ring3: 取证` | 29 格全 0 | `读回=100 首8=0xe0c1a283… 字节和=12838 尾和=6257 stat大小=100 首簇=3 条目=3 名字和=1292 大小和=100 多级读回=64 多级首簇=65600` |
+| `abi: 读用户页被拒` | **3292** 条 | **0** 条 |
+| `check` | 18/18 | 18/18 |
+| 特性档 | 73/73 | 73/73 |
+
+**剩余的唯一失败是 `t_proc_job_wait`**（`proc: 判据不成立 … baseline=false`），
+与 FS-03 无关，属 §441 那 12 条既有失败之一，**未修**。
+
+### 改动范围
+
+- `kernel/src/ktests/storage/fs_open.rs`：标定前置 + `timer_start` 失败不再吞
+- `kernel/src/sched/mod.rs`：恢复 `USER_KSTACK_PAGES`（fs-open 8 页 / 其余 4 页）
+  并接进 `spawn_user`
+
+### 这一条最该记的
+
+**两处缺失都是"以前修过、后来丢了"**：`calibrate_clock_once` 在别处有、
+这里没有；`USER_KSTACK_PAGES` 有过、被重构吃掉而注释还在引用。
+所以这类红的正确查法不是"读代码猜逻辑"，是**先找出它是从哪一轮开始红的**
+（`git log` 该文件 + BACKLOG 里同一用例的历史读数），再对比那一轮改了什么。

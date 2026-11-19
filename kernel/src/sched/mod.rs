@@ -37,6 +37,25 @@ const _: () = assert!(MAX_TASKS <= crate::mm::MAX_TASKS_SUPPORTED);
 /// 全系统可登记的任务数（跨所有 CPU）。用例读 `WORK[i]` / `state_of(i)` 时用的是这个空间里的全局下标。
 pub const MAX_TASKS_TOTAL: usize = MAX_TASKS * crate::arch::x86_64::cpu::MAX_CPUS;
 const STACK_PAGES: usize = 4;
+/// 用户任务的**内核栈**页数（ring3 → ring0 陷入时用那条）。
+///
+/// 与 `STACK_PAGES` 分开是有实测依据的：`fs-open` 档的 ring3 打 22 号那条链
+/// （trap 帧 → `syscall_dispatch` → `sys_file_open` → `fs_open::open` →
+/// `vfs_ro::lookup`）用到 **16,760 字节**，越过 4 页（16,384）——形状是
+/// 「挂载读回 3 个扇区之后，在 `lookup` 的序言里 `#DF(8)` 死循环」。
+///
+/// **不能把 `STACK_PAGES` 整体改成 8**：那是内核任务的栈，改了会让
+/// `t_q2_workload_slots` 的「回基线」从相等变成少一格（BACKLOG §335 实测）。
+/// 所以作用域只到「ring3 陷入用的那条栈」。
+///
+/// 真该修的是那条链的峰值（把 VFS 那几帧压回去），页数只是先把产品路径跑通
+/// —— 记为欠账，见 BACKLOG §335 的欠账 ①。
+#[cfg(feature = "fs-open")]
+pub const USER_KSTACK_PAGES: usize = 8;
+#[cfg(not(feature = "fs-open"))]
+pub const USER_KSTACK_PAGES: usize = STACK_PAGES;
+/// 用户任务内核栈的 VA 跨度（含栈底 guard 页）。
+const USER_STACK_VA_PAGES: usize = USER_KSTACK_PAGES + 1;
 /// +1 = 栈底 guard 页（永不映射）
 const STACK_VA_PAGES: usize = STACK_PAGES + 1;
 
@@ -1536,12 +1555,12 @@ fn spawn_inner(entry: fn() -> !, resident: bool) -> Result<usize, mm::MmError> {
 /// **既有调用点全部传 0** ⇒ 行为逐字不变（`t_elf_load_run` 那一族本来就不看 rdi）。
 pub fn spawn_user(entry_rip: u64, user_stack_top: u64, arg: u64, mut res: OwnedSet) -> Result<usize, mm::MmError> {
     let cpu = crate::arch::x86_64::cpu::self_slot();
-    let win = mm::alloc_va_range(STACK_VA_PAGES).ok_or(mm::MmError::OutOfMemory)?;
+    let win = mm::alloc_va_range(USER_STACK_VA_PAGES).ok_or(mm::MmError::OutOfMemory)?;
     let map_lo = win.0 + mm::PAGE as u64;
-    let frames = mm::phys_alloc(STACK_PAGES.trailing_zeros() as u8, MOD_STACK_KUSER)?;
+    let frames = mm::phys_alloc(USER_KSTACK_PAGES.trailing_zeros() as u8, MOD_STACK_KUSER)?;
     let m = mm::map(VirtAddr(map_lo), frames, PageFlags::RW)?;
     res.push(m)?;
-    let kstack_hi = win.0 + (STACK_VA_PAGES as u64) * mm::PAGE as u64;
+    let kstack_hi = win.0 + (USER_STACK_VA_PAGES as u64) * mm::PAGE as u64;
 
     let mut s = rq(cpu);
     let slot = (0..MAX_TASKS).find(|&i| s.tasks[i].state == TaskState::Free).ok_or(mm::MmError::Unsupported)?;
