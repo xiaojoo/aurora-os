@@ -433,8 +433,17 @@ VBLK_FEATURES = {"virtio-blk", "virtio-msix-probe", "virtio-two-probe"}
 # ADR-112：第二台 virtio-blk。容量**故意不同**（96 MiB vs 64 MiB）——"两台都在"不能只看台数，
 # 每一台自报的容量要与宿主机 `qemu-img info` 各自那份文件对上；图案也不同，环串了会立刻露。
 VBLK2 = BUILD / "virtio-disk2.qcow2"
+NVME_IMG = BUILD / "nvme.img"
+NVME_MIB = 64
+# 图案与 VBLK(0x5C) / VBLK2(0x3C) 都不撞：这样「读到的字节是不是 NVMe 那块盘的」
+# 能一眼分辨（判据的读回对账靠它）。
+NVME_PATTERN = 0x7E
+
 VBLK2_MIB = 96
 VBLK2_PATTERN = 0x3C
+NVME_FEATURES = {"nvme"}
+# NVMe 单独一块盘：命名空间大小由 `-device nvme` 的 drive= 决定，
+# 与 AHCI/virtio 的口/槽无关。复用会让「NVMe 容量对账」与别的盘混在一起。
 VBLK2_FEATURES = {"virtio-two-probe"}
 # W4 S1（ADR-078 决策 7）：GPT 解析用例的夹具盘。**为什么负样本不改引导盘**（实测出来的）：
 # OVMF/EDK2 启动时会**用备份 GPT 把主表修回原值**（数组首字节 0x29 改下去、跑完读回 0x28），
@@ -677,6 +686,11 @@ def make_vblk() -> list[str]:
 
 def make_vblk2() -> list[str]:
     return _make_vblk(VBLK2, VBLK2_MIB, VBLK2_PATTERN, "virtio2")
+
+def make_nvme() -> list[str]:
+    """NVMe 命名空间的镜像。形状与 virtio 那两块盘一样（qcow2 + 已知图案），
+    所以「读回对账」的判据可以直接复用。"""
+    return _make_vblk(NVME_IMG, NVME_MIB, NVME_PATTERN, "nvme")
 
 
 def make_gpt_fixture() -> list[str]:
@@ -3838,6 +3852,12 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
         bad = make_vblk2()
         if bad:
             sys.exit("第二块 virtio 盘造不出来：" + " / ".join(bad))
+    if NVME_FEATURES & set(features):
+        # 同一条规矩：夹具跟着「要挂这块盘」走。NVMe 的**容量**也要对账
+        # （宿主机知道文件多大，内核 Identify Namespace 读到的 NSZE × LBA 必须等于它）。
+        bad = make_nvme()
+        if bad:
+            sys.exit("NVMe 盘造不出来：" + " / ".join(bad))
     if FAT_FEATURES & set(features):
         # L3-C①：两块只读 FAT32 卷。夹具跟着"要挂这两块盘"走（与前两块的规矩同一条），
         # 而且这里**必须**在解压之前先核指纹：内核那一批写死的期望数全是照着这两个字节串量的。
@@ -3953,6 +3973,14 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
         cmd += [
             "-drive", f"if=none,id=vblk1,format=qcow2,file={VBLK2}",
             "-device", "virtio-blk-pci,drive=vblk1",
+        ]
+    if NVME_FEATURES & set(features):
+        # `serial=` 是判据：Identify Controller 读回的型号/序列号要与它对账。
+        # 这是最便宜的第一条判据——证明「我们读到了这台设备」，
+        # 不依赖任何后续路径（照 e1000e 的 MAC 对账形状）。
+        cmd += [
+            "-drive", f"if=none,id=nvme0,format=qcow2,file={NVME_IMG}",
+            "-device", "nvme,drive=nvme0,serial=AURORANVME",
         ]
     # 一次性实验用的附加参数（例如 `-device intel-iommu,intremap=on` 去真正解析 DMAR）。
     # 走环境变量而不是加一堆子命令开关：这类实验今天要做、明天可能就废，不该进判定链的默认路径。

@@ -281,6 +281,9 @@ impl DriverCtx {
         if len == 0 || len % PAGE != 0 {
             return Err(DriverError::Denied("长度必须是整页的非零倍数"));
         }
+        // **页数必须是 2 的幂**：`ilog2()` 向下取整，传 5 页会静默变成 4 页。
+        // 实测教训（ADR-169）：NVMe 驱动第一版传 5 页，第 5 页的偏移当场 #PF，
+        // 而错误现场只说「写不存在的页」，看不出是这里截断的。
         let order = (len / PAGE).ilog2();
         let order = u8::try_from(order).map_err(|_| DriverError::Denied("跨度过大"))?;
         let frames = mm::phys_alloc(order, self.owner).map_err(|_| DriverError::ResourceExhausted)?;
@@ -537,3 +540,7 @@ pub fn mmio_gen_at(slot: u16) -> Option<u32> {
 // ahci / virtio 本来就与 driver 同属一个逻辑模块，所以环 A 与棘轮基线一格不动。
 pub(crate) mod ahci;
 pub(crate) mod virtio;
+/// NVMe（ADR-169）。挂在 `nvme` 特性下：新驱动先按特性落地、判据跑过再谈常开
+/// （AHCI/virtio 都是这个顺序）。
+#[cfg(feature = "nvme")]
+pub(crate) mod nvme;

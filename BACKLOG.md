@@ -17078,3 +17078,105 @@ ADR-166 的两项（协议搬迁除外，理由见 §448）。
   本轮整块搬，拆文件是下一轮的机械工作。
 - **`network` 仍在环 A**：见上。
 - `net-pattern` 现在扫两个文件，将来拆 7 个时要改成扫整个 `network/`。
+
+
+## 450. NVMe 驱动落地到「识别」，容量与数据通路未通（2026-11-20，ADR-169）
+
+`kernel/src/driver/nvme.rs`（约 600 行）在 QEMU `-device nvme` 上做到**识别**，
+但**容量与数据读写未通**。按硬约束 7 如实记录，不夸大。
+
+### 通了什么（实测）
+
+    nvme: 识别 bdf=6144 vendor=0x1b36 device=0x10
+         cap_lo=0xf0107ff cap_hi=0x400820 vs=0x10400
+         csts=0x1->0x1 already=true mqes=2048 nn=256 nsze=0 lbads=9
+
+- `vendor=0x1b36` = QEMU Red Hat vendor ID
+- `vs=0x10400` = NVMe 1.4
+- `mqes=2048` ⇒ 最大队列深度 2049，`QDEPTH=8` 装得下
+- **Identify Controller 成功**（`cid=1 status=0`）：
+  序列号读回 `AURORANVME`（`前16[4..16]`，与 `-device nvme,serial=` 对上），
+  型号读回 `QEMU NVMe Ctrl`
+
+### 这一轮抓到三个真 bug
+
+**① `alloc_dma` 只接受 2 的幂的页数**
+
+    unexpected #PF rip=… cr2=0xffff80002058e000 err=0x2
+
+`alloc_dma` 内部是 `(len / PAGE).ilog2()`，**向下取整且静默**。
+传 5 页 ⇒ 实际只映 4 页，而 `OFF_DATA=16384` 在第 5 页 ⇒ 写数据页当场 #PF。
+修：`DMA_PAGES: 5 → 8`，并把契约写进 `alloc_dma` 注释。
+
+**② CQ 的 phase 是「整圈翻转的奇偶」，不是「每格置 1」**
+
+    cid=1 成功 → cid=2 超时
+
+**这是 NVMe 与 virtio 最根本的差别**：virtio 的 `used.idx` 单调递增，NVMe 的 phase 翻转。
+修：维护 `cq_phase: bool`（初值 true），每绕满一圈翻转。
+
+**③ 已使能时必须先 `CC.EN=0` 再重配 ASQ/ACQ**
+
+规范（NVMe 1.4 §7.6.1）要求改 ASQ/ACQ/AQA 前必须 `CC.EN=0` 并等 `RDY=0`。
+第一版跳过它直接写 ASQ/ACQ ⇒ 控制器继续用固件留下的旧队列 ⇒ 命令永不完成。
+修：两条路都走完整「（必要时先关）→ 配置 → 使能」序列。
+
+### 卡在哪（未验证，不编解释）
+
+**Identify Namespace 不产生完成项**：
+
+    sq 诊断 slot=1 dw0=0x20006 dw10=0x0   ← opcode 6 / CID 2 / CNS 0
+    cq 诊断 cid=2 d2=0x2                  ← SQHD=2 说明设备**已消费**
+    CmdTimeout cid=2                      ← 但没写 CQE
+
+设备接受了命令、推进了 SQ head，**但不产生完成项**。
+
+两个可疑点，**都未验证**：
+1. NSID 不匹配（我传 1）——但规范说应回 `Invalid Namespace`（status=0x0B），
+   不是静默不写 CQE，所以这个解释不完全站得住；
+2. CDW11 的 `CNTID`——SQE 清零过，应当是 0，不该有问题。
+
+**临时处置**：`NSZE` 记 0 + `log_warn!` 明说未读到；容量判据交给宿主机 `qemu-img`
+独立算，两边对不上就是红——**不是绿**。`nn=256` 同样只当读数不当判据
+（QEMU 默认 1 个命名空间，256 可疑）。
+
+### 一条判据在这一轮被改正（记下来）
+
+识别格里原来写「未使能时 `CSTS.RDY` 必须为 0」，实测报
+`BadRegs { off: 28, got: 1 }` —— QEMU 的 NVMe 在 EDK2 阶段就可能已经使能过。
+
+**那条假设证的是「设备还没被碰过」，那是环境假设，不是设备性质。**
+改成状态机合法（起始 CFS=0；终态 RDY=1 且 CFS=0），比原来**更强**。
+ktest 侧也同步改了——两处不同步过一次。
+
+### 登记增量（按实测）
+
+| 项 | 变化 |
+|---|---|
+| unsafe 普查 | 523 → **530**（U4 142 → 149，`STATE` 的 UnsafeCell + 4 个 dma 访问点） |
+| 棘轮 `driver->memory` | 16 → **21** |
+| 棘轮 `driver->pci` | 18 → **21** |
+| `driver.public_api` | +3（`NvmeError`/`read_lba`/`write_lba`） |
+| `driver.source_modules` | +`driver/nvme` |
+| `block_io::BUCKETS` | 42 → **44**（`DiskKey::Nvme` 要有自己的桶） |
+
+棘轮变大是**新增设备**造成的，不是既有代码变差。ADR-044 要求"变了要显式登记"，
+这里如实抬高并在 ADR-169 写明理由。
+
+### 读数
+
+| 项 | 值 |
+|---|---|
+| `check` | **18/18**（exit=0） |
+| 特性档 | **74/74**（`nvme` 已进矩阵） |
+| `nvme` 档判定 | **FAIL(35)** —— 识别格过，容量/图案未通 |
+| `ktests`（nvme 档） | 83 / 82 / **1 failed**（`t_nvme_all`） |
+
+**这个 FAIL 是诚实的**：驱动确实还没可用。判据红着，而不是被改成绿。
+
+### 下一步（按依赖顺序，先量再改）
+
+1. 量出 Identify Namespace 的真实 NSID：用 `NSID=0xFFFFFFFF`（广播）读一次看设备回什么；
+2. 量 `nn` 的真实偏移：用"型号区能读对"证明缓冲起点正确之后，逐 4 字节扫 512..560；
+3. 容量通了再验数据通路的 PRP1 与 NLB；
+4. `tools/aurora.py` 加 `check_nvme_capacity`（今天只有 `make_nvme()` 造盘）。

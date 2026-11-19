@@ -15,6 +15,7 @@ path = "src/main.rs"
 workspace = true
 
 [features]
+nvme = []
 default = []
 # 负样本：让 ktest 里的一条断言故意不成立，用于证明判定契约的尺子能分辨
 # （手册 §12.3 R19）。正常运行时不得带这个 feature 合入。

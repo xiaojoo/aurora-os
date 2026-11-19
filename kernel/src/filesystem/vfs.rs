@@ -129,6 +129,8 @@ pub enum DiskKey {
     Unknown,
     Ahci(u8),
     Virtio(u8),
+    /// NVMe（ADR-169）。槽号恒 0：今天只支持单台，表化留给需要时。
+    Nvme(u8),
     Mem,
 }
 
@@ -262,6 +264,57 @@ fn virtio_block_err(e: virtio::VirtioError) -> BlockError {
         V::BadLen(_) => BlockError::Refused,
         // 块路径上收到网卡的解析错，说明调用方向错了——不当"超时"也不当"没设备"。
         V::NotV4 { .. } => BlockError::DeviceError,
+    }
+}
+
+/// NVMe 的 `Block` 适配器（ADR-169）。
+///
+/// 形状与 `AhciDisk`/`VirtioDisk` 一样**逐扇区**：`block_io` 本来就是逐扇区提交
+/// （ADR-110 决策 1），所以「一次一页 PRP」与既有契约天然对齐，不需要 PRP List。
+///
+/// 死线、取消、半途读数全部由 `block_io` 负责，这一层不重复实现——
+/// ADR-110 存在的理由就是「两份算术会漂」。
+#[cfg(feature = "nvme")]
+#[derive(Debug, Clone, Copy)]
+pub struct NvmeDisk;
+
+#[cfg(feature = "nvme")]
+impl Block for NvmeDisk {
+    fn read_sectors(&self, lba: u64, dst: &mut [u8]) -> Result<(), BlockError> {
+        if dst.is_empty() || dst.len() % SECTOR_BYTES != 0 {
+            return Err(BlockError::Refused);
+        }
+        for (i, chunk) in dst.chunks_mut(SECTOR_BYTES).enumerate() {
+            crate::nvme::read_lba(lba + i as u64, chunk).map_err(nvme_block_err)?;
+        }
+        Ok(())
+    }
+
+    fn write_sectors(&self, lba: u64, src: &[u8]) -> Result<(), BlockError> {
+        if src.is_empty() || src.len() % SECTOR_BYTES != 0 {
+            return Err(BlockError::Refused);
+        }
+        for (i, chunk) in src.chunks(SECTOR_BYTES).enumerate() {
+            crate::nvme::write_lba(lba + i as u64, chunk).map_err(nvme_block_err)?;
+        }
+        Ok(())
+    }
+
+    fn disk_key(&self) -> DiskKey {
+        // 今天只支持单台，所以槽号恒 0。表化留给「多台 NVMe」那次。
+        DiskKey::Nvme(0)
+    }
+}
+
+/// `NvmeError` → `BlockError`。**按成因分族，不合并成「设备坏了」一种**：
+/// 超时（`NotSettled`）与「这台设备不能用」（`NoDevice`）对调用方的处置完全不同。
+#[cfg(feature = "nvme")]
+fn nvme_block_err(e: crate::nvme::NvmeError) -> BlockError {
+    use crate::nvme::NvmeError as N;
+    match e {
+        N::NoDevice | N::BadRegs { .. } | N::ControllerFatal { .. } => BlockError::NoDevice,
+        N::NotReady { .. } | N::CmdTimeout { .. } => BlockError::NotSettled,
+        N::QueueTooDeep { .. } | N::Ctx(_) | N::CmdFailed { .. } => BlockError::DeviceError,
     }
 }
 

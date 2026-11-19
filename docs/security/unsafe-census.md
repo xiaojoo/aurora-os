@@ -3,17 +3,17 @@
 > 本文件与 `docs/security/unsafe-whitelist.toml` 同源：上面的登记表存「模块 × 类别 → 处数」，这里给出每一处**具体在哪一行、长什么样**，
 > 供「类别判错了要能翻到现场」时使用。数字由 `python tools/aurora.py check`（`check-unsafe`）双向对账。
 >
-> **2026-11-20（ADR-166 协议搬迁）**：`network/proto` 新增 U4 6 处、
-> `driver/virtio` U4 14 → 8。**总数守恒**（8 + 6 = 14），说明是纯移动。
+> **2026-11-20（ADR-169 NVMe）**：`driver/nvme` 新增 U4 7 处
+> （`STATE` 的 `UnsafeCell` 与 4 个 `dma_*` 访问点）。
 
-总计 523 处。U1 85 · U2 119 · U3 13 · U4 142 · U5 128 · U6 36
+总计 530 处。U1 85 · U2 119 · U3 13 · U4 149 · U5 128 · U6 36
 
 | 类别 | 含义 | 处数 |
 |---|---|---|
 | U1 | 架构入口与特殊寄存器 | 85 |
 | U2 | 页表、物理内存与 MMIO | 119 |
 | U3 | DMA 与设备共享内存 | 13 |
-| U4 | 并发共享状态与 UnsafeCell | 142 |
+| U4 | 并发共享状态与 UnsafeCell | 149 |
 | U5 | 用户指针与地址空间访问 | 128 |
 | U6 | 诊断路径的有限现场读取 | 36 |
 
@@ -208,20 +208,32 @@
 | U4 | 204 | `let t = unsafe { &mut *TABLE.0.get() }; let slot = t.free_mmio_slot().ok_or(DriverError::ResourceExhausted)?; ` |
 | U4 | 217 | `let e = unsafe { &*TABLE.0.get() }.mmio[i].as_ref().ok_or(DriverError::NoSuchHandle(h.slot))?; check_m(e, h.sl` |
 | U4 | 266 | `match unsafe { &mut *TABLE.0.get() }.mmio[i].take() { Some(_) => Ok(()), None => Err(DriverError::NoSuchHandle` |
-| U4 | 304 | `let t = unsafe { &mut *TABLE.0.get() }; let slot = t.free_dma_slot().ok_or(DriverError::ResourceExhausted)?; l` |
-| U4 | 317 | `let e = unsafe { &*TABLE.0.get() }.dma[i].as_ref().ok_or(DriverError::NoSuchHandle(h.slot))?; check_d(e, h.slo` |
-| U3 | 345 | `Ok(unsafe { core::ptr::read_volatile(at as *const u8) }) } ` |
-| U3 | 354 | `Ok(unsafe { core::ptr::read_volatile(at as *const u32) }) } ` |
-| U3 | 365 | `Ok(unsafe { core::ptr::read_volatile(at as *const u16) }) } ` |
-| U3 | 371 | `Ok(unsafe { core::ptr::write_volatile(at as *mut u8, v) }) } ` |
-| U3 | 381 | `Ok(unsafe { core::ptr::write_volatile(at as *mut u16, v) }) } ` |
-| U3 | 390 | `Ok(unsafe { core::ptr::write_volatile(at as *mut u32, v) }) } ` |
-| U3 | 404 | `unsafe { core::ptr::write_volatile(at as *mut u8, *b) }; } Ok(())` |
-| U3 | 412 | `Ok(unsafe { core::ptr::write_bytes(at as *mut u8, pat, n) }) } ` |
-| U3 | 421 | `*o = unsafe { core::ptr::read_volatile((at + i as u64) as *const u8) }; } Ok(())` |
-| U4 | 434 | `match unsafe { &mut *TABLE.0.get() }.dma[i].take() { Some(_) => Ok(()), None => Err(DriverError::NoSuchHandle(` |
-| U4 | 499 | `let t = unsafe { &*TABLE.0.get() }; (t.mmio.iter().filter(\|e\| e.is_some()).count(), t.dma.iter().filter(\|e\` |
-| U4 | 531 | `unsafe { &*TABLE.0.get() }.mmio[usize::from(slot)].as_ref().map(\|e\| e.gen) } ` |
+| U4 | 307 | `let t = unsafe { &mut *TABLE.0.get() }; let slot = t.free_dma_slot().ok_or(DriverError::ResourceExhausted)?; l` |
+| U4 | 320 | `let e = unsafe { &*TABLE.0.get() }.dma[i].as_ref().ok_or(DriverError::NoSuchHandle(h.slot))?; check_d(e, h.slo` |
+| U3 | 348 | `Ok(unsafe { core::ptr::read_volatile(at as *const u8) }) } ` |
+| U3 | 357 | `Ok(unsafe { core::ptr::read_volatile(at as *const u32) }) } ` |
+| U3 | 368 | `Ok(unsafe { core::ptr::read_volatile(at as *const u16) }) } ` |
+| U3 | 374 | `Ok(unsafe { core::ptr::write_volatile(at as *mut u8, v) }) } ` |
+| U3 | 384 | `Ok(unsafe { core::ptr::write_volatile(at as *mut u16, v) }) } ` |
+| U3 | 393 | `Ok(unsafe { core::ptr::write_volatile(at as *mut u32, v) }) } ` |
+| U3 | 407 | `unsafe { core::ptr::write_volatile(at as *mut u8, *b) }; } Ok(())` |
+| U3 | 415 | `Ok(unsafe { core::ptr::write_bytes(at as *mut u8, pat, n) }) } ` |
+| U3 | 424 | `*o = unsafe { core::ptr::read_volatile((at + i as u64) as *const u8) }; } Ok(())` |
+| U4 | 437 | `match unsafe { &mut *TABLE.0.get() }.dma[i].take() { Some(_) => Ok(()), None => Err(DriverError::NoSuchHandle(` |
+| U4 | 502 | `let t = unsafe { &*TABLE.0.get() }; (t.mmio.iter().filter(\|e\| e.is_some()).count(), t.dma.iter().filter(\|e\` |
+| U4 | 534 | `unsafe { &*TABLE.0.get() }.mmio[usize::from(slot)].as_ref().map(\|e\| e.gen) } ` |
+
+### driver/nvme
+
+| 类别 | 行 | 形状 |
+|---|---|---|
+| U4 | 176 | `unsafe impl Sync for Cell {}  struct State {` |
+| U4 | 208 | `unsafe { (*STATE.0.get()).as_ref().map(\|s\| s.reading) } } ` |
+| U4 | 214 | `unsafe { (*STATE.0.get()).as_ref().map(\|s\| s.nsze) } } ` |
+| U4 | 220 | `unsafe { (*STATE.0.get()).as_ref().map(\|s\| s.lba_bytes) } } ` |
+| U4 | 244 | `if unsafe { (*STATE.0.get()).is_some() } { // 幂等：已经初始化过就直接回读数 return Ok(reading().unwrap_or_else(\|\| unreacha` |
+| U4 | 425 | `unsafe { *STATE.0.get() = Some(st) }; Ok(out) }` |
+| U4 | 526 | `let st = unsafe { (*STATE.0.get()).as_mut() }.ok_or(NvmeError::NoDevice)?; let n = buf.len().min(st.lba_bytes)` |
 
 ### driver/virtio
 
@@ -230,11 +242,11 @@
 | U4 | 459 | `unsafe impl Sync for DevCell {}  impl DevCell {` |
 | U4 | 476 | `unsafe { (*slot.0.get()).as_ref().map(f).ok_or(VirtioError::NoDevice)? } } ` |
 | U4 | 633 | `unsafe { *DEVS[slot].0.get() = Some(bound) }; Ok(()) }` |
-| U4 | 936 | `unsafe impl Sync for NetCell {} static NET_DEV: NetCell = NetCell(core::cell::UnsafeCell::new(None)); static N` |
-| U4 | 942 | `unsafe { (*NET_DEV.0.get()).as_ref().map(f).ok_or(VirtioError::NoDevice)? } } ` |
-| U4 | 948 | `if unsafe { (*NET_DEV.0.get()).is_some() } { return Ok(()); }` |
-| U4 | 1047 | `unsafe { *NET_DEV.0.get() = Some(net) }; Ok(()) }` |
-| U4 | 1053 | `unsafe { (*NET_DEV.0.get()).as_ref().map(\|d\| NetInfo { bdf: d.bdf,` |
+| U4 | 928 | `unsafe impl Sync for NetCell {} static NET_DEV: NetCell = NetCell(core::cell::UnsafeCell::new(None)); static N` |
+| U4 | 934 | `unsafe { (*NET_DEV.0.get()).as_ref().map(f).ok_or(VirtioError::NoDevice)? } } ` |
+| U4 | 940 | `if unsafe { (*NET_DEV.0.get()).is_some() } { return Ok(()); }` |
+| U4 | 1039 | `unsafe { *NET_DEV.0.get() = Some(net) }; Ok(()) }` |
+| U4 | 1045 | `unsafe { (*NET_DEV.0.get()).as_ref().map(\|d\| NetInfo { bdf: d.bdf,` |
 
 ### filesystem/fs_open
 
@@ -350,11 +362,11 @@
 
 | 类别 | 行 | 形状 |
 |---|---|---|
-| U4 | 133 | `unsafe impl Sync for MpCell {} static MP_SNAP: MpCell = MpCell(UnsafeCell::new(MpSlot(None))); ` |
-| U4 | 139 | `unsafe { (*MP_SNAP.0.get()) = MpSlot(Some(m)) }; } ` |
-| U4 | 144 | `unsafe { (*MP_SNAP.0.get()).0 } } ` |
-| U4 | 714 | `unsafe impl Sync for BootPkgCell {} static BOOT_PKG_BUF: BootPkgCell = BootPkgCell(UnsafeCell::new([0u8; sign:` |
-| U4 | 757 | `let buf = unsafe { &mut *BOOT_PKG_BUF.0.get() }; let mut off = 0usize; let mut reads = 0usize;` |
+| U4 | 137 | `unsafe impl Sync for MpCell {} static MP_SNAP: MpCell = MpCell(UnsafeCell::new(MpSlot(None))); ` |
+| U4 | 143 | `unsafe { (*MP_SNAP.0.get()) = MpSlot(Some(m)) }; } ` |
+| U4 | 148 | `unsafe { (*MP_SNAP.0.get()).0 } } ` |
+| U4 | 718 | `unsafe impl Sync for BootPkgCell {} static BOOT_PKG_BUF: BootPkgCell = BootPkgCell(UnsafeCell::new([0u8; sign:` |
+| U4 | 761 | `let buf = unsafe { &mut *BOOT_PKG_BUF.0.get() }; let mut off = 0usize; let mut reads = 0usize;` |
 
 ### memory/heap
 
@@ -456,12 +468,12 @@
 
 | 类别 | 行 | 形状 |
 |---|---|---|
-| U4 | 261 | `unsafe impl Sync for ArpCell {} static ARP: ArpCell = ArpCell(core::cell::UnsafeCell::new(ArpTable { ips: [[0;` |
-| U4 | 271 | `let t = unsafe { &mut *ARP.0.get() }; let mut i = 0usize; while i < t.n {` |
-| U4 | 287 | `let t = unsafe { &mut *ARP.0.get() }; t.learns += 1; let mut i = 0usize;` |
-| U4 | 318 | `let t = unsafe { &*ARP.0.get() }; ArpStats { hits: t.hits, misses: t.misses, learns: t.learns, evicts: t.evict` |
-| U4 | 327 | `let t = unsafe { &*ARP.0.get() }; let mut n = 0usize; let mut i = cursor as usize;` |
-| U4 | 343 | `let t = unsafe { &*ARP.0.get() }; t.n as u32 }` |
+| U4 | 275 | `unsafe impl Sync for ArpCell {} static ARP: ArpCell = ArpCell(core::cell::UnsafeCell::new(ArpTable { ips: [[0;` |
+| U4 | 285 | `let t = unsafe { &mut *ARP.0.get() }; let mut i = 0usize; while i < t.n {` |
+| U4 | 301 | `let t = unsafe { &mut *ARP.0.get() }; t.learns += 1; let mut i = 0usize;` |
+| U4 | 332 | `let t = unsafe { &*ARP.0.get() }; ArpStats { hits: t.hits, misses: t.misses, learns: t.learns, evicts: t.evict` |
+| U4 | 341 | `let t = unsafe { &*ARP.0.get() }; let mut n = 0usize; let mut i = cursor as usize;` |
+| U4 | 357 | `let t = unsafe { &*ARP.0.get() }; t.n as u32 }` |
 
 ### sched/mod
 

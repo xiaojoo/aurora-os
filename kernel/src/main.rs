@@ -78,6 +78,10 @@ pub(crate) use display::frame;
 
 pub(crate) use driver::ahci;
 pub(crate) use driver::virtio;
+// NVMe 走 `crate::nvme::` 这条路径（`vfs.rs` 的适配器用它），
+// 所以单独重导出而不是挂到 `driver::` 下。
+#[cfg(feature = "nvme")]
+pub(crate) use driver::nvme;
 
 #[cfg(feature = "ps2-kbd")]
 pub(crate) use input::kbd;

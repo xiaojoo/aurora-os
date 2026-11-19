@@ -6,5 +6,9 @@
 mod driver;
 #[cfg(feature = "virtio-blk")]
 mod virtio;
+/// NVMe 判据（ADR-169）。与驱动本身同挂 `nvme` 特性：
+/// 特性不开时驱动不存在，判据也不该注册（否则链接期找不到符号）。
+#[cfg(feature = "nvme")]
+mod nvme;
 mod resource;
 mod watchdog;

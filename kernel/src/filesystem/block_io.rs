@@ -86,9 +86,16 @@ impl Bucket {
     }
 }
 
-/// 桶号：Unknown=0、Ahci(p)=1+p(0..31)、Virtio(i)=33+i(0..7)、Mem=41。
-/// 超出表宽的 key 折回 0——宁可少数一台，也不越界写静态。
-const BUCKETS: usize = 42;
+/// 桶号：Unknown=0、Ahci(p)=1+p(0..31)、Virtio(i)=33+i(0..7)、Mem=41、
+/// Nvme(s)=42+s(0..1)。
+///
+/// **2026-11-20（ADR-169）：42 → 44**，给 NVMe 两格。
+/// 只留 2 格是因为 NVMe 表化（多台）还没做——把 8 格留给一个不存在的场景
+/// 是过度设计；真要多台时再扩，扩桶表是纯机械改动。
+///
+/// 「超出表宽的 key 折回 0」那条规则是为了**不越界写静态**，
+/// 不是为了**让新设备默默消失**：新设备必须有自己的桶，否则它的请求计数永远读不到。
+const BUCKETS: usize = 44;
 static STATS: [Bucket; BUCKETS] = [const { Bucket::new() }; BUCKETS];
 
 fn bucket_of(k: DiskKey) -> &'static Bucket {
@@ -97,6 +104,8 @@ fn bucket_of(k: DiskKey) -> &'static Bucket {
         DiskKey::Ahci(p) => 1 + (p as usize & 31),
         DiskKey::Virtio(v) => 33 + (v as usize & 7),
         DiskKey::Mem => 41,
+        // 今天只支持单台 NVMe，所以 & 1 只是防越界；表化时把 1 改大。
+        DiskKey::Nvme(s) => 42 + (s as usize & 1),
     };
     &STATS[i]
 }

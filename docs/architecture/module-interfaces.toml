@@ -561,14 +561,15 @@ unsafe_scope = []
 module_id = "driver"
 owner = "driver"
 layer = "hal"
-source_modules = ["driver", "driver/ahci", "driver/virtio"]
+source_modules = ["driver", "driver/ahci", "driver/virtio", "driver/nvme"]
 public_api = [
   "driver::DriverCtx", "driver::DmaHandle", "driver::DriverError", "driver::IrqHandle",
   "driver::MmioHandle", "ahci::REG_CAP", "ahci::REG_GHC", "ahci::SECTOR", "ahci::boot_port",
   "ahci::fnv1a64", "ahci::init", "ahci::read_bytes", "ahci::write_bytes", "ahci::AhciError",
   "virtio::VirtioError", "virtio::read_block", "virtio::write_block", "virtio::read_block_at",
   "virtio::write_block_at", "virtio::bind_net", "virtio::send_raw", "virtio::receive",
-  "virtio::net_info", "ahci::State", "ahci::info", "ahci::state"
+  "virtio::net_info", "ahci::State", "ahci::info", "ahci::state", "nvme::NvmeError",
+  "nvme::read_lba", "nvme::write_lba"
 ]
 allowed_callers = ["diagnostics", "integration", "network", "sched", "storage"]
 dependencies = ["arch", "boot", "irq", "memory", "network", "pci", "time"]
@@ -1045,9 +1046,9 @@ known_scc = [
 "driver->arch" = 55
 "driver->boot" = 1
 "driver->irq" = 19
-"driver->memory" = 16
+"driver->memory" = 21
 "driver->network" = 2
-"driver->pci" = 18
+"driver->pci" = 21
 "driver->time" = 13
 "irq->arch" = 29
 "irq->memory" = 1
