@@ -16189,3 +16189,41 @@ display 允许 sched）；整链 **72 符合 + 2 条不符**（`virtio 两台并
 长链抖动不归因）。
 
 **D4 剩余**：`t_sdkdemo` 判据打通、SDK 的 ABI 文档、开发工具、包生态（D5 已跳过）。
+
+
+## 431. ADR-155：A3 第一片——管道 `|` 与 `grep`（workbuddy，2026-11-19）
+
+**审计第 1 项**。零新号。`parser::split_pipe` 只做**段间**切分（`parse` 仍只做段内词法，
+两件事分开各自的边界能单独测——本片用宿主机 Python 复刻算法验了 11 个用例）。
+管道在 **`con_write` 一处拦截**（216 个调用点全经它）：左段执行时开全局 sink，
+输出进 4 KiB 定长缓冲，右段从缓冲取输入。`grep` 只做子串匹配（手写 `contains`，
+不用 `str::contains`——输入可能非 UTF-8）。
+
+**实测**（a3-shell,fat32-probe PASS33 15.1s）：`ls | grep NOTES` → `f NOTES 1000`
+（grep 从 ls 的 sink 里筛出 NOTES 那一行，表头 `ls: /` 被过滤掉）。
+新增判定格 `_pipe_rows` 两格：① 不得出现 `ls: /|`（管道没生效的症状）
+② 必须出现 `<kind> NOTES <num>`。**变异证红**：`split_pipe` 恒返 1 段 ⇒ False，还原 True。
+
+### 六个坑
+
+1. **脚本模式不经过管道**（最大）：`a3-shell` 的 argv 走**独立的 `;` 分割循环**
+   （main.rs:411），直接 parse+dispatch ⇒ `ls | grep NOTES` 打 `ls: /|`。
+   抽成 `run_segments` 让两条路径**共用一份**。
+2. **`SINK` 的绝对地址**：`&SINK[..]` 让闭包实例化生成 `references 'shell::SINK'`
+   的 32S（`cat_each`/`dir_list` 各几处）⇒ 改 `asm!("lea ... sym SINK")`。
+3. **`.text` 第七次溢出**：48 → **128 KiB**（.rodata 移 0x100020000）。
+   印证审计判断：shell 单二进制承载全部命令快到尽头。
+4. `static mut` 放函数内也会被取址（`wc` 的 WCBUF）。
+5. **`b"字面量"` 做诊断自己触发 32S**（第一次加 `b"DBG nseg="` 就炸）。
+6. **AHCI 取证日志淹没管道输出**：`f NOTES 1000` 夹在 8 行 ahci 取证之间，
+   第一眼看成没输出。判据要往后扫足够行数（本片 40 行）。
+
+### `wc` 本片不做（如实记录）
+
+试三种写法都被函数专属 `.rodata` 常量池取址挡住（`cmd_wc`/`wc_count`）。
+留到重定向片一起做（那时可走"写文件再读"绕开）。
+
+读数：`check` **18/18**（unsafe 520/U1 85/U5 125）；整链 **73 符合 + 1 条不符**
+（`多级首簇高半抹零` HANG——单跑 FAIL(35) 正是期望值，长链抖动不归因）。
+
+**A3 剩余**：重定向 `>` `>>` `<`、`wc`、引号内 `|`、多段管道、`ls -lah` 参数解析。

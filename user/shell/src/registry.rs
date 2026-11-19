@@ -29,6 +29,8 @@ use crate::{
     M_CRED_CAPS, M_CRED_GID, M_CRED_NONE, M_CRED_UID, M_DENIED, M_ID_PFX, M_WHOAMI_PFX, M_WHOAMI_USAGE,
     M_PART_ENTRIES, M_PART_LBA, M_PART_NODISK, M_PART_TYPE, M_PART_USABLE, M_PART_USED,
     M_CLEAR_DONE, M_CLEAR_NOFB,
+    M_PIPE_EMPTY, M_PIPE_TRUNC,
+    M_GREP_NOIN, M_GREP_USAGE,
     M_DMESG_USAGE, M_KILLED, M_KILL_USAGE, M_LSDEV_USAGE, M_LSPCI_USAGE,
     M_IP_ADDR, M_IP_DNS, M_IP_DOWN, M_IP_GW, M_IP_LINK, M_IP_MAC, M_IP_MTU, M_IP_STATE, M_IP_UP,
     M_COLON, M_IP_USAGE, M_NEIGH_EMPTY, M_PING_DOT, M_PING_FROM, M_PING_SEQ,
@@ -54,6 +56,25 @@ pub struct Ctx<'a> {
     pub st: &'a mut ShellState,
 }
 
+// ---------------------------------------------------------------- ADR-155 管道输入
+//
+// 管道右段从这里取输入。**不建真管道对象**：shell 单线程、两段顺序执行，
+// 一个"当前输入切片"就够。`set_stdin` 由 `main.rs` 的管道驱动在每段执行前设置，
+// 执行完复位成空。
+static mut STDIN: &[u8] = &[];
+
+/// 设置当前段的"标准输入"（管道上一段的输出）。
+pub fn set_stdin(s: &'static [u8]) {
+    // SAFETY: 单线程 shell；只在本函数与 `read_stdin` 里读写，都在同一个调用栈上。
+    unsafe { STDIN = s };
+}
+
+/// 读当前段的"标准输入"。
+pub fn read_stdin() -> &'static [u8] {
+    // SAFETY: 同 `set_stdin`。
+    unsafe { STDIN }
+}
+
 // ---- 命令词：const 字节数组折成 immediates，不取地址（沿用旧 dispatch 的纪律）----
 const CMD_HELP: [u8; 4] = [b'h', b'e', b'l', b'p'];
 const CMD_ECHO: [u8; 4] = [b'e', b'c', b'h', b'o'];
@@ -64,6 +85,7 @@ const CMD_WHOAMI: [u8; 6] = [b'w', b'h', b'o', b'a', b'm', b'i'];
 const CMD_ID: [u8; 2] = [b'i', b'd'];
 const CMD_PART: [u8; 4] = [b'p', b'a', b'r', b't'];
 const CMD_CLEAR: [u8; 5] = [b'c', b'l', b'e', b'a', b'r'];
+const CMD_GREP: [u8; 4] = [b'g', b'r', b'e', b'p'];
 const CMD_IP: [u8; 2] = [b'i', b'p'];
 const CMD_ABI: [u8; 3] = [b'a', b'b', b'i'];
 const CMD_EXIT: [u8; 4] = [b'e', b'x', b'i', b't'];
@@ -1702,6 +1724,74 @@ fn cmd_clear(c: &Ctx) -> bool {
     true
 }
 
+/// ADR-155：`grep <pattern>` —— 从**管道输入**里筛出含该子串的行。
+///
+/// **只做子串匹配，不做正则**：正则引擎是独立的一刀（词法、回溯、
+/// 复杂度上界），塞进管道这一片会让两件事都做不干净。
+///
+/// 输入来源：`read_stdin()`（管道上一段的输出）。没有输入就明确说
+/// `grep: no input`——**不假装成功**（那是把"没接管道"伪装成"没匹配"）。
+#[inline(never)]
+fn cmd_grep(c: &Ctx) -> bool {
+    if !allow(c, rt::CAP_READ) { return true; }
+    let pat = match (c.p.err.is_none(), c.p.args.get(0)) {
+        (true, Some(a)) if !a.is_empty() => a,
+        _ => {
+            con_write(c.h, msg(M_GREP_USAGE));
+            return true;
+        }
+    };
+    let input = read_stdin();
+    if input.is_empty() {
+        con_write(c.h, msg(M_GREP_NOIN));
+        return true;
+    }
+    // 逐行扫：找到行边界就判一次"这一行含不含 pattern"。
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i <= input.len() {
+        let at_end = i == input.len();
+        let is_nl = input.get(i).copied() == Some(b'\n');
+        if at_end || is_nl {
+            if let Some(line) = input.get(start..i) {
+                if contains(line, pat) {
+                    con_write(c.h, line);
+                    con_write(c.h, msg(M_NL));
+                }
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// 子串判定（**不用 `str::contains`**：输入是 `&[u8]`，可能是非 UTF-8；
+/// 转 str 会在非法字节上失败，而"含不含这串字节"对任意字节都有定义）。
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || needle.len() > hay.len() {
+        return false;
+    }
+    let last = hay.len() - needle.len();
+    let mut i = 0usize;
+    while i <= last {
+        let mut k = 0usize;
+        let mut hit = true;
+        while k < needle.len() {
+            if hay.get(i + k).copied() != needle.get(k).copied() {
+                hit = false;
+                break;
+            }
+            k += 1;
+        }
+        if hit {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 /// 分派一条已解析的命令。返回 false = 退出 shell。
 ///
 /// 每个分支都是"名字 immediate 比较 → 直接调用处理器"，不写 `match lookup()`：
@@ -1744,6 +1834,9 @@ pub fn dispatch(h: ConsoleHandle, si_va: u64, p: &Parsed, st: &mut ShellState) -
     }
     if cmd_is(p.cmd, &CMD_CLEAR) {
         return cmd_clear(&c);
+    }
+    if cmd_is(p.cmd, &CMD_GREP) {
+        return cmd_grep(&c);
     }
     if streq(p.cmd, &CMD_ABI) {
         return cmd_abi(&c);

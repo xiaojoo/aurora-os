@@ -38,7 +38,7 @@ mod registry;
 /// （hello/probe 的模块头都记过这个坑，本轮实测又撞一次）。改成 RIP 相对 lea 取基址 + 常量偏移。
 /// S6u：横幅的前导 `\x0a` 去掉了——那是当年为了跟上面的内核日志隔开留的，
 /// ADR-096 之后画面正文只有会话输出，前面什么都没有，那一格就成了纯粹的空行。
-static MSGS: [u8; 930] = *b"dmesg: usage\x0admesg: err=\x0admesg: tail\x0acommands: help | echo <text> | ping | abi | ps | free | top | kill | exit\x0aAurora OS 6.1.0-aurora (tty1)\x0aaurora@os:~$ \x0aline too long, discarded\x0aunknown command:  (try help)\x0aping=abi_info=bye\x0a\x08 \x08^C\x0arun:  exit= (timeout) error=usage: run <path>\x0a-PID GEN THR ST PAGES\x0aps: no job handle\x0alivedead ps: error=free: procs= threads= pages=#\x0atop: usage\x0aframe kill: usage\x0akilled=dmesg: usage\x0admesg: err=dmesg: tail\x0alspci: usage\x0auptime: sleep <ms>\x0aping <ip>\x0afrom \x20\x0ap\x2e\x0a: seq=\x0atimeout\x0aip: usage\x0alink addr mtu=state=up\x0adown\x0amac gw dns \x3als: cat: d f  entries bytes= fnv=pwd: cd:  not a directoryusage: cd <path>usage: cat <path> | cd | pwdneigh neigh: empty\x0aip: usage\x0a\x0aroute default via  mask=/lsdev usage\x0aclass 0x count=devctl status\x0adevctl usage\x0apciblknetdisplaybridgeotheruid= gid= caps=whoami: id: usage: whoami\x0ano creddenied: part: entries= used= usable= lba=type=0xpart: no disk\x0aclear: no fb\x0aclear: done\x0a";
+static MSGS: [u8; 1041] = *b"dmesg: usage\x0admesg: err=\x0admesg: tail\x0acommands: help | echo <text> | ping | abi | ps | free | top | kill | exit\x0aAurora OS 6.1.0-aurora (tty1)\x0aaurora@os:~$ \x0aline too long, discarded\x0aunknown command:  (try help)\x0aping=abi_info=bye\x0a\x08 \x08^C\x0arun:  exit= (timeout) error=usage: run <path>\x0a-PID GEN THR ST PAGES\x0aps: no job handle\x0alivedead ps: error=free: procs= threads= pages=#\x0atop: usage\x0aframe kill: usage\x0akilled=dmesg: usage\x0admesg: err=dmesg: tail\x0alspci: usage\x0auptime: sleep <ms>\x0aping <ip>\x0afrom \x20\x0ap\x2e\x0a: seq=\x0atimeout\x0aip: usage\x0alink addr mtu=state=up\x0adown\x0amac gw dns \x3als: cat: d f  entries bytes= fnv=pwd: cd:  not a directoryusage: cd <path>usage: cat <path> | cd | pwdneigh neigh: empty\x0aip: usage\x0a\x0aroute default via  mask=/lsdev usage\x0aclass 0x count=devctl status\x0adevctl usage\x0apciblknetdisplaybridgeotheruid= gid= caps=whoami: id: usage: whoami\x0ano creddenied: part: entries= used= usable= lba=type=0xpart: no disk\x0aclear: no fb\x0aclear: done\x0apipe: empty segment\x0apipe: input truncated\x0agrep: usage <pattern>\x0agrep: no input\x0awc: usage\x0a lines= words= bytes=\x0a";
 
 const M_HELP: (usize, usize) = (37, 14);
 const M_BANNER: (usize, usize) = (111, 30);
@@ -145,6 +145,16 @@ const M_PART_NODISK: (usize, usize) = (891, 14);
 // `clear`（ADR-153，D3）：清屏。
 const M_CLEAR_NOFB: (usize, usize) = (905, 13);
 const M_CLEAR_DONE: (usize, usize) = (918, 12);
+// 管道（ADR-155）。
+const M_PIPE_EMPTY: (usize, usize) = (930, 20);
+const M_PIPE_TRUNC: (usize, usize) = (950, 22);
+// grep / wc（ADR-155：管道的两个真实消费者）。
+const M_GREP_USAGE: (usize, usize) = (972, 22);
+const M_GREP_NOIN: (usize, usize) = (994, 15);
+const M_WC_USAGE: (usize, usize) = (1009, 10);
+const M_WC_LINES: (usize, usize) = (1019, 7);
+const M_WC_WORDS: (usize, usize) = (1026, 7);
+const M_WC_BYTES: (usize, usize) = (1033, 7);
 const M_CLASS_PREFIX: (usize, usize) = (726, 8);
 const M_COUNT: (usize, usize) = (734, 7);
 const M_DEVCTL_STATUS: (usize, usize) = (741, 13);
@@ -210,7 +220,146 @@ fn trim_ascii(mut b: &[u8]) -> &[u8] {
 /// 读它**（逐处核对过）——签名顺势改 `()`，错误也和旧版一样不上抛（旧版忽略 rax，
 /// 交互程序对写失败没有可恢复动作；`let _` 是显式声明"与旧版同口径地忽略"，不是吞错）。
 fn con_write(h: u64, s: &[u8]) {
+    // ADR-155：管道左段的输出先落进 sink 缓冲，右段再从缓冲读。
+    // **在这里拦一层**而不是改 216 个调用点：`con_write` 是唯一输出入口，
+    // 一处拦截就让全部命令自动支持管道。
+    if let Some(n) = sink_write(s) {
+        let _ = n;
+        return;
+    }
     let _ = rt::console_write(h, s);
+}
+
+/// 执行一段命令行（可能是管道）。返回 false = 收到退出请求。
+///
+/// **交互模式与脚本模式（argv）共用这一个函数**：之前两条路径各写一份，
+/// 管道只在交互路径里生效，argv 档静默把 `|` 当成参数（实测 `ls | grep NOTES`
+/// 打 `ls: /|`）。共用一份就不会再分叉。
+fn run_segments(console: u64, si_va: u64, raw: &[u8], st: &mut ShellState) -> bool {
+    let (segs, nseg) = parser::split_pipe(raw);
+    if nseg <= 1 {
+        let parsed = parser::parse(raw);
+        return registry::dispatch(console, si_va, &parsed, st);
+    }
+    let mut carry: &[u8] = &[];
+    let mut trunc = false;
+    let mut i = 0usize;
+    let mut quit = false;
+    while i < nseg {
+        let last = i + 1 == nseg;
+        let seg = segs.get(i).copied().unwrap_or(&[]);
+        let parsed = parser::parse(seg);
+        if parsed.cmd.is_empty() {
+            con_write(console, msg(M_PIPE_EMPTY));
+            break;
+        }
+        registry::set_stdin(if i == 0 { &[] } else { carry });
+        if last {
+            if !registry::dispatch(console, si_va, &parsed, st) {
+                quit = true;
+            }
+        } else {
+            sink_begin();
+            let _ = registry::dispatch(console, si_va, &parsed, st);
+            let (buf, tr) = sink_take();
+            carry = buf;
+            trunc = trunc || tr;
+        }
+        i += 1;
+    }
+    registry::set_stdin(&[]);
+    if trunc {
+        con_write(console, msg(M_PIPE_TRUNC));
+    }
+    !quit
+}
+
+// ---------------------------------------------------------------- ADR-155 管道
+//
+// 设计：管道左段执行时把 `con_write` 的输出收进一个**定长内存缓冲**，
+// 右段执行时从该缓冲取输入。**不建真管道对象、不开并发**——shell 是单线程，
+// 两段顺序执行，所以"缓冲"就够。
+//
+// 容量 4 KiB：一条 `cat /NOTES` 的输出上限（NOTES 是 27 字节，但 `ls`/`dmesg`
+// 会长）。超了**截断并记标志**，右段会看到"输入被截断"——不静默丢。
+
+/// sink 缓冲容量。
+const SINK_CAP: usize = 4096;
+
+static mut SINK: [u8; SINK_CAP] = [0; SINK_CAP];
+static mut SINK_LEN: usize = 0;
+static mut SINK_ON: bool = false;
+static mut SINK_TRUNC: bool = false;
+
+/// 取 `SINK` 基址。**必须 RIP 相对 `lea`**：
+///
+/// `&SINK[..]` / `SINK.get_mut(i)` 这类写法会让编译器生成对 `shell::SINK`
+/// 的**绝对地址**引用（`R_X86_64_32S`），而镜像基址在 4 GiB 之上 ⇒ 链接期
+/// out of range（实测：`cat_each`/`dir_list` 的闭包实例化里各有几处，
+/// 报错文本是 `references 'shell::SINK (.llvm.NNN)'`）。
+/// 这与 ADR-154 记的 `MSGS` 是同一条纪律。
+#[inline]
+fn sink_base() -> *mut u8 {
+    let p: *mut u8;
+    // SAFETY: `lea` 只做地址计算，不读内存；`SINK` 是 'static 定长数组。
+    unsafe {
+        core::arch::asm!(
+            "lea {0}, [rip + {1}]",
+            out(reg) p,
+            sym SINK,
+            options(nostack, preserves_flags)
+        );
+    }
+    p
+}
+
+/// 开启 sink（管道左段执行前调用）。
+fn sink_begin() {
+    // SAFETY: 单线程 shell；这三个静态量只在 `sink_begin`/`sink_write`/`sink_take`
+    // 三处读写，都在同一个调用栈里顺序发生，没有并发。
+    unsafe {
+        SINK_LEN = 0;
+        SINK_TRUNC = false;
+        SINK_ON = true;
+    }
+}
+
+/// 关闭 sink 并交出（切片, 是否截断）。
+fn sink_take() -> (&'static [u8], bool) {
+    // SAFETY: 同 `sink_begin`。返回 'static 切片：SINK 是 'static，且调用方在
+    // 下一次 `sink_begin` 之前用完（右段执行期间不会再开 sink）。
+    // 用裸指针构造切片，避免 `&SINK[..]` 的绝对地址引用。
+    unsafe {
+        SINK_ON = false;
+        let base = sink_base() as *const u8;
+        (core::slice::from_raw_parts(base, SINK_LEN), SINK_TRUNC)
+    }
+}
+
+/// 若 sink 开着，把 `s` 收进缓冲并返回 `Some(写入字节数)`；否则 `None`。
+fn sink_write(s: &[u8]) -> Option<usize> {
+    // SAFETY: 同 `sink_begin`。
+    unsafe {
+        if !SINK_ON {
+            return None;
+        }
+        let base = sink_base();
+        let mut n = 0usize;
+        while n < s.len() {
+            if SINK_LEN >= SINK_CAP {
+                SINK_TRUNC = true;
+                break;
+            }
+            if let Some(src) = s.get(n) {
+                core::ptr::write(base.add(SINK_LEN), *src);
+                SINK_LEN += 1;
+                n += 1;
+            } else {
+                break;
+            }
+        }
+        Some(n)
+    }
 }
 
 /// 从控制台读**一个**字节。返回 None 表示当前没有输入（21 号不阻塞）。
@@ -316,8 +465,10 @@ pub extern "C" fn _start(si_va: u64) -> ! {
             any = true;
             con_write(console, cmd);
             con_write(console, msg(M_NL));
-            let parsed = parser::parse(cmd);
-            let _ = registry::dispatch(console, si_va, &parsed, &mut st);
+            // ADR-155：脚本模式（argv）同样支持管道——与交互模式**共用同一段逻辑**。
+            // 之前这里直接 `parse` + `dispatch`，管道在 argv 档里静默失效
+            // （实测 `ls | grep NOTES` 把 `|` 当成 `ls` 的参数）。
+            run_segments(console, si_va, cmd, &mut st);
         }
         if any {
             rt::exit(0);
@@ -343,15 +494,9 @@ pub extern "C" fn _start(si_va: u64) -> ! {
             if overflow {
                 con_write(console, msg(M_TOOLONG));
             } else {
-                // A3：解析 → 注册表分派。msg 常量与打印顺序一行未动，
-                // 五命令与 unknown 的输出路径逐字节不变（见两模块头注释）。
-                let parsed = parser::parse(line.get(..len).unwrap_or(&[]));
-                // A3：`run` 要按角色取 Job 句柄，所以把 SI 页地址一并传进分派层
-                // （只有 `run` 用它，其余命令一个字都没变）。
-                if !registry::dispatch(console, si_va, &parsed, &mut st) {
-                    // A2 接线：与旧版同义（3 号、code=0）。`rt::exit` 是 `-> !`，
-                    // 失败时 runtime 侧自旋兜底（旧版这里无兜底，exit 失败会掉回循环——
-                    // 那是内核异常态，自旋比静默继续更诚实）。
+                // ADR-155：切管道 → 逐段执行。单段走的就是原来的路径。
+                let raw = line.get(..len).unwrap_or(&[]);
+                if !run_segments(console, si_va, raw, &mut st) {
                     rt::exit(0);
                 }
             }

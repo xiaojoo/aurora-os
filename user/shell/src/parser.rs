@@ -6,7 +6,9 @@
 //!   新解析器在同形输入上产出同一个命令词，所以规则原样搬过来。
 //! - **成对双引号**：词首的 `"` 开启，到下一个 `"` 关闭，期间的空格并进同一个词。
 //!   词中的引号按普通字节；空串引号 `""` 不产出词（与旧实现的"连续空格不产词"同口径）。
-//!   管道/重定向不在本片（后续切片）。
+//!   管道 `|` 由 [`split_pipe`] 单独切（ADR-155）：`parse` 不认它，
+//!   调用方先切管道再逐段 `parse`——这样"一个词的解析"与"多段的组合"
+//!   是两件事，各自的边界都能单独测。
 //! - 静态缓冲、无堆；所有容量编译期定死。**任何输入都不 panic**：
 //!   空行、超长、引号不闭合、非 ASCII 字节，走到的都是普通分支。
 //! - **超限记错误而不是截断假装成功**：个数超 `ARG_MAX`、单词超 `ARG_LEN`、
@@ -193,4 +195,48 @@ fn commit(
     }
     args.count += 1;
     true
+}
+
+/// 管道切分（ADR-155）：把一行按 `|` 切成最多 [`PIPE_MAX`] 段。
+///
+/// **为什么不在 `tokenize` 里做**：管道是**段间**结构，而 tokenize 处理的是
+/// **段内**词法。混在一起会让"引号里的 `|` 算不算分隔符"变成一个必须回答的问题
+/// ——今天不回答它（引号内的 `|` 一律当普通字节，因为切分发生在 parse 之前，
+/// 此时还不知道引号状态）。这是**明确的限制**，写进 ADR-155 未决 1。
+///
+/// 返回切出的段数；每段是**原样的字节切片**（不去空格，交给 `parse` 修剪）。
+/// 空段（`a || b` 或行首 `|`）**保留**——由调用方判"空段 = 语法错误"，
+/// 因为"要不要报错"是执行策略，不是词法事实。
+pub const PIPE_MAX: usize = 4;
+
+pub fn split_pipe(line: &[u8]) -> ([&[u8]; PIPE_MAX], usize) {
+    let mut segs: [&[u8]; PIPE_MAX] = [&[]; PIPE_MAX];
+    let mut n = 0usize;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while let Some(&c) = line.get(i) {
+        if c == b'|' {
+            if n == PIPE_MAX {
+                // 超过上限：把剩余全部并入最后一段（不丢字节，也不静默截断）
+                break;
+            }
+            if let Some(s) = line.get(start..i) {
+                if let Some(slot) = segs.get_mut(n) {
+                    *slot = s;
+                }
+                n += 1;
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if n < PIPE_MAX {
+        if let Some(s) = line.get(start..) {
+            if let Some(slot) = segs.get_mut(n) {
+                *slot = s;
+            }
+            n += 1;
+        }
+    }
+    (segs, n)
 }

@@ -7921,6 +7921,41 @@ def _lspci_rows(log: str) -> bool:
     return False
 
 
+def _pipe_rows(log: str) -> bool:
+    """管道的显示层判据（ADR-155，A3 第一项）。
+
+    两格，都读串口原文：
+
+    ① **`|` 不再被当成参数**：`ls | grep NOTES` 之后**不得**出现 `ls: /|`
+       （那是"管道没生效、`|` 被 `ls` 当路径"的症状，本片开工时的实测形态）。
+    ② **右段真收到了左段的输出**：`ls | grep NOTES` 之后必须出现一行
+       `f NOTES <size>` 或 `d NOTES`——`grep` 从 `ls` 的 sink 里筛出了
+       含 `NOTES` 的那一行，而 `ls` 自己那行表头（`ls: /`）**不在**结果里
+       （它被 grep 过滤掉了，因为表头不含 `NOTES`）。
+
+    判据不依赖具体文件名/大小（换卷也成立）：只要求"有一行形如
+    `<kind> NOTES <num>`"。
+    """
+    import re
+    row = re.compile(r"^[fd] NOTES \d+$")
+    lines = log.split("\n")
+    saw_echo = False
+    got_row = False
+    bad_arg = False
+    for k, ln in enumerate(lines):
+        if ln.strip() != "ls | grep NOTES":
+            continue
+        saw_echo = True
+        # 往后看 40 行（中间会夹 AHCI 取证日志，实测有 8 行）
+        for j in range(k + 1, min(k + 41, len(lines))):
+            s = lines[j].strip()
+            if s == "ls: /|":
+                bad_arg = True
+            if row.match(s):
+                got_row = True
+    return saw_echo and got_row and not bad_arg
+
+
 def _clear_row(log: str) -> bool:
     """`clear` 的显示层判据（ADR-153，D3）。
 
@@ -9042,6 +9077,8 @@ def do_test(timeout: int) -> int:
         _cred_rows(ashlog),
         # clear（ADR-153，D3）：清屏的明确回答（done 或 no fb，不许静默）
         _clear_row(ashlog),
+        # 管道（ADR-155）：`|` 不再当参数，且右段真收到左段输出
+        _pipe_rows(ashlog),
         # part（ADR-152）：**不在 argv 判定链里**——它会卡在故障盘上（口 0 被 wedge，
         # 任何 I/O 重试到取证耗尽）。C3 的验收由内核 ktest `t_part_read`（合成盘）承担，
         # 见 ADR-152「影响/负面 2」。
