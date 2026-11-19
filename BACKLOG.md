@@ -16392,3 +16392,42 @@ ktests: total=95 passed=95 failed=0
 `探针几何`/`FS-03ring3`/`A2 argv`/`A3包读不到`）。
 **单跑复验：`normal` PASS(33)、`a3-shell,fat32-probe` PASS(33)、`fs-open` 104/104 全绿**
 ⇒ 按 AGENTS 纪律记录为**长链抖动，不归因**。
+
+
+## 436. ADR-160：§10.2 写方向第一片 write（workbuddy，2026-11-19，零新号）
+
+**审计第 2 项**。**勘察纠正了审计的判断**：审计说"FAT32 写路径要从零做簇分配/目录项/FAT 更新"，
+实际 `vfs_ro::write_at`（ADR-111）、`fs_open::OPEN_WRITE`、23 号 `SYS_FILE_WRITE`、
+内核 ktest `t_fs_rw_write`/`t_fs_rw_syscall23`/`t_fs_rw_open_write` **全都已有**。
+缺的只是**用户态封装与命令**。
+
+- `write <path> <text>`：22 号 open(OPEN_WRITE) → 23 号 write → close。
+- **只覆盖已有区间**：越 EOF 整次拒绝（ADR-111 决策 1）⇒ 不能创建/扩展。
+- 权限闸用 `CAP_WRITE`（不是 `CAP_READ`——写比读高）。
+
+**实测**（a3-shell,fat32-probe PASS33 16.0s）：`write /LOG.TXT abc` → `write: read-only vol`。
+判定格 `_write_row` 接受**三种**明确回答（ok/read-only vol/err）——本片证的是
+"23 号有用户态出口且给出明确回答"，不是"所有档都能写"。
+**变异证红**：Err 分支静默 return ⇒ False，还原 True。
+
+### 两件事
+
+1. **`a3-shell,fs-rw` 不是受支持的档**：我临时拼它得到 107 passed 105 failed 2
+   （`t_fs_open_ring3` + `t_clock_uptime`）；单独 `fs-rw` 是 **107/107 全绿**。
+   判定表只跑 `["fs-rw"]`。**"我临时拼的档"与"受支持的档"是两件事**。
+2. **可写卷在产品路径上不可达**：`fs-rw` 的可写卷挂口 4，而根卷 `/` 只读
+   ⇒ `write` 在产品档只能打 `read-only vol`。**写能力内核 ktest 通了，
+   但用户态拿不到可写挂载**——本片最该记的欠账。
+
+### 本片抓出的一个真 bug（不是抖动）
+
+`t_sdkdemo` 起任务后**没显式收尾**，`exit(0)` 只让任务变 `Done`，
+装载时占的 VA 登记要到回收才放手 ⇒ **后面**的 `t_copy_user`/`t_syscall_fastpath`/
+`t_user_pointer_checks` 三条一起报 `目标 VA 已被登记或已映射`。
+加 `terminate_task(t)` 后 `handles` 档 **95/95 全绿**。
+**教训（AGENTS 那条的镜像）**：用例必须自足，**也不能假设别的用例会替你收尾**。
+
+读数：`check` **18/18**（unsafe 523/U5 128）；整链 **71 符合 + 3 条不符**
+（`A2 argv`/`A3换代码字节`/`A3包读不到`，都是 `a2-exec`/`a3-exec` 档）。
+**这三条是既有问题**：`git stash` 后跑基线同样红 3 条（`t_copy_user`/
+`t_syscall_fastpath`/`t_user_pointer_checks`），**与本片无关，不归因**。

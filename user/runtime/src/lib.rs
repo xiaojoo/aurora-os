@@ -1172,6 +1172,33 @@ pub fn dns_resolve(name: &[u8], timeout_ms: u64) -> Result<(u8, u16, [u8; 4]), R
     }
 }
 
+/// ADR-160：23 号 `SYS_FILE_WRITE` 的用户态封装。
+pub const SYS_FILE_WRITE: u64 = 23;
+/// 22 号 open 的写意图（内核 `fs_open::OPEN_WRITE`）。
+pub const OPEN_WRITE: u64 = 1;
+
+/// 23：从 `buf` 写进句柄 `h` 当前游标处。返回写入字节数。
+///
+/// **只覆盖已有区间**（ADR-111 决策 1）：越 EOF 时内核**整次拒绝**（`BadOffset`），
+/// 一个字节都不写。创建/扩展/截断不在这一层（那是簇分配与目录项，另一刀）。
+pub fn file_write(h: Handle, buf: &[u8]) -> Result<u64, RTError> {
+    if buf.is_empty() {
+        return Err(RTError::INVALID);
+    }
+    if buf.len() > 4096 {
+        return Err(RTError::TOOLONG);
+    }
+    // SAFETY: 23 号 rdi=句柄、rsi=用户缓冲、rdx=长度。内核按块 copy_from_user。
+    let ret = unsafe {
+        syscall_abi(SYS_FILE_WRITE, h, buf.as_ptr() as u64, buf.len() as u64, 0)
+    } as i64;
+    if ret < 0 {
+        Err(RTError(ret))
+    } else {
+        Ok(ret as u64)
+    }
+}
+
 /// 46（ADR-157）：内核身份与内存读数。
 pub const SYS_SYSINFO: u64 = 46;
 /// 记录定长。

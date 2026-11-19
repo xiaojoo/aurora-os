@@ -48,6 +48,14 @@ fn t_sdkdemo() -> bool {
     let _ = crate::apic::with_interrupts(|| {
         crate::sched::wait_for_task(t, crate::clock::window_cycles(64))
     });
+    // **必须显式收尾**：`sdkdemo` 自己 `exit(0)` 只让任务变 `Done`，
+    // 而它装载时占的 VA 登记要到任务真正回收才放手。
+    // 不收尾就会让**后面**的用例在装载时报
+    // `目标 VA 已被登记或已映射`——实测 `t_copy_user` / `t_syscall_fastpath` /
+    // `t_user_pointer_checks` 三条一起红（它们装到同一批 VA）。
+    // 这与 AGENTS 那条「用例必须自足，不能假设别的用例已经认领过设备」是同一件事的
+    // 镜像：**也不能假设别的用例会替你收尾**。
+    let _ = crate::sched::terminate_task(t);
 
     // 判据读**用户态信箱**（`.slots` 段）。
     //

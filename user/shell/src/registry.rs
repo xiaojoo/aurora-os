@@ -36,6 +36,7 @@ use crate::{
     M_UNAME_USAGE, M_UNAME_OUT, M_ARCH_USAGE, M_ARCH_OUT,
     M_MEM_USAGE, M_MEM_TOTAL, M_MEM_FREE, M_MEM_USED, M_MEM_PAGE,
     M_NS_USAGE, M_NS_NAME, M_NS_IP, M_NS_AN, M_NS_RC, M_NS_NOANS,
+    M_WR_USAGE, M_WR_OK, M_WR_ERR, M_WR_RO,
     M_DMESG_USAGE, M_KILLED, M_KILL_USAGE, M_LSDEV_USAGE, M_LSPCI_USAGE,
     M_IP_ADDR, M_IP_DNS, M_IP_DOWN, M_IP_GW, M_IP_LINK, M_IP_MAC, M_IP_MTU, M_IP_STATE, M_IP_UP,
     M_COLON, M_IP_USAGE, M_NEIGH_EMPTY, M_PING_DOT, M_PING_FROM, M_PING_SEQ,
@@ -99,6 +100,7 @@ const CMD_UNAME: [u8; 5] = [b'u', b'n', b'a', b'm', b'e'];
 const CMD_ARCH: [u8; 4] = [b'a', b'r', b'c', b'h'];
 const CMD_MEMINFO: [u8; 7] = [b'm', b'e', b'm', b'i', b'n', b'f', b'o'];
 const CMD_NSLOOKUP: [u8; 8] = [b'n', b's', b'l', b'o', b'o', b'k', b'u', b'p'];
+const CMD_WRITE: [u8; 5] = [b'w', b'r', b'i', b't', b'e'];
 const CMD_IP: [u8; 2] = [b'i', b'p'];
 const CMD_ABI: [u8; 3] = [b'a', b'b', b'i'];
 const CMD_EXIT: [u8; 4] = [b'e', b'x', b'i', b't'];
@@ -2184,6 +2186,64 @@ fn dot(c: &Ctx) {
     con_write(c.h, &one);
 }
 
+/// ADR-160：`write <path> <text>` —— 覆盖写已有文件的**前 N 字节**（23 号）。
+///
+/// **只覆盖已有区间**：23 号的 `write_at` 越 EOF 时整次拒绝（ADR-111 决策 1）。
+/// 所以这条命令**不能创建文件、不能扩展**——那要簇分配与目录项写入，是另一刀。
+/// 这正是本片要如实标出的边界：**写能力通了，创建能力还没通**。
+///
+/// 读权限闸：`CAP_WRITE`（不是 `CAP_READ`——写比读更高）。
+#[inline(never)]
+fn cmd_write(c: &Ctx) -> bool {
+    if !allow(c, rt::CAP_WRITE) { return true; }
+    let path = match (c.p.err.is_none(), c.p.args.get(0)) {
+        (true, Some(a)) if !a.is_empty() => a,
+        _ => { con_write(c.h, msg(M_WR_USAGE)); return true; }
+    };
+    let text = match c.p.args.get(1) {
+        Some(t) if !t.is_empty() => t,
+        _ => { con_write(c.h, msg(M_WR_USAGE)); return true; }
+    };
+    let mut abuf = [0u8; 160];
+    let Some(al) = resolve_path(c.st, Some(path), &mut abuf) else {
+        con_write(c.h, msg(M_WR_USAGE));
+        return true;
+    };
+    let Some(ap) = abuf.get(..al) else {
+        con_write(c.h, msg(M_WR_USAGE));
+        return true;
+    };
+    write_run(c, ap, text);
+    true
+}
+
+/// `write` 的本体。**与 `cmd_write` 分开**（函数专属 `.rodata` 常量池的纪律）。
+#[inline(never)]
+fn write_run(c: &Ctx, path: &[u8], text: &[u8]) {
+    // 22 号 open 带写意图：不可写卷在这里就被内核拒（`BadFlags`）
+    let h = match rt::file_open(path, rt::OPEN_WRITE) {
+        Ok(v) => v,
+        Err(_) => {
+            con_write(c.h, msg(M_WR_RO));
+            return;
+        }
+    };
+    let r = rt::file_write(h, text);
+    let _ = rt::handle_close(h);
+    match r {
+        Ok(n) => {
+            con_write(c.h, msg(M_WR_OK));
+            put_u64(c.h, n);
+            con_write(c.h, msg(M_NL));
+        }
+        Err(e) => {
+            con_write(c.h, msg(M_WR_ERR));
+            put_i64(c.h, e.0);
+            con_write(c.h, msg(M_NL));
+        }
+    }
+}
+
 /// 分派一条已解析的命令。返回 false = 退出 shell。
 ///
 /// 每个分支都是"名字 immediate 比较 → 直接调用处理器"，不写 `match lookup()`：
@@ -2253,6 +2313,9 @@ pub fn dispatch(h: ConsoleHandle, si_va: u64, p: &Parsed, st: &mut ShellState) -
     }
     if cmd_is(p.cmd, &CMD_NSLOOKUP) {
         return cmd_nslookup(&c);
+    }
+    if cmd_is(p.cmd, &CMD_WRITE) {
+        return cmd_write(&c);
     }
     if streq(p.cmd, &CMD_ABI) {
         return cmd_abi(&c);

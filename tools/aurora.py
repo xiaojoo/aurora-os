@@ -7921,6 +7921,34 @@ def _lspci_rows(log: str) -> bool:
     return False
 
 
+def _write_row(log: str) -> bool:
+    """`write` 的显示层判据（ADR-160，§10.2 的写方向）。
+
+    一格：`write /LOG.TXT abc` 之后必须出现**两种明确回答之一**：
+
+    - `write: ok bytes=<n>` —— 真写进去了；
+    - `write: read-only vol` —— 该档的根卷不可写（明确说"不能写"，不是静默成功）；
+    - `write: err=<n>` —— 内核拒绝（带错误码）。
+
+    **三者都算过**：本片证明的是"23 号有了用户态出口，且它给出明确回答"，
+    不是"这条命令在所有档都能写"。实测 `a3-shell,fs-rw` 档打
+    `write: read-only vol`——因为可写卷挂在口 4 而根卷是只读的，
+    **产品路径拿不到可写挂载**（这是 ADR-160 的未决 1，不是本判据该判红的东西）。
+    """
+    import re
+    ok_pat = re.compile(r"^write: ok bytes=\d+$")
+    err_pat = re.compile(r"^write: err=-?\d+$")
+    lines = log.split("\n")
+    for k, ln in enumerate(lines):
+        if ln.strip() != "write /LOG.TXT abc":
+            continue
+        for j in range(k + 1, min(k + 40, len(lines))):
+            s = lines[j].strip()
+            if ok_pat.match(s) or err_pat.match(s) or s == "write: read-only vol":
+                return True
+    return False
+
+
 def _nslookup_row(log: str) -> bool:
     """`nslookup` 的显示层判据（ADR-158，§10.4 的第三条）。
 
@@ -9200,6 +9228,8 @@ def do_test(timeout: int) -> int:
         _sysinfo_rows(ashlog),
         # nslookup（ADR-158）：四个读数各自可核（ancount=0 合法，DNS 离线）
         _nslookup_row(ashlog),
+        # write（ADR-160）：23 号的用户态出口给出明确回答（ok/err/read-only 都算）
+        _write_row(ashlog),
         # part（ADR-152）：**不在 argv 判定链里**——它会卡在故障盘上（口 0 被 wedge，
         # 任何 I/O 重试到取证耗尽）。C3 的验收由内核 ktest `t_part_read`（合成盘）承担，
         # 见 ADR-152「影响/负面 2」。
