@@ -16106,3 +16106,41 @@ part: 判据 表头=true 首条逐字节=true 分页=true 无GPT拒=true
 
 读数：`check` **18/18**（storage 模块补 ahci::State/info/state + part 五项、runtime U5 50→52、
 census 500）；整链 **74 符合 + 0 不符（全绿）**。
+
+
+## 429. ADR-153：D3 第一片——帧缓冲文本出口（workbuddy，2026-11-19）
+
+**使用者裁决 ⑤A**：D2 跳过，D3 只做已有 framebuffer 的文本 API 固化。
+新增 2 个号：44 `SYS_FB_TEXT`（col/row/len/ptr → 写入字符数）、
+45 `SYS_FB_CLEAR`（无参 → 1/0）。`fbcon` 加两个方法：
+`Term::puts`（走列、遇宽换行不裁、返回 (写入数, 结束行)）、
+`Term::clear_viewport`（一次 clear_rect 清整块，不逐格）。
+
+### 本片最关键的判断：**44/45 绕过 `frozen()` 闸门**
+
+第一版我给两个方法都加了 `if Self::frozen() { return }`，结果 `clear` 打
+`clear: no fb`——**显示 API 被测试图案的闸门锁死了**。判断：`frozen()` 保护的是
+"测试图案的像素不被后续写入改掉"（串口有 `fbcon: 冻结后再写无效=true` 那条用例），
+**不是禁止显示**。显示 API 是 D3 的产品面，必须能在冻结之后工作。
+⇒ 两个方法不查冻结，注释里写明是设计决定。
+
+**实测**（`a3-shell,fat32-probe,framebuffer` PASS33 15.1s）：`clear → clear: done`；
+无 framebuffer 档：`clear → clear: no fb`（**不假装清过了**）。
+判定格 `_clear_row` 接受 `done` **或** `no fb` 两种明确回答。
+**变异证红**：`cmd_clear` 改静默 ⇒ `_clear_row=False`，还原 True。
+
+### 三个坑
+
+1. **`clear_rect` 返回 `()` 不是 `bool`** ⇒ E0308。
+2. **`copy_from_user(va, dst)` 的参数顺序是 va 在前**（我写反了）。
+3. **`fbcon` 模块只在 `framebuffer` 特性下存在**，而 handler 只受 `handles` 门控
+   ⇒ 默认档 E0433「cannot find fbcon」。改成 `all(handles, framebuffer)`。
+   这个坑让第一次整链在 handles 档**卡住不返回**（日志停在 cargo build 那行），
+   不是失败而是构建挂起。
+
+读数：`check` **18/18**（runtime U5 52→54、census 502、sched 依赖 display、
+display 允许 sched）；整链 **72 符合 + 2 条不符**（`virtio 两台并存` HANG、
+`A3 shell` FAIL——**单跑 a3-shell PASS(33) 且七格全 True**，长链抖动不归因）。
+
+**D3 剩余**：`echo` 上屏（44 号目前零产品调用者）、滚屏、光标/颜色、
+多视口、合成器与桌面会话。

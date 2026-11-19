@@ -7895,6 +7895,24 @@ def _lspci_rows(log: str) -> bool:
     return False
 
 
+def _clear_row(log: str) -> bool:
+    """`clear` 的显示层判据（ADR-153，D3）。
+
+    回显之后必须出现 `clear: done` 或 `clear: no fb`——**两者都是合法结果**：
+    前者证明 45 号真清了屏，后者证明没有帧缓冲时命令**明确说没有**
+    （不是静默成功）。判据只要求"有一个明确回答"，不要求特定分支。
+    """
+    lines = log.split("\n")
+    for k, ln in enumerate(lines):
+        if ln.strip() != "clear":
+            continue
+        for j in range(k + 1, min(k + 3, len(lines))):
+            s = lines[j].strip()
+            if s in ("clear: done", "clear: no fb"):
+                return True
+    return False
+
+
 def _part_row(log: str) -> bool:
     """`part` 的形状判据（ADR-152，C3 只读查询）。
 
@@ -8996,6 +9014,8 @@ def do_test(timeout: int) -> int:
         # å¤æ®å½¢ç¶ï¼`whoami: <å>` ä¸ `id: uid=<æ°> gid=<æ°> caps=<æ°>`
         # ââåå­ä¸è½æ¯ç©ºãcaps ä¸è½ä¸º 0ï¼æå­æ®å°±å¾æè½åï¼
         _cred_rows(ashlog),
+        # clear（ADR-153，D3）：清屏的明确回答（done 或 no fb，不许静默）
+        _clear_row(ashlog),
         # part（ADR-152）：**不在 argv 判定链里**——它会卡在故障盘上（口 0 被 wedge，
         # 任何 I/O 重试到取证耗尽）。C3 的验收由内核 ktest `t_part_read`（合成盘）承担，
         # 见 ADR-152「影响/负面 2」。

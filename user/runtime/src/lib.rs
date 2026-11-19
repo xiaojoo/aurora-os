@@ -1142,6 +1142,39 @@ pub const SYS_NET_INFO: u64 = 35;
 /// 网卡读数包（18 字节定长）：MAC6 + 本机 IP4 + 网关4 + DNS4。
 /// 读数包 24 字节（ADR-144 从 18 扩到 24）：MAC6 + 本机IP4 + 网关4 + DNS4 + mtu2 + link2。
 pub const NET_INFO_BYTES: usize = 28;
+/// 44/45（ADR-153，D3）：帧缓冲文本出口。
+pub const SYS_FB_TEXT: u64 = 44;
+pub const SYS_FB_CLEAR: u64 = 45;
+
+/// 44：把 `text` 写到屏幕 `(col, row)` 处（格坐标）。返回写入字符数。
+pub fn fb_text(col: u64, row: u64, text: &[u8]) -> Result<u64, RTError> {
+    if text.is_empty() || text.len() > 256 {
+        return Err(RTError::INVALID);
+    }
+    // SAFETY: 44 号 rdi=col、rsi=row、rdx=len、r10=文本指针（内核只读这块用户内存）。
+    let ret = unsafe {
+        syscall_abi(
+            SYS_FB_TEXT,
+            col,
+            row,
+            text.len() as u64,
+            text.as_ptr() as u64,
+        )
+    };
+    if ret < 0 {
+        Err(RTError(ret))
+    } else {
+        Ok(ret as u64)
+    }
+}
+
+/// 45：清屏。返回 true 表示清成功（没有帧缓冲或已冻结 ⇒ false）。
+pub fn fb_clear() -> bool {
+    // SAFETY: 45 号无参数。
+    let ret = unsafe { syscall_abi(SYS_FB_CLEAR, 0, 0, 0, 0) } as i64;
+    ret > 0
+}
+
 /// 42/43（ADR-152）：分区表只读查询（C3）。
 pub const SYS_PART_ENUM: u64 = 42;
 pub const SYS_PART_INFO: u64 = 43;

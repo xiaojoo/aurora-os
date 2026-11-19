@@ -406,7 +406,7 @@ public_api = [
   "sched::set_cred",
 ]
 allowed_callers = ["integration"]
-dependencies = ["arch", "boot", "capability", "diagnostics", "input", "memory", "pci", "security", "storage", "sync", "time"]
+dependencies = ["arch", "boot", "capability", "diagnostics", "input", "memory", "pci", "security", "storage", "sync", "time", "display"]
 forbidden_dependencies = []
 known_violations = []
 context = ["KERNEL", "IRQ_OFF", "ISR_TOP"]
@@ -498,7 +498,7 @@ public_api = [
   "fbcon::win_hit",
   "fbcon::Chrome",
 ]
-allowed_callers = ["integration"]
+allowed_callers = ["integration", "sched"]
 dependencies = ["boot", "diagnostics", "memory", "pci"]
 forbidden_dependencies = ["storage", "capability"]
 known_violations = []

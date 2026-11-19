@@ -3737,6 +3737,56 @@ impl Term {
         true
     }
 
+    /// ADR-153（D3）：**视口内写一行文本**——用户态 `clear`/`echo` 到屏幕的唯一入口。
+    ///
+    /// 与 [`Term::put_char`] 的差别只在"谁来走列"：这里按字符宽度推进，
+    /// 走到视口右边就**换行**（不是裁掉），超出 `rows` 就停。
+    ///
+    /// 返回 `(写入字符数, 结束行号)`。`frozen()` 时返回 `(0, row)`——冻结是
+    /// 测试图案的闸门，用户态文本不该绕过它。
+    pub fn puts(&self, f: &Frame, col: u64, row: u64, text: &str) -> (u64, u64) {
+        // **不查 `frozen()`**：冻结是**测试图案的像素证人闸门**（`fbcon_test_pattern`
+        // 冻结之后要保证"再写无效"那条用例成立），它不该禁止用户态显示。
+        // 本函数是 D3 的显示 API，绕过冻结是设计决定，见 ADR-153。
+        let mut c = col;
+        let mut r = row;
+        let mut n = 0u64;
+        for ch in text.chars() {
+            if ch == '\n' {
+                c = 0;
+                r += 1;
+                if r >= self.rows {
+                    break;
+                }
+                continue;
+            }
+            let w = char_cells(ch);
+            if c + w > self.cols {
+                c = 0;
+                r += 1;
+                if r >= self.rows {
+                    break;
+                }
+            }
+            if !self.put_char(f, c, r, ch) {
+                break;
+            }
+            c += w;
+            n += 1;
+        }
+        (n, r)
+    }
+
+    /// ADR-153（D3）：把整个视口刷成正文底色——用户态 `clear` 的实现。
+    ///
+    /// **整块清**而不是逐格清：逐格要 `cols * rows` 次落笔，而 `clear_rect` 一次
+    /// 覆盖同样的像素（与面板收起的做法同一条）。
+    pub fn clear_viewport(&self, f: &Frame) -> bool {
+        // 同 `puts`：不查冻结（显示 API 不是测试图案的一部分）。
+        self.clear_rect(f, 0, 0, self.cols * CELL_W, self.rows * CELL_H);
+        true
+    }
+
     /// 擦掉光标：把它画过的三行半格宽原样刷回背景。
     ///
     /// **为什么一条"擦"就够了**：光标画在 `cells_of(文本)` 那一格，也就是正文结尾的**空格**上；

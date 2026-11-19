@@ -147,6 +147,11 @@ pub const SYS_PART_ENUM: u64 = 42;
 pub const SYS_PART_INFO: u64 = 43;
 /// 一条分区记录的定长（index4 + first8 + last8 + attrs8 + type_guid16 = 44，垫到 48）。
 pub const PART_RECORD_LEN: usize = 48;
+/// 44（ADR-153）：把用户态文本写到帧缓冲。`rdi`=col、`rsi`=row、`rdx`=len、`r10`=文本指针。
+/// 返回写入字符数；没有帧缓冲 ⇒ `E_IO`。
+pub const SYS_FB_TEXT: u64 = 44;
+/// 45（ADR-153）：清屏（把正文视口刷成底色）。无参数。
+pub const SYS_FB_CLEAR: u64 = 45;
 /// 每条 ARP 表项的定长记录（10 字节：IP4 + MAC6）。与 27/31 号的 32 字节记录不同：这里的内容就是 10 字节，不垫到 32。
 pub const ARP_RECORD_LEN: usize = 10;
 /// 16：`rdi` = Proc 句柄、`rsi` = Thread 句柄、`rdx` = StartupInfo 那一页的 VMO 句柄、
@@ -1858,6 +1863,50 @@ fn sys_part_info(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     }
 }
 
+/// 44（ADR-153，D3）：用户态文本上屏。
+///
+/// **每帧重新 `Frame::init()`**：帧缓冲的映射在 `frame.rs` 里是幂等的（同一块物理
+/// 内存再映射一次拿到同样的 VA），所以这里不需要一个全局 `Frame` 单例——那会让
+/// "帧缓冲只在测试图案阶段存在"这个既有事实变成一个新约束。
+#[cfg(all(feature = "handles", feature = "framebuffer"))]
+#[inline(never)]
+fn sys_fb_text(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let col = frame.rdi;
+    let row = frame.rsi;
+    let len = frame.rdx as usize;
+    if len == 0 || len > 256 {
+        return E_INVALID;
+    }
+    let mut buf = [0u8; 256];
+    if copy_from_user(frame.r10, &mut buf[..len]).is_err() {
+        return E_FAULT;
+    }
+    // 只接受 ASCII：位图字体只有 95 个可打印字符（`0x20..=0x7E`），
+    // 非 ASCII 一律当 `?`——**不静默丢弃**（那会让"写了 5 个字只出来 3 个"
+    // 看起来像内核吞了字节）。
+    let mut s = [b'?'; 256];
+    let mut k = 0usize;
+    while k < len {
+        let b = buf[k];
+        s[k] = if (0x20..=0x7E).contains(&b) { b } else { b'?' };
+        k += 1;
+    }
+    let Ok(text) = core::str::from_utf8(&s[..len]) else { return E_INVALID };
+    let Ok(f) = crate::frame::Frame::init() else { return E_IO };
+    let Some(term) = crate::fbcon::Term::new(&f) else { return E_IO };
+    let (n, _r) = term.puts(&f, col, row, text);
+    n
+}
+
+/// 45（ADR-153，D3）：清屏。
+#[cfg(all(feature = "handles", feature = "framebuffer"))]
+#[inline(never)]
+fn sys_fb_clear(_frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let Ok(f) = crate::frame::Frame::init() else { return E_IO };
+    let Some(term) = crate::fbcon::Term::new(&f) else { return E_IO };
+    u64::from(term.clear_viewport(&f))
+}
+
 /// 键盘字符的读取入口。拆成小函数是为了让上面那条 `or_else` 在没开 `ps2-kbd` 时
 /// 也能编译（此时它恒返回 None，等价于原行为），而调用点不必铺 `cfg!`。
 #[cfg(not(feature = "ps2-kbd"))]
@@ -3001,6 +3050,10 @@ pub fn syscall_dispatch(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> boo
         SYS_PART_ENUM => sys_part_enum(frame),
         #[cfg(all(feature = "handles", feature = "fs-open"))]
         SYS_PART_INFO => sys_part_info(frame),
+        #[cfg(all(feature = "handles", feature = "framebuffer"))]
+        SYS_FB_TEXT => sys_fb_text(frame),
+        #[cfg(all(feature = "handles", feature = "framebuffer"))]
+        SYS_FB_CLEAR => sys_fb_clear(frame),
         #[cfg(feature = "handles")]
         SYS_CONSOLE_WRITE => sys_console_io(frame, true),
         #[cfg(feature = "handles")]

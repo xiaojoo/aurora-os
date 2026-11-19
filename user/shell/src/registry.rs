@@ -28,6 +28,7 @@ use crate::{
     M_CLASS_PCI, M_COUNT, M_DEVCTL_STATUS, M_DEVCTL_USAGE, M_DMESG_ERR, M_DMESG_HDR,
     M_CRED_CAPS, M_CRED_GID, M_CRED_NONE, M_CRED_UID, M_DENIED, M_ID_PFX, M_WHOAMI_PFX, M_WHOAMI_USAGE,
     M_PART_ENTRIES, M_PART_LBA, M_PART_NODISK, M_PART_TYPE, M_PART_USABLE, M_PART_USED,
+    M_CLEAR_DONE, M_CLEAR_NOFB,
     M_DMESG_USAGE, M_KILLED, M_KILL_USAGE, M_LSDEV_USAGE, M_LSPCI_USAGE,
     M_IP_ADDR, M_IP_DNS, M_IP_DOWN, M_IP_GW, M_IP_LINK, M_IP_MAC, M_IP_MTU, M_IP_STATE, M_IP_UP,
     M_COLON, M_IP_USAGE, M_NEIGH_EMPTY, M_PING_DOT, M_PING_FROM, M_PING_SEQ,
@@ -62,6 +63,7 @@ const CMD_DEVCTL: [u8; 6] = [b'd', b'e', b'v', b'c', b't', b'l'];
 const CMD_WHOAMI: [u8; 6] = [b'w', b'h', b'o', b'a', b'm', b'i'];
 const CMD_ID: [u8; 2] = [b'i', b'd'];
 const CMD_PART: [u8; 4] = [b'p', b'a', b'r', b't'];
+const CMD_CLEAR: [u8; 5] = [b'c', b'l', b'e', b'a', b'r'];
 const CMD_IP: [u8; 2] = [b'i', b'p'];
 const CMD_ABI: [u8; 3] = [b'a', b'b', b'i'];
 const CMD_EXIT: [u8; 4] = [b'e', b'x', b'i', b't'];
@@ -1682,6 +1684,24 @@ fn cmd_part(c: &Ctx) -> bool {
     true
 }
 
+/// ADR-153（D3）：`clear` —— 清屏。
+///
+/// 走 45 号 `SYS_FB_CLEAR`；没有帧缓冲（无 `framebuffer` 特性的档）就明确说
+/// `clear: no fb`，**不假装清过了**（总设计 §12.2「不允许把未支持操作伪装成成功」）。
+#[inline(never)]
+fn cmd_clear(c: &Ctx) -> bool {
+    if c.p.err.is_some() || c.p.args.count() != 0 {
+        con_write(c.h, msg(M_CLEAR_NOFB));
+        return true;
+    }
+    if rt::fb_clear() {
+        con_write(c.h, msg(M_CLEAR_DONE));
+    } else {
+        con_write(c.h, msg(M_CLEAR_NOFB));
+    }
+    true
+}
+
 /// 分派一条已解析的命令。返回 false = 退出 shell。
 ///
 /// 每个分支都是"名字 immediate 比较 → 直接调用处理器"，不写 `match lookup()`：
@@ -1721,6 +1741,9 @@ pub fn dispatch(h: ConsoleHandle, si_va: u64, p: &Parsed, st: &mut ShellState) -
     }
     if streq(p.cmd, &CMD_PART) {
         return cmd_part(&c);
+    }
+    if cmd_is(p.cmd, &CMD_CLEAR) {
+        return cmd_clear(&c);
     }
     if streq(p.cmd, &CMD_ABI) {
         return cmd_abi(&c);
