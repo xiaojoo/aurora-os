@@ -30,6 +30,13 @@ name = "aurora-user-runtime"
 version = "0.0.0"
 
 [[package]]
+name = "aurora-user-sdkdemo"
+version = "0.0.0"
+dependencies = [
+ "aurora-user-runtime",
+]
+
+[[package]]
 name = "aurora-user-shell"
 version = "0.0.0"
 dependencies = [

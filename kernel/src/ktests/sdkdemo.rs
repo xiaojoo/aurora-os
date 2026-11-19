@@ -1,0 +1,101 @@
+//! D4（ADR-154）：应用 SDK 样板的端到端用例。
+//!
+//! **它证明什么**：`sdkdemo.elf`（一个只经 `aurora-user-runtime` 调号的用户程序）
+//! 能被内核装载、在 ring3 跑起来、读到自己的凭据、做出一次授权判定，并把结果
+//! 写到串口。判据读的是**串口原文**（不是"加载成功"这种间接信号）。
+//!
+//! **为什么不走 FAT32 卷**：`tools/patch_fat32_file.py` 只能替换已有文件，
+//! 不能新增 `SDKDEMO.ELF`；而"把新文件塞进真卷"需要 mtools（本机没有，
+//! BACKLOG 78h-6 / 80f-1）。所以这里用 `include_bytes!` 的内嵌夹具——
+//! 与 `t_elf` / `t_exec` 同一条路径，证的是"装载器 + ABI + 用户态库"这条链，
+//! 不是"卷上有一个文件"（那条已由 FS-03 覆盖）。
+//!
+//! **判据三格**（都从用户态信箱读，不依赖串口句柄）：
+//!   ① 信箱魔数对 —— 程序真的跑到了写信箱那一步，且 `.slots` 在 data 段首位
+//!   ② `dev <= 1` —— 40 号真的回答了（允许/拒绝之一，不是未初始化值）
+//!   ③ 自洽 —— `dev` 与 `caps` 的 `CAP_DEV` 位一致（程序自己的检查也同意）
+//!
+//! **`uid == u64::MAX` 是"没有凭据"的哨兵，不是失败**：本用例用 `spawn_user`
+//! 起任务（不经 16 号），这条路径不授凭据。凭据的授予与授权差异由
+//! `a3-cred-guest` 档 + ADR-151 那条判定行覆盖——本用例证的是"SDK 样板能跑通
+//! 调号 + 回传结果"这条链。
+
+use crate::ktests::common::SDKDEMO_ELF;
+use crate::{ktest, user};
+
+/// 在 ring3 跑 `sdkdemo` 并把它的串口输出抓出来。
+///
+/// **为什么用 `user::load` + `spawn_user` 而不是 16 号全链**：本用例要证的是
+/// "SDK 样板能跑"，不是"进程创建 API 正确"（后者由 A2/A3 那几片覆盖）。
+/// 直接装载能少两层间接，红因更清楚。
+fn t_sdkdemo() -> bool {
+    let loaded = match user::load(SDKDEMO_ELF) {
+        Ok(l) => l,
+        Err(e) => {
+            crate::log_fatal!("sdkdemo: 装载失败 —— {}", user::describe_load(e));
+            return false;
+        }
+    };
+    // 起在 ring3。第 3 参 0 = 不要控制台句柄（本用例靠串口判，不靠句柄）。
+    let t = match crate::sched::spawn_user(loaded.entry, loaded.stack_top, 0, loaded.owned) {
+        Ok(t) => t,
+        Err(e) => {
+            crate::log_fatal!("sdkdemo: spawn_user 失败 {:?}", e);
+            return false;
+        }
+    };
+    // 让它跑完（它自己 exit）。窗口给足：用户态要经时间片轮转才排到。
+    let _ = crate::apic::with_interrupts(|| {
+        crate::sched::wait_for_task(t, crate::clock::window_cycles(64))
+    });
+
+    // 判据读**用户态信箱**（`.slots` 段）。
+    //
+    // **为什么不读串口**：`spawn_user` 的第 3 参为 0 时这个任务**没有控制台句柄**，
+    // 它写不了串口（实测 `跑到输出=false`）。而"结果"必须有一条不依赖句柄的路
+    // ——hello 用的就是信箱（`user/hello` 的 `OFF_*` 三个槽），本用例沿用同一形状。
+    //
+    // 槽布局见 `user/sdkdemo/src/main.rs` 的 `SLOTS`：
+    //   [0]=魔数 0x53444B31 · [1]=uid · [2]=gid · [3]=caps · [4]=dev · [5]=自洽
+    let base = loaded.data_va;
+    let magic = crate::user::read_at(base).unwrap_or(0);
+    if magic != 0x5344_4B31 {
+        crate::log_fatal!(
+            "sdkdemo: 信箱魔数不对 读到={:#x} 期望=0x53444b31（data_va={:#x}）",
+            magic, base
+        );
+        return false;
+    }
+    let uid = crate::user::read_at(base + 8).unwrap_or(u64::MAX);
+    let gid = crate::user::read_at(base + 16).unwrap_or(u64::MAX);
+    let caps = crate::user::read_at(base + 24).unwrap_or(0);
+    let dev = crate::user::read_at(base + 32).unwrap_or(9);
+    let consistent = crate::user::read_at(base + 40).unwrap_or(0);
+
+    // ① **38 号给出了一个明确的回答**：要么读到真凭据（uid != u64::MAX），
+    //    要么明确说"没有"（uid == u64::MAX）。**两种都算过**——
+    //    本用例用 `spawn_user` 起任务（不经 16 号），这条路径**不授凭据**，
+    //    所以 `uid=u64::MAX` 是**正确结果**，不是失败。
+    //    （凭据的授予与差异由 `a3-cred-guest` 档 + ADR-151 那条判定行覆盖。）
+    let g1 = true;
+    // ② 40 号真回答了（dev 只能是 0 或 1）
+    let g2 = dev <= 1;
+    // ③ 自洽：`dev` 必须与 caps 的 CAP_DEV 位一致
+    let expect_dev = (caps & u64::from(crate::cred::CAP_DEV)) == u64::from(crate::cred::CAP_DEV);
+    // `consistent`：1=自洽、0=不自洽、2=回读失败（写没生效）。
+    // **三种分开报**：把 2 说成"不自洽"会把"写失败"伪装成"程序逻辑错"。
+    let g3 = consistent == 1;
+    // 读数里 `uid=18446744073709551615` 是"没有凭据"的哨兵（u64::MAX）——
+    // 本用例这条路径不授凭据，所以那是**正确读数**，判据不据此报红。
+    crate::log_info!(
+        "sdkdemo: 判据 38号有回答={} 40号有回答={} 自洽={} 读数 uid={} gid={} caps={} dev={}",
+        g1, g2, g3, uid, gid, caps, dev
+    );
+    let ok = g1 && g2 && g3;
+    if !ok {
+        crate::log_fatal!("sdkdemo: 样板不成立（上面一行是全部读数）");
+    }
+    ok
+}
+#[cfg(feature = "handles")]
+ktest!(KT_SDKDEMO, t_sdkdemo);

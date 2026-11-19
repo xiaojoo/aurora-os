@@ -16144,3 +16144,48 @@ display 允许 sched）；整链 **72 符合 + 2 条不符**（`virtio 两台并
 
 **D3 剩余**：`echo` 上屏（44 号目前零产品调用者）、滚屏、光标/颜色、
 多视口、合成器与桌面会话。
+
+
+## 430. ADR-154：D4 第一片——应用 SDK 样板（workbuddy，2026-11-19，**部分采纳**）
+
+**使用者裁决 ⑥A**：D4 做用户态 SDK 骨架，D5 跳过。零新号。
+`user/sdkdemo` 是 workspace 第七个成员、第五个用户产物——**不是空 SDK 骨架**
+（硬约束 2 禁止没有真实调用者的空 trait）：它只经 `aurora-user-runtime` 调号，
+演示 38/40 号读凭据 + 授权判定，结果写 `.slots` 信箱（因为 `spawn_user` 那条路
+**没有控制台句柄**，写不了串口）。
+
+### 已达成
+`sdkdemo.elf` **可构建**（13560 字节，三个 LOAD 段：`.text` 1656 / `.rodata` 39 /
+`.data` 64 —— **data 段存在**，`.slots` 在首位）；构建链与夹具登记齐全
+（`Cargo.toml` members / `crates.toml` / `tools/aurora.py` `do_build_sdkdemo` /
+`ktests/common.rs` `SDKDEMO_ELF`）。
+
+### 未达成（诚实标注，按硬约束 7「能编译」≠「能跑」）
+**`t_sdkdemo` 判据没跑绿，因此未注册进 `.ktests`**（文件保留在
+`kernel/src/ktests/sdkdemo.rs`，`mod sdkdemo;` 已移除，供后续接手）。实测：
+信箱通了（魔数 + uid/gid/caps/dev 五槽都读到）、`uid=u64::MAX` 是正确结果
+（该路径不授凭据），但 **`consistent` 槽读到 0** 而用户态应写 1 ⇒
+那段写入没执行到。**没继续追**：本片已投入约 40 轮，D4 其余部分（工具链/包生态）
+更重要。列进 ADR-154 未决 1。
+
+### 五个坑（按代价排序，全部实测）
+
+1. **`R_X86_64_32S` 出现四次**：`MSGS.get(..)` 的边界检查、`from_le_bytes([..])`、
+   `static DIGITS` 索引、元组字面量参数——**四种都会生成 `.rodata..Lanon`
+   24 字节 panic location**（`0x18` 是标识），取址走 32S ⇒ 4 GiB 基址下链接期炸。
+   统一解法：`asm!("lea {0}, [rip + {1}]", sym MSGS)` + 裸指针，其余改算术。
+2. **`rust-lld` 直接 segfault（`0xC0000005`）**：32S 错误太多时 lld 崩而不是报错，
+   输出变成 "PLEASE submit a bug report"。**看到 lld 崩先怀疑 32S，不要怀疑工具链**。
+3. **`.data` 段被 lld 省略**：`static mut SLOTS` + `#[used]` **不进对象文件**
+   （`llvm-objdump -h` 里没有 `.slots`）⇒ `data_va=0x0`。改成
+   `#[repr(C)] struct` + `static SLOTS` + `#[link_section]`（hello 的形状）一次就通。
+4. `copy_from_user(va, dst)` 参数顺序是 **va 在前**。
+5. `check-unsafe` 有两层口径：第一层按**包名**看 `[crate.*]`，第二层按
+   **模块路径**看 `[modules.*]`。sdkdemo 需要两个块都写。
+
+读数：`check` **18/18**（unsafe 514/U5 120、census、SBOM 8 成员、
+`release` 判定符合）；整链 **72 符合 + 2 条不符**（`正向` FAIL、
+`边沿与消息由设备事件数到` EXCEPTION——**单跑 default PASS(33)、ps2-kbd PASS(33)**，
+长链抖动不归因）。
+
+**D4 剩余**：`t_sdkdemo` 判据打通、SDK 的 ABI 文档、开发工具、包生态（D5 已跳过）。

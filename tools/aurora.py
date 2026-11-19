@@ -171,6 +171,11 @@ EXECPROBE_PKG = "aurora-user-execprobe"
 EXECPROBE_ELF = ROOT / "target" / TARGET / "debug" / "execprobe"
 EXECPROBE_FIXTURE = ROOT / "kernel" / "fixtures" / "execprobe.elf"
 EXECPROBE_RUSTFLAGS = "-C link-arg=-Tuser/execprobe/link.ld -C relocation-model=static -C panic=abort -C opt-level=1 -C debuginfo=0"
+# D4（ADR-154）：应用 SDK 样板。构建纪律与 execprobe 逐条相同，只换包名与链接脚本。
+SDKDEMO_PKG = "aurora-user-sdkdemo"
+SDKDEMO_ELF = ROOT / "target" / TARGET / "debug" / "sdkdemo"
+SDKDEMO_FIXTURE = ROOT / "kernel" / "fixtures" / "sdkdemo.elf"
+SDKDEMO_RUSTFLAGS = "-C link-arg=-Tuser/sdkdemo/link.ld -C relocation-model=static -C panic=abort -C opt-level=1 -C debuginfo=0"
 
 
 def do_build_fileprobe() -> Path:
@@ -191,6 +196,26 @@ def do_build_fileprobe() -> Path:
     print(f"文件探针: {FILEPROBE_FIXTURE.relative_to(ROOT)}  {len(data)} 字节  "
           f"sha256={hashlib.sha256(data).hexdigest()[:12]} {'（夹具已更新）' if changed else '（与夹具一致）'}")
     return FILEPROBE_FIXTURE
+
+
+def do_build_sdkdemo() -> Path:
+    """D4（ADR-154）：构建应用 SDK 样板并落成夹具。与 do_build_execprobe 逐条同形。"""
+    r = subprocess.run(
+        [str(CARGO), "build", "--target", TARGET, "-p", SDKDEMO_PKG],
+        capture_output=True, text=True, cwd=str(ROOT),
+        env={**env(), "RUSTFLAGS": SDKDEMO_RUSTFLAGS},
+    )
+    if r.returncode != 0:
+        sys.exit("sdkdemo 构建失败：" + (r.stdout + r.stderr)[-3000:])
+    data = SDKDEMO_ELF.read_bytes()
+    SDKDEMO_FIXTURE.parent.mkdir(exist_ok=True)
+    changed = not SDKDEMO_FIXTURE.exists() or SDKDEMO_FIXTURE.read_bytes() != data
+    if changed:
+        SDKDEMO_FIXTURE.write_bytes(data)
+    import hashlib
+    print(f"SDK 样板: {SDKDEMO_FIXTURE.relative_to(ROOT)}  {len(data)} 字节  "
+          f"sha256={hashlib.sha256(data).hexdigest()[:12]} {'（夹具已更新）' if changed else '（与夹具一致）'}")
+    return SDKDEMO_FIXTURE
 
 
 def do_build_execprobe() -> Path:
@@ -260,6 +285,7 @@ def do_build(features: list[str]) -> Path:
     do_build_shell()
     do_build_fileprobe()
     do_build_execprobe()
+    do_build_sdkdemo()
     elf = kernel_binary(features)
     print(f"内核: {elf}  ({elf.stat().st_size} 字节)")
     return elf

@@ -46,6 +46,11 @@ reason = "A2 外部命令探针（ADR-130）：unsafe 需求是 msgs_base 的 RI
 scope = "src/main.rs：msgs_base 的 lea 块 · msg 的 from_raw_parts · panic 自跳转 · _start 的两处 runtime unsafe fn 调用"
 expires = "A2 收尾后若 unsafe 面扩大，回这条账重登记"
 
+[crate.aurora-user-sdkdemo]
+# D4（ADR-154）：应用 SDK 样板（部分采纳）。允许含 unsafe：
+# 它必须自己取 MSGS 基址（RIP 相对 lea）与写信箱（volatile），
+# 与 user/hello、user/execprobe 同一条纪律。
+
 [crate.aurora-user-hello]
 reason = "它是产物而不是库：唯一的 unsafe 需求是 `int 0x80` 与一个自跳转，没有任何指针算术、没有内存操作、不碰任何内核对象"
 scope = "main.rs：3 次 int 0x80（inlateout rax + in rdi/rsi）、panic 与收尾各一个 `jmp .` 自跳转"
@@ -90,12 +95,12 @@ expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe
 # 2026-11-17 ADR-133（top）：+user/shell/registry U5 2→3（`cmd_top` 取 ROLE_SELF_THREAD
 # 的 handle_of_role）。runtime 零新增——`sleep_ms` 是 safe fn `object_wait` 的薄壳，
 # 自身没有 unsafe 块。对账：467+1=468、U5 90+1=91。
-total = 502
-U1 = 83
+total = 514
+U1 = 84
 U2 = 119
 U3 = 13
 U4 = 142
-U5 = 109
+U5 = 120
 U6 = 36
 
 [modules."acpi"]
@@ -342,6 +347,20 @@ U4 = 7
 #   不变量由 `unsafe impl Sync for VmoCell` 上面那段论证与 vmo_write/vmo_read 的长度检查保证。
 U2 = 3
 U4 = 2
+
+[modules."user/sdkdemo"]
+# D4（ADR-154）：应用 SDK 样板。指针来源分两类：
+# ① U1（1 处）：`asm!("lea {0}, [rip + {1}]", sym MSGS)` —— 只做地址计算，不读内存；
+# ② U5（11 处）：`MSGS` 的裸切片（`from_raw_parts(msgs_base().add(off), len)`，
+#    off/len 是本文件手写常量，边界由 tools/aurora.py 的 MSGS 长度对账保证）、
+#    `.slots` 信箱的 `write_volatile`/`read_volatile`（定长结构，偏移常量 < 8，
+#    单线程，内核只在程序 exit 后读）、`put_u32` 的 tmp/num 裸指针写
+#    （两者都是本栈帧定长数组，索引由循环上界保证）。
+# 地址范围：`MSGS` 是 'static 定长数组、`.slots` 在 data 段首位、tmp/num 在栈上。
+# 生命周期：'static（MSGS/SLOTS）与当前栈帧（tmp/num）。对齐：u64 槽按 8 字节对齐
+# （`#[repr(C)]` + `static` 保证）。并发：单线程，无共享。
+U1 = 1
+U5 = 11
 
 [modules."user/runtime"]
 # A2（总设计切片，2026-11-16）：用户态运行时库。U1 三处 = syscall_abi 的 unsafe fn 声明

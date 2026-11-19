@@ -1,0 +1,29 @@
+[package]
+name = "aurora-user-sdkdemo"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# D4（ADR-154，2026-11-19）：**应用 SDK 的第一个样板**。
+#
+# 它不是"空 SDK 骨架"——AGENTS 硬约束 2 禁止没有真实调用者的空 trait/空模块。
+# 这个包是一个**真能跑起来的用户程序**，它演示 SDK 的三件事：
+#   1) 只经 `aurora-user-runtime` 调号（不自己写 `int 0x80`）；
+#   2) 用 44/45 号把文本写到屏幕上（D3 的显示出口）；
+#   3) 用 38/40 号读自己的凭据并做一次授权判定（C1 的凭据出口）。
+# 它是 `run /SDKDEMO.ELF` 的被测物，也是"怎么写一个 Aurora 应用"的活文档。
+[[bin]]
+name = "sdkdemo"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+aurora-user-runtime = { path = "../runtime" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

@@ -29,6 +29,12 @@ pub(crate) static FILEPROBE_ELF: &[u8] = include_bytes!("../../fixtures/fileprob
 /// `cfg` 门），构建入口 `tools/aurora.py` 的 `do_build_execprobe`。
 pub(crate) static EXECPROBE_ELF: &[u8] = include_bytes!("../../fixtures/execprobe.elf");
 
+/// D4（ADR-154）：**应用 SDK 的第一个样板**——真在 ring3 打 38/40 号（凭据与授权）
+/// 的调用方，也是"怎么写一个 Aurora 应用"的活文档。
+/// 只在 `handles` 档嵌入：38/40 号要凭据表，没有那条路它只能读到 `Err`。
+#[cfg(feature = "handles")]
+pub(crate) static SDKDEMO_ELF: &[u8] = include_bytes!("../../fixtures/sdkdemo.elf");
+
 /// M4-2 第二段：把**真 ELF** 装进用户窗口并跑起来。
 ///
 /// 与 `t_user_roundtrip` 的分工是刻意的：那条继续用内核自己编的 66 字节镜像，

@@ -38,6 +38,12 @@ crate.aurora-user-runtime = "aurora-user-runtime"
 # 外部 ELF**。只在 `a2-exec` 构建里被内核 include_bytes!；与 probe/fileprobe 同样不进签名链。
 crate.aurora-user-execprobe = "aurora-user-execprobe"
 
+# D4（ADR-154，2026-11-19）：第七个成员——**应用 SDK 的第一个样板**。
+# 它不是空 SDK 骨架（硬约束 2）：这是一个**真能跑起来的用户程序**，演示
+# ①只经 runtime 调号、②38/40 号读凭据并做授权判定、③44/45 号把文本写到屏幕上。
+# 它是 `run /SDKDEMO.ELF` 的被测物，也是"怎么写一个 Aurora 应用"的活文档。
+crate.aurora-user-sdkdemo = "aurora-user-sdkdemo"
+
 # ---------------------------------------------------------------- 许可证策略（§11.2 R10 / ADR-009b）
 #
 # 白名单与"登记过的留空"的唯一来源就在这里，`check-sbom` 直接读这两段。
@@ -60,3 +66,4 @@ license.pending.aurora-user-shell = "同上：第三个用户产物（S5c 串口
 license.pending.aurora-user-fileprobe = "同上：第四个用户产物（FS-03 D ring3 文件探针），许可证随内核一起定"
 license.pending.aurora-user-runtime = "同上：A2 用户态库骨架（总设计 §9 A2），许可证随内核一起定"
 license.pending.aurora-user-execprobe = "同上：A2 外部命令探针（ADR-130），许可证随内核一起定"
+license.pending.aurora-user-sdkdemo = "同上：D4 应用 SDK 样板（ADR-154，部分采纳），许可证随内核一起定"

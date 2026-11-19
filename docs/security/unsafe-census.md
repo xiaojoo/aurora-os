@@ -1,6 +1,6 @@
 # unsafe 逐处审计表（U1–U6）
 
-总计 502 处。U1 83 · U2 119 · U3 13 · U4 142 · U5 109 · U6 36
+总计 514 处。U1 84 · U2 119 · U3 13 · U4 142 · U5 120 · U6 36
 
 本表由 `tools/aurora.py` 的 `unsafe_sites()` 从源码逐处生成，**不是手写的**。
 机器可读的权威来源是 `docs/security/unsafe-whitelist.toml` 的 `[modules.*]` 段（模块×类别→处数），
@@ -1131,6 +1131,13 @@
   > unsafe { *NET_DEV.0.get() = Some(net) }; Ok(()) } 
 - `kernel/src/virtio.rs:982` [{] **U4** fn=`net_info`
   > unsafe { (*NET_DEV.0.get()).as_ref().map(|d| NetInfo { bdf: d.bdf, 
+
+### user/sdkdemo
+
+| 处 | 类别 | 说明 |
+|---|---|---|
+| 1 | U1 | `asm!("lea {0}, [rip + {1}]", sym MSGS)`：只做地址计算，不读内存（ADR-154）。 |
+| 11 | U5 | `MSGS` 裸切片（off/len 是手写常量，边界由 tools 侧对账）、`.slots` 信箱的 `write_volatile`/`read_volatile`（定长结构、偏移常量 < 8、单线程）、`put_u32` 的栈上 tmp/num 裸指针写。 |
 
 ### cred
 
