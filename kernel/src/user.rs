@@ -152,6 +152,9 @@ pub const PART_RECORD_LEN: usize = 48;
 pub const SYS_FB_TEXT: u64 = 44;
 /// 45（ADR-153）：清屏（把正文视口刷成底色）。无参数。
 pub const SYS_FB_CLEAR: u64 = 45;
+/// 46（ADR-157）：内核身份与内存读数（64 字节定长记录，含魔数）。
+/// `rdi`=buf、`rsi`=len。返回写入字节数。
+pub const SYS_SYSINFO: u64 = 46;
 /// 每条 ARP 表项的定长记录（10 字节：IP4 + MAC6）。与 27/31 号的 32 字节记录不同：这里的内容就是 10 字节，不垫到 32。
 pub const ARP_RECORD_LEN: usize = 10;
 /// 16：`rdi` = Proc 句柄、`rsi` = Thread 句柄、`rdx` = StartupInfo 那一页的 VMO 句柄、
@@ -1907,6 +1910,29 @@ fn sys_fb_clear(_frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     u64::from(term.clear_viewport(&f))
 }
 
+/// 46（ADR-157）：内核身份与内存读数。
+///
+/// **一次给全**：`uname`/`arch`/`meminfo` 读的是同一组事实，分三个号会让
+/// "版本读到了但架构读到空"这种半截状态变得可能。
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_sysinfo(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let len = frame.rsi as usize;
+    if len < crate::sysinfo::SYSINFO_LEN || len > 256 {
+        return E_TOO_LONG;
+    }
+    let mut buf = [0u8; 256];
+    let n = crate::sysinfo::fill(&mut buf[..len], ABI_MAJOR, ABI_MINOR);
+    if n == 0 {
+        return E_INVALID;
+    }
+    match copy_to_user(&buf[..n], frame.rdi) {
+        Ok(w) if w == n => w as u64,
+        Ok(_) => E_FAULT,
+        Err(_) => E_FAULT,
+    }
+}
+
 /// 键盘字符的读取入口。拆成小函数是为了让上面那条 `or_else` 在没开 `ps2-kbd` 时
 /// 也能编译（此时它恒返回 None，等价于原行为），而调用点不必铺 `cfg!`。
 #[cfg(not(feature = "ps2-kbd"))]
@@ -3054,6 +3080,8 @@ pub fn syscall_dispatch(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> boo
         SYS_FB_TEXT => sys_fb_text(frame),
         #[cfg(all(feature = "handles", feature = "framebuffer"))]
         SYS_FB_CLEAR => sys_fb_clear(frame),
+        #[cfg(feature = "handles")]
+        SYS_SYSINFO => sys_sysinfo(frame),
         #[cfg(feature = "handles")]
         SYS_CONSOLE_WRITE => sys_console_io(frame, true),
         #[cfg(feature = "handles")]

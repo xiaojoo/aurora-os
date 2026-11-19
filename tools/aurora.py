@@ -7921,6 +7921,53 @@ def _lspci_rows(log: str) -> bool:
     return False
 
 
+def _sysinfo_rows(log: str) -> bool:
+    """`uname` / `arch` / `meminfo` 的显示层判据（ADR-157，§10.3 的三条）。
+
+    三格，各自可核：
+
+    ① `uname` 之后出现 `aurora <版本串>`，且**版本串非空**——
+       它来自 46 号记录第 48..64 字节（内核写的），不是 shell 硬编码。
+    ② `arch` 之后出现 `x86_64`。
+    ③ `meminfo` 之后出现 `total=<n> free=<n> used=<n> page=<n>`（判据先 strip，故不要求前导空格），且
+       **`total > 0`、`used == total - free`**（自洽）——后者是关键：
+       内核算的 used 与两个独立读数必须对得上，对不上就是记录布局错了。
+
+    判据不依赖具体内存大小（换 QEMU -m 也成立），只要求非零与自洽。
+    """
+    import re
+    ver = re.compile(r"^aurora \S+$")
+    mem = re.compile(r"^total=(\d+) free=(\d+) used=(\d+) page=(\d+)$")
+    lines = log.split("\n")
+    uname_ok = False
+    arch_ok = False
+    mem_ok = False
+    for k, ln in enumerate(lines):
+        s = ln.strip()
+        if s == "uname":
+            for j in range(k + 1, min(k + 6, len(lines))):
+                if ver.match(lines[j].strip()):
+                    uname_ok = True
+                    break
+        if s == "arch":
+            for j in range(k + 1, min(k + 6, len(lines))):
+                if lines[j].strip() == "x86_64":
+                    arch_ok = True
+                    break
+        if s == "meminfo":
+            for j in range(k + 1, min(k + 6, len(lines))):
+                m = mem.match(lines[j].strip())
+                if m:
+                    total = int(m.group(1))
+                    free = int(m.group(2))
+                    used = int(m.group(3))
+                    page = int(m.group(4))
+                    if total > 0 and page > 0 and used == total - free:
+                        mem_ok = True
+                    break
+    return uname_ok and arch_ok and mem_ok
+
+
 def _fs_cmd_rows(log: str) -> bool:
     """`stat` / `file` 的显示层判据（ADR-156，§10.2 的四个只读命令）。
 
@@ -9120,6 +9167,8 @@ def do_test(timeout: int) -> int:
         _pipe_rows(ashlog),
         # stat / file（ADR-156）：元数据三数可核 + 类型判定有明确回答
         _fs_cmd_rows(ashlog),
+        # uname / arch / meminfo（ADR-157）：版本非空 + 架构名 + 内存三数自洽
+        _sysinfo_rows(ashlog),
         # part（ADR-152）：**不在 argv 判定链里**——它会卡在故障盘上（口 0 被 wedge，
         # 任何 I/O 重试到取证耗尽）。C3 的验收由内核 ktest `t_part_read`（合成盘）承担，
         # 见 ADR-152「影响/负面 2」。

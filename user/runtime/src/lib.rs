@@ -1142,6 +1142,29 @@ pub const SYS_NET_INFO: u64 = 35;
 /// 网卡读数包（18 字节定长）：MAC6 + 本机 IP4 + 网关4 + DNS4。
 /// 读数包 24 字节（ADR-144 从 18 扩到 24）：MAC6 + 本机IP4 + 网关4 + DNS4 + mtu2 + link2。
 pub const NET_INFO_BYTES: usize = 28;
+/// 46（ADR-157）：内核身份与内存读数。
+pub const SYS_SYSINFO: u64 = 46;
+/// 记录定长。
+pub const SYSINFO_LEN: usize = 64;
+/// 记录魔数（"SINF"）。
+pub const SYSINFO_MAGIC: u32 = 0x5349_4E46;
+/// 架构号：x86-64。
+pub const ARCH_X86_64: u32 = 1;
+
+/// 46：读内核身份与内存读数（64 字节记录）。
+pub fn sysinfo() -> Result<[u8; SYSINFO_LEN], RTError> {
+    let mut blk = [0u8; SYSINFO_LEN];
+    // SAFETY: 46 号 rdi=buf、rsi=len（内核 copy_to_user 写回 64 字节定长）。
+    let ret = unsafe {
+        syscall_abi(SYS_SYSINFO, blk.as_mut_ptr() as u64, blk.len() as u64, 0, 0)
+    } as i64;
+    if ret < 0 {
+        Err(RTError(ret))
+    } else {
+        Ok(blk)
+    }
+}
+
 /// 44/45（ADR-153，D3）：帧缓冲文本出口。
 pub const SYS_FB_TEXT: u64 = 44;
 pub const SYS_FB_CLEAR: u64 = 45;

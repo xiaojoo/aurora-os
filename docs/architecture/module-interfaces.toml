@@ -173,7 +173,7 @@ status = "部分落地"
 module_id = "memory"
 owner = "memory"
 layer = "core"
-source_modules = ["mm", "heap", "vmo"]
+source_modules = ["mm", "heap", "vmo", "sysinfo"]
 public_api = [
   "heap::AuroraGlobal",
   "heap::LARGE_MAX",
@@ -277,6 +277,11 @@ public_api = [
   "mm::total_frames",
   "mm::usable_bytes",
   "mm::with_vmm_lock",
+  "sysinfo::SYSINFO_LEN",
+  "sysinfo::SYSINFO_MAGIC",
+  "sysinfo::ARCH_X86_64",
+  "sysinfo::VERSION",
+  "sysinfo::fill",
 ]
 allowed_callers = ["arch", "capability", "diagnostics", "display", "driver", "input", "integration", "irq", "pci", "resource", "sched", "storage"]
 dependencies = ["arch", "boot", "diagnostics", "resource", "sync", "time"]

@@ -33,6 +33,8 @@ use crate::{
     M_GREP_NOIN, M_GREP_USAGE,
     M_STAT_USAGE, M_STAT_KIND, M_STAT_SIZE, M_STAT_FNV, M_HEAD_USAGE, M_TAIL_USAGE,
     M_FILE_USAGE, M_FILE_ELF, M_FILE_EMPTY, M_FILE_TEXT, M_FILE_BIN,
+    M_UNAME_USAGE, M_UNAME_OUT, M_ARCH_USAGE, M_ARCH_OUT,
+    M_MEM_USAGE, M_MEM_TOTAL, M_MEM_FREE, M_MEM_USED, M_MEM_PAGE,
     M_DMESG_USAGE, M_KILLED, M_KILL_USAGE, M_LSDEV_USAGE, M_LSPCI_USAGE,
     M_IP_ADDR, M_IP_DNS, M_IP_DOWN, M_IP_GW, M_IP_LINK, M_IP_MAC, M_IP_MTU, M_IP_STATE, M_IP_UP,
     M_COLON, M_IP_USAGE, M_NEIGH_EMPTY, M_PING_DOT, M_PING_FROM, M_PING_SEQ,
@@ -92,6 +94,9 @@ const CMD_STAT: [u8; 4] = [b's', b't', b'a', b't'];
 const CMD_HEAD: [u8; 4] = [b'h', b'e', b'a', b'd'];
 const CMD_TAIL: [u8; 4] = [b't', b'a', b'i', b'l'];
 const CMD_FILE: [u8; 4] = [b'f', b'i', b'l', b'e'];
+const CMD_UNAME: [u8; 5] = [b'u', b'n', b'a', b'm', b'e'];
+const CMD_ARCH: [u8; 4] = [b'a', b'r', b'c', b'h'];
+const CMD_MEMINFO: [u8; 7] = [b'm', b'e', b'm', b'i', b'n', b'f', b'o'];
 const CMD_IP: [u8; 2] = [b'i', b'p'];
 const CMD_ABI: [u8; 3] = [b'a', b'b', b'i'];
 const CMD_EXIT: [u8; 4] = [b'e', b'x', b'i', b't'];
@@ -2015,6 +2020,114 @@ fn file_classify(c: &Ctx, path: &[u8]) {
     }
 }
 
+/// ADR-157：`uname` —— 内核身份（46 号 `SYS_SYSINFO`）。
+///
+/// **版本串从内核读，不在用户态硬编码**：46 号记录第 48..64 字节是
+/// 内核自己写的版本串。这条命令的存在意义就是"用户态不编造内核身份"。
+#[inline(never)]
+fn cmd_uname(c: &Ctx) -> bool {
+    if c.p.err.is_some() || c.p.args.count() != 0 {
+        con_write(c.h, msg(M_UNAME_USAGE));
+        return true;
+    }
+    let rec = match rt::sysinfo() {
+        Ok(v) => v,
+        Err(_) => { con_write(c.h, msg(M_UNAME_USAGE)); return true; }
+    };
+    // 魔数校验：不是 sysinfo 记录就不打印（不猜）
+    let magic = u32::from(rec.get(0).copied().unwrap_or(0))
+        | (u32::from(rec.get(1).copied().unwrap_or(0)) << 8)
+        | (u32::from(rec.get(2).copied().unwrap_or(0)) << 16)
+        | (u32::from(rec.get(3).copied().unwrap_or(0)) << 24);
+    if magic != rt::SYSINFO_MAGIC {
+        con_write(c.h, msg(M_UNAME_USAGE));
+        return true;
+    }
+    con_write(c.h, msg(M_UNAME_OUT));
+    con_write(c.h, msg(M_SP));
+    // 版本串：第 48..64 字节，0 结尾
+    let mut k = 0usize;
+    while k < 16 {
+        let ch = rec.get(48 + k).copied().unwrap_or(0);
+        if ch == 0 { break; }
+        let one = [ch];
+        con_write(c.h, &one);
+        k += 1;
+    }
+    con_write(c.h, msg(M_NL));
+    true
+}
+
+/// ADR-157：`arch` —— 架构名（46 号记录第 8..12 字节的架构号）。
+///
+/// 架构号是**数字**（1 = x86-64），名字由用户态映射：数字不让内核占 `.rodata`。
+#[inline(never)]
+fn cmd_arch(c: &Ctx) -> bool {
+    if c.p.err.is_some() || c.p.args.count() != 0 {
+        con_write(c.h, msg(M_ARCH_USAGE));
+        return true;
+    }
+    let rec = match rt::sysinfo() {
+        Ok(v) => v,
+        Err(_) => { con_write(c.h, msg(M_ARCH_USAGE)); return true; }
+    };
+    let a = u32::from(rec.get(8).copied().unwrap_or(0))
+        | (u32::from(rec.get(9).copied().unwrap_or(0)) << 8)
+        | (u32::from(rec.get(10).copied().unwrap_or(0)) << 16)
+        | (u32::from(rec.get(11).copied().unwrap_or(0)) << 24);
+    if a == rt::ARCH_X86_64 {
+        con_write(c.h, msg(M_ARCH_OUT));
+        con_write(c.h, msg(M_NL));
+    } else {
+        // 认不出的架构号：打数字，不猜名字
+        put_u64(c.h, u64::from(a));
+        con_write(c.h, msg(M_NL));
+    }
+    true
+}
+
+/// ADR-157：`meminfo` —— 物理页统计（46 号记录第 16..48 字节）。
+///
+/// 四个数：total / free / used / page。**`used` 是内核算的**（总-空闲），
+/// 不让用户态自己减——减法做在两边就有两个答案。
+#[inline(never)]
+fn cmd_meminfo(c: &Ctx) -> bool {
+    if c.p.err.is_some() || c.p.args.count() != 0 {
+        con_write(c.h, msg(M_MEM_USAGE));
+        return true;
+    }
+    let rec = match rt::sysinfo() {
+        Ok(v) => v,
+        Err(_) => { con_write(c.h, msg(M_MEM_USAGE)); return true; }
+    };
+    mem_print(c, &rec);
+    true
+}
+
+/// `meminfo` 的输出。**单独成函数**（函数专属 `.rodata` 常量池的纪律）。
+#[inline(never)]
+fn mem_print(c: &Ctx, rec: &[u8; rt::SYSINFO_LEN]) {
+    let rd = |off: usize| -> u64 {
+        let mut v = 0u64;
+        let mut k = 0usize;
+        while k < 8 {
+            let b = u64::from(rec.get(off + k).copied().unwrap_or(0));
+            v |= b << (8 * k);
+            k += 1;
+        }
+        v
+    };
+    con_write(c.h, msg(M_MEM_TOTAL));
+    put_u64(c.h, rd(16));
+    con_write(c.h, msg(M_MEM_FREE));
+    put_u64(c.h, rd(24));
+    con_write(c.h, msg(M_MEM_USED));
+    put_u64(c.h, rd(40));
+    con_write(c.h, msg(M_MEM_PAGE));
+    put_u64(c.h, rd(32));
+    con_write(c.h, msg(M_NL));
+}
+
 /// 分派一条已解析的命令。返回 false = 退出 shell。
 ///
 /// 每个分支都是"名字 immediate 比较 → 直接调用处理器"，不写 `match lookup()`：
@@ -2072,6 +2185,15 @@ pub fn dispatch(h: ConsoleHandle, si_va: u64, p: &Parsed, st: &mut ShellState) -
     }
     if streq(p.cmd, &CMD_FILE) {
         return cmd_file(&c);
+    }
+    if cmd_is(p.cmd, &CMD_UNAME) {
+        return cmd_uname(&c);
+    }
+    if streq(p.cmd, &CMD_ARCH) {
+        return cmd_arch(&c);
+    }
+    if cmd_is(p.cmd, &CMD_MEMINFO) {
+        return cmd_meminfo(&c);
     }
     if streq(p.cmd, &CMD_ABI) {
         return cmd_abi(&c);

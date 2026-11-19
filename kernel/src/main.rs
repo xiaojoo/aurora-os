@@ -60,6 +60,7 @@ mod resource;
 mod user;
 mod pci;
 mod state_store;
+mod sysinfo;
 mod watchdog;
 mod tsc;
 mod virtio;
@@ -1634,7 +1635,7 @@ fn stage_init_user(sid: u8) -> Option<usize> {
     // 描述表最多 4 条（24 + 4×16 = 88），280 在页内且不与表重叠（ADR-130 决策 2 的校验）。
     #[cfg(feature = "a3-shell")]
     {
-        const A3_CMD: &[u8] = b"run /HELLO.ELF; ls; cat /NOTES; ps; free; top 2; kill 9999; lspci; uptime; sleep 1100; uptime; top 2; uptime; ping 10.0.2.2; ip link; ip addr; ip neigh; ip route; lsdev; devctl status; whoami; id; clear; ls | wc; ls | grep NOTES; stat /NOTES; file /NOTES; dmesg ";
+        const A3_CMD: &[u8] = b"run /HELLO.ELF; ls; cat /NOTES; ps; free; top 2; kill 9999; lspci; uptime; sleep 1100; uptime; top 2; uptime; ping 10.0.2.2; ip link; ip addr; ip neigh; ip route; lsdev; devctl status; whoami; id; clear; ls | wc; ls | grep NOTES; stat /NOTES; file /NOTES; uname; arch; meminfo; dmesg ";
         const A3_CMD_DEEP: &[u8] = b"pwd; cd /PROJECT; pwd; ls DOCS; cat DOCS/NESTED.TXT; cd ..; ls; ps; free ";
         let cmd: &[u8] = if cfg!(feature = "a3-ls-deep") { A3_CMD_DEEP } else { A3_CMD };
         hdr[12..16].copy_from_slice(&280u32.to_le_bytes());

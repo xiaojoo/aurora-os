@@ -16260,3 +16260,45 @@ display 允许 sched）；整链 **72 符合 + 2 条不符**（`virtio 两台并
 
 **§10.2 剩余**：`touch`/`mkdir`/`rmdir`/`rm`/`cp`/`mv`（FAT32 写路径）、
 `find`（递归遍历）、`grep`（已有）、`wc`（.rodata 常量池）、`df`/`du`（需 statfs）。
+
+
+## 433. ADR-157：§10.3 三条 uname/arch/meminfo（workbuddy，2026-11-19）
+
+**审计第 4 项**。新增 **46 号 `SYS_SYSINFO`**：64 字节定长记录一次给全
+（魔数/ABI 主次/架构号/页总/页空闲/页大小/页已用/版本串）。
+**不拆三个号**：三条命令读同一组事实，拆开会让"版本读到但架构读到空"变得可能。
+
+**关键判断**：**版本串的唯一来源是内核**（`sysinfo::VERSION`）。
+shell 里那句 `Aurora OS 6.1.0-aurora` 是登录横幅，不是 `uname` 的来源——
+把版本写死在用户态等于用户态自己编造内核身份。架构号用**数字**（1=x86-64）
+不用字符串：字符串在内核要占 `.rodata` 并被取址 ⇒ 32S。`used` 由**内核算**，
+不让用户态减（减法做两边就有两个答案）。
+
+**实测**（PASS33 15.1s）：
+```
+uname   → aurora 6.1.0-aurora
+arch    → x86_64
+meminfo → total=130780 free=128329 used=2451 page=4096
+```
+`total=130780` 与启动日志 `mm: frames total=130780` **逐字一致**，`used` 自洽。
+新增判定格 `_sysinfo_rows` 三格（版本非空 / x86_64 / 三数自洽）。
+**变异证红**：`used` 写成 `rd(40)+1` ⇒ False，还原 True。
+
+### 两个坑
+
+1. **`meminfo` 消息切分算错**：一条 `" total= free= used= page="`（25 字节）按
+   `(1253,8)/(1261,7)/(1268,7)/(1275,3)` 切，正确是 `(1253,7)/(1260,6)/(1266,6)/(1272,6)`。
+   错切让四个数字**交错**：`total= 130780free= u128329sed= pa2451ge=4096`。
+   **`(offset,len)` 必须按子串实际长度算**。
+2. **判定格正则要求前导空格**：`^ total=` 配 `strip()` 后的行永远不匹配（要 `^total=`）。
+
+### 门禁抓到的设计缺陷（不是我想到的）
+
+第一版 `sysinfo::fill` 内部读 `crate::user::ABI_MAJOR/MINOR`，把 `memory` 拖进
+`diagnostics` 的依赖里 ⇒ `check-module-interfaces` 报 **SCC 环从 11 涨到 15 个模块**。
+修法：ABI 两版由调用方传进来，`sysinfo` 只依赖 `mm`，环回基线。
+
+读数：`check` **18/18**（unsafe 521/U5 126）；整链 **74 符合 + 0 不符（全绿）**。
+§10.3 从 **6/12 → 9/12**。
+
+**§10.3 剩余**：`date`（需真机 RTC）、`reboot`/`poweroff`（需 ACPI 电源状态机 + ADR）。
