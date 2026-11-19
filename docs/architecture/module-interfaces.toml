@@ -14,7 +14,7 @@ error_classes = ["A", "B", "C", "D"]
 module_id = "boot"
 owner = "boot"
 layer = "boot"
-source_modules = ["limine", "boot_guard"]
+source_modules = ["boot/limine", "boot/boot_guard"]
 public_api = [
   "boot_guard::BootMode",
   "boot_guard::decide",
@@ -33,7 +33,7 @@ public_api = [
   "limine::hhdm_offset",
   "limine::release_mp_cpu",
 ]
-allowed_callers = ["arch", "display", "integration", "memory", "sched", "storage"]
+allowed_callers = ["arch", "display", "driver", "integration", "memory", "sched"]
 dependencies = ["diagnostics"]
 forbidden_dependencies = []
 known_violations = []
@@ -41,7 +41,7 @@ context = ["BOOT", "KERNEL"]
 error_classes = ["A", "D"]
 resource_ownership = "Limine 交接信息的规范化副本、启动阶段状态与启动健康计数；不拥有物理帧分配策略。"
 error_policy = "启动信息缺失/基线版本不支持 → BootInvalid(37)；不把缺失能力降级成默认值。"
-unsafe_scope = ["limine:U2,U3"]
+unsafe_scope = ["boot/limine:U2,U3"]
 test_targets = ["t_revision_tag_rewritten", "t_memmap_usable_ge_32mib", "t_hhdm_is_canonical_and_below_kernel", "t_pf_probe_recovers", "t_all_32_vectors_distinct", "t_boot_guard", "t_negative_probe_must_fail"]
 status = "部分落地"
 
@@ -49,7 +49,10 @@ status = "部分落地"
 module_id = "arch"
 owner = "arch"
 layer = "arch"
-source_modules = ["arch", "arch/x86_64", "arch/x86_64/apic", "arch/x86_64/cpu", "hooks", "arch/x86_64/cpuid", "arch/x86_64/smp", "arch/x86_64/trap"]
+source_modules = [
+  "arch", "arch/x86_64", "arch/x86_64/apic", "arch/x86_64/cpu", "arch/hooks",
+  "arch/x86_64/cpuid", "arch/x86_64/smp", "arch/x86_64/trap"
+]
 public_api = [
   "apic::ApicError",
   "apic::TimerError",
@@ -157,7 +160,9 @@ public_api = [
   "x86_64::trap",
   "x86_64::smp",
 ]
-allowed_callers = ["diagnostics", "driver", "input", "integration", "irq", "memory", "sched", "storage", "sync", "time"]
+allowed_callers = [
+  "diagnostics", "driver", "input", "integration", "irq", "memory", "sched", "sync", "time"
+]
 dependencies = ["boot", "diagnostics", "irq", "memory", "pci", "sync", "time"]
 forbidden_dependencies = ["sched"]
 known_violations = []
@@ -165,7 +170,7 @@ context = ["BOOT", "KERNEL", "IRQ_OFF", "ISR_TOP", "USER_ENTRY", "PANIC"]
 error_classes = ["A", "C", "D"]
 resource_ownership = "CPU 特性快照、GDT/IDT/TSS、LAPIC/IOAPIC、每 CPU 槽位与上线状态、TrapFrame 与上下文布局。"
 error_policy = "非法向量/未映射 → 明确错误；必需 CPU 特性缺失 → BootInvalid(37)；致命异常 → L4(39)。"
-unsafe_scope = ["arch/x86_64/apic:U1,U2,U4", "arch/x86_64/cpu:U1", "hooks:U4", "arch/x86_64/smp:U1,U4", "arch/x86_64/trap:U1,U4"]
+unsafe_scope = ["arch/x86_64/apic:U1,U2,U4", "arch/x86_64/cpu:U1", "arch/hooks:U4", "arch/x86_64/smp:U1,U4", "arch/x86_64/trap:U1,U4"]
 test_targets = ["t_cpu_ids_agree", "t_ap_released_and_ticking", "t_ap_boot_abi", "t_exception_stack_guard", "t_tlb_shootdown", "t_percpu_queues", "t_if_belongs_to_cpu", "t_if_patch_both_branches", "t_cross_cpu_lock_contention", "t_pic_still_masked"]
 status = "部分落地"
 
@@ -173,7 +178,7 @@ status = "部分落地"
 module_id = "memory"
 owner = "memory"
 layer = "core"
-source_modules = ["mm", "heap", "vmo", "sysinfo"]
+source_modules = ["memory/mm", "memory/heap", "memory/vmo", "memory/sysinfo"]
 public_api = [
   "heap::AuroraGlobal",
   "heap::LARGE_MAX",
@@ -283,7 +288,10 @@ public_api = [
   "sysinfo::VERSION",
   "sysinfo::fill",
 ]
-allowed_callers = ["arch", "capability", "diagnostics", "display", "driver", "input", "integration", "irq", "pci", "resource", "sched", "storage"]
+allowed_callers = [
+  "arch", "capability", "diagnostics", "display", "driver", "input", "integration", "irq",
+  "pci", "resource", "sched"
+]
 dependencies = ["arch", "boot", "diagnostics", "resource", "sync", "time"]
 forbidden_dependencies = ["storage"]
 known_violations = []
@@ -291,7 +299,7 @@ context = ["KERNEL", "IRQ_OFF", "PANIC"]
 error_classes = ["A", "B", "C", "D"]
 resource_ownership = "物理帧分配状态、VA 保留表、页表（含每个非内核 AS 自己建的表页）、Mapping 所有权对象、内核堆、TLB shootdown 请求与回执；VMO 对象表与它的引用计数、往指定 AS 铺的共享映射（AspaceMapping 只持 frame_get 参考，不拥有帧）。"
 error_policy = "非法参数/未映射 → Err；耗尽 → OutOfMemory/ResourceExhausted；DoubleFree/所有权破坏/shootdown 超时 → L4。"
-unsafe_scope = ["mm:U1,U2,U4", "heap:U2", "vmo:U2,U4"]
+unsafe_scope = ["memory/mm:U1,U2,U4", "memory/heap:U2", "memory/vmo:U2,U4"]
 test_targets = ["t_alloc_free_returns_frames", "t_map_write_unmap", "t_guard_page_blocks_access", "t_wx_construction_rejected", "t_map_refused_inside_huge_page", "t_double_free_must_escalate", "t_global_allocator_backs_vec", "t_heap_reuses_freed_slot", "t_heap_rejects_oversize", "t_heap_slots_are_mapped", "t_split_huge", "t_map_hole", "t_demand_zero", "t_vmo_object", "t_aspace_map_vmo", "t_aspace_switch_isolation"]
 status = "部分落地"
 
@@ -299,7 +307,7 @@ status = "部分落地"
 module_id = "sched"
 owner = "sched"
 layer = "service"
-source_modules = ["sched", "proc", "user", "elf"]
+source_modules = ["sched", "sched/proc", "sched/user", "sched/elf"]
 public_api = [
   "sched::record_exit_code",
   "user::exec_verify_counters",
@@ -411,14 +419,17 @@ public_api = [
   "sched::set_cred",
 ]
 allowed_callers = ["integration"]
-dependencies = ["arch", "boot", "capability", "diagnostics", "input", "memory", "pci", "security", "storage", "sync", "time", "display"]
+dependencies = [
+  "arch", "boot", "capability", "diagnostics", "display", "driver", "input", "memory", "pci",
+  "security", "storage", "sync", "time"
+]
 forbidden_dependencies = []
 known_violations = []
 context = ["KERNEL", "IRQ_OFF", "ISR_TOP"]
 error_classes = ["A", "B", "D"]
 resource_ownership = "任务槽位、每 CPU 运行队列、当前任务与 CPU 归属、任务状态、任务拥有的映射集合、退出与待回收状态；进程与 Job 记录（定长表、僵尸期保留到被收走）。"
 error_policy = "创建失败 → MmError；非法槽位 → false/None；退出与延迟回收不返回业务错误，账目不平 → FAIL/L4。"
-unsafe_scope = ["sched:U1,U2,U4", "proc:U4", "user:U1,U2,U4,U5"]
+unsafe_scope = ["sched/mod:U1,U2,U4", "sched/proc:U4", "sched/user:U1,U2,U4,U5"]
 test_targets = ["t_preempt_round_robin", "t_task_stack_guard", "t_task_exit", "t_user_roundtrip", "t_elf_container", "t_elf_load_run", "t_user_pointer_checks", "t_copy_user", "t_syscall_fastpath", "t_proc_job_wait", "t_q2_workload_slots"]
 status = "部分落地"
 
@@ -453,7 +464,7 @@ context = ["KERNEL", "IRQ_OFF", "ISR_TOP"]
 error_classes = ["A", "D"]
 resource_ownership = "锁状态、持有者信息、每 CPU 锁序状态、竞争与等待超时统计。"
 error_policy = "rank 违例/重入 → L4；等待超时只记账，由调用方决定是否失败。"
-unsafe_scope = ["sync:U1,U4"]
+unsafe_scope = ["sync/mod:U1,U4"]
 test_targets = ["t_lock_reentry_must_escalate"]
 status = "部分落地"
 
@@ -464,7 +475,7 @@ status = "部分落地"
 module_id = "display"
 owner = "display"
 layer = "hal"
-source_modules = ["frame", "fbcon"]
+source_modules = ["display/frame", "display/fbcon"]
 public_api = [
   "fbcon::BAND_ROWS",
   "fbcon::drain_and_draw",
@@ -520,23 +531,28 @@ status = "部分落地"
 module_id = "driver"
 owner = "driver"
 layer = "hal"
-source_modules = ["driver"]
+source_modules = ["driver", "driver/ahci", "driver/virtio"]
 public_api = [
-  "driver::DriverCtx",
-  "driver::DmaHandle",
-  "driver::DriverError",
-  "driver::IrqHandle",
-  "driver::MmioHandle",
+  "driver::DriverCtx", "driver::DmaHandle", "driver::DriverError", "driver::IrqHandle",
+  "driver::MmioHandle", "ahci::REG_CAP", "ahci::REG_GHC", "ahci::SECTOR", "ahci::boot_port",
+  "ahci::fnv1a64", "ahci::init", "ahci::read_bytes", "ahci::write_bytes", "ahci::AhciError",
+  "virtio::VirtioError", "virtio::read_block", "virtio::write_block", "virtio::read_block_at",
+  "virtio::write_block_at", "virtio::NET_TX_MAX", "virtio::DHCP_GUEST_IP",
+  "virtio::NET_GATEWAY_IP", "virtio::NET_DNS_IP", "virtio::bind_net", "virtio::send_raw",
+  "virtio::receive", "virtio::net_info", "virtio::arp_len", "virtio::arp_read_from",
+  "virtio::arp_learn_from_frame", "virtio::NET_SUBNET_MASK", "ahci::State", "ahci::info",
+  "ahci::state", "virtio::DNS_FRAME_BYTES", "virtio::DnsReply", "virtio::arp_lookup",
+  "virtio::build_dns_query_name", "virtio::parse_dns_reply", "virtio::DNS_NAME_MAX"
 ]
-allowed_callers = ["integration", "storage"]
-dependencies = ["arch", "irq", "memory", "pci"]
+allowed_callers = ["diagnostics", "integration", "sched", "storage"]
+dependencies = ["arch", "boot", "irq", "memory", "pci", "time"]
 forbidden_dependencies = ["storage"]
 known_violations = []
 context = ["KERNEL"]
 error_classes = ["A", "B", "C"]
 resource_ownership = "驱动模块身份、MMIO/DMA 能力句柄表、槽位与 generation、授权与撤销状态、驱动资源统计。"
 error_policy = "Denied/WrongContext/ResourceExhausted/MappingError；越权/世代不匹配 → 拒绝并记事件。"
-unsafe_scope = ["driver:U3,U4"]
+unsafe_scope = ["driver/mod:U3,U4", "driver/ahci:U4", "driver/virtio:U4"]
 test_targets = ["t_driver_ctx"]
 status = "部分落地"
 
@@ -544,7 +560,7 @@ status = "部分落地"
 module_id = "pci"
 owner = "pci"
 layer = "hal"
-source_modules = ["pci", "acpi", "hw"]
+source_modules = ["bus/pci", "bus/acpi", "bus/hw"]
 public_api = [
   "acpi::Madt",
   "acpi::gsi_for",
@@ -565,7 +581,7 @@ public_api = [
   "pci::init",
   "hw::MmioRegion",
 ]
-allowed_callers = ["arch", "diagnostics", "display", "driver", "input", "integration", "sched", "storage"]
+allowed_callers = ["arch", "diagnostics", "display", "driver", "input", "integration", "sched"]
 dependencies = ["memory"]
 forbidden_dependencies = ["storage"]
 known_violations = []
@@ -573,7 +589,7 @@ context = ["BOOT", "KERNEL"]
 error_classes = ["A", "B"]
 resource_ownership = "PCI 枚举快照、BDF、BAR 描述、能力结构解析结果、总线访问后端；ACPI 固定表快照。"
 error_policy = "非法 BDF/越界 → None/Err；枚举只描述设备，不猜设备类型。"
-unsafe_scope = ["pci:U2,U4", "acpi:U2,U4", "hw:U1,U2"]
+unsafe_scope = ["bus/pci:U2,U4", "bus/acpi:U2,U4", "bus/hw:U1,U2"]
 test_targets = ["t_pci_config", "t_irq_probe", "t_acpi_tables_and_checksums", "t_acpi_madt_shape", "t_acpi_fadt_and_mcfg", "t_mp_agrees_with_madt", "t_madt_offsets_synthetic", "t_apic_handoff_state", "t_rsdp_signature_at_virtual_addr"]
 status = "部分落地"
 
@@ -596,7 +612,7 @@ public_api = [
   "irq::request",
   "irq::set_affinity",
 ]
-allowed_callers = ["arch", "diagnostics", "driver", "input", "integration", "storage"]
+allowed_callers = ["arch", "diagnostics", "driver", "input", "integration"]
 dependencies = ["arch", "memory"]
 forbidden_dependencies = []
 known_violations = []
@@ -604,7 +620,7 @@ context = ["KERNEL", "IRQ_OFF", "ISR_TOP"]
 error_classes = ["A", "C"]
 resource_ownership = "向量认领表、所有者、目的 CPU、消息编程与完成计数；顶半只记账不越权。"
 error_policy = "NoSuchHandle/StaleHandle/Denied；未认领中断 → 计数后 EOI。"
-unsafe_scope = ["irq:U4"]
+unsafe_scope = ["irq/mod:U4"]
 test_targets = ["t_irq_ahci", "t_irq_probe", "t_irq_affinity"]
 status = "部分落地"
 
@@ -612,118 +628,39 @@ status = "部分落地"
 module_id = "storage"
 owner = "storage"
 layer = "service"
-source_modules = ["ahci", "virtio", "filesystem", "filesystem/block_io", "filesystem/fat32", "filesystem/fs_open", "filesystem/fs_rw", "filesystem/gpt", "filesystem/vfs", "filesystem/vfs_ro", "filesystem/part"]
-public_api = [
-  "ahci::REG_CAP",
-  "ahci::REG_GHC",
-  "ahci::SECTOR",
-  "ahci::boot_port",
-  "ahci::fnv1a64",
-  "ahci::init",
-  "ahci::read_bytes",
-  "ahci::write_bytes",
-  "filesystem::block_io",
-  "filesystem::fat32",
-  "filesystem::fs_open",
-  "filesystem::gpt",
-  "filesystem::vfs",
-  "filesystem::vfs_ro",
-  "gpt::Entry",
-  "gpt::GptError",
-  "gpt::Header",
-  "gpt::Table",
-  "gpt::crc32",
-  "gpt::find_by_type",
-  "gpt::find_esp",
-  "gpt::parse_header",
-  "gpt::protective_mbr",
-  "gpt::scan",
-  "gpt::ESP_TYPE_GUID",
-  "gpt::MAX_ARRAY_BYTES",
-  "gpt::MAX_ENTRIES",
-  "gpt::MAX_ENTRY_BYTES",
-  "vfs::AhciDisk",
-  "vfs::SECTOR_BYTES",
-  "ahci::AhciError",
-  "fat32::FileCursor",
-  "fat32::FsError",
-  "fat32::MAX_CLUSTERS_WALKED",
-  "fat32::FAT16_ENTRY_BYTES",
-  "fs_open::DIRENT_RECORD_LEN",
-  "fs_open::Opened",
-  "fs_open::PORT",
-  "fs_open::port",
-  "fs_open::set_port",
-  "fs_open::OPEN_READ_ONLY",
-  "fs_open::OPEN_WRITE",
-  "fs_rw::PORT",
-  "filesystem::fs_rw",
-  "fs_open::STAT_KIND_FILE",
-  "fs_open::STAT_RECORD_LEN",
-  "fs_open::dirent_record",
-  "fs_open::open",
-  "fs_open::stat_record",
-  "vfs_ro::DirState",
-  "vfs_ro::Entry",
-  "vfs_ro::PATH_MAX",
-  "vfs_ro::ReadCursor",
-  "vfs_ro::ReadOnlyFs",
-  "vfs_ro::VfsError",
-  "vfs_ro::read_disk",
-  "vfs_ro::seek_disk",
-  "vfs_ro::write_at",
-  "block_io::Budget",
-  "block_io::read_checked",
-  "vfs::Block",
-  "vfs::BlockError",
-  "vfs::FileStat",
-  "vfs::Partition",
-  "vfs::PartitionView",
-  "vfs::DiskKey",
-  "virtio::VirtioError",
-  "virtio::read_block",
-  "virtio::write_block",
-  "virtio::read_block_at",
-  "virtio::write_block_at",
-  # ADR-143：网卡三原语的用户态出口（33/34/35 号）与帧构造常量
-  "virtio::NET_TX_MAX",
-  "virtio::DHCP_GUEST_IP",
-  "virtio::NET_GATEWAY_IP",
-  "virtio::NET_DNS_IP",
-  "virtio::bind_net",
-  "virtio::send_raw",
-  "virtio::receive",
-  "virtio::net_info",
-  "virtio::arp_len",
-  "virtio::arp_read_from",
-  "virtio::arp_learn_from_frame",
-  "virtio::NET_SUBNET_MASK",
-  "ahci::State",
-  "ahci::info",
-  "ahci::state",
-  "filesystem/part::PART_RECORD_LEN",
-  "filesystem/part::PartError",
-  "filesystem/part::PartInfo",
-  "filesystem/part::part_read_block",
-  "filesystem/part::part_read_from",
-  "filesystem::part",
-  "gpt::HEADER_LBA",
-  "virtio::DNS_FRAME_BYTES",
-  "virtio::DnsReply",
-  "virtio::arp_lookup",
-  "virtio::build_dns_query_name",
-  "virtio::parse_dns_reply",
-  "virtio::DNS_NAME_MAX",
+source_modules = [
+  "filesystem", "filesystem/block_io", "filesystem/fat32", "filesystem/fs_open",
+  "filesystem/fs_rw", "filesystem/gpt", "filesystem/vfs", "filesystem/vfs_ro",
+  "filesystem/part"
 ]
-allowed_callers = ["capability", "diagnostics", "integration", "sched"]
-dependencies = ["arch", "boot", "driver", "irq", "memory", "pci", "time"]
+public_api = [
+  "filesystem::block_io", "filesystem::fat32", "filesystem::fs_open", "filesystem::gpt",
+  "filesystem::vfs", "filesystem::vfs_ro", "gpt::Entry", "gpt::GptError", "gpt::Header",
+  "gpt::Table", "gpt::crc32", "gpt::find_by_type", "gpt::find_esp", "gpt::parse_header",
+  "gpt::protective_mbr", "gpt::scan", "gpt::ESP_TYPE_GUID", "gpt::MAX_ARRAY_BYTES",
+  "gpt::MAX_ENTRIES", "gpt::MAX_ENTRY_BYTES", "vfs::AhciDisk", "vfs::SECTOR_BYTES",
+  "fat32::FileCursor", "fat32::FsError", "fat32::MAX_CLUSTERS_WALKED",
+  "fat32::FAT16_ENTRY_BYTES", "fs_open::DIRENT_RECORD_LEN", "fs_open::Opened", "fs_open::PORT",
+  "fs_open::port", "fs_open::set_port", "fs_open::OPEN_READ_ONLY", "fs_open::OPEN_WRITE",
+  "fs_rw::PORT", "filesystem::fs_rw", "fs_open::STAT_KIND_FILE", "fs_open::STAT_RECORD_LEN",
+  "fs_open::dirent_record", "fs_open::open", "fs_open::stat_record", "vfs_ro::DirState",
+  "vfs_ro::Entry", "vfs_ro::PATH_MAX", "vfs_ro::ReadCursor", "vfs_ro::ReadOnlyFs",
+  "vfs_ro::VfsError", "vfs_ro::read_disk", "vfs_ro::seek_disk", "vfs_ro::write_at",
+  "block_io::Budget", "block_io::read_checked", "vfs::Block", "vfs::BlockError",
+  "vfs::FileStat", "vfs::Partition", "vfs::PartitionView", "vfs::DiskKey",
+  "filesystem/part::PART_RECORD_LEN", "filesystem/part::PartError",
+  "filesystem/part::PartInfo", "filesystem/part::part_read_block",
+  "filesystem/part::part_read_from", "filesystem::part", "gpt::HEADER_LBA"
+]
+allowed_callers = ["capability", "integration", "sched"]
+dependencies = ["driver"]
 forbidden_dependencies = []
 known_violations = []
 context = ["KERNEL", "IRQ_OFF", "ISR_TOP"]
 error_classes = ["A", "B", "D"]
 resource_ownership = "AHCI/virtio-blk 设备路径、块读写请求、FAT32 只读解析与薄 VFS；GPT 只读解析（ADR-078，gpt-probe 档）自成一格，不挂载文件系统、不存分区名单表。"
 error_policy = "BlockError/FsError/GptError 分层；设备超时/离线 → 错误 + 重试/隔离；读失败不许读成 0；GPT 每道闸各一个点名变体，BlockError 原样透传不吞不改名。"
-unsafe_scope = ["ahci:U4", "virtio:U4"]
+unsafe_scope = []
 test_targets = ["t_ahci_claim", "t_ahci_disk", "t_ahci_high_lba", "t_ahci_write", "t_ahci_recovery", "t_fat32", "t_fat32_mem", "t_fat32_exec", "t_fat16", "t_gpt", "t_vfs_ro", "t_vfs_ro_fat32", "t_vfs_ro_lfn", "t_vfs_ro_esp", "t_block_io_budget", "t_virtio_probe", "t_virtio_io", "t_virtio_block", "t_virtio_two", "t_net_tx", "t_net_rx"]
 status = "部分落地"
 
@@ -731,7 +668,7 @@ status = "部分落地"
 module_id = "diagnostics"
 owner = "diagnostics"
 layer = "core"
-source_modules = ["crash", "exit", "serial", "state_store", "watchdog"]
+source_modules = ["diag/crash", "diag/exit", "diag/serial", "diag/state_store", "diag/watchdog"]
 public_api = [
   "serial::mirror_wrapped",
   "serial::mirror_total",
@@ -791,14 +728,14 @@ public_api = [
   "state_store::MAX_FRAMES",
 ]
 allowed_callers = ["arch", "boot", "display", "input", "integration", "memory", "sched", "sync", "testing", "time"]
-dependencies = ["arch", "irq", "memory", "pci", "storage", "time"]
+dependencies = ["arch", "driver", "irq", "memory", "pci", "time"]
 forbidden_dependencies = []
 known_violations = []
 context = ["BOOT", "KERNEL", "IRQ_OFF", "ISR_TOP", "PANIC"]
 error_classes = ["B", "D"]
 resource_ownership = "日志环、崩溃摘要、持久状态记录、启动健康状态、看门狗状态、最终停机出口。"
 error_policy = "故障路径不分配、不等可能损坏的锁；持久状态写失败不得再触发不可恢复故障。"
-unsafe_scope = ["serial:U1", "crash:U6"]
+unsafe_scope = ["diag/serial:U1", "diag/crash:U6"]
 test_targets = ["t_state_store", "t_crash", "t_crash_oops", "t_watchdog", "t_serial_atomic", "t_serial_rx"]
 status = "部分落地"
 
@@ -806,7 +743,7 @@ status = "部分落地"
 module_id = "input"
 owner = "input"
 layer = "hal"
-source_modules = ["kbd", "mouse"]
+source_modules = ["input/kbd", "input/mouse"]
 public_api = [
   "kbd::enable",
   "kbd::read_char",
@@ -839,7 +776,7 @@ status = "部分落地"
 module_id = "security"
 owner = "security"
 layer = "service"
-source_modules = ["sign", "cred"]
+source_modules = ["security/sign", "security/cred"]
 public_api = [
   "sign::PKG_BYTES",
   "sign::PKG_PAYLOAD_BYTES",
@@ -903,7 +840,7 @@ status = "部分落地"
 module_id = "time"
 owner = "time"
 layer = "core"
-source_modules = ["clock", "tsc"]
+source_modules = ["time/clock", "time/tsc"]
 public_api = [
   "clock::Calibration",
   "clock::MIN_SAMPLES",
@@ -922,7 +859,7 @@ public_api = [
   "tsc::stage",
   "tsc::total_stages",
 ]
-allowed_callers = ["arch", "diagnostics", "integration", "memory", "sched", "storage", "sync"]
+allowed_callers = ["arch", "diagnostics", "driver", "integration", "memory", "sched", "sync"]
 dependencies = ["arch", "diagnostics"]
 forbidden_dependencies = []
 known_violations = []
@@ -930,7 +867,7 @@ context = ["BOOT", "KERNEL", "IRQ_OFF", "ISR_TOP"]
 error_classes = ["A"]
 resource_ownership = "PIT/LAPIC 定时器、TSC 标定与阶段计时；无墙钟。"
 error_policy = "未标定 → None，不回退成假设频率。"
-unsafe_scope = ["tsc:U1"]
+unsafe_scope = ["time/tsc:U1"]
 test_targets = ["t_timer_ticks_recur", "t_no_alloc_in_isr", "t_clock_calibrated_by_pit"]
 status = "部分落地"
 
@@ -938,7 +875,7 @@ status = "部分落地"
 module_id = "capability"
 owner = "capability"
 layer = "core"
-source_modules = ["handle"]
+source_modules = ["capability/handle"]
 public_api = [
   "handle::HErr",
   "handle::begin_write",
@@ -1018,7 +955,7 @@ status = "部分落地"
 module_id = "testing"
 owner = "testing"
 layer = "integration"
-source_modules = ["ktest", "ktests", "ktests/common"]
+source_modules = ["testing/ktest", "ktests", "ktests/common"]
 public_api = [
   "ktest::KTest",
   "ktest::run_all",
@@ -1031,7 +968,7 @@ context = ["KERNEL", "BOOT"]
 error_classes = ["A"]
 resource_ownership = ".ktests 注册表、运行器、报告与判定契约。"
 error_policy = "表空/长度不整除 → 失败；用例返回 false → FAIL(35)。"
-unsafe_scope = ["ktest:U6"]
+unsafe_scope = ["testing/ktest:U6"]
 test_targets = ["t_negative_probe_must_fail"]
 status = "已落地"
 
@@ -1061,15 +998,10 @@ status = "部分落地"
 [baseline]
 # 当前产品代码的强连通分量（Task B 冻结基线）：新增环成员或改环 ⇒ check 红。
 known_scc = [
-  ["arch", "boot", "diagnostics", "driver", "irq", "memory", "pci", "resource", "storage", "sync", "time"],
+  ["arch", "boot", "diagnostics", "driver", "irq", "memory", "pci", "resource", "sync", "time"],
 ]
 
 [baseline.ring_edge_sites]
-# ADR-044 的棘轮：环内每条边的引用站点数（check-module-interfaces 按行实测）。
-# 只许减不许增；减了要显式改小，改到 0 就删这一行。环外的单向边不登记。
-# 原始冻结时点：46 条边 / 449 个站点 / 最小割 12 条边（那一份图把 `core::arch|sync|time`
-# 也算成了到 crate 同名模块的边，见 BACKLOG §363）。
-# 2026-11-16 修正短名误检后重钉：41 条边 / 422 个站点；最小割是旧图上的分析，未重算。
 "arch->boot" = 2
 "arch->diagnostics" = 19
 "arch->irq" = 2
@@ -1079,18 +1011,19 @@ known_scc = [
 "arch->time" = 22
 "boot->diagnostics" = 11
 "diagnostics->arch" = 32
+"diagnostics->driver" = 15
 "diagnostics->irq" = 3
 "diagnostics->memory" = 6
 "diagnostics->pci" = 1
-"diagnostics->storage" = 15
 "diagnostics->time" = 3
-"driver->arch" = 4
-"driver->irq" = 18
-"driver->memory" = 5
-"driver->pci" = 3
+"driver->arch" = 55
+"driver->boot" = 1
+"driver->irq" = 19
+"driver->memory" = 17
+"driver->pci" = 18
+"driver->time" = 13
 "irq->arch" = 29
 "irq->memory" = 1
-# P3（ADR-065）：VA 容量改 256 定长，删掉派生公式里的 cpu::MAX_CPUS 引用 ⇒ 67→64（解耦，收紧）。
 "memory->arch" = 61
 "memory->boot" = 8
 "memory->diagnostics" = 9
@@ -1100,15 +1033,6 @@ known_scc = [
 "pci->memory" = 9
 "resource->memory" = 1
 "resource->sync" = 2
-"storage->arch" = 51
-"storage->boot" = 1
-"storage->driver" = 2
-"storage->irq" = 1
-"storage->memory" = 12
-# 2026-11-17：13→15。ADR-112 把 virtio 的设备发现从"找第一台"改成枚举全部
-# （`pci::info` + `pci::dev` 两处），这是真边，不是短名误撞。
-"storage->pci" = 15
-"storage->time" = 13
 "sync->arch" = 12
 "sync->diagnostics" = 3
 "sync->time" = 3

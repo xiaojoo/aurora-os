@@ -49,6 +49,40 @@ SERIAL_LOG = ROOT / "build" / "serial.log"
 BUILD = ROOT / "build"
 QEMU = TOOLS / "qemu" / "qemu-system-x86_64.exe"
 
+def kernel_src(name: str, in_tests: bool = False) -> Path:
+    """按**模块名**取 `kernel/src` 下的一个源文件，不写死目录层。
+
+    为什么要这一层：目录重构（2026-11-19，`kernel/src` 按域分文件夹）让原先
+    二十多处 `ROOT / "kernel" / "src" / "xxx.rs"` 全部失效，而失效的表现是
+    **FileNotFoundError 把整道门禁崩掉**——后面的门禁一条都不跑，
+    看起来反而像「没红」。按名字找 + 命中数校验，把这件事变成一次可判定的查找。
+
+    **同名会有两份**（实测：virtio / sched / crash / gpt / fs / elf 在产品代码
+    与 ktests/ 下各一份），所以按 in_tests 选边，而不是静默挑第一个。
+
+    命中 0 个或多个都抛 LookupError（调用方自己决定报红还是解释）。
+    """
+    src_root = ROOT / "kernel" / "src"
+    hits = []
+    # 形态一：`X.rs`
+    for p in sorted(src_root.rglob(name + ".rs")):
+        if p.stem == name and (("ktests" in p.parts) == in_tests):
+            hits.append(p)
+    # 形态二：**域根**的 `X/mod.rs`（六个改名文件）。只在 src/X/mod.rs 与
+    # src/ktests/X/mod.rs 两处成立——`ktests/sched/sched.rs` 那种"域文件夹里
+    # 恰好同名的文件"不算（上一版按目录名找，把它误收成 2 个命中）。
+    for base in (src_root, src_root / "ktests"):
+        m = base / name / "mod.rs"
+        if m.is_file() and (("ktests" in m.parts) == in_tests):
+            hits.append(m)
+    hits = sorted(set(hits))
+    if len(hits) != 1:
+        raise LookupError(
+            f"kernel/src 下名为 {name}.rs 的文件有 {len(hits)} 个"
+            f"（in_tests={in_tests}），无法唯一确定：{hits}")
+    return hits[0]
+
+
 # 与 kernel/linker.ld 的 ENTRY 和 §6.1 的 high 半区一致
 KERNEL_BASE = 0xFFFFFFFF80000000
 # §3.5 固定的测试拓扑；比较基线时必须同一套参数。
@@ -385,7 +419,10 @@ SCRATCH_FEATURES = {
 }
 # §8.5：这些文件是"驱动"，只能通过 `driver.rs` 的句柄表碰硬件。新增驱动就加进这张表，
 # 于是它从第一天起就受 `check-driver-ctx` 约束（不加进来 = 没人管它，这条网关就会慢慢变假）。
-DRIVER_MODULES = ["ahci.rs", "virtio.rs"]
+DRIVER_MODULES = ["driver/ahci.rs", "driver/virtio.rs"]
+# 注意 `driver/mod.rs` **故意不在**上面：它就是 DriverCtx 自己的实现，
+# 按 ADR-030 决定 4 必须含 volatile 访问器。ADR-030 决定 3 的尺子自证
+# 原文就写着「把清单临时指向 driver.rs ⇒ 门禁报出裸访问 ⇒ 它能红」。
 
 # M5-f：第三块盘，走 virtio-blk 而不是 AHCI。容量写成整数 MiB，因为宿主机要拿
 # `virtual size / 512` 与内核读到的 `容量扇区=` 对账（两台仪器）。
@@ -2229,8 +2266,8 @@ def check_gpt_bounds() -> list[str]:
     符号常量只认已知的那两种写法，写法变了就报红而不是静默算成 0（静默少核一条 = 静默少测一条）。
     """
     bad: list[str] = []
-    gpt = (ROOT / "kernel" / "src" / "filesystem" / "gpt.rs").read_text(encoding="utf-8")
-    vfs = (ROOT / "kernel" / "src" / "filesystem" / "vfs.rs").read_text(encoding="utf-8")
+    gpt = kernel_src("gpt").read_text(encoding="utf-8")
+    vfs = kernel_src("vfs").read_text(encoding="utf-8")
     writer = (ROOT / "tools" / "make_gpt_disk.py").read_text(encoding="utf-8")
     reader = (ROOT / "tools" / "validate_esp.py").read_text(encoding="utf-8")
 
@@ -2319,7 +2356,7 @@ def check_fatal_record() -> list[str]:
        只会让下一次挂死的证据少一级——那种缺失只有静态对账抓得到。
     """
     bad: list[str] = []
-    src = (ROOT / "kernel" / "src" / "crash.rs").read_text(encoding="utf-8")
+    src = kernel_src("crash").read_text(encoding="utf-8")
     m = re.search(r"pub const FATAL_FIELDS: usize = (\d+);", src)
     if m is None:
         return ["crash.rs 里找不到 `pub const FATAL_FIELDS`（改名了？整张对账不成立，不许当成核过了）"]
@@ -2355,7 +2392,7 @@ def check_fatal_record() -> list[str]:
                          (ROOT / "kernel" / "src" / "main.rs").read_text(encoding="utf-8"))
     if boot_fmt is None:
         bad.append("main.rs 里没有 `fatalrec: 物理={:#x} cpu数={} 每cpu字段={} 字节={}` 那行（改了格式串没改本脚本的正则 ⇒ 读回静默跳过）")
-    ks = (ROOT / "kernel" / "src" / "ktests" / "crash.rs").read_text(encoding="utf-8")
+    ks = kernel_src("crash", in_tests=True).read_text(encoding="utf-8")
     if 'fatalrec: 自查 故意停住 期待宿主机读回 向量=' not in ks:
         bad.append("ktests/crash.rs 里没有 `fatalrec: 自查 故意停住 期待宿主机读回 向量=` 那行 ⇒ 端到端自查无从对账")
     # ④ 四个进度点都在各自的调用文件里被真的写出去（删掉一处 = 证据少一级，且不会报错）
@@ -2365,7 +2402,10 @@ def check_fatal_record() -> list[str]:
         ("STAGE_DUMPSITE_EXIT", "crash.rs"),
         ("STAGE_EXIT_FINISH", "exit.rs"),
     ):
-        txt = (ROOT / "kernel" / "src" / file).read_text(encoding="utf-8")
+        # main.rs 在顶层；其余按名字找（重构后它们在域目录里）
+        _p = ((ROOT / "kernel" / "src" / file) if file == "main.rs"
+              else kernel_src(Path(file).stem))
+        txt = _p.read_text(encoding="utf-8")
         if re.search(rf"mark_fatal\(\s*(?:crate::)?(?:crash::)?{stage}\b", txt) is None:
             bad.append(f"{file} 里没有把 {stage} 真写出去的那次 mark_fatal 调用（进度点被删 ⇒ 下一次挂死的证据少一级）")
     # 自查那一档必须在 Cargo 里存在，且 ktests 真的按它门控（否则"端到端证过"这句话没载体）
@@ -2417,8 +2457,37 @@ def check_wedge_probe() -> list[str]:
             bad.append(f"wedge 符号 {label} 与 {seen[segs]} 指向同一个静态量（{'::'.join(segs)}）⇒ 少读一个量")
             continue
         seen[segs] = label
+        # `segs[:-1]` 是**符号的模块路径**，`segs[-1]` 是静态量名。
+        # 文件路径由模块路径推出来（不是由量名推）。
+        # 重构后 `X.rs` 可能变成域根的 `X/mod.rs`，且模块路径前面多了域前缀，
+        # 所以按"模块路径后缀匹配"找，多处命中时取最短（产品侧优先），并列则报红。
         name = segs[-1]
-        path = ROOT / "kernel" / "src" / ("/".join(segs[:-1]) + ".rs")
+        _modpath = "/".join(segs[:-1])
+        _src = ROOT / "kernel" / "src"
+        _cands = []
+        for p in sorted(_src.rglob("*.rs")):
+            mod = p.relative_to(_src).with_suffix("").as_posix()
+            if mod.endswith("/mod"):
+                mod = mod[:-4]
+            if mod == _modpath or mod.endswith("/" + _modpath):
+                _cands.append((len(mod), p))
+        if not _cands:
+            bad.append(f"wedge 符号 {label}：src 下找不到模块 {_modpath}（模块挪了？）")
+            continue
+        _cands.sort()
+        # **一律**用 `static NAME` 是否存在来筛（不是只在多候选时）：
+        # `X/mod.rs` 与 `X/X.rs` 都后缀命中模块 X，而符号只写在其中一个里——
+        # 实测 SLEEP_PROBE 在 `ktests/sched/sched.rs`，而 `sched/mod.rs` 里没有它。
+        with_sym = [(n, p) for (n, p) in _cands
+                    if re.search(rf"static {name}\s*:", p.read_text(encoding="utf-8"))]
+        if not with_sym:
+            bad.append(f"wedge 符号 {label}：模块 {_modpath} 的 {len(_cands)} 个候选文件里"
+                       f"都没有 `static {name}` ⇒ 仪器会读到别的内存")
+            continue
+        if len(with_sym) > 1:
+            bad.append(f"wedge 符号 {label}：`static {name}` 在 {len(with_sym)} 个候选文件里都有，无法唯一确定")
+            continue
+        path = with_sym[0][1]
         if not path.exists():
             bad.append(f"wedge 符号 {label}：源文件 {path.name} 不在（模块挪了？）")
             continue
@@ -2440,7 +2509,7 @@ def check_wedge_probe() -> list[str]:
     #   "每圈都没有可唤醒的等待者"。顺序反了这条判据就整个翻面。
     # ②`WORK` 只被 AP 工人循环与 ktests/sched.rs 那几条工人自增 ⇒ 它不是"任务在跑"，
     #   判别表里不许出现它（第一版就是拿它当第三支，把真挂死判成了"有任务在跑"）。
-    sched_src = (ROOT / "kernel" / "src" / "sched.rs").read_text(encoding="utf-8")
+    sched_src = kernel_src("sched").read_text(encoding="utf-8")
     idle = sched_src[sched_src.find("fn idle_entry()"):]
     idle = idle[:idle.find("\n}")]
     guard = idle.find("if task_wake_tick()")
@@ -2461,11 +2530,11 @@ def check_wedge_probe() -> list[str]:
     paths = sorted(str(f.relative_to(ROOT)).replace("\\", "/")
                    for f in (ROOT / "kernel" / "src").rglob("*.rs")
                    if re.search(r"WORK\[[^\]]*\]\.fetch_add", f.read_text(encoding="utf-8", errors="replace")))
-    want = ["kernel/src/ktests/sched.rs", "kernel/src/sched.rs"]
+    want = ["kernel/src/ktests/sched/sched.rs", "kernel/src/sched/mod.rs"]
     if paths != want:
         bad.append(f"WORK 的直接自增点不再是那两处（现在={paths}）⇒ 它的语义变了，wedge 的只报不判要重核")
     # AP 工人走 hook 不直接写 WORK ⇒ 那一支要单独核，否则这个普查是假的
-    smp = (ROOT / "kernel" / "src" / "arch" / "x86_64" / "smp.rs").read_text(encoding="utf-8")
+    smp = kernel_src("smp").read_text(encoding="utf-8")
     if "bump_current_work)()" not in smp:
         bad.append("smp.rs 里找不到 bump_current_work 的 hook 调用 ⇒ WORK 的语义普查漏了 AP 工人那一支")
     # 留档序号必须跨进程接着数：撞号会**覆盖**上一跑的串口与现场（§193 实测丢过一次）。
@@ -2532,7 +2601,7 @@ def check_wedge_probe() -> list[str]:
     # 旧 drain 是 load-then-store ⇒ 两个 drain 各自减一次 ⇒ ARMED 下溢成 u64::MAX（run-099 原始字节）；
     # 旧 take 只判 ARMED ⇒ SIGNALLED 那一支漏减；旧 drain 把 wake_task 的 false 用 let _ = 吞掉
     # ⇒ 唤醒提前投递给还没 Blocked 的等待者然后丢弃（run-096/100 的 B1）。
-    sc = (ROOT / "kernel" / "src" / "sched.rs").read_text(encoding="utf-8")
+    sc = kernel_src("sched").read_text(encoding="utf-8")
     if "compare_exchange(st, TW_WOKEN" not in sc:
         bad.append("drain 不再用 CAS 消费等待槽 ⇒ 两个 drain 会各自减一次计数（§194 实测下溢成 u64::MAX）")
     if "let _ = wake_task(gidx, tok);" in sc:
@@ -2570,7 +2639,7 @@ def check_esp_partition() -> list[str]:
     （`FileObj` 有 `part`、`read` 真的按它重建视图）；⑤越界有**自己的**错误码与 tag。
     """
     bad: list[str] = []
-    k = ROOT / "kernel" / "src" / "ktests" / "esp.rs"
+    k = kernel_src("esp", in_tests=True)
     if not k.exists():
         return ["缺 kernel/src/ktests/esp.rs：S2b 的被测物不在位，整段对账不成立"]
     ks = k.read_text(encoding="utf-8")
@@ -2591,16 +2660,20 @@ def check_esp_partition() -> list[str]:
     if not ESP_FEATURES <= GPT_FEATURES:
         bad.append(f"esp-probe 不在 GPT_FEATURES 里 ⇒ 口 1 的夹具盘不挂，t_gpt 会以 Io(NotSettled) 红"
                    f"（名单是文本交集，不跟 cargo 依赖闭包走）：{sorted(GPT_FEATURES)}")
-    mods = (ROOT / "kernel" / "src" / "ktests" / "mod.rs").read_text(encoding="utf-8")
+    # `mod esp;` 与门控在重构后分居 `ktests/storage/mod.rs`：按**全部**域
+    # `mod.rs` 合起来找。判据仍是"这一档真的注册了 mod esp"，只是不假定文件。
+    mods = "\n".join(
+        p.read_text(encoding="utf-8")
+        for p in sorted((ROOT / "kernel" / "src" / "ktests").rglob("mod.rs")))
     if '#[cfg(feature = "esp-probe")]\nmod esp;' not in mods.replace("\r\n", "\n"):
         bad.append("ktests/mod.rs 没有按 esp-probe 门控注册 mod esp ⇒ 用例进不了 .ktests 表")
-    h = (ROOT / "kernel" / "src" / "handle.rs").read_text(encoding="utf-8")
+    h = kernel_src("handle").read_text(encoding="utf-8")
     if "pub part: Option<Partition>" not in h:
         bad.append("handle.rs 的 FileObj 没有 `pub part: Option<Partition>` ⇒ 偏移没进句柄身份，"
                    "read 重建整盘之后偏移就丢了（S2b 的裁决是『偏移进身份』）")
     if "PartitionView { inner: &disk, part }" not in h:
         bad.append("handle::read 没有按票里的分区重建 PartitionView ⇒ 身份带了偏移也没人用")
-    v = (ROOT / "kernel" / "src" / "filesystem" / "vfs.rs").read_text(encoding="utf-8")
+    v = kernel_src("vfs").read_text(encoding="utf-8")
     if "BeyondPartition" not in v or "越出分区" not in v:
         bad.append("vfs.rs 缺 BeyondPartition 变体或它的 tag ⇒ 越界与形状错合成一个码，负样本分不开")
     if "pub struct PartitionView" not in v:
@@ -2618,7 +2691,7 @@ def check_fat32_ports() -> list[str]:
     任何一处断了，红都发生在跑之前，而不是跑完之后没人知道少了什么。
     """
     bad: list[str] = []
-    src = (ROOT / "kernel" / "src" / "ktests" / "fs.rs").read_text(encoding="utf-8")
+    src = kernel_src("fs", in_tests=True).read_text(encoding="utf-8")
     for tag, const in (("卷A", "FAT_PORT_A"), ("卷B", "FAT_PORT_B")):
         m = re.search(rf"const {const}: u8 = (\d+);", src)
         if m is None:
@@ -2637,7 +2710,7 @@ def check_fat32_ports() -> list[str]:
     # ADR-109：`fs-open` 的挂载根同样是两处各写一份（内核 `filesystem/fs_open.rs` 的 `PORT`
     # 与本脚本的 `FS_OPEN_PORTS`），必须机器对账。口号接错不会让用例"编译不过"，只会让它
     # 读一块根本没有多级路径的盘——那时红看起来像解析器坏了，其实断的是接线。
-    osrc = (ROOT / "kernel" / "src" / "filesystem" / "fs_open.rs").read_text(encoding="utf-8")
+    osrc = kernel_src("fs_open").read_text(encoding="utf-8")
     om = re.search(r"^pub const PORT: u8 = (\d+);", osrc, re.M)
     if om is None:
         bad.append("filesystem/fs_open.rs 里找不到模块层的 `pub const PORT`（挪进函数体了？两处各写一份就会分家）")
@@ -2688,7 +2761,7 @@ def check_fat32_ports() -> list[str]:
     # 或与 fs-open 的口撞上（同一跑两块卷只能有一块赢），两种都表现为"写成功、宿主机对不上"。
     # 口 4 与 FAT 卷B 同号是**按变体错开的**：fs-rw 不编 fat32-probe，反向组合由 run 侧的
     # `接线不可歧义` 闸拒——所以这一格不把"口在 FAT_PORTS 里"当红。
-    rsrc = (ROOT / "kernel" / "src" / "filesystem" / "fs_rw.rs").read_text(encoding="utf-8")
+    rsrc = kernel_src("fs_rw").read_text(encoding="utf-8")
     rm = re.search(r"^pub const PORT: u8 = (\d+);", rsrc, re.M)
     if rm is None:
         bad.append("filesystem/fs_rw.rs 里找不到模块层的 `pub const PORT`（挪进函数体了？两处各写一份就会分家）")
@@ -2709,7 +2782,7 @@ def check_fat32_ports() -> list[str]:
     # W4 S1（ADR-078 决策 7）：GPT 夹具盘的口号同样两处各写一份，必须机器对账。
     # 它**不能**撞引导盘（口 0）——负样本的全部意义就在于"改的是一块固件不碰的盘"，
     # 撞上去就回到实测过的那个死路：EDK2 用备份表把主表修回去，注入到不了内核。
-    gsrc = (ROOT / "kernel" / "src" / "ktests" / "gpt.rs").read_text(encoding="utf-8")
+    gsrc = kernel_src("gpt", in_tests=True).read_text(encoding="utf-8")
     gm = re.search(r"const GPT_FIX_PORT: u8 = (\d+);", gsrc)
     if gm is None:
         bad.append("ktests/gpt.rs 里找不到模块层的 `const GPT_FIX_PORT`（挪进函数体了？两处各写一份就会分家）")
@@ -2751,7 +2824,7 @@ def check_fat32_ports() -> list[str]:
     for f in sorted(FAT_DISK_FEATURES):
         if f'feature = "{f}"' not in src:
             bad.append(f'ktests/fs.rs 里没有 `feature = "{f}"`：这条特性编不出被调用的用例')
-    fat_src = (ROOT / "kernel" / "src" / "filesystem" / "fat32.rs").read_text(encoding="utf-8")
+    fat_src = kernel_src("fat32").read_text(encoding="utf-8")
     for f in sorted(FAT_FAULT_FEATURES):
         if f'feature = "{f}"' not in fat_src:
             bad.append(f"fat32.rs 里没有 `feature = \"{f}\"`：注入点被删了，那条负样本是空转")
@@ -2782,8 +2855,8 @@ def check_fat32_ports() -> list[str]:
             bad.append(f"{f}: 算出的镜像偏移 {off} 不在 {name} 的 {FAT_EXPECT[name][0]} 字节之内")
 
     # GPT 那六条宿主机侧注入查同样的**反面**，外加"现在就定位得出来"（与 FAT 那六行同一纪律）。
-    gpt_ktest = (ROOT / "kernel" / "src" / "ktests" / "gpt.rs").read_text(encoding="utf-8")
-    gpt_mod = (ROOT / "kernel" / "src" / "filesystem" / "gpt.rs").read_text(encoding="utf-8")
+    gpt_ktest = kernel_src("gpt", in_tests=True).read_text(encoding="utf-8")
+    gpt_mod = kernel_src("gpt").read_text(encoding="utf-8")
     for f in sorted(GPT_HOST_FAULTS):
         if re.search(rf"^{f} = ", feats, re.M):
             bad.append(f"Cargo.toml 里有 {f}：宿主机侧注入不该是构建变量（改了它 ELF 就变了，"
@@ -2820,7 +2893,7 @@ def check_fat32_ports() -> list[str]:
     # W4 S2a：FAT16 合成整卷的配方常数与内核用例里的同名常数逐字对账。
     # 两处各写一份而不核对正是手册 V8 点名的形状：改了配方没改用例，红会落在"判据不成立"上，
     # 而不是落在"夹具与期望分家"上——后者一眼看得出是谁的错。
-    f16_ktest = (ROOT / "kernel" / "src" / "ktests" / "fat16.rs").read_text(encoding="utf-8")
+    f16_ktest = kernel_src("fat16", in_tests=True).read_text(encoding="utf-8")
     f16_recipe = (ROOT / "tools" / "make_fat16_mem.py").read_text(encoding="utf-8")
     for name in ("RESERVED", "FAT_COUNT", "SPF16", "ROOT_ENTRIES", "ROOT_SECTORS",
                  "DATA_START", "DATA_CLUSTERS", "TOTAL_SECTORS", "VOL_BYTES", "FILE_SIZE"):
@@ -2856,7 +2929,7 @@ def check_fat32_ports() -> list[str]:
         bad.append('③ 没有 `vol.open("HELLO.ELF")`：它读的名字与 FAT_READ_NAMES 不是同一个对象')
     # T0.1：`elfload: magic=` 这句在 `t_elf_load_run`（ktests/elf.rs），其余在 ktests/fs.rs。
     # 锚点必须去它实际所在的那个文件找；只改读的文件、不改判据强度。
-    elf_src = (ROOT / "kernel" / "src" / "ktests" / "elf.rs").read_text(encoding="utf-8")
+    elf_src = kernel_src("elf", in_tests=True).read_text(encoding="utf-8")
     for anchor in ("elfdisk: 目录 大小=", "elfdisk: 段", "elfdisk: 跑后 entry=",
                    "elfdisk: 负格 元数据说大=", "| 收尾 终止=", "elfload: magic=",
                    "elfdisk: 尾格溢出 已喂=", "elfdisk: 判据 同长=",
@@ -3317,10 +3390,12 @@ WEDGE_SYMBOLS = [
     # §201 零串口探针：t_sleep_until 的探测读数（10 槽，含义见 ktests/sched.rs 的 SLEEP_PROBE 头注释）。
     # 为什么是静态量而不是串口日志：§200 实测带串口诊断 80 跑 0 挂、无诊断 50 跑 2 挂 ⇒
     # 往串口加行疑似把现象压掉了。静态量让两臂代码相同，扰动只剩几条 store。
-    (("ktests", "sched", "SLEEP_PROBE"), "睡眠探测", 8),
+    # 域文件夹与文件同名 ⇒ 模块路径是 `ktests/sched/sched`（重复一层）。
+    (("ktests", "sched", "sched", "SLEEP_PROBE"), "睡眠探测", 8),
     # §215 零串口步骤探针（elfload / two_containers 的停点定位）
-    (("ktests", "elf", "ELF_PROBE"), "ELF步骤", 8),
-    (("ktests", "elf", "FAT32_PROBE"), "FAT32步骤", 8),
+    # 2026-11-19 目录重构：`ktests/elf.rs` → `ktests/syscall/elf.rs`
+    (("ktests", "syscall", "elf", "ELF_PROBE"), "ELF步骤", 8),
+    (("ktests", "syscall", "elf", "FAT32_PROBE"), "FAT32步骤", 8),
     (("sched", "SWITCH_PROBE"), "换入探针", 8),
 ]
 
@@ -4666,6 +4741,17 @@ def _classify_unsafe(kind: str, text: str, module: str, fn: str,
     整个函数体都染成了 U1（29 处与 5 处），而它们真正做的是 syscall 跨界与镜像边界测量。
     入口**声明本身**由 `kind == "extern"` 那条归 U1，够了。
     """
+    # 模块名一律按**末段**判：目录重构后 `crash` 变成 `diag/crash`、`ktest` 变成
+    # `testing/ktest`、`driver` 拆成 `driver/mod` 与 `driver/ahci`。规则本来问的是
+    # "这是哪个文件"，不是"它在哪一层目录"。
+    # 实测（2026-11-19）：不按末段匹配会让 U3 从 13 掉到 0、U6 从 36 掉到 33，
+    # 而**总数仍是 523**——量具自己错了，读数看起来却像"分类规则没问题"。
+    leaf = module.rsplit("/", 1)[-1]
+    # `mod.rs` 的模块末段是 **`mod`** 而不是目录名——这一条的实测证据就在下面
+    # `driver/mod` 那条判断上：写 `leaf == "driver"` 时它永不成立，
+    # 13 处 DMA 访问器全部掉进兜底 U2（U3 从 13 掉到 4），而总数仍是 523。
+
+
     if kind == "impl":
         return "U2" if "GlobalAlloc" in text else "U4"
     # 用户指针拷贝先判：ucopy_from/to 也是 extern fn，但它的语义比"架构入口"更具体。
@@ -4680,16 +4766,17 @@ def _classify_unsafe(kind: str, text: str, module: str, fn: str,
         return "U1"
     if any(k in text for k in (".0.get()", "UnsafeCell", ".data.get()", "locked.store")):
         return "U4"
-    if module in ("crash", "ktest"):
+    if leaf in ("crash", "ktest"):
         return "U6"
     # 用户态成员包一律按"入口声明 = U1、其余 = 用户指针 U5"归类。
     # **不写死 user/hello**（P5a 实测：新包 user/probe 掉进 U2 兜底，而它做的是 syscall 跨界
     # 与读自己映射的用户页，语义就是 U1/U5）。这是改规则，不是改登记数去凑。
     if module.startswith("user/"):
         return "U1" if kind == "fn" else "U5"
-    if module == "driver" and any(k in text for k in ("read_volatile", "write_volatile", "write_bytes")):
+    if module == "driver/mod" and any(
+            k in text for k in ("read_volatile", "write_volatile", "write_bytes")):
         return "U3"
-    if module == "limine" and any(k in text for k in ("extra_argument", "goto_address", "release_mp_cpu")):
+    if leaf == "limine" and any(k in text for k in ("extra_argument", "goto_address", "release_mp_cpu")):
         return "U3"
     if fn.startswith("t_"):
         return "U6"
@@ -5202,8 +5289,8 @@ def check_vector_table() -> list[str]:
     """
     import tomllib
 
-    trap = ROOT / "kernel" / "src" / "arch" / "x86_64" / "trap.rs"
-    apic = ROOT / "kernel" / "src" / "arch" / "x86_64" / "apic.rs"
+    trap = kernel_src("trap")
+    apic = kernel_src("apic")
     text, atext = trap.read_text(encoding="utf-8"), apic.read_text(encoding="utf-8")
     consts = {m.group(1): int(m.group(2), 0) for m in re.finditer(
         r"pub const (VEC_[A-Z0-9_]+)\s*:\s*(?:usize|u64)\s*=\s*(0x[0-9a-fA-F]+|\d+)", text)}
@@ -5444,7 +5531,7 @@ def check_state_window() -> list[str]:
     或者落在备份 GPT 上 —— 而两边都"以为自己对"，测试仍然是绿的。
     """
     bad: list[str] = []
-    rs = (ROOT / "kernel" / "src" / "state_store.rs").read_text(encoding="utf-8")
+    rs = kernel_src("state_store").read_text(encoding="utf-8")
     gen = (ROOT / "tools" / "esp_image.py").read_text(encoding="utf-8")
     r_lba = re.search(r"pub const STATE_START_LBA: u64 = ([0-9_]+);", rs)
     r_slot = re.search(r"pub const SLOT_BYTES: usize = (\d+);", rs)
@@ -5632,7 +5719,7 @@ def check_virtio_pattern() -> list[str]:
     没有这道对账，那条判据会**当场红一次**（红是对的方向），但更常见的情节是有人为了让它绿
     去改其中一边，从此这条判据只在"两边一起改"时才红，而那是它唯一不需要证明的事。
     """
-    rs = (ROOT / "kernel" / "src" / "ktests" / "virtio.rs").read_text(encoding="utf-8")
+    rs = kernel_src("virtio", in_tests=True).read_text(encoding="utf-8")
     m = re.search(r"const EXPECT_PATTERN: u8 = 0x([0-9A-Fa-f]{2})", rs)
     if m is None:
         return ["内核侧没找到 EXPECT_PATTERN（改名了？用例在 virtio-blk 变体里，常量必须留在 ktests/virtio.rs）"]
@@ -5648,7 +5735,7 @@ def check_net_pattern() -> list[str]:
     才知道 pcap 里那个包是不是我们声称发出去的那一帧。两边各写一份而不对账，改一边就把判据
     变成"只在两边一起错时才红"——而那是它唯一不需要证明的事。
     """
-    src = (ROOT / "kernel" / "src" / "virtio.rs").read_text(encoding="utf-8")
+    src = kernel_src("virtio").read_text(encoding="utf-8")
     # 内核侧这几个数三种写法都有：十进制（步长 `11`）、十六进制（图案那两个字节）、
     # 加法（`6 + 6 + 2`：谁跟谁加起来）。三种都吃，比较一律按**数值** ——
     # 按渲染比会把 `11` 与 `0x0B` 报成不一致（这条门禁第一次跑就是这么红的，红的是量具）
@@ -5725,7 +5812,7 @@ def check_sha_primitives() -> list[str]:
     而错一个词的表现不是崩溃，是"摘要对一切输入都自洽地错"——除了拿另一台仪器重算，
     没有任何判据会红。第二轮（`check-sha256` 的 hashlib 对账）管轮函数，这一道管表。
     """
-    src = (ROOT / "kernel" / "src" / "sign.rs").read_text(encoding="utf-8")
+    src = kernel_src("sign").read_text(encoding="utf-8")
 
     def grab(name: str) -> list[int] | None:
         m = re.search(rf"{name}: [^=]+?= \[(.*?)\];", src, re.S)
@@ -5837,7 +5924,7 @@ def rust_int(expr: str, env: dict[str, int]) -> int:
 
 def kernel_sig_constants() -> tuple[dict[str, int], list[tuple[int, int]], bytes, list[str]]:
     """从 `kernel/src/sign.rs` 读出签名那套形状、锚点字节与篡改表。"""
-    src = (ROOT / "kernel" / "src" / "sign.rs").read_text(encoding="utf-8")
+    src = kernel_src("sign").read_text(encoding="utf-8")
     bad: list[str] = []
     names = ["DIGEST_BYTES", "PK_ITEMS", "PK_BYTES", "SIG_ITEMS", "SIG_BYTES",
              "PKG_VERSION", "PKG_HDR_BYTES", "PK_OFF", "SIG_OFF", "PAY_OFF", "PKG_PAYLOAD_BYTES",
@@ -6192,7 +6279,7 @@ def check_verdict_contract() -> list[str]:
     这正是手册 B.3/V8 说的“改一处忘改另一处”——后果不是报错，而是内核往不存在的端口写，
     测试既不通过也不失败，只能等到超时。两个文件里各写一份数字，就必须有机器对账。
     """
-    src = (ROOT / "kernel" / "src" / "exit.rs").read_text(encoding="utf-8")
+    src = kernel_src("exit").read_text(encoding="utf-8")
     bad: list[str] = []
 
     import re
@@ -7022,7 +7109,7 @@ def aurora_pit_divisor() -> int:
     """PIT 分频只有一份来源：内核 `clock.rs` 的 `PIT_DIVISOR`。
     宿主机不自己写死 11932——写死就是凭记忆改硬件常数，那一族错的源头。"""
     m = re.search(r"pub const PIT_DIVISOR: u64 = ([0-9_]+);",
-                  (ROOT / "kernel" / "src" / "clock.rs").read_text(encoding="utf-8"))
+                  kernel_src("clock").read_text(encoding="utf-8"))
     if not m:
         raise SystemExit("clock.rs 里找不到 PIT_DIVISOR ⇒ 设备侧超速的上界没有依据，拒绝判定")
     return int(m.group(1).replace("_", ""))

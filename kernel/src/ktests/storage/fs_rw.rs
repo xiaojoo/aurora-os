@@ -7,7 +7,7 @@ use crate::filesystem::vfs::AhciDisk;
 use crate::filesystem::vfs_ro::{self, ReadOnlyFs, VfsError};
 use crate::handle::{self, Handle, RIGHT_READ, RIGHT_WRITE};
 use crate::{ahci, ktest, mm, sched, user};
-use super::common::{call, frame0, get_user, put_user};
+use crate::ktests::common::{call, frame0, get_user, put_user};
 
 /// `/LOG.TXT` 64 字节、`/DATA.BIN` 1024 字节（跨两簇）。写 `LOG.TXT` 的 `[8,12)`，
 /// 再证 `DATA.BIN` 的头 16 字节与 `LOG.TXT` 的邻居字节都没变。

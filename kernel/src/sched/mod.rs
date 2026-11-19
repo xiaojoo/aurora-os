@@ -2541,3 +2541,11 @@ fn preempt_hook(frame: u64, cpu: usize) {
     // 契约与 sched::preempt_point 的 SAFETY 注释相同。
     unsafe { preempt_point(frame, cpu) }
 }
+
+// ---------------------------------------------------------------- 同层成员
+//
+// `proc` / `user` / `elf` 与 `sched` 同级：四者都在回答同两件事——
+// 谁在跑（`sched`/`proc`）、它手里的地址空间长什么样（`user`/`elf`）。
+pub(crate) mod elf;
+pub(crate) mod proc;
+pub(crate) mod user;

@@ -13,7 +13,7 @@ use crate::filesystem::vfs::AhciDisk;
 use crate::filesystem::vfs_ro::{self, ReadOnlyFs, VfsError};
 use crate::handle::{self, Handle, MAX_HANDLES, RIGHT_READ};
 use crate::{ahci, ktest, mm, sched, user};
-use super::common::{call, frame0, get_user, put_user};
+use crate::ktests::common::{call, frame0, get_user, put_user};
 
 const SMALL: &[u8] = b"/SMALL.BIN";
 const ROOT: &[u8] = b"/";

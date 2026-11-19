@@ -33,7 +33,7 @@ const BUF: usize = 2048;
 /// 合成盘的前缀扇区数（非零就够：要证的是"偏移真的被加上了"）。
 const PREFIX: usize = 4;
 /// S2a 那份合成整卷（23 扇区）。与 `ktests/fat16.rs` 同一份字节，指纹由门禁在编译前核。
-static FAT16_MEM: &[u8] = include_bytes!("../../fixtures/fat16-mem.img");
+static FAT16_MEM: &[u8] = include_bytes!("../../../fixtures/fat16-mem.img");
 const SYN_SECTORS: usize = 23;
 const SYN_FILE: &str = "TEST.BIN";
 const SYN_SIZE: usize = 1000;

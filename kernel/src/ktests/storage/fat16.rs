@@ -16,7 +16,7 @@ use crate::filesystem::vfs::{MemDisk, SECTOR_BYTES};
 use crate::{ahci, ktest};
 
 /// 与 `tools/make_fat16_mem.py` 的产物同一份字节；指纹由 `ensure_fat16_mem` 在**编译之前**核。
-static FAT16_MEM: &[u8] = include_bytes!("../../fixtures/fat16-mem.img");
+static FAT16_MEM: &[u8] = include_bytes!("../../../fixtures/fat16-mem.img");
 
 // 这几个数与配方脚本里的同名常数由门禁逐字对账（两处各写一份而不核对正是手册 V8 点名的形状）。
 const RESERVED: usize = 1;

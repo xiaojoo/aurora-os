@@ -519,3 +519,10 @@ pub fn mmio_gen_at(slot: u16) -> Option<u32> {
     // SAFETY: 见 TableCell，只读
     unsafe { &*TABLE.0.get() }.mmio[usize::from(slot)].as_ref().map(|e| e.gen)
 }
+
+// ---------------------------------------------------------------- 同层成员
+//
+// `ahci` 与 `virtio` 放进 driver 域。注意这**不改变依赖边**：登记表里
+// ahci / virtio 本来就与 driver 同属一个逻辑模块，所以环 A 与棘轮基线一格不动。
+pub(crate) mod ahci;
+pub(crate) mod virtio;

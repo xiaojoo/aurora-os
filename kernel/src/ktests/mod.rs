@@ -1,49 +1,17 @@
-//! 内核用例（T0.1 从 main.rs 纯搬移：只挪位置，不改判据）。
+//! 内核用例（`.ktests` 段）按域分文件夹。
+//!
+//! **顺序由链接器决定**，不是这里 `mod` 声明的顺序——用例必须自足，
+//! 不能假设别的用例已经认领过设备（AGENTS.md 取证纪律）。
+//! 这一层的 `mod` 声明只决定"哪些用例被编进这一档"，不决定它们跑的先后。
 
-mod acpi;
 mod boot;
-pub(crate) mod common;
-mod crash;
+mod diag;
 mod driver;
-mod elf;
-#[cfg(feature = "fat16-probe")]
-mod fat16;
-#[cfg(feature = "esp-probe")]
-mod esp;
-#[cfg(feature = "fat32-probe")]
-pub(crate) mod fs;
-#[cfg(feature = "fs-ro")]
-mod vfs_ro;
-#[cfg(feature = "fs-open")]
-mod fs_open;
-#[cfg(feature = "fs-rw")]
-mod fs_rw;
-#[cfg(feature = "gpt-probe")]
-mod gpt;
-mod heap;
-mod mm;
-#[cfg(feature = "virtio-net")]
+mod memory;
 mod net;
-#[cfg(feature = "handles")]
-mod procinfo;
-#[cfg(feature = "handles")]
-mod prockill;
-#[cfg(feature = "handles")]
-mod logread;
-#[cfg(feature = "handles")]
-mod pcienum;
-#[cfg(feature = "handles")]
-mod uptime;
-mod resource;
 mod sched;
-#[cfg(feature = "sig-check")]
-mod sign;
-#[cfg(feature = "handles")]
-mod sdkdemo;
-mod state;
+mod security;
+pub(crate) mod storage;
 mod syscall;
-mod time;
-mod user;
-#[cfg(feature = "virtio-blk")]
-mod virtio;
-mod watchdog;
+
+pub(crate) mod common;

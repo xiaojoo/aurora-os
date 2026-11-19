@@ -47,7 +47,7 @@ const F32_INNER_LBA: usize = F32_DATA_START + 3; // 簇 5
 
 /// ESP 根的 VFAT 长名。短名 `LIMINE.CON` 与它指向同一目录项。
 const ESP_BUF: usize = 1024;
-static LIMINE_CONF: &[u8] = include_bytes!("../../../boot/limine.conf");
+static LIMINE_CONF: &[u8] = include_bytes!("../../../../boot/limine.conf");
 
 const FILE_ROOT_LEN: usize = 5;
 const FILE_LFN_LEN: usize = 3;

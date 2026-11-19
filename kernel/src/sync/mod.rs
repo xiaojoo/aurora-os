@@ -635,4 +635,3 @@ impl<T: Send> IrqSpinLock<T> {
         Some(IrqGuard { lock: self, flags, prev_rank, slot })
     }
 }
-

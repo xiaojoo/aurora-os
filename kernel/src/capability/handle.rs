@@ -1341,7 +1341,7 @@ mod tests {
     use crate::filesystem::fat32::Volume;
     use crate::filesystem::vfs::MemDisk;
 
-    const IMAGE: &[u8] = include_bytes!("../fixtures/fat32-mem.img");
+    const IMAGE: &[u8] = include_bytes!("../../fixtures/fat32-mem.img");
     const OWNER: (usize, u32) = (5, 77);
 
     fn fixture() -> Option<FileCursor> {

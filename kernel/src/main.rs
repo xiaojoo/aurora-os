@@ -17,54 +17,103 @@ use alloc::vec::Vec;
 #[global_allocator]
 static GLOBAL: heap::AuroraGlobal = heap::AuroraGlobal;
 
-mod acpi;
+// ---------------------------------------------------------------- 模块树（按域分层）
+//
+// 顶层只剩 16 个域 + `main` 自己。每个域一个文件夹、一个 `mod.rs` 汇总。
+// 域名与 `docs/architecture/module-interfaces.toml` 的 18 个逻辑模块是**两套名字**：
+// 逻辑模块是架构登记（`driver`/`storage`/`diagnostics`…），域是物理目录分组；
+// 两者都保留，因为登记表冻结的是依赖边与 SCC，改名会让整张基线失效。
+// 域本身**无条件声明**，门控在各自的 `mod.rs` 里逐成员做——这与重构前
+// 「每个文件各自 cfg」的粒度完全一致。若在域上开门控、成员上再开一次，
+// 下面那批 `pub(crate) use` 就会指向不存在的模块（实测：默认档 E0432 ×3）。
 mod arch;
-mod ahci;
-mod boot_guard;
-mod clock;
-mod crash;
-mod cred;
+mod boot;
+mod bus;
+mod capability;
+mod diag;
+mod display;
 mod driver;
-mod elf;
 mod filesystem;
-mod heap;
-mod hooks;
-#[cfg(feature = "handles")]
-mod handle;
-mod hw;
-#[cfg(feature = "framebuffer")]
-mod frame;
-#[cfg(feature = "framebuffer")]
-mod fbcon;
-#[cfg(feature = "ps2-kbd")]
-mod kbd;
-#[cfg(feature = "ps2-mouse")]
-mod mouse;
+mod input;
 mod irq;
-mod exit;
-mod ktest;
 mod ktests;
+mod memory;
+mod resource;
+mod sched;
+mod security;
+mod sync;
+mod testing;
+mod time;
+
+// ---------------------------------------------------------------- 旧路径重导出
+//
+// 目的只有一个：让 `crate::mm::`、`crate::virtio::`、`crate::serial::` 这些既有的
+// 绝对路径继续可用。**不改语义、不改可见性**（全部 `pub(crate)`，与原来 `mod x;`
+// 在 crate 内的可见范围一致）。
+//
+// 文件夹名与本文件撞名的（`sched`/`sync`/`irq`/`driver`/`filesystem`/`arch`），
+// 成员直接成为 `mod.rs`，`crate::X::` 天然成立，这里不重复导出。
+pub(crate) use boot::boot_guard;
+pub(crate) use boot::limine;
+
+// `hooks` 是 arch↔sched 的回调表（ADR-040）。物理上在 `arch/`，逻辑上被
+// arch 与 sched 两边引用，所以从 crate 根重导出，保持 `crate::hooks::` 可用。
+pub(crate) use arch::hooks;
+
+pub(crate) use bus::acpi;
+pub(crate) use bus::hw;
+pub(crate) use bus::pci;
+
+pub(crate) use diag::crash;
+pub(crate) use diag::exit;
+pub(crate) use diag::serial;
+pub(crate) use diag::state_store;
+pub(crate) use diag::watchdog;
+
+#[cfg(feature = "framebuffer")]
+pub(crate) use display::fbcon;
+#[cfg(feature = "framebuffer")]
+pub(crate) use display::frame;
+
+pub(crate) use driver::ahci;
+pub(crate) use driver::virtio;
+
+#[cfg(feature = "ps2-kbd")]
+pub(crate) use input::kbd;
+#[cfg(feature = "ps2-mouse")]
+pub(crate) use input::mouse;
+
+pub(crate) use memory::heap;
+pub(crate) use memory::mm;
+// `sysinfo` 的调用者是 46 号系统调用的产品路径；默认档里那条路径不编，
+// 所以这里在默认档无人引用。重导出是**结构需要**（保持 `crate::sysinfo::` 可用），
+// 不是死代码，用 allow 标出来而不是删掉。
+#[allow(unused_imports)]
+pub(crate) use memory::sysinfo;
+pub(crate) use memory::vmo;
+
+pub(crate) use sched::elf;
+pub(crate) use sched::proc;
+pub(crate) use sched::user;
+
+// `cred` 的调用者只在 `a3-*` / `handles` 档（建凭据与授权判定）。
+// 与 `sysinfo` 同一条理由：保持 `crate::cred::` 可用，不因某一档没人调就删重导出。
+#[allow(unused_imports)]
+pub(crate) use security::cred;
+#[cfg(feature = "handles")]
+pub(crate) use capability::handle;
+pub(crate) use security::sign;
+
+
+pub(crate) use time::clock;
+pub(crate) use time::tsc;
+
+pub(crate) use testing::ktest;
 
 // T0.1：跨文件引用保持 `crate::HELLO_ELF` / `crate::P7_CALLS` / `crate::drain_reap` 可用。
 pub(crate) use ktests::common::{HELLO_ELF, P7_CALLS, drain_reap};
 #[cfg(feature = "fat32-probe")]
-pub(crate) use ktests::fs::{FAT_PORT_A, FAT_PORT_B};
-mod limine;
-mod mm;
-mod proc;
-mod sched;
-mod serial;
-mod sign;
-mod sync;
-mod resource;
-mod user;
-mod pci;
-mod state_store;
-mod sysinfo;
-mod watchdog;
-mod tsc;
-mod virtio;
-mod vmo;
+pub(crate) use ktests::storage::fs::{FAT_PORT_A, FAT_PORT_B};
 
 use crate::arch::x86_64::{apic, cpu, cpuid, smp, trap};
 use core::cell::UnsafeCell;

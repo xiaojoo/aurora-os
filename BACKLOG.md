@@ -16431,3 +16431,114 @@ ktests: total=95 passed=95 failed=0
 （`A2 argv`/`A3换代码字节`/`A3包读不到`，都是 `a2-exec`/`a3-exec` 档）。
 **这三条是既有问题**：`git stash` 后跑基线同样红 3 条（`t_copy_user`/
 `t_syscall_fastpath`/`t_user_pointer_checks`），**与本片无关，不归因**。
+
+
+## 437. ADR-161：kernel/src 按域分层，物理路径与逻辑模块名解耦（2026-11-19）
+
+**动因**：`kernel/src` 平铺 44 个顶层文件，而 `module-interfaces.toml` 早就登记了
+18 个逻辑模块——**分类早就存在，只是没落到文件系统上**。代价实测三条：
+新增驱动没地方放；`aurora.py` 里 28 处写死路径一搬就**崩**（不是红，是
+`FileNotFoundError` 抛异常退出，后面 11 道门禁一条都不跑）；`unsafe` 普查的
+模块名就是路径，分类规则与文件位置绑死。
+
+**做成什么**：顶层只剩 `main.rs` + **18 个域目录**（`arch` `boot` `bus`
+`capability` `diag` `display` `driver` `filesystem` `input` `irq` `ktests`
+`memory` `resource` `sched` `security` `sync` `testing` `time`）。
+`ktests/` 也分 9 个域。六个"文件夹名与 `crate::X` 撞名"的文件改成 `X/mod.rs`，
+其余由 `main.rs` 用 `pub(crate) use` 重导出 ⇒ **几千处 `crate::X::` 路径一字未改**。
+
+**实测读数（完工后复量）**：
+
+- `check` **18/18**；
+- `unsafe` 普查**逐类**回到基线：U1 85 / U2 119 / U3 13 / U4 142 / U5 128 / U6 36，
+  总 **523**；
+- **73 个特性档中 72 个编译通过**（`trace-switch` 在基线就失败，见 §439 未决）；
+- 默认档内核 **6075272** 字节（重构前 6034160）。差 41112 字节**全在 `.debug_*` 段**
+  （路径字符串长度变了）；**代码段只差 280 字节**（`.text` −16、`.rodata` +128、
+  `.data` +160、`.bss` +8，`llvm-objdump -h` 逐段对比）；
+- 警告数 **666**，与重构前相同（一度涨到 668，定位为两条重导出在默认档无人引用，
+  用 `#[allow(unused_imports)]` 精确标注后回到 666）；
+- **47 个被移动文件逐个与 HEAD 比对：38 个逐字节相同，9 个有改动**，
+  9 处全部是预期改动（5 处 `mod` 声明追加、4 处 `include_bytes!`/`super::` 路径修正），
+  **零行逻辑改动**。
+
+**架构事实的变化（必须记账）**：
+
+- **`storage` 退出环 A**（`known_scc` 11 → 10）。它的 6 条出边
+  （`storage->arch/boot/irq/memory/pci/time`）全消失，因为 ahci/virtio 不再住在
+  storage 那批文件里。**这正是 ADR-044 想要的"环缩小"**。
+- **`driver` 接过 ahci/virtio 的引用**：`driver->arch` 4→55、`driver->pci` 3→18、
+  `driver->memory` 5→17、`driver->time` 0→13、`driver->boot` 0→1，
+  新增 `diagnostics->driver` 15。环内站点总数 **464→422（净减 42）**。
+  **边的归属变了，不是代码多写了引用。**
+- `unsafe-whitelist.toml` 的 46 个键改名（`ahci → driver/ahci` 等），
+  **计数与类别一格未动**；`unsafe-census.md` 按新路径重生成。
+
+**门禁侧的四类修法（都记进 ADR-161 了）**：
+
+1. 新增 `kernel_src(name, in_tests=False)`：按**名字**找文件（`rglob` 唯一命中，
+   0 个或多个都抛 `LookupError`，不静默挑第一个）。同名两份时按 `in_tests` 选边
+   ——`virtio`/`sched`/`crash`/`gpt`/`fs`/`elf` 在产品代码与 `ktests/` 下**各一份**。
+   同时认 `X.rs` 与**域根**的 `X/mod.rs`（`ktests/sched/sched.rs` 那种同名的域内文件不算）。
+2. `DRIVER_MODULES` 改模块路径，但**`driver/mod.rs` 故意不进去**——它就是
+   `DriverCtx` 自己的实现，按 ADR-030 决定 4 必须含 volatile 访问器。
+3. `_classify_unsafe` 的模块名匹配改成"末段"，但 **`driver/mod` 那一条认完整路径**
+   ——`mod.rs` 的末段是 `mod` 不是目录名。踩过两次：先写 `module=="driver"`（U3 13→0）、
+   再写 `leaf=="driver"`（U3 13→4），**两次总数都是 523，看起来像规则没问题**。
+4. `check_wedge_probe` 恢复"由模块路径找文件"（我一度错改成按**符号名**找，
+   于是报 `找不到 TASK_ARMED.rs`），多候选时**问哪个文件真有 `static NAME`**。
+
+**这一轮最值钱的教训（AGENTS.md 那条的又一次印证）**：
+*量具自己错了，读数看起来却像被测物坏了。* `unsafe` 普查那次，
+U3 从 13 掉到 0 而总数仍是 523——如果只看总数，这条改动会被判成"没问题"。
+修法是**改规则**（按末段/按完整路径），**不是改登记数去凑 523**。
+
+## 438. 硬件驱动体系设计文档（20 份，2026-11-19）
+
+`docs/hardware/` 建 6 个子目录，共 20 份：
+
+```text
+Aurora-OS-硬件驱动体系总设计-V1.0.md    （68 KB，69 项对账 + 11 处必改 + AHE-01..09）
+architecture/  统一设备模型 / 驱动生命周期 / MMIO与DMA资源管理 / 硬件中断管理 / 驱动故障隔离
+input/         键盘 / 鼠标 / USB-HID（候选，需重新裁决）
+display/       Framebuffer / 显示设备管理 / VirtIO-GPU
+network/       网卡驱动（三层）/ VirtIO-Net / 物理网卡
+storage/       NVMe
+testing/       QEMU硬件测试规范 / 真机测试规范 / 硬件兼容性矩阵
+```
+
+**这批文档的立场**（不是"规划"，是"对账"）：每条结论标「实测」或「未验证」，
+凡与既有 ADR/裁决冲突的先记差异。最要紧的几条判断：
+
+1. **不要引入 `trait Driver`**：与 ADR-030 决定 5 冲突（"没人调的方法摆进 trait
+   就是把目录当成实现"），且 `&mut self` 在这个内核里没有落脚点（驱动状态住在
+   静态 `UnsafeCell` 里）。改成"设备表 + 纯函数匹配器 + 既有 `DriverCtx`"。
+2. **不要建 `PixelFormat` 枚举**：`frame.rs` 的 `pack()` 按 Limine 掩码算，
+   枚举把"设备说了算"改回"我们猜"，方向相反。真缺口是"只接受 32bpp"那条硬拒绝。
+3. **USB/xHCI 与硬件矩阵是候选**：裁决 ④A/⑥A 已跳过，重开需新 ADR（162 起）。
+4. **`MMIO_SLOTS`/`DMA_SLOTS` = 8 是第一个硬前置**：AHCI(1+1) + 2×virtio-blk(2+2)
+   + virtio-net(1+2) 已近上限；NVMe 要 5 格 DMA。**AHE-01 必须排最前**。
+5. **显示/输入的第二台仪器不在链里**：`aurora.py` 里 `screendump` 与
+   `input-send-event` **零命中**，脚本全在未跟踪的 `.scratch/`。
+   这是整个显示栈（5263 行）今天只有内核自证的原因。
+6. **`network` 逻辑模块不存在**（18 个里没有）：物理网卡落地前必须写 ADR。
+7. **`MOD_VIRTIO` 与 `MOD_VMO` 都是 `ModuleId(19)`**：台账按模块聚合，
+   新增驱动前必须分开。
+
+**本轮只写文档，零代码改动**（除目录重构本身）。
+
+## 439. 未决与欠账（本轮新增）
+
+1. **`trace-switch` 在基线就编译失败**：`11 positional arguments in format string,
+   but there are 10`（`sched/mod.rs:2447`），另有 `apic::lapic_debug` 不存在。
+   **不属重构范围，未修**——修它要动 `sched` 的日志契约，按工作协议先问。
+2. **`DRIVER_MODULES` 仍是文本网关**：新驱动不加进清单 ⇒ `check-driver-ctx`
+   对它空转。建议改成"`driver/` 下所有 `.rs` 默认受约束，`driver/mod.rs` 显式豁免"。
+3. **`storage` 退出环 A 后，`sched -> storage` 这条单向跨层依赖是否也该消失**：
+   本次只登记实测结果，**未深入分析**它的来源（可能来自 `proc`/`elf` 对
+   `filesystem` 的引用）。记一条待查。
+4. **`AGENTS.md` 的读数仍过期**（17 门禁 / 41 行判定表 / ADR 014–045 共 31 份 /
+   两处"未跟踪"）。本轮实测应为：**18 门禁 / 74 行 / 136 份 ADR（007–161）/
+   两个文件都已跟踪**。**未改 `AGENTS.md`**，留待单独一轮。
+5. **`docs/hardware/bringup.md` 未并入**新增的 20 条待测项（H-32…H-51）。
+   那份文件有它自己的纪律（状态列只允许写待测/已测），是否并入由使用者决定。
