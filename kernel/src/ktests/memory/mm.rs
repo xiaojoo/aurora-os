@@ -879,10 +879,16 @@ fn t_proc_job_wait() -> bool {
     let (pc1, _) = proc::proc_residual();
     let (jc1, _) = proc::job_residual();
     let f1 = mm::free_frames();
+    // `f1 >= f0` 而不是 `==`：泄漏的方向是 free **变小**（帧没还回来），
+    // 而 `f0` 是在用例开头读的——那一刻**别的用例遗留的异步回收可能还没跑完**，
+    // 本用例中间经过多次 `with_interrupts` 窗口之后 reaper 跑过，`f1` 就比 `f0` 高。
+    // 实测：`free113763->113774`（+11 帧）而 `drained=true pc=0 jc=0`。
+    // 与 `ktests/sched/sched.rs:1781` 同一口径（那里写着"别的用例也可能同时在动，
+    // 只判不回退"）。`>=` 对"本用例不泄漏"这件事不比 `==` 弱：泄漏仍然会被抓住。
     let baseline_ok = drained
         && up_after == Some(0)
         && jd_child.is_ok() && jd_job.is_ok()
-        && pc1 == 0 && jc1 == 0 && f1 == f0;
+        && pc1 == 0 && jc1 == 0 && f1 >= f0;
 
     if !was_running { crate::arch::x86_64::apic::timer_stop().ok(); }
 

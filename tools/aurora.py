@@ -6378,8 +6378,12 @@ def crash_cross(log1: str, log2: str) -> tuple[bool, bool, bool]:
 # 第 21 行的第二台仪器：内核只交出**地址**，"这个地址属于哪个函数"由 ELF 符号表说。
 # 两个期望写成模块路径，尾部由 _mangle_tail 现算 —— 手写 mangled 长度是本机错过的那一类数。
 OOPS_FRAMES_FNS = (
-    ("aurora_kernel", "ktests", "crash", "t_crash_oops"),   # T0.1 搬进 ktests/crash 出事那一帧：必须落在故意越界的那个函数里
-    ("aurora_kernel", "ktest", "run_all"),  # 它的调用者：用例就是被运行器调进去的
+    # 2026-11-20（ADR-161 目录重构的遗留）：模块路径多了域前缀——
+    # `ktests/crash.rs` → `ktests/diag/crash.rs`、`ktest.rs` → `testing/ktest.rs`。
+    # 实测解出的符号是 `aurora_kernel::ktests::diag::crash::t_crash_oops` 与
+    # `aurora_kernel::testing::ktest::run_all`，旧值在这里会让"符号化"恒假。
+    ("aurora_kernel", "ktests", "diag", "crash", "t_crash_oops"),   # 出事那一帧：必须落在故意越界的那个函数里
+    ("aurora_kernel", "testing", "ktest", "run_all"),  # 它的调用者：用例就是被运行器调进去的
 )
 
 
