@@ -17,7 +17,15 @@
 use crate::mm::{self, AspaceHandle, AspaceMapping, MmError, ModuleId, PageFlags, PhysAddr, VirtAddr, PAGE};
 
 /// VMO 的帧记在这个模块号下：台账要能分开回答"内存对象占了多少帧"。
-pub const MOD_VMO: ModuleId = ModuleId(19);
+///
+/// **2026-11-20（ADR-165）：19 → 20。** 原来这里和 `driver/virtio.rs` 的
+/// `MOD_VIRTIO` **都是 19**，而 `resource::Ledger` 按 `ModuleId` 聚合 ⇒
+/// 查"virtio 占了多少帧"会读到 VMO 的数。今天不出事只因两条账从不放在一起比。
+///
+/// 换 VMO 而不是换 virtio：`virtio` 的 19 已经出现在既有日志里
+/// （`ledger: module 19 …`），换它会让历史读数对不上；本常量的引用面更小。
+/// **历史读数的 19 一律是 virtio**（本改动之前 VMO 的账也记在 19 上，不可重解）。
+pub const MOD_VMO: ModuleId = ModuleId(20);
 /// 定长容量。与 `MAX_LAZY_REGIONS`/`MAX_ADDR_SPACES` 同一口径：接缝够用，欠 workload 依据
 /// （ADR-074 未决 1：P5 真起进程之后按"一个进程几个 VMO、每个几页"重量）。
 // ADR-131（A3 切片）：8 → 16。用户态装载器要求**父子同时**持有 VMO：

@@ -527,6 +527,31 @@ test_targets = []
 # S6b：正文区一次性写完就落冻结闸门，**滚动与真日志镜像还没做**
 status = "部分落地"
 
+[modules."network"]
+module_id = "network"
+owner = "network"
+layer = "service"
+source_modules = ["network"]
+# 今天只有边界声明与 `NetError`：协议实现仍在 `driver/virtio.rs` 里，**待搬迁**
+# （ADR-166 未决 1）。先登记"这个域存在、依赖谁、谁能调"，搬迁时往这里加成员。
+public_api = ["network::NetError"]
+# 今天**无人调用**（协议还在 driver 里）；按实测填空，搬迁后再长出来。
+allowed_callers = []
+# 依赖方向是 **network → driver（单向）**：协议通过驱动的收发原语工作。
+# 反向依赖会让驱动不得不认识协议，那正是 ADR-166 要拆掉的东西。
+# 今天**无源码依赖**：`network/mod.rs` 只 use 了 core。
+# 登记表写的是「现在是什么」，不是「打算变成什么」——计划属 ADR，事实属这里。
+dependencies = []
+forbidden_dependencies = ["storage", "display", "input"]
+known_violations = []
+test_targets = []
+# 域已存在、协议待搬迁（ADR-166 未决 1）⇒ 目标设计，不是「部分落地」
+status = "目标设计"
+context = ["KERNEL"]
+error_classes = ["A", "C"]
+resource_ownership = "无自有资源：协议层只处理字节，收发由 driver 域的网卡驱动持有。"
+error_policy = "NetError 具名返回；每一处切片先验长度（线上/盘上的数不能直接当界用）。"
+unsafe_scope = []
 [modules."driver"]
 module_id = "driver"
 owner = "driver"

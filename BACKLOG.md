@@ -16941,3 +16941,74 @@ testing/       QEMU硬件测试规范 / 真机测试规范 / 硬件兼容性矩�
 - `ktests` 104/104（内核用例全绿）
 - 判定表：**69 符合 / 5 不符合**，其中 4 条是长链抖动（单跑全绿）、
   本条是唯一的内核外既有失败
+
+
+## 447. ADR-165 四项 + ADR-166 两项的实施读数（2026-11-20）
+
+按使用者裁决「按完整系统角度定，不是更容易方向」，落地了 ADR-165 全部四项与
+ADR-166 的两项（协议搬迁除外，理由见 §448）。
+
+### 改了什么
+
+| 项 | 改动 | 落点 |
+|---|---|---|
+| `MOD_VMO` | `ModuleId(19)` → `20` | `memory/vmo.rs:28` |
+| 驱动槽 | `MMIO_SLOTS`/`DMA_SLOTS` 8 → 16 | `driver/mod.rs:30,44` |
+| 任务数 | `MAX_TASKS` 9 → 12，`MAX_TASKS_SUPPORTED` 同步 12 | `sched/mod.rs`、`memory/mm.rs` |
+| syscall 段 | 48–63 预留（`SYS_SOCK_*` 8 / `SYS_INPUT_*` 4 / `SYS_AUDIO_*` 2 / 保留 2） | `sched/user.rs` |
+| `network` 域 | 新建 `network/mod.rs`（边界 + `NetError`）+ 登记为第 19 个逻辑模块 | `network/`、`module-interfaces.toml` |
+| framebuffer | 32/24/16bpp 分档，掩码打包不变 | `display/frame.rs` |
+
+### 读数
+
+| 项 | 值 |
+|---|---|
+| `check` | **18/18**（exit=0） |
+| 特性档 | **73/73** |
+| `ktests`（fs-open 档） | **104/104 passed** |
+
+### 过程中被门禁/断言拦住的四次（都是对的）
+
+1. **`MAX_TASKS` 9→12 被编译期断言拦住**：
+   `error[E0080]: assertion failed: MAX_TASKS <= crate::mm::MAX_TASKS_SUPPORTED`。
+   那道 `const _: () = assert!(...)` 是 memory 与 sched 之间的容量契约，
+   存在的意义就是逼两边一起改。
+2. **`mod network` 未登记**：`check-module-interfaces` 报
+   「被 0 个逻辑模块覆盖（[]）」。
+3. **`network` 的依赖填错**：我按"将来谁会调"写了
+   `dependencies = ["driver","memory","sync"]`，门禁比的是**源码实测**
+   （今天只 use 了 core）⇒ 报「源码多 []，登记多 [...]」。
+   **登记表写的是「现在是什么」，不是「打算变成什么」**——这条已写进 ADR-167 §二。
+4. **syscall 命名撞车**：初版 48–55 写 `SYS_NET_SEND/RECV`，撞了既有的 33/34
+   （那是**原始以太网帧**收发）。改成 `SYS_SOCK_*` 前缀，两族一眼分得开。
+
+### 命名与语义的两处澄清
+
+- **`SYS_NET_SEND`(33)/`SYS_NET_RECV`(34) ≠ `SYS_SOCK_SEND`(53)/`SYS_SOCK_RECV`(54)**：
+  前者是原始以太网帧（无连接），后者是 socket 族（有连接、有状态、有 fd 语义）。
+- **历史日志里的 `ledger: module 19` 一律是 virtio**：`MOD_VMO` 换号前两者混用，
+  **不可重解**。这条写进了 `vmo.rs` 的注释。
+
+### 未做
+
+- **`network` 的协议搬迁（约 1050 行）未做**，理由见 §448。
+- **24/16bpp 无真实面板可测**：QEMU 恒 32bpp；`dropped` 那一掩在 5/6/5 上是否够，
+  只在 8/8/8 上验证过。
+- **syscall 48–63 只有常量、无实现**：号占住了，实现按各 ADR 分片推进。
+- **`MAX_TASKS` 9→12 的 `.bss` 增量未实测**。
+
+## 448. 为什么 `network` 的协议搬迁单独一轮做（2026-11-20）
+
+协议块在 `driver/virtio.rs:1148–2206`，约 **1050 行**。四条理由：
+
+1. **共享 20 多个常量**：`NET_TYPE_*`、`DHCP_*`、`ARP_*`、`BOOTP_OFF`…
+   搬迁要精确切分哪些进 `network`、哪些留 `driver`，切错会让帧对账静默读错。
+2. **错误类型要逐个翻**：`VirtioError::NotV4 { at, guard }` 等 5 处要翻成 `NetError`，
+   翻错会让判定表第 32/33 行的帧对账**静默读成零条**（不是报错，是读不到）。
+3. **必然改 `known_scc`**：ADR-044 要求实测后重写基线，不许猜。
+4. **4 条长链抖动还没归因**（§441）：搬迁会改变 `.ktests` 布局，
+   让抖动与搬迁的效应混在一起，事后分不开。
+
+**已完成的边界工作让这一轮变小**：`network/mod.rs` 已定死依赖方向
+（`network → driver` 单向）与 `NetError`，搬迁时只需把函数搬进去、
+往 `source_modules` 加成员、再实测重算 SCC。

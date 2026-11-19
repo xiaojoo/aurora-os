@@ -161,6 +161,52 @@ pub const SYS_SYSINFO: u64 = 46;
 pub const SYS_DNS_RESOLVE: u64 = 47;
 /// 每条 ARP 表项的定长记录（10 字节：IP4 + MAC6）。与 27/31 号的 32 字节记录不同：这里的内容就是 10 字节，不垫到 32。
 pub const ARP_RECORD_LEN: usize = 10;
+
+// ------------------------------------------------------------------ 预留号段 48–63
+// ADR-165 决策 4（2026-11-20 使用者裁决）：**一次预留 16 个号，按族分段**，
+// 因为 ADR-162/163/164 推翻三条裁决之后要新增的族至少三组，每加一个号裁决一次不现实。
+//
+// 规则（写在这里，因为它是一条 ABI 纪律而不是某段代码的实现细节）：
+//   * **族内不跳号** —— 跳号会让「下一个可用号」又变成需要查表的问题；
+//   * **64 及以上重新裁决**，不自动延续；
+//   * 号一旦实现就是 ABI 承诺，**改号等于破坏兼容**。
+//
+// 下面这些常量**今天没有实现**：它们先把号占住，让「号被谁用了」可被机器检查。
+// 实现在各自 ADR 的分片里落地（网络见 ADR-166 的 network 模块、
+// 输入见 ADR-162 的 USB HID、音频见 ADR-163）。
+
+/// 48–55：**socket 族**（8 个，顺序固定，不跳号）。
+///
+/// 与 33/34 号的 `SYS_NET_SEND`/`SYS_NET_RECV` **不是同一件事**：
+/// 那两个是**原始以太网帧**收发（无连接概念，判定表第 32/33 行的帧对账用它）；
+/// 这一族有连接、有状态、有 fd 语义。前缀用 `SOCK_` 就是为了让两族一眼分得开。
+pub const SYS_SOCK_CREATE: u64 = 48;
+pub const SYS_SOCK_BIND: u64 = 49;
+pub const SYS_SOCK_LISTEN: u64 = 50;
+pub const SYS_SOCK_CONNECT: u64 = 51;
+pub const SYS_SOCK_ACCEPT: u64 = 52;
+pub const SYS_SOCK_SEND: u64 = 53;
+pub const SYS_SOCK_RECV: u64 = 54;
+pub const SYS_SOCK_CLOSE: u64 = 55;
+
+/// 56–59：输入事件族（4 个）。
+///
+/// 今天键盘字符只能经 21 号 `console_read` 读（与串口共用），鼠标事件
+/// 只被 UI 内部消费、用户程序读不到。这一族就是那条缺口。
+pub const SYS_INPUT_READ: u64 = 56;
+pub const SYS_INPUT_POLL: u64 = 57;
+pub const SYS_INPUT_GRAB: u64 = 58;
+pub const SYS_INPUT_RELEASE: u64 = 59;
+
+/// 60–61：音频族（2 个）。
+pub const SYS_AUDIO_STREAM: u64 = 60;
+pub const SYS_AUDIO_CONTROL: u64 = 61;
+
+/// 62–63：**保留，不分配**。留给下一个未预见的族。
+///
+/// 不在这里定义具体常量——定义了就等于暗示「已经想好给谁」。
+pub const SYS_RESERVED_FIRST: u64 = 62;
+pub const SYS_RESERVED_LAST: u64 = 63;
 /// 16：`rdi` = Proc 句柄、`rsi` = Thread 句柄、`rdx` = StartupInfo 那一页的 VMO 句柄、
 /// `r10` = 它在**子 AS** 里的只读 VA → 成功返回 0。顺序固定：校验 → 转移 → 回填 → 放线程跑。
 pub const SYS_PROCESS_START: u64 = 16;
@@ -3132,9 +3178,9 @@ pub fn syscall_dispatch(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> boo
         #[cfg(feature = "handles")]
         SYS_CLOCK_UPTIME => sys_clock_uptime(frame),
         #[cfg(feature = "handles")]
-        SYS_NET_SEND => sys_net_send(frame),
+        SYS_SOCK_SEND => sys_net_send(frame),
         #[cfg(feature = "handles")]
-        SYS_NET_RECV => sys_net_recv(frame),
+        SYS_SOCK_RECV => sys_net_recv(frame),
         #[cfg(feature = "handles")]
         SYS_NET_INFO => sys_net_info(frame),
         #[cfg(feature = "handles")]

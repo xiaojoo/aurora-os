@@ -38,6 +38,7 @@ mod input;
 mod irq;
 mod ktests;
 mod memory;
+mod network;
 mod resource;
 mod sched;
 mod security;

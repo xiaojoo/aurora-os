@@ -18,9 +18,15 @@ use alloc::vec::Vec;
 use crate::hw::{self, MmioRegion};
 use crate::limine::{self, FbInfo};
 
-/// 只支持 32bpp：24/16bpp 的打包要按掩码重排字节序，画错了不会报错、只会静默变色，
-/// 那种"看起来出画面了"的结论本仓库不收（AGENTS 硬约束⑦）。
-const SUPPORTED_BPP: u16 = 32;
+/// 支持的位宽（ADR-166 决策 2）：**按位宽分档，像素值仍由掩码算**。
+///
+/// 为什么不是 `PixelFormat` 枚举：枚举是「我们列出可能的答案让设备去匹配」，
+/// **判断本身就是猜**，而判错的表现是「画面出来了但颜色不对」——几何、位置、
+/// 读回值全对，只有通道错位，**不会让任何判据变红**。
+/// 掩码是设备在启动时报的（`info.masks`），按它算才是「设备说了算」。
+///
+/// 每一档只决定「一次写几个字节」，像素值的算法三档共用。
+const SUPPORTED_BPPS: [u16; 3] = [32, 24, 16];
 /// `LIMINE_FRAMEBUFFER_RGB`
 const MEMORY_MODEL_RGB: u8 = 1;
 
@@ -73,7 +79,8 @@ impl Frame {
     pub fn init() -> Result<Self, FrameError> {
         let info = limine::framebuffer().ok_or(FrameError::NotProvided)?;
         let (pa, len) = limine::framebuffer_memmap().ok_or(FrameError::NotProvided)?;
-        if info.bpp != SUPPORTED_BPP || info.memory_model != MEMORY_MODEL_RGB {
+        if !SUPPORTED_BPPS.contains(&info.bpp) || info.memory_model != MEMORY_MODEL_RGB {
+            // 报**实际值**：只报「不支持」的失败无法归因（ADR-166 决策 2）。
             return Err(FrameError::UnsupportedMode { bpp: info.bpp, memory_model: info.memory_model });
         }
         // 要映射的是"每一行 pitch 字节 × height 行"，不是 width*height*4：
@@ -84,7 +91,10 @@ impl Frame {
             pitch: info.pitch,
             height: info.height,
         })?;
-        if info.width == 0 || info.height == 0 || info.pitch < info.width * 4 || need > len {
+        // 每像素字节数由位宽算，不再硬编码 4（24bpp 是 3、16bpp 是 2）。
+        // `pitch` 仍可能**大于** `width * 每像素字节`（行对齐），所以判据是「不小于」。
+        let bytes_pp = u64::from(info.bpp / 8);
+        if info.width == 0 || info.height == 0 || info.pitch < info.width * bytes_pp || need > len {
             return Err(FrameError::BadGeometry { need, have: len, pitch: info.pitch, height: info.height });
         }
         let pages = ((need + (crate::mm::PAGE as u64 - 1)) / crate::mm::PAGE as u64) as usize;
@@ -124,7 +134,19 @@ impl Frame {
             unsafe {
                 if ROW_DIRTY[y] {
                     let row = &BACK[y * w..(y + 1) * w];
-                    let _ = self.region.write_slice(y * self.info.pitch as usize, row);
+                    if self.info.bpp == 32 {
+                        // 快路径：整行一次搬（32bpp 的像素值就是 `u32`，与 BACK 同宽）。
+                        let _ = self.region.write_slice(y * self.info.pitch as usize, row);
+                    } else {
+                        // 24/16bpp：逐像素写。**必须分档**——`write_slice` 会把 32 位字
+                        // 写进窄像素的显存，每行错位且不报错（比拒绝更糟）。
+                        // 慢一个量级，但这两档在真机上罕见，正确性优先。
+                        let bytes_pp = u64::from(self.info.bpp / 8);
+                        let base = y as u64 * self.info.pitch;
+                        for (x, &px) in row.iter().enumerate() {
+                            let _ = self.write_pixel((base + x as u64 * bytes_pp) as usize, px);
+                        }
+                    }
                     ROW_DIRTY[y] = false;
                 }
             }
@@ -200,7 +222,7 @@ impl Frame {
             self.dirty.set(true);
             return Ok(());
         }
-        self.region.write32(off, self.pack(rgb)).map_err(FrameError::Map)
+        self.write_pixel(off, self.pack(rgb))
     }
 
     /// 搬一个**已经打包好的**像素值。滚动必须用它：`put` 收 24 位色再打包，
@@ -218,7 +240,33 @@ impl Frame {
             self.dirty.set(true);
             return Ok(());
         }
-        self.region.write32((y * self.info.pitch + x * 4) as usize, packed).map_err(FrameError::Map)
+        let off = (y * self.info.pitch + x * u64::from(self.info.bpp / 8)) as usize;
+        self.write_pixel(off, packed)
+    }
+
+    /// 按位宽把**已打包**的像素值写到显存偏移 `off`。三档共用 `packed` 的算法，
+    /// 差别只在「一次写几个字节」（ADR-166 决策 2）。
+    ///
+    /// 24bpp 按小端拆三个字节：`pack()` 已经把每个通道挪到掩码指定的位上，
+    /// 所以低 24 位的字节序就是显存字节序（小端面板）。**这不是在猜格式**——
+    /// 格式已经由掩码定了，这里只决定写几个字节。
+    #[inline]
+    fn write_pixel(&self, off: usize, packed: u32) -> Result<(), FrameError> {
+        match self.info.bpp {
+            32 => self.region.write32(off, packed).map_err(FrameError::Map),
+            24 => {
+                self.region.write8(off, packed as u8).map_err(FrameError::Map)?;
+                self.region.write8(off + 1, (packed >> 8) as u8).map_err(FrameError::Map)?;
+                self.region.write8(off + 2, (packed >> 16) as u8).map_err(FrameError::Map)
+            }
+            16 => self.region.write16(off, packed as u16).map_err(FrameError::Map),
+            // 进不来：`init()` 已经用 `SUPPORTED_BPPS` 挡过了。留一条显式的
+            // 失败而不是 `unreachable!()`——后者在 no_std 里会变成 panic 路径。
+            _ => Err(FrameError::UnsupportedMode {
+                bpp: self.info.bpp,
+                memory_model: self.info.memory_model,
+            }),
+        }
     }
     /// S11：把 `rgb` 按覆盖率 `a15`(0..15) 混进**当前像素**，用于抗锯齿的指针边缘。
     pub fn put_mix(&self, x: u64, y: u64, rgb: u32, a15: u32) -> Result<(), FrameError> {

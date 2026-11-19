@@ -27,8 +27,15 @@ pub const MOD_STACK_KUSER: ModuleId = ModuleId(15);
 /// 不是把回收问题解掉：过程与现在的状态见 BACKLOG 的 M4 一节。
 /// 8 → 9 是 W3 P3 的 Q2 裁决（2026-11-09，使用者选定）：参考 workload
 /// （init + 3 子进程 × 2 线程 = 7 条线程）加 boot 上下文与兜底 idle **正好 9 格、零余量**。
-/// 实测读数与三本账的代价见 ADR-071 决策 3 的补记；再要余量得重开那一题。
-pub const MAX_TASKS: usize = 9;
+/// 实测读数与三本账的代价见 ADR-071 决策 3 的补记。
+///
+/// **9 → 12（2026-11-20，ADR-165 决策 3）：那一题被重开了。**
+/// 推翻 ADR-162/163/164 之后要三个常驻任务：USB 事件环轮询、GPU fence 等待、
+/// 音频流喂样本。零余量意味着**新增一个就挤掉一个**，所以扩到 12（9 + 3）。
+///
+/// 注意 `MAX_TASKS_TOTAL = MAX_TASKS * MAX_CPUS`：8 核从 72 槽变 96 槽，
+/// 凡按它算上界的判据（`tasks_active()`、`t_q2_workload_slots` 的回基线）都要重核。
+pub const MAX_TASKS: usize = 12;
 /// `Task::as_slot` 的"内核 AS"哨兵（W3 P5b，ADR-075 决策 2）。
 /// **内核任务恒为它**，所以既有路径一次 CR3 都不多写（矩阵 45 行不该变的论证基础）。
 pub const NO_ASPACE: u8 = 0xFF;

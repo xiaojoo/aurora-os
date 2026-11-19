@@ -74,7 +74,15 @@ const FRAME_INFO_BYTES: usize = core::mem::size_of::<FrameInfo>();
 /// （sched.rs 的 const 断言），不再派生 VA 容量。W3 P3 随 sched 的 8→9 同步抬到 9（Q2 裁决），
 /// **VA 表仍是 256，不跟着派生**：每任务栈占 5 页 VA，9×8=72 条满配也只用 72 格。
 /// 登记不下时**明确失败**而不是发一条没登记的 VA（见 alloc_va_range 的注释）。
-pub const MAX_TASKS_SUPPORTED: usize = 9;
+/// **2026-11-20（ADR-165）：9 → 12**，随 `sched::MAX_TASKS` 一起抬。
+///
+/// 这两个数是 memory 与 sched 之间的**容量契约**：`sched/mod.rs` 有编译期断言
+/// `assert!(MAX_TASKS <= MAX_TASKS_SUPPORTED)`，所以改一边不改另一边会当场编译失败
+/// ——那道断言存在的意义就是逼两边一起改。
+///
+/// **`MAX_VA_RESERVATIONS` 不跟着派生**（ADR-065 已解耦）：每任务栈占 5 页 VA，
+/// 12×8 = 96 条仍远小于 256。
+pub const MAX_TASKS_SUPPORTED: usize = 12;
 const MAX_VA_RESERVATIONS: usize = 256;
 /// 占用位图字数（bit i=1 表示槽 i 已用）。所有访问都在 VMM 锁内，普通 u64 即可（非原子）。
 const VA_BITMAP_WORDS: usize = MAX_VA_RESERVATIONS / 64;

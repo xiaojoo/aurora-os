@@ -25,11 +25,22 @@ use crate::mm::{self, Mapping, ModuleId, PageFlags, PAGE};
 use crate::pci::Dev;
 use core::cell::UnsafeCell;
 
-/// MMIO 句柄槽数。首期只有 AHCI 一个驱动，留 8 格是给"同一份驱动多次映射不同 BAR"
-/// 的余量，不是给未来的驱动池。
-const MMIO_SLOTS: usize = 8;
-/// DMA 句柄槽数（AHCI 首期只占 1 格：环形结构那一整块）
-const DMA_SLOTS: usize = 8;
+/// MMIO 句柄槽数。
+///
+/// **2026-11-20（ADR-165）：8 → 16。** 8 格是「首期只有 AHCI」时代的数，
+/// 而实测占用已经是 AHCI(1) + 2×virtio-blk(2) + virtio-net(1) ≈ 4 格，
+/// 且 `virtio::probe()` 还会临时多占 1 格。
+///
+/// ADR-162/163/164 推翻三条裁决之后要挂的：NVMe(1) + xHCI(1) + HDA(1)
+/// ⇒ 全挂齐 7 MMIO。16 格给到两倍余量。
+const MMIO_SLOTS: usize = 16;
+/// DMA 句柄槽数。
+///
+/// **8 → 16（同上）。** 实测占用 AHCI(1) + 2×virtio-blk(2) + net(2) = 5 格。
+/// NVMe 一台就要 5 格（Admin SQ/CQ + I/O SQ/CQ + 数据页）——但那是**没做队列合并**
+/// 的数；ADR-165 决策 2 要求把它压到 2 格（四个环塞进同一块 `alloc_dma`，
+/// 用 `DmaHandle` 的 `off` 参数切偏移）。合并之后全挂齐是 10 格，16 剩 6 格。
+const DMA_SLOTS: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DriverError {
