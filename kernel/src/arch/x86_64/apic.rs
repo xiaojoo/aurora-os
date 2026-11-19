@@ -26,6 +26,12 @@ pub const MOD_APIC: ModuleId = ModuleId(11);
 const LAPIC_ID: u64 = 0x0020;
 const LAPIC_VER: u64 = 0x0030;
 const LAPIC_EOI: u64 = 0x00b0;
+/// 在服务寄存器：已被 CPU 接受、正在（或等待）执行的中断位图。
+const LAPIC_ISR: u64 = 0x0100;
+/// 中断请求寄存器：已到达 LAPIC 但还没被接受的中断位图。
+/// 与 ISR 分开是诊断的关键——「挂在 IRR 里」= 优先级/屏蔽问题，
+/// 「在 ISR 里不动」= 处理函数没 EOI。两件事的处置完全不同。
+const LAPIC_IRR: u64 = 0x0200;
 const LAPIC_SVR: u64 = 0x00f0;
 /// I/O APIC 的两个 32 位端口：选择寄存器 + 窗口
 const IOREGSEL: u64 = 0x0000;
@@ -935,3 +941,20 @@ pub fn eoi_self() {
     }
 }
 
+
+/// 本 CPU 的 LAPIC 中断位图读数：`(IRR, ISR)`。**诊断用**，不改任何状态。
+///
+/// 为什么分两个数：`IRR` 非零而 `ISR` 为零 ⇒ 中断到了但没被接受
+/// （优先级低于 ISR 里那条、或 LVT/SVR 屏蔽了它）；`ISR` 非零而 tick 不前进
+/// ⇒ 处理函数没 EOI。这两种成因在日志里必须分得开，否则
+/// 「tick 没来」只能靠猜。
+///
+/// 读不到 LAPIC（还没初始化）时返回 `(0, 0)`——**不是**错误：
+/// 调用方（`trace-switch` 的诊断行）在启动早期也可能走到这里。
+pub fn lapic_debug() -> (u32, u32) {
+    let lapic = LAPIC_VA.load(Ordering::Relaxed);
+    if lapic == 0 {
+        return (0, 0);
+    }
+    (mmio_read32(lapic, LAPIC_IRR), mmio_read32(lapic, LAPIC_ISR))
+}

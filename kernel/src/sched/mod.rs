@@ -2443,9 +2443,12 @@ pub unsafe fn preempt_point(frame: u64, cpu: usize) {
     #[cfg(feature = "trace-switch")]
     {
         let mut s = rq(cpu);
+        // 序号取"本次是第几次切换"：上面已经 `fetch_add(1)`，所以减 1。
+        // **先取出来再格式化**——同一行里既加又读是两个时刻，日志会自相矛盾。
+        let sw = FLAGS[cpu].switches.load(Ordering::Relaxed) - 1;
         crate::log_info!(
             "sw#{} cpu{} {}->{} me_frame={:#x} next_frame={:#x} st=[{:?},{:?},{:?}] need_rs={} ticks={}",
-            cpu, me, next, frame, s.tasks[nslot].frame,
+            sw, cpu, me, next, frame, s.tasks[nslot].frame,
             s.tasks[0].state, s.tasks[1].state, s.tasks[2].state,
             FLAGS[cpu].need.load(Ordering::Relaxed), FLAGS[cpu].ticks.load(Ordering::Relaxed)
         );
