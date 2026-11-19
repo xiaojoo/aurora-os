@@ -16302,3 +16302,50 @@ meminfo → total=130780 free=128329 used=2451 page=4096
 §10.3 从 **6/12 → 9/12**。
 
 **§10.3 剩余**：`date`（需真机 RTC）、`reboot`/`poweroff`（需 ACPI 电源状态机 + ADR）。
+
+
+## 434. ADR-158：§10.4 第三条 nslookup 与 DNS 解析出口（workbuddy，2026-11-19）
+
+**审计第 5 项**（TCP/Socket 太大，先做 DNS——内核侧构造/解析已有，只缺出口）。
+新增 **47 号 `SYS_DNS_RESOLVE`**：核内完成 构造→发送→等应答→取 A→写回 4 字节。
+
+### 三处内核改动
+
+1. **名字参数化**：`build_dns_query` 原来硬编码 `\x09localhost\x00`，
+   只能证明"DNS 通道能通"。新增 `build_dns_query_name(..., name)` +
+   `encode_dns_name`（RFC 1035 §3.1 长度前置；空名/连续点/段超 63/超 128 字节都返回 0，
+   **不 panic 不截断**）。
+2. **A 记录提取**：`DnsReply` 原来只有 `rcode`/`ancount`，**没有地址**。
+   加 `a_record: [u8;4]`（`[0,0,0,0]` 当"没有"哨兵），`dns_first_a` 跳过
+   QDCOUNT 条问题再逐条看 answer。
+   **压缩指针防循环两条**：只认"指向更靠前"（`target < p`）+ 最多跳 8 次
+   （`DNS_MAX_PTR_JUMPS`）。
+3. **返回值 `(rcode<<16)|ancount`**：`rcode!=0` 是服务器拒绝、`ancount==0` 是没这条记录，
+   合成一个错误码就混成一样。**超时返回 0**（与 34 号约定一致，不新造错误码）。
+
+**实测**（PASS33 16.0s）：`nslookup localhost` →
+`nslookup: name=localhost ip=0.0.0.0 ancount=0 rcode=0`。
+**`ancount=0` 是正确结果**（本机 slirp DNS 离线，ADR-141）。
+判定格 `_nslookup_row` 一格（四字段都在、ip 四段、rcode 数字，**不断言 ancount>0**）。
+**变异证红**：不打 rcode ⇒ False，还原 True。
+
+### 三个坑
+
+1. **`(offset,len)` 又一次算错**（**与 ADR-157 meminfo 同一个坑，重复两次了**）：
+   35 字节的 `"nslookup: name= ip= ancount= rcode="` 按
+   `(1301,13)/(1314,4)/(1318,9)/(1327,8)` 切，正确是
+   `(1301,15)/(1316,4)/(1320,9)/(1329,7)`。错切输出 `namlocalhoste= i0.0.0.0p= ancoun0t= rcode0`。
+2. **三个符号名猜错**：`NET_GUEST_IP`→`DHCP_GUEST_IP`、
+   `clock::uptime_us`→`uptime_micros() -> Option<u64>`、`E_TIMEOUT`→**不存在**
+   （34 号约定超时返回 0）。前两个查一下就有，第三个是设计问题：我差点造一个新错误码。
+3. `check-virtio-pattern` 对 `virtio.rs` 的 `read_volatile`/`write_volatile`/`ptr::` 有禁令
+   （AGENTS 硬约束 3）；本片全是纯切片读，符合。
+
+读数：`check` **18/18**（unsafe 522/U5 127）；整链 **74 符合 + 0 不符（全绿）**。
+§10.4 从 **2/5 → 3/5**。
+
+### 诚实负面
+
+**真实 DNS 解析未被端到端证明**：`ancount` 实测恒 0，链路跑通但"查到地址"没有证据。
+其余：只取第一条 A（无 CNAME 链/AAAA/多记录）、超时 800ms 写死、
+`ss` 需 socket 表（TCP 未做）、`hostname` 需主机名存储（依赖 FAT32 写）。

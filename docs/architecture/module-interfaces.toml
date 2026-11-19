@@ -708,6 +708,12 @@ public_api = [
   "filesystem/part::part_read_from",
   "filesystem::part",
   "gpt::HEADER_LBA",
+  "virtio::DNS_FRAME_BYTES",
+  "virtio::DnsReply",
+  "virtio::arp_lookup",
+  "virtio::build_dns_query_name",
+  "virtio::parse_dns_reply",
+  "virtio::DNS_NAME_MAX",
 ]
 allowed_callers = ["capability", "diagnostics", "integration", "sched"]
 dependencies = ["arch", "boot", "driver", "irq", "memory", "pci", "time"]

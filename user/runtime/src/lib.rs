@@ -1142,6 +1142,36 @@ pub const SYS_NET_INFO: u64 = 35;
 /// 网卡读数包（18 字节定长）：MAC6 + 本机 IP4 + 网关4 + DNS4。
 /// 读数包 24 字节（ADR-144 从 18 扩到 24）：MAC6 + 本机IP4 + 网关4 + DNS4 + mtu2 + link2。
 pub const NET_INFO_BYTES: usize = 28;
+/// 47（ADR-158）：DNS 解析。返回 `(rcode, ancount, ip4)`。
+pub const SYS_DNS_RESOLVE: u64 = 47;
+
+/// 47：把 `name` 解析成 IPv4。返回 `(rcode, ancount, [a,b,c,d])`。
+///
+/// **超时返回 `Ok((0, 0, [0;4]))`**：与 34 号的约定一致（"0 = 没有应答"），
+/// 不新造错误码。调用方靠 `ancount == 0` 判"没查到"。
+pub fn dns_resolve(name: &[u8], timeout_ms: u64) -> Result<(u8, u16, [u8; 4]), RTError> {
+    if name.is_empty() || name.len() > 128 {
+        return Err(RTError::INVALID);
+    }
+    let mut ip = [0u8; 4];
+    // SAFETY: 47 号 rdi=名字、rsi=名字长、rdx=超时、r10=4 字节输出缓冲。
+    let ret = unsafe {
+        syscall_abi(
+            SYS_DNS_RESOLVE,
+            name.as_ptr() as u64,
+            name.len() as u64,
+            timeout_ms,
+            ip.as_mut_ptr() as u64,
+        )
+    } as i64;
+    if ret < 0 {
+        Err(RTError(ret))
+    } else {
+        let v = ret as u64;
+        Ok(((v >> 16) as u8, (v & 0xFFFF) as u16, ip))
+    }
+}
+
 /// 46（ADR-157）：内核身份与内存读数。
 pub const SYS_SYSINFO: u64 = 46;
 /// 记录定长。

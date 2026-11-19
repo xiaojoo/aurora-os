@@ -7921,6 +7921,35 @@ def _lspci_rows(log: str) -> bool:
     return False
 
 
+def _nslookup_row(log: str) -> bool:
+    """`nslookup` 的显示层判据（ADR-158，§10.4 的第三条）。
+
+    一格：`nslookup localhost` 之后必须出现
+    `nslookup: name=localhost ip=<a.b.c.d> ancount=<n> rcode=<n>`。
+
+    **`ancount=0` 是合法结果**：本机 slirp 的 DNS 离线（ADR-141），查不到是
+    正确读数。判据只要求四个字段都在、`ip` 是四段数字、`rcode` 是数字——
+    **不断言 ancount > 0**（那会在离线环境里误红）。
+    它证明的是"47 号走完了全链并给出四个可核读数"，不是"DNS 服务器答了"。
+    """
+    import re
+    pat = re.compile(
+        r"^nslookup: name=localhost ip=(\d+)\.(\d+)\.(\d+)\.(\d+) ancount=(\d+) rcode=(\d+)$"
+    )
+    lines = log.split("\n")
+    for k, ln in enumerate(lines):
+        if ln.strip() != "nslookup localhost":
+            continue
+        for j in range(k + 1, min(k + 40, len(lines))):
+            s = lines[j].strip()
+            if pat.match(s):
+                return True
+            # 明确说"没有应答"也是合法回答（47 号返回 0 的情形）
+            if s == "nslookup: no answer":
+                return True
+    return False
+
+
 def _sysinfo_rows(log: str) -> bool:
     """`uname` / `arch` / `meminfo` 的显示层判据（ADR-157，§10.3 的三条）。
 
@@ -9169,6 +9198,8 @@ def do_test(timeout: int) -> int:
         _fs_cmd_rows(ashlog),
         # uname / arch / meminfo（ADR-157）：版本非空 + 架构名 + 内存三数自洽
         _sysinfo_rows(ashlog),
+        # nslookup（ADR-158）：四个读数各自可核（ancount=0 合法，DNS 离线）
+        _nslookup_row(ashlog),
         # part（ADR-152）：**不在 argv 判定链里**——它会卡在故障盘上（口 0 被 wedge，
         # 任何 I/O 重试到取证耗尽）。C3 的验收由内核 ktest `t_part_read`（合成盘）承担，
         # 见 ADR-152「影响/负面 2」。

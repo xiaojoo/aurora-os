@@ -35,6 +35,7 @@ use crate::{
     M_FILE_USAGE, M_FILE_ELF, M_FILE_EMPTY, M_FILE_TEXT, M_FILE_BIN,
     M_UNAME_USAGE, M_UNAME_OUT, M_ARCH_USAGE, M_ARCH_OUT,
     M_MEM_USAGE, M_MEM_TOTAL, M_MEM_FREE, M_MEM_USED, M_MEM_PAGE,
+    M_NS_USAGE, M_NS_NAME, M_NS_IP, M_NS_AN, M_NS_RC, M_NS_NOANS,
     M_DMESG_USAGE, M_KILLED, M_KILL_USAGE, M_LSDEV_USAGE, M_LSPCI_USAGE,
     M_IP_ADDR, M_IP_DNS, M_IP_DOWN, M_IP_GW, M_IP_LINK, M_IP_MAC, M_IP_MTU, M_IP_STATE, M_IP_UP,
     M_COLON, M_IP_USAGE, M_NEIGH_EMPTY, M_PING_DOT, M_PING_FROM, M_PING_SEQ,
@@ -97,6 +98,7 @@ const CMD_FILE: [u8; 4] = [b'f', b'i', b'l', b'e'];
 const CMD_UNAME: [u8; 5] = [b'u', b'n', b'a', b'm', b'e'];
 const CMD_ARCH: [u8; 4] = [b'a', b'r', b'c', b'h'];
 const CMD_MEMINFO: [u8; 7] = [b'm', b'e', b'm', b'i', b'n', b'f', b'o'];
+const CMD_NSLOOKUP: [u8; 8] = [b'n', b's', b'l', b'o', b'o', b'k', b'u', b'p'];
 const CMD_IP: [u8; 2] = [b'i', b'p'];
 const CMD_ABI: [u8; 3] = [b'a', b'b', b'i'];
 const CMD_EXIT: [u8; 4] = [b'e', b'x', b'i', b't'];
@@ -2128,6 +2130,60 @@ fn mem_print(c: &Ctx, rec: &[u8; rt::SYSINFO_LEN]) {
     con_write(c.h, msg(M_NL));
 }
 
+/// ADR-158：`nslookup <name>` —— DNS 解析（47 号）。
+///
+/// 全链在核内（构造→发送→等应答→取 A 记录）。用户态只给名字、收 4 字节地址。
+/// 输出四个读数：`name=` / `ip=` / `ancount=` / `rcode=`——
+/// **`rcode != 0` 是服务器拒绝，`ancount == 0` 是没有这条记录**，两者分开报。
+#[inline(never)]
+fn cmd_nslookup(c: &Ctx) -> bool {
+    if c.p.err.is_some() || c.p.args.count() != 1 {
+        con_write(c.h, msg(M_NS_USAGE));
+        return true;
+    }
+    let name = match c.p.args.get(0) {
+        Some(a) if !a.is_empty() => a,
+        _ => { con_write(c.h, msg(M_NS_USAGE)); return true; }
+    };
+    ns_run(c, name);
+    true
+}
+
+/// `nslookup` 的本体。**与 `cmd_nslookup` 分开**（函数专属 `.rodata` 常量池的纪律）。
+#[inline(never)]
+fn ns_run(c: &Ctx, name: &[u8]) {
+    // 超时 800ms：slirp 的 DNS 在本机离线时不会回，必须有界
+    match rt::dns_resolve(name, 800) {
+        Ok((rcode, ancount, ip)) => {
+            con_write(c.h, msg(M_NS_NAME));
+            con_write(c.h, name);
+            con_write(c.h, msg(M_NS_IP));
+            put_u64(c.h, u64::from(ip[0]));
+            dot(c);
+            put_u64(c.h, u64::from(ip[1]));
+            dot(c);
+            put_u64(c.h, u64::from(ip[2]));
+            dot(c);
+            put_u64(c.h, u64::from(ip[3]));
+            con_write(c.h, msg(M_NS_AN));
+            put_u64(c.h, u64::from(ancount));
+            con_write(c.h, msg(M_NS_RC));
+            put_u64(c.h, u64::from(rcode));
+            con_write(c.h, msg(M_NL));
+        }
+        Err(_) => {
+            con_write(c.h, msg(M_NS_NOANS));
+        }
+    }
+}
+
+/// 打一个点（IPv4 地址的分隔符）。
+#[inline(never)]
+fn dot(c: &Ctx) {
+    let one = [b'.'];
+    con_write(c.h, &one);
+}
+
 /// 分派一条已解析的命令。返回 false = 退出 shell。
 ///
 /// 每个分支都是"名字 immediate 比较 → 直接调用处理器"，不写 `match lookup()`：
@@ -2194,6 +2250,9 @@ pub fn dispatch(h: ConsoleHandle, si_va: u64, p: &Parsed, st: &mut ShellState) -
     }
     if cmd_is(p.cmd, &CMD_MEMINFO) {
         return cmd_meminfo(&c);
+    }
+    if cmd_is(p.cmd, &CMD_NSLOOKUP) {
+        return cmd_nslookup(&c);
     }
     if streq(p.cmd, &CMD_ABI) {
         return cmd_abi(&c);

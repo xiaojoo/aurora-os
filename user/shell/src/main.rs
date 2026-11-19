@@ -38,7 +38,7 @@ mod registry;
 /// （hello/probe 的模块头都记过这个坑，本轮实测又撞一次）。改成 RIP 相对 lea 取基址 + 常量偏移。
 /// S6u：横幅的前导 `\x0a` 去掉了——那是当年为了跟上面的内核日志隔开留的，
 /// ADR-096 之后画面正文只有会话输出，前面什么都没有，那一格就成了纯粹的空行。
-static MSGS: [u8; 1278] = *b"dmesg: usage\x0admesg: err=\x0admesg: tail\x0acommands: help | echo <text> | ping | abi | ps | free | top | kill | exit\x0aAurora OS 6.1.0-aurora (tty1)\x0aaurora@os:~$ \x0aline too long, discarded\x0aunknown command:  (try help)\x0aping=abi_info=bye\x0a\x08 \x08^C\x0arun:  exit= (timeout) error=usage: run <path>\x0a-PID GEN THR ST PAGES\x0aps: no job handle\x0alivedead ps: error=free: procs= threads= pages=#\x0atop: usage\x0aframe kill: usage\x0akilled=dmesg: usage\x0admesg: err=dmesg: tail\x0alspci: usage\x0auptime: sleep <ms>\x0aping <ip>\x0afrom \x20\x0ap\x2e\x0a: seq=\x0atimeout\x0aip: usage\x0alink addr mtu=state=up\x0adown\x0amac gw dns \x3als: cat: d f  entries bytes= fnv=pwd: cd:  not a directoryusage: cd <path>usage: cat <path> | cd | pwdneigh neigh: empty\x0aip: usage\x0a\x0aroute default via  mask=/lsdev usage\x0aclass 0x count=devctl status\x0adevctl usage\x0apciblknetdisplaybridgeotheruid= gid= caps=whoami: id: usage: whoami\x0ano creddenied: part: entries= used= usable= lba=type=0xpart: no disk\x0aclear: no fb\x0aclear: done\x0apipe: empty segment\x0apipe: input truncated\x0agrep: usage <pattern>\x0agrep: no input\x0awc: usage\x0a lines= words= bytes=\x0astat: usage <path>\x0astat: kind= size= fnv=head: usage [-n N] <path>\x0atail: usage [-n N] <path>\x0afile: usage <path>\x0afile: ELF\x0afile: empty\x0afile: text\x0afile: binary\x0ausage: uname\x0aaurora usage: arch\x0ax86_64 usage: meminfo\x0a total= free= used= page=";
+static MSGS: [u8; 1356] = *b"dmesg: usage\x0admesg: err=\x0admesg: tail\x0acommands: help | echo <text> | ping | abi | ps | free | top | kill | exit\x0aAurora OS 6.1.0-aurora (tty1)\x0aaurora@os:~$ \x0aline too long, discarded\x0aunknown command:  (try help)\x0aping=abi_info=bye\x0a\x08 \x08^C\x0arun:  exit= (timeout) error=usage: run <path>\x0a-PID GEN THR ST PAGES\x0aps: no job handle\x0alivedead ps: error=free: procs= threads= pages=#\x0atop: usage\x0aframe kill: usage\x0akilled=dmesg: usage\x0admesg: err=dmesg: tail\x0alspci: usage\x0auptime: sleep <ms>\x0aping <ip>\x0afrom \x20\x0ap\x2e\x0a: seq=\x0atimeout\x0aip: usage\x0alink addr mtu=state=up\x0adown\x0amac gw dns \x3als: cat: d f  entries bytes= fnv=pwd: cd:  not a directoryusage: cd <path>usage: cat <path> | cd | pwdneigh neigh: empty\x0aip: usage\x0a\x0aroute default via  mask=/lsdev usage\x0aclass 0x count=devctl status\x0adevctl usage\x0apciblknetdisplaybridgeotheruid= gid= caps=whoami: id: usage: whoami\x0ano creddenied: part: entries= used= usable= lba=type=0xpart: no disk\x0aclear: no fb\x0aclear: done\x0apipe: empty segment\x0apipe: input truncated\x0agrep: usage <pattern>\x0agrep: no input\x0awc: usage\x0a lines= words= bytes=\x0astat: usage <path>\x0astat: kind= size= fnv=head: usage [-n N] <path>\x0atail: usage [-n N] <path>\x0afile: usage <path>\x0afile: ELF\x0afile: empty\x0afile: text\x0afile: binary\x0ausage: uname\x0aaurora usage: arch\x0ax86_64 usage: meminfo\x0a total= free= used= page=nslookup: usage <name>\x0anslookup: name= ip= ancount= rcode=nslookup: no answer\x0a";
 
 const M_HELP: (usize, usize) = (37, 14);
 const M_BANNER: (usize, usize) = (111, 30);
@@ -177,6 +177,13 @@ const M_MEM_TOTAL: (usize, usize) = (1253, 7);
 const M_MEM_FREE: (usize, usize) = (1260, 6);
 const M_MEM_USED: (usize, usize) = (1266, 6);
 const M_MEM_PAGE: (usize, usize) = (1272, 6);
+// nslookup（ADR-158，§10.4 的第三条）。
+const M_NS_USAGE: (usize, usize) = (1278, 23);
+const M_NS_NAME: (usize, usize) = (1301, 15);
+const M_NS_IP: (usize, usize) = (1316, 4);
+const M_NS_AN: (usize, usize) = (1320, 9);
+const M_NS_RC: (usize, usize) = (1329, 7);
+const M_NS_NOANS: (usize, usize) = (1336, 20);
 const M_CLASS_PREFIX: (usize, usize) = (726, 8);
 const M_COUNT: (usize, usize) = (734, 7);
 const M_DEVCTL_STATUS: (usize, usize) = (741, 13);

@@ -155,6 +155,10 @@ pub const SYS_FB_CLEAR: u64 = 45;
 /// 46（ADR-157）：内核身份与内存读数（64 字节定长记录，含魔数）。
 /// `rdi`=buf、`rsi`=len。返回写入字节数。
 pub const SYS_SYSINFO: u64 = 46;
+/// 47（ADR-158）：DNS 解析（核内完成 构造→发送→等应答→取 A 记录）。
+/// `rdi`=名字、`rsi`=名字长、`rdx`=超时毫秒、`r10`=4 字节输出缓冲。
+/// 返回 `(rcode<<16)|ancount`；名字非法/发送失败/无应答都是错误码。
+pub const SYS_DNS_RESOLVE: u64 = 47;
 /// 每条 ARP 表项的定长记录（10 字节：IP4 + MAC6）。与 27/31 号的 32 字节记录不同：这里的内容就是 10 字节，不垫到 32。
 pub const ARP_RECORD_LEN: usize = 10;
 /// 16：`rdi` = Proc 句柄、`rsi` = Thread 句柄、`rdx` = StartupInfo 那一页的 VMO 句柄、
@@ -1933,6 +1937,79 @@ fn sys_sysinfo(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     }
 }
 
+/// 47（ADR-158）：DNS 解析。
+///
+/// **全链在核内**：用户态只给名字、收 4 字节地址。理由——用户态发帧要走
+/// 33（send）+34（recv）两次调用，中间它得自己拼 DNS 报文；而构造/解析
+/// 已经有内核实现（`build_dns_query_name` / `parse_dns_reply`），
+/// 让用户态再拼一遍就是两份实现两个答案。
+///
+/// 返回 `(rcode << 16) | ancount`：两个数都要让用户态看见——
+/// `rcode != 0` 是"服务器拒绝了"，`ancount == 0` 是"没有这条记录"，
+/// 合成一个错误码就把这两种情况混成一样了（总设计 §12.2 禁止）。
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_dns_resolve(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    if crate::virtio::bind_net().is_err() {
+        return E_IO;
+    }
+    let nlen = frame.rsi as usize;
+    if nlen == 0 || nlen > 128 {
+        return E_INVALID;
+    }
+    let ms = frame.rdx;
+    if ms > 60_000 {
+        return E_INVALID;
+    }
+    let mut name = [0u8; 128];
+    match copy_from_user(frame.rdi, &mut name[..nlen]) {
+        Ok(n) if n == nlen => {}
+        _ => return E_FAULT,
+    }
+    // 网关 MAC：先查 ARP 表（`ip neigh` 有内容时就是热的）；没有就发一次 ARP 等它
+    let gw_ip = crate::virtio::NET_GATEWAY_IP;
+    let Some(gw_mac) = crate::virtio::arp_lookup(&gw_ip) else {
+        return E_IO; // ARP 表里没有网关：不猜 MAC
+    };
+    let our_mac = crate::virtio::net_info().map(|i| i.mac).unwrap_or([0u8; 6]);
+    let our_ip = crate::virtio::DHCP_GUEST_IP;
+    // txid 用时钟低位：同一个名字连查两次不会撞 id
+    let txid = (crate::clock::uptime_micros().unwrap_or(0) & 0xFFFF) as u16;
+    let (f, _h) = crate::virtio::build_dns_query_name(&gw_mac, &our_mac, &our_ip, txid, name.get(..nlen).unwrap_or(&[]));
+    let flen = crate::virtio::DNS_FRAME_BYTES;
+    if crate::virtio::send_raw(&f[..flen]).is_err() {
+        return E_IO;
+    }
+    // 等应答：**只认 txid 与源端口都对得上的那一包**
+    let mut got: Option<crate::virtio::DnsReply> = None;
+    let mut tries = 0usize;
+    while tries < 4 && got.is_none() {
+        match crate::virtio::receive(ms) {
+            Ok((data, n, uidx, ulen, uid)) => {
+                let n = n.min(data.len());
+                if let Ok(r) = crate::virtio::parse_dns_reply(&data[..n], uidx, ulen, uid) {
+                    if r.txid == txid {
+                        got = Some(r);
+                        break;
+                    }
+                }
+            }
+            Err(_) => break, // 超时
+        }
+        tries += 1;
+    }
+    // 超时**返回 0**：与 34 号的约定一致（"0 = 没有应答"），不新造错误码。
+    let Some(r) = got else { return 0 };
+    // 把 A 记录写回用户态（4 字节）。**没有 A 记录也写全 0**——
+    // 让用户态看到"这次查到了 0 条"，而不是"写失败"。
+    let a = r.a_record;
+    match copy_to_user(&a, frame.r10) {
+        Ok(4) => {}
+        _ => return E_FAULT,
+    }
+    (u64::from(r.rcode) << 16) | u64::from(r.ancount)
+}
+
 /// 键盘字符的读取入口。拆成小函数是为了让上面那条 `or_else` 在没开 `ps2-kbd` 时
 /// 也能编译（此时它恒返回 None，等价于原行为），而调用点不必铺 `cfg!`。
 #[cfg(not(feature = "ps2-kbd"))]
@@ -3082,6 +3159,8 @@ pub fn syscall_dispatch(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> boo
         SYS_FB_CLEAR => sys_fb_clear(frame),
         #[cfg(feature = "handles")]
         SYS_SYSINFO => sys_sysinfo(frame),
+        #[cfg(feature = "handles")]
+        SYS_DNS_RESOLVE => sys_dns_resolve(frame),
         #[cfg(feature = "handles")]
         SYS_CONSOLE_WRITE => sys_console_io(frame, true),
         #[cfg(feature = "handles")]
