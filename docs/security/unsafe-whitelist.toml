@@ -75,6 +75,8 @@ expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe
 # 本轮普查：278 处 = U1 53 + U2 60 + U3 13 + U4 103 + U5 28 + U6 21
 # 2026-11-07 P7：hello 加了 syscall3（U1 两处）与 ring3 句柄读/close（U5 三处）。
 
+[modules."network/proto"]
+U4 = 6
 [unsafe-census]
 # 2026-11-16 A2/A3 切片：+user/runtime（U1 3 / U5 23）；
 # 2026-11-16 A2 接线：shell 的 syscall 底座迁入 runtime ⇒ user/shell 17→4（U1 7→2、U5 10→2）、
@@ -155,7 +157,7 @@ U3 = 9
 U4 = 9
 
 [modules."driver/virtio"]
-U4 = 14
+U4 = 8
 
 [modules."filesystem/fs_open"]
 U2 = 2

@@ -531,17 +531,22 @@ status = "部分落地"
 module_id = "network"
 owner = "network"
 layer = "service"
-source_modules = ["network"]
+source_modules = ["network", "network/proto"]
 # 今天只有边界声明与 `NetError`：协议实现仍在 `driver/virtio.rs` 里，**待搬迁**
 # （ADR-166 未决 1）。先登记"这个域存在、依赖谁、谁能调"，搬迁时往这里加成员。
-public_api = ["network::NetError"]
+public_api = [
+  "network::NetError", "proto::DHCP_GUEST_IP", "proto::DNS_FRAME_BYTES", "proto::DNS_NAME_MAX",
+  "proto::NET_DNS_IP", "proto::NET_GATEWAY_IP", "proto::NET_SUBNET_MASK", "proto::NET_TX_MAX",
+  "proto::arp_learn_from_frame", "proto::arp_len", "proto::arp_lookup", "proto::arp_read_from",
+  "proto::build_dns_query_name", "proto::parse_dns_reply"
+]
 # 今天**无人调用**（协议还在 driver 里）；按实测填空，搬迁后再长出来。
-allowed_callers = []
+allowed_callers = ["driver"]
 # 依赖方向是 **network → driver（单向）**：协议通过驱动的收发原语工作。
 # 反向依赖会让驱动不得不认识协议，那正是 ADR-166 要拆掉的东西。
 # 今天**无源码依赖**：`network/mod.rs` 只 use 了 core。
 # 登记表写的是「现在是什么」，不是「打算变成什么」——计划属 ADR，事实属这里。
-dependencies = []
+dependencies = ["driver"]
 forbidden_dependencies = ["storage", "display", "input"]
 known_violations = []
 test_targets = []
@@ -562,15 +567,11 @@ public_api = [
   "driver::MmioHandle", "ahci::REG_CAP", "ahci::REG_GHC", "ahci::SECTOR", "ahci::boot_port",
   "ahci::fnv1a64", "ahci::init", "ahci::read_bytes", "ahci::write_bytes", "ahci::AhciError",
   "virtio::VirtioError", "virtio::read_block", "virtio::write_block", "virtio::read_block_at",
-  "virtio::write_block_at", "virtio::NET_TX_MAX", "virtio::DHCP_GUEST_IP",
-  "virtio::NET_GATEWAY_IP", "virtio::NET_DNS_IP", "virtio::bind_net", "virtio::send_raw",
-  "virtio::receive", "virtio::net_info", "virtio::arp_len", "virtio::arp_read_from",
-  "virtio::arp_learn_from_frame", "virtio::NET_SUBNET_MASK", "ahci::State", "ahci::info",
-  "ahci::state", "virtio::DNS_FRAME_BYTES", "virtio::DnsReply", "virtio::arp_lookup",
-  "virtio::build_dns_query_name", "virtio::parse_dns_reply", "virtio::DNS_NAME_MAX"
+  "virtio::write_block_at", "virtio::bind_net", "virtio::send_raw", "virtio::receive",
+  "virtio::net_info", "ahci::State", "ahci::info", "ahci::state"
 ]
-allowed_callers = ["diagnostics", "integration", "sched", "storage"]
-dependencies = ["arch", "boot", "irq", "memory", "pci", "time"]
+allowed_callers = ["diagnostics", "integration", "network", "sched", "storage"]
+dependencies = ["arch", "boot", "irq", "memory", "network", "pci", "time"]
 forbidden_dependencies = ["storage"]
 known_violations = []
 context = ["KERNEL"]
@@ -1023,7 +1024,7 @@ status = "部分落地"
 [baseline]
 # 当前产品代码的强连通分量（Task B 冻结基线）：新增环成员或改环 ⇒ check 红。
 known_scc = [
-  ["arch", "boot", "diagnostics", "driver", "irq", "memory", "pci", "resource", "sync", "time"],
+  ["arch", "boot", "diagnostics", "driver", "irq", "memory", "network", "pci", "resource", "sync", "time"],
 ]
 
 [baseline.ring_edge_sites]
@@ -1044,7 +1045,8 @@ known_scc = [
 "driver->arch" = 55
 "driver->boot" = 1
 "driver->irq" = 19
-"driver->memory" = 17
+"driver->memory" = 16
+"driver->network" = 2
 "driver->pci" = 18
 "driver->time" = 13
 "irq->arch" = 29
@@ -1055,6 +1057,7 @@ known_scc = [
 "memory->resource" = 2
 "memory->sync" = 7
 "memory->time" = 2
+"network->driver" = 8
 "pci->memory" = 9
 "resource->memory" = 1
 "resource->sync" = 2
