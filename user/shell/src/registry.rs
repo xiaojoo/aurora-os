@@ -31,6 +31,8 @@ use crate::{
     M_CLEAR_DONE, M_CLEAR_NOFB,
     M_PIPE_EMPTY, M_PIPE_TRUNC,
     M_GREP_NOIN, M_GREP_USAGE,
+    M_STAT_USAGE, M_STAT_KIND, M_STAT_SIZE, M_STAT_FNV, M_HEAD_USAGE, M_TAIL_USAGE,
+    M_FILE_USAGE, M_FILE_ELF, M_FILE_EMPTY, M_FILE_TEXT, M_FILE_BIN,
     M_DMESG_USAGE, M_KILLED, M_KILL_USAGE, M_LSDEV_USAGE, M_LSPCI_USAGE,
     M_IP_ADDR, M_IP_DNS, M_IP_DOWN, M_IP_GW, M_IP_LINK, M_IP_MAC, M_IP_MTU, M_IP_STATE, M_IP_UP,
     M_COLON, M_IP_USAGE, M_NEIGH_EMPTY, M_PING_DOT, M_PING_FROM, M_PING_SEQ,
@@ -86,6 +88,10 @@ const CMD_ID: [u8; 2] = [b'i', b'd'];
 const CMD_PART: [u8; 4] = [b'p', b'a', b'r', b't'];
 const CMD_CLEAR: [u8; 5] = [b'c', b'l', b'e', b'a', b'r'];
 const CMD_GREP: [u8; 4] = [b'g', b'r', b'e', b'p'];
+const CMD_STAT: [u8; 4] = [b's', b't', b'a', b't'];
+const CMD_HEAD: [u8; 4] = [b'h', b'e', b'a', b'd'];
+const CMD_TAIL: [u8; 4] = [b't', b'a', b'i', b'l'];
+const CMD_FILE: [u8; 4] = [b'f', b'i', b'l', b'e'];
 const CMD_IP: [u8; 2] = [b'i', b'p'];
 const CMD_ABI: [u8; 3] = [b'a', b'b', b'i'];
 const CMD_EXIT: [u8; 4] = [b'e', b'x', b'i', b't'];
@@ -1792,6 +1798,223 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
     false
 }
 
+/// ADR-156：`stat <path>` —— 文件元数据（22 号 open + 25 号 stat）。
+#[inline(never)]
+fn cmd_stat(c: &Ctx) -> bool {
+    if !allow(c, rt::CAP_READ) { return true; }
+    let path = match (c.p.err.is_none(), c.p.args.get(0)) {
+        (true, Some(a)) if !a.is_empty() => a,
+        _ => { con_write(c.h, msg(M_STAT_USAGE)); return true; }
+    };
+    let mut abuf = [0u8; 160];
+    let Some(al) = resolve_path(c.st, Some(path), &mut abuf) else {
+        con_write(c.h, msg(M_STAT_USAGE));
+        return true;
+    };
+    let Some(ap) = abuf.get(..al) else {
+        con_write(c.h, msg(M_STAT_USAGE));
+        return true;
+    };
+    let h = match rt::file_open(ap, 0) {
+        Ok(v) => v,
+        Err(_) => { con_write(c.h, msg(M_STAT_USAGE)); return true; }
+    };
+    let st = rt::file_stat(h);
+    let _ = rt::handle_close(h);
+    let rec = match st {
+        Ok(v) => v,
+        Err(_) => { con_write(c.h, msg(M_STAT_USAGE)); return true; }
+    };
+    con_write(c.h, msg(M_STAT_KIND));
+    put_u64(c.h, u64::from(rec.kind()));
+    con_write(c.h, msg(M_STAT_SIZE));
+    put_u64(c.h, u64::from(rec.size()));
+    con_write(c.h, msg(M_STAT_FNV));
+    put_u64(c.h, 0);
+    con_write(c.h, msg(M_NL));
+    true
+}
+
+/// ADR-156：`head [-n N] <path>` —— 前 N 行（默认 10）。
+/// 边读边打，数到第 N 个换行就停：不把大文件整个搬进栈。
+#[inline(never)]
+fn cmd_head(c: &Ctx) -> bool {
+    head_tail_impl(c, true)
+}
+
+/// ADR-156：`tail [-n N] <path>` —— 后 N 行（默认 10）。
+/// 走两遍：第一遍数总行数，第二遍从 total-want+1 行开始打。栈占用恒定。
+#[inline(never)]
+fn cmd_tail(c: &Ctx) -> bool {
+    head_tail_impl(c, false)
+}
+
+/// `head`/`tail` 的共同实现。`first=true` 取前 N 行。
+/// 参数：`-n N <path>` 或 `<path>`（默认 10）。只认 `-n`。
+#[inline(never)]
+fn head_tail_impl(c: &Ctx, first: bool) -> bool {
+    if !allow(c, rt::CAP_READ) { return true; }
+    let usage = if first { M_HEAD_USAGE } else { M_TAIL_USAGE };
+    let mut want: u64 = 10;
+    let mut pathi: usize = 0;
+    if let Some(a0) = c.p.args.get(0) {
+        if a0.len() == 2 && a0.first().copied() == Some(b'-') {
+            if a0.get(1).copied() == Some(b'n') {
+                let Some(nv) = c.p.args.get(1) else {
+                    con_write(c.h, msg(usage));
+                    return true;
+                };
+                let mut v = 0u64;
+                let mut k = 0usize;
+                while k < nv.len() {
+                    let ch = nv.get(k).copied().unwrap_or(b'x');
+                    if ch < b'0' || ch > b'9' {
+                        con_write(c.h, msg(usage));
+                        return true;
+                    }
+                    v = v * 10 + u64::from(ch - b'0');
+                    if v > 10000 { v = 10000; }
+                    k += 1;
+                }
+                want = v;
+                pathi = 2;
+            }
+        }
+    }
+    let Some(path) = c.p.args.get(pathi) else {
+        con_write(c.h, msg(usage));
+        return true;
+    };
+    if path.is_empty() {
+        con_write(c.h, msg(usage));
+        return true;
+    }
+    let mut abuf = [0u8; 160];
+    let Some(al) = resolve_path(c.st, Some(path), &mut abuf) else {
+        con_write(c.h, msg(usage));
+        return true;
+    };
+    let Some(ap) = abuf.get(..al) else {
+        con_write(c.h, msg(usage));
+        return true;
+    };
+    if first {
+        head_first(c, ap, want);
+    } else {
+        tail_last(c, ap, want);
+    }
+    true
+}
+
+/// `head`：边读边打，数到第 `want` 个换行就停。
+#[inline(never)]
+fn head_first(c: &Ctx, path: &[u8], want: u64) {
+    let mut nl = 0u64;
+    let mut stop = false;
+    let _ = rt::cat_each(path, |b| {
+        if stop { return; }
+        let mut i = 0usize;
+        while i < b.len() {
+            let ch = b.get(i).copied().unwrap_or(0);
+            let one = [ch];
+            con_write(c.h, &one);
+            if ch == b'\n' {
+                nl += 1;
+                if nl >= want { stop = true; return; }
+            }
+            i += 1;
+        }
+    });
+}
+
+/// `tail`：两遍。第一遍数总行数，第二遍从 `total-want` 行开始打。
+#[inline(never)]
+fn tail_last(c: &Ctx, path: &[u8], want: u64) {
+    let mut total = 0u64;
+    let _ = rt::cat_each(path, |b| {
+        let mut i = 0usize;
+        while i < b.len() {
+            if b.get(i).copied() == Some(b'\n') { total += 1; }
+            i += 1;
+        }
+    });
+    if total == 0 { return; }
+    let skip = total.saturating_sub(want);
+    let mut seen = 0u64;
+    let _ = rt::cat_each(path, |b| {
+        let mut i = 0usize;
+        while i < b.len() {
+            let ch = b.get(i).copied().unwrap_or(0);
+            if seen >= skip {
+                let one = [ch];
+                con_write(c.h, &one);
+            }
+            if ch == b'\n' { seen += 1; }
+            i += 1;
+        }
+    });
+}
+
+/// ADR-156：`file <path>` —— 按魔数判类型（ELF/empty/text/binary）。
+/// 不猜 MIME：那是另一套表，今天没有。
+#[inline(never)]
+fn cmd_file(c: &Ctx) -> bool {
+    if !allow(c, rt::CAP_READ) { return true; }
+    let path = match (c.p.err.is_none(), c.p.args.get(0)) {
+        (true, Some(a)) if !a.is_empty() => a,
+        _ => { con_write(c.h, msg(M_FILE_USAGE)); return true; }
+    };
+    let mut abuf = [0u8; 160];
+    let Some(al) = resolve_path(c.st, Some(path), &mut abuf) else {
+        con_write(c.h, msg(M_FILE_USAGE));
+        return true;
+    };
+    let Some(ap) = abuf.get(..al) else {
+        con_write(c.h, msg(M_FILE_USAGE));
+        return true;
+    };
+    file_classify(c, ap);
+    true
+}
+
+/// `file` 的分类本体。**与 `cmd_file` 分开**：常量与闭包挤在一个函数里会
+/// 生成函数专属 `.rodata` 常量池并取址 ⇒ `R_X86_64_32S`（本仓多次实测）。
+#[inline(never)]
+fn file_classify(c: &Ctx, path: &[u8]) {
+    let mut first = [0u8; 4];
+    let mut fn_ = 0usize;
+    let mut total = 0u64;
+    let mut printable = true;
+    let _ = rt::cat_each(path, |b| {
+        let mut i = 0usize;
+        while i < b.len() {
+            let ch = b.get(i).copied().unwrap_or(0);
+            if fn_ < 4 {
+                if let Some(s) = first.get_mut(fn_) { *s = ch; }
+                fn_ += 1;
+            }
+            let ws = ch == b'\t' || ch == b'\n' || ch == b'\r';
+            if !ws && (ch < 0x20 || ch > 0x7e) { printable = false; }
+            total += 1;
+            i += 1;
+        }
+    });
+    if total == 0 {
+        con_write(c.h, msg(M_FILE_EMPTY));
+    } else if fn_ >= 4
+        && first.first().copied() == Some(0x7f)
+        && first.get(1).copied() == Some(b'E')
+        && first.get(2).copied() == Some(b'L')
+        && first.get(3).copied() == Some(b'F')
+    {
+        con_write(c.h, msg(M_FILE_ELF));
+    } else if printable {
+        con_write(c.h, msg(M_FILE_TEXT));
+    } else {
+        con_write(c.h, msg(M_FILE_BIN));
+    }
+}
+
 /// 分派一条已解析的命令。返回 false = 退出 shell。
 ///
 /// 每个分支都是"名字 immediate 比较 → 直接调用处理器"，不写 `match lookup()`：
@@ -1837,6 +2060,18 @@ pub fn dispatch(h: ConsoleHandle, si_va: u64, p: &Parsed, st: &mut ShellState) -
     }
     if cmd_is(p.cmd, &CMD_GREP) {
         return cmd_grep(&c);
+    }
+    if streq(p.cmd, &CMD_STAT) {
+        return cmd_stat(&c);
+    }
+    if streq(p.cmd, &CMD_HEAD) {
+        return cmd_head(&c);
+    }
+    if streq(p.cmd, &CMD_TAIL) {
+        return cmd_tail(&c);
+    }
+    if streq(p.cmd, &CMD_FILE) {
+        return cmd_file(&c);
     }
     if streq(p.cmd, &CMD_ABI) {
         return cmd_abi(&c);

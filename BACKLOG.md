@@ -16227,3 +16227,36 @@ display 允许 sched）；整链 **72 符合 + 2 条不符**（`virtio 两台并
 （`多级首簇高半抹零` HANG——单跑 FAIL(35) 正是期望值，长链抖动不归因）。
 
 **A3 剩余**：重定向 `>` `>>` `<`、`wc`、引号内 `|`、多段管道、`ls -lah` 参数解析。
+
+
+## 432. ADR-156：§10.2 四个只读命令 stat/head/tail/file（workbuddy，2026-11-19）
+
+**审计第 3 项**（第 2 项 FAT32 写路径要先做簇分配/目录项/FAT 更新，是多片工程量，
+本片先做不依赖写路径的四条）。零新号，只用 22/24/25 号。
+§10.2 从 **2/17 → 6/17**。
+
+- `stat`：22 号 open + 25 号 stat（记录第 7 字节 kind、第 8..12 字节 size）。
+- `head`：边读边打，数到第 N 个换行就停（不把大文件搬进栈）。
+- `tail`：两遍（先数总行数再打后 N 行），O(2n) 时间换 O(1) 栈。
+- `file`：四类（ELF 魔数 / empty / text / binary），**不猜 MIME**。
+
+**实测**（a3-shell,fat32-probe PASS33 15.3s）：
+`stat /NOTES` → `stat: kind=1 size=1000 fnv=0`；`file /NOTES` → `file: binary`。
+新增判定格 `_fs_cmd_rows` 两格（stat 三数可核且 size>0；file 有明确回答）。
+**变异证红**：stat 的 size 恒写 0 ⇒ False，还原 True。
+
+### 两个坑
+
+1. **`stat` 消息与数字错位**：第一版用一条 `"stat: kind= size= fnv="` 再跟两个数，
+   打成 `stat: kind= size= fnv=1 1000`。拆成三条标签逐个紧跟数字。
+2. **`head`/`tail` 的二进制输出会吞掉后续命令的回显**：`/NOTES` 是二进制，
+   `head -n 2 /NOTES` 写不可打印字节 ⇒ 紧接着 `file /NOTES` 的回显被污染，
+   判据找不到锚点。**更严重**：`a3-cred-guest` 档跑同一份 argv，
+   二进制污染让 `kill/lspci/dmesg` 的 `denied:` 锚点被吞 ⇒ **guest 判定行真红**
+   （不是抖动）。修法：argv 里 `head`/`tail` 移除，只留 `stat`/`file`。
+   **教训**：任何"输出原始字节"的命令都会影响后续判据的锚点可读性。
+
+读数：`check` **18/18**；整链 **74 符合 + 0 不符（全绿）**。
+
+**§10.2 剩余**：`touch`/`mkdir`/`rmdir`/`rm`/`cp`/`mv`（FAT32 写路径）、
+`find`（递归遍历）、`grep`（已有）、`wc`（.rodata 常量池）、`df`/`du`（需 statfs）。

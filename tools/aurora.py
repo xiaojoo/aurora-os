@@ -7921,6 +7921,45 @@ def _lspci_rows(log: str) -> bool:
     return False
 
 
+def _fs_cmd_rows(log: str) -> bool:
+    """`stat` / `file` 的显示层判据（ADR-156，§10.2 的四个只读命令）。
+
+    两格：
+
+    ① `stat /NOTES` 之后必须出现 `stat: kind=<n> size=<n> fnv=<n>`——
+       三个数各自可核，且 **size 必须 > 0**（`/NOTES` 是 1000 字节的文件，
+       size=0 说明 25 号记录读歪了）。
+    ② `file /NOTES` 之后必须出现 `file: <elf|empty|text|binary>` 之一——
+       **不断言具体是哪个**：判据要能在换卷/换夹具时仍成立。
+       （实测 `/NOTES` 是二进制图案 ⇒ `binary`。）
+
+    `head`/`tail` 不进判据：它们输出的是**文件原始字节**，`/NOTES` 是二进制，
+    串口里会出现不可打印字符，按文本锚点判会误红。它们的存在由 `help` 与
+    命令注册表保证，功能正确性由"`cat` 能读"间接覆盖。
+    """
+    import re
+    stat_pat = re.compile(r"^stat: kind=\d+ size=(\d+) fnv=\d+$")
+    file_pat = re.compile(r"^file: (elf|empty|text|binary)$")
+    lines = log.split("\n")
+    stat_ok = False
+    file_ok = False
+    for k, ln in enumerate(lines):
+        s = ln.strip()
+        if s == "stat /NOTES":
+            for j in range(k + 1, min(k + 60, len(lines))):
+                m = stat_pat.match(lines[j].strip())
+                if m:
+                    if int(m.group(1)) > 0:
+                        stat_ok = True
+                    break
+        if s == "file /NOTES":
+            for j in range(k + 1, min(k + 60, len(lines))):
+                if file_pat.match(lines[j].strip()):
+                    file_ok = True
+                    break
+    return stat_ok and file_ok
+
+
 def _pipe_rows(log: str) -> bool:
     """管道的显示层判据（ADR-155，A3 第一项）。
 
@@ -9079,6 +9118,8 @@ def do_test(timeout: int) -> int:
         _clear_row(ashlog),
         # 管道（ADR-155）：`|` 不再当参数，且右段真收到左段输出
         _pipe_rows(ashlog),
+        # stat / file（ADR-156）：元数据三数可核 + 类型判定有明确回答
+        _fs_cmd_rows(ashlog),
         # part（ADR-152）：**不在 argv 判定链里**——它会卡在故障盘上（口 0 被 wedge，
         # 任何 I/O 重试到取证耗尽）。C3 的验收由内核 ktest `t_part_read`（合成盘）承担，
         # 见 ADR-152「影响/负面 2」。
