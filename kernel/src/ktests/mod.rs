@@ -38,6 +38,8 @@ mod resource;
 mod sched;
 #[cfg(feature = "sig-check")]
 mod sign;
+#[cfg(feature = "handles")]
+mod sdkdemo;
 mod state;
 mod syscall;
 mod time;

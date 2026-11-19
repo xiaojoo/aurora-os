@@ -135,9 +135,19 @@ static SLOTS: Slots = Slots {
 #[no_mangle]
 pub extern "C" fn _start(si_va: u64) -> ! {
     // 控制台句柄是**可选**的：有就打串口（便于人看），没有也不影响信箱。
-    // SAFETY: si_va 由内核映射并校验（user+只读），读取期间不会被解映射
-    // ——与 shell 同一条契约。
-    let h = unsafe { rt::find_console(si_va) };
+    //
+    // **`si_va == 0` 时必须跳过 `find_console`**：`spawn_user` 的第 3 参就是
+    // 用户入口的第一个参数；传 0 表示"没有 StartupInfo 页"。而 `find_console(0)`
+    // 会去读地址 0 ⇒ #PF，程序在写信箱之前就崩了。
+    // 实测症状：信箱里所有槽都是**初值**（魔数恰好等于期望值、uid 恰好等于
+    // `u64::MAX`），看起来像"写入没生效"，其实是**根本没跑到那一步**。
+    // SAFETY: `si_va != 0` 时由内核映射并校验（user+只读），读取期间不会被解映射
+    // ——与 shell 同一条契约。`si_va == 0` 时不解引用任何东西。
+    let h = if si_va == 0 {
+        None
+    } else {
+        unsafe { rt::find_console(si_va) }
+    };
 
     if let Some(handle) = h {
         out(handle, M_PFX_O, M_PFX_L);
@@ -184,6 +194,7 @@ pub extern "C" fn _start(si_va: u64) -> ! {
         if back != consistent {
             core::ptr::write_volatile(p.add(5), 2u64);
         }
+
     }
 
     // ④ 有句柄就顺便打一行（便于人读；判据不依赖它）。

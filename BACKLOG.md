@@ -16349,3 +16349,46 @@ meminfo → total=130780 free=128329 used=2451 page=4096
 **真实 DNS 解析未被端到端证明**：`ancount` 实测恒 0，链路跑通但"查到地址"没有证据。
 其余：只取第一条 A（无 CNAME 链/AAAA/多记录）、超时 800ms 写死、
 `ss` 需 socket 表（TCP 未做）、`hostname` 需主机名存储（依赖 FAT32 写）。
+
+
+## 435. ADR-159：D4 判据打通（workbuddy，2026-11-19）——**D4 第一片升为「采纳」**
+
+**审计第 6 项**。零新号。补完 ADR-154 的「未达成」：`t_sdkdemo` 跑绿并注册进 `.ktests`。
+
+### 根因（ADR-154 的推断只对了一半）
+
+`spawn_user(entry, stack_top, arg, owned)` 的第 3 参 `arg` 写进 `frame[10]`，
+就是**用户 `_start` 的第一个参数**。`t_sdkdemo` 传 0（"不要控制台句柄"），
+而 `sdkdemo::_start(si_va)` 第一件事是 `rt::find_console(si_va)`——
+**`find_console(0)` 读地址 0 ⇒ #PF**，程序在写信箱之前就死了。
+
+修法：`si_va == 0` 时跳过 `find_console`，把契约写清（0 = 没有 StartupInfo 页）。
+
+### 为什么症状看起来像"写入没生效"（本片最值得记的一条）
+
+`Slots` 的六个槽里**五个的初值都是"合法读数"**：
+`magic` 初值**恰好等于期望魔数**（校验通过）、`uid`/`gid` 初值 `u64::MAX`
+（"没有凭据"的哨兵）、`caps`/`dev` 初值 0（拒绝的自然值）。
+**只有 `consistent` 的初值 0 暴露了问题**。
+⇒ **哨兵值选得太像真实值，会把"程序没跑"伪装成"结果不对"。**
+
+**实测**（handles 档 PASS33 6.6s）：
+```
+sdkdemo: 判据 38号有回答=true 40号有回答=true 自洽=true
+         读数 uid=4294967295 gid=4294967295 caps=0 dev=0
+ktests: total=95 passed=95 failed=0
+```
+`uid=4294967295` = `u32::MAX` **正是 sdkdemo 写的哨兵**——这一次它证明"写入生效了"
+（上一次同样的数字证明的是"没生效"，那时它还是初值 `u64::MAX` 的扩展）。
+**变异证红**：`consistent` 恒写 0 ⇒ 95 passed 94 failed 1 ⇒ FAIL(35)，还原 PASS(33)。
+
+### 另一个坑：`mod sdkdemo;` 未门控
+
+`SDKDEMO_ELF` 只在 `handles` 档存在，但 `mod sdkdemo;` 无条件引入 ⇒ **默认档 E0432**
+⇒ 整链在第一步就卡住（日志停在 cargo build，不是失败而是挂起）。加 `#[cfg(feature="handles")]`。
+
+读数：`check` **18/18**；整链两次都是 **70 符合 + 4 条不符**（两次的具体行不同：
+`FS-03文件ABI`/`A2 argv`/`A3包读不到`/`A3长名` 与
+`探针几何`/`FS-03ring3`/`A2 argv`/`A3包读不到`）。
+**单跑复验：`normal` PASS(33)、`a3-shell,fat32-probe` PASS(33)、`fs-open` 104/104 全绿**
+⇒ 按 AGENTS 纪律记录为**长链抖动，不归因**。
