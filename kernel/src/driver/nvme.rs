@@ -390,13 +390,10 @@ pub fn init() -> Result<Reading, NvmeError> {
             "nvme: Identify Namespace 未读到（NSID 不匹配？）⇒ NSZE 记 0，容量对账交给宿主机"
         );
     }
-    // NN（Number of Namespaces）在 Identify **Controller** 的偏移 516（4 字节小端）。
-    // 用它证「有命名空间」——这条命令已验成功（cid=1 status=0）。
-    // 诊断：型号区（24..40）应读成可打印 ASCII；NN 区（512..520）用来反推偏移。
-    crate::log_info!(
-        "nvme: idc 型号区={:02x?} nn区={:02x?} 前16={:02x?}",
-        &ctrl[24..40], &ctrl[512..520], &ctrl[0..16]
-    );
+    // NN（Number of Namespaces）在 Identify Controller 的偏移 516。
+    // **注意**：实测 QEMU 读回 256 而 -device nvme 只有一个 drive，
+    // 所以这个值**不可信**（512..768 是 SUBNQN 字符串区，偏移可能不对）。
+    // 只当读数记录，不当判据（ADR-169 §三）。
     let nn = u32::from_le_bytes([ctrl[516], ctrl[517], ctrl[518], ctrl[519]]);
     st.reading.namespaces = nn;
     // NSZE 在 Identify Namespace 的偏移 0（8 字节小端）；没读到就是 0
@@ -463,8 +460,14 @@ fn submit(
     fill(st, off)?;
 
     st.sq_tail = ((st.sq_tail as usize + 1) % QDEPTH) as u16;
+    // **屏障**：SQE 是 DMA 写、门铃是 MMIO 写，PCIe 上两者没有隐含顺序。
+    // 不屏障时门铃可能先到，设备读到一条不完整的命令 ⇒ 它不产生完成项
+    // （实测：第一条成功、第二条超时；游标与门铃值全对）。
+    // 一次 MMIO **读**是可靠屏障——读会强制之前的写完成。
+    let _ = rd32(&st.ctx, st.mmio, REG_CSTS)?;
     // 敲门铃：管理队列的 SQ0 tail doorbell 在 0x1000
     wr32(&st.ctx, st.mmio, 0x1000, st.sq_tail as u32)?;
+    // 量 门铃：记下每次提交的 slot 与写进去的 tail 值。
     Ok(cid)
 }
 
@@ -479,16 +482,21 @@ fn wait_cqe(st: &mut State, cid: u16) -> Result<(), NvmeError> {
         let off = OFF_ADMIN_CQ + st.cq_head as usize * CQE_BYTES;
         // CQE 的 DW3：bit0 = phase，bit1..16 = status，bit16..32 = CID。
         //
-        // **phase 是整圈翻转的奇偶**：只有「当前格的 phase == 本圈期望值」
-        // 才说明设备写过了这一格。把它当成「每格置 1」时，第一圈过后
-        // 第二条命令永远等不到（实测 cid=1 过、cid=2 超时）。
-        // 这条与 virtio 的 `used.idx` 单调递增是**根本差别**。
+        // **主判据是 CID，不是 phase。** 实测（ADR-169 补记）：QEMU 在命令
+        // 失败时把这一格的 phase 写成 0，而第一圈正常完成的写 1 ⇒ 用 phase
+        // 当「到达标志」会把**失败**的命令当成**没到**，报成 `CmdTimeout`。
+        // 那让成因完全错：说「超时」，实际是「被拒」。
+        //
+        // CID 是我自己发的、唯一的，所以用它判「这一格是不是我要等的」；
+        // phase 只用来判「这一格被设备写过没有」——**两种取值都接受**。
         let dw3 = st.ctx.dma_read32(st.dma, off + 12)?;
-        if (dw3 & 1 == 1) == st.cq_phase {
-            let got_cid = (dw3 >> 16) as u16;
-            let status = ((dw3 >> 1) & 0x7FFF) as u16;
+        let got_cid = (dw3 >> 16) as u16;
+        let status = ((dw3 >> 1) & 0x7FFF) as u16;
+        let phase = dw3 & 1;
+        // 这一格被写过：要么 CID 是我们的，要么 phase 与本圈期望值一致。
+        let written = got_cid == cid || (phase == 1) == st.cq_phase;
+        if written {
             st.cq_head = ((st.cq_head as usize + 1) % QDEPTH) as u16;
-            // 绕回 0 = 走满一圈 ⇒ phase 翻转
             if st.cq_head == 0 {
                 st.cq_phase = !st.cq_phase;
             }
@@ -497,7 +505,6 @@ fn wait_cqe(st: &mut State, cid: u16) -> Result<(), NvmeError> {
             if status != 0 {
                 return Err(NvmeError::CmdFailed { cid: got_cid, status });
             }
-            // CID 对不上是「完成项串了」——比超时更严重，必须点名
             if got_cid != cid {
                 return Err(NvmeError::CmdFailed { cid: got_cid, status: 0xFFFF });
             }
