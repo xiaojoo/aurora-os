@@ -2857,16 +2857,25 @@ fn t_load_into_child_as() -> bool {
     //
     // **必须赶在 `aspace_destroy` 之前**：销毁之后那棵树就没了（§465 记的同一类）。
     const SENTINEL_VA: u64 = 0x1_0000_1000;
-    const SENTINEL: u64 = 0xa701_0203_0405_0607;
+    // **小端**：内存里是字节 a7 01 02 03 04 05 06 07，
+    // 按 LE 读成 u64 就是 0x0706_0504_0302_01a7。
+    // 第一版写成 0xa701_0203_0405_0607（大端形式）⇒ N1 红，而读数本身是对的。
+    const SENTINEL: u64 = 0x0706_0504_0302_01a7;
     let read_child = crate::user::read_at_in(aslot, SENTINEL_VA);
     // N1：按子 AS 读得到哨兵 ⇒ API 真的能用
     let n1 = read_child == Some(SENTINEL);
     // N2：按**内核 AS** 读同一个 VA ⇒ 必须读不到或读到别的。
     //     若 `read_at_in` 忽略 `aslot`、总走当前 CR3，它就会读到哨兵 ⇒ 判据红。
     //     **把「选错 AS」从取决于 tick 变成必然红。**
-    let kernel_aslot = 0u8;
-    let read_kernel = crate::user::read_at_in(kernel_aslot, SENTINEL_VA);
-    let n2 = read_kernel != Some(SENTINEL);
+    // **不能用 slot 0**：实测 `aslot` 本身就是 0（`aspace_new_kernel` 从空槽里
+    // 挑第一个），那样 N2 变成「同一个 AS 读两次」⇒ 必然相等 ⇒ 判据永远红。
+    // 用 `NO_ASPACE`（255，确定越界）。
+    let absent_aslot = crate::sched::NO_ASPACE;
+
+    let read_absent = crate::user::read_at_in(absent_aslot, SENTINEL_VA);
+
+    let n2 = read_absent.is_none();
+
     // N3：明显没映射的高地址 ⇒ 必须 Err（`NotMapped`）
     let hole = crate::elf::USER_VA_TOP - mm::PAGE as u64;
     let n3 = crate::user::read_at_in(aslot, hole).is_none();
@@ -2875,8 +2884,8 @@ fn t_load_into_child_as() -> bool {
     let n4 = crate::user::read_at(SENTINEL_VA) != Some(SENTINEL);
     let read_at_in_ok = n1 && n2 && n3 && n4;
     crate::log_info!(
-        "load_into: read_at_in 子AS读={:?} 内核AS读={:?} 洞={} read_at对照={} ⇒ {}",
-        read_child, read_kernel, n3, n4, read_at_in_ok
+        "load_into: read_at_in 子AS读={:?} 不存在AS读={:?} 洞={} read_at对照={} ⇒ {}",
+        read_child, read_absent, n3, n4, read_at_in_ok
     );
     if !read_at_in_ok {
         crate::log_fatal!(

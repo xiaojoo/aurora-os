@@ -3914,13 +3914,22 @@ pub fn copy_from_user_in(aslot: u8, va: u64, dst: &mut [u8]) -> Result<usize, Pt
                 return Err(PtrError::NotSharedWithUser);
             }
             let pa = mm::phys_of_in(root, at).ok_or(PtrError::NotMapped)?;
+            // **`phys_of_in` 返回的是页基址，不是精确地址**（`mm.rs:1617` 的
+            // `entry & ADDR_MASK` 只有页框号）。所以页内偏移要自己加。
+            //
+            // 漏这一步的症状很隐蔽（实测）：读 `va=0x100001000` 期望
+            // `0xa701020304050607`，实际得到 `0xa7a7a7a7a7a7a7a7`——
+            // **第一个字节对、后面 7 个错**，因为 8 个字节全落在页基址那一格。
+            //
+            // 不改 `phys_of_in` 的语义：它被 ADR-066 的「翻译等价」仪器依赖
+            // （注释写「返回 4 KiB 页的物理基址」）。在调用侧加偏移改动更小。
             // SAFETY: `pa` 由 `phys_of_in` 从**那台 AS 的页表**翻译得出，
-            // 而上面 `aspace_effective_flags` 已确认那一页 present 且对用户开放；
+            // 而上面 `aspace_effective_flags_locked` 已确认那一页 present 且对用户开放；
             // `via_hhdm` 给出的是该物理帧的内核别名（U/S=0，SMAP 不管），
-            // 读 1 字节不越出页边界（`at` 与 `pa` 都按同一 VA 算）。
+            // `at % pg` 保证不越出页边界。
             // 校验与读在**同一次持锁期**内，所以「校验后帧被回收」那个窗口不存在。
             let b = unsafe {
-                let kva = mm::PhysAddr(pa).via_hhdm();
+                let kva = mm::PhysAddr(pa + (at % pg)).via_hhdm();
                 core::ptr::read_volatile(kva.0 as *const u8)
             };
             dst[done] = b;
