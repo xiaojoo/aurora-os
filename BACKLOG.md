@@ -17331,3 +17331,99 @@ SQE 是 DMA 写、门铃是 MMIO 写，两者没有隐含顺序。保留。
 
 `nvme.rs` 的 `submit()` 里门铃处有完整记录：八方向、dump 读数、
 以及「下一轮查 QEMU 源码」的指引。**下一个人不必重走这八步。**
+
+
+## 453. QEMU trace 揭出两个真 bug；NVMe 容量格通过（2026-11-20，ADR-169 补记）
+
+§452 说「下一轮该查 QEMU 源码」。查了 `hw/nvme/ctrl.c`，但网页抓取只到 1500 行，
+`nvme_process_sq` 的函数体读不到。**改用 QEMU 自带的 trace** —— 224 个 `pci_nvme_*`
+事件，直接回答「设备看到了什么」。**这是这一轮唯一真正有效的动作。**
+
+### 加了什么仪器
+
+`tools/aurora.py` 加 `AURORA_NVME_TRACE=<file>` 开关（走环境变量，不进默认路径，
+与 `AURORA_QEMU_EXTRA` 同一条理由）：
+
+    "-trace", f"enable=pci_nvme_*,file={_trace}"
+
+一次跑抓到 **12680 行**设备侧记录。
+
+### trace 给出的真相（推翻 §451/§452 的推断）
+
+    门铃 new_tail 1 → admin_cmd cid 1 opc 0x6 (Identify) → identify_ctrl → status 0x0 ✅
+    门铃 new_tail 2 → admin_cmd cid 2 opc 0x6 (Identify) → identify_ns   → status 0x0 ✅
+    门铃 new_tail 3 → admin_cmd cid 3 opc 0x2 (GetLogPage) → err_invalid_log_page → status 0x4002
+
+**三条命令设备全收到了，前两条全成功。** 所以：
+
+- §451/§452 说「设备只处理第一条」「new_tail 2 没到达」——**都是错的**。
+  那是把「dump 时 slot=1 显示 0」误读成「设备没写」；
+  真相是 `wait_cqe` 已消费并推了 `head=2`，那一格当然归零。
+
+### 揭出的真 bug ①：`io_lba` 把 I/O 命令发到 admin 队列
+
+trace 第 3 条：`opc 0x2` = **`GET_LOG_PAGE`**（admin 队列语义），
+而我以为发的是 Read。根因：`io_lba` 走 `submit()`，而 `submit()` 只写 admin 队列。
+
+**NVMe 的 opcode 是按队列解释的**：`0x02` 在 admin 上是 Get Log Page、
+在 I/O 上是 Read。发错队列不会报「队列错」，只会被当成另一条命令。
+
+修：
+- `submit` 加 `Q`（Admin/Io）参数，SQE 基址与门铃偏移跟着走；
+- `OP_READ`/`OP_WRITE` 改名 `OP_IO_READ`/`OP_IO_WRITE` 并单独分组；
+- **`io_lba` 明确返回 `IoQueueNotReady`**（I/O 队列还没建，是另一条命令序列）。
+  **错要错得明白**：不能退回去用 admin 队列。
+
+### 揭出的真 bug ②：CQE 的 CID 在 DW2，不在 DW3
+
+终诊 dump：
+
+    slot=0 d2=0x1 d3=0x10001
+    slot=1 d2=0x2 d3=0x10002
+
+`d2` 的 **1/2** 与命令 CID **一一对应**；而 `d3` 两条的 `>>16` **都是 1**，分不开。
+
+我按规范假设 CID 在 DW3 bit16..31 ⇒ 第二条取到 CID=1、status=1，
+判成「不匹配 + 非零」，实际是「第二条成功了」。
+
+**这就是「第一条成功、第二条失败」的全部真相**——不是设备不处理，
+是我把第二条的完成项读成了第一条的样子。
+
+修：**DW2 与 DW3 双来源**，哪个的 CID 等于要等的就用哪个。
+真机上若布局与 QEMU 不同，这一条让它仍然工作，判据不依赖单一假设。
+
+### 读数（修完）
+
+    nvme: 识别 bdf=6144 vendor=0x1b36 device=0x10 cap_lo=0xf0107ff cap_hi=0x400820
+         vs=0x10400 csts=0x1->0x1 already=true mqes=2048 nn=256 nsze=131072 lbads=9
+    nvme: 容量 扇区=131072 字节=67108864 lba=512
+    nvme: 三格 识别=true 容量=true 图案=false ⇒ false
+
+**容量格通过**：`131072 × 512 = 67,108,864 字节 = 64 MiB`，与 `NVME_MIB = 64` **完全一致**。
+
+| 格 | 修前 | 修后 |
+|---|---|---|
+| 识别 | ✅ | ✅ |
+| 容量 | ❌ `nsze=0` | **✅ `nsze=131072`（64 MiB）** |
+| 图案 | ❌ `CmdTimeout` | ❌ `IoQueueNotReady`（**成因准确**） |
+
+| 项 | 值 |
+|---|---|
+| `check` | **18/18** |
+| 特性档 | **74/74** |
+| `nvme` 档 | **FAIL(35)** —— 两格通、图案格待 I/O 队列 |
+
+### 这一条最该记的
+
+**排除法有边界。** 八轮推断（§451/§452）全部指向「设备不处理第二条」，
+而 trace 一次就证明**设备两条都处理了**，问题在主机侧读 CQE。
+
+**下一个卡点该先问「有没有现成的仪器能直接看到那一侧」，再开始推断。**
+QEMU 的 trace 一直在那里，我八轮没想到用它。
+
+### 下一步
+
+1. **Create I/O CQ + Create I/O SQ**（两条 admin 命令），之后 `io_lba` 才能工作；
+2. 然后图案格才有意义；
+3. `nn=256` 仍是可疑读数（QEMU 只有一个 drive ⇒ 应为 1），但**不影响容量格**
+   （容量走 NSZE，已对）。

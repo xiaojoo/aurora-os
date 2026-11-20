@@ -315,6 +315,13 @@ fn nvme_block_err(e: crate::nvme::NvmeError) -> BlockError {
         N::NoDevice | N::BadRegs { .. } | N::ControllerFatal { .. } => BlockError::NoDevice,
         N::NotReady { .. } | N::CmdTimeout { .. } => BlockError::NotSettled,
         N::QueueTooDeep { .. } | N::Ctx(_) | N::CmdFailed { .. } => BlockError::DeviceError,
+        // **折衷**：`BlockError` 没有「我们还没实现」这个变体。
+        // 用 `NoDevice` 而不是 `DeviceError` 是因为前者会被上层读成
+        // 「这台盘用不了」，而 I/O 队列没建恰恰就是「今天还用不了」；
+        // 后者会被读成「设备报了错」，那是**推卸**。
+        // 真正该做的是给 `BlockError` 加一个 `NotImplemented`——
+        // 那要改块层的公开契约，留给 ADR-169 的下一轮。
+        N::IoQueueNotReady => BlockError::NoDevice,
     }
 }
 

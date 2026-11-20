@@ -59,14 +59,24 @@ pub const CSTS_CFS: u32 = 1 << 1;
 
 // ---------------------------------------------------------------- 命令 opcode
 
+// **opcode 是按队列解释的**（NVMe 规范 §4）：同一个数在 admin 队列与
+// I/O 队列上是两条不同的命令。0x02 在 admin 上是 Get Log Page、在 I/O 上是 Read。
+// 所以下面按队列分组，且**不许**跨队列复用常量——
+// 实测教训（BACKLOG §453）：`io_lba` 误用 admin 队列的 submit，
+// 于是「读扇区 0」被设备理解成「读日志页」，被拒 `status 0x4002`，
+// 而现场只说「命令失败」，看不出是发错了队列。
+
+// ---- Admin 队列 opcode
 pub const OP_DELETE_SQ: u8 = 0x00;
 pub const OP_CREATE_SQ: u8 = 0x01;
 pub const OP_GET_LOG_PAGE: u8 = 0x02;
 pub const OP_DELETE_CQ: u8 = 0x04;
 pub const OP_CREATE_CQ: u8 = 0x05;
 pub const OP_IDENTIFY: u8 = 0x06;
-pub const OP_READ: u8 = 0x02;
-pub const OP_WRITE: u8 = 0x01;
+
+// ---- I/O 队列 opcode（与上面**同值不同义**，所以名字必须带 IO_ 前缀）
+pub const OP_IO_WRITE: u8 = 0x01;
+pub const OP_IO_READ: u8 = 0x02;
 
 /// Identify 的 CNS：0 = Identify Namespace，1 = Identify Controller。
 pub const CNS_NAMESPACE: u32 = 0x00;
@@ -118,6 +128,12 @@ pub enum NvmeError {
     CmdFailed { cid: u16, status: u16 },
     /// 队列深度超出 CAP.MQES 给的上限
     QueueTooDeep { want: usize, max: usize },
+    /// I/O 队列还没建（Create I/O CQ/SQ 未做）。
+    ///
+    /// **单独一个变体而不是复用 `CmdFailed`**：这条路径的成因是
+    /// 「我们还没做那一步」，不是「设备拒了」。混在一起会让日志说
+    /// 「命令失败」，而真正该说的是「I/O 队列没建」。
+    IoQueueNotReady,
     /// 句柄表拒绝（映射/DMA/中断）
     Ctx(DriverError),
 }
@@ -132,6 +148,7 @@ impl NvmeError {
             NvmeError::CmdTimeout { .. } => "命令在时限内没收到完成",
             NvmeError::CmdFailed { .. } => "完成的 status 非零",
             NvmeError::QueueTooDeep { .. } => "队列深度超出 CAP.MQES",
+            NvmeError::IoQueueNotReady => "I/O 队列还没建（Create I/O CQ/SQ 未做）",
             NvmeError::Ctx(_) => "句柄表拒绝",
         }
     }
@@ -425,7 +442,7 @@ pub fn init() -> Result<Reading, NvmeError> {
 
 /// 发一条 Identify（CNS 选 Controller 或 Namespace），把 4096 字节读进 `out`。
 fn identify(st: &mut State, cns: u32, nsid: u32, out: &mut [u8]) -> Result<(), NvmeError> {
-    let cid = submit(st, OP_IDENTIFY, nsid, |st, off| {
+    let cid = submit(st, Q::Admin, OP_IDENTIFY, nsid, |st, off| {
         // DPTR = PRP1 = 数据页的 bus 地址（只一页，所以不需要 PRP2）
         st.ctx.dma_write32(st.dma, off + 24, st.data_bus as u32)?;
         st.ctx.dma_write32(st.dma, off + 28, (st.data_bus >> 32) as u32)?;
@@ -440,14 +457,25 @@ fn identify(st: &mut State, cns: u32, nsid: u32, out: &mut [u8]) -> Result<(), N
 }
 
 /// 提交一条命令：写 SQE，敲门铃。`fill` 负责写命令特有的那几个 DWORD。
+/// 命令发给哪个队列。**这个区分是必须的**：opcode 按队列解释，
+/// 发错队列不会报「队列错」，只会被当成另一条命令（见 `OP_*` 的注释）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Q { Admin, Io }
+
 fn submit(
     st: &mut State,
+    q: Q,
     opcode: u8,
     nsid: u32,
     fill: impl FnOnce(&mut State, usize) -> Result<(), NvmeError>,
 ) -> Result<u16, NvmeError> {
     let slot = st.sq_tail as usize;
-    let off = OFF_ADMIN_SQ + slot * SQE_BYTES;
+    // SQE 基址与门铃偏移都跟着队列走。
+    let (sq_off, db_off) = match q {
+        Q::Admin => (OFF_ADMIN_SQ, 0x1000usize),
+        Q::Io => (OFF_IO_SQ, 0x1008usize), // qid 1 的 SQ tail doorbell
+    };
+    let off = sq_off + slot * SQE_BYTES;
     // 清掉上一条的残留：命令是 64 字节，不全会让"上一条的 CDW10"混进这一条。
     st.ctx.dma_fill(st.dma, off, 0, SQE_BYTES)?;
     let cid = st.next_cid;
@@ -481,7 +509,7 @@ fn submit(
     // 下一轮应当**查 QEMU 源码**（`hw/nvme/ctrl.c` 的 `nvme_process_sq`）
     // 或对照一个已知能工作的实现（UEFI Shell / Linux）的 admin 队列提交序列。
     // **继续在本仓库里猜会浪费轮次。**
-    wr32(&st.ctx, st.mmio, 0x1000, st.sq_tail as u32)?;
+    wr32(&st.ctx, st.mmio, db_off as u64, st.sq_tail as u32)?;
 
     Ok(cid)
 }
@@ -495,22 +523,35 @@ fn wait_cqe(st: &mut State, cid: u16) -> Result<(), NvmeError> {
         }
         spins += 1;
         let off = OFF_ADMIN_CQ + st.cq_head as usize * CQE_BYTES;
-        // CQE 的 DW3：bit0 = phase，bit1..16 = status，bit16..32 = CID。
+        let d2 = st.ctx.dma_read32(st.dma, off + 8)?;
+        let d3 = st.ctx.dma_read32(st.dma, off + 12)?;
+        // CQE 的两个候选字段位置：
+        //   规范：DW2 = SQHD(16..31)|SQID(0..15)，DW3 = status|phase|CID(16..31)
+        //   实测：**CID 在 DW2 的低 16 位、status 在 DW2 的高 16 位**
         //
-        // **主判据是 CID，不是 phase。** 实测（ADR-169 补记）：QEMU 在命令
-        // 失败时把这一格的 phase 写成 0，而第一圈正常完成的写 1 ⇒ 用 phase
-        // 当「到达标志」会把**失败**的命令当成**没到**，报成 `CmdTimeout`。
-        // 那让成因完全错：说「超时」，实际是「被拒」。
+        // 实测证据（ADR-169 补记，两条独立来源）：
+        //   终诊 dump：slot=0 d2=0x1 d3=0x10001 / slot=1 d2=0x2 d3=0x10002
+        //   QEMU trace：enqueue_req_completion cid 1 status 0x0 / cid 2 status 0x0
+        // `d2` 的 1/2 与命令 CID 一一对应，而 `d3` 两条的 `>>16` 都是 1，分不开。
         //
-        // CID 是我自己发的、唯一的，所以用它判「这一格是不是我要等的」；
-        // phase 只用来判「这一格被设备写过没有」——**两种取值都接受**。
-        let dw3 = st.ctx.dma_read32(st.dma, off + 12)?;
-        let got_cid = (dw3 >> 16) as u16;
-        let status = ((dw3 >> 1) & 0x7FFF) as u16;
-        let phase = dw3 & 1;
-        // 这一格被写过：要么 CID 是我们的，要么 phase 与本圈期望值一致。
-        let written = got_cid == cid || (phase == 1) == st.cq_phase;
+        // **两种来源都试**：哪个的 CID 等于我们要等的就用哪个。
+        // 真机上若布局与 QEMU 不同，这一条让它仍然工作；而判据不依赖单一假设。
+        let cid_dw2 = (d2 & 0xFFFF) as u16;
+        let st_dw2 = ((d2 >> 16) & 0x7FFF) as u16;
+        let cid_dw3 = (d3 >> 16) as u16;
+        let st_dw3 = ((d3 >> 1) & 0x7FFF) as u16;
+        // 这一格被写过：要么某一处的 CID 是我们的，要么 phase 与本圈一致。
+        let phase = d3 & 1;
+        let written = cid_dw2 == cid || cid_dw3 == cid || (phase == 1) == st.cq_phase;
         if written {
+            // 取与我们要等的那个匹配的 (cid, status) 对；都不匹配就用 DW2 那组。
+            let (got_cid, status) = if cid_dw2 == cid {
+                (cid_dw2, st_dw2)
+            } else if cid_dw3 == cid {
+                (cid_dw3, st_dw3)
+            } else {
+                (cid_dw2, st_dw2)
+            };
             st.cq_head = ((st.cq_head as usize + 1) % QDEPTH) as u16;
             if st.cq_head == 0 {
                 st.cq_phase = !st.cq_phase;
@@ -553,8 +594,15 @@ fn io_lba(lba: u64, buf: &mut [u8], write: bool) -> Result<(), NvmeError> {
     } else {
         st.ctx.dma_fill(st.dma, OFF_DATA, 0, crate::mm::PAGE)?;
     }
-    let op = if write { OP_WRITE } else { OP_READ };
-    let cid = submit(st, op, 1, |st, off| {
+    // **I/O 队列还没建**（Create I/O CQ/SQ 是另一条命令序列，未做）。
+    // 这里必须**明确拒绝**，不能退回去用 admin 队列——
+    // 实测教训：用 admin 队列发 `OP_IO_READ`(0x02) 会被设备当成 Get Log Page，
+    // 返回 `status 0x4002`，而现场只说「命令失败」，看不出是发错了队列。
+    let _ = (write, buf);
+    return Err(NvmeError::IoQueueNotReady);
+    #[allow(unreachable_code)]
+    let op = if write { OP_IO_WRITE } else { OP_IO_READ };
+    let cid = submit(st, Q::Io, op, 1, |st, off| {
         // DPTR = PRP1 = 数据页
         st.ctx.dma_write32(st.dma, off + 24, st.data_bus as u32)?;
         st.ctx.dma_write32(st.dma, off + 28, (st.data_bus >> 32) as u32)?;

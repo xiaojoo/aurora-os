@@ -3982,6 +3982,15 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
             "-drive", f"if=none,id=nvme0,format=qcow2,file={NVME_IMG}",
             "-device", "nvme,drive=nvme0,serial=AURORANVME",
         ]
+        # 一次性实验：QEMU 自带的 NVMe trace。
+        # `AURORA_NVME_TRACE=<path>` 时把设备侧看到的东西写进那个文件——
+        # 这是「设备看到了什么」的第二台仪器（224 个 pci_nvme_* 事件），
+        # 比在内核里猜十轮有用。不进默认路径（与 AURORA_QEMU_EXTRA 同一条理由）。
+        _trace = os.environ.get("AURORA_NVME_TRACE")
+        if _trace:
+            cmd += [
+                "-trace", f"enable=pci_nvme_*,file={_trace}",
+            ]
     # 一次性实验用的附加参数（例如 `-device intel-iommu,intremap=on` 去真正解析 DMAR）。
     # 走环境变量而不是加一堆子命令开关：这类实验今天要做、明天可能就废，不该进判定链的默认路径。
     # ADR-143：网卡设备**无条件挂给 QEMU**（之前只有 virtio-net 档有。实测 a3-shell 档的 ping 找不到设备 ⇒ NoDevice）。设备在但没人 claim 对其它档无害。
