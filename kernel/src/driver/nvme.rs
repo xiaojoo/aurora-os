@@ -465,9 +465,24 @@ fn submit(
     // （实测：第一条成功、第二条超时；游标与门铃值全对）。
     // 一次 MMIO **读**是可靠屏障——读会强制之前的写完成。
     let _ = rd32(&st.ctx, st.mmio, REG_CSTS)?;
-    // 敲门铃：管理队列的 SQ0 tail doorbell 在 0x1000
+    // 敲门铃：管理队列的 SQ0 tail doorbell 在 0x1000。
+    //
+    // **已知未解**（ADR-169 未决 1，BACKLOG §451/§452）：设备只处理**第一条**命令，
+    // 第二条看不到。实测证据：
+    //   asq=0x98000 acq=0x99000（地址对）、sqe_dw0 slot=0/1 = 0x10006/0x20006（写对了）、
+    //   cqe_d3 slot=0 = 0x10001（第一条完成）、slot=1..7 全 0（**设备没写第二条**）。
+    // 所以不是 CID 报错，是那一格压根没被写过。
+    // **已排除的七个方向**（全部有实测读数，见 BACKLOG §451/§452）：
+    //   NSID（广播 0xFFFFFFFF 也失败）、命令类型（连发 Controller 也失败）、
+    //   队列深度（AQA 读写 = 0x70007）、游标与门铃值（slot/tail/head 全对）、
+    //   PCIe 内存序（门铃前 MMIO 读屏障无效）、CID 字段（SQE DW0 = 0x20006 正确）、
+    //   posted write 投递（双写门铃 + 中间读，仍无效）、地址（asq/acq 正确）。
+    //
+    // 下一轮应当**查 QEMU 源码**（`hw/nvme/ctrl.c` 的 `nvme_process_sq`）
+    // 或对照一个已知能工作的实现（UEFI Shell / Linux）的 admin 队列提交序列。
+    // **继续在本仓库里猜会浪费轮次。**
     wr32(&st.ctx, st.mmio, 0x1000, st.sq_tail as u32)?;
-    // 量 门铃：记下每次提交的 slot 与写进去的 tail 值。
+
     Ok(cid)
 }
 
