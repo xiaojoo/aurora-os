@@ -219,6 +219,7 @@ public_api = [
   "mm::aspace_map_slot",
   "mm::aspace_effective_flags",
   "mm::aspace_root",
+  "mm::aspace_root_locked",
   "mm::aspace_mapped_pages",
   "mm::frame_seal",
   "mm::frame_sealed",

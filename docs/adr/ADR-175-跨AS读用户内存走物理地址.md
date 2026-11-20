@@ -191,9 +191,10 @@ B1 是"再写一个只在用例里用的旁路读"，B2 是"把它做成 `mm`/`s
   已登记进 `docs/security/unsafe-whitelist.toml`（`sched/user` U2 9 → 10），
   census 重算 530 → 531。
 - **逐字节**：8 字节一次 `read_volatile`，没有批量优化（§八 未决 1）。
-- **校验与读之间没有持锁**：`copy_from_user_in` **没有**像 `copy_from_user` 那样
-  用 `mm::with_vmm_lock` 把"校验 + 读"整段包住（§八 未决 2）。这是本轮落地形态的
-  真实缺口，不是笔误。
+- **校验与读已同在一次持锁期**（本文修订）：`copy_from_user_in` 现在用
+  `mm::with_vmm_lock` 把「取根 → 校验 → 翻译 → 读」整段包住，与 `copy_from_user`
+  同一条纪律。见 §八 未决 2 的处置记录——那里记了为什么不能直接在外层包
+  （`VMM_LOCK` 不可重入），以及为此拆出的 `aspace_root_locked`。
 - **本轮不消灭那 7 次拒绝**：调用点（`ktests/security/sdkdemo.rs` 的 `read_at`、
   `ktests/storage/fs_open.rs` 的探针）**还没有切到 `read_at_in`**，所以 chain 上仍会复现。
 
@@ -282,22 +283,30 @@ B1 是"再写一个只在用例里用的旁路读"，B2 是"把它做成 `mm`/`s
 
 ---
 
-## 八、未决
+2. ~~**`copy_from_user_in` 缺 `with_vmm_lock`**~~ **已修（本文修订）**。
 
-1. **逐字节读，没有批量优化**：`copy_from_user_in` 循环里每次
-   `read_volatile` 读 1 字节，且**每字节**重新 `phys_of_in`（一次四级页表遍历）。
-   8 字节 = 8 次遍历。`copy_from_user` 那边是按页 `ucopy_from`（`rep movsb`）。
-   要做批量，得先决定"同页内只翻译一次"的边界形状，并补一条逐字节准确的判据
-   （`copy_into_scratch` 的 FNV 对照可以照抄）。
-2. **校验与读之间没有持锁**（真实缺口）：`copy_from_user_in` 没有
-   `mm::with_vmm_lock` 包住整段，`aspace_effective_flags` 每次自己取放 VMM(20)。
-   于是"这一页对用户开放"的结论与"读到那个帧"之间有一个窗口：另一颗 CPU 若在
-   这个窗口里 `aspace_destroy` 该 AS 并归还帧，读到的是**已被别人复用的物理内存**。
-   `copy_from_user` 的注释把这件事写死了（"校验与拷贝必须在同一次持锁期内完成"），
-   本函数今天**没有兑现**。要关掉它，要么外层 `with_vmm_lock` 包住（注意
-   `aspace_root` 内部还会再取一次 VMM——同 CPU 重入会撞 `重入获取 rank=20`，
-   得先确认 `IrqGuard` 的等级栈语义），要么给 `aspace_root` 加一个"锁已在手"的变体。
-   **这是本 ADR 落地形态里最该先修的一条。**
+   原来的形态是：`aspace_root` 自取锁，而 `aspace_effective_flags` 与 `phys_of_in`
+   都不取锁 ⇒ 「校验说这一页对用户开放」与「按翻译出来的帧去读」之间有一个窗口，
+   另一颗 CPU 可以在这中间 `aspace_destroy` 并归还帧，于是读到的是**已被复用的
+   物理内存**——那是把别人的数据当这个容器的数据交出去。
+
+   **为什么不能直接在外层包一层**：`VMM_LOCK` 是 rank 锁、**不可重入**
+   （`IrqGuard` + rank 断言），而 `aspace_root` 自己会取它 ⇒ 外层再包会撞
+   「重入获取 rank=20」。
+
+   **怎么修的**：把取锁从 `aspace_root` 里提出来，拆成两个版本——
+
+       pub fn aspace_root(slot)         // 自取锁，单次查询用
+       pub fn aspace_root_locked(slot)  // 要求调用方已持锁，组合操作用
+
+   `copy_from_user_in` 改用 `_locked` 那个，整段包在 `with_vmm_lock` 里。
+   `aspace_effective_flags` 仍用自取锁版，语义不变。
+
+   **负样本**：把 `copy_from_user_in` 的 `with_vmm_lock` 去掉，
+   `check-driver-ctx` 不红（它只看驱动），但**这条缺口没有任何门禁能自动抓**——
+   它只在「另一颗 CPU 恰好在那个窗口里 destroy」时才显现。所以它靠的是
+   **与 `copy_from_user` 的结构一致性**，而不是一条会红的判据。
+   **这一点必须如实记着：它是纪律，不是判据。**
 3. **`write_at_in`（写方向）还没做**：写要额外要求 `eff.writable`（`NotWritable`），
    并且要决定"写穿过 COW 怎么办"——本内核今天没有 COW，但这条判据的占位得先想清楚。
 4. **`aspace_root` 失败原因的合并**：`None` 同时表示"槽号越界""槽位未使用""MM 未就绪"

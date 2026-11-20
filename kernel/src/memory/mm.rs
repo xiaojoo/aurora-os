@@ -1497,18 +1497,36 @@ pub fn current_effective_flags(va: u64) -> Option<EffectiveFlags> {
 /// 栈页可写、StartupInfo 页**只读**，而那些页都在子 AS 里，不在当前 CR3 上）。
 /// 与 `effective_flags` 共用同一段遍历，差别只有根从哪来。
 pub fn aspace_effective_flags(slot: u8, va: u64) -> Option<EffectiveFlags> {
+    let root = aspace_root(slot)?;
+    effective_flags_in(root, va)
+}
+
+/// 按**槽号**取那台 AS 的 PML4 物理地址（ADR-175）。
+///
+/// 从 `aspace_effective_flags` 里提出来的：`copy_from_user_in` 也要取同一个根，
+/// 而「怎么取根」只该有一份实现（两处各写一遍就会有一处忘了 `e.used` 判）。
+pub fn aspace_root(slot: u8) -> Option<u64> {
     if !is_ready() {
         return None;
     }
-    let root = {
-        let _g = vmm();
-        let e = aspaces().items.get(usize::from(slot))?;
-        if !e.used {
-            return None;
-        }
-        e.pml4
-    };
-    effective_flags_in(root, va)
+    let _g = vmm();
+    aspace_root_locked(slot)
+}
+
+/// 同 `aspace_root`，但**要求调用方已持有 VMM 锁**。
+///
+/// 为什么要两个版本：`VMM_LOCK` 是 rank 锁、**不可重入**（`IrqGuard` + rank 断言）。
+/// `copy_from_user_in` 要把「取根 → 校验 → 翻译 → 读」放在**同一次持锁期**里
+/// （否则校验结论与读到帧之间有窗口，另一颗 CPU 可以在这中间 `aspace_destroy`
+/// 并归还帧），所以它必须先拿锁再调这个，不能调自取锁的那个。
+///
+/// 前提：调用方持有 VMM 锁。**单次查询用 `aspace_root`**。
+pub fn aspace_root_locked(slot: u8) -> Option<u64> {
+    let e = aspaces().items.get(usize::from(slot))?;
+    if !e.used {
+        return None;
+    }
+    Some(e.pml4)
 }
 
 fn effective_flags_in(root: u64, va: u64) -> Option<EffectiveFlags> {
@@ -1552,13 +1570,28 @@ fn effective_flags_in(root: u64, va: u64) -> Option<EffectiveFlags> {
 /// 前提与 `is_mapped` 同：刻意不加锁，所有写者都在 VMM(20) 内；锁外读是无保证快照。
 /// 大页 ⇒ 块物理基 + 块内偏移再下取整到 4 KiB；叶子 ⇒ 叶子物理基。不 present/非规范 ⇒ None。
 pub fn phys_of(va: u64) -> Option<u64> {
+    if !is_ready() {
+        return None;
+    }
+    phys_of_in(s().pml4_phys, va)
+}
+
+/// `phys_of` 的**按根**版本（ADR-175）：走 `root` 这张表翻译 `va`。
+///
+/// 用途只有一个但很关键：内核上下文要读**另一个 AS** 里的用户页时，
+/// 当前 CR3 是内核页表、翻译不出来。Linux 的 `access_process_vm` 对这件事的
+/// 说法是一句话：**Do not walk the page table directly, use get_user_pages**——
+/// 拿到页框再经 direct map 访问，**不切 CR3**。这里就是那个「拿页框」。
+///
+/// 前提与 `phys_of` 同：只读遍历，所有写者都在 VMM(20) 锁内；锁外读是无保证快照。
+pub fn phys_of_in(root: u64, va: u64) -> Option<u64> {
     if !is_ready() || VirtAddr::new(va).is_none() {
         return None;
     }
     let hhdm = s().hhdm;
     // SAFETY: 只读遍历自建表，前提与 is_mapped 相同
     unsafe {
-        let mut table = (s().pml4_phys + hhdm) as *const Page;
+        let mut table = (root + hhdm) as *const Page;
         let mut level = 3u8;
         loop {
             let entry = (*table).0[idx(va, level)];

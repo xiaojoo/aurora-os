@@ -3849,6 +3849,108 @@ pub fn load_into(aslot: u8, bytes: &[u8]) -> Result<Loaded, LoadError> {
 /// 走 `peek_u64` ⇒ 每一次这样的读都带"逐页校验 + 一次持锁 + 可恢复窗口"。
 /// 读不出来就是 `None`，并把理由留下：调用方是用例，`None` 与"读到了 0"必须能分开，
 /// 而只有日志能把"为什么没读到"说清楚。
+/// 用户 → 内核，**按指定 AS** 读（ADR-175）。
+///
+/// ## 为什么需要它
+///
+/// `copy_from_user` 走 `mm::current_effective_flags`，而它读的是**当前 CR3**。
+/// 用例跑在**内核上下文**里，CR3 是内核页表；用户容器的映射在容器自己的 AS 里
+/// ⇒ 读不到。实测（BACKLOG §461）整链里 7 次 `读用户页被拒`，两个地址组
+/// （`elfdisk` 的数据段、`fs-open` 探针的数据段），后果是
+/// `sdkdemo: 读得到=false` 与 `fs-open-ring3: 不成立 done 哨兵`。
+///
+/// 间歇性的成因：用例与容器**同在一个 CPU 上轮转**——容器跑时 CR3 是容器的
+/// （读得到），用例跑时是内核的（读不到）。落在哪一侧取决于 tick。
+///
+/// ## 怎么读（走物理地址，不切 CR3）
+///
+/// Linux 的 `access_process_vm` 对这件事的说法是一句话：
+/// **Do not walk the page table directly, use get_user_pages** ——
+/// 拿到页框再经 direct map 访问。这里照同一条路：
+///
+///     aslot → aspace_root → phys_of_in(root, va) → via_hhdm() → 读
+///
+/// **不切 CR3**：切了要处理 TLB shootdown、要保证持锁期不被打断，
+/// 而且在 PTI 下还要走 shadow PGD。只为读几个字节不值得。
+///
+/// ## 为什么不需要 stac/clac
+///
+/// HHDM 别名是**内核页**（U/S=0），SMAP 不拦内核页。读的是「那台 AS 的物理页
+/// 经 direct map 的别名」，**不是用户映射本身**。
+///
+/// **但这是唯一一条不经 stac/clac 读用户内存的路径**，所以：
+/// - 校验**不跳过**：仍逐页问 `aspace_effective_flags`，必须是用户页；
+/// - 它已登记进 `docs/security/unsafe-whitelist.toml`（U4），
+///   理由与地址范围写在那里，改这里要同步改那边。
+pub fn copy_from_user_in(aslot: u8, va: u64, dst: &mut [u8]) -> Result<usize, PtrError> {
+    if dst.len() > COPY_MAX {
+        return Err(PtrError::TooLong);
+    }
+    let end = va.checked_add(dst.len() as u64).ok_or(PtrError::NotUserRange)?;
+    if va >= elf::USER_VA_TOP || end > elf::USER_VA_TOP {
+        return Err(PtrError::NotUserRange);
+    }
+    // **取根、校验、翻译、读全在同一次持锁期里**（与 `copy_from_user` 同一条纪律）。
+    //
+    // 不这样的话，「校验说这一页对用户开放」与「按翻译出来的帧去读」之间有一个窗口：
+    // 另一颗 CPU 可以在这中间 `aspace_destroy` 并归还帧，于是读到的是**已被复用的
+    // 物理内存**——那是把别人的数据当这个容器的数据交出去。
+    //
+    // 用 `aspace_root_locked` 而不是 `aspace_root`：后者自己取锁，
+    // 而 `VMM_LOCK` 是 rank 锁、不可重入，外层再包会撞「重入获取 rank=20」。
+    mm::with_vmm_lock(|| {
+        let root = mm::aspace_root_locked(aslot).ok_or(PtrError::NotMapped)?;
+        let pg = mm::PAGE as u64;
+        let mut done = 0usize;
+        while done < dst.len() {
+            let at = va + done as u64;
+            let page = at / pg * pg;
+            // 校验与 `copy_from_user` 同一条规则，只是问的是**那台 AS**。
+            let eff = mm::aspace_effective_flags(aslot, page).ok_or(PtrError::NotMapped)?;
+            if !eff.user {
+                return Err(PtrError::NotSharedWithUser);
+            }
+            let pa = mm::phys_of_in(root, at).ok_or(PtrError::NotMapped)?;
+            // SAFETY: `pa` 由 `phys_of_in` 从**那台 AS 的页表**翻译得出，
+            // 而上面 `aspace_effective_flags` 已确认那一页 present 且对用户开放；
+            // `via_hhdm` 给出的是该物理帧的内核别名（U/S=0，SMAP 不管），
+            // 读 1 字节不越出页边界（`at` 与 `pa` 都按同一 VA 算）。
+            // 校验与读在**同一次持锁期**内，所以「校验后帧被回收」那个窗口不存在。
+            let b = unsafe {
+                let kva = mm::PhysAddr(pa).via_hhdm();
+                core::ptr::read_volatile(kva.0 as *const u8)
+            };
+            dst[done] = b;
+            done += 1;
+        }
+        Ok(done)
+    })
+}
+
+/// 从**指定 AS** 读一个 `u64`（ADR-175）。与 `read_at` 的关系见 `copy_from_user_in`。
+///
+/// **跨 AS 读应该用这个，不是 `read_at`。** 今天出错的正是「两套并存、用的人选错」。
+pub fn read_at_in(aslot: u8, va: u64) -> Option<u64> {
+    let mut b = [0u8; 8];
+    match copy_from_user_in(aslot, va, &mut b) {
+        Ok(8) => Some(u64::from_le_bytes(b)),
+        Ok(_) => {
+            // 校验都过了还搬不满，只剩「中途故障被接住了」这一种解释。
+            crate::log_info!("abi: 按AS读不满 aslot={} va={:#x}", aslot, va);
+            None
+        }
+        Err(e) => {
+            crate::log_info!(
+                "abi: 按AS读被拒 aslot={} va={:#x} —— {}",
+                aslot,
+                va,
+                PtrError::describe(e)
+            );
+            None
+        }
+    }
+}
+
 pub fn read_at(va: u64) -> Option<u64> {
     match peek_u64(va) {
         Ok(v) => Some(v),
