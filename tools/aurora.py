@@ -45,8 +45,6 @@ ROOT = Path(__file__).resolve().parents[1]
 TOOLS = ROOT / ".tools"
 CARGO = TOOLS / "cargo" / "bin" / "cargo.exe"
 TARGET = "x86_64-unknown-none"
-IMAGE = ROOT / "build" / "aurora.img"
-SERIAL_LOG = ROOT / "build" / "serial.log"
 # `AURORA_BUILD` 让并发实测各用一套产物目录（BACKLOG §466）。
 #
 # 起因：`SERIAL_LOG` 写死成 `build/serial.log`，任何并发 `run`/`test`/`check`
@@ -56,6 +54,14 @@ SERIAL_LOG = ROOT / "build" / "serial.log"
 # 所以分目录而不是排队。不设这个变量时行为一个字符都不变。
 BUILD = pathlib.Path(os.environ.get("AURORA_BUILD") or (ROOT / "build"))
 BUILD.mkdir(parents=True, exist_ok=True)
+
+# 镜像与串口留档**也必须**跟着 BUILD 走（BACKLOG 470）：
+# 466 只分了 BUILD 派生的产物，这两行还写死 `ROOT/build` =>
+# 两个 aurora.py 并发时仍然互相覆盖镜像（458 记过的那件事只修了一半）。
+# 不设 AURORA_BUILD 时 BUILD == ROOT/build，行为一个字符都不变。
+IMAGE = BUILD / "aurora.img"
+SERIAL_LOG = BUILD / "serial.log"
+
 QEMU = TOOLS / "qemu" / "qemu-system-x86_64.exe"
 
 def kernel_src(name: str, in_tests: bool = False) -> Path:
@@ -5853,6 +5859,65 @@ def check_interface_change() -> list[str]:
     return bad
 
 
+def check_syscall_abi_arms() -> list[str]:
+    """用户态真打的每一个号，内核分派表里必须有**同名**的臂。
+
+    ## 为什么要这道门禁（一次真实事故）
+
+    2026-11-20 的 `04af866`（ADR-165 实施）把分派臂从 `SYS_NET_SEND` 改成了
+    `SYS_SOCK_SEND`，而 `user/runtime/src/lib.rs` 里 `net_send`/`net_recv`
+    **还在打 33/34**。于是 33 落到 `_ => E_INVALID`，`cmd_ping` 把每次发送失败
+    都打成 `ping <ip>`，`ip neigh` 恒空。宿主机侧全量对账：改之前 7865 份跑里
+    153 份有 `from 10.0.2.2: seq=`，改之后 1248 份跑里 **0 份**。
+
+    **为什么当时没有任何门禁咬**：这条边唯一的判据是判定表 `A3 shell…` 那一行的
+    一格，而那一行本来就因别的原因红（§441 记作既有失败）——**一格新红被既有的红
+    遮住了**。`ktests` 里零个用例打 33/34/53/54，`check` 里零处引用这些号。
+
+    ## 判据
+
+    1. `user/runtime` 里每个 `syscall_abi(SYS_X)` 的 `SYS_X`，内核
+       `syscall_dispatch` 的 `match` 里必须有一条 `SYS_X =>` 的臂。**名字对名字**，
+       不比号——两边的号本来就是各写一份常量，改名不改号正是这次事故的形状。
+    2. 反向的**别名**禁令：53/54（`SYS_SOCK_SEND/RECV`）今天没有 socket 实现，
+       不许拿它们去挂原始以太网帧的 handler。挂上去就是两族语义合并，而 ADR-165
+       明写这两族**不是同一件事**（§447 的澄清）。
+
+    ## 这条门禁抓不到什么（如实写）
+
+    它只对账名字在不在，不证语义对不对。33 号挂了一个空实现照样绿——那要靠
+    内核用例 `t_syscall_abi_arms` 的实跑读数兜（它真调一次 33，看返回是不是 -1）。
+    """
+    rt = (ROOT / "user" / "runtime" / "src" / "lib.rs").read_text(encoding="utf-8", errors="replace")
+    kern = kernel_src("user").read_text(encoding="utf-8", errors="replace")
+    bad: list[str] = []
+
+    used = sorted(set(m.group(1) for m in re.finditer(r"syscall_abi\(\s*(SYS_[A-Z_0-9]+)", rt)))
+    if not used:
+        # 量具自己失灵时也要能被发现：一个号都解析不出来 = 正则或路径变了，
+        # 那不是全都对上了，是**这道门禁在空转**。
+        return ["user/runtime 里一个 syscall_abi(SYS_*) 都没解析出来 ⇒ 这道门禁在空转（正则或路径变了？）"]
+
+    arms = set(m.group(1) for m in re.finditer(r"(?m)^\s{8}(SYS_[A-Z_0-9]+)\s*=>", kern))
+    if not arms:
+        return ["内核 syscall_dispatch 里一条 SYS_* => 臂都没解析出来 ⇒ 这道门禁在空转"]
+
+    for name in [u for u in used if u not in arms]:
+        bad.append(
+            f"用户态在打 {name}，但内核分派表里没有它的臂 ⇒ 这个号会落到 `_ => E_INVALID`"
+            "（这正是 2026-11-20 那次 ping 全死的形状）"
+        )
+
+    # 别名禁令：socket 族的号不许挂原始帧的 handler。
+    for sock, raw in (("SYS_SOCK_SEND", "sys_net_send"), ("SYS_SOCK_RECV", "sys_net_recv")):
+        if re.search(r"(?m)^\s+" + sock + r"\s*=>\s*" + raw, kern):
+            bad.append(
+                f"{sock} 挂在 {raw} 上 ⇒ 把 socket 族与原始以太网帧族合并了；"
+                "ADR-165/§447 明写这两族不是同一件事"
+            )
+
+    return bad
+
 def check_nofloat(elf: Path) -> list[str]:
     """镜像里不允许出现 SSE/x87 指令：本目标默认不发浮点，但这个保证可被单个
     #[target_feature] 或 C 侧选项悄悄拆掉，而 §5.3 的入口桩不保存浮点状态。"""
@@ -6443,7 +6508,7 @@ def check_pkg_manifest() -> list[str]:
     script = ROOT / "tools" / "pkg_manifest.py"
     if not script.exists():
         return [f"缺少 {script}"]
-    img = ROOT / "build" / "aurora.img"
+    img = IMAGE  # 470：跟着 BUILD 走（并发实测各用一套产物）
     if not img.exists():
         # 镜像由 `build`/`image` 生成；check 在 build 之前跑时没有镜像可读——
         # 此时清单不存在就生成期望清单（与 esp_image 常量同源），存在就只校验 JSON 形状。
@@ -7613,6 +7678,7 @@ def do_check(elf: Path | None) -> int:
         "check-sbom": lambda: check_sbom(),
         "check-matrix-wiring": lambda: check_matrix_wiring(),
         "check-verdict": lambda: check_verdict_contract(),
+        "check-syscall-abi-arms": lambda: check_syscall_abi_arms(),
         "check-nofloat": (lambda: check_nofloat(elf)) if elf else (lambda: ["未提供内核镜像路径"]),
     }
     rc = 0

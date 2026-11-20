@@ -357,6 +357,12 @@ fn t_fs_rw_open_write() -> bool {
     };
     let mut fr = frame0();
     let mut ok = true;
+    // 句柄基线（463/ADR-174 七.1）：**授出任何句柄之前**记一次。
+    //
+    // 旧写法 `live == 0` 问的是「全系统一个句柄都没有」——句柄是多主人资源，
+    // 而 `.ktests` 的顺序由链接器决定 => 那条判据在整链里绿不绿取决于本用例排第几。
+    // 463 改了 6 处，漏了这一处。**没放宽**：本用例漏 close 一个 => 比基线多 1，仍然红。
+    let h0 = handle::used();
 
     let path = b"/w/LOG.TXT";
     ok &= put_user(va.0, 0, path);
@@ -414,6 +420,6 @@ fn t_fs_rw_open_write() -> bool {
         live
     );
     drop(map);
-    ok && open_ok && c == 0 && live == 0
+    ok && open_ok && c == 0 && live == h0
 }
 ktest!(KT_FS_RW_OPEN_WRITE, t_fs_rw_open_write);

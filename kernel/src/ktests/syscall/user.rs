@@ -448,3 +448,83 @@ fn t_task_exit() -> bool {
 }
 ktest!(KT_TASK_EXIT, t_task_exit);
 
+
+// ---- 33/34/53/54 的分派臂：**用户态真打什么号，内核就必须有那条臂**
+//
+// ## 为什么这一格单独存在（一次真实事故，BACKLOG §469）
+//
+// 2026-11-20 的 04af866 把分派臂从 SYS_NET_SEND(33) 改成 SYS_SOCK_SEND(53)，
+// 而 user/runtime 还在打 33/34 ⇒ ping 全死，1248 份跑后日志里 0 次 ICMP 回话。
+// 当时**没有任何内核用例打这四个号**，所以 ktests 全绿也照样漏。
+//
+// ## 判据（四格，两正两负）
+//
+// 33 必须**已知**：调一次，unknown_nr() 不涨（落不落 E_INVALID 由设备决定——
+//   没网卡时 bind_net 失败回 E_IO，那也是"这条臂在"，与"号根本不存在"是两件事）。
+// 34 同上。
+// 53/54 必须**未知**：今天没有 socket 实现，调了必须落 _ => E_INVALID 且 unknown_nr() 涨。
+//   **这一格是防"别名"的那一半**：谁再把 53 挂回 sys_net_send，这里立刻红。
+//
+// 反过来说：若哪天 socket 真实现了，53/54 那两格要按新语义重写，不许直接删——
+// 删掉就回到"没有用例打这些号"的状态，而那次事故正是从那个状态长出来的。
+#[cfg(feature = "handles")]
+fn t_syscall_abi_arms() -> bool {
+    use crate::user::{self, syscall_dispatch, SYS_NET_RECV, SYS_NET_SEND,
+                      SYS_SOCK_RECV, SYS_SOCK_SEND};
+    let mut f = crate::arch::x86_64::trap::TrapFrame {
+        cr2: 0, r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
+        rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0, vector: 0,
+        error_code: 0, rip: 0, cs: 0, rflags: 0, rsp: 0, ss: 0,
+    };
+
+    // ---- 33：必须已知。**只数 unknown_nr 有没有涨**，不判返回值。
+    // 返回值取决于设备在不在（没有网卡 ⇒ bind_net 失败 ⇒ E_IO = -7），
+    // 而"这条臂存不存在"与"设备在不在"是两件事——混在一起判，
+    // 判定表里那些不挂网卡的档会假红（这正是 ping 那次被遮住的同一类错误）。
+    let u0 = user::unknown_nr();
+    f.rax = SYS_NET_SEND;
+    f.rdi = 0;      // 帧指针：不校验指针先看号（号不存在时连指针都不该碰）
+    f.rsi = 0;      // 长 0 ⇒ 已知臂会回 E_INVALID（形状检查），未知号也会回 E_INVALID
+    syscall_dispatch(&mut f);
+    let send_known = user::unknown_nr() == u0;
+
+    // ---- 34：同上。
+    let u1 = user::unknown_nr();
+    f.rax = SYS_NET_RECV;
+    f.rdi = 0;
+    f.rsi = 0;
+    f.rdx = 0;
+    syscall_dispatch(&mut f);
+    let recv_known = user::unknown_nr() == u1;
+
+    // ---- 53：必须未知（没有 socket 实现）。unknown_nr 必须**涨**。
+    let u2 = user::unknown_nr();
+    f.rax = SYS_SOCK_SEND;
+    f.rdi = 0; f.rsi = 0; f.rdx = 0;
+    syscall_dispatch(&mut f);
+    let sock_send_unknown = user::unknown_nr() == u2 + 1 && f.rax == user::E_INVALID;
+
+    // ---- 54：同上。
+    let u3 = user::unknown_nr();
+    f.rax = SYS_SOCK_RECV;
+    f.rdi = 0; f.rsi = 0; f.rdx = 0;
+    syscall_dispatch(&mut f);
+    let sock_recv_unknown = user::unknown_nr() == u3 + 1 && f.rax == user::E_INVALID;
+
+    let ok = send_known && recv_known && sock_send_unknown && sock_recv_unknown;
+    crate::log_info!(
+        "abi-arms: 33已知={} 34已知={} 53未知={} 54未知={} ⇒ {}",
+        send_known, recv_known, sock_send_unknown, sock_recv_unknown, ok
+    );
+    if !ok {
+        crate::log_fatal!(
+            "abi-arms: 判据不成立（33/34 必须已知、53/54 必须未知）\
+             unknown_nr 起点 u0={} u1={} u2={} u3={} 末值={}",
+            u0, u1, u2, u3, user::unknown_nr()
+        );
+    }
+    ok
+}
+#[cfg(feature = "handles")]
+ktest!(KT_SYSCALL_ABI_ARMS, t_syscall_abi_arms);
+

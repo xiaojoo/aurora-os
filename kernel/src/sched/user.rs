@@ -3177,10 +3177,18 @@ pub fn syscall_dispatch(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> boo
         SYS_PCI_ENUM => sys_pci_enum(frame),
         #[cfg(feature = "handles")]
         SYS_CLOCK_UPTIME => sys_clock_uptime(frame),
+        // 33/34 是 **ADR-143 的原始以太网帧**收发（`user/runtime` 的 `net_send`/`net_recv`
+        // 打的就是这两个号）。
+        //
+        // **2026-11-20 这里被改成 `SYS_SOCK_SEND/RECV`(53/54)，而用户态没跟着改** ⇒
+        // 33 落到 `_ => E_INVALID`，`cmd_ping` 把每次发送失败都打成 `ping <ip>`，
+        // `ip neigh` 恒空。1248 份跑后日志里 0 次 ICMP 回话（此前 7865 份里 153 次）。
+        // 53/54 属于 socket 族（有连接/有状态），今天**没有实现**——不许拿它当 33/34 的别名。
+        // 判据：`t_syscall_abi_arms`（33/34 必须已知、53/54 必须未知）。
         #[cfg(feature = "handles")]
-        SYS_SOCK_SEND => sys_net_send(frame),
+        SYS_NET_SEND => sys_net_send(frame),
         #[cfg(feature = "handles")]
-        SYS_SOCK_RECV => sys_net_recv(frame),
+        SYS_NET_RECV => sys_net_recv(frame),
         #[cfg(feature = "handles")]
         SYS_NET_INFO => sys_net_info(frame),
         #[cfg(feature = "handles")]
