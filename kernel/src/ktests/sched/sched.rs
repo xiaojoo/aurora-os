@@ -2040,13 +2040,24 @@ fn t_q2_workload_slots() -> bool {
     Q2_SAMPLE_CYCLES.store(0, Ordering::Relaxed);
 
     // 前提：表是空的（本用例不假设别的用例收过尾）
+    //
+    // **步骤日志**（BACKLOG §461）：整链里本用例有时卡在这几行读数上
+    // （`run-8346.log` 连 `q2: 前提失效` 都没打就卡到 120 s）。
+    // 串口是同步的，所以卡住之前的最后一行就是答案——这比 `fmark` + pmemsave
+    // 那套仪器便宜得多，而这里只需要「卡在哪一步」。
+    crate::log_info!("q2: 步骤 1 开始读数");
     let (pc0, _) = proc::proc_residual();
+    crate::log_info!("q2: 步骤 2 进程残留={}", pc0);
     let (jc0, _) = proc::job_residual();
+    crate::log_info!("q2: 步骤 3 Job残留={}", jc0);
     let f0 = mm::free_frames();
     let va0 = mm::reservation_count();
+    crate::log_info!("q2: 步骤 4 空闲页={} 保留={}", f0, va0);
     let rel0 = sched::reap_released();
+    crate::log_info!("q2: 步骤 5 回收={}", rel0);
     // active 的基线里含跑用例的 boot 上下文自己（它也是 Running），所以拿读数对读数
     let act0 = sched::tasks_active();
+    crate::log_info!("q2: 步骤 6 活跃={}", act0);
     // 本 CPU 此刻占着几格：这一格解释"成功数为什么小于请求数"——链接顺序会把别的用例
     // 留下的任务算进来，而 `spawn` 只往调用者这颗 CPU 放（今天没有迁移）。
     let me_cpu = cpu::self_slot();
@@ -2058,6 +2069,7 @@ fn t_q2_workload_slots() -> bool {
     let slots_done0 = (0..sched::MAX_TASKS)
         .filter(|&sl| sched::state_of(sched::gidx(me_cpu, sl)) == sched::TaskState::Done)
         .count();
+    crate::log_info!("q2: 步骤 7 占用={} 已收工={}", slots_used0, slots_done0);
     if pc0 != 0 || jc0 != 0 {
         crate::log_fatal!("q2: 前提失效 残留进程={} Job={}", pc0, jc0);
         return false;
