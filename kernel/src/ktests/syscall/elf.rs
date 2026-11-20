@@ -978,6 +978,14 @@ fn t_two_containers() -> bool {
         crate::log_fatal!("2box: 前提失效，进来就有残留");
         return false;
     }
+    // 句柄基线（§463）：记在**装载第一份容器之前**。
+    //
+    // 收尾那格判的是「两份容器都收干净、我们授出的句柄回基线」，而旧写法
+    // `crate::handle::live() == 0` 判的是「全系统归零」——句柄是多主人资源，
+    // `.ktests` 的顺序由链接器决定 ⇒ 那条判据的绿取决于本用例排第几。
+    // 上面那道入口闸今天仍要求干净房间，所以此处 `h0` 必为 0（判据等价）；
+    // 但判据从此不依赖那道闸还在。
+    let h0 = crate::handle::live();
     let f0 = mm::free_frames();
     let va0 = mm::reservation_count();
     let act0 = sched::stats().2;
@@ -1051,8 +1059,10 @@ fn t_two_containers() -> bool {
     let dp = drained_or_free(rel_p, tp);
     let f1 = mm::free_frames();
     let va1 = mm::reservation_count();
+    // **比基线，不比 0**（§463）。两份容器各自名下的句柄都要收掉：多一格是漏关，
+    // 少一格是误清别人的表项，两种都红。
     let base_ok = dh && dp && f1 == f0 && va1 == va0 && sched::stats().2 == act0
-        && crate::handle::live() == 0;
+        && crate::handle::live() == h0;
     crate::log_info!(
         "2box(P7): 同时装=(hello段{} probe段{} 地址互不相同{}) 各读各的=(hello魔数{:#x} probe魔数{:#x} 判据{}) 各自条数=(hello{}>=装载{}+1 probe{}>=装载{}+1) 生效位={} 都跑过=(h{} p{}) 完成标记=(h{} p{}) 收场=(dh{} dp{} free{}->{} va{}->{} active{}->{})",
         nh, np, apart, mh, mp, own_ok, oh, nh, op, np, eff_ok,

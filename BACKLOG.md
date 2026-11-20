@@ -18572,3 +18572,143 @@ HANG 与 FAIL 交替出现是资源压力的特征（§441/§454 记过同一族
   的问题，快照在 `IF=0` 窗口内取）。未归因。
 - `read_at_in` / `copy_from_user_in` 今天**没有产品调用者**。ADR-175 已写明它的定位，
   但**是否保留**要重新裁决——见下面「需要裁决」。
+## 463. §463：6 处「全系统归零」句柄判据改成比基线；并更正 ADR-174 的归因（2026-11-20，ADR-174 补记）
+
+### 一、这轮做了什么
+
+ADR-174 修了 `t_fat32_exec` 一处 `live() == 0`，第七节「未决 1」留了一句
+「应当全仓搜一遍同类形状」。本轮把那句话执行完：全仓 6 处，逐个判断、逐个改。
+
+判据形状照 `mm.rs` 里已有的先例（`handle::live() == lv0`，约 1503 / 1843 行）：
+
+    let h0 = <全系统句柄数>;        // 用例开头，授出任何句柄之前
+    ...
+    let base_ok = ... && handle::live() == h0;
+
+### 二、6 处逐个判断
+
+| # | 位置 | 用例 | 档 | 改动前 | 判断 |
+|---|---|---|---|---|---|
+| 1 | `capability/handle.rs:1486` | `t_handle_table` ⑨ | `fat32-exec` | `&& live() == 0` | **改** |
+| 2 | `ktests/memory/mm.rs:2136` | `t_process_startup` | `handles` | `&& handle::live() == 0` | **改** |
+| 3 | `ktests/memory/mm.rs:2361` | `t_object_wait` | `handles` | `&& handle::live() == 0` | **改** |
+| 4 | `ktests/memory/mm.rs:2571` | `t_vmo_syscalls` | `handles` | `&& handle::live() == 0` | **改（唯一一处真修）** |
+| 5 | `ktests/storage/fs_open.rs:815` | `t_fs_open_ring3` | `fs-open` | `let table_clean = handle::live() == 0;` | **改** |
+| 6 | `ktests/syscall/elf.rs:1055` | `t_two_containers` | `handles` | `&& crate::handle::live() == 0` | **改** |
+
+**6 处全改，没有一处「不该修」。** 理由分两类：
+
+**（甲）4 处是「侥幸正确」——必须改。** 1/2/3/6 号用例所在档里，进用例时确实没有别的句柄
+（`t_process_startup`、`t_object_wait`、`t_two_containers` 自己都有 `live() != 0` 的入口闸；
+`t_handle_table` 开头有 `reset_for_test()`），所以 `== 0` 今天绿。但**顺序由链接器决定**，
+`reset_for_test()` 又会把别人的残留一起抹掉——这两件事都不由用例自己控制。
+按任务书的口径：侥幸正确**仍然要改**，因为顺序不可依赖。
+
+**（乙）1 处是真修。** 4 号 `t_vmo_syscalls` **没有**入口闸（它不检查进来时表是否干净），
+所以 `live() == 0` 直接就是「全系统归零」。**它有天然负样本**（见 §四）。
+
+**（丙）1 处是「改法正确但旧判据也没错」的边界情形。** 5 号 `t_fs_open_ring3` 前面有
+`handle::reset_for_test()`，所以进来时表必然是空的，`== 0` 与 `== h_before` 今天**等价**。
+仍改：① 判据的语义要写对它想问的那件事（「容器 close 干净了没」而不是「全系统归零」）；
+② 哪天有人把 `reset_for_test()` 挪走或去掉，判据不该跟着坏。
+
+### 三、更正 ADR-174 的归因（这条比 6 处改动本身更重要）
+
+ADR-174 说 `live()==0` 红是因为「**启动任务的常驻句柄**」。本轮扫了
+`build/run-*.log` 全部历史样本，**证据不支持这个归因**：
+
+| 检验 | 样本数 | 读数 |
+|---|---|---|
+| 「魔数正确（容器真读到 ELF）**且** `表清空=false`」 | 1027 | **0 条** |
+| 「魔数正确 **且** `表清空=true`」 | 1027 | **287 条** |
+| `handle-reap` 的 `live` 读数 | 1114 | **恒为 1** |
+
+三条读数合起来的结论：
+
+1. **容器正常跑完时 `live()` 恰好回到 0**（287 次）。若启动任务真有常驻句柄，
+   这 287 次里 `表清空` 应当恒为 `false`——实测一次都没有。
+2. `handle-reap` 的 `live=1` 是**它自己刚 grant 的那个 `keep`**（源码 `:1719`，
+   判据 `live_after == 1` 就是写死等这一格），不是「启动任务的常驻句柄」。
+3. **决定性反证**：若启动任务有常驻句柄，`finish_sweep` 会在**每一条**用例边界都报
+   「仍有 1 个句柄没关」。实测 `run-8163` 只在 `t_fat32_exec` 起**连续 6 条**报
+   （`t_fat32_exec` / `t_fat32` / `t_fatal_record` / `t_crash` / `t_clock_uptime` /
+   `t_proc_info`），之后停止——那是**某条用例漏了一个句柄**，被后面的
+   `reset_for_test()` 清掉，不是常驻句柄。
+
+**所以 `run-8163` 里 `t_fat32_exec` 红的真正原因是容器没读到 ELF**：
+
+    elfdisk: ring3 句柄 魔数=Some(3735945212) done=Some(310383693381) 句柄值=0x110000 表清空=false
+
+`3735945212` = `0xdeadfffc`，是垃圾值；正确的 ELF 魔数是 `0x464c457f` = `1179403647`。
+`魔数` 那一格单独就能让它红——**不是** `live()==0` 的顺序依赖。
+
+而「容器读不到自己的页」正是 §461 那条（`read_at` 用当前 CR3）。§461 在本轮两跑里
+「读用户页被拒」都是 0 次，`wire-as-read` 的插桩也证了那三个调用点 `as_slot=255`、
+`as_count=0`——所以 §461 在当前树上**不表现为抖动**。两条结论并不矛盾：
+`run-8163` 是**旧树**的现场，§461 是**当时**的成因，而 ADR-174 把它归错了。
+
+**这不改变「该改成比基线」这个结论**（那是正确写法，理由独立成立），但它改变叙事：
+ADR-174 不是「修了一个判据缺陷」，而是「把一个读页失败误归因成了判据缺陷」。
+两者都要修，但方向不同。
+
+### 四、负样本（变异证红）
+
+**（甲）注入式负样本**——在用例收尾判据之前故意多留一个 VMO 句柄不关，
+模拟「用例漏关了一个句柄」：
+
+| 档 | 注入前 | 注入后 | 红在哪 |
+|---|---|---|---|
+| `fs-open`（run-8882 / run-8883） | `表清空=true ⇒ true`，`t_fs_open_ring3 -> ok` | `表清空=false`，`live=1`，`t_fs_open_ring3 -> failed` | `不成立 表清空（live=1）` |
+| `fat32-exec`（run-8884 / run-8885） | `收场=(… active1->1)`，`t_two_containers -> ok` | `收场=false`，`t_two_containers -> failed` | `2box: 判据不成立 … 收场=false` |
+
+注入用 VMO 句柄而不是文件句柄：VMO 的 close 语义单一，不污染文件游标/卷缓存那一串判据。
+两处注入都**已还原**（`git diff --numstat` 与注入前逐字相同），还原后又各跑一次确认绿。
+
+**（乙）天然负样本，比注入的更可信**——`run-2602` / `run-2603` 里
+`t_vmo_syscalls` 报 `live=2` 判红：
+
+    vmosys(P4b): … 退出回基线=(drainedtrue free113964->113964 va21->21 vmo0 live2)
+    [fatal] vmosys: 判据不成立 … 基线=false
+
+而泄漏实际来自**前面**的 `t_fs_rw_syscall23`（那一跑的**每个**边界都报「仍有 2 个句柄没关」）。
+这正是「`== 0` 会**误归因**」的实证：`t_vmo_syscalls` 什么都没做错，却被记了别人的账。
+改成比基线后，它只会记自己的账。
+
+### 五、读数
+
+| 项 | 值 |
+|---|---|
+| `cargo build --features handles` | 通过（429 既有 warning） |
+| `cargo build --features fat32-exec` | 通过 |
+| `check` | **18/18，exit=0** |
+| 特性档编译 `sweep.py` | **74/74，失败 0** |
+| `run --features fs-open` | 判定 FAIL（**唯一 FAIL 是 `t_load_into_child_as`，属 §466，与本轮无关**）；`t_fs_open_ring3 -> ok`，`表清空=true` |
+| `run --features fat32-exec` | 判定 FAIL（同上）；六处判据全绿：`handle: checks` 17/17 true、`elfdisk ring3句柄=true`、`2box` 收场 true、`owait`/`vmosys`/`psys` 收场 `live0` |
+| `run --features handles` | 判定 FAIL（同上）；`owait`/`vmosys`/`psys`/`2box` 四行收场全绿 |
+| `run --features handles,fs-open` | 判定 FAIL（同上）；`表清空=true` |
+| `run --features fat32-probe` | 判定 FAIL（同上）；该档不注册 handle 用例（`t_handle_table` 在 `fat32-exec` 档） |
+
+**`t_load_into_child_as` 的 FAIL 不归因于本轮。** 它在**本轮改动之前**的树上就是红的
+（lead 的 §466 `read_at_in` 负样本 `N1=false`），且本轮六处改动一行都没碰
+`read_at` / `read_at_in` / `load_into`。
+
+### 六、没做的
+
+1. **没有跑整链。** 本轮只跑了 5 个单档（fs-open / fat32-exec / handles / handles+fs-open /
+   fat32-probe）。整链读数要等 `t_load_into_child_as` 修好之后才有意义。
+2. **没有改 `handle` 模块的 API。** 6 处全部用现成的 `live() -> usize`，没有新增
+   「按句柄值查」的函数（ADR-174 §七.3 那条欠账仍然开着——加它会动契约，要先问）。
+3. **`t_handle_table` 的 ⑨ 段只证了 `revoke_task` 的清表，没证「只清 OWNER 的」**：
+   该用例全程只有一个 owner，所以「多清别人的」这种错它抓不到。`t_handle_reap`
+   才证那一格（`live_after == 1` 且 `keep_ok`）。这是既有的分工，本轮没动。
+
+### 七、一处过程记录（值得留）
+
+本轮改动**被外部回滚过一次**：`capability/handle.rs`、`ktests/storage/fs_open.rs`、
+`ktests/syscall/elf.rs` 三处被还原到 HEAD（`ktests/memory/mm.rs` 的三处没被还原）。
+没有找到是谁做的（`git status` 里那三个文件当时根本不显示为 modified）。
+**这不是 `git` 的正常行为**——`git checkout` 会连 `mm.rs` 一起还原。
+已重贴，并核对 `git diff --numstat` 与首次改动逐字相同。
+
+教训：**多 agent 共用一棵工作树时，改动落盘后要立刻核对 `git status`**，
+不能假设「我刚才写过所以它还在」。

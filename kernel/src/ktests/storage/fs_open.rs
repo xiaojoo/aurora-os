@@ -741,6 +741,16 @@ fn t_fs_open_ring3() -> bool {
     sched::start_workers();
     handle::reset_for_test();
     handle::reset_counters_for_test();
+    // 句柄基线（§463）：**清表之后、授出任何句柄之前**。
+    //
+    // 收尾那格问的是「容器自己 close 干净了没」，而旧写法 `handle::live() == 0` 问的是
+    // 「全系统一个句柄都没有」——句柄是多主人资源，`.ktests` 的顺序又由链接器决定
+    // ⇒ 那条判据在整链里绿不绿取决于本用例排第几。
+    //
+    // 记在 `reset_for_test()` **之后**而不是之前：清表本身就是把「进来时的残留」抹掉，
+    // 记在之前会把那些残留算进基线。
+    // **没放宽**：容器漏 close 一个 ⇒ `live()` 比基线多 1，仍然红。
+    let h_before = handle::live();
     user::clear_counters();
 
     let rel0 = sched::reap_released();
@@ -812,7 +822,8 @@ fn t_fs_open_ring3() -> bool {
     // 快照已在上面（第一段窗口退出、IF 关着时）取走：容器一被 reap，它名下的页就还给分配器，
     // 之后再 `read_at` 读到的就是"页表链没走完"（§366）。
     let reaped = drained_or_free(rel0, t);
-    let table_clean = handle::live() == 0;
+    // **比基线，不比 0**（§463）。
+    let table_clean = handle::live() == h_before;
 
     if !in_window {
         crate::log_fatal!("fs-open-ring3: 不成立 done 哨兵（窗口内没等到）");

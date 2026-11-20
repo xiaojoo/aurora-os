@@ -1372,6 +1372,13 @@ mod tests {
     pub fn t_handle_table() -> bool {
         reset_for_test();
         reset_counters_for_test();
+        // 句柄基线（§463）：`reset_for_test()` 之后、本用例授出任何句柄之前。
+        //
+        // ⑨ 段的 `revoke_ok` 判「撤销之后表回到基线」，不判「全系统归零」——句柄是
+        // **多主人**资源，`.ktests` 的顺序由链接器决定，`== 0` 就成了判据依赖用例顺序。
+        // 基线必须记在这里而不是 ⑨ 段之前：记在 ⑨ 段之前会把 ①–⑧ 段的泄漏算进基线，
+        // 判据就看不见它了。
+        let h0 = live();
         let Some(cur) = fixture() else { return false };
 
         // ① 打包形状：48 位世代填满高位；0 / gen 0 / slot `MAX_HANDLES` 全非法
@@ -1482,8 +1489,10 @@ mod tests {
         let h1 = grant_file(OWNER, 3, cur, RIGHT_READ).ok();
         let h2 = grant_file(OWNER, 3, cur, RIGHT_READ).ok();
         let revoked = revoke_task(OWNER.0, OWNER.1);
+        // **比基线，不比 0**（§463）：⑨ 段只该清掉 OWNER 名下那两格。少清或多清都会
+        // 让 `live()` 偏离基线 ⇒ 判据仍然咬得到（不是放宽）。
         let revoke_ok = h1.is_some() && h2.is_some() && revoked == 2
-            && live() == 0
+            && live() == h0
             && h1.is_some_and(|v| matches!(begin_read(v, OWNER), Err(HErr::NoSuch)));
         // ⑩ 双 close：第二次是 NoSuch（表项已空），不是 Stale
         let h = match grant_file(OWNER, 3, cur, RIGHT_READ) {
