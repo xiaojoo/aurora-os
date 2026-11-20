@@ -687,9 +687,42 @@ def make_vblk() -> list[str]:
 def make_vblk2() -> list[str]:
     return _make_vblk(VBLK2, VBLK2_MIB, VBLK2_PATTERN, "virtio2")
 
-def make_nvme() -> list[str]:
-    """NVMe 命名空间的镜像。形状与 virtio 那两块盘一样（qcow2 + 已知图案），
-    所以「读回对账」的判据可以直接复用。"""
+def make_nvme_fat() -> list[str]:
+    """NVMe 命名空间上放一块**真 FAT32 卷**（ADR-172）。
+
+    ## 为什么不再用纯图案
+
+    原来那块盘是 `qemu-io` 写的全 `0x7E`，只能证「数据通路通」。
+    要证「NVMe 上能挂真卷、读出真文件」，盘上就得有文件系统。
+
+    ## 做法
+
+    1. `make_fat32_rw.py` 生成 1 MiB 的 FAT32 卷（它自带读回复算，不成立就退出非零）；
+    2. `qemu-img resize` 扩到 64 MiB（**保留前 1 MiB**，后面补零）。
+
+    容量对账仍按 64 MiB；引导扇区在偏移 0，所以「这是一块真卷」可判。
+
+    ## 为什么 raw 而不是 qcow2
+
+    `make_fat32_rw.py` 输出 raw，转 qcow2 要再走一遍 `qemu-img convert`；
+    而 raw 的容量对账更直接（文件大小 = 容量）。AHCI 那几块 FAT 卷也都是 raw。
+    """
+    bad: list[str] = []
+    NVME_IMG.unlink(missing_ok=True)
+    # 1) 1 MiB 的 FAT32 卷（脚本自己读回复算）
+    r = subprocess.run([sys.executable, str(FAT_RW_SCRIPT), str(NVME_IMG)],
+                       cwd=str(ROOT), capture_output=True, text=True)
+    if r.returncode != 0:
+        return ["make_fat32_rw.py 造不出 NVMe 卷（它自己的读回复算没通过）"]
+    # 2) 扩到 64 MiB，前 1 MiB 原样保留
+    if sh([str(TOOLS / "qemu" / "qemu-img.exe"), "resize", "-f", "raw",
+           str(NVME_IMG), f"{NVME_MIB}M"]) != 0:
+        return ["qemu-img resize 扩不到 64 MiB"]
+    return bad
+
+
+def make_nvme_pattern() -> list[str]:
+    """图案档的 NVMe 盘：qcow2 + 全 0x7E（`nvme` 档的图案判据仍用它）。"""
     return _make_vblk(NVME_IMG, NVME_MIB, NVME_PATTERN, "nvme")
 
 
@@ -3379,6 +3412,55 @@ FB_SAMPLE_RE = re.compile(
     r"fb: 判据 采样=(?P<n>\d+) 全对=(?P<ok>true|false)")
 
 
+NVME_FAT_RE = re.compile(r"nvme-fat: 判据 首8=\[(?P<b>[^\]]+)\]")
+
+
+def _nvme_data_bin_head(n: int = 8) -> list[int]:
+    """按 `tools/make_fat32_rw.py` 的**同一份式子**重算 `DATA.BIN` 的前 n 字节。
+
+    **照抄而不是 import**：那个脚本顶层就跑整份生成逻辑，import 会执行它。
+    照抄式子的代价是两边要同步——**而不同步时判据会红，那正是我们要的**。
+    """
+    # 与 `make_fat32_rw.py` 的 `body(seed, n)` **逐字相同**：
+    #     ((i * 37 + seed * 11) & 0xFF) ^ (seed & 0xFF)
+    # `DATA.BIN` 用 `body(1, 512)` 写两簇（脚本第 149–150 行）。
+    #
+    # **必须照抄完整**：漏掉 `^ seed` 或 `seed * 11` 就全错，
+    # 而错了判据会红——那正是对账该有的行为。
+    seed = 1
+    return [(((i * 37 + seed * 11) & 0xFF) ^ (seed & 0xFF)) for i in range(n)]
+
+
+def check_nvme_fat(log: str) -> list[str]:
+    """NVMe 卷上读出的 `/DATA.BIN` 前 8 字节与宿主机独立重算的对账。
+
+    内核报 `nvme-fat: 判据 首8=[…]`，这里按同一式子重算再比。
+    **两边各自算**：内核从盘上读，宿主机按配方算。
+    """
+    bad: list[str] = []
+    m = NVME_FAT_RE.search(log)
+    if not m:
+        bad.append("串口没有 `nvme-fat: 判据 首8=[…]` 那一行（挂载用例没跑到结论）")
+        return bad
+    try:
+        got = [int(x.strip(), 16) for x in m.group("b").split(",") if x.strip()]
+    except ValueError:
+        return ["`nvme-fat: 判据 首8=` 的字节串解析不了：" + m.group("b")]
+    want = _nvme_data_bin_head(len(got))
+    if got != want:
+        bad.append(f"DATA.BIN 首 8 字节不符：内核 {got}，宿主机按配方算 {want}")
+    # 几何也要对上（配方写死：2048 簇 / 512 字节每簇 / 根簇 2）
+    g = re.search(r"nvme-fat: 几何 簇数=(\d+) 数据起点=(\d+) 每簇字节=(\d+)", log)
+    if not g:
+        bad.append("串口没有 `nvme-fat: 几何 …` 那一行")
+    else:
+        if int(g.group(1)) != 2048:
+            bad.append(f"簇数 {g.group(1)} != 2048（配方写死）")
+        if int(g.group(3)) != 512:
+            bad.append(f"每簇字节 {g.group(3)} != 512（配方写死）")
+    return bad
+
+
 def check_fb_pattern(log: str, ppm: tuple[int, int, bytes] | str) -> list[str]:
     """显示域的宿主机侧对账：从 `screendump` 的 PPM 里取样，与内核图案对账。
 
@@ -4087,7 +4169,9 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
     if NVME_FEATURES & set(features):
         # 同一条规矩：夹具跟着「要挂这块盘」走。NVMe 的**容量**也要对账
         # （宿主机知道文件多大，内核 Identify Namespace 读到的 NSZE × LBA 必须等于它）。
-        bad = make_nvme()
+        # ADR-172：`nvme` 档要一块**真 FAT32 卷**（挂载判据要读文件）；
+        # 纯图案版留给将来的 `nvme-pattern` 档。
+        bad = make_nvme_fat() if "nvme" in set(features) else make_nvme_pattern()
         if bad:
             sys.exit("NVMe 盘造不出来：" + " / ".join(bad))
     if FAT_FEATURES & set(features):
@@ -4211,7 +4295,9 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
         # 这是最便宜的第一条判据——证明「我们读到了这台设备」，
         # 不依赖任何后续路径（照 e1000e 的 MAC 对账形状）。
         cmd += [
-            "-drive", f"if=none,id=nvme0,format=qcow2,file={NVME_IMG}",
+            # `format=raw`：ADR-172 起这块盘是 `make_fat32_rw.py` 产的真 FAT32 卷
+            # （raw + `qemu-img resize` 到 64 MiB），与 AHCI 那几块 FAT 卷一致。
+            "-drive", f"if=none,id=nvme0,format=raw,file={NVME_IMG}",
             "-device", "nvme,drive=nvme0,serial=AURORANVME",
         ]
         # 一次性实验：QEMU 自带的 NVMe trace。
@@ -9047,6 +9133,21 @@ def do_test(timeout: int) -> int:
     if _kb:
         print(f"    注入 {KBD_INJECT_CHAR!r}({_want}) ⇒ 内核收到 {_kb.group(1)}")
 
+    # =====================================================================
+    # ADR-172：NVMe 上挂真卷。这一次跑同时给出**两层**证据：
+    #   `t_nvme_all` 三格 = 设备层（认到、容量、能读扇区）
+    #   `t_nvme_fat`     = 文件系统层（能挂、文件内容对）
+    # 两层各自能独立红，所以两行判据来自同一次启动、不合并成一个布尔。
+    print("=== NVMe：设备层三格 + 文件系统层挂载 ===")
+    nvfv, nvfrc, nvflog = do_run(["nvme"], timeout)
+    nvf_bad = check_nvme_fat(nvflog)
+    nvf_verdict = nvfv if nvfv != "PASS" else ("PASS" if not nvf_bad else "CONTENT-MISMATCH")
+    for x in nvf_bad:
+        print("    对账:", x)
+    _nf = re.search(r"nvme-fat: 读回 DATA\.BIN 大小=(\d+) 走过字节=(\d+) 簇数=(\d+)", nvflog)
+    if _nf:
+        print(f"    DATA.BIN 大小={_nf.group(1)} 走过={_nf.group(2)} 簇数={_nf.group(3)}")
+
     print("=== 崩溃记录跨重启读回：同一份镜像连跑两遍 fault-double-free ===")
     # §9.7 的另一半只能跨重启量：崩溃时写下的摘要，要被**下一次启动**读回来。
     # 两遍用同一个变体 ⇒ `ensure_image` 复用镜像（它比的是"变体 + ELF 摘要"），
@@ -9861,6 +9962,9 @@ def do_test(timeout: int) -> int:
         # 的 PPM 里**独立算同一份几何**再取样——两边各自算，不是互相抄。
         # 这一行正面回答 AHE-04 记的缺口（显示域以前只有内核自报）。
         ("帧缓冲图案与显存对账", fb_verdict, fbrc, "PASS", 33),
+        # ADR-172：NVMe 上挂真卷。这一行证的是**文件系统层**，
+        # 与 `t_nvme_all` 的设备层三格是不同层的证据（两层各自能独立红）。
+        ("NVMe 卷上读出文件与宿主机对账", nvf_verdict, nvfrc, "PASS", 33),
         # ADR-170：输入域的第二台仪器。宿主机 QMP `input-send-event` 注入 'a'，
         # 内核从**真实 PS/2 端口**收到 97。`t_ps2_kbd_decode` 只证解码，
         # 这一行证两端（端口 → 解码 → 环）。
@@ -9986,6 +10090,7 @@ def do_test(timeout: int) -> int:
         "投递三层由控制器事件数到": dllog,
         "virtio 写落盘与宿主机对账": vvilog,
 "帧缓冲图案与显存对账": fblog,
+"NVMe 卷上读出文件与宿主机对账": nvflog,
 "按键注入与输入通路对账": kbdlog,
         "网卡第一帧与 pcap 对账": ntlog,
         "第一条协议往返与 pcap 对账": rtlog,

@@ -11,6 +11,10 @@ mod fat16;
 mod fs_open;
 #[cfg(feature = "fs-rw")]
 mod fs_rw;
+/// NVMe 上挂真卷（ADR-172）。与 `driver/nvme` 的三格是**不同层**的证据：
+/// 设备能读扇区 != 那块盘上有能被解析的卷 != 文件内容对。
+#[cfg(feature = "nvme")]
+mod nvme_fat;
 #[cfg(feature = "gpt-probe")]
 mod gpt;
 #[cfg(feature = "esp-probe")]

@@ -98,23 +98,34 @@ fn t_nvme_read_pattern() -> bool {
         crate::log_fatal!("nvme: 读扇区 0 失败 {:?}", e);
         return false;
     }
-    // 图案字节：与 `tools/aurora.py` 的 `NVME_PATTERN = 0x7E` 同源
-    // （`check-nvme-pattern` 逐字对账这两个数）
-    const PAT: u8 = 0x7E;
-    let bad = buf.iter().filter(|&&b| b != PAT).count();
-    // 首 8 字节的哈希：宿主机用同一份 `fnv1a64` 独立重算
-    let head = crate::ahci::fnv1a64(&buf[..8]);
+    // **判据是「这是一块结构合法的 FAT32 卷」，不是「全 0x7E」。**
+    //
+    // ADR-172 起 NVMe 盘上是 `make_fat32_rw.py` 造的真卷，所以第 0 扇区
+    // 是引导扇区。这比原来的图案判据**更强**：原来只证「能读回我写的字节」，
+    // 现在证「读回的是一块能被解析的卷」。
+    //
+    // 三条独立特征：
+    //   ① 偏移 510 的 0x55AA 引导签名
+    //   ② 偏移 82 的 `FAT32   ` 字样（8 字节，尾部补空格）
+    //   ③ 偏移 0 的跳转指令（0xEB .. 0x90 或 0xE9 ..）
+    let sig_ok = buf[510] == 0x55 && buf[511] == 0xAA;
+    let fstype_ok = &buf[82..90] == b"FAT32   ";
+    let jump_ok = (buf[0] == 0xEB && buf[2] == 0x90) || buf[0] == 0xE9;
+    // 首 8 字节的哈希：宿主机用同一份算法独立重算（`check-nvme-pattern` 对账）
+    let head = crate::network::eth::frame_hash(&buf[..8]);
     crate::log_info!(
-        "nvme: 读回 扇区0 首8={:#x} 不符字节={} 图案={:#x}",
-        head, bad, PAT
+        "nvme: 读回 扇区0 首8={:#x} 引导签名={} FAT32字样={} 跳转={}",
+        head, sig_ok, fstype_ok, jump_ok
     );
-    let ok = bad == 0;
+    let ok = sig_ok && fstype_ok && jump_ok;
     if !ok {
-        crate::log_fatal!("nvme: 判据不成立 扇区0 有 {} 字节不是图案", bad);
+        crate::log_fatal!(
+            "nvme: 判据不成立 扇区0 不是合法 FAT32 引导扇区（签名={} 字样={} 跳转={}）",
+            sig_ok, fstype_ok, jump_ok
+        );
     }
     ok
 }
-
 
 /// 三格合起来跑：**顺序固定**（识别 → 容量 → 图案），因为后两格依赖第一格。
 /// 但每一格自己的读数与 `fatal` 都独立打出来——红在哪一格一眼可见。
