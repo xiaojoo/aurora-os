@@ -3906,7 +3906,10 @@ pub fn copy_from_user_in(aslot: u8, va: u64, dst: &mut [u8]) -> Result<usize, Pt
             let at = va + done as u64;
             let page = at / pg * pg;
             // 校验与 `copy_from_user` 同一条规则，只是问的是**那台 AS**。
-            let eff = mm::aspace_effective_flags(aslot, page).ok_or(PtrError::NotMapped)?;
+            // **必须用 `_locked` 版**：外层已持 VMM 锁，而自取锁的那版会撞
+            // 「重入获取 rank=20」（BACKLOG §466 实测崩在 L4 sync）。
+            let eff =
+                mm::aspace_effective_flags_locked(aslot, page).ok_or(PtrError::NotMapped)?;
             if !eff.user {
                 return Err(PtrError::NotSharedWithUser);
             }

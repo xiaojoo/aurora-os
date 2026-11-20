@@ -1501,6 +1501,22 @@ pub fn aspace_effective_flags(slot: u8, va: u64) -> Option<EffectiveFlags> {
     effective_flags_in(root, va)
 }
 
+/// 同 `aspace_effective_flags`，但**要求调用方已持有 VMM 锁**。
+///
+/// 为什么要两个版本：`aspace_effective_flags` 经 `aspace_root` **自取锁**，
+/// 所以任何已经持锁的组合操作（如 `copy_from_user_in`）调它会撞
+/// 「重入获取 rank=20」。
+///
+/// **这条踩过一次**（BACKLOG §466）：我先把 `aspace_root` 拆出 `_locked` 版给
+/// `copy_from_user_in` 用，却漏了 `aspace_effective_flags` 是它的**间接调用者**
+/// ⇒ 内核直接 `L4 sync: 重入获取 rank=20` 崩在 `t_load_into_child_as` 之前。
+///
+/// 前提：调用方持有 VMM 锁。**单次查询用 `aspace_effective_flags`**。
+pub fn aspace_effective_flags_locked(slot: u8, va: u64) -> Option<EffectiveFlags> {
+    let root = aspace_root_locked(slot)?;
+    effective_flags_in(root, va)
+}
+
 /// 按**槽号**取那台 AS 的 PML4 物理地址（ADR-175）。
 ///
 /// 从 `aspace_effective_flags` 里提出来的：`copy_from_user_in` 也要取同一个根，

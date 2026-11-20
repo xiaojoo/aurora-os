@@ -283,6 +283,56 @@ B1 是"再写一个只在用例里用的旁路读"，B2 是"把它做成 `mm`/`s
 
 ---
 
+## 七之二、锁链要**整条**查，不能只看直接调用
+
+修 `copy_from_user_in` 的持锁缺口时，我第一次只拆了 `aspace_root`：
+
+    pub fn aspace_root(slot)         // 自取锁
+    pub fn aspace_root_locked(slot)  // 要求已持锁
+
+然后在 `copy_from_user_in` 里包 `with_vmm_lock` 并调 `_locked` 那个。
+**结果内核直接崩：**
+
+    [fatal] L4 sync: 重入获取 rank=20 token=0x0
+
+### 为什么
+
+`copy_from_user_in` 的锁内**还调了另一个函数**：
+
+    copy_from_user_in
+      └─ with_vmm_lock                 ← 取锁
+         ├─ aspace_root_locked         ← OK（不取锁）
+         └─ aspace_effective_flags     ← **内部调 aspace_root（自取锁）** ⇒ 重入
+
+`aspace_effective_flags` 是 `aspace_root` 的**间接调用者**，我第一次没看见。
+
+### 修法
+
+`aspace_effective_flags` 也拆一个 `_locked` 版本：
+
+    pub fn aspace_effective_flags(slot, va)         // 自取锁，既有调用者用
+    pub fn aspace_effective_flags_locked(slot, va)  // 要求已持锁
+
+`copy_from_user_in` 用后者。
+
+### 这条教训值得单独记
+
+**改持锁边界时，要列出「锁内会调到谁」的整条链，不是只看自己写的那几行。**
+
+`rank=20` 的重入断言是这套机制的守门人——它把「我以为只取一次锁」变成了
+一次**当场崩溃**，而不是一个偶发的死锁。**这就是 rank 锁的价值。**
+
+同时它也是 §八 未决 2 里警告过的那件事：那个警告说对了，
+只是我的第一次修法不完整。
+
+---
+
+## 八、未决
+
+1. **逐字节读，没有批量优化**：`copy_from_user_in` 循环里每次
+   `read_volatile` 读 1 字节，且**每字节**重新 `phys_of_in`（一次四级页表遍历）。
+   8 字节 = 8 次遍历。`copy_from_user` 那边是按页 `ucopy_from`（`rep movsb`）。
+
 2. ~~**`copy_from_user_in` 缺 `with_vmm_lock`**~~ **已修（本文修订）**。
 
    原来的形态是：`aspace_root` 自取锁，而 `aspace_effective_flags` 与 `phys_of_in`

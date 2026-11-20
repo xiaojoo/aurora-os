@@ -2091,6 +2091,12 @@ fn t_process_startup() -> bool {
     sched::init_boot_task();
     sched::start_workers();
     if crate::clock::current().is_none() { crate::calibrate_clock_once(); }
+    // 句柄基线（§463）：记在**授出任何句柄之前**，与下面 `f0`/`va0` 同一位置。
+    // 收尾那格判的是「本用例授出的句柄回到基线」，不判「全系统归零」——句柄是多主人
+    // 资源，`.ktests` 的顺序由链接器决定，`== 0` 会把**别人**的残留算到这条用例头上。
+    // 下面那道闸今天仍要求干净房间，所以此处 `h0` 必为 0（判据等价）；但判据从此不
+    // 依赖那道闸还在——闸一旦放宽，基线法照旧成立。
+    let h0 = handle::live();
     if proc::proc_residual().0 != 0 || proc::job_residual().0 != 0 || mm::aspace_count() != 0
         || vmo::vmo_count() != 0 || handle::live() != 0 {
         crate::log_fatal!("psys: 前提失效，进来就有残留");
@@ -2133,7 +2139,9 @@ fn t_process_startup() -> bool {
     let kill_ok = r[27] == 1;
     // 页额度三格：记满 3、超额拒且用量不涨、子线程死后退干净
     let quota_ok = r[28] == 3 && r[29] == crate::user::E_EXHAUSTED && r[30] == 0 && r[31] == 0;
-    let base_ok = drained && disc && jdel && handle::live() == 0 && vmo::vmo_count() == 0
+    // **比基线，不比 0**（§463）。psys 收场必须回到进来时的句柄数：多一格是漏关，
+    // 少一格是误清别人的表项，两种都红。
+    let base_ok = drained && disc && jdel && handle::live() == h0 && vmo::vmo_count() == 0
         && mm::free_frames() == f0 && mm::reservation_count() == va0
         && mm::aspace_count() == 0 && proc::proc_residual().0 == 0 && proc::job_residual().0 == 0;
     crate::log_info!(
@@ -2320,6 +2328,8 @@ fn t_object_wait() -> bool {
     sched::init_boot_task();
     sched::start_workers();
     if crate::clock::current().is_none() { crate::calibrate_clock_once(); }
+    // 句柄基线（§463），理由与 `t_process_startup` 同一段：判「回到基线」而不是「全系统归零」。
+    let h0 = handle::live();
     if proc::proc_residual().0 != 0 || proc::job_residual().0 != 0 || handle::live() != 0
         || vmo::vmo_count() != 0 {
         crate::log_fatal!("owait: 前提失效，进来就有残留");
@@ -2358,7 +2368,8 @@ fn t_object_wait() -> bool {
     let reject_ok = r[12] == crate::user::E_INVALID && r[13] == crate::user::E_INVALID
         && r[14] == crate::user::E_DENIED;
     let st = sched::task_wait_stats();
-    let base_ok = waited && drained && handle::live() == 0 && vmo::vmo_count() == 0
+    // **比基线，不比 0**（§463）。等待者与被等待者都不许把句柄留在表里。
+    let base_ok = waited && drained && handle::live() == h0 && vmo::vmo_count() == 0
         && proc::proc_residual().0 == 0 && proc::job_residual().0 == 0
         && mm::free_frames() == f0 && st.3 == 0;
     crate::log_info!(
@@ -2541,6 +2552,12 @@ fn t_vmo_syscalls() -> bool {
     for i in 0..10 {
         VMO_SYS[i].store(0, Ordering::Relaxed);
     }
+    // 句柄基线（§463）：记在**工人起来之前**，与 `f0`/`va0`/`v0` 同一位置。
+    // 这一条是本轮**唯一一处真修**：它没有 `live() != 0` 那道入口闸，所以旧判据
+    // `live() == 0` 直接就是「全系统归零」——只要排在一条漏过关的用例之后，
+    // 这条用例什么也没做错也会红（判据依赖用例顺序）。
+    // **没放宽**：工人漏关一个句柄 ⇒ `live()` 比基线多 1，仍然红。
+    let h0 = crate::handle::live();
     let f0 = mm::free_frames();
     let va0 = mm::reservation_count();
     let rel0 = sched::reap_released();
@@ -2567,8 +2584,9 @@ fn t_vmo_syscalls() -> bool {
     // 退出之后：对象、句柄、帧、VA 保留全部回基线（映射是挂在工人袋里的那一份）
     let f1 = mm::free_frames();
     let va1 = mm::reservation_count();
+    // **比基线，不比 0**（§463）。
     let base_ok = drained && f1 == f0 && va1 == va0 && crate::vmo::vmo_count() == v0
-        && crate::handle::live() == 0;
+        && crate::handle::live() == h0;
     crate::log_info!(
         "vmosys(P4b): 建={} 写={} 长度三态={} 映射双向={} 权限={} ABI={} 退出回基线=(drained{} free{}->{} va{}->{} vmo{} live{})",
         create_ok, write_ok, len_ok, map_ok, rights_ok, abi_ok,
@@ -2809,7 +2827,7 @@ fn t_load_into_child_as() -> bool {
         None => { crate::log_fatal!("load_into: 建子 AS 失败"); return false; }
     };
     let r = crate::user::load_into(aslot, crate::ktests::common::HELLO_ELF);
-    let (ok, segs, pages, entry, data_va) = match &r {
+    let (ok, segs, pages, entry, data_va, image_lo) = match &r {
         Ok(l) => {
             let code = mm::aspace_effective_flags(aslot, l.entry);
             let data = mm::aspace_effective_flags(aslot, l.data_va);
@@ -2817,21 +2835,63 @@ fn t_load_into_child_as() -> bool {
             let good = code.is_some_and(|f| f.user && f.executable && !f.writable)
                 && data.is_some_and(|f| f.user && f.writable && !f.executable)
                 && stack.is_some_and(|f| f.user && f.writable);
-            (good, l.segs, l.pages, l.entry, l.data_va)
+            (good, l.segs, l.pages, l.entry, l.data_va, l.image_lo)
         }
         Err(e) => {
             crate::log_fatal!("load_into: 装载失败 —— {}", crate::user::describe_load(*e));
-            (false, 0, 0, 0, 0)
+            (false, 0, 0, 0, 0, 0)
         }
     };
+    // ---- `read_at_in` 负样本（ADR-175 / BACKLOG §466）
+    //
+    // 挂在这里的理由：这是全仓**唯一**真的建了子 AS 的用例（`load_into`），
+    // 所以 `read_at_in(aslot, …)` 有真实目标可读。
+    //
+    // **判别点怎么选**：`hello.elf` 的第二个 LOAD 段在 `va=0x100001000`、
+    // 只有 8 字节、内容是 `0xa701020304050607`（独特魔数）。它满足两个条件：
+    // 子 AS 里读得到（正向）、内核 AS 里读不到或读到别的（反向）。
+    //
+    // **原来的判别点错了**（实测）：用 `image_lo`（段跨度起点）期望 ELF 魔数，
+    // 但那里是 `.rodata` 内容（全 `0x48`），而且**内核 AS 读到同一个值**——
+    // 那个点判不出两张 AS 的差别。
+    //
+    // **必须赶在 `aspace_destroy` 之前**：销毁之后那棵树就没了（§465 记的同一类）。
+    const SENTINEL_VA: u64 = 0x1_0000_1000;
+    const SENTINEL: u64 = 0xa701_0203_0405_0607;
+    let read_child = crate::user::read_at_in(aslot, SENTINEL_VA);
+    // N1：按子 AS 读得到哨兵 ⇒ API 真的能用
+    let n1 = read_child == Some(SENTINEL);
+    // N2：按**内核 AS** 读同一个 VA ⇒ 必须读不到或读到别的。
+    //     若 `read_at_in` 忽略 `aslot`、总走当前 CR3，它就会读到哨兵 ⇒ 判据红。
+    //     **把「选错 AS」从取决于 tick 变成必然红。**
+    let kernel_aslot = 0u8;
+    let read_kernel = crate::user::read_at_in(kernel_aslot, SENTINEL_VA);
+    let n2 = read_kernel != Some(SENTINEL);
+    // N3：明显没映射的高地址 ⇒ 必须 Err（`NotMapped`）
+    let hole = crate::elf::USER_VA_TOP - mm::PAGE as u64;
+    let n3 = crate::user::read_at_in(aslot, hole).is_none();
+    // N4：同一组读也用 `read_at`（当前 CR3）做一遍——它读子 AS 的 VA 应该失败。
+    //     这一格证明两个 API 的**语义确实不同**，不是别名。
+    let n4 = crate::user::read_at(SENTINEL_VA) != Some(SENTINEL);
+    let read_at_in_ok = n1 && n2 && n3 && n4;
+    crate::log_info!(
+        "load_into: read_at_in 子AS读={:?} 内核AS读={:?} 洞={} read_at对照={} ⇒ {}",
+        read_child, read_kernel, n3, n4, read_at_in_ok
+    );
+    if !read_at_in_ok {
+        crate::log_fatal!(
+            "load_into: read_at_in 判据不成立 N1={} N2={} N3={} N4={}",
+            n1, n2, n3, n4
+        );
+    }
     drop(r);
     let destroyed = mm::aspace_destroy(aslot);
     let frames_back = mm::free_frames() == f0;
     let as_back = mm::aspace_count() == a0;
     crate::log_info!(
-        "load_into: 子AS={} 段={} 页={} entry={:#x} data={:#x} 生效位对={} 销毁={} 帧回原值={} AS数回原值={}",
-        aslot, segs, pages, entry, data_va, ok, destroyed, frames_back, as_back
+        "load_into: 子AS={} 段={} 页={} entry={:#x} data={:#x} 生效位对={} 销毁={} 帧回原值={} AS数回原值={} read_at_in={}",
+        aslot, segs, pages, entry, data_va, ok, destroyed, frames_back, as_back, read_at_in_ok
     );
-    ok && destroyed && frames_back && as_back
+    ok && destroyed && frames_back && as_back && read_at_in_ok
 }
 ktest!(KT_LOAD_INTO_CHILD_AS, t_load_into_child_as);

@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import os
+import pathlib
 import re
 import socket
 import struct
@@ -46,7 +47,15 @@ CARGO = TOOLS / "cargo" / "bin" / "cargo.exe"
 TARGET = "x86_64-unknown-none"
 IMAGE = ROOT / "build" / "aurora.img"
 SERIAL_LOG = ROOT / "build" / "serial.log"
-BUILD = ROOT / "build"
+# `AURORA_BUILD` 让并发实测各用一套产物目录（BACKLOG §466）。
+#
+# 起因：`SERIAL_LOG` 写死成 `build/serial.log`，任何并发 `run`/`test`/`check`
+# 必然互撞，表现为 `PermissionError` / `NOEMU` / 假 HANG。实测撞过 4 次。
+#
+# **加锁只能让第二个实例等待，而这里需要的是并行**（一个跑整链、一个实测单档），
+# 所以分目录而不是排队。不设这个变量时行为一个字符都不变。
+BUILD = pathlib.Path(os.environ.get("AURORA_BUILD") or (ROOT / "build"))
+BUILD.mkdir(parents=True, exist_ok=True)
 QEMU = TOOLS / "qemu" / "qemu-system-x86_64.exe"
 
 def kernel_src(name: str, in_tests: bool = False) -> Path:
@@ -4381,11 +4390,30 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
                     for _n in _inject_notes:
                         print("   + QMP: " + _n)
     else:
+        # **超时之后必须等 QEMU 真死**（BACKLOG §466 第四类成因）。
+        #
+        # 原来用 `subprocess.run(..., timeout=)`：超时只杀**直接子进程**，
+        # 而 QEMU 的 `serial.log` 句柄要等它真死才释放 ⇒ 下一跑 `unlink` 抛
+        # `WinError 32`。实测：`verify5` 与 `stable-B` 崩在**完全相同的位置**
+        # （`fault-gpt-header-crc`），而前一跑 `gpt-probe` 正好有 120s HANG。
+        #
+        # **含义：任何一次 120s HANG 都会炸掉整份整链读数。**
+        #
+        # QMP 分支一直是对的（`proc.kill()` + `proc.communicate()`），
+        # 普通分支少了后面那一步。`communicate()` 在 kill 之后会等子进程真的退出。
+        proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, env=env())
         try:
-            r = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True, timeout=timeout, env=env())
-            rc = r.returncode
+            out_b, err_b = proc.communicate(timeout=timeout)
+            rc = proc.returncode
         except subprocess.TimeoutExpired:
+            proc.kill()
+            # 等它真死：句柄释放就发生在这一刻。
+            out_b, err_b = proc.communicate()
             rc = -1
+        # 与 `subprocess.run(capture_output=True)` 的返回形状对齐，
+        # 后面那段 `r.stdout` / `r.stderr` 的读取一字不改。
+        r = subprocess.CompletedProcess(cmd, rc, out_b, err_b)
     # 必须显式按 UTF-8 读：内核写的是 UTF-8，而 `read_text()` 不带 encoding 时用本机默认
     # 编码（这台机是 GBK），中文日志全部变乱码——于是任何按中文锚点的判据都会读成"零条记录"。
     # 实测踩过：内容对账第一次跑报"串口里只有 0 条块读记录"，而记录明明在。
