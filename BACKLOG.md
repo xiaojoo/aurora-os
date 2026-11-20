@@ -18143,3 +18143,127 @@ HANG 与 FAIL 交替出现是资源压力的特征（§441/§454 记过同一族
 | ADR-174 | `table_clean = live()==0` 依赖用例顺序 | 判据写错 | 已修 |
 | §459② | `unwrap_or(9)` 把读失败伪装成值不对 | 违反硬约束 6 | 已修 |
 | **§461** | **`read_at` 用当前 CR3 读容器的页** | **真竞态** | **待裁决** |
+
+
+## 462. 任务书的前提不成立：三个「读用户容器页」调用点**根本没有容器 AS**（2026-11-20）
+
+任务书（lead 派工）要求把三处 `user::read_at(...)` 改成 `read_at_in(aslot, ...)`：
+`t_fs_open_ring3`、`t_fat32_exec`、`t_sdkdemo`。**本轮查证后确认这个前提不成立，三处一处未改。**
+
+这不是「不做」，是**先证伪再不动手**：改了会让当前绿的东西红（下面第 3 节）。
+
+### 1. 实测读数（插桩，已撤；树已还原到与 HEAD 逐字节相同）
+
+插桩位置：`terminate_task` 之前/之后各读一次，并打出该任务的 AS 归属与全系统 AS 数。
+
+| 档 | 用例 | `as_slot` | `as_count` | `cur_as` | 原判据结果 |
+|---|---|---|---|---|---|
+| `handles` | `t_sdkdemo` | **255**（`NO_ASPACE`） | **0** | 255 | `读得到=true … 自洽=true` ⇒ ok |
+| `fat32-exec` | `t_fat32_exec` | **255** | **0** | 255 | `elfdisk: 判据 … ⇒ true` |
+| `fs-open` | `t_fs_open_ring3` | **255** | **0** | 255 | 窗口/快照全绿 |
+
+`handles` 那一跑的原文：
+
+    probe-before: as_count=0 base_va=0x100002000 magic_before=Some(1396984625) n0=Some(4294967295)
+    probe-after:  as_count=0 magic_after=Some(1396984625) n0=Some(4294967295)
+    sdkdemo: 判据 读得到=true 38号有回答=true 40号有回答=true 自洽=true …
+    t_sdkdemo -> ok
+
+`as_count=0` 与 `as_slot=255` 两条一起说清了：**这三个用例跑在内核 AS 里，没有容器 AS。**
+
+### 2. 为什么（代码路径，不是猜）
+
+三个用例都是 `user::load()` + `sched::spawn_user()`：
+
+- `user::load()` 走 `mm::map(...)`，**往当前 AS**（内核那棵）铺映射；
+- `spawn_user()` 里 `as_slot: NO_ASPACE`（`sched/mod.rs:1605` 那一格）。
+
+容器 AS 是**另一条路**：`user::load_into(aslot, …)` + 16 号
+（`sys_thread_create` → `sched::set_aspace(g, aslot)`，`user.rs:771`）。
+`proc_aspace(pid, pgen)` 也只有在那条路上才拿得到槽号。
+
+所以任务书说的「aslot 从 `proc::proc_aspace(pid, pgen)` 取」，在这三个用例里
+**取不到**——不是我没找到取法，是这些用例**没有** pid/pgen（不经 11 号建进程）。
+
+### 3. 改会怎样（为什么「不改」是对的，不是偷懒）
+
+`read_at` 走**当前 CR3**。这三个用例的页就映在当前 CR3 上 ⇒ `read_at` 读得到（实测 `读得到=true`）。
+换成 `read_at_in(aslot, …)` 需要 aslot；没有 aslot 时只能：
+
+- 传 `NO_ASPACE`(255) ⇒ `mm::aspace_root(255)` 返回 `None` ⇒ 全部读失败 ⇒ **把今天绿的判据改红**；
+- 或传别的槽号 ⇒ 读到**别人的页或读不到**，语义比现状更差。
+
+这正是硬约束 6 要防的形状：为了「用上新 API」而让失败路径变成常态。
+
+### 4. §461 那 7 次「读用户页被拒」在哪
+
+**不在当前树上。** 本轮三档日志 `读用户页被拒` 计数均为 **0**：
+
+| 档 | 日志 | 计数 |
+|---|---|---|
+| `handles` | `build/run-8621.log` | 0 |
+| `fs-open` | `build/run-8622.log` | 0 |
+| `fat32-exec` | `build/run-8624.log` | 0 |
+
+§461 引的 7 次来自旧树形态（`build/run-1999.log` 里 `va=0x1000c2008` 一族，
+那是**旧** `t_fs_open_ring3` 在窗口外读快照的形状）。§366 已经把快照移进 IF=0 的窗口内，
+`as_count=0` 又说明没有跨 AS 这回事。
+
+⇒ **若整链里仍看到这行串，那是新现象，要单独记一条，不要归到 §461 名下。**
+
+### 5. 真正需要 `read_at_in` 的调用点（本轮没改，留给下一轮）
+
+有子 AS 且内核要去读它的地方，仓库里今天只有两处，都**已经**用对了 API：
+
+- `user.rs:908 / 944 / 970`（`child_bytes_eq` / `seal_exec_frames` / `exec_binding_chunk`）
+  用 `mm::aspace_leaf_slot` + HHDM 读子 AS 的页；
+- `ktests/memory/mm.rs:1924` 用 `proc::proc_aspace` 取槽号。
+
+`read_at_in` 是 ADR-175 的新 API（`user.rs:3933`，已提交 `e74f5ba`），
+**当前没有产品调用者**。它的负样本（故意传错 aslot 必须读不到/读到不同的值）
+应当配给**真有子 AS 的用例**，例如 `t_load_into_child_as`（`ktests/memory/mm.rs:2822`，
+它已经建了子 AS 并用 `aspace_effective_flags` 验生效位）——那才是能证红的地方。
+本轮**未写**这个负样本，因为写它就要改 `ktests/memory/mm.rs`，
+而那文件正在 `fix-live-zero` 的 §463 手里（同树并发）。
+
+### 6. 本轮做了什么 / 没做什么
+
+做了：
+
+- 三档单跑（`handles` / `fs-open` / `fat32-exec`）全部 PASS，`读用户页被拒` 0 次；
+- 插桩取证（三处各一次），**已全部撤销**，`sdkdemo.rs` / `fs.rs` 现与 HEAD 逐字节相同；
+- `check` 18/18、特性档 74/74（读数见下）。
+
+**没做**（明确记账，不假装）：
+
+- 三处调用点**一处未改**——前提不成立，改了会把绿改红（第 3 节）；
+- `read_at_in` 的负样本**未写**（要动 `ktests/memory/mm.rs`，与 §463 并发冲突）；
+- 本节**未提交任何 ktest 文件**（同树另有 §463 的改动未提交，按 explicit 文件名 stage 时避开）。
+
+### 7. 读数（本轮，`e74f5ba` 之后）
+
+| 项 | 值 |
+|---|---|
+| `handles` 单跑 | **PASS**（`run-8621.log`，ktests 95/95） |
+| `fs-open` 单跑 | **PASS**（`run-8622.log`，ktests 104/104） |
+| `fat32-exec` 单跑 | **PASS**（`run-8624.log`，ktests 104/104） |
+| `check` | **18/18**，exit=0 |
+| 特性档 `sweep.py` | **74/74**，失败 0 |
+| 三档 `读用户页被拒` | **0 / 0 / 0** |
+
+一条**不归因**的旁证：`fat32-exec` 另有一次 `run-8686.log` 为 FAIL，
+唯一红的是 `t_preempt_round_robin`，而 `elfdisk: 判据 … ⇒ true` 全绿。
+同一时段有别的 agent 在并发跑 QEMU（`serial.log` 争用，见下），
+**这一格红不归因于本轮任何改动**，按 AGENTS.md「同一份源码单跑定性」留待整链复核。
+
+### 8. 量具侧的一条事实（给所有跑仪器的人）
+
+`tools/aurora.py:48` 把 `SERIAL_LOG` 写死成 `build/serial.log`，**没有环境变量可覆盖**。
+所以任何两个并发的 `run` / `test` / `check` 必然互撞，表现是三种假象：
+
+    PermissionError: [WinError 32] … build\serial.log
+    verdict: NOEMU
+    判定=HANG（300 s，日志里「红过的用例 = 无」）
+
+本轮各撞到一次。**这三种都不是代码红。** 起跑前先拿 `coord.py` 的 qemu 锁，
+并试开一次 `build\serial.log`（独占）确认没被占。
