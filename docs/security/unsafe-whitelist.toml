@@ -101,9 +101,14 @@ U4 = 7
 # 2026-11-17 ADR-133（top）：+user/shell/registry U5 2→3（`cmd_top` 取 ROLE_SELF_THREAD
 # 的 handle_of_role）。runtime 零新增——`sleep_ms` 是 safe fn `object_wait` 的薄壳，
 # 自身没有 unsafe 块。对账：467+1=468、U5 90+1=91。
-total = 530
+# 2026-11-20 ADR-175（跨 AS 读走物理地址）：+sched/user U2 9→10
+# （`copy_from_user_in` 里 HHDM 别名的单字节 `read_volatile`）。
+# `mm` 的 U2 不变：`phys_of_in` 是**从 `phys_of` 提出来的**，遍历体原样搬走，
+# 两个函数各一处 `unsafe {`，总数仍 55。`aspace_root` 自身没有 unsafe 块。
+# 对账：530+1=531、U2 119+1=120。
+total = 531
 U1 = 85
-U2 = 119
+U2 = 120
 U3 = 13
 U4 = 149
 U5 = 128
@@ -224,7 +229,21 @@ U4 = 3
 
 [modules."sched/user"]
 U1 = 1
-U2 = 9
+# ADR-175：+1（U2 9 → 10）= `copy_from_user_in` 里那次 HHDM 别名的单字节读。
+# 这一处是**全仓唯一一条不经 stac/clac 读用户内存的路径**（HHDM 别名是内核页，SMAP 不拦），
+# 所以它不能靠「反正会 #PF」兜底——它根本不会 #PF。逐条写清：
+#   指针来源：`phys_of_in(root, at)` 用**目标 AS 的页表**（`aspace_root(aslot)` 取根）翻译出的
+#             物理地址，再经 `PhysAddr::via_hhdm()` 加 HHDM 偏移得到内核别名。不是用户 VA。
+#   地址范围：单字节（`read_volatile(*const u8)`），`at` 与 `pa` 按同一 VA 算 ⇒ 不跨页。
+#   对齐：字节读，无需对齐（`*const u8` 没有对齐要求）。
+#   生命周期：当次调用内。不存指针、不返回引用、读完立即写进 `dst[done]`。
+#   并发规则：与 `copy_from_user` 同一条——所有页表写者都在 VMM(20) 里；
+#             本函数**没有**用 `with_vmm_lock` 把校验与读包成一段（ADR-175 §八 未决 2 记的就是这个缺口）。
+#   上下文约束：KERNEL（用例/调试路径）。可读**任意** AS 的页，正因如此才必须逐页校验。
+#   由谁保证不变量：`copy_from_user_in` 自己——`va`/`end` 过 `USER_VA_TOP` 与 `COPY_MAX` 两关，
+#             每页过 `aspace_effective_flags(aslot, page).user`，`phys_of_in` 返回 `None` 就拒。
+#             少了 `.user` 那一关，内核就会替用户读它的内核页（负样本 N1）。
+U2 = 10
 U4 = 8
 U5 = 6
 

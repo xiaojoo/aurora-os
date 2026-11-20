@@ -3,15 +3,14 @@
 > 本文件与 `docs/security/unsafe-whitelist.toml` 同源：上面的登记表存「模块 × 类别 → 处数」，这里给出每一处**具体在哪一行、长什么样**，
 > 供「类别判错了要能翻到现场」时使用。数字由 `python tools/aurora.py check`（`check-unsafe`）双向对账。
 >
-> **2026-11-20（ADR-171 协议拆文件）**：`network/proto` 的 U4 6 处
-> 跟着 ARP 表搬到 `network/arp_table`。**总数不变（6 → 6）**。
+> **2026-11-20（ADR-175 跨 AS 读走物理地址）**：`sched/user` U2 9 → 10（`copy_from_user_in` 里 HHDM 别名的单字节读）。**总数 +1**（530 → 531）。
 
-总计 530 处。U1 85 · U2 119 · U3 13 · U4 149 · U5 128 · U6 36
+总计 531 处。U1 85 · U2 120 · U3 13 · U4 149 · U5 128 · U6 36
 
 | 类别 | 含义 | 处数 |
 |---|---|---|
 | U1 | 架构入口与特殊寄存器 | 85 |
-| U2 | 页表、物理内存与 MMIO | 119 |
+| U2 | 页表、物理内存与 MMIO | 120 |
 | U3 | DMA 与设备共享内存 | 13 |
 | U4 | 并发共享状态与 UnsafeCell | 149 |
 | U5 | 用户指针与地址空间访问 | 128 |
@@ -341,9 +340,9 @@
 | 类别 | 行 | 形状 |
 |---|---|---|
 | U4 | 556 | `unsafe impl Sync for ElfDiskScratch {} #[cfg(feature = "fat32-exec")] static ELF_DISK: ElfDiskScratch = ElfDis` |
-| U6 | 644 | `unsafe { let buf = &mut *dst; buf[fed..fed + chunk.len()].copy_from_slice(chunk);` |
-| U6 | 654 | `let head = unsafe { (*dst).as_ptr() }; (w, unsafe { core::slice::from_raw_parts(head, size) }) }` |
-| U6 | 655 | `(w, unsafe { core::slice::from_raw_parts(head, size) }) } Err(e) => {` |
+| U6 | 650 | `unsafe { let buf = &mut *dst; buf[fed..fed + chunk.len()].copy_from_slice(chunk);` |
+| U6 | 660 | `let head = unsafe { (*dst).as_ptr() }; (w, unsafe { core::slice::from_raw_parts(head, size) }) }` |
+| U6 | 661 | `(w, unsafe { core::slice::from_raw_parts(head, size) }) } Err(e) => {` |
 
 ### ktests/syscall/elf
 
@@ -412,47 +411,47 @@
 | U2 | 1416 | `unsafe { *e = 0 }; tlb_invalidate(va.0); }` |
 | U2 | 1442 | `unsafe { let mut table = (s().pml4_phys + hhdm) as *const Page; let mut level = 3u8;` |
 | U1 | 1492 | `let root = unsafe { aspace_cr3_read() }; effective_flags_in(root, va) }` |
-| U2 | 1520 | `unsafe { let mut table = (root + hhdm) as *const Page; let mut level = 3u8;` |
-| U2 | 1560 | `unsafe { let mut table = (s().pml4_phys + hhdm) as *const Page; let mut level = 3u8;` |
-| U2 | 1589 | `unsafe { let mut table = (s().pml4_phys + hhdm) as *const Page; let mut level = 3u8;` |
-| U2 | 1626 | `let pd_entry: *mut u64 = unsafe { let mut table = (s().pml4_phys + hhdm) as *mut Page; let e3 = &mut (*table).` |
-| U2 | 1647 | `let old = unsafe { *pd_entry }; if old & P_PRESENT == 0 { return Err(MmError::NotMapped);` |
-| U2 | 1665 | `unsafe { let pt_page = (pt_phys + hhdm) as *mut Page; for k in 0..512u64 {` |
-| U2 | 1674 | `unsafe { *pd_entry = new_pd }; tlb_invalidate(block); shootdown_others(block);` |
-| U4 | 1801 | `unsafe impl Sync for AspaceCell {}  static ASPACES: AspaceCell = AspaceCell(UnsafeCell::new(AspaceTable { item` |
-| U4 | 1817 | `unsafe { &mut *ASPACES.0.get() } } ` |
-| U2 | 1853 | `unsafe { let mine = (e.pml4 + hhdm) as *const Page; let kernel = (s().pml4_phys + hhdm) as *const Page;` |
-| U2 | 1875 | `unsafe { let mine = (e.pml4 + hhdm) as *const Page; Some((0..256).filter(\|&i\| (*mine).0[i] & P_PRESENT != 0)` |
-| U2 | 1909 | `unsafe { let mine = (pml4 + hhdm) as *mut Page; core::ptr::write_bytes(mine as *mut u8, 0, PAGE);` |
-| U2 | 2076 | `let leaf = unsafe { walk_leaf_in(e.pml4, None, va.0, false, false, false)? }; // SAFETY: 上一行返回的是有效表项指针 let v =` |
-| U2 | 2078 | `let v = unsafe { *leaf }; if v & P_PRESENT == 0 { None } else { Some(v) } }` |
-| U2 | 2140 | `if let Some(leaf) = unsafe { walk_leaf_in(self.root, None, a, false, false, false) } { // SAFETY: 上一行返回的是有效表项指` |
-| U2 | 2142 | `unsafe { *leaf = 0 }; tlb_invalidate(a); // 清完叶子才等回执，回执收齐之前不还帧（ADR-023/072）。` |
-| U2 | 2266 | `if let Some(leaf) = unsafe { walk_leaf_in(root, None, a, false, false, false) } { // SAFETY: 上一行返回的是有效表项指针 if ` |
-| U2 | 2268 | `if unsafe { *leaf } & P_PRESENT != 0 { return Err(MmError::AlreadyMapped); }` |
-| U2 | 2286 | `if let Some(leaf) = unsafe { walk_leaf_in(root, None, b, false, false, false) } { // SAFETY: 有效表项指针 unsafe { *` |
-| U2 | 2288 | `unsafe { *leaf = 0 }; tlb_invalidate(b); }` |
-| U1 | 2334 | `pub unsafe fn aspace_switch(pml4: u64, me: usize, as_slot: Option<u8>) -> bool { // SAFETY: 读 CR3 是特权读，调用方在 ri` |
-| U1 | 2336 | `let cur = unsafe { aspace_cr3_read() }; if cur == pml4 { return false;` |
-| U1 | 2341 | `unsafe { aspace_cr3_write(pml4) }; CR3_WRITES.fetch_add(1, Ordering::Relaxed); // ADR-072：登记"这颗 CPU 曾跑过这个 AS"。` |
-| U2 | 2358 | `pub unsafe fn aspace_switch_kernel(me: usize) -> bool { // SAFETY: our_cr3 是启动时建的内核表，前提由 take_over 保证；内核表没有 AS` |
-| U2 | 2360 | `unsafe { aspace_switch(our_cr3(), me, None) } } ` |
-| U4 | 2404 | `unsafe impl Sync for LazyCell {}  static LAZY: LazyCell = LazyCell(UnsafeCell::new(LazyTable { items: [LAZY_EM` |
-| U4 | 2410 | `unsafe { &mut *LAZY.0.get() } } ` |
-| U2 | 2508 | `unsafe { core::ptr::write_bytes((p + s().hhdm) as *mut u8, 0, PAGE) }; // 竞争变体（ADR-067 验收⑥的确定性构造）：把"已查未填 → 分配 ` |
-| U2 | 2689 | `unsafe { let e = &mut *arr.add(f as usize); e.refcnt = AtomicU32::new(if used { 1 } else { 0 });` |
-| U2 | 2724 | `unsafe { (*arr.add(f as usize)).refcnt.load(Ordering::Relaxed) } } ` |
-| U2 | 2732 | `unsafe { (*arr.add(f as usize)).owner } } ` |
-| U2 | 2740 | `unsafe { let e = &mut *arr.add(f as usize); e.refcnt.store(if used { 1 } else { 0 }, Ordering::Relaxed);` |
-| U2 | 2753 | `unsafe { (*arr.add(f as usize)).refcnt.fetch_add(1, Ordering::Relaxed); } } ` |
-| U2 | 2761 | `unsafe { (*arr.add(f as usize)).refcnt.fetch_sub(1, Ordering::Relaxed); } } ` |
-| U2 | 2786 | `unsafe { let e = &mut *arr.add(frame as usize); if e.flags & FI_USED == 0 {` |
-| U2 | 2805 | `unsafe { (*arr.add(frame as usize)).flags & FI_SEALED != 0 } } ` |
-| U2 | 2869 | `unsafe { core::ptr::write_bytes(ptr, 0, cap) }; Ok(KBuf { frames, ptr, len: bytes }) }` |
-| U2 | 2889 | `unsafe { core::slice::from_raw_parts(self.ptr, self.len) } } pub fn as_mut_slice(&mut self) -> &mut [u8] {` |
-| U2 | 2893 | `unsafe { core::slice::from_raw_parts_mut(self.ptr, self.len) } } }` |
-| U2 | 2966 | `unsafe { core::ptr::write_volatile((st.hhdm + base + b) as *mut u8, 0xa5) }; } if !ledger_free(owner, 1) {` |
-| U2 | 3014 | `unsafe { core::ptr::write_volatile((st.hhdm + base.0 + b) as *mut u8, 0xa5) }; } if !ledger_free(owner, n) {` |
+| U2 | 1526 | `unsafe { let mut table = (root + hhdm) as *const Page; let mut level = 3u8;` |
+| U2 | 1581 | `unsafe { let mut table = (root + hhdm) as *const Page; let mut level = 3u8;` |
+| U2 | 1610 | `unsafe { let mut table = (s().pml4_phys + hhdm) as *const Page; let mut level = 3u8;` |
+| U2 | 1647 | `let pd_entry: *mut u64 = unsafe { let mut table = (s().pml4_phys + hhdm) as *mut Page; let e3 = &mut (*table).` |
+| U2 | 1668 | `let old = unsafe { *pd_entry }; if old & P_PRESENT == 0 { return Err(MmError::NotMapped);` |
+| U2 | 1686 | `unsafe { let pt_page = (pt_phys + hhdm) as *mut Page; for k in 0..512u64 {` |
+| U2 | 1695 | `unsafe { *pd_entry = new_pd }; tlb_invalidate(block); shootdown_others(block);` |
+| U4 | 1822 | `unsafe impl Sync for AspaceCell {}  static ASPACES: AspaceCell = AspaceCell(UnsafeCell::new(AspaceTable { item` |
+| U4 | 1838 | `unsafe { &mut *ASPACES.0.get() } } ` |
+| U2 | 1874 | `unsafe { let mine = (e.pml4 + hhdm) as *const Page; let kernel = (s().pml4_phys + hhdm) as *const Page;` |
+| U2 | 1896 | `unsafe { let mine = (e.pml4 + hhdm) as *const Page; Some((0..256).filter(\|&i\| (*mine).0[i] & P_PRESENT != 0)` |
+| U2 | 1930 | `unsafe { let mine = (pml4 + hhdm) as *mut Page; core::ptr::write_bytes(mine as *mut u8, 0, PAGE);` |
+| U2 | 2097 | `let leaf = unsafe { walk_leaf_in(e.pml4, None, va.0, false, false, false)? }; // SAFETY: 上一行返回的是有效表项指针 let v =` |
+| U2 | 2099 | `let v = unsafe { *leaf }; if v & P_PRESENT == 0 { None } else { Some(v) } }` |
+| U2 | 2161 | `if let Some(leaf) = unsafe { walk_leaf_in(self.root, None, a, false, false, false) } { // SAFETY: 上一行返回的是有效表项指` |
+| U2 | 2163 | `unsafe { *leaf = 0 }; tlb_invalidate(a); // 清完叶子才等回执，回执收齐之前不还帧（ADR-023/072）。` |
+| U2 | 2287 | `if let Some(leaf) = unsafe { walk_leaf_in(root, None, a, false, false, false) } { // SAFETY: 上一行返回的是有效表项指针 if ` |
+| U2 | 2289 | `if unsafe { *leaf } & P_PRESENT != 0 { return Err(MmError::AlreadyMapped); }` |
+| U2 | 2307 | `if let Some(leaf) = unsafe { walk_leaf_in(root, None, b, false, false, false) } { // SAFETY: 有效表项指针 unsafe { *` |
+| U2 | 2309 | `unsafe { *leaf = 0 }; tlb_invalidate(b); }` |
+| U1 | 2355 | `pub unsafe fn aspace_switch(pml4: u64, me: usize, as_slot: Option<u8>) -> bool { // SAFETY: 读 CR3 是特权读，调用方在 ri` |
+| U1 | 2357 | `let cur = unsafe { aspace_cr3_read() }; if cur == pml4 { return false;` |
+| U1 | 2362 | `unsafe { aspace_cr3_write(pml4) }; CR3_WRITES.fetch_add(1, Ordering::Relaxed); // ADR-072：登记"这颗 CPU 曾跑过这个 AS"。` |
+| U2 | 2379 | `pub unsafe fn aspace_switch_kernel(me: usize) -> bool { // SAFETY: our_cr3 是启动时建的内核表，前提由 take_over 保证；内核表没有 AS` |
+| U2 | 2381 | `unsafe { aspace_switch(our_cr3(), me, None) } } ` |
+| U4 | 2425 | `unsafe impl Sync for LazyCell {}  static LAZY: LazyCell = LazyCell(UnsafeCell::new(LazyTable { items: [LAZY_EM` |
+| U4 | 2431 | `unsafe { &mut *LAZY.0.get() } } ` |
+| U2 | 2529 | `unsafe { core::ptr::write_bytes((p + s().hhdm) as *mut u8, 0, PAGE) }; // 竞争变体（ADR-067 验收⑥的确定性构造）：把"已查未填 → 分配 ` |
+| U2 | 2710 | `unsafe { let e = &mut *arr.add(f as usize); e.refcnt = AtomicU32::new(if used { 1 } else { 0 });` |
+| U2 | 2745 | `unsafe { (*arr.add(f as usize)).refcnt.load(Ordering::Relaxed) } } ` |
+| U2 | 2753 | `unsafe { (*arr.add(f as usize)).owner } } ` |
+| U2 | 2761 | `unsafe { let e = &mut *arr.add(f as usize); e.refcnt.store(if used { 1 } else { 0 }, Ordering::Relaxed);` |
+| U2 | 2774 | `unsafe { (*arr.add(f as usize)).refcnt.fetch_add(1, Ordering::Relaxed); } } ` |
+| U2 | 2782 | `unsafe { (*arr.add(f as usize)).refcnt.fetch_sub(1, Ordering::Relaxed); } } ` |
+| U2 | 2807 | `unsafe { let e = &mut *arr.add(frame as usize); if e.flags & FI_USED == 0 {` |
+| U2 | 2826 | `unsafe { (*arr.add(frame as usize)).flags & FI_SEALED != 0 } } ` |
+| U2 | 2890 | `unsafe { core::ptr::write_bytes(ptr, 0, cap) }; Ok(KBuf { frames, ptr, len: bytes }) }` |
+| U2 | 2910 | `unsafe { core::slice::from_raw_parts(self.ptr, self.len) } } pub fn as_mut_slice(&mut self) -> &mut [u8] {` |
+| U2 | 2914 | `unsafe { core::slice::from_raw_parts_mut(self.ptr, self.len) } } }` |
+| U2 | 2987 | `unsafe { core::ptr::write_volatile((st.hhdm + base + b) as *mut u8, 0xa5) }; } if !ledger_free(owner, 1) {` |
+| U2 | 3035 | `unsafe { core::ptr::write_volatile((st.hhdm + base.0 + b) as *mut u8, 0xa5) }; } if !ledger_free(owner, n) {` |
 
 ### memory/vmo
 
@@ -545,6 +544,7 @@
 | U2 | 3783 | `unsafe { core::ptr::write_bytes(fill as *mut u8, 0, mm::PAGE) }; if copy > 0 { let at = seg.offset + page_in_s` |
 | U2 | 3790 | `unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), fill as *mut u8, copy) }; } // `aspace_map_slot` 收的是**帧号` |
 | U2 | 3824 | `unsafe { core::ptr::write_bytes(stack_frames.base().via_hhdm().0 as *mut u8, 0, 8 * mm::PAGE) }; let mut pas: ` |
+| U2 | 3909 | `let b = unsafe { let kva = mm::PhysAddr(pa).via_hhdm(); core::ptr::read_volatile(kva.0 as *const u8)` |
 
 ### security/cred
 
