@@ -3432,6 +3432,61 @@ fn copy_to_user_locked(src: &[u8], va: u64) -> Result<usize, PtrError> {
     Ok(done)
 }
 
+/// 内核 → 用户，**按指定 AS** 写（ADR-175 §八 未决 3 的补做）。
+///
+/// 与读方向的 `copy_from_user_in` 同一条路（走物理地址、不切 CR3），
+/// 但有**三点差别**：
+///
+/// 1. **多一条校验**：目标页必须 `eff.writable`。读只要「在 + 对用户开放」，
+///    写还要那一页真的可写——否则就是内核替用户绕过 W^X（§6.4）。
+/// 2. 写的是 HHDM 别名（内核页，U/S=0，SMAP 不管）。
+/// 3. **整段在 VMM 锁里**：校验说「可写」与真去写之间不能有窗口，
+///    否则另一颗 CPU 可以在这中间撤销映射或改 W 位。
+///
+/// **用 `_locked` 版的两个查询**：外层已持 VMM 锁，自取锁那版会撞
+/// 「重入获取 rank=20」（BACKLOG §466 踩过两次）。
+///
+/// **页内偏移自己加**：`phys_of_in` 返回页基址（`entry & ADDR_MASK` 只有页框号），
+/// 漏了它会「第一个字节对、后面全错」（§466 修过同样的错）。
+pub fn copy_to_user_in(aslot: u8, va: u64, src: &[u8]) -> Result<usize, PtrError> {
+    if src.len() > COPY_MAX {
+        return Err(PtrError::TooLong);
+    }
+    let end = va.checked_add(src.len() as u64).ok_or(PtrError::NotUserRange)?;
+    if va >= elf::USER_VA_TOP || end > elf::USER_VA_TOP {
+        return Err(PtrError::NotUserRange);
+    }
+    mm::with_vmm_lock(|| {
+        let root = mm::aspace_root_locked(aslot).ok_or(PtrError::NotMapped)?;
+        let pg = mm::PAGE as u64;
+        let mut done = 0usize;
+        while done < src.len() {
+            let at = va + done as u64;
+            let page = at / pg * pg;
+            let eff =
+                mm::aspace_effective_flags_locked(aslot, page).ok_or(PtrError::NotMapped)?;
+            if !eff.user {
+                return Err(PtrError::NotSharedWithUser);
+            }
+            // **写方向独有的那一条**：目标页必须可写。
+            if !eff.writable {
+                return Err(PtrError::NotWritable);
+            }
+            let pa = mm::phys_of_in(root, at).ok_or(PtrError::NotMapped)?;
+            // SAFETY: `pa` 由 `phys_of_in` 从**那台 AS 的页表**翻译得出；
+            // 上面 `aspace_effective_flags_locked` 已确认那一页 present、对用户开放、
+            // **且可写**；`via_hhdm` 给出的是该物理帧的内核别名（U/S=0，SMAP 不管）；
+            // `at % pg` 保证不越出页边界。校验与写在同一次持锁期内。
+            unsafe {
+                let kva = mm::PhysAddr(pa + (at % pg)).via_hhdm();
+                core::ptr::write_volatile(kva.0 as *mut u8, src[done]);
+            }
+            done += 1;
+        }
+        Ok(done)
+    })
+}
+
 /// `SYS_POKE_BUF` 写进用户缓冲区的模式：`j` 是**这次拷贝内的字节序号**，不是绝对地址。
 /// 两边（内核与用户程序）各自独立实现同一个函数，跨页拷贝是否逐字节准确就由它证明。
 pub fn poke_pattern(j: usize) -> u8 {

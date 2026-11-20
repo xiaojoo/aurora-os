@@ -2882,6 +2882,37 @@ fn t_load_into_child_as() -> bool {
     // N4：同一组读也用 `read_at`（当前 CR3）做一遍——它读子 AS 的 VA 应该失败。
     //     这一格证明两个 API 的**语义确实不同**，不是别名。
     let n4 = crate::user::read_at(SENTINEL_VA) != Some(SENTINEL);
+    // ---- `copy_to_user_in` 负样本（ADR-175 §八 未决 3 的补做）
+    //
+    // `hello.elf` 的三个段：代码 R+X、只读 R、数据 R+W。
+    // **W1 是写方向独有的那一格**：读只读段是合法的（N1 就读它），写不行。
+    // 若 `copy_to_user_in` 忘了查 `eff.writable`，W1 就会成功 ⇒ 判据红。
+    let ro_va = SENTINEL_VA; // 只读段（flags=4）
+    let w1 = crate::user::copy_to_user_in(aslot, ro_va, &[0x11u8])
+        == Err(crate::user::PtrError::NotWritable);
+    // W2：写**数据段**（R+W）必须成功，且读回一致。
+    //     只证「没报错」不够——页内偏移若漏了（§466 踩过），写会「成功」
+    //     但落在页基址那一格。读回比对才证字节真的到位。
+    let rw_va = data_va;
+    let w2_write = crate::user::copy_to_user_in(aslot, rw_va, &[0x5au8, 0xc3u8]);
+    let w2_back = crate::user::read_at_in(aslot, rw_va);
+    let w2 = w2_write == Ok(2)
+        && w2_back == Some(u64::from_le_bytes([0x5a, 0xc3, 0, 0, 0, 0, 0, 0]));
+    // W3：写不存在的 AS ⇒ 必须 NotMapped。
+    let w3 = crate::user::copy_to_user_in(absent_aslot, rw_va, &[0u8])
+        == Err(crate::user::PtrError::NotMapped);
+    let copy_to_user_in_ok = w1 && w2 && w3;
+    crate::log_info!(
+        "load_into: copy_to_user_in 只读段被拒={} 数据段往返={}(写{:?} 读{:?}) 不存在AS={} ⇒ {}",
+        w1, w2, w2_write, w2_back, w3, copy_to_user_in_ok
+    );
+    if !copy_to_user_in_ok {
+        crate::log_fatal!(
+            "load_into: copy_to_user_in 判据不成立 W1={} W2={} W3={}",
+            w1, w2, w3
+        );
+    }
+
     let read_at_in_ok = n1 && n2 && n3 && n4;
     crate::log_info!(
         "load_into: read_at_in 子AS读={:?} 不存在AS读={:?} 洞={} read_at对照={} ⇒ {}",
@@ -2901,6 +2932,6 @@ fn t_load_into_child_as() -> bool {
         "load_into: 子AS={} 段={} 页={} entry={:#x} data={:#x} 生效位对={} 销毁={} 帧回原值={} AS数回原值={} read_at_in={}",
         aslot, segs, pages, entry, data_va, ok, destroyed, frames_back, as_back, read_at_in_ok
     );
-    ok && destroyed && frames_back && as_back && read_at_in_ok
+    ok && destroyed && frames_back && as_back && read_at_in_ok && copy_to_user_in_ok
 }
 ktest!(KT_LOAD_INTO_CHILD_AS, t_load_into_child_as);
