@@ -3212,6 +3212,238 @@ def qmp_pmemsave(port: int, addr: int, size: int, path: Path) -> str:
         s.close()
 
 
+KBD_INJECT_CHAR = "a"
+
+
+def qmp_inject_and_shoot(port: int, shoot_path: Path, delay_s: float) -> list[str]:
+    """等 `delay_s` 秒后注入 `KBD_INJECT_CHAR`，再等 1 秒截屏。返回读数行。
+
+    **为什么必须并发**：`do_run` 在 QMP 分支里阻塞等 QEMU 退出，
+    而注入与截屏要在内核还在跑的时候做——`t_kbd_inject` 正在等那个键。
+
+    延迟是必须的：QEMU 起来到内核跑 ktests 之间隔着 OVMF 引导 + 内核初始化。
+    太早注入按键会丢（`kbd` 的环还没建），太晚 `t_kbd_inject` 已经超时。
+    """
+    import time
+
+    out: list[str] = []
+    time.sleep(delay_s)
+    err = qmp_input_key(port, [KBD_INJECT_CHAR], True)
+    if err:
+        out.append("注入失败（按下）：" + err)
+    time.sleep(0.05)
+    err = qmp_input_key(port, [KBD_INJECT_CHAR], False)
+    if err:
+        out.append("注入失败（抬起）：" + err)
+    else:
+        out.append("注入 " + repr(KBD_INJECT_CHAR) + " 完成")
+    time.sleep(1.0)
+    err = qmp_screendump(port, shoot_path)
+    if err:
+        out.append("截屏失败：" + err)
+    else:
+        out.append("截屏 " + shoot_path.name)
+    return out
+
+
+def qmp_screendump(port: int, path: Path) -> str:
+    """QMP `screendump`：把 QEMU 的显存截成 PPM（P6）写到宿主机。空串 = 成功。
+
+    为什么是 PPM 而不是 PNG：`screendump` 原生输出 P6，解析它不需要 zlib/PIL，
+    而且**像素值就是显存字节**——判据要对的正是那件事。转 PNG 只为了存档。
+
+    这台仪器补的是 AHE-04 记的缺口：显示域今天只有内核自报，没有第二台仪器。
+    """
+    import json
+    import socket
+
+    req = {"execute": "screendump",
+           "arguments": {"filename": str(path).replace("\\", "/")}}
+    try:
+        s = socket.create_connection(("127.0.0.1", port), timeout=10)
+    except OSError as e:
+        return "QMP 连不上（port=" + str(port) + "）：" + repr(e)
+    f = s.makefile("rw", encoding="utf-8")
+    try:
+        f.readline()  # greeting
+        f.write(json.dumps({"execute": "qmp_capabilities"}) + "\r\n"); f.flush()
+        f.readline()
+        f.write(json.dumps(req) + "\r\n"); f.flush()
+        while True:
+            line = f.readline()
+            if not line:
+                return "QMP 没有回话（连接断开）"
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "error" in msg:
+                return "screendump 被拒：" + json.dumps(msg["error"], ensure_ascii=False)
+            if msg.get("return") is not None:
+                return ""
+    except OSError as e:
+        return "QMP 读取中断：" + repr(e)
+    finally:
+        f.close()
+        s.close()
+
+
+def ppm_read(path: Path) -> tuple[int, int, bytes] | str:
+    """读 P6 PPM，返回 `(宽, 高, RGB 字节)`；失败返回成因字符串。
+
+    P6 头是 `P6\n<w> <h>\n<maxval>\n`，但 QEMU 可能在中间夹注释（`#` 开头）。
+    逐 token 读、跳过注释，比按固定行数切更稳——**显存截图的头格式不是我们定的**。
+    """
+    try:
+        raw = path.read_bytes()
+    except OSError as e:
+        return "读不到 " + path.name + "：" + repr(e)
+    if not raw.startswith(b"P6"):
+        return "不是 P6 PPM（头 " + repr(raw[:8]) + "）"
+    i = 2
+    toks: list[int] = []
+    while len(toks) < 3 and i < len(raw):
+        c = raw[i:i + 1]
+        if c == b"#":
+            while i < len(raw) and raw[i:i + 1] not in (b"\n", b"\r"):
+                i += 1
+            continue
+        if c.isspace():
+            i += 1
+            continue
+        j = i
+        while j < len(raw) and raw[j:j + 1].isdigit():
+            j += 1
+        if j == i:
+            return "PPM 头解析失败（偏移 " + str(i) + "）"
+        toks.append(int(raw[i:j]))
+        i = j
+    if len(toks) < 3:
+        return "PPM 头不完整"
+    w, h, maxv = toks
+    i += 1  # 头与数据之间恰好一个空白
+    if maxv != 255:
+        return "maxval=" + str(maxv) + " 不是 255（只支持 8 位）"
+    need = w * h * 3
+    if len(raw) - i < need:
+        return "像素数据不够：要 " + str(need) + "，实际 " + str(len(raw) - i)
+    return (w, h, raw[i:i + need])
+
+
+def qmp_input_key(port: int, keys: list[str], down: bool) -> str:
+    """QMP `input-send-event`：注入一次按键（按下或抬起）。空串 = 成功。
+
+    用 `qcode`（QEMU 的键名，如 `a`、`ret`、`spc`）而不是键码数字：
+    键码数字是 PS/2 扫描码，而 QEMU 的 qcode 表更稳定、也更容易读。
+
+    这台仪器补的是输入域的缺口：今天 PS/2 键鼠**没有任何端到端判据**——
+    内核自报「收到按键」与「真的收到」是两件事。
+    """
+    import json
+    import socket
+
+    events = [{"type": "key",
+               "data": {"down": down, "key": {"type": "qcode", "data": k}}}
+              for k in keys]
+    req = {"execute": "input-send-event", "arguments": {"events": events}}
+    try:
+        s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    except OSError as e:
+        return "QMP 连不上（port=" + str(port) + "）：" + repr(e)
+    f = s.makefile("rw", encoding="utf-8")
+    try:
+        f.readline()
+        f.write(json.dumps({"execute": "qmp_capabilities"}) + "\r\n"); f.flush()
+        f.readline()
+        f.write(json.dumps(req) + "\r\n"); f.flush()
+        while True:
+            line = f.readline()
+            if not line:
+                return "QMP 没有回话（连接断开）"
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "error" in msg:
+                return "input-send-event 被拒：" + json.dumps(msg["error"], ensure_ascii=False)
+            if msg.get("return") is not None:
+                return ""
+    except OSError as e:
+        return "QMP 读取中断：" + repr(e)
+    finally:
+        f.close()
+        s.close()
+
+
+FB_SAMPLE_RE = re.compile(
+    r"fb: 判据 采样=(?P<n>\d+) 全对=(?P<ok>true|false)")
+
+
+def check_fb_pattern(log: str, ppm: tuple[int, int, bytes] | str) -> list[str]:
+    """显示域的宿主机侧对账：从 `screendump` 的 PPM 里取样，与内核图案对账。
+
+    **两边各自算**：这里按 `(w/6, h/4)` 这类几何式自己算采样点，
+    不去解析内核日志里的坐标。若抄内核的坐标，两边同时错就都绿了。
+
+    内核侧（`frame.rs` 的 `draw_test_pattern`）：上半全黑、下半三等分
+    红/绿/蓝。四个采样点：上左黑、下左红、下中绿、下右蓝。
+
+    返回对账失败项（空 = 全对）。
+    """
+    bad: list[str] = []
+    if isinstance(ppm, str):
+        return ["screendump 取不到：" + ppm]
+    w, h, px = ppm
+    if w == 0 or h == 0:
+        return ["screendump 的几何是 0"]
+
+    def at(x: int, y: int) -> tuple[int, int, int]:
+        i = (y * w + x) * 3
+        return (px[i], px[i + 1], px[i + 2])
+
+    # 与内核 `samples()` 同一份几何式，但**独立写一遍**（不读内核日志）
+    band = h // 2
+    want = [
+        ("上左黑", w // 6, h // 4, (0x00, 0x00, 0x00)),
+        ("下左红", w // 6, h - h // 4, (0xFF, 0x00, 0x00)),
+        ("下中绿", w // 2, h - h // 4, (0x00, 0xFF, 0x00)),
+        ("下右蓝", w - w // 6, h - h // 4, (0x00, 0x00, 0xFF)),
+    ]
+    for name, x, y, exp in want:
+        if not (0 <= x < w and 0 <= y < h):
+            bad.append(f"{name} 采样点 ({x},{y}) 越出 {w}x{h}")
+            continue
+        got = at(x, y)
+        if got != exp:
+            bad.append(f"{name} 像素 ({x},{y}) 是 {got}，期望 {exp}")
+
+    # 图案的结构判据：上半整片黑、下半左中右三段各自纯色。
+    # **不只查四个点** —— 四个点全对但中间画错（例如 pitch 错位只影响某些行）
+    # 也可能发生，所以再查三条水平线的整段。
+    for yy, label in ((h // 4, "上"), (h - h // 4, "下")):
+        row_bad = 0
+        for xx in range(w):
+            r, g, b = at(xx, yy)
+            if label == "上":
+                if (r, g, b) != (0, 0, 0):
+                    row_bad += 1
+            else:
+                third = xx * 3 // w
+                exp = [(0xFF, 0, 0), (0, 0xFF, 0), (0, 0, 0xFF)][min(third, 2)]
+                if (r, g, b) != exp:
+                    row_bad += 1
+        if row_bad:
+            bad.append(f"{label}半第 {yy} 行有 {row_bad}/{w} 个像素不符")
+
+    # 内核自报那一格也要对上（它证的是「内核认为自己画对了」）。
+    m = FB_SAMPLE_RE.search(log)
+    if not m:
+        bad.append("串口没有 `fb: 判据 采样=… 全对=…` 那一行（显示用例没跑到结论）")
+    elif m.group("ok") != "true":
+        bad.append("内核自报采样不全对 ⇒ 它自己也知道画错了")
+    return bad
+
+
 def fatalrec_readback(port: int, log: str, build_dir: Path, seq: int) -> tuple[str, list[list[int]]]:
     """挂死那一跑的现场读回。返回（给人看的文本，逐槽解码）；解码为空 ⇒ 一步都没成。
 
@@ -4027,6 +4259,19 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
     elif qmp_port:
         with subprocess.Popen(cmd, cwd=str(ROOT), stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, text=True, env=env()) as proc:
+            # 显示/输入的第二台仪器：内核还在跑的时候注入按键 + 截屏。
+            # 只在 `framebuffer` / `ps2-kbd` 档里做；其它档一个字符都不变。
+            _shoot = BUILD / "qmp-shot.ppm"
+            _need_inject = bool({"ps2-kbd", "framebuffer"} & set(features))
+            _inject_thread = None
+            _inject_notes: list[str] = []
+            if _need_inject:
+                _shoot.unlink(missing_ok=True)
+                def _worker():
+                    _inject_notes.extend(qmp_inject_and_shoot(qmp_port, _shoot, 2.5))
+                import threading as _th
+                _inject_thread = _th.Thread(target=_worker, name="qmp-inject", daemon=True)
+                _inject_thread.start()
             try:
                 proc.communicate(timeout=timeout)
                 rc = proc.returncode
@@ -4044,6 +4289,11 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
                 proc.kill()
                 proc.communicate()
                 rc = -1
+            finally:
+                if _inject_thread is not None:
+                    _inject_thread.join(timeout=15)
+                    for _n in _inject_notes:
+                        print("   + QMP: " + _n)
     else:
         try:
             r = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True, timeout=timeout, env=env())
@@ -8752,6 +9002,47 @@ def do_test(timeout: int) -> int:
         print("    对账:", x)
     IMAGE.unlink(missing_ok=True)
 
+    # =====================================================================
+    # ADR-170：显示与输入的第二台仪器。
+    #
+    # 两域以前只有内核自报（显示）或纯解码判据（输入）。这两跑让宿主机
+    # **从设备侧**读同一件事：显示从 QEMU 的显存截图像素，输入从 QMP 注入的按键。
+    # 两个端口写死：这两跑自己开自己关，与用户的 AURORA_QEMU_QMP 正交。
+    print("=== 显示：画图案，宿主机从 QMP screendump 的 PPM 里独立取样 ===")
+    _fb_port = 4555
+    os.environ["AURORA_QEMU_QMP"] = str(_fb_port)
+    try:
+        fbv, fbrc, fblog = do_run(["framebuffer"], timeout)
+    finally:
+        os.environ.pop("AURORA_QEMU_QMP", None)
+    _ppm = ppm_read(BUILD / "qmp-shot.ppm")
+    fb_bad = check_fb_pattern(fblog, _ppm)
+    fb_verdict = fbv if fbv != "PASS" else ("PASS" if not fb_bad else "CONTENT-MISMATCH")
+    for x in fb_bad:
+        print("    对账:", x)
+    if isinstance(_ppm, tuple):
+        print(f"    显存 {_ppm[0]}x{_ppm[1]}，四个采样点与整行由宿主机独立算")
+
+    print("=== 输入：QMP 注入 'a'，内核从真实 PS/2 端口收 ===")
+    _kbd_port = 4556
+    os.environ["AURORA_QEMU_QMP"] = str(_kbd_port)
+    try:
+        kbdv, kbdrc, kbdlog = do_run(["ps2-kbd"], timeout)
+    finally:
+        os.environ.pop("AURORA_QEMU_QMP", None)
+    _kb = re.search(r"kbd: 判据 收到=(\d+)", kbdlog)
+    _want = ord(KBD_INJECT_CHAR)
+    kbd_bad: list[str] = []
+    if not _kb:
+        kbd_bad.append("串口没有 `kbd: 判据 收到=…` 那一行（输入用例没跑到结论）")
+    elif int(_kb.group(1)) != _want:
+        kbd_bad.append(f"内核收到 {_kb.group(1)}，宿主机注入的是 {_want}")
+    kbd_verdict = kbdv if kbdv != "PASS" else ("PASS" if not kbd_bad else "CONTENT-MISMATCH")
+    for x in kbd_bad:
+        print("    对账:", x)
+    if _kb:
+        print(f"    注入 {KBD_INJECT_CHAR!r}({_want}) ⇒ 内核收到 {_kb.group(1)}")
+
     print("=== 崩溃记录跨重启读回：同一份镜像连跑两遍 fault-double-free ===")
     # §9.7 的另一半只能跨重启量：崩溃时写下的摘要，要被**下一次启动**读回来。
     # 两遍用同一个变体 ⇒ `ensure_image` 复用镜像（它比的是"变体 + ELF 摘要"），
@@ -9562,6 +9853,14 @@ def do_test(timeout: int) -> int:
         ("投递三层由控制器事件数到", dl_verdict, dlrc, "PASS", 33),
         # M5-f②：第一条 virtio I/O 落到盘上的字节由第二台仪器读回来核
         ("virtio 写落盘与宿主机对账", vblk_verdict, vvic, "PASS", 33),
+        # ADR-170：显示域的第二台仪器。内核画图案，宿主机从 QMP `screendump`
+        # 的 PPM 里**独立算同一份几何**再取样——两边各自算，不是互相抄。
+        # 这一行正面回答 AHE-04 记的缺口（显示域以前只有内核自报）。
+        ("帧缓冲图案与显存对账", fb_verdict, fbrc, "PASS", 33),
+        # ADR-170：输入域的第二台仪器。宿主机 QMP `input-send-event` 注入 'a'，
+        # 内核从**真实 PS/2 端口**收到 97。`t_ps2_kbd_decode` 只证解码，
+        # 这一行证两端（端口 → 解码 → 环）。
+        ("按键注入与输入通路对账", kbd_verdict, kbdrc, "PASS", 33),
         # M8-a①：驱动说发出去的那一帧，宿主机必须在 QEMU 的抓包文件里读到逐字节相同的那一个
         ("网卡第一帧与 pcap 对账", net_verdict, ntrc, "PASS", 33),
         # M8-a②：对端答了，内核读回来的那一包由宿主机第二次独立解一遍，且地址必须是宿主机定的那一个
@@ -9682,6 +9981,8 @@ def do_test(timeout: int) -> int:
         "目的地由宿主机按SP数到": aflog,
         "投递三层由控制器事件数到": dllog,
         "virtio 写落盘与宿主机对账": vvilog,
+"帧缓冲图案与显存对账": fblog,
+"按键注入与输入通路对账": kbdlog,
         "网卡第一帧与 pcap 对账": ntlog,
         "第一条协议往返与 pcap 对账": rtlog,
         "SHA-256 十三向量与 hashlib 对账": shlog,

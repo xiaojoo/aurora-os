@@ -7,6 +7,8 @@
 mod boot;
 mod diag;
 mod driver;
+/// 显示与输入的端到端判据（ADR-170）。两个域以前只有解码/自报，没有端到端。
+mod display;
 mod memory;
 mod net;
 mod sched;
