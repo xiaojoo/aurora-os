@@ -18963,3 +18963,141 @@ ADR-174 不是「修了一个判据缺陷」，而是「把一个读页失败误
 
 一个假设在提出时，应当先问「有没有现成的读数能直接检验它」。
 这次有，而且只要一次 `grep`。
+
+
+## 470. 33/34 分派被改名成 53/54：`ping` 自 2026-11-20 起 100% 失效（2026-11-21）
+
+### 先说这是怎么发现的（不是猜的）
+
+上一轮盘点「未完成步骤」时，顺手把 `user/runtime` 真打的每个号与内核分派表对了一遍，
+发现 `SYS_NET_SEND`(33) / `SYS_NET_RECV`(34) **在内核里没有分派臂**。
+
+追下去：`04af866`（2026-11-20 04:08，ADR-165 实施）的 diff 是
+
+    -        SYS_NET_SEND => sys_net_send(frame),
+    +        SYS_SOCK_SEND => sys_net_send(frame),
+
+而 `user/runtime/src/lib.rs` 的 `net_send`/`net_recv` **还在打 33/34**——
+那个提交只改了 `kernel/src/sched/user.rs`，没有改用户态。
+
+于是 33 落到 `_ => E_INVALID`（`user.rs:3239`），`net_send` 返 Err，
+`cmd_ping` 把每次发送失败都打成 `ping <ip>`（`registry.rs:241`），
+`ip neigh` 恒空（ARP 根本没发出去）。
+
+### 宿主机侧全量对账（不抽样，`build/run-*.log` 逐份）
+
+| 时段 | 跑数 | 有 `from 10.0.2.2: seq=` | 有 `ping <ip>`（失败回显） |
+|---|---|---|---|
+| `04af866` 之前 | 7865 | **153** | 0 |
+| `04af866` 之后 | 1248 | **0** | **30**（凡真发了 ping 的全失败） |
+
+另有一组对照：改前 153 份里 `ip neigh` 能读到 `10.0.2.2 52:55:0a:00:02:02`，
+改后 30 份全是 `neigh: empty`。
+
+### 为什么当时没有任何门禁咬（这条比 bug 本身重要）
+
+这条边**唯一的判据**是判定表 `A3 shell执行argv命令并ps/free读数` 那一行的**一格**
+（`_ping_row`）。而那一行本来就因别的原因红（441 记作"既有失败"，§468 也记它恒红）——
+**一格新红被既有的红遮住了**。
+
+补充两条实测：
+
+- `ktests` 里**零个**用例打 33/34/53/54（`grep SYS_NET_SEND` 在 `ktests/` 下零命中）；
+- `tools/aurora.py` 里**零处**引用这些号（只按串口文本判）。
+
+⇒ 这条 ABI 边**没有任何单元级判据**，只有产品档的间接格。
+
+### 改了什么
+
+| # | 改动 | 落点 |
+|---|---|---|
+| 1 | 分派臂改回 `SYS_NET_SEND`/`SYS_NET_RECV` | `sched/user.rs:3181,3183` |
+| 2 | **新门禁** `check-syscall-abi-arms`（第 19 道） | `tools/aurora.py` |
+| 3 | **新用例** `t_syscall_abi_arms`（handles 档） | `ktests/syscall/user.rs` |
+| 4 | `live == 0` → `live == h0` | `ktests/storage/fs_rw.rs:417` |
+| 5 | `IMAGE`/`SERIAL_LOG` 改为 `BUILD` 派生 | `tools/aurora.py:48-63` |
+
+**为什么是改内核而不是改用户态**：ADR-143 已经把这组号定死（33 发帧、34 收帧、
+35 读数），判定表第 32/33 行的 pcap 对账也按它写的；53/54 属于 ADR-165 预留的
+**socket 族**（有连接/有状态），今天没有实现。改用户态等于让 53/54 冒充 33/34，
+而 §447 明写这两族"不是同一件事"。
+
+### 新门禁 check-syscall-abi-arms 判什么
+
+1. `user/runtime` 里每个 `syscall_abi(SYS_X)` 的 `SYS_X`，内核 `syscall_dispatch`
+   的 `match` 里必须有 `SYS_X =>` 的臂。**名字对名字**，不比号——两边各写一份常量，
+   **改名不改号**正是这次事故的形状，比号会比不出来。
+2. 反向的**别名禁令**：`SYS_SOCK_SEND`/`SYS_SOCK_RECV` 不许挂 `sys_net_send`/`sys_net_recv`。
+
+**它抓不到什么（如实写）**：只对账名字在不在，不证语义对不对。33 号挂一个空实现
+照样绿——那由 `t_syscall_abi_arms` 的实跑读数兜。
+
+### 新用例 t_syscall_abi_arms 判什么（四格）
+
+    33已知=true 34已知=true 53未知=true 54未知=true ⇒ true
+
+- 33/34 **必须已知**：调一次，`unknown_nr()` **不涨**。
+  判据刻意**不看返回值**——没网卡时 `bind_net` 失败回 `E_IO`，那也是"这条臂在"，
+  与"号根本不存在"是两件事。混在一起判，不挂网卡的档会假红。
+- 53/54 **必须未知**：`unknown_nr()` 必须涨 1 且回 `E_INVALID`。
+  这一格是防"别名"的那一半：谁再把 53 挂回 `sys_net_send`，这里立刻红。
+
+**将来 socket 真实现时**，53/54 那两格要按新语义重写，不许直接删——删掉就回到
+"没有用例打这些号"的状态，而这次事故正是从那个状态长出来的。
+
+### 变异证红（各做一次，原文照贴）
+
+**① 门禁**（把臂改回 `SYS_SOCK_SEND`）：
+
+    BAD: 用户态在打 SYS_NET_SEND，但内核分派表里没有它的臂 ⇒ 这个号会落到 `_ => E_INVALID`
+    BAD: SYS_SOCK_SEND 挂在 sys_net_send 上 ⇒ 把 socket 族与原始以太网帧族合并了
+
+还原后 `findings: []`。
+
+**② 内核用例**（同样改回）：
+
+    [info] abi-arms: 33已知=false 34已知=true 53未知=false 54未知=true ⇒ false
+    [fatal] abi-arms: 判据不成立（33/34 必须已知、53/54 必须未知）unknown_nr 起点 u0=1 u1=2 u2=2 u3=2 末值=3
+    [FAIL] t_syscall_abi_arms -> failed
+    [info] ktests: total=96 passed=95 failed=1
+
+还原后 `total=96 passed=96 failed=0`。
+
+**③ fs_rw 的句柄基线**（把 close 跳掉）：
+
+    [info] fs-rw-open-w: … 关=18446744073709551611 关后活=1
+    [FAIL] t_fs_rw_open_write -> failed
+    [fatal] 用例收尾不变量破坏：test=t_fs_rw_open_write 之后仍有 1 个句柄没关
+
+还原后 `关=0 关后活=0`、`total=108 passed=108`。
+
+### 读数（本轮）
+
+| 项 | 值 |
+|---|---|
+| `check` | **19/19**（exit=0，新门禁第 19 道） |
+| `handles` 档 | **ktests 96/96**，`abi-arms` 四格全 true |
+| `fs-rw` 档 | **ktests 108/108** |
+| `a3-shell,fat32-probe` 单跑 | **PASS(33) 16.2s** |
+| ping 回话 | `ping 10.0.2.2` → `from 10.0.2.2: seq=1` |
+| `ip neigh` | `10.0.2.2 52:55:0a:00:02:02`（不再是 `neigh: empty`） |
+| A3 shell 那一行 25 格判据 | **全部 True**（在 run-004 日志上逐格复算） |
+
+### 未做
+
+1. **没跑整链。** A3 shell 那一行的 25 格已在单跑日志上逐格复算过（全 True），
+   但整链读数要等下一次冻结树——§468 已证同一份代码三次是三个数。
+2. **`崩溃记录跨重启读回` 仍未动**（§446 已裁决未实施）。
+3. **53/54 的 socket 实现本身没做。** 本提交只保证"它们不冒充 33/34"。
+4. **`t_handle_table` ⑨ 段仍只证清表**，没证"只清 OWNER 的"（§463 记过，既有分工）。
+
+### 一条方法论（值得单独记）
+
+这次不是靠跑出来的，是**把两个文件里的常量表对了一遍**发现的。
+
+代价：一次 `grep` + 一次集合差。
+
+如果 2026-11-20 那轮在改分派臂之前做过同一件事，这 1248 份跑就都不用白跑。
+
+**"改名"是比"改号"更隐蔽的一类 ABI 破坏**：号没变，编译过，测试不红，
+只有那条边真被调用时才现形——而它恰好是"产品档一行里的一格"。
