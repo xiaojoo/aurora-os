@@ -2079,6 +2079,7 @@ fn t_q2_workload_slots() -> bool {
         Ok(j) => j,
         Err(e) => { crate::log_fatal!("q2: job_create {:?}", e); return false; }
     };
+    crate::log_info!("q2: 步骤 8 job 建好");
     // init 1 条线程，三个子进程各 2 条
     let shapes = [1usize, 2, 2, 2];
     let total_req: usize = shapes.iter().sum();
@@ -2090,6 +2091,7 @@ fn t_q2_workload_slots() -> bool {
         };
     }
 
+    crate::log_info!("q2: 步骤 9 proc×4 建好");
     // 先 spawn、后登记：工人要等发令才收工，不存在"登记之前就跑完"那个窗口
     //（t_proc_job_wait 那边先 attach 的规则针对的是立刻收工的工人，两种顺序各有前提）。
     let mut gids = [usize::MAX; 8];
@@ -2144,6 +2146,7 @@ fn t_q2_workload_slots() -> bool {
         apic::timer_start().ok();
     }
 
+    crate::log_info!("q2: 步骤 10 spawn 完 成功={} 拒绝={}", ok_n, refused);
     // 采样轮数必须容纳"每条活线程至少被选中一次"再加 boot 自己与 idle 的份；
     // 给少了峰值必然偏低，那是量具不成立而不是被测代码。
     Q2_ARMED.store(1, Ordering::Release);
