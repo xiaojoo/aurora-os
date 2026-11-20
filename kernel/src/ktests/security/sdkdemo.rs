@@ -55,7 +55,6 @@ fn t_sdkdemo() -> bool {
     // `t_user_pointer_checks` 三条一起红（它们装到同一批 VA）。
     // 这与 AGENTS 那条「用例必须自足，不能假设别的用例已经认领过设备」是同一件事的
     // 镜像：**也不能假设别的用例会替你收尾**。
-    let _ = crate::sched::terminate_task(t);
 
     // 判据读**用户态信箱**（`.slots` 段）。
     //
@@ -85,6 +84,20 @@ fn t_sdkdemo() -> bool {
     let caps = crate::user::read_at(base + 24);
     let dev = crate::user::read_at(base + 32);
     let consistent = crate::user::read_at(base + 40);
+    // **收尾必须在六个槽全读完之后**（BACKLOG §465）。
+    //
+    // `terminate_task` 只把任务置 `Done`，而它装载时占的 VA 登记
+    // **要到异步 reaper 在 tick 上真正回收才放手**。原来的顺序是
+    // 「先 terminate、再读六个槽」⇒ 中间一次 tick 就把页还了，
+    // 于是 `base+0`（魔数）读得到、`base+8..40` 全部 `NotMapped`。
+    //
+    // 实测（run-8430，a2-exec-bad 档）：五个地址在同一页，而页若没映射
+    // 连 `base+0` 也读不到 ⇒ **不是页表问题，是时间问题**。
+    //
+    // 这与 §366 是同一类：`fs_open.rs` 的注释写过「容器一被 reap，
+    // 它名下的页就还给分配器」，所以它在 `IF=0` 窗口里取快照。
+    // 这里六个读是纯读、无副作用，提前比关中断简单。
+    let _ = crate::sched::terminate_task(t);
     // 五个槽全读到了，后面的判据才有意义。读不到时它单独红一格。
     let readable = uid.is_some()
         && gid.is_some()
