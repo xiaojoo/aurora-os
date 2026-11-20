@@ -85,6 +85,10 @@ pub const CNS_CONTROLLER: u32 = 0x01;
 /// 一条提交命令定长 64 字节、一条完成定长 16 字节（NVMe 规范 §4）。
 pub const SQE_BYTES: usize = 64;
 pub const CQE_BYTES: usize = 16;
+/// `Create I/O CQ` 的 CDW12 要报条目大小的 log2：SQE 64 字节 ⇒ 6。
+pub const SQE_LOG2: u8 = 6;
+/// CQE 16 字节 ⇒ 4。
+pub const CQE_LOG2: u8 = 4;
 
 /// 队列深度。取 8 而不是 MQES 的上限：判据只需要"能排队、能收完成"，
 /// 而 8 条 × 64 字节 = 512 字节 = 正好一页，切起来干净。
@@ -180,6 +184,8 @@ pub struct Reading {
     pub lbads: u8,
     /// Identify Controller 读回的型号前 16 字节（ASCII，尾部补空格）
     pub model: [u8; 16],
+    /// I/O 队列是否建起来了（Create I/O CQ/SQ 两条 admin 命令是否都成功）。
+    pub io_queues: bool,
     /// Identify Controller 的 NN：设备有几个命名空间。
     ///
     /// 用它证「有命名空间」——而 NSZE（容量）来自 Identify Namespace，
@@ -192,6 +198,25 @@ struct Cell(core::cell::UnsafeCell<Option<State>>);
 // SAFETY: 唯一的写入点是 `init()`，它只在启动期单核跑一次；之后只读。
 unsafe impl Sync for Cell {}
 
+/// 一个队列的提交/完成游标。
+///
+/// `phase` 是**整圈翻转的奇偶**（NVMe 与 virtio 最大的差别：virtio 的 `used.idx`
+/// 单调递增，NVMe 的 phase 翻转）。清零之后第一圈是 `true`。
+#[derive(Clone, Copy)]
+struct QState {
+    sq_tail: u16,
+    cq_head: u16,
+    phase: bool,
+    /// 队列深度（Create 时定的）。0 = 这个队列还没建。
+    depth: u16,
+}
+
+impl QState {
+    const fn new(depth: u16) -> Self {
+        Self { sq_tail: 0, cq_head: 0, phase: true, depth }
+    }
+}
+
 struct State {
     ctx: DriverCtx,
     mmio: MmioHandle,
@@ -201,12 +226,14 @@ struct State {
     /// 管理队列的两个 bus 地址
     asq_bus: u64,
     acq_bus: u64,
-    /// 提交/完成的游标（各队列共用一对，因为判据是串行的）
-    sq_tail: u16,
-    cq_head: u16,
-    /// CQ 的 phase 位：**整圈翻转的奇偶**，不是每格独立的到达标志
-    /// （与 virtio 的 `used.idx` 单调递增不同）。清零后第一圈是 `true`。
-    cq_phase: bool,
+    /// I/O 队列的两个 bus 地址（Create I/O CQ/SQ 要用）
+    cq1_bus: u64,
+    sq1_bus: u64,
+    /// 每个队列一套游标（下标 = qid：0 = admin、1 = I/O）。
+    ///
+    /// **不能共用一对**：I/O 命令推进 `sq_tail` 会让 admin 的门铃值错位，
+    /// 而那种错表现成「admin 命令偶尔超时」，极难归因。
+    q: [QState; 2],
     /// 下一条命令的 CID
     next_cid: u16,
     /// 读回的读数
@@ -299,6 +326,8 @@ pub fn init() -> Result<Reading, NvmeError> {
     let asq_bus = base + OFF_ADMIN_SQ as u64;
     let acq_bus = base + OFF_ADMIN_CQ as u64;
     let data_bus = base + OFF_DATA as u64;
+    let cq1_bus = base + OFF_IO_CQ as u64;
+    let sq1_bus = base + OFF_IO_SQ as u64;
     // 环要先清零：NVMe 读 CQ 的 phase 位，脏数据会让"第一条完成"看起来已经到了。
     for off in (0..DMA_PAGES * crate::mm::PAGE).step_by(crate::mm::PAGE) {
         ctx.dma_fill(dma, off, 0, crate::mm::PAGE)?;
@@ -337,7 +366,21 @@ pub fn init() -> Result<Reading, NvmeError> {
     }
 
     // 到这里 RDY 一定是 0（起始未使能，或上面已经关掉），所以无条件写 CC.EN。
-    wr32(&ctx, mmio, REG_CC, CC_EN)?;
+    //
+    // **`CC` 要一次写全**：`IOSQES`(bit19..16) 与 `IOCQES`(bit23..20) 是
+    // **控制器级配置**，不是 Create 命令的字段 —— QEMU 在 `nvme_create_cq`
+    // 里读的是 `n->bar.cc`。只写 `EN` 会让 Create I/O CQ 报
+    // `err_invalid_create_cq_entry_size iosqes 0 iocqes 0`。
+    //
+    // **这条踩了两轮**：先试 CDW12、再试 CDW11，两处都写仍报 0，
+    // 而内存读回证明 dw12=0x46 真的写进去了 —— **那个矛盾才是提示：
+    // 读的不是我写的那个地方。** 它根本不在命令里。
+    //
+    // 规范 Figure 34：CC = EN(0) | CSS(6..4) | MPS(10..7) | AMS(13..11)
+    //   | SHN(15..14) | IOSQES(19..16) | IOCQES(23..20)。
+    // SQE 64 字节 ⇒ log2 = 6；CQE 16 字节 ⇒ log2 = 4。
+    let cc = CC_EN | ((SQE_LOG2 as u32) << 16) | ((CQE_LOG2 as u32) << 20);
+    wr32(&ctx, mmio, REG_CC, cc)?;
     // 等 RDY。窗口按"最多转这么多轮"给，而不是按周期——
     // 周期要时钟，而时钟标定可能还没跑（§442 那次就是这么红的）。
     let mut spins = 0u32;
@@ -362,9 +405,10 @@ pub fn init() -> Result<Reading, NvmeError> {
         data_bus,
         asq_bus,
         acq_bus,
-        sq_tail: 0,
-        cq_head: 0,
-        cq_phase: true, // 清零后第一圈 phase 是 1
+        cq1_bus,
+        sq1_bus,
+        // admin 队列在建 ASQ/ACQ 时就有了；I/O 队列的 depth 先 0（未建）
+        q: [QState::new(QDEPTH as u16), QState::new(0)],
         next_cid: 1,
         reading: Reading {
             bdf: dev.bdf,
@@ -380,6 +424,7 @@ pub fn init() -> Result<Reading, NvmeError> {
             lbads: 0,
             model: [0; 16],
             namespaces: 0,
+            io_queues: false,
         },
         nsze: 0,
         lba_bytes: 512,
@@ -434,10 +479,72 @@ pub fn init() -> Result<Reading, NvmeError> {
     st.reading.nsze = nsze;
     st.reading.lbads = lbads;
 
+    // ---- 6) 建 I/O 队列（两条 admin 命令）。失败不致命：
+    // 识别与容量两格已经成立，图案格会报 `IoQueueNotReady` 而不是静默错。
+    let io_ok = create_io_queues(&mut st).is_ok();
+    st.reading.io_queues = io_ok;
+    if !io_ok {
+        crate::log_warn!("nvme: I/O 队列没建起来 ⇒ 数据通路不可用（图案格会报 IoQueueNotReady）");
+    }
+
     let out = st.reading;
     // SAFETY: 见 `Cell`
     unsafe { *STATE.0.get() = Some(st) };
     Ok(out)
+}
+
+/// 建 I/O CQ + I/O SQ（NVMe 1.4 §5.2）。**两条都是 admin 队列命令。**
+///
+/// 顺序不能换：Create SQ 的 CDW11 要写它绑哪个 CQ，所以 CQ 得先存在。
+///
+/// 为什么 `IEN=0`（关中断）：我们轮询完成项（`wait_cqe`），不靠中断。
+/// 开中断还要配 MSI-X 向量，那是另一件事（`msix_probe` 那套）。
+/// 轮询对块层逐扇区的节奏足够，而且少一条「中断没来」的失败模式。
+fn create_io_queues(st: &mut State) -> Result<(), NvmeError> {
+    let depth = QDEPTH as u32;
+    // QSIZE 是「深度 - 1」（0 基）
+    let qsize = depth - 1;
+    let cq_bus = st.cq1_bus;
+    let sq_bus = st.sq1_bus;
+
+    // ---- Create I/O CQ：qid 1
+    let cid = submit(st, Q::Admin, OP_CREATE_CQ, 0, |st, off| {
+        // DPTR = PRP1 = I/O CQ 的物理地址
+        st.ctx.dma_write32(st.dma, off + 24, cq_bus as u32)?;
+        st.ctx.dma_write32(st.dma, off + 28, (cq_bus >> 32) as u32)?;
+        // CDW10 = QID(15..0) | QSIZE(31..16)
+        st.ctx.dma_write32(st.dma, off + 40, 1 | (qsize << 16))?;
+        // CDW11 = PC(0) | IEN(1) | IV(31..16)
+        //
+        // **实测定位（QEMU 11.1 + trace）**：
+        //   把条目大小放在 CDW11 的 bit16..23 时，trace 报 `vector=70`（0x46）
+        //   ⇒ QEMU 把 CDW11 的 bit16..31 当 IV。所以条目大小不能在那里。
+        // 规范 Figure 141：CDW12 = IOSQES(3..0) | IOCQES(7..4)。
+        //
+        // CDW11 = PC(0) | IEN(1) | IV(15..0)。**条目大小不在这条命令里** ——
+        // 它在 `CC` 寄存器（`IOSQES`/`IOCQES`），见 `init` 里 `CC` 的写法。
+        // 实测教训：把它塞进 dw11 的 bit16..31 会被当成 IV（trace 报 `vector=70`），
+        // 塞进 dw12 则完全无效（trace 仍报 `iosqes 0`）。
+        st.ctx.dma_write32(st.dma, off + 44, 1)?;
+        Ok(())
+    })?;
+    wait_cqe(st, Q::Admin, cid)?;
+    // ---- Create I/O SQ：qid 1，绑到 CQID 1
+    let cid = submit(st, Q::Admin, OP_CREATE_SQ, 0, |st, off| {
+        st.ctx.dma_write32(st.dma, off + 24, sq_bus as u32)?;
+        st.ctx.dma_write32(st.dma, off + 28, (sq_bus >> 32) as u32)?;
+        // CDW10 = QID(15..0) | QSIZE(31..16)
+        st.ctx.dma_write32(st.dma, off + 40, 1 | (qsize << 16))?;
+        // CDW11 = PC(bit0)=1 | QPRIO(2..1)=0 | CQID(31..16)=1
+        st.ctx.dma_write32(st.dma, off + 44, 1 | (1 << 16))?;
+        Ok(())
+    })?;
+    wait_cqe(st, Q::Admin, cid)?;
+
+    // 两条都成功了才把 depth 立起来——**失败时 depth 保持 0**，
+    // 于是 `submit(Q::Io)` 会明确返回 `IoQueueNotReady` 而不是发到一条半建的队列上。
+    st.q[1] = QState::new(QDEPTH as u16);
+    Ok(())
 }
 
 /// 发一条 Identify（CNS 选 Controller 或 Namespace），把 4096 字节读进 `out`。
@@ -450,7 +557,7 @@ fn identify(st: &mut State, cns: u32, nsid: u32, out: &mut [u8]) -> Result<(), N
         st.ctx.dma_write32(st.dma, off + 40, cns)?;
         Ok(())
     })?;
-    wait_cqe(st, cid)?;
+    wait_cqe(st, Q::Admin, cid)?;
     // 从数据页读回（Identify 的返回是 4096 字节）
     st.ctx.dma_copy_out(st.dma, OFF_IDENTIFY, &mut out[..IDENTIFY_BYTES])?;
     Ok(())
@@ -462,6 +569,16 @@ fn identify(st: &mut State, cns: u32, nsid: u32, out: &mut [u8]) -> Result<(), N
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Q { Admin, Io }
 
+impl Q {
+    /// 队列号。admin 恒 0，第一个 I/O 队列是 1（规范 §5.2）。
+    fn qid(self) -> u8 {
+        match self {
+            Q::Admin => 0,
+            Q::Io => 1,
+        }
+    }
+}
+
 fn submit(
     st: &mut State,
     q: Q,
@@ -469,11 +586,17 @@ fn submit(
     nsid: u32,
     fill: impl FnOnce(&mut State, usize) -> Result<(), NvmeError>,
 ) -> Result<u16, NvmeError> {
-    let slot = st.sq_tail as usize;
-    // SQE 基址与门铃偏移都跟着队列走。
+    let qid = q.qid();
+    let qs = st.q[qid as usize];
+    // 队列没建就明确拒绝（I/O 队列要等 Create I/O CQ/SQ 之后才有）
+    if qs.depth == 0 {
+        return Err(NvmeError::IoQueueNotReady);
+    }
+    let slot = qs.sq_tail as usize;
+    // SQE 基址与门铃偏移都跟着 qid 走（stride = 8，因为 CAP.DSTRD = 0）。
     let (sq_off, db_off) = match q {
         Q::Admin => (OFF_ADMIN_SQ, 0x1000usize),
-        Q::Io => (OFF_IO_SQ, 0x1008usize), // qid 1 的 SQ tail doorbell
+        Q::Io => (OFF_IO_SQ, 0x1000usize + 8), // qid 1 的 SQ tail doorbell
     };
     let off = sq_off + slot * SQE_BYTES;
     // 清掉上一条的残留：命令是 64 字节，不全会让"上一条的 CDW10"混进这一条。
@@ -487,77 +610,61 @@ fn submit(
     st.ctx.dma_write32(st.dma, off + 4, nsid)?;
     fill(st, off)?;
 
-    st.sq_tail = ((st.sq_tail as usize + 1) % QDEPTH) as u16;
+    let qs = &mut st.q[qid as usize];
+    qs.sq_tail = ((qs.sq_tail as usize + 1) % qs.depth as usize) as u16;
+    let tail = qs.sq_tail;
     // **屏障**：SQE 是 DMA 写、门铃是 MMIO 写，PCIe 上两者没有隐含顺序。
-    // 不屏障时门铃可能先到，设备读到一条不完整的命令 ⇒ 它不产生完成项
-    // （实测：第一条成功、第二条超时；游标与门铃值全对）。
     // 一次 MMIO **读**是可靠屏障——读会强制之前的写完成。
     let _ = rd32(&st.ctx, st.mmio, REG_CSTS)?;
-    // 敲门铃：管理队列的 SQ0 tail doorbell 在 0x1000。
-    //
-    // **已知未解**（ADR-169 未决 1，BACKLOG §451/§452）：设备只处理**第一条**命令，
-    // 第二条看不到。实测证据：
-    //   asq=0x98000 acq=0x99000（地址对）、sqe_dw0 slot=0/1 = 0x10006/0x20006（写对了）、
-    //   cqe_d3 slot=0 = 0x10001（第一条完成）、slot=1..7 全 0（**设备没写第二条**）。
-    // 所以不是 CID 报错，是那一格压根没被写过。
-    // **已排除的七个方向**（全部有实测读数，见 BACKLOG §451/§452）：
-    //   NSID（广播 0xFFFFFFFF 也失败）、命令类型（连发 Controller 也失败）、
-    //   队列深度（AQA 读写 = 0x70007）、游标与门铃值（slot/tail/head 全对）、
-    //   PCIe 内存序（门铃前 MMIO 读屏障无效）、CID 字段（SQE DW0 = 0x20006 正确）、
-    //   posted write 投递（双写门铃 + 中间读，仍无效）、地址（asq/acq 正确）。
-    //
-    // 下一轮应当**查 QEMU 源码**（`hw/nvme/ctrl.c` 的 `nvme_process_sq`）
-    // 或对照一个已知能工作的实现（UEFI Shell / Linux）的 admin 队列提交序列。
-    // **继续在本仓库里猜会浪费轮次。**
-    wr32(&st.ctx, st.mmio, db_off as u64, st.sq_tail as u32)?;
-
-    Ok(cid)
+    // 敲门铃。qid 0 = admin(0x1000)、qid 1 = I/O(0x1008)。
+    wr32(&st.ctx, st.mmio, db_off as u64, tail as u32)?;    Ok(cid)
 }
 
 /// 等一条命令的完成项。返回时已经把 CQ 的头推进过。
-fn wait_cqe(st: &mut State, cid: u16) -> Result<(), NvmeError> {
+fn wait_cqe(st: &mut State, q: Q, cid: u16) -> Result<(), NvmeError> {
+    let qid = q.qid();
     let mut spins = 0u32;
     loop {
         if spins >= 2_000_000 {
             return Err(NvmeError::CmdTimeout { cid });
         }
         spins += 1;
-        let off = OFF_ADMIN_CQ + st.cq_head as usize * CQE_BYTES;
-        let d2 = st.ctx.dma_read32(st.dma, off + 8)?;
+        let qs = st.q[qid as usize];
+        let cq_off = match qid {
+            0 => OFF_ADMIN_CQ,
+            _ => OFF_IO_CQ,
+        };
+        let off = cq_off + qs.cq_head as usize * CQE_BYTES;
         let d3 = st.ctx.dma_read32(st.dma, off + 12)?;
-        // CQE 的两个候选字段位置：
-        //   规范：DW2 = SQHD(16..31)|SQID(0..15)，DW3 = status|phase|CID(16..31)
-        //   实测：**CID 在 DW2 的低 16 位、status 在 DW2 的高 16 位**
+        // CQE 的 DW3 布局。
         //
-        // 实测证据（ADR-169 补记，两条独立来源）：
-        //   终诊 dump：slot=0 d2=0x1 d3=0x10001 / slot=1 d2=0x2 d3=0x10002
-        //   QEMU trace：enqueue_req_completion cid 1 status 0x0 / cid 2 status 0x0
-        // `d2` 的 1/2 与命令 CID 一一对应，而 `d3` 两条的 `>>16` 都是 1，分不开。
+        // **实测（QEMU 11.1）**：CID(0..15) | phase(16) | status(17..31)。
+        // 两条独立证据：
+        //   I/O READ：trace `cid 5 status 0x0` ↔ d3=0x10005
+        //             ⇒ CID=5、phase=1、status=0
+        //   Identify：d3=0x10001 ⇒ CID=1、phase=1、status=0
         //
-        // **两种来源都试**：哪个的 CID 等于我们要等的就用哪个。
-        // 真机上若布局与 QEMU 不同，这一条让它仍然工作；而判据不依赖单一假设。
-        let cid_dw2 = (d2 & 0xFFFF) as u16;
-        let st_dw2 = ((d2 >> 16) & 0x7FFF) as u16;
-        let cid_dw3 = (d3 >> 16) as u16;
-        let st_dw3 = ((d3 >> 1) & 0x7FFF) as u16;
-        // 这一格被写过：要么某一处的 CID 是我们的，要么 phase 与本圈一致。
-        let phase = d3 & 1;
-        let written = cid_dw2 == cid || cid_dw3 == cid || (phase == 1) == st.cq_phase;
+        // **规范 Figure 38 是 CID(16..31) | status(1..15) | phase(0)，与此不同。**
+        // 按规范写时 `0x10001` 恰好也得出 CID=1/status=0/phase=1（**巧合**），
+        // 于是 admin 队列「看起来能用」；而 `0x10005` 在旧假设下得出
+        // CID=1/status=2 ⇒ I/O 命令被判成 CmdFailed。
+        //
+        // **巧合通过的那一次掩盖了布局错误两轮**（BACKLOG §454）。
+        let got_cid = (d3 & 0xFFFF) as u16;
+        let phase = ((d3 >> 16) & 1) as u8;
+        let status = ((d3 >> 17) & 0x7FFF) as u16;
+        // 这一格被写过：CID 是我们的，或 phase 与本圈期望值一致。
+        let written = got_cid == cid || (phase == 1) == qs.phase;
         if written {
-            // 取与我们要等的那个匹配的 (cid, status) 对；都不匹配就用 DW2 那组。
-            let (got_cid, status) = if cid_dw2 == cid {
-                (cid_dw2, st_dw2)
-            } else if cid_dw3 == cid {
-                (cid_dw3, st_dw3)
-            } else {
-                (cid_dw2, st_dw2)
-            };
-            st.cq_head = ((st.cq_head as usize + 1) % QDEPTH) as u16;
-            if st.cq_head == 0 {
-                st.cq_phase = !st.cq_phase;
+            let qsm = &mut st.q[qid as usize];
+            qsm.cq_head = ((qsm.cq_head as usize + 1) % qsm.depth as usize) as u16;
+            if qsm.cq_head == 0 {
+                qsm.phase = !qsm.phase;
             }
-            // 推 CQ 门铃（0x1004），让设备知道这一格可以复用了
-            wr32(&st.ctx, st.mmio, 0x1004, st.cq_head as u32)?;
+            let head = qsm.cq_head;
+            // 推 CQ head 门铃：qid 0 = 0x1004、qid 1 = 0x100c
+            let cq_db = 0x1000usize + qid as usize * 8 + 4;
+            wr32(&st.ctx, st.mmio, cq_db as u64, head as u32)?;
             if status != 0 {
                 return Err(NvmeError::CmdFailed { cid: got_cid, status });
             }
@@ -594,13 +701,12 @@ fn io_lba(lba: u64, buf: &mut [u8], write: bool) -> Result<(), NvmeError> {
     } else {
         st.ctx.dma_fill(st.dma, OFF_DATA, 0, crate::mm::PAGE)?;
     }
-    // **I/O 队列还没建**（Create I/O CQ/SQ 是另一条命令序列，未做）。
-    // 这里必须**明确拒绝**，不能退回去用 admin 队列——
-    // 实测教训：用 admin 队列发 `OP_IO_READ`(0x02) 会被设备当成 Get Log Page，
-    // 返回 `status 0x4002`，而现场只说「命令失败」，看不出是发错了队列。
-    let _ = (write, buf);
-    return Err(NvmeError::IoQueueNotReady);
-    #[allow(unreachable_code)]
+    // 走 **I/O 队列**。`submit` 会在 `depth == 0`（队列没建起来）时返回
+    // `IoQueueNotReady` —— 那条保护在队列状态里，不在调用方硬编码。
+    //
+    // 实测教训（BACKLOG §453）：早先这里误用 admin 队列发 `OP_IO_READ`(0x02)，
+    // 被设备当成 Get Log Page，返回 `status 0x4002`，而现场只说「命令失败」。
+    // **opcode 按队列解释，发错队列不会报「队列错」。**
     let op = if write { OP_IO_WRITE } else { OP_IO_READ };
     let cid = submit(st, Q::Io, op, 1, |st, off| {
         // DPTR = PRP1 = 数据页
@@ -613,7 +719,7 @@ fn io_lba(lba: u64, buf: &mut [u8], write: bool) -> Result<(), NvmeError> {
         st.ctx.dma_write32(st.dma, off + 48, 0)?;
         Ok(())
     })?;
-    wait_cqe(st, cid)?;
+    wait_cqe(st, Q::Io, cid)?;
     if !write {
         st.ctx.dma_copy_out(st.dma, OFF_DATA, &mut buf[..n])?;
     }

@@ -17427,3 +17427,95 @@ QEMU 的 trace 一直在那里，我八轮没想到用它。
 2. 然后图案格才有意义；
 3. `nn=256` 仍是可疑读数（QEMU 只有一个 drive ⇒ 应为 1），但**不影响容量格**
    （容量走 NSZE，已对）。
+
+
+## 454. NVMe 三格全通：I/O 队列建起来、CQE 布局定死（2026-11-20）
+
+`nvme` 档 **PASS(33)**，三格全过：
+
+    nvme: 识别 bdf=6144 vendor=0x1b36 device=0x10 vs=0x10400 mqes=2048 nn=256 nsze=131072 lbads=9
+    nvme: 容量 扇区=131072 字节=67108864 lba=512
+    nvme: 读回 扇区0 首8=0x50a20d42b24c84c5 不符字节=0 图案=0x7e
+    nvme: 三格 识别=true 容量=true 图案=true ⇒ true
+
+`不符字节=0` —— 读回的 512 字节**全部**是 `qemu-io` 写的 `0x7E` 图案。
+
+### 这一轮踩的四个坑（每个都由 QEMU trace 定死）
+
+**① `iosqes`/`iocqes` 不在 Create 命令里，在 `CC` 寄存器**
+
+我连着两轮在「命令的哪个 DW」里找：
+
+| 尝试 | trace 报 |
+|---|---|
+| `dw12 = 0x46` | `iosqes 0 iocqes 0` |
+| `dw11 = 1 \| 6<<16 \| 4<<20` | `vector=70`（= 0x46，被当成 IV）、`iosqes 0` |
+| 两处都写 | `vector=70`、`iosqes 0` |
+
+**两处都写仍报 0，而内存读回证明 `dw12=0x46` 真的写进去了** ——
+**那个矛盾就是提示：读的不是我写的那个地方。**
+
+规范 Figure 34：`CC` 寄存器 bit19..16 = `IOSQES`、bit23..20 = `IOCQES`，
+它们是**控制器级配置**，QEMU 在 `nvme_create_cq` 里读 `n->bar.cc`。
+我只写了 `CC_EN`（bit0），没写这两个字段。
+
+**修**：`CC` 一次写全 `EN | IOSQES<<16 | IOCQES<<20`。
+
+**② CQE 的 DW3 布局与规范不同**
+
+实测（QEMU 11.1）：
+
+    DW3 = CID(0..15) | phase(16) | status(17..31)
+
+规范 Figure 38 是 `CID(16..31) | status(1..15) | phase(0)`。
+
+**两条独立证据**：
+
+| 命令 | trace | DW3 | 新布局解析 |
+|---|---|---|---|
+| I/O READ | `cid 5 status 0x0` | `0x10005` | CID=5、phase=1、status=0 ✅ |
+| Identify | `cid 1 status 0x0` | `0x10001` | CID=1、phase=1、status=0 ✅ |
+
+**③ 「巧合通过」掩盖了布局错误两轮**
+
+按规范布局解析 `0x10001` 也得出 CID=1/status=0/phase=1 —— **因为 CID=1、
+status=0 时两种布局给出相同结果**。于是 admin 队列「看起来能用」，
+而 `0x10005` 在旧布局下得出 CID=1/status=2 ⇒ I/O 命令被判成 `CmdFailed`。
+
+**这是本轮最该记的一条**：一个**恰好通过**的读数，比一个失败的读数更危险——
+它让错误的假设活过了两轮。
+
+**④ 两个队列的游标必须分开**
+
+原来 `sq_tail`/`cq_head`/`cq_phase` 是单对，admin 与 I/O 共用会互相踩。
+拆成 `QState[2]`（下标 = qid），每个队列有自己的游标、phase、depth。
+
+**`depth == 0` 表示队列没建**，`submit(Q::Io)` 会明确返回 `IoQueueNotReady`——
+错要错得明白。
+
+### 创建 I/O 队列的两条命令（NVMe 1.4 §5.2）
+
+    Create I/O CQ (opc 0x05, admin)：CDW10 = QID | QSIZE<<16，CDW11 = PC|IEN，DPTR = CQ 地址
+    Create I/O SQ (opc 0x01, admin)：CDW10 = QID | QSIZE<<16，CDW11 = PC | CQID<<16，DPTR = SQ 地址
+
+**顺序不能换**：SQ 的 CDW11 要写它绑哪个 CQ。
+
+**`IEN=0` 是有意的**：我们轮询完成项，不靠中断。开中断还要配 MSI-X 向量。
+
+### 读数
+
+| 项 | 值 |
+|---|---|
+| `check` | **18/18** |
+| 特性档 | **74/74** |
+| `nvme` 档 | **PASS(33)** |
+| `ktests`（nvme 档） | 全绿（`t_nvme_all` 过） |
+
+### 未做
+
+- **多台 NVMe**：`STATE` 是单例、`DiskKey::Nvme` 只留 2 格桶。
+- **中断（MSI-X）**：今天纯轮询。轮询对块层逐扇区够用，但高队列深度会吃 CPU。
+- **`nn=256` 仍是可疑读数**（QEMU 只有一个 drive ⇒ 应为 1），但不影响容量格
+  （容量走 NSZE，已对）。
+- **NVMe 还没接进 `Block` 的默认路径**：`NvmeDisk` 适配器在 `nvme` 特性下存在，
+  但没有任何 `mount` 走它——今天它只被 `t_nvme_all` 直接调用。
