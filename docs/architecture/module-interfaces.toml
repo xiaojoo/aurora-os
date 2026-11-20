@@ -531,14 +531,34 @@ status = "部分落地"
 module_id = "network"
 owner = "network"
 layer = "service"
-source_modules = ["network", "network/proto"]
+source_modules = [
+  "network", "network/arp", "network/arp_table", "network/dhcp", "network/dns", "network/eth",
+  "network/icmp", "network/ipv4", "network/proto"
+]
 # 今天只有边界声明与 `NetError`：协议实现仍在 `driver/virtio.rs` 里，**待搬迁**
 # （ADR-166 未决 1）。先登记"这个域存在、依赖谁、谁能调"，搬迁时往这里加成员。
 public_api = [
-  "network::NetError", "proto::DHCP_GUEST_IP", "proto::DNS_FRAME_BYTES", "proto::DNS_NAME_MAX",
-  "proto::NET_DNS_IP", "proto::NET_GATEWAY_IP", "proto::NET_SUBNET_MASK", "proto::NET_TX_MAX",
-  "proto::arp_learn_from_frame", "proto::arp_len", "proto::arp_lookup", "proto::arp_read_from",
-  "proto::build_dns_query_name", "proto::parse_dns_reply"
+  "network::NetError", "eth::NET_TYPE", "eth::NET_DST", "eth::NET_HEAD_BYTES",
+  "eth::NET_FRAME_BYTES", "eth::NET_PAYLOAD_BYTES", "eth::NET_MUL", "eth::NET_ADD",
+  "eth::NET_XOR", "eth::NET_TX_MAX", "eth::frame_hash", "dhcp::NET_TYPE_IPV4",
+  "dhcp::DHCP_CLIENT_PORT", "dhcp::DHCP_SERVER_PORT", "dhcp::DHCP_XID", "dhcp::DHCP_GUEST_IP",
+  "dhcp::DHCP_MAGIC", "dhcp::OPT_MSG_TYPE", "dhcp::OPT_SUBNET_MASK", "dhcp::OPT_ROUTER",
+  "dhcp::OPT_END", "dhcp::OPT_PAD", "dhcp::BOOTREQUEST", "dhcp::BOOTREPLY",
+  "dhcp::DHCP_DISCOVER", "dhcp::DHCP_OFFER", "dhcp::DHCP_ACK", "dhcp::DHCP_FRAME_BYTES",
+  "dhcp::Reply", "dhcp::parse_reply", "dhcp::build_dhcp_discover", "arp::NET_TYPE_ARP",
+  "arp::ARP_HTYPE_ETH", "arp::ARP_PTYPE_IPV4", "arp::ARP_REQUEST", "arp::ARP_REPLY",
+  "arp::ARP_LEN", "arp::NET_GATEWAY_IP", "arp::ARP_FRAME_BYTES", "arp::ArpReply",
+  "arp::build_arp_request", "arp::parse_arp_reply", "icmp::NET_TYPE_ICMP",
+  "icmp::ICMP_ECHO_REQUEST", "icmp::ICMP_ECHO_REPLY", "icmp::ICMP_ECHO_ID",
+  "icmp::ICMP_PAYLOAD", "icmp::ICMP_FRAME_BYTES", "icmp::IcmpReply",
+  "icmp::build_icmp_echo_request", "icmp::parse_icmp_reply", "dns::NET_DNS_IP",
+  "dns::DNS_CLIENT_PORT", "dns::DNS_QUERY_PORT", "dns::DNS_QTYPE_A", "dns::DNS_QCLASS_IN",
+  "dns::DNS_FRAME_BYTES", "dns::DNS_NAME_MAX", "dns::DnsReply", "dns::build_dns_query",
+  "dns::build_dns_query_name", "dns::parse_dns_reply", "arp_table::ARP_TABLE_MAX",
+  "arp_table::ArpStats", "arp_table::arp_lookup", "arp_table::arp_learn",
+  "arp_table::arp_stats", "arp_table::arp_read_from", "arp_table::arp_len",
+  "ipv4::NET_SUBNET_MASK", "ipv4::is_local_subnet", "ipv4::next_hop",
+  "ipv4::arp_learn_from_frame", "ipv4::ip_cksum"
 ]
 # 今天**无人调用**（协议还在 driver 里）；按实测填空，搬迁后再长出来。
 allowed_callers = ["driver"]
@@ -546,7 +566,9 @@ allowed_callers = ["driver"]
 # 反向依赖会让驱动不得不认识协议，那正是 ADR-166 要拆掉的东西。
 # 今天**无源码依赖**：`network/mod.rs` 只 use 了 core。
 # 登记表写的是「现在是什么」，不是「打算变成什么」——计划属 ADR，事实属这里。
-dependencies = ["driver"]
+# ADR-171：协议拆成 7 个文件后 `network` **不再依赖 driver**
+# （`fnv1a64` 换成自带的 `eth::frame_hash`）⇒ 出环。
+dependencies = []
 forbidden_dependencies = ["storage", "display", "input"]
 known_violations = []
 test_targets = []
@@ -571,7 +593,7 @@ public_api = [
   "virtio::net_info", "ahci::State", "ahci::info", "ahci::state", "nvme::NvmeError",
   "nvme::read_lba", "nvme::write_lba"
 ]
-allowed_callers = ["diagnostics", "integration", "network", "sched", "storage"]
+allowed_callers = ["diagnostics", "integration", "sched", "storage"]
 dependencies = ["arch", "boot", "irq", "memory", "network", "pci", "time"]
 forbidden_dependencies = ["storage"]
 known_violations = []
@@ -1025,7 +1047,7 @@ status = "部分落地"
 [baseline]
 # 当前产品代码的强连通分量（Task B 冻结基线）：新增环成员或改环 ⇒ check 红。
 known_scc = [
-  ["arch", "boot", "diagnostics", "driver", "irq", "memory", "network", "pci", "resource", "sync", "time"],
+  ["arch", "boot", "diagnostics", "driver", "irq", "memory", "pci", "resource", "sync", "time"],
 ]
 
 [baseline.ring_edge_sites]
@@ -1047,7 +1069,6 @@ known_scc = [
 "driver->boot" = 1
 "driver->irq" = 19
 "driver->memory" = 21
-"driver->network" = 2
 "driver->pci" = 21
 "driver->time" = 13
 "irq->arch" = 29
@@ -1058,7 +1079,6 @@ known_scc = [
 "memory->resource" = 2
 "memory->sync" = 7
 "memory->time" = 2
-"network->driver" = 8
 "pci->memory" = 9
 "resource->memory" = 1
 "resource->sync" = 2

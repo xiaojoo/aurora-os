@@ -75,7 +75,9 @@ expires = "M4-2 之后如果它继续当夹具，这两处仍然是全部 unsafe
 # 本轮普查：278 处 = U1 53 + U2 60 + U3 13 + U4 103 + U5 28 + U6 21
 # 2026-11-07 P7：hello 加了 syscall3（U1 两处）与 ring3 句柄读/close（U5 三处）。
 
-[modules."network/proto"]
+# ADR-171：协议按文件拆开，ARP 表那 6 处 U4 跟着搬到 `arp_table.rs`。
+# **总数不变（6 → 6）**，只是归属变了——这张表是 `network` 域唯一的并发共享状态。
+[modules."network/arp_table"]
 U4 = 6
 [modules."driver/nvme"]
 U4 = 7

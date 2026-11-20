@@ -6022,12 +6022,16 @@ def check_net_pattern() -> list[str]:
     才知道 pcap 里那个包是不是我们声称发出去的那一帧。两边各写一份而不对账，改一边就把判据
     变成"只在两边一起错时才红"——而那是它唯一不需要证明的事。
     """
-    # ADR-166 把帧布局常量与 DHCP 那三个号下沉到了 `network/proto.rs`。
-    # **两个文件都扫**而不是改成一个：判据是「内核侧数值 == 宿主机重算值」，
-    # 查找范围扩大不放宽判据（常量真被改名/删掉仍然红）；而 ADR-166 还计划
-    # 把协议拆成 7 个文件，扫协议层比钉死某个文件耐久。
-    src = (kernel_src("virtio").read_text(encoding="utf-8")
-           + "\n" + kernel_src("proto").read_text(encoding="utf-8"))
+    # ADR-171 把协议拆成了 7 个文件（`eth`/`arp`/`ipv4`/`icmp`/`dns`/`dhcp`/
+    # `arp_table`），常量按归属散在各处。**扫整个 `network/` 目录**：
+    # 判据仍是「内核侧数值 == 宿主机重算值」，查找范围扩大**不放宽判据**
+    # （常量真被改名/删掉仍然红）；而且将来再加协议文件不用改门禁。
+    #
+    # 驱动侧的 `virtio.rs` 也一起扫：它 re-export 了这些常量，
+    # 若哪天有人在那边写死一个数，这条闸也要能看见。
+    src = kernel_src("virtio").read_text(encoding="utf-8")
+    for _f in sorted((ROOT / "kernel" / "src" / "network").glob("*.rs")):
+        src += "\n" + _f.read_text(encoding="utf-8")
     # 内核侧这几个数三种写法都有：十进制（步长 `11`）、十六进制（图案那两个字节）、
     # 加法（`6 + 6 + 2`：谁跟谁加起来）。三种都吃，比较一律按**数值** ——
     # 按渲染比会把 `11` 与 `0x0B` 报成不一致（这条门禁第一次跑就是这么红的，红的是量具）

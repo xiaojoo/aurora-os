@@ -14,6 +14,14 @@
 //! 依赖方向是 **`network → driver`**（单向）：协议通过驱动的收发原语工作。
 //! 所以这一层不反向引用驱动，而是让驱动把字节交上来。
 
+// ADR-171：协议按文件拆开。`proto` 保留为重导出层（既有路径不变）。
+pub mod arp;
+pub mod arp_table;
+pub mod dhcp;
+pub mod dns;
+pub mod eth;
+pub mod icmp;
+pub mod ipv4;
 pub mod proto;
 
 

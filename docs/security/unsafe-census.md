@@ -3,8 +3,8 @@
 > 本文件与 `docs/security/unsafe-whitelist.toml` 同源：上面的登记表存「模块 × 类别 → 处数」，这里给出每一处**具体在哪一行、长什么样**，
 > 供「类别判错了要能翻到现场」时使用。数字由 `python tools/aurora.py check`（`check-unsafe`）双向对账。
 >
-> **2026-11-20（ADR-169 NVMe）**：`driver/nvme` 新增 U4 7 处
-> （`STATE` 的 `UnsafeCell` 与 4 个 `dma_*` 访问点）。
+> **2026-11-20（ADR-171 协议拆文件）**：`network/proto` 的 U4 6 处
+> 跟着 ARP 表搬到 `network/arp_table`。**总数不变（6 → 6）**。
 
 总计 530 处。U1 85 · U2 119 · U3 13 · U4 149 · U5 128 · U6 36
 
@@ -227,13 +227,13 @@
 
 | 类别 | 行 | 形状 |
 |---|---|---|
-| U4 | 176 | `unsafe impl Sync for Cell {}  struct State {` |
-| U4 | 208 | `unsafe { (*STATE.0.get()).as_ref().map(\|s\| s.reading) } } ` |
-| U4 | 214 | `unsafe { (*STATE.0.get()).as_ref().map(\|s\| s.nsze) } } ` |
-| U4 | 220 | `unsafe { (*STATE.0.get()).as_ref().map(\|s\| s.lba_bytes) } } ` |
-| U4 | 244 | `if unsafe { (*STATE.0.get()).is_some() } { // 幂等：已经初始化过就直接回读数 return Ok(reading().unwrap_or_else(\|\| unreacha` |
-| U4 | 425 | `unsafe { *STATE.0.get() = Some(st) }; Ok(out) }` |
-| U4 | 526 | `let st = unsafe { (*STATE.0.get()).as_mut() }.ok_or(NvmeError::NoDevice)?; let n = buf.len().min(st.lba_bytes)` |
+| U4 | 199 | `unsafe impl Sync for Cell {}  /// 一个队列的提交/完成游标。` |
+| U4 | 252 | `unsafe { (*STATE.0.get()).as_ref().map(\|s\| s.reading) } } ` |
+| U4 | 258 | `unsafe { (*STATE.0.get()).as_ref().map(\|s\| s.nsze) } } ` |
+| U4 | 264 | `unsafe { (*STATE.0.get()).as_ref().map(\|s\| s.lba_bytes) } } ` |
+| U4 | 288 | `if unsafe { (*STATE.0.get()).is_some() } { // 幂等：已经初始化过就直接回读数 return Ok(reading().unwrap_or_else(\|\| unreacha` |
+| U4 | 492 | `unsafe { *STATE.0.get() = Some(st) }; Ok(out) }` |
+| U4 | 696 | `let st = unsafe { (*STATE.0.get()).as_mut() }.ok_or(NvmeError::NoDevice)?; let n = buf.len().min(st.lba_bytes)` |
 
 ### driver/virtio
 
@@ -464,16 +464,16 @@
 | U2 | 273 | `unsafe { core::ptr::copy(src.as_ptr().add(done), (pa + hhdm) as *mut u8, k) }; done += k; }` |
 | U2 | 306 | `unsafe { core::ptr::copy((pa + hhdm) as *const u8, dst.as_mut_ptr().add(done), k) }; done += k; }` |
 
-### network/proto
+### network/arp_table
 
 | 类别 | 行 | 形状 |
 |---|---|---|
-| U4 | 275 | `unsafe impl Sync for ArpCell {} static ARP: ArpCell = ArpCell(core::cell::UnsafeCell::new(ArpTable { ips: [[0;` |
-| U4 | 285 | `let t = unsafe { &mut *ARP.0.get() }; let mut i = 0usize; while i < t.n {` |
-| U4 | 301 | `let t = unsafe { &mut *ARP.0.get() }; t.learns += 1; let mut i = 0usize;` |
-| U4 | 332 | `let t = unsafe { &*ARP.0.get() }; ArpStats { hits: t.hits, misses: t.misses, learns: t.learns, evicts: t.evict` |
-| U4 | 341 | `let t = unsafe { &*ARP.0.get() }; let mut n = 0usize; let mut i = cursor as usize;` |
-| U4 | 357 | `let t = unsafe { &*ARP.0.get() }; t.n as u32 }` |
+| U4 | 28 | `unsafe impl Sync for ArpCell {} static ARP: ArpCell = ArpCell(core::cell::UnsafeCell::new(ArpTable { ips: [[0;` |
+| U4 | 38 | `let t = unsafe { &mut *ARP.0.get() }; let mut i = 0usize; while i < t.n {` |
+| U4 | 54 | `let t = unsafe { &mut *ARP.0.get() }; t.learns += 1; let mut i = 0usize;` |
+| U4 | 85 | `let t = unsafe { &*ARP.0.get() }; ArpStats { hits: t.hits, misses: t.misses, learns: t.learns, evicts: t.evict` |
+| U4 | 94 | `let t = unsafe { &*ARP.0.get() }; let mut n = 0usize; let mut i = cursor as usize;` |
+| U4 | 110 | `let t = unsafe { &*ARP.0.get() }; t.n as u32 }` |
 
 ### sched/mod
 
