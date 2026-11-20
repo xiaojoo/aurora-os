@@ -74,11 +74,23 @@ fn t_sdkdemo() -> bool {
         );
         return false;
     }
-    let uid = crate::user::read_at(base + 8).unwrap_or(u64::MAX);
-    let gid = crate::user::read_at(base + 16).unwrap_or(u64::MAX);
-    let caps = crate::user::read_at(base + 24).unwrap_or(0);
-    let dev = crate::user::read_at(base + 32).unwrap_or(9);
-    let consistent = crate::user::read_at(base + 40).unwrap_or(0);
+    // **不再 `unwrap_or` 兜底**（硬约束 6）：读失败必须与「值不对」分开报。
+    //
+    // 实测（BACKLOG §459）：`dev = read_at(base+32).unwrap_or(9)` 把
+    // 「读用户页被拒」变成了「读到了 9」，于是判据报「40 号没回答」——
+    // 而真正的原因是 `abi: 读用户页被拒 va=0x100002020`，在另一行日志里。
+    // **读不到 ≠ 值不对**，两者的处置方向完全不同。
+    let uid = crate::user::read_at(base + 8);
+    let gid = crate::user::read_at(base + 16);
+    let caps = crate::user::read_at(base + 24);
+    let dev = crate::user::read_at(base + 32);
+    let consistent = crate::user::read_at(base + 40);
+    // 五个槽全读到了，后面的判据才有意义。读不到时它单独红一格。
+    let readable = uid.is_some()
+        && gid.is_some()
+        && caps.is_some()
+        && dev.is_some()
+        && consistent.is_some();
 
     // ① **38 号给出了一个明确的回答**：要么读到真凭据（uid != u64::MAX），
     //    要么明确说"没有"（uid == u64::MAX）。**两种都算过**——
@@ -86,20 +98,26 @@ fn t_sdkdemo() -> bool {
     //    所以 `uid=u64::MAX` 是**正确结果**，不是失败。
     //    （凭据的授予与差异由 `a3-cred-guest` 档 + ADR-151 那条判定行覆盖。）
     let g1 = true;
-    // ② 40 号真回答了（dev 只能是 0 或 1）
-    let g2 = dev <= 1;
+    // ② 40 号真回答了（dev 只能是 0 或 1）。**读不到时这一格不参与**——
+    //    它已经由 `readable` 那一格报了，强行判假会让成因说谎。
+    let g2 = dev.is_none_or(|d| d <= 1);
     // ③ 自洽：`dev` 必须与 caps 的 CAP_DEV 位一致
-    let expect_dev = (caps & u64::from(crate::cred::CAP_DEV)) == u64::from(crate::cred::CAP_DEV);
+    let expect_dev = caps.is_some_and(|c| {
+        (c & u64::from(crate::cred::CAP_DEV)) == u64::from(crate::cred::CAP_DEV)
+    });
     // `consistent`：1=自洽、0=不自洽、2=回读失败（写没生效）。
     // **三种分开报**：把 2 说成"不自洽"会把"写失败"伪装成"程序逻辑错"。
-    let g3 = consistent == 1;
+    let g3 = consistent == Some(1);
     // 读数里 `uid=18446744073709551615` 是"没有凭据"的哨兵（u64::MAX）——
     // 本用例这条路径不授凭据，所以那是**正确读数**，判据不据此报红。
     crate::log_info!(
-        "sdkdemo: 判据 38号有回答={} 40号有回答={} 自洽={} 读数 uid={} gid={} caps={} dev={}",
-        g1, g2, g3, uid, gid, caps, dev
+        "sdkdemo: 判据 读得到={} 38号有回答={} 40号有回答={} 自洽={} \
+         读数 uid={:?} gid={:?} caps={:?} dev={:?} consistent={:?}",
+        readable, g1, g2, g3, uid, gid, caps, dev, consistent
     );
-    let ok = g1 && g2 && g3;
+    // **`readable` 是独立一格**：它红的时候日志直接说「读不到」，
+    // 而不再伪装成「40 号没回答」。
+    let ok = readable && g1 && g2 && g3;
     if !ok {
         crate::log_fatal!("sdkdemo: 样板不成立（上面一行是全部读数）");
     }

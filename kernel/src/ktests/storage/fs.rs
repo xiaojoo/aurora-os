@@ -588,6 +588,12 @@ fn t_fat32_exec() -> bool {
         crate::log_fatal!("elfdisk: APIC 起不来，跑不了时间片");
         return false;
     }
+    // 句柄基线（ADR-174）：`table_clean` 判「本用例授出的句柄回到基线」，
+    // 不判「全系统归零」——后者会把**启动任务的常驻句柄**算进来 ⇒ 单跑绿、整链红。
+    //
+    // **记在用例开头**（与下面 `before` 同一位置）：若记在句柄路径那段之后，
+    // 那段万一泄漏就已经被算进基线，判据看不见。
+    let h_before = crate::handle::live();
     let before = mm::reservation_count();
     let vol = match Volume::mount(&AhciDisk { port: FAT_PORT_A }) {
         Ok(v) => v,
@@ -892,7 +898,13 @@ fn t_fat32_exec() -> bool {
     // ring3 那两格：由**用户侧**写，内核只读。close 的成功不单占一格——`live()==0` 就是见证。
     let h_magic = user::read_at(loaded.data_va + user::ABI_SLOT_H_MAGIC);
     let h_done = user::read_at(loaded.data_va + user::ABI_SLOT_H_DONE);
-    let table_clean = crate::handle::live() == 0;
+    // **比基线，不比 0**：`live()==0` 要求全系统归零，而启动任务有自己的常驻句柄
+    // （`handle-reap` 明写「启动任务句柄还在=true」）⇒ 只要本用例排在 `handle-*`
+    // 之后，那条判据必然红。实测 run-8163 就是这样：单跑绿、整链红。
+    //
+    // 改判「回到本用例开始前的基线」——它问的正是「我们授出的那个句柄关掉了没」。
+    // **没放宽**：用户程序若漏 close，`live()` 会比基线多 1，仍然红。
+    let table_clean = crate::handle::live() == h_before;
     let ring3_ok = h_magic == Some(0x464c_457f)
         && h_done == Some(0x4844_4f4e_45)
         && table_clean;
