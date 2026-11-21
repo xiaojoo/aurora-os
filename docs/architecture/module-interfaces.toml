@@ -316,10 +316,29 @@ status = "部分落地"
 module_id = "sched"
 owner = "sched"
 layer = "service"
-source_modules = ["sched", "sched/proc", "sched/user", "sched/elf"]
+source_modules = ["sched", "sched/proc", "sched/user", "sched/elf", "sched/signal"]
 public_api = [
   "sched::record_exit_code",
   "user::exec_verify_counters",
+  "user::deliver",
+  "signal::NSIG",
+  "signal::active_of",
+  "signal::clear_active",
+  "signal::clear_task",
+  "signal::handler_of",
+  "signal::note_delivered",
+  "signal::note_dropped",
+  "signal::note_returned",
+  "signal::raise",
+  "signal::reset_counters",
+  "signal::set_active",
+  "signal::set_mask",
+  "signal::take_pending",
+  "signal::mask_of",
+  "signal::sigaction",
+  "signal::delivered",
+  "signal::dropped",
+  "signal::returned",
   "elf::ElfError",
   "elf::Program",
   "elf::USER_VA_TOP",

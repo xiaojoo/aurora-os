@@ -2590,6 +2590,7 @@ pub fn install_arch_hooks() {
         // ADR-067/P5：#PF 修复接缝装的是 mm 的实现（sched 只是安装方，不加自己的逻辑）。
         demand_zero: mm::demand_zero_try,
         cow: mm::cow_try,
+        deliver_signal: |f| { crate::user::deliver(f); },
     });
 }
 
@@ -2611,4 +2612,5 @@ fn preempt_hook(frame: u64, cpu: usize) {
 // 谁在跑（`sched`/`proc`）、它手里的地址空间长什么样（`user`/`elf`）。
 pub(crate) mod elf;
 pub(crate) mod proc;
+pub(crate) mod signal;
 pub(crate) mod user;

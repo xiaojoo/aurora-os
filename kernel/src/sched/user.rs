@@ -225,6 +225,23 @@ pub const SYS_FS_CREATE: u64 = 70;
 /// 71：`fs_unlink` —— 删一个文件。`rdi`=路径、`rsi`=路径长 → 0。
 pub const SYS_FS_UNLINK: u64 = 71;
 
+/// 67：`sigaction` —— 注册信号处理函数。`rdi`=signo、`rsi`=handler、`rdx`=flags → 旧 handler。
+///
+/// `handler == 0` 表示恢复默认动作。`signo` 范围 1..=32（`signal::NSIG`）。
+/// **flags 今天只接受 0**：`SA_RESTART`/`SA_NODEFER` 等语义都没有实现，
+/// 接受非 0 却不做事等于撒谎。
+pub const SYS_SIGACTION: u64 = 67;
+/// 68：`sigreturn` —— 从信号处理函数返回，恢复被中断的上下文。无参数 → 0。
+///
+/// 它读的是**用户栈顶那份 `TrapFrame`**（投递时压的），读回来整份覆盖当前 frame，
+/// 于是 `iretq` 自然回到被中断的那条指令。
+pub const SYS_SIGRETURN: u64 = 68;
+/// 69：`sigmask` —— 设置信号屏蔽字。`rdi`=how、`rsi`=mask → 旧 mask。
+///
+/// **今天只存不用**（见 `signal` 模块头）：屏蔽字被记下来，但投递时不查它。
+/// 这一点写在 ABI 文档里，不假装它生效。
+pub const SYS_SIGMASK: u64 = 69;
+
 /// 62–63：**保留，不分配**。留给下一个未预见的族。
 ///
 /// 不在这里定义具体常量——定义了就等于暗示「已经想好给谁」。
@@ -697,6 +714,181 @@ fn sys_fs_unlink(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
         Err(crate::filesystem::vfs_ro::VfsError::IsDir) => E_IS_DIR,
         Err(e) => vfs_err_ret(e),
     }
+}
+// ---------------------------------------------------------------- 67/68/69（ADR-177 信号族）
+
+/// 信号帧在用户栈上的布局：**整份 `TrapFrame` + 一个魔数**。
+///
+/// 魔数在**最高地址**（压栈顺序：先压 frame，再压魔数，所以 rsp 指向魔数）。
+/// 为什么需要它：`sigreturn` 要从用户给的 rsp 读回一份 184 字节的上下文，
+/// 而用户可以把 rsp 指到任何地方。魔数让「这看起来像一份信号帧」变成一个**可判**的事，
+/// 而不是「读回来什么都信」。没有它，一个野 rsp 会让内核按垃圾值 `iretq`——
+/// 那是把用户态的错误变成内核的任意跳转。
+const SIG_MAGIC: u64 = 0x5149_4746_5241_4D45; // "QIGFRAME"
+
+/// 在 ring3 返回路径上投递一个待处理信号。**返回 true = 已经改好 frame，直接 iretq**。
+///
+/// ## 调用前提（由 `trap.rs` 保证）
+///
+/// 1. 来自 ring3（内核任务没有信号）；
+/// 2. 当前不在信号 handler 里（`active == 0`）——**不嵌套**。
+///    嵌套要在栈上叠多份帧，而今天没有任何调用方需要它；做了就是给一条没走过的路。
+///
+/// ## 失败处置
+///
+/// 压栈失败（用户栈不可写）⇒ **丢弃这个信号 + 计数 + 返回 false**，任务继续跑。
+/// 不杀任务：投递失败是内核这边的条件不满足，不是这个任务做错了什么。
+pub fn deliver(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> bool {
+    let task = crate::sched::current_id();
+    if task >= crate::sched::MAX_TASKS_TOTAL {
+        return false;
+    }
+    // 已经在 handler 里就不嵌套
+    if crate::sched::signal::active_of(task) != 0 {
+        return false;
+    }
+    let signo = crate::sched::signal::take_pending(task);
+    if signo == 0 {
+        return false;
+    }
+    let handler = crate::sched::signal::handler_of(task, signo);
+    if handler == 0 {
+        // 取走之后 handler 没了（并发 sigaction(0)）⇒ 丢掉，不投递
+        crate::sched::signal::note_dropped();
+        return false;
+    }
+    // 用户栈顶：从 frame.rsp 往下压。先按 16 字节对齐（SysV ABI 的调用约定），
+    // 再留出 frame + 魔数的空间。
+    let frame_bytes = core::mem::size_of::<crate::arch::x86_64::trap::TrapFrame>() as u64;
+    let need = frame_bytes + 8;
+    let mut sp = frame.rsp & !0xF;
+    if sp < need + 64 {
+        // 栈顶太低（几乎没空间）：丢掉，不去赌它够
+        crate::sched::signal::note_dropped();
+        return false;
+    }
+    sp -= need;
+    // 压：整份 frame 在最前面，魔数在最后
+    // SAFETY: `frame` 是栈上真实的 TrapFrame；`copy_to_user` 做指针校验与映射检查，
+    // 失败会返回 Err 而不是越界写。这里按字节切片读它——它全是 u64，没有填充。
+    let raw = unsafe {
+        core::slice::from_raw_parts(frame as *const _ as *const u8, frame_bytes as usize)
+    };
+    if copy_to_user(raw, sp).is_err() {
+        crate::sched::signal::note_dropped();
+        return false;
+    }
+    if copy_to_user(&SIG_MAGIC.to_le_bytes(), sp + frame_bytes).is_err() {
+        crate::sched::signal::note_dropped();
+        return false;
+    }
+    // 改 frame：rip 跳 handler、rsp 指到信号帧、rdi 传信号号（handler(signo) 的形状）
+    frame.rip = handler;
+    frame.rsp = sp;
+    frame.rdi = signo as u64;
+    crate::sched::signal::set_active(task, signo);
+    crate::sched::signal::note_delivered();
+    true
+}
+
+/// 67：注册信号处理函数。
+#[cfg(feature = "handles")]
+fn sys_sigaction(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let Some(_owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
+    let signo = frame.rdi as u32;
+    if signo == 0 || signo > crate::sched::signal::NSIG {
+        return E_INVALID;
+    }
+    // flags 只接受 0：SA_RESTART / SA_NODEFER 都没实现，接受非 0 却不做事等于撒谎
+    if frame.rdx != 0 {
+        return E_NOT_SUPPORTED;
+    }
+    let task = crate::sched::current_id();
+    match crate::sched::signal::sigaction(task, signo, frame.rsi) {
+        Some(old) => {
+            SIGACTION_CALLS.fetch_add(1, Ordering::Relaxed);
+            old
+        }
+        None => E_INVALID,
+    }
+}
+
+/// 68：从信号处理函数返回。**整份恢复**被中断的上下文。
+///
+/// 它读的是**当前用户 rsp 指向的那份 `TrapFrame`**（投递时压的），
+/// 校验魔数之后整份覆盖 `frame`。于是 `iretq` 自然回到被中断的那条指令，
+/// 寄存器、rflags、栈指针全部与进 handler 之前一致。
+#[cfg(feature = "handles")]
+fn sys_sigreturn(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let Some(_owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
+    let task = crate::sched::current_id();
+    let frame_bytes = core::mem::size_of::<crate::arch::x86_64::trap::TrapFrame>() as u64;
+    let sp = frame.rsp;
+    // 先验魔数：它把「这看起来像一份信号帧」变成一个可判的事
+    let mut magic = [0u8; 8];
+    match copy_from_user(sp + frame_bytes, &mut magic) {
+        Ok(8) => {}
+        _ => return E_FAULT,
+    }
+    if u64::from_le_bytes(magic) != SIG_MAGIC {
+        // 不是信号帧：**不恢复**。一个野 rsp 不能变成内核按垃圾 iretq。
+        return E_INVALID;
+    }
+    // 读回整份 frame
+    let mut buf = [0u8; 184]; // TrapFrame = 23 × u64
+    let want = frame_bytes as usize;
+    if want != buf.len() {
+        return E_NOT_SUPPORTED; // 结构变了而这里没跟上：明确拒，不按旧尺寸读
+    }
+    match copy_from_user(sp, &mut buf[..want]) {
+        Ok(n) if n == want => {}
+        _ => return E_FAULT,
+    }
+    // 整份覆盖。**注意不覆盖 vector/error_code**：那是「这次陷进内核的原因」，
+    // 由硬件决定；用户给的副本里这两个字段可能是上次的值。
+    let saved: &crate::arch::x86_64::trap::TrapFrame =
+        unsafe { &*(buf.as_ptr() as *const crate::arch::x86_64::trap::TrapFrame) };
+    frame.r15 = saved.r15;
+    frame.r14 = saved.r14;
+    frame.r13 = saved.r13;
+    frame.r12 = saved.r12;
+    frame.r11 = saved.r11;
+    frame.r10 = saved.r10;
+    frame.r9 = saved.r9;
+    frame.r8 = saved.r8;
+    frame.rbp = saved.rbp;
+    frame.rdi = saved.rdi;
+    frame.rsi = saved.rsi;
+    frame.rdx = saved.rdx;
+    frame.rcx = saved.rcx;
+    frame.rbx = saved.rbx;
+    frame.rax = saved.rax;
+    frame.rip = saved.rip;
+    frame.cs = saved.cs;
+    frame.rflags = saved.rflags;
+    frame.rsp = saved.rsp;
+    frame.ss = saved.ss;
+    crate::sched::signal::clear_active(task);
+    crate::sched::signal::note_returned();
+    SIGRETURN_CALLS.fetch_add(1, Ordering::Relaxed);
+    0
+}
+
+/// 69：设置信号屏蔽字。
+///
+/// **今天只存不用**：屏蔽字被记下来并原样返回旧值，但投递路径不查它。
+/// 这一点在 ABI 文档里明写，不假装它生效——「检测到」不等于「已生效」是同一条纪律。
+#[cfg(feature = "handles")]
+fn sys_sigmask(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let Some(_owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
+    // how 只接受 0（SIG_SETMASK 的语义）。SIG_BLOCK/SIG_UNBLOCK 没有实现。
+    if frame.rdi != 0 {
+        return E_NOT_SUPPORTED;
+    }
+    let task = crate::sched::current_id();
+    let old = crate::sched::signal::set_mask(task, frame.rsi as u32);
+    SIGMASK_CALLS.fetch_add(1, Ordering::Relaxed);
+    old as u64
 }
 #[cfg(feature = "handles")]
 #[inline(never)]
@@ -3085,6 +3277,10 @@ static MMAP_PAGES: AtomicU64 = AtomicU64::new(0);
 /// 「建了 10 个删了 9 个」与「建了 1 个删了 0 个」的区别。
 static FS_CREATE_CALLS: AtomicU64 = AtomicU64::new(0);
 static FS_UNLINK_CALLS: AtomicU64 = AtomicU64::new(0);
+/// ADR-177 信号族：三个号各自的调用次数。
+static SIGACTION_CALLS: AtomicU64 = AtomicU64::new(0);
+static SIGRETURN_CALLS: AtomicU64 = AtomicU64::new(0);
+static SIGMASK_CALLS: AtomicU64 = AtomicU64::new(0);
 static KILLS: AtomicU64 = AtomicU64::new(0);
 static EXITS: AtomicU64 = AtomicU64::new(0);
 /// 被指针校验挡下来的次数（判据要能区分"内核拒了"与"内核根本没检查"）
@@ -3119,6 +3315,16 @@ pub fn fs_create_calls() -> u64 {
 }
 pub fn fs_unlink_calls() -> u64 {
     FS_UNLINK_CALLS.load(Ordering::Relaxed)
+}
+/// ADR-177 信号族：三个号各自的调用次数。
+pub fn sigaction_calls() -> u64 {
+    SIGACTION_CALLS.load(Ordering::Relaxed)
+}
+pub fn sigreturn_calls() -> u64 {
+    SIGRETURN_CALLS.load(Ordering::Relaxed)
+}
+pub fn sigmask_calls() -> u64 {
+    SIGMASK_CALLS.load(Ordering::Relaxed)
 }
 
 /// ADR-176：**"号登记了，但这份构建没实现它"的唯一出口**。
@@ -3160,6 +3366,10 @@ fn reset_counters() {
     MMAP_PAGES.store(0, Ordering::Relaxed);
     FS_CREATE_CALLS.store(0, Ordering::Relaxed);
     FS_UNLINK_CALLS.store(0, Ordering::Relaxed);
+    SIGACTION_CALLS.store(0, Ordering::Relaxed);
+    SIGRETURN_CALLS.store(0, Ordering::Relaxed);
+    SIGMASK_CALLS.store(0, Ordering::Relaxed);
+    crate::sched::signal::reset_counters();
     KILLS.store(0, Ordering::Relaxed);
     EXITS.store(0, Ordering::Relaxed);
     BAD_PTRS.store(0, Ordering::Relaxed);
@@ -3635,6 +3845,14 @@ pub fn syscall_dispatch(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> boo
         SYS_FS_CREATE => sys_fs_create(frame),
         #[cfg(all(feature = "handles", feature = "fs-open", feature = "fs-rw"))]
         SYS_FS_UNLINK => sys_fs_unlink(frame),
+        // ---- 67/68/69：信号族（ADR-177 决策 1）。
+        // **注意 sigreturn 收 `&mut`**：它要整份覆盖当前 frame，`iretq` 才能回到被中断处。
+        #[cfg(feature = "handles")]
+        SYS_SIGACTION => sys_sigaction(frame),
+        #[cfg(feature = "handles")]
+        SYS_SIGRETURN => sys_sigreturn(frame),
+        #[cfg(feature = "handles")]
+        SYS_SIGMASK => sys_sigmask(frame),
         SYS_POKE_BUF => {
             // 内核 → 用户。写成 `Ok(n)` 而不是布尔：`n != want` 就是"中途被接住的故障"，
             // 程序核对字节时看得见的差异与内核报回的数必须一致（两台仪器不能各说各话）。

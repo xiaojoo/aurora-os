@@ -34,6 +34,10 @@ pub struct SchedHooks {
     /// ADR-177 切片 2：COW 写故障的处理接缝。**与 `demand_zero` 并列，不是它的扩展**——
     /// 那一条要求「页不存在」，这一条要求「页存在但不可写」，两个条件互斥。
     pub cow: fn(u64) -> bool,
+    /// ADR-177 信号族：ring3 返回前的投递点。**在 `preempt_point` 之前调**——
+    /// 投递会改 `frame.rip/rsp`，而 `preempt_point` 把这个 frame 当续跑点存。
+    /// 顺序反了会让被换出的任务按旧 rip 恢复，信号等于没投递且不会有任何东西变红。
+    pub deliver_signal: fn(&mut crate::arch::x86_64::trap::TrapFrame),
     pub exit_current: fn(usize),
     /// 安全契片由 sched 安装；调用点必须在异常出口。
     pub preempt_point: fn(u64, usize),
@@ -67,6 +71,9 @@ fn no_demand_zero(_: u64) -> bool {
 fn no_cow(_: u64) -> bool {
     false
 }
+
+/// 默认实现：不投递。未装 `sched` 时信号族不存在，行为与装之前逐字相同。
+fn no_signal(_: &mut crate::arch::x86_64::trap::TrapFrame) {}
 fn no_exit(_: usize) {}
 fn no_preempt(_: u64, _: usize) {}
 
@@ -83,6 +90,7 @@ static HOOKS: HooksCell = HooksCell(UnsafeCell::new(SchedHooks {
     current_id_snapshot: no_id,
     demand_zero: no_demand_zero,
     cow: no_cow,
+    deliver_signal: no_signal,
     exit_current: no_exit,
     preempt_point: no_preempt,
 }));

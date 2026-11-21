@@ -1132,6 +1132,18 @@ pub unsafe extern "C" fn aurora_trap_entry(frame: &mut TrapFrame) {
         Action::Exit => (crate::hooks::sched().exit_current)(cpu),
         Action::Resume => {}
     }
+    // ADR-177 信号族：**投递点**。位置有三个约束，每一个都是必须的：
+    //
+    // ① 在 `Action::Resume` 之后 —— Exit/Kill 的任务不该再收到信号；
+    // ② 在 `preempt_point` **之前** —— 投递会改 `frame.rip/rsp`，而 `preempt_point`
+    //    把这个 frame 当续跑点存下来。反过来（先存再改）会让被换出的任务按**旧** rip 恢复，
+    //    信号等于没投递，而且没有任何东西会红。
+    // ③ 只在 ring3 —— 内核任务没有信号（见 `signal` 模块头）。
+    //
+    // 投递失败（用户栈压不下）在 `deliver` 内部计数并返回 false，任务继续跑。
+    if from_user(frame) {
+        (crate::hooks::sched().deliver_signal)(frame);
+    }
     // 抢占点：此刻 frame 就压在**被中断任务自己的栈**上，所以它就是续跑点。
     // 若发生切换，下面这行不会返回（见 sched::preempt_point）。
     // SAFETY: 见 preempt_point 的契约——frame 必须是本任务栈上真实的异常帧，

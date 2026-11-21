@@ -577,3 +577,136 @@ fn t_syscall_abi_arms() -> bool {
 #[cfg(feature = "handles")]
 ktest!(KT_SYSCALL_ABI_ARMS, t_syscall_abi_arms);
 
+
+
+// ---- 67/68/69：信号族（ADR-177 切片 2d）
+//
+// ## 这一格证什么
+//
+// 信号的全部价值是「打断一条正在跑的指令流，去执行 handler，再**原样回来**」。
+// 所以判据必须是**三段**：
+//   A：sigaction 注册成功、返回旧值（0）、计数涨；
+//   B：投递改了 frame——rip 变成 handler、rsp 下移、rdi 是信号号；
+//   C：sigreturn **整份恢复**——rip/rsp/寄存器全部回到投递之前。
+//
+// **C 是全部价值所在**：只证 B 等于证了「跳得出去」，没证「回得来」。
+// 回不来就是比没有信号更糟——那是一个只能进不能出的陷阱。
+//
+// ## 为什么不用真 ring3 任务
+//
+// 投递点与 sigreturn 都只操作 `TrapFrame`，不依赖 ring3 真的在跑。
+// 用合成 frame 能把「投递前 / 投递后 / 恢复后」三份逐字段对比，比跑一个用户程序更容易读出差异。
+#[cfg(feature = "handles")]
+fn t_signal_roundtrip() -> bool {
+    use crate::arch::x86_64::trap::TrapFrame;
+    use crate::sched::signal;
+    use crate::user::{self, syscall_dispatch, SYS_SIGACTION, SYS_SIGRETURN, SYS_SIGMASK};
+    crate::sched::init_boot_task();
+    crate::sched::start_workers();
+    crate::arch::x86_64::apic::timer_start().ok();
+
+    let task = crate::sched::current_id();
+    signal::clear_task(task);
+
+    // 真映射一页当用户栈：信号帧要压在上面，
+    // 而 copy_to_user 会拒绝未映射的页——用假地址会得到假红。
+    let Ok(stack_frames) = mm::phys_alloc(0, mm::MOD_TEST) else {
+        crate::log_fatal!("signal: 栈页分配失败");
+        return false;
+    };
+    let stack_va = mm::USER_MMAP_BASE + 0xC000;
+    let stack_map = match mm::map(mm::VirtAddr(stack_va), stack_frames, mm::PageFlags::USER_RW) {
+        Ok(m) => m,
+        Err(_) => {
+            crate::log_fatal!("signal: 栈页映射失败");
+            return false;
+        }
+    };
+    let mut f = TrapFrame {
+        cr2: 0, r15: 0x1515, r14: 0x1414, r13: 0x1313, r12: 0x1212, r11: 0x1111,
+        r10: 0x1010, r9: 0x0909, r8: 0x0808, rbp: 0x0b0b, rdi: 0x0d0d, rsi: 0x0e0e,
+        rdx: 0x0d0d, rcx: 0x0c0c, rbx: 0x0b0b, rax: 0x0a0a, vector: 0x80, error_code: 0,
+        // 栈顶 = 页尾：信号帧从这里往下压
+        rip: 0x1000_0500, cs: 0x1b, rflags: 0x202, rsp: stack_va + mm::PAGE as u64, ss: 0x23,
+    };
+
+    // ---- A：注册
+    let a0 = user::sigaction_calls();
+    let handler = 0x1000_9000u64;
+    f.rax = SYS_SIGACTION; f.rdi = 11; f.rsi = handler; f.rdx = 0;
+    syscall_dispatch(&mut f);
+    let registered = f.rax == 0 && user::sigaction_calls() == a0 + 1
+        && signal::handler_of(task, 11) == handler;
+    // 再注册一次，应返回旧 handler
+    f.rax = SYS_SIGACTION; f.rdi = 11; f.rsi = 0x1000_9100; f.rdx = 0;
+    syscall_dispatch(&mut f);
+    let old_returned = f.rax == handler;
+    // 恢复成第一次的 handler
+    f.rax = SYS_SIGACTION; f.rdi = 11; f.rsi = handler; f.rdx = 0;
+    syscall_dispatch(&mut f);
+
+    // ---- B：投递
+    let before_rip = f.rip;
+    let before_rsp = f.rsp;
+    let before_r15 = f.r15;
+    let d0 = signal::delivered();
+    let raised = signal::raise(task, 11);
+    let took = signal::take_pending(task);
+    // 把信号放回待处理位，让 deliver 自己取
+    let _ = signal::raise(task, 11);
+    let delivered = user::deliver(&mut f);
+    let jumped = delivered && f.rip == handler && f.rsp < before_rsp && f.rdi == 11;
+    let counted = signal::delivered() == d0 + 1;
+
+    // ---- C：sigreturn 整份恢复
+    let r0 = user::sigreturn_calls();
+    f.rax = SYS_SIGRETURN;
+    syscall_dispatch(&mut f);
+    let restored = f.rip == before_rip && f.rsp == before_rsp && f.r15 == before_r15
+        && user::sigreturn_calls() == r0 + 1
+        && signal::active_of(task) == 0;
+
+    // ---- D：野 rsp 不能变成内核按垃圾 iretq（魔数校验）
+    let mut g = TrapFrame {
+        cr2: 0, r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
+        rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0, vector: 0x80, error_code: 0,
+        // **已映射但内容不是信号帧**的页：这样才真的走到魔数校验。
+        // 用未映射地址（如 0xDEAD_B000）会先在 copy_from_user 就失败，
+        // 根本测不到魔数——那是一个**看起来绿的空转判据**（本轮实测撞到过）。
+        rip: 0x1000_0600, cs: 0x1b, rflags: 0x202, rsp: stack_va, ss: 0x23,
+    };
+    g.rax = SYS_SIGRETURN;
+    syscall_dispatch(&mut g);
+    let bogus_rejected = g.rax == user::E_FAULT || g.rax == user::E_INVALID;
+    let rip_untouched = g.rip == 0x1000_0600;
+
+    // ---- E：拒绝格
+    f.rax = SYS_SIGACTION; f.rdi = 0; f.rsi = handler; f.rdx = 0;
+    syscall_dispatch(&mut f);
+    let signo0_rejected = f.rax == user::E_INVALID;
+    f.rax = SYS_SIGACTION; f.rdi = 11; f.rsi = handler; f.rdx = 1;
+    syscall_dispatch(&mut f);
+    let flags_rejected = f.rax == user::E_NOT_SUPPORTED;
+    f.rax = SYS_SIGMASK; f.rdi = 0; f.rsi = 0xFF; f.rdx = 0;
+    syscall_dispatch(&mut f);
+    let mask_set = f.rax == 0 && signal::mask_of(task) == 0xFF;
+
+    let ok = registered && old_returned && raised && took == 11
+        && jumped && counted && restored
+        && bogus_rejected && rip_untouched
+        && signo0_rejected && flags_rejected && mask_set;
+    crate::log_info!(
+        "signal: A注册={} 旧值={} B投递={} 跳转={} 计数={} C恢复={} \
+         D野rsp拒={} rip未动={} E(0号={} flags={} mask={}) ⇒ {}",
+        registered, old_returned, delivered, jumped, counted, restored,
+        bogus_rejected, rip_untouched, signo0_rejected, flags_rejected, mask_set, ok
+    );
+    if !ok {
+        crate::log_fatal!("signal: 判据不成立（见上面每一格）rip={:#x} rsp={:#x}", f.rip, f.rsp);
+    }
+    signal::clear_task(task);
+    drop(stack_map);
+    ok
+}
+#[cfg(feature = "handles")]
+ktest!(KT_SIGNAL_ROUNDTRIP, t_signal_roundtrip);

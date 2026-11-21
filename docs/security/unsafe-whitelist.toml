@@ -106,9 +106,9 @@ U4 = 7
 # `mm` 的 U2 不变：`phys_of_in` 是**从 `phys_of` 提出来的**，遍历体原样搬走，
 # 两个函数各一处 `unsafe {`，总数仍 55。`aspace_root` 自身没有 unsafe 块。
 # 对账：530+1=531、U2 119+1=120。
-total = 558
+total = 560
 U1 = 85
-U2 = 145
+U2 = 147
 U3 = 13
 U4 = 149
 U5 = 128
@@ -243,7 +243,7 @@ U1 = 1
 #   由谁保证不变量：`copy_from_user_in` 自己——`va`/`end` 过 `USER_VA_TOP` 与 `COPY_MAX` 两关，
 #             每页过 `aspace_effective_flags(aslot, page).user`，`phys_of_in` 返回 `None` 就拒。
 #             少了 `.user` 那一关，内核就会替用户读它的内核页（负样本 N1）。
-U2 = 11
+U2 = 13
 # ADR-175 补记：+1（U2 10 → 11）= `copy_to_user_in` 里那次 HHDM 别名的单字节**写**。
 # 与读那一处的差别只有方向与一条额外校验，逐条：
 #   指针来源：同读方向（`phys_of_in` 从目标 AS 页表翻译 + `via_hhdm()`）。
