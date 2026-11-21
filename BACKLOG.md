@@ -21015,3 +21015,71 @@ ADR-178 定的目标值（32768 进程 / 1024 作业 / 32768 AS）**已落地并
 4. **fd 表释放时机**（进程退出时逐项 close 还是整表丢弃）
 5. **用户态 fd API**（7 个程序不改是硬要求，但新 API 需要有人写）
 6. **把 fd 表接进 `proc_create`**（今天 `fd_table` 字段存在但没人写）——这是下一步的入口
+---
+
+## 494. ADR-180 第 4 项：fd 表接进 proc_create，并纠正一条环（2026-11-22）
+
+### 为什么做这个
+
+ADR-180 落地时 `ProcEntry.fd_table` 是**空壳**（字段存在但没人写），
+违反 AGENTS.md 硬约束 2「不创建没有真实调用者的空服务」。
+
+### 第一版错在哪：泄漏 2 帧
+
+`proc_create` 时 `FdTable::allocate()` 分配 1 页。实测：
+
+    proc(P3): baseline=(drained free101500->101498 ...)   ← 少 2 帧
+
+`t_proc_job_wait` 这类用例建很多进程再逐个收，中间态必然「分了还没收」⇒
+`baseline=false` 被顶红 ⇒ **5 个用例级联失败**。
+
+### 第二版：懒分配
+
+`proc_create` 不预分配；`proc_fd_table` 首次被调时才分：
+
+    先查（只持 VMM）→ 没有就锁外分（走 PMM）→ 锁内装 → 竞争兜底（别人先装了就把自己那份还回去）
+
+实测 `free101486->101486`，**零泄漏**。
+这与 Linux `copy_files` 只在真正需要时创建 `files_struct` 的语义一致。
+
+### 一条环：门禁纠正了我
+
+把 `FdTable::allocate` 放进 `capability/handle.rs` 后：
+
+    memory.dependencies 不符：源码多 ['capability']
+    强连通分量与 baseline.known_scc 不符：源码 [[arch, boot, capability, ...]]
+    环内新边 capability->memory（站点 23）未登记棘轮
+
+**两处根因，我一开始只找到一处：**
+
+| # | 位置 | 修法 |
+|---|---|---|
+| 1 | `handle.rs` 里 `phys_alloc_above` | 改 `mm::alloc_handle_slots` / `alloc_fd_table_pages` |
+| 2 | **`mm.rs` 里 `crate::handle::FD_TABLE_INIT`** | `release_fd_table(base, bytes)` 收参数 |
+
+第 2 条最隐蔽：**一个常量引用**，看起来无害，但那就是让两模块进同一 SCC 的边。
+
+**纪律**：依赖方向必须单向——`capability` 可以依赖 `memory`，**反之不行，常量也不行，要传参**。
+
+### 读数
+
+| 项 | 结果 |
+|---|---|
+| `check` | **20/20** |
+| `handles` 档 | **102/102**（新增 `t_proc_fd_table`）|
+| 默认档 | PASS(33)，102/102 |
+| `procfd` | `取到=true 独立=true 可用=true ⇒ true` |
+| `proc(P3)` 基线 | `free101486->101486`，**零泄漏** |
+
+### 又一个判据自己写错（记录）
+
+`t_proc_fd_table` 第一版查 `lookup(1)` 期望拿到 `stdin` 句柄，但 `preset_std(stdin, stdout, stderr)`
+把 **stdin 放 fd 0**、stdout 放 fd 1。实测 `a.lookup(1)=Some(slot=2)` 而期望 `slot=1` ——
+**判据把 stdin 和 stdout 搞混了**，改成查 fd 0 后立刻绿。
+
+### 未做
+
+- fd 号段分配（`open_fd`/`read_fd`/`close_fd` 用哪个 syscall 号）
+- `dup2` 语义
+- fd 表扩容（64 → 1024）
+- 用户态 fd API

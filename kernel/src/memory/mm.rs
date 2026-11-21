@@ -3433,6 +3433,77 @@ pub fn frame_sealed(frame: u64) -> bool {
     unsafe { (*arr.add(frame as usize)).flags & FI_SEALED != 0 }
 }
 
+/// 分配句柄槽数组占的连续页，返回 HHDM 虚地址（ADR-179/180）。
+///
+/// 与 `alloc_fd_table_pages` 同一理由：`capability -> memory` 的**分配动作**
+/// 会让依赖图出现新环，所以分配在 `mm` 侧，`capability` 只拿地址。
+pub fn alloc_handle_slots(order: u8, min_phys: u64) -> Result<u64, MmError> {
+    let frames = phys_alloc_above(order, MOD_BOOT, min_phys)?;
+    let base = frames.base().0;
+    core::mem::forget(frames);
+    Ok(hhdm() + base)
+}
+
+/// 分配一张 fd 表占的连续页，返回它的 **HHDM 虚地址**（ADR-180）。
+///
+/// ## 为什么这个函数在 `mm` 而不在 `capability`
+///
+/// `check-module-interfaces` 抓到过一条新环：`capability -> memory` 让强连通分量
+/// 从 10 个模块涨到 12 个（`memory.dependencies` 多了 `capability`、
+/// `capability.allowed_callers` 多了 `memory`）。
+///
+/// `capability` 本来就依赖 `memory`（`aspace_live` 等），所以那条边不是新的；
+/// 新的是「`capability` 里出现 `phys_alloc_above`」这个**分配动作**——
+/// 那让 `memory` 反过来被算进 `capability` 的调用者集合。
+///
+/// 把分配搬到 `mm` 侧，`capability` 只拿地址 ⇒ 不新增反向边。
+///
+/// ## 参数
+///
+/// `order`：页数的 log2（调用方按 `FD_TABLE_INIT * 8` 字节算）。
+/// `min_phys`：从这个物理地址之上分配（避开 bootloader 占用的低端区）。
+pub fn alloc_fd_table_pages(order: u8, min_phys: u64) -> Result<u64, MmError> {
+    let frames = phys_alloc_above(order, MOD_BOOT, min_phys)?;
+    let base = frames.base().0;
+    // 永不归还：与 `frame_info` 同律（生命周期 = 整个内核）。
+    // 真正的归还走 `release_fd_table`（进程销毁时按帧还）。
+    core::mem::forget(frames);
+    Ok(hhdm() + base)
+}
+
+/// 归还一张 fd 表占的物理页（ADR-180）。**调用方不得持 VMM 锁**。
+///
+/// ## 为什么单独一个函数
+///
+/// `proc_discard` 在 `with_vmm_lock` 里，而归还走 `frame_put`（PMM，rank 30）。
+/// 从 VMM(20) 里取 PMM(30) 是**正向**嵌套，但 `frame_put` 失败时会回头取 VMM 记账
+/// ⇒ 反向 ⇒ L4。所以把归还单独拆出来，由调用方在**放锁之后**调（与 `aspace_destroy` 同律）。
+///
+/// `base` 是 `FdTable::allocate` 返回的 HHDM 虚地址。
+/// `bytes` 是表本体占的字节数（由调用方给，**`mm` 不引用 `capability`**）。
+///
+/// **为什么要传参而不是在这里读 `handle::FD_TABLE_INIT`**：那会让 `memory -> capability`
+/// 成为一条真实边，而 `capability -> memory` 本来就有 ⇒ 两模块进同一个强连通分量，
+/// `check-module-interfaces` 当场红（实测：`环内新边 capability->memory 未登记棘轮`）。
+/// 依赖方向必须是单向的：**`capability` 可以依赖 `memory`，反之不行**。
+pub fn release_fd_table(base: u64, bytes: usize) {
+    if base == 0 {
+        return;
+    }
+    let pages = bytes.div_ceil(PAGE);
+    let order = (usize::BITS - 1 - pages.leading_zeros()) as u8;
+    let phys = base - hhdm();
+    crate::log_info!("fd: release base={:#x} phys={:#x} 帧={} order={}",
+        base, phys, phys / PAGE as u64, order);
+    // 逐帧归还（`frame_put` 按单帧 refcnt 记账，段级归还会在部分共享时写坏账）。
+    for k in 0..(1usize << order) {
+        if let Err(e) = frame_put((phys / PAGE as u64) + k as u64) {
+            crate::log_fatal!("fd: 归还帧 {} 失败 {:?}（base={:#x} order={}）",
+                (phys / PAGE as u64) + k as u64, e, base, order);
+        }
+    }
+}
+
 pub fn frame_put(frame: u64) -> Result<(), MmError> {
     let _g = pmm();
     let rc = fi_refcnt(frame);

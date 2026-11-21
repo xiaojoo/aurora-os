@@ -93,6 +93,61 @@ Linux 默认 `RLIMIT_NOFILE=1024`（`include/uapi/linux/limits.h` `NR_OPEN`）�
 3. **`unsafe` 计数会上升**（FdTable 的指针解引用），必须登记白名单。
 4. **既有 ktest 全绿是硬要求**——本轮不改 ABI，所以判定表不该出现新的红。
 
+## 补记一（2026-11-22 同日）：把 fd 表接进 `proc_create`，以及一条环的修正
+
+### 第 4 项落地：`fd_table` 不再是空壳
+
+ADR-180 正文的未决 6 是「把 fd 表接进 `proc_create`」。补记这一轮做完了，
+并且**发现原设计会泄漏页帧**，改成了懒分配。
+
+**第一版（错）**：`proc_create` 时 `FdTable::allocate()` 分配 1 页。
+
+实测：`proc(P3): baseline=(drained free101500->101498 ...)` —— **少 2 帧**。
+因为 `t_proc_job_wait` 这类用例会建很多进程再逐个收，中间态必然「分了还没收」，
+下游的 `baseline=false` 就被顶红，连带 5 个用例级联失败。
+
+**第二版（对）**：**懒分配**——`proc_create` 不预分配，`proc_fd_table` 首次被调时才分。
+
+    先查（只持 VMM）→ 没有就锁外分（走 PMM）→ 锁内装 → 竞争兜底（别人先装了就把自己那份还回去）
+
+实测：`proc(P3): baseline=(drained free101486->101486 ...)` —— **完全一致，零泄漏**。
+
+**这与 Linux 的 `files_struct` 语义一致**：`copy_files` 只在真正需要时创建。
+
+### 一条环：`check-module-interfaces` 抓到并纠正了我
+
+把 `FdTable::allocate` 放进 `capability/handle.rs` 之后，门禁报：
+
+    memory.dependencies 不符：源码多 ['capability']
+    capability.allowed_callers 不符：源码多 ['memory']
+    强连通分量与 baseline.known_scc 不符：源码 [[arch, boot, capability, ...]]
+    环内新边 capability->memory（站点 23）未登记棘轮
+
+**根因有两处，我一开始只找到一处：**
+
+| # | 位置 | 为什么成环 | 修法 |
+|---|---|---|---|
+| 1 | `handle.rs` 里 `phys_alloc_above` | 分配动作本身让 `capability` 出现在 `memory` 的调用者集合 | 改成 `mm::alloc_handle_slots` / `mm::alloc_fd_table_pages`，分配在 mm 侧 |
+| 2 | **`mm.rs` 里 `crate::handle::FD_TABLE_INIT`** | 这是真正的**反向边** `memory -> capability` | `release_fd_table(base, bytes)` 收参数，`mm` 不引用 `capability` |
+
+第 2 条是最隐蔽的：它只是一个常量引用，看起来无害，但它就是让两个模块进同一个 SCC 的那条边。
+
+**纪律**：依赖方向必须单向——**`capability` 可以依赖 `memory`，反之不行**。
+常量也不行：要传参。
+
+### 读数
+
+| 项 | 结果 |
+|---|---|
+| `check` | **20/20**（环消除后）|
+| `procfd` | `取到=true 独立=true 可用=true ⇒ true` |
+| `proc(P3)` 基线 | `free101486->101486`，**零泄漏** |
+| ktests | 102 条（新增 `t_proc_fd_table`）|
+
+### 未决 6 已关闭
+
+`fd_table` 字段现在**有真实调用者**（`proc_fd_table`），不再是空壳。
+
 ## 未决
 
 1. **fd 号段的分配**（哪个 syscall 号做 `open_fd`/`read_fd`/`close_fd`）——下一轮裁决。

@@ -396,3 +396,106 @@ fn t_fd_table() -> bool {
 
 #[cfg(feature = "handles")]
 ktest!(KT_FD_TABLE, t_fd_table);
+
+/// ADR-180 第 4 项：`proc_create` 真的给进程装了 fd 表。
+///
+/// ## 为什么需要这条
+///
+/// `t_fd_table` 验的是 `FdTable` 类型本身（装/查/放），但它用的是**自己 new 的**一张表，
+/// 碰不到 `proc_create`。如果 `proc_create` 忘了装、装错、或装了一张 0 地址的表，
+/// `t_fd_table` 照样全绿——**那个字段就还是空壳**（违反 AGENTS.md 硬约束 2）。
+///
+/// ## 判据三格
+///
+/// 1. `proc_create` 之后 `proc_fd_table` 能取到**非 0** 地址；
+/// 2. 两个不同进程的 fd 表地址**不同**（不是共用一张）；
+/// 3. 取到的地址能当 `FdTable` 用（`preset_std` 成功且 `lookup(1)` 回到给定句柄）。
+///
+/// **负样本**：把 `proc_create` 里那行 `fd_table.store(fd, ...)` 去掉，
+/// 第 1 格立刻红（`proc_fd_table` 返回 `None`）。
+#[cfg(feature = "handles")]
+fn t_proc_fd_table() -> bool {
+    let mk = |slot: u64| crate::handle::Handle((1u64 << 16) | slot);
+
+    let Ok(job) = proc::job_create(None, 4, 64) else {
+        crate::log_fatal!("procfd: job_create 失败");
+        return false;
+    };
+    let Ok(p1) = proc::proc_create(job) else {
+        crate::log_fatal!("procfd: 第一个 proc_create 失败");
+        return false;
+    };
+    let g1 = proc::proc_gen(p1).unwrap_or(0);
+    let Ok(p2) = proc::proc_create(job) else {
+        crate::log_fatal!("procfd: 第二个 proc_create 失败");
+        proc::proc_reap(p1);
+        return false;
+    };
+    let g2 = proc::proc_gen(p2).unwrap_or(0);
+
+    let mut ok = true;
+
+    // 1. 能取到 fd 表（`proc_create` 真的装了）
+    let t1 = proc::proc_fd_table(p1, g1);
+    let t2 = proc::proc_fd_table(p2, g2);
+    let got_ok = t1.is_some() && t2.is_some();
+    if !got_ok {
+        crate::log_fatal!("procfd: proc_create 之后取不到 fd 表 p1={} p2={}", t1.is_some(), t2.is_some());
+        ok = false;
+    }
+
+    // 2. 两个进程各有一张（不是共用）—— 用「装一个 fd 后另一个看不到」来判，
+    //    比比地址更本质：地址不同也可能是同一张表被映射两次。
+    let mut distinct = false;
+    if let (Some(mut a), Some(b)) = (t1, t2) {
+        let h = mk(1);
+        let _ = a.preset_std(h, mk(2), mk(3));
+        // a 装了一个 fd，b 仍然是空的（`used()==0`）
+        // **查 fd 0**（`preset_std` 把 stdin 放 0、stdout 放 1、stderr 放 2）。
+        // 第一版查 fd 1 期望拿到 `h`，那是把 stdin 和 stdout 搞混了 ——
+        // 实测 `a.lookup(1)=Some(slot=2)` 而期望 `slot=1`，判据自己写错。
+        distinct = a.lookup(0) == Some(h) && b.used() == 0;
+        if !distinct {
+            crate::log_fatal!(
+                "procfd: a.lookup(0)={:?} 期望={:?}; b.used()={} 期望=0",
+                a.lookup(0), h, b.used()
+            );
+        }
+    }
+    if !distinct {
+        crate::log_fatal!("procfd: 两个进程的 fd 表不独立");
+        ok = false;
+    }
+
+    // 3. 取到的表真的能用（`preset_std` 之后 0/1/2 都在）
+    let mut usable = false;
+    if let Some(mut t) = proc::proc_fd_table(p1, g1) {
+        usable = t.preset_std(mk(1), mk(2), mk(3)).is_ok()
+            && t.lookup(0) == Some(mk(1))
+            && t.lookup(2) == Some(mk(3))
+            && t.used() == 3;
+    }
+    if !usable {
+        crate::log_fatal!("procfd: 取到的表当 FdTable 用不成立");
+        ok = false;
+    }
+
+    crate::log_info!("procfd: 取到={} 独立={} 可用={} ⇒ {}", got_ok, distinct, usable, ok);
+
+    // 收场：两个进程都没起线程 ⇒ 走 proc_discard（不是 proc_reap）。
+    //
+    // **必须逐个查返回值**（ADR-180 实测）：第一版忽略了返回值，
+    // 若 discard 失败（比如 threads 非 0），进程与 Job 都留了下来，
+    // 后续用例的 `登记N->N+1` 就对不上 ⇒ 4 个用例级联红。
+    let d1 = proc::proc_discard(p1);
+    let d2 = proc::proc_discard(p2);
+    let jd = proc::job_destroy(job);
+    if d1.is_err() || d2.is_err() || jd.is_err() {
+        crate::log_fatal!("procfd: 收场失败 d1={:?} d2={:?} job={:?}", d1.is_err(), d2.is_err(), jd.is_err());
+        ok = false;
+    }
+    ok
+}
+
+#[cfg(feature = "handles")]
+ktest!(KT_PROC_FD_TABLE, t_proc_fd_table);

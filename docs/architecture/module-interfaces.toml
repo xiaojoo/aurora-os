@@ -285,6 +285,10 @@ public_api = [
   "mm::phys_alloc_above",
   # ADR-179 补记三：VA 保留项数组也改为运行时分配。
   "mm::bootstrap_va_res",
+  # ADR-179/180：分配动作放 mm 侧，避免 capability -> memory 成环。
+  "mm::alloc_handle_slots",
+  "mm::alloc_fd_table_pages",
+  "mm::release_fd_table",
   "mm::reclaim_bootloader_regions",
   "mm::region_count",
   "mm::release_va",

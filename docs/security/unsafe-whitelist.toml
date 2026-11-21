@@ -82,7 +82,7 @@ U4 = 6
 [modules."driver/nvme"]
 U4 = 7
 [modules."capability/handle"]
-U2 = 7
+U2 = 8
 # ADR-179：句柄槽数组从 .bss 改为运行时分配（phys_alloc_above + 清零循环 +
 # as_slice/as_mut_slice 的 from_raw_parts{,_mut}）。指针来源是 MOD_BOOT 的连续帧、
 # 长度 MAX_HANDLES、生命周期整个内核、访问都在 RANK_HANDLE(35) 锁内。
@@ -112,9 +112,9 @@ U2 = 7
 # `mm` 的 U2 不变：`phys_of_in` 是**从 `phys_of` 提出来的**，遍历体原样搬走，
 # 两个函数各一处 `unsafe {`，总数仍 55。`aspace_root` 自身没有 unsafe 块。
 # 对账：530+1=531、U2 119+1=120。
-total = 569
+total = 570
 U1 = 85
-U2 = 156
+U2 = 157
 U3 = 13
 U4 = 149
 U5 = 128

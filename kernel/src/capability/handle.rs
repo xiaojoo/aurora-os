@@ -303,11 +303,9 @@ impl SlotArray {
         // 取 `max_phys / 2` 作起点：那是高半区，bootloader 从不往那里放东西，
         // 且按 2^order 对齐后仍有足够空间（512 MiB 机器 ⇒ 起点 256 MiB）。
         let min_phys = crate::mm::max_phys() / 2;
-        let frames = crate::mm::phys_alloc_above(order, crate::mm::MOD_BOOT, min_phys)?;
-        let base = frames.base().0;
-        // 永不归还：与 frame_info 同律（生命周期 = 整个内核）。
-        core::mem::forget(frames);
-        let va = crate::mm::hhdm() + base;
+        // **分配走 mm 侧的入口**（ADR-180 的环修正，与 `FdTable` 同一修法）：
+        // `capability -> memory` 的新边让强连通分量涨大，`check-module-interfaces` 会红。
+        let va = crate::mm::alloc_handle_slots(order, min_phys)?;
         // 清零：`EMPTY` 是全 0 语义（used=false, gen=0, obj=None），
         // 但**不能假设刚分到的物理页是干净的**（bootloader 可能留了内容）。
         // SAFETY: va 指向刚分配的 2^order 个连续帧（>= MAX_HANDLES 个 Entry），
@@ -522,11 +520,19 @@ impl FdTable {
         let order = (usize::BITS - 1 - pages.leading_zeros()) as u8;
         // 与句柄表同一修法：从 max_phys/2 之上分配，避开 bootloader 占用的低端区。
         let min_phys = crate::mm::max_phys() / 2;
-        let frames = crate::mm::phys_alloc_above(order, crate::mm::MOD_BOOT, min_phys)
+        // **分配在 mm 侧完成**（ADR-180 的环修正）：
+        //
+        // `capability -> memory` 会让依赖图出现新环（`check-module-interfaces` 抓到：
+        // `memory.dependencies` 多了 `capability`、`capability.allowed_callers` 多了 `memory`，
+        // 强连通分量从 10 个模块涨到 12 个）。
+        //
+        // 所以 `mm` 自己提供一个「分配并返回 HHDM 地址」的入口，`capability` 只调它、
+        // 不碰 `phys_alloc_above`。这样 capability 仍然依赖 memory（既有边），
+        // 但不新增**反向**边。
+        // **显式映射**（与 `proc_create` 里同一条纪律）：不写 `From<MmError> for HErr`，
+        // 那会让内存层与句柄层的错误语义被抹平。
+        let va = crate::mm::alloc_fd_table_pages(order, min_phys)
             .map_err(|_| HErr::Exhausted)?;
-        let base = frames.base().0;
-        core::mem::forget(frames);
-        let va = crate::mm::hhdm() + base;
         // SAFETY: va 指向刚分配的连续帧（>= FD_TABLE_INIT 个 u32），
         // 调用方持 HANDLE 锁 ⇒ 独占；归 MOD_BOOT 永不归还。
         unsafe {
@@ -602,8 +608,11 @@ impl FdTable {
     }
 
     /// 当前已用个数。
+    /// 已用个数。**现算，不存第二份真相**（ADR-180 实测教训）：
+    /// `from_ptr` 重建的视图里 `used` 字段是 0（那个字段随临时值丢了），
+    /// 存第二份就会与 entries 不一致。扫一遍 64 项代价可忽略。
     pub fn used(&self) -> usize {
-        self.used.load(Ordering::Relaxed)
+        self.as_slice().iter().filter(|v| **v != 0).count()
     }
 
     /// 把 0/1/2 预置成给定的三个句柄（ADR-180 决策 2）。
@@ -618,6 +627,65 @@ impl FdTable {
         slice[2] = stderr.0;
         self.used.store(3, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// 分配一张 fd 表并返回它的 **HHDM 虚地址**（ADR-180）。
+    ///
+    /// ## 为什么返回裸地址而不是 `FdTable` 值
+    ///
+    /// `ProcEntry` 里存的是地址（`fd_table: AtomicU64`），不是值——值放进定长表
+    /// 就是 ADR-179 撞过的 `.bss` 膨胀。所以这里给「分配 + 返回地址」，
+    /// 由调用方（`proc_create`）把它装进 `ProcEntry`。
+    ///
+    /// ## 为什么在锁外调
+    ///
+    /// 内部走 `phys_alloc_above`（PMM，rank 30）。调用方若已持 VMM(20)，
+    /// PMM 失败时回头取 VMM 记账 ⇒ 反向嵌套 ⇒ L4。`proc_create` 因此在
+    /// `with_vmm_lock` **之外**调它。
+    pub fn allocate() -> Result<u64, HErr> {
+        let t = FdTable::new();
+        t.ensure()?;
+        let base = t.base.load(Ordering::Acquire);
+        if base == 0 {
+            return Err(HErr::Exhausted);
+        }
+        // 只返回 base。**容量是编译期常量**（`FD_TABLE_INIT`），不需要存在内存里；
+        // 表本体只放 entries。`FdTable::from_ptr` 用常量重建视图。
+        // **清零必须在这里再做一次**（ADR-180 实测）：
+        //
+        // `ensure()` 里清过，但那是在临时 `t` 上做的。调用方拿到 `base` 后用
+        // `from_ptr` 重建视图，读的是同一块内存——若这块内存被分配器复用给过
+        // 别人（`phys_alloc_above` 不保证返回零页），读出来就是脏的。
+        // 实测症状：`procfd: 独立=false`（第二个进程的 `used()` 不是 0）。
+        //
+        // SAFETY: base 指向刚分配的连续帧（>= FD_TABLE_INIT 个 u64），
+        // 调用方在锁外单线程路径；归 MOD_BOOT 永不归还。
+        unsafe {
+            let q = base as *mut u64;
+            for i in 0..FD_TABLE_INIT {
+                core::ptr::write(q.add(i), 0);
+            }
+        }
+        Ok(base)
+    }
+
+    /// 从一个 `proc_create` 装进 `ProcEntry` 的地址重建视图（ADR-180）。
+    ///
+    /// ## 为什么需要它（实测教训）
+    ///
+    /// 第一版让 `proc_fd_table` 直接返回 `*mut FdTable`，然后 `&mut *p` 重建。
+    /// 但 `ProcEntry` 里只存了 `base`（entries 的地址），**没存 `cap`/`used`** ⇒
+    /// 重建出来的 `FdTable` 里 cap=0 ⇒ `as_mut_slice` 返回空 ⇒ `preset_std` 失败。
+    /// 实测 `procfd: 取到=true 不同址=true 可用=false`。
+    ///
+    /// 修法：容量是编译期常量（`FD_TABLE_INIT`），`from_ptr` 直接用它；
+    /// `used` 改成**每次现算**（扫一遍 entries），不存第二份真相。
+    pub fn from_ptr(base: u64) -> FdTable {
+        FdTable {
+            base: AtomicU64::new(base),
+            cap: AtomicUsize::new(if base == 0 { 0 } else { FD_TABLE_INIT }),
+            used: AtomicUsize::new(0),
+        }
     }
 }
 

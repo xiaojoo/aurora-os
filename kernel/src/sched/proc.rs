@@ -24,6 +24,13 @@ pub const MAX_PROCESSES: usize = 32768;
 pub const MAX_JOBS: usize = 1024;
 /// Task.proc_id 的"无进程"哨兵。
 pub const NO_PROC: u16 = 0xFFFF;
+
+/// fd 表本体占的字节数（ADR-180）。**`mm::release_fd_table` 要它来算页数**。
+///
+/// 为什么这里写数字而不是读 `handle::FD_TABLE_INIT`：`sched` 已经依赖 `capability`，
+/// 但 `mm` 不依赖 `capability`；`release_fd_table` 在 `mm` 侧，所以字节数由**调用方**给。
+/// 必须与 `handle::FD_TABLE_INIT * size_of::<u64>()` 相等（64 * 8 = 512）。
+const FD_TABLE_BYTES: usize = 64 * 8;
 /// `ProcEntry::aspace` 的"这个进程还没有地址空间"哨兵（与 `sched::NO_ASPACE` 同值不同模块）。
 pub const NO_ASPACE: u16 = 0xFFFF;
 /// signal：bit31 = 0 表示还在跑。
@@ -45,6 +52,9 @@ pub enum ProcError {
     /// 想往一个已进入终止态的进程上挂线程。
     AlreadyTerminated,
     InvalidArgument,
+    /// 物理内存不足（ADR-180：fd 表首次分配失败）。
+    /// 与 `TableFull` 分开：那是「进程表满了」，这是「表本身分不出来」。
+    NoMem,
 }
 
 // ---------------------------------------------------------------- 两张表
@@ -177,6 +187,14 @@ pub fn job_create(parent: Option<u16>, max_procs: u32, max_pages: u64) -> Result
 
 /// 创建一个进程，占住 Job 的一个进程额度。返回进程表槽号。
 pub fn proc_create(job: u16) -> Result<u16, ProcError> {
+    // ADR-180：fd 表**懒分配**——`proc_create` 不预分配，首次用到时才分。
+    //
+    // 为什么不是创建时就分：每个进程 1 页，而 `t_proc_job_wait` 这类用例
+    // 会建很多进程再逐个收，中间态必然「分了还没收」⇒ `free_frames` 比基线少，
+    // 下游的 `baseline=false` 就被顶红（实测 `free101500->101498`）。
+    //
+    // 懒分配让「建了进程但没开文件」零成本，这也是 Linux `files_struct` 的语义：
+    // `copy_files` 只在真正需要时复制/创建。
     mm::with_vmm_lock(|| {
         let s = st();
         let j = s.jobs.get_mut(job as usize).ok_or(ProcError::NoSuchJob)?;
@@ -363,15 +381,25 @@ pub fn proc_discard(proc_id: u16) -> Result<(), ProcError> {
         // **gen 必须活过销毁**（P5c-3a 修的那条 ABA）：整项写回 EMPTY 会把 gen 复位成 0，
         // 下一次 create 又变 1 ⇒ 旧句柄的 `(slot, gen)` 重新匹配上。
         let gen = p.gen;
+        // ADR-180：fd 表要跟着进程一起还。
+        //
+        // **必须在锁外还**（与 `aspace_destroy` 同一纪律）：归还走 `frame_put`（PMM，rank 30），
+        // 而这里持 VMM(20) ⇒ 反向嵌套 ⇒ L4。所以只把地址抄出来，放锁之后还。
+        let fd_base = p.fd_table.load(Ordering::Acquire);
         *p = PROC_EMPTY;
         p.gen = gen;
         if let Some(j) = s.jobs.get_mut(job as usize) {
             j.used_procs = j.used_procs.saturating_sub(1);
         }
-        Ok(aspace)
+        Ok((aspace, fd_base))
     })?;
+    let (aspace, fd_base) = aspace;
     if aspace != NO_ASPACE {
         mm::aspace_destroy(aspace);
+    }
+    // fd 表：锁外归还（见上面那段注释）。0 = 从没分配过，不必还。
+    if fd_base != 0 {
+        mm::release_fd_table(fd_base, FD_TABLE_BYTES);
     }
     Ok(())
 }
@@ -420,19 +448,40 @@ pub fn proc_aspace(proc_id: u16, gen: u32) -> Option<(u16, u32)> {
 /// 放进 `handle` 会让 `capability` 反过来依赖 `sched`，而今天 `sched → capability`
 /// 已经存在，反向再加一条会成环。所以表住在 `proc`，`handle` 只提供「fd → 句柄」
 /// 的语义层（后续切片）。
-pub fn proc_fd_table(proc_id: u16, gen: u32) -> Option<*mut crate::handle::FdTable> {
-    mm::with_vmm_lock(|| {
+pub fn proc_fd_table(proc_id: u16, gen: u32) -> Option<crate::handle::FdTable> {
+    // 先查有没有（快路径，只持 VMM）。
+    let existing = mm::with_vmm_lock(|| {
         let s = st();
         let p = s.procs.get(proc_id as usize)?;
         if !alive_flag(&p.used) || p.gen != gen {
             return None;
         }
-        let ptr = p.fd_table.load(Ordering::Acquire);
-        if ptr == 0 {
+        Some(p.fd_table.load(Ordering::Acquire))
+    })?;
+    if existing != 0 {
+        return Some(crate::handle::FdTable::from_ptr(existing));
+    }
+    // 懒分配：**锁外**分（走 PMM，不能持 VMM），再锁内装。
+    let base = crate::handle::FdTable::allocate().ok()?;
+    let stored = mm::with_vmm_lock(|| {
+        let s = st();
+        let p = s.procs.get_mut(proc_id as usize)?;
+        if !alive_flag(&p.used) || p.gen != gen {
             return None;
         }
-        Some(ptr as *mut crate::handle::FdTable)
-    })
+        // 竞争兜底：若别的线程已经装了，用它的（把自己刚分的还回去）。
+        let cur = p.fd_table.load(Ordering::Acquire);
+        if cur != 0 {
+            return Some((cur, true));
+        }
+        p.fd_table.store(base, Ordering::Release);
+        Some((base, false))
+    })?;
+    let (use_base, was_race) = stored;
+    if was_race {
+        mm::release_fd_table(base, FD_TABLE_BYTES);
+    }
+    Some(crate::handle::FdTable::from_ptr(use_base))
 }
 
 /// 给进程装一张 fd 表（ADR-180）。**`ptr` 必须来自 `handle` 侧的一次分配**。
