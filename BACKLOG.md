@@ -19616,3 +19616,74 @@ ADR-118（2026-11-18）给 `create`/`unlink`/`truncate` 的 30/34/35 **全部已
 - **整跑偶发 HANG 一次**：120s 停在 `spawn: S3 前 map`，红过的用例=无，同构建重跑 PASS(33)。
   与 §468–§473 长链抖动、§474 记的 `spawn: S2 前 phys_alloc` 同族。**未验证，不下结论**
 - COW 的「原值不变」目前只有内核侧自证，**没有宿主机第二台仪器**（ADR-177 验收里要求的那条）
+
+---
+
+## 476. 切片 2b：mmap/munmap/mprotect 落地（ADR-177 的 64/65/66，2026-11-21）
+
+### 做了什么
+
+三个号接成 syscall，**不引入新机制**——复用 ADR-067 的惰性区间：
+
+- **64 `SYS_MMAP`**：匿名映射。`lazy_new` 发 VA，缺页时 `demand_zero_try` 补页。
+  长度向上取整到页；超 `MAX_LAZY_PAGES`(16) 回 `-6`（**不是 -1**：调用方看到 -1 会去查自己的长度，
+  而真相是这张表就这么大）；bit1 可执行回 `-4`（W^X）；非 0 建议 VA 回 `-15`（明确拒，不静默忽略）。
+- **65 `SYS_MUNMAP`**：按 VA 整段释放。**不收长度**——惰性区间的粒度是整段，
+  部分释放会把「哪几页填充过」拆成两半而表里没有第二份记录。不是惰性区间回 `-8`（不是 -1）。
+- **66 `SYS_MPROTECT`**：改已填充页的写权限，两个方向都走 COW 位。
+  **它是 COW 的第一个真实消费者**（切片 2 落的机制在此有了调用者）。
+
+新增四个公开入口（都是 `memory/mm` → `sched/user` 的产品路径引用，已登记 `module-interfaces.toml`）：
+`lazy_find` / `lazy_free_at` / `lazy_protect` / `lazy_leaf_writable`。
+
+### 读数（handles 档）
+
+    mmap族: 拒绝格(0长=true 超限=true 可执行=true 建议VA=true)
+            A(对齐=true 计数=true 写读=true)
+            B(计数=true 只读=1 确只读=true 恢复=1 确可写=true)
+            C(=0 计数=true 已释放=true) ⇒ true
+
+| 项 | 值 |
+|---|---|
+| `ktests`（handles 档） | **98/98 passed**（+1：`t_mmap_family`） |
+| `run --features handles` | **PASS(33)**，6.7s |
+| `check` | **19/19** |
+| 真实改动量 | **404 增 / 4 删** |
+
+### 一个值得记的设计点：mprotect 返回 1 而不是 2
+
+映射了两页，但只触发了第 0 页的 demand-zero，所以 `mprotect` 只改了 1 页。
+**返回 2 才是错的**——那意味着它假装改了不存在的页。未填充页的权限在
+`demand_zero_try` 建页时按当时的 flags 定，这里改不了也不该假装改了。
+
+### 负样本
+
+删掉 `SYS_MPROTECT` 的分派臂 ⇒ **ADR-176 规则 3 立刻红**：
+
+    [FAIL] check-syscall-abi-arms
+      内核声明了 SYS_MPROTECT 却没有对应的分派臂 ⇒ 这个号会落到 `_ => E_INVALID`…
+    check rc=1
+
+还原后 check 19/19、rc=0。**上一轮新加的门禁在本轮第一次咬到真问题**。
+
+### 两个踩到的坑
+
+**① 测试写用户页走错了路。** 内核侧 `write_at` 会先过 `validate_range`，
+而惰性区间的页**还不存在** ⇒ 校验直接拒，**永远不会触发 demand-zero**。
+真实路径是用户态执行写指令 ⇒ #PF ⇒ `demand_zero_try`。用例里直接调那一步。
+**「内核能写用户页」与「用户态能写自己的页」是两条不同的路**，混起来会得到假红。
+
+**② 用例的 cfg 门。** 64–66 的臂挂在 `feature = "handles"` 下，而 `default = []`。
+所以默认档里这三个号落到 `_ => E_INVALID`，`t_mmap_family` 也不注册。
+**要验它们必须用 `run --features handles`。** 这与 `t_syscall_abi_arms` 同形。
+
+### 未做
+
+- **67–71（信号族 3 个 + 文件族 2 个）全部未做**
+- 判定表整链未跑
+- `mmap` 只支持匿名、只支持整段 `munmap`/`mprotect`、容量受 `MAX_LAZY_REGIONS=8` /
+  `MAX_LAZY_PAGES=16`（64 KiB）限制。**这是 ADR-067 定的接缝容量，不是产品容量**
+- 没有宿主机侧第二台仪器（ADR-177 验收要求的那条）
+- **`handles` 档本身偶发 HANG**（`tools/aurora.py:4611` 已记：5 个样本
+  `HANG 300.06 / PASS 6.52 / HANG 300.05 / PASS 6.51 / HANG 300.05`）。
+  本轮 4 次 `handles` 跑里撞了 2 次，均停在 `q2: spawn#6 后`，重跑即 PASS。**未验证，不下结论**
