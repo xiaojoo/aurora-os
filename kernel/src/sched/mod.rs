@@ -119,6 +119,14 @@ pub struct Task {
     /// 取值只有五个来源，就是下面五个 `Task` 字面量；`terminate_task` 释放槽位时清掉，
     /// 所以"槽位被复用"不会把常驻身份带给下一个任务（ADR-061 未决 1 的 ABA 同一条线）。
     pub resident: bool,
+    /// **这个任务还没跑过第一行**（§481）。
+    ///
+    /// 用来判断「换入它时要不要强制开中断窗口」：`spawn` 合成的帧 `rflags=0x2`（IF=0），
+    /// 而首次运行没有「中断帧把 IF 装回来」那一步 ⇒ 不自旋等门的任务也会带 IF=0 跑，
+    /// 自旋等门的任务则永远等不到 tick（实测 `q2_worker` 撞的就是这个）。
+    ///
+    /// 首次换入后由 `preempt_point` 保存现场时清掉（那一刻起它有了真实中断帧）。
+    pub never_ran: bool,
     /// 所属进程槽号（`proc::NO_PROC` = 无进程/内核任务）。W3 P3（ADR-073）。
     /// 收工出口据此置 signal + 减线程计数；收尾判据据此判"用例造的进程线程必须清零"。
     pub proc_id: u16,
@@ -541,6 +549,7 @@ const EMPTY_TASK: Task = Task {
     state: TaskState::Free,
     user: false,
     resident: false,
+    never_ran: false,
     proc_id: crate::proc::NO_PROC,
     as_slot: NO_ASPACE,
     #[cfg(feature = "handles")]
@@ -1191,6 +1200,7 @@ pub fn init_boot_task() {
         state: TaskState::Running,
         user: false,
         resident: true, // 每 CPU 的启动/空闲上下文：设计上不退出（名单见 Task::resident）
+        never_ran: false, // 启动上下文已经在跑，不是首次
         proc_id: crate::proc::NO_PROC,
         as_slot: NO_ASPACE,
         #[cfg(feature = "handles")]
@@ -1226,6 +1236,7 @@ pub fn init_idle_task(stack_lo: u64, stack_hi: u64, guarded: bool) {
         state: TaskState::Running,
         user: false,
         resident: true, // 每 CPU 的启动/空闲上下文：设计上不退出（名单见 Task::resident）
+        never_ran: false, // 启动上下文已经在跑，不是首次
         proc_id: crate::proc::NO_PROC,
         as_slot: NO_ASPACE,
         #[cfg(feature = "handles")]
@@ -1469,6 +1480,7 @@ pub fn init_idle() -> bool {
         state: TaskState::Runnable,
         user: false,
         resident: true, // 兜底 idle 永不退出（ADR-051）：它是"没人可换"时的最后一格
+        never_ran: true, // §481：首次运行必须开窗（合成帧 rflags=0x2）
         proc_id: crate::proc::NO_PROC,
         as_slot: NO_ASPACE,
         #[cfg(feature = "handles")]
@@ -1570,6 +1582,10 @@ fn spawn_inner(entry: fn() -> !, resident: bool) -> Result<usize, mm::MmError> {
         state: TaskState::Runnable,
         user: false,
         resident,
+        // §481：**首次运行必须开窗**。合成帧 `rflags=0x2`（IF=0），而首次运行没有
+        // 「中断帧把 IF 装回来」那一步 ⇒ 自旋等门的任务（`q2_worker`）会带 IF=0 自旋，
+        // tick 进不来 ⇒ `need` 不置位 ⇒ 永不换人 ⇒ 整机停摆（实测 120s HANG）。
+        never_ran: true,
         proc_id: crate::proc::NO_PROC,
         as_slot: NO_ASPACE,
         #[cfg(feature = "handles")]
@@ -1634,6 +1650,7 @@ pub fn spawn_user(entry_rip: u64, user_stack_top: u64, arg: u64, mut res: OwnedS
         state: TaskState::Runnable,
         user: true,
         resident: false, // 用户任务永远不进常驻名单：收尾判据对它本来就点名（ADR-050）
+        never_ran: false, // 用户任务走 `user` 那条分支强制开窗，不靠这个标记
         proc_id: crate::proc::NO_PROC,
         as_slot: NO_ASPACE,
         #[cfg(feature = "handles")]
@@ -2470,6 +2487,9 @@ pub unsafe fn preempt_point(frame: u64, cpu: usize) {
             s.tasks[mslot].state = TaskState::Runnable;
         }
         s.tasks[mslot].frame = frame; // 换回来时从这个异常帧继续出口路径
+        // §481：从这里起它有了**真实的中断帧**，下次被换入时 `iretq` 会把 IF 装回来，
+        // 不再需要「首次运行强制开窗」那个补丁。
+        s.tasks[mslot].never_ran = false;
         s.tasks[mslot].left_tsc = t0;
         s.current = next;
         s.tasks[nslot].state = TaskState::Running;
@@ -2543,7 +2563,22 @@ pub unsafe fn preempt_point(frame: u64, cpu: usize) {
     // 再 `iretq`、用户态也没有开中断的手段 ⇒ 它带着 IF=0 自旋到永远，整机停摆。
     // 现场：`framebuffer` 单档 5/5 停在 `init-user:` 之后，QMP 抓到的就是
     // `CPL=3 RIP=0x100000492（用户半区自旋）RFL=0x46 ⇒ IF=0 HLT=0`（BACKLOG §257）。
-    if rq(cpu).tasks[nslot].user {
+    // **ADR-021 的补全（2026-11-21 §481）**：除了用户任务，**首次运行的内核任务**也必须开窗。
+    //
+    // 上面那段论证的前提是「被换下时留下的是中断帧，恢复时 `iretq` 会把 IF 装回来」——
+    // 那个前提**只对被抢占过的任务成立**。`spawn` 合成的那份帧（`frame[20] = 0x2`，IF=0）
+    // 是它的**第一次**运行，没有「装回来」这一步。
+    //
+    // 后果（实测，QMP 抓到）：`q2_worker` 首次运行就 `IF=0` 自旋等 `Q2_ARMED`，
+    // 而 tick 只在 IF=1 时被取走 ⇒ `FLAGS[cpu].need` 永远不置位 ⇒ `preempt_point`
+    // 永远不换人 ⇒ 等门的任务永远等下去。整机停摆，表现是 120 s HANG。
+    //
+    // 判据：`RIP=q2_worker+0x55`（读 `Q2_ARMED` 的自旋）、`RFL=0x83`（IF=0）、`CPL=0`。
+    // 频率：单跑 4/6 或 2/5，历史整链 3–6%。
+    //
+    // 为什么不用「frame 是不是合成的那一个」判断：`frame` 会在首次保存时被改写，
+    // 而改写与「这一跑是不是第一次」之间没有原子性。用一个显式标记更可靠。
+    if rq(cpu).tasks[nslot].user || rq(cpu).tasks[nslot].never_ran {
         if_open = true;
     }
     IF_LOADS[usize::from(if_open)].fetch_add(1, Ordering::Relaxed);
