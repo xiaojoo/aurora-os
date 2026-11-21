@@ -338,7 +338,7 @@ pub fn terminate_task(task: usize) -> bool {
     }
     let cpu = cpu_of(task);
     let (slot, on_cpu_now, has_bag, was_blocked, dead_id, dead_proc) = {
-        let mut s = rq(cpu);
+    let mut s = rq(cpu);
         let slot = slot_of(task);
         if s.tasks[slot].state == TaskState::Free {
             return false;
@@ -566,6 +566,17 @@ const EMPTY_QUEUE: RunQueue = RunQueue {
     current: 0,
     entries: [None; MAX_TASKS],
 };
+
+/// `spawn_inner` 的步骤追踪（BACKLOG §470）。
+///
+/// **为什么是函数不是宏**：`spawn_user` 在 `spawn_inner` 之前，而 `macro_rules!`
+/// 的作用域是定义点之后。函数没有这个限制，而且内联后开销一样。
+#[inline]
+fn strace(step: &'static str) {
+    if SPAWN_TRACE.load(core::sync::atomic::Ordering::Relaxed) {
+        crate::log_info!("spawn: {}", step);
+    }
+}
 
 #[repr(C, align(64))]
 struct QueueCell {
@@ -1487,14 +1498,34 @@ pub fn spawn_resident(entry: fn() -> !) -> Result<usize, mm::MmError> {
     spawn_inner(entry, true)
 }
 
+/// spawn 内部步骤追踪开关（BACKLOG §470）。
+///
+/// **为什么需要它**：`a2-exec-bad` 连跑 4 次有 2 次 HANG，卡点不固定
+/// （一次在 `spawn#3 前`、一次在 `spawn#4 后`）⇒ 不是确定性死锁。
+/// 而 `spawn_inner` 有四个可能阻塞的点（VMM / PMM / VMM+PMM / RUNQ），
+/// 不打标记就分不清卡在哪一把锁上。
+///
+/// **只在使用例显式打开时打**：它是公共函数，默认静默（否则每条 spawn
+/// 都多 4 行串口，而串口吞吐本身是要盯的量）。
+pub static SPAWN_TRACE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+
+
 fn spawn_inner(entry: fn() -> !, resident: bool) -> Result<usize, mm::MmError> {
     let cpu = crate::arch::x86_64::cpu::self_slot();
     // 分配走 mm 的锁，**不能**在已经拿着自己队列的时候做：
     // 队列的 SAFETY 前提是"只由本 CPU 碰"，而 mm 的等待时间完全可能跨过别的 CPU 的观察点。
+    strace("spawn: S1 前 alloc_va_range");
     let win = mm::alloc_va_range(STACK_VA_PAGES).ok_or(mm::MmError::OutOfMemory)?;
+    strace("spawn: S1 后");
     let map_lo = win.0 + mm::PAGE as u64; // 第一页留 guard
+    strace("spawn: S2 前 phys_alloc");
     let frames = mm::phys_alloc(STACK_PAGES.trailing_zeros() as u8, MOD_STACK_TASK)?;
+    strace("spawn: S2 后");
+    strace("spawn: S3 前 map");
     let m = mm::map(VirtAddr(map_lo), frames, PageFlags::RW)?;
+    strace("spawn: S3 后");
     // 这一句以前是 `core::mem::forget(m)`，注释写"任务栈与内核同寿命：M3a 不做回收"。
     // M4-2 把它作废了：**任务会结束，所以它的栈必须有一个能在结束时还回去的主人**。
     // 忘记句柄的代价已经在台账上出现过两次（Done 的任务永久占格；页框与 VA 保留有去无回）。
@@ -1502,7 +1533,9 @@ fn spawn_inner(entry: fn() -> !, resident: bool) -> Result<usize, mm::MmError> {
     owned.push(m)?;
     let stack_hi = win.0 + (STACK_VA_PAGES as u64) * mm::PAGE as u64;
 
+    strace("spawn: S4 前 rq");
     let mut s = rq(cpu);
+    strace("spawn: S4 后");
     let slot = (0..MAX_TASKS).find(|&i| s.tasks[i].state == TaskState::Free).ok_or(mm::MmError::Unsupported)?;
     // 合成首次运行的异常帧：放在栈顶往下，字段顺序必须与 trap::TrapFrame 逐格一致。
     let f = (stack_hi - trap::TRAP_FRAME_BYTES as u64) as usize;

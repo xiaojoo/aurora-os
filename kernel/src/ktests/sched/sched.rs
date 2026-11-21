@@ -2098,9 +2098,24 @@ fn t_q2_workload_slots() -> bool {
     let mut proc_with_thread = [false; 4];
     let mut ok_n = 0usize;
     let mut refused = 0usize;
+    // **spawn 前后各打一行**（BACKLOG §470）：base2 的 HANG 现场是
+    // 「步骤 9 之后什么都没有」，而 `spawn_inner` 的前三行都要取 mm 的锁
+    // （`alloc_va_range` → VMM 20、`phys_alloc` → PMM、`map` → VMM 20）。
+    // 前一条用例 `t_cross_cpu_lock_contention` 刚 `acquires=4 万多`——
+    // 若它收尾留了一把没放，卡点就在这里。
+    //
+    // 卡住时：最后一行是 `spawn#N 前` 而没有对应的 `后` ⇒ 确认在 `spawn_inner` 里。
+    // 打开 spawn 内部步骤追踪（BACKLOG §470）。跑完在下面关掉——
+    // 它是公共函数上的开关，留着会让**别的用例**也打这四行。
+    crate::sched::SPAWN_TRACE.store(true, core::sync::atomic::Ordering::Relaxed);
+    let mut spawn_seq = 0usize;
     for (pi, &nthr) in shapes.iter().enumerate() {
         for _ in 0..nthr {
-            match sched::spawn(q2_worker) {
+            spawn_seq += 1;
+            crate::log_info!("q2: spawn#{} 前", spawn_seq);
+            let spawned = sched::spawn(q2_worker);
+            crate::log_info!("q2: spawn#{} 后", spawn_seq);
+            match spawned {
                 Ok(g) => {
                     let reg = proc::proc_attach_thread(pids[pi]).is_ok() && sched::set_proc_id(g, pids[pi]);
                     if reg {
@@ -2147,6 +2162,7 @@ fn t_q2_workload_slots() -> bool {
     }
 
     crate::log_info!("q2: 步骤 10 spawn 完 成功={} 拒绝={}", ok_n, refused);
+    crate::sched::SPAWN_TRACE.store(false, core::sync::atomic::Ordering::Relaxed);
     // 采样轮数必须容纳"每条活线程至少被选中一次"再加 boot 自己与 idle 的份；
     // 给少了峰值必然偏低，那是量具不成立而不是被测代码。
     Q2_ARMED.store(1, Ordering::Release);
@@ -2163,12 +2179,36 @@ fn t_q2_workload_slots() -> bool {
     // 发令 → 逐条等收工。工人收工后自己让出，所以一次有界等待就够（不等 tick）。
     Q2_RELEASE.store(1, Ordering::Release);
     let mut ended = 0usize;
+    // **余量读数**（BACKLOG §470）：每次等待的实际耗时 vs 预算。
+    //
+    // 为什么测这个：§469 证伪了「串口吞吐」假设，剩下最可疑的是
+    // 「宿主机 VM exit 开销随负载漂移」。要验它，得测**余量**而不是「有没有超时」——
+    // 超时是个布尔，余量才是抖动的物理量。
+    //
+    // 预算 `window_cycles(8)` 是按 **5 GHz 最坏情况**算的（`clock.rs:31` MAX_TSC_HZ），
+    // 而实测 TSC 约 3.19 GHz ⇒ 正常余量应当很宽（比值远小于 1）。
+    // 若某次跑这个比值接近 1000‰，就说明**那一次宿主确实慢**。
+    let budget = clock::window_cycles(8);
+    let mut worst_permille = 0u64;
+    let mut worst_cycles = 0u64;
     for g in gids.iter().take(ok_n) {
-        let w = apic::with_interrupts(|| sched::wait_for_task(*g, clock::window_cycles(8)));
+        let t0 = tsc::now();
+        let w = apic::with_interrupts(|| sched::wait_for_task(*g, budget));
+        let spent = tsc::now().wrapping_sub(t0);
+        let pm = if budget > 0 { spent.saturating_mul(1000) / budget } else { 0 };
+        if pm > worst_permille {
+            worst_permille = pm;
+            worst_cycles = spent;
+        }
         if w {
             ended += 1;
         }
     }
+    // 这一行的形状是下一轮对账的锚点：**千分比**而不是百分比（正常值只有几个百分点）。
+    crate::log_info!(
+        "q2: 余量 等{}条 最差={}‰ 最差cycles={} 预算={} 收工={}",
+        ok_n, worst_permille, worst_cycles, budget, ended
+    );
     for g in gids.iter().take(ok_n) {
         let _ = sched::terminate_task(*g);
     }
