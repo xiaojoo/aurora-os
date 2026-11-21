@@ -2542,6 +2542,78 @@ pub fn lazy_new(pages: usize, owner: ModuleId) -> Option<LazyHandle> {
     release_va_locked(va.0);
     None
 }
+/// 改一段惰性区间里**已填充页**的写权限。返回改了几页。
+///
+/// `writable=true` 走「加 P_WRITE、清 P_COW」；`false` 走「清 P_WRITE、置 P_COW」。
+/// 两个方向都走 COW 位，所以「只读化之后再写」会落到 `cow_try` 而不是被当成越权杀进程。
+///
+/// **未填充页不改**：它们还不存在，权限在 `demand_zero_try` 建页时按当时的 `USER_RW` 定。
+/// 这里返回的计数只数真正改到的页——0 表示「一页都没填充」，调用方据此报 `E_NOT_SUPPORTED`。
+pub fn lazy_protect(base: u64, writable: bool) -> usize {
+    if !is_ready() {
+        return 0;
+    }
+    let _g = vmm();
+    let root = our_cr3();
+    if root == 0 {
+        return 0;
+    }
+    // 先找区间（表项是 Copy，取出来就不必一直借表）
+    let mut hit: Option<(u16, u16)> = None;
+    for r in lazy_items().items.iter() {
+        if r.used && r.base == base {
+            hit = Some((r.pages, r.filled));
+            break;
+        }
+    }
+    let Some((pages, filled)) = hit else { return 0 };
+    let mut n = 0usize;
+    for i in 0..pages as usize {
+        if filled & (1 << i) == 0 {
+            continue; // 未填充页：不存在，不改
+        }
+        let va = base + i as u64 * PAGE as u64;
+        // SAFETY: root 是当前 PML4；va 页对齐；持 VMM；不建表
+        let Some(leaf) = (unsafe { walk_leaf_in(root, None, va, false, false, true) }) else {
+            continue;
+        };
+        // SAFETY: 有效表项指针
+        unsafe {
+            let v = *leaf;
+            if v & P_PRESENT == 0 {
+                continue;
+            }
+            *leaf = if writable {
+                (v | P_WRITE) & !P_COW
+            } else {
+                (v & !P_WRITE) | P_COW
+            };
+        }
+        tlb_invalidate(va);
+        n += 1;
+    }
+    n
+}
+/// 读一个惰性区间某页的**当前可写位**（判据要证 mprotect 真的改了 PTE）。
+/// 返回 `None` = 这段不是惰性区间，或那一页还没填充（不存在 ⇒ 没有权限可言）。
+pub fn lazy_leaf_writable(va: u64) -> Option<bool> {
+    if !is_ready() {
+        return None;
+    }
+    let _g = vmm();
+    let root = our_cr3();
+    if root == 0 {
+        return None;
+    }
+    // SAFETY: root 是当前 PML4；va 页对齐；持 VMM；不建表
+    let leaf = unsafe { walk_leaf_in(root, None, va & !(PAGE as u64 - 1), false, false, true) }?;
+    // SAFETY: 有效表项指针
+    let v = unsafe { *leaf };
+    if v & P_PRESENT == 0 {
+        return None;
+    }
+    Some(v & P_WRITE != 0)
+}
 
 /// #PF 修复入口（ADR-067 决策 3/4）。命中已登记区间才动手：
 /// 查表（VMM 内）→ 放锁 → phys_alloc（PMM）→ 清零（HHDM，ADR-064 同律）→ map（VMM）→
@@ -2608,6 +2680,38 @@ pub fn demand_zero_try(cr2: u64) -> bool {
     r.filled |= 1 << idx;
     r.frames[idx] = p;
     DEMAND_ZERO_COUNT.fetch_add(1, Ordering::Relaxed);
+    true
+}
+/// 按 VA 找一个惰性区间并返回它的 (slot, base, pages)。
+///
+/// **为什么必须有它**：`LazyHandle` 是 RAII，drop 即释放；而 `munmap(va)` 拿到的是
+/// 一个裸 VA，手里没有柄。没有这个查询就只能让 syscall 侧自己存一张 slot 表，
+/// 那是把「区间归属」这件事写两遍（本仓反复踩过的形状）。
+///
+/// 返回 `None` = 这段 VA 不是惰性区间（可能是普通映射、或者根本没映射）。
+/// 调用方**不要**把 `None` 读成「可以随便释放」。
+pub fn lazy_find(va: u64) -> Option<(u8, u64, usize)> {
+    if !is_ready() {
+        return None;
+    }
+    let _g = vmm();
+    for (i, r) in lazy_items().items.iter().enumerate() {
+        if r.used && va >= r.base && va < r.base + r.pages as u64 * PAGE as u64 {
+            return Some((i as u8, r.base, r.pages as usize));
+        }
+    }
+    None
+}
+
+/// 按 VA 释放一个惰性区间。返回是否找到了并释放。
+///
+/// 与 `LazyHandle::drop` 走**同一个** `lazy_release`：不复制清理逻辑。
+/// 复制的话，将来 `lazy_release` 改了归还顺序，这里就会变成一个不会红的漏。
+pub fn lazy_free_at(va: u64) -> bool {
+    let Some((slot, _, _)) = lazy_find(va) else {
+        return false;
+    };
+    lazy_release(slot);
     true
 }
 

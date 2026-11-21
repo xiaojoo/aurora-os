@@ -1005,6 +1005,121 @@ fn dz_wait_kills(target: u64) -> bool {
     }
     crate::user::kills() >= target
 }
+// ---- 64/65/66：内存映射族（ADR-177 切片 2b）
+//
+// ## 这一格证什么
+//
+// 三个号各自的**正常路径**与**拒绝路径**：
+//   D：拒绝格——len=0 回 -1、超 MAX_LAZY_PAGES 回 -6、可执行位回 -4、非 0 建议 VA 回 -15；
+//   A：mmap 拿得到页对齐的 VA、写进去、读回；
+//   B：mprotect 只读化之后 PTE 真的变成只读，恢复可写也真的生效；
+//   C：munmap 之后同一段再 munmap 回 -8。
+//
+// ## 为什么 B 这一格最重要
+//
+// 它是 COW 的**第一个真实消费者**：mprotect 把页降成只读，用户态再写会触发 #PF，
+// `cow_try` 发现引用计数是 1，原地恢复可写、不分配新帧。
+// 没有这一格，切片 2 落的 COW 就还是「没有调用者的机制」（AGENTS.md 硬约束 2）。
+#[cfg(feature = "handles")]
+fn t_mmap_family() -> bool {
+    use crate::arch::x86_64::trap::TrapFrame;
+    use crate::user::{self, syscall_dispatch, SYS_MMAP, SYS_MUNMAP, SYS_MPROTECT};
+    // 用例自足三条（与 t_demand_zero 同一套理由，逐条实测过）
+    crate::sched::init_boot_task();
+    crate::sched::start_workers();
+    crate::arch::x86_64::apic::timer_start().ok();
+
+    let mut f = TrapFrame {
+        cr2: 0, r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
+        rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0, vector: 0,
+        error_code: 0, rip: 0, cs: 0, rflags: 0, rsp: 0, ss: 0,
+    };
+
+    // ---- D 先做拒绝格（失败路径不留残留，先证它再动真的）
+    f.rax = SYS_MMAP; f.rdi = 0; f.rsi = 0; f.rdx = 0;
+    syscall_dispatch(&mut f);
+    let len0 = f.rax == user::E_INVALID;
+    // 17 页 > MAX_LAZY_PAGES(16) ⇒ -6（表/名额耗尽，不是参数错）
+    f.rax = SYS_MMAP; f.rdi = 17 * mm::PAGE as u64; f.rsi = 0; f.rdx = 0;
+    syscall_dispatch(&mut f);
+    let too_big = f.rax == user::E_EXHAUSTED;
+    // bit1 可执行 ⇒ -4（W^X）
+    f.rax = SYS_MMAP; f.rdi = mm::PAGE as u64; f.rsi = 2; f.rdx = 0;
+    syscall_dispatch(&mut f);
+    let exec_denied = f.rax == user::E_DENIED;
+    // 非 0 建议 VA ⇒ -15（今天不支持，明确拒而不是静默忽略）
+    f.rax = SYS_MMAP; f.rdi = mm::PAGE as u64; f.rsi = 1; f.rdx = 0x1000_0000;
+    syscall_dispatch(&mut f);
+    let hint_unsup = f.rax == user::E_NOT_SUPPORTED;
+
+    // ---- A：真 mmap 两页
+    let calls0 = user::mmap_calls();
+    let pages0 = user::mmap_pages();
+    f.rax = SYS_MMAP; f.rdi = 2 * mm::PAGE as u64; f.rsi = 1; f.rdx = 0;
+    syscall_dispatch(&mut f);
+    let va = f.rax;
+    let aligned = va != 0 && va & (mm::PAGE as u64 - 1) == 0;
+    let counted = user::mmap_calls() == calls0 + 1 && user::mmap_pages() == pages0 + 2;
+
+    // 写进去：走内核侧的用户页写入口（它做指针校验，裸写会绕过 SMAP 契约）
+    // 先触发 demand-zero 补页：惰性区间的页不存在，
+    // 内核侧 write_at 会先过 validate_range 而被拒（它不造缺页）。
+    // 真实路径是用户态执行一条写指令 => #PF => demand_zero_try。
+    // 这里直接调那一步，不绕用户态壳。
+    let filled = aligned && mm::demand_zero_try(va);
+    if filled {
+        crate::user::write_at(va, 0xC0FF_EE00);
+    }
+    // 读回：第一次读会触发 demand-zero 补页
+    let mut buf = [0u8; 8];
+    let read_ok = crate::user::copy_from_user(va, &mut buf).is_ok();
+    let wrote = read_ok && u64::from_le_bytes(buf) == 0xC0FF_EE00;
+
+    // ---- B：mprotect 只读化 → PTE 真的变只读 → 恢复可写
+    let prot0 = user::mprotect_calls();
+    f.rax = SYS_MPROTECT; f.rdi = va; f.rsi = 2 * mm::PAGE as u64; f.rdx = 0;
+    syscall_dispatch(&mut f);
+    let ro_ret = f.rax;
+    let prot_counted = user::mprotect_calls() == prot0 + 1;
+    let now_ro = mm::lazy_leaf_writable(va) == Some(false);
+    f.rax = SYS_MPROTECT; f.rdi = va; f.rsi = 2 * mm::PAGE as u64; f.rdx = 1;
+    syscall_dispatch(&mut f);
+    let rw_ret = f.rax;
+    let now_rw = mm::lazy_leaf_writable(va) == Some(true);
+
+    // ---- C：munmap
+    let un0 = user::munmap_calls();
+    f.rax = SYS_MUNMAP; f.rdi = va; f.rsi = 0; f.rdx = 0;
+    syscall_dispatch(&mut f);
+    let un_ret = f.rax;
+    let un_counted = user::munmap_calls() == un0 + 1;
+    // 再 munmap 同一段 ⇒ -8（已经不是我 mmap 来的了）
+    f.rax = SYS_MUNMAP; f.rdi = va; f.rsi = 0; f.rdx = 0;
+    syscall_dispatch(&mut f);
+    let gone = f.rax == user::E_NOT_FOUND;
+
+    let ok = len0 && too_big && exec_denied && hint_unsup
+        && aligned && counted && wrote
+        // mprotect 只改**已填充**的页：这里只触发了第 0 页的 demand-zero，
+        // 所以返回 1 而不是 2。返回 2 才是错的（那意味着它假装改了不存在的页）。
+        && prot_counted && ro_ret == 1 && now_ro && rw_ret == 1 && now_rw
+        && un_ret == 0 && un_counted && gone;
+
+    crate::log_info!(
+        "mmap族: 拒绝格(0长={} 超限={} 可执行={} 建议VA={}) A(对齐={} 计数={} 写读={}) \
+         B(计数={} 只读={} 确只读={} 恢复={} 确可写={}) C(={} 计数={} 已释放={}) ⇒ {}",
+        len0, too_big, exec_denied, hint_unsup,
+        aligned, counted, wrote,
+        prot_counted, ro_ret, now_ro, rw_ret, now_rw,
+        un_ret, un_counted, gone, ok
+    );
+    if !ok {
+        crate::log_fatal!("mmap族: 判据不成立（见上面每一格）va={:#x}", va);
+    }
+    ok
+}
+#[cfg(feature = "handles")]
+ktest!(KT_MMAP_FAMILY, t_mmap_family);
 
 // ---- COW（ADR-177 切片 2）：两个 AS 共享一帧，一个写，另一个必须看到原值
 //

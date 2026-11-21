@@ -106,9 +106,9 @@ U4 = 7
 # `mm` 的 U2 不变：`phys_of_in` 是**从 `phys_of` 提出来的**，遍历体原样搬走，
 # 两个函数各一处 `unsafe {`，总数仍 55。`aspace_root` 自身没有 unsafe 块。
 # 对账：530+1=531、U2 119+1=120。
-total = 554
+total = 558
 U1 = 85
-U2 = 141
+U2 = 145
 U3 = 13
 U4 = 149
 U5 = 128
@@ -212,7 +212,7 @@ U2 = 7
 
 [modules."memory/mm"]
 U1 = 6
-U2 = 75
+U2 = 79
 U4 = 8
 
 [modules."memory/vmo"]

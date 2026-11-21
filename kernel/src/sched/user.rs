@@ -202,6 +202,21 @@ pub const SYS_INPUT_RELEASE: u64 = 59;
 pub const SYS_AUDIO_STREAM: u64 = 60;
 pub const SYS_AUDIO_CONTROL: u64 = 61;
 
+/// 64–66：**内存映射族**（ADR-177 决策 1，2026-11-21 使用者裁决开 64+ 新段）。
+///
+/// 与 12/13/14 号（VMO）**不是同一件事**：那三个走句柄、走 VMO，语义是「共享一块有名字的内存」；
+/// 这一族补的是**没有句柄**的那一半——调用方只想要一块可写内存（匿名）。
+/// 两件事分开写而不是给 14 号加 flag，是因为 14 号的返回集合已被判定行钉住
+/// （ADR-106 §3：旧号的返回集合一个字不改）。
+pub const SYS_MMAP: u64 = 64;
+/// 65：释放 64 号返回的那一段。`rdi`=VA（**不收长度**，惰性区间的粒度是整段）。
+pub const SYS_MUNMAP: u64 = 65;
+/// 66：改一段的权限。`rdi`=VA、`rsi`=长度、`rdx`=新 flags（bit0 可写）。
+///
+/// **它是 COW 的第一个真实消费者**：只读化之后写入会落进 `cow_try`，
+/// 引用计数为 1 时原地恢复可写、不分配新帧（ADR-177 切片 2 落的机制）。
+pub const SYS_MPROTECT: u64 = 66;
+
 /// 62–63：**保留，不分配**。留给下一个未预见的族。
 ///
 /// 不在这里定义具体常量——定义了就等于暗示「已经想好给谁」。
@@ -429,6 +444,136 @@ pub(crate) fn handle_err(e: crate::handle::HErr) -> u64 {
 /// 同上：分派器不该替每个号背自己的缓冲（`sys_file_read` 的落盘块、`sys_process_start` 的
 /// StartupInfo 页、`sys_object_wait` 的等待格……）。整批内联时它的序言峰值实测 10,584 字节，
 /// 逐号拆开后降到只剩分派本身。
+// ---------------------------------------------------------------- 64/65/66（ADR-177 切片 2b）
+
+/// 64：`mmap` —— 匿名映射。`rdi`=长度（字节）、`rsi`=flags、`rdx`=建议 VA（0=内核挑）。
+///
+/// 返回映射起始 VA（页对齐）；失败返回负的错误码。
+///
+/// ## flags（与 14 号同一套位，便于调用方只记一次）
+///
+/// | 位 | 含义 | 今天 |
+/// | --- | --- | --- |
+/// | bit0 | 可写 | 支持 |
+/// | bit1 | 可执行 | **拒**（匿名页可执行 = 把 W^X 拆了，ADR-070） |
+///
+/// ## 为什么只做匿名
+///
+/// 文件/VMO 的映射已经有 14 号（`SYS_ASPACE_MAP`），它走句柄、走 VMO，语义完整。
+/// 这里补的是**没有句柄**的那一半：调用方只想要一块可写内存。
+/// 两件事分开写而不是给 14 号加 flag，是因为 14 号的返回集合已经被判定行钉住
+/// （ADR-106 §3：旧号的返回集合一个字不改）。
+///
+/// ## 容量（如实说，不粉饰）
+///
+/// 惰性区间表是 `MAX_LAZY_REGIONS = 8` 格、每格 `MAX_LAZY_PAGES = 16` 页（64 KiB）。
+/// 超出返回 `E_EXHAUSTED`。这个上限是 ADR-067 定的，不是本切片引入的；
+/// 它是「够用一轮接缝」的容量，不是产品容量——要扩得另开 ADR。
+#[cfg(feature = "handles")]
+fn sys_mmap(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
+    let len = frame.rdi;
+    if len == 0 {
+        return E_INVALID;
+    }
+    // 长度向上取整到页；溢出即拒（不 saturating：那会把一个荒谬的长度变成一个正常长度）
+    let Some(pages_u64) = len.checked_add(mm::PAGE as u64 - 1).map(|v| v / mm::PAGE as u64) else {
+        return E_INVALID;
+    };
+    let Ok(pages) = usize::try_from(pages_u64) else { return E_INVALID };
+    if pages == 0 || pages > mm::MAX_LAZY_PAGES {
+        // 超上限明确报 -6（表/名额耗尽），不是 -1（参数错）——
+        // 调用方看到 -1 会去检查自己的长度，而真相是这张表就这么大。
+        return E_EXHAUSTED;
+    }
+    // 可执行位拒：匿名页给 X 等于允许运行**刚写进去的字节**，那是 W^X 的反面
+    if frame.rsi & 2 != 0 {
+        return E_DENIED;
+    }
+    // 建议 VA：今天只接受 0（内核挑）。非 0 明确拒，不静默忽略——
+    // 静默忽略会让调用方以为自己拿到了指定地址（同 14 号「要么原样拿到、要么明确拒绝」）。
+    if frame.rdx != 0 {
+        return E_NOT_SUPPORTED;
+    }
+    let Some(h) = mm::lazy_new(pages, crate::vmo::MOD_VMO) else {
+        return E_EXHAUSTED;
+    };
+    let Some(base) = h.base() else {
+        return E_IO;
+    };
+    // 柄交给「表」持有：mmap 的 VA 是调用方的，munmap 用 lazy_free_at 按 VA 找回。
+    // forget 掉柄是因为 Drop 会释放区间，而我们要让它活到 munmap。
+    core::mem::forget(h);
+    MMAP_CALLS.fetch_add(1, Ordering::Relaxed);
+    MMAP_PAGES.fetch_add(pages as u64, Ordering::Relaxed);
+    base
+}
+
+/// 65：`munmap` —— 释放 64 号返回的那段。`rdi`=VA。
+///
+/// **不校验长度**：惰性区间的粒度是整段（ADR-067 决策 1），部分释放会把
+/// 「哪几页填充过」这件事拆成两半，而表里没有第二份记录。所以只收 VA，整段释放。
+/// 传长度会被忽略——这一点写在这里而不是静默吞掉，因为它是一个**语义选择**。
+#[cfg(feature = "handles")]
+fn sys_munmap(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let Some(_owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
+    if frame.rdi == 0 {
+        return E_INVALID;
+    }
+    if mm::lazy_free_at(frame.rdi) {
+        MMUNMAP_CALLS.fetch_add(1, Ordering::Relaxed);
+        0
+    } else {
+        // 不是惰性区间：明确报 -8（找不到），不是 -1。
+        // 调用方看到 -8 知道「这段不是我 mmap 来的」，看到 -1 会去查参数。
+        E_NOT_FOUND
+    }
+}
+
+/// 66：`mprotect` —— 改一段惰性区间的权限。`rdi`=VA、`rsi`=长度、`rdx`=新 flags。
+///
+/// ## 今天支持的范围（如实说）
+///
+/// 只支持「可写 → 只读」与「只读 → 可写」两种，且**只对已填充的页**生效。
+/// 未填充的页是「还不存在」，给它改权限没有意义（它下次缺页时会按当时的 flags 建）。
+///
+/// **只读化之后写入会触发 COW 吗**：会。这正是切片 2 落的机制——降权后 `cow_try`
+/// 发现引用计数是 1，原地恢复可写、不分配新帧。所以 mprotect 在这里是 COW 的**第一个真实消费者**。
+#[cfg(feature = "handles")]
+fn sys_mprotect(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let Some(_owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
+    let va = frame.rdi;
+    let len = frame.rsi;
+    if va == 0 || len == 0 {
+        return E_INVALID;
+    }
+    let Some((_slot, base, pages)) = mm::lazy_find(va) else {
+        return E_NOT_FOUND;
+    };
+    // 区间必须整段覆盖：部分 mprotect 要拆区间，而表里没有拆分记录（同 munmap 的理由）
+    let want_end = match va.checked_add(len) {
+        Some(e) => e,
+        None => return E_INVALID,
+    };
+    let have_end = base + pages as u64 * mm::PAGE as u64;
+    if va != base || want_end != have_end {
+        return E_NOT_SUPPORTED;
+    }
+    // 可执行位今天拒（同 mmap）
+    if frame.rdx & 2 != 0 {
+        return E_DENIED;
+    }
+    let writable = frame.rdx & 1 != 0;
+    let n = mm::lazy_protect(base, writable);
+    if n == 0 && pages != 0 {
+        // 一页都没改：区间里全是未填充页，或者页表改失败。
+        // 报 0 会让调用方以为成功，所以报 -15（本构建不支持这种形状）。
+        return E_NOT_SUPPORTED;
+    }
+    MPROTECT_CALLS.fetch_add(1, Ordering::Relaxed);
+    n as u64
+}
+#[cfg(feature = "handles")]
 #[inline(never)]
 fn sys_vmo_create(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let pages = frame.rdi as usize;
@@ -2798,6 +2943,13 @@ static UNKNOWN_NR: AtomicU64 = AtomicU64::new(0);
 /// 两者之和才是"内核没服务这个调用"，而分开之后"号表缺了一格"与"实现欠了一刀"
 /// 可以被分别数出来（同 ADR-030 决定 2：`no_such`/`stale` 分开计数的那种形状）。
 static NOSYS_NR: AtomicU64 = AtomicU64::new(0);
+/// ADR-177 切片 2b：内存映射族三个号的调用计数。**分开数**：
+/// 合成一个数会让「mmap 成功了但 munmap 一次没调」这种泄漏在读数上看不出来。
+static MMAP_CALLS: AtomicU64 = AtomicU64::new(0);
+static MMUNMAP_CALLS: AtomicU64 = AtomicU64::new(0);
+static MPROTECT_CALLS: AtomicU64 = AtomicU64::new(0);
+/// mmap 累计发出去的页数（判据要能与 munmap 的归还对账）。
+static MMAP_PAGES: AtomicU64 = AtomicU64::new(0);
 static KILLS: AtomicU64 = AtomicU64::new(0);
 static EXITS: AtomicU64 = AtomicU64::new(0);
 /// 被指针校验挡下来的次数（判据要能区分"内核拒了"与"内核根本没检查"）
@@ -2812,6 +2964,19 @@ pub fn unknown_nr() -> u64 {
 /// ADR-176：号登记了但没实现的次数（与 `unknown_nr` 分开数，理由见 `NOSYS_NR`）。
 pub fn nosys_nr() -> u64 {
     NOSYS_NR.load(Ordering::Relaxed)
+}
+/// ADR-177 切片 2b：内存映射族三个号各自的调用次数。
+pub fn mmap_calls() -> u64 {
+    MMAP_CALLS.load(Ordering::Relaxed)
+}
+pub fn munmap_calls() -> u64 {
+    MMUNMAP_CALLS.load(Ordering::Relaxed)
+}
+pub fn mprotect_calls() -> u64 {
+    MPROTECT_CALLS.load(Ordering::Relaxed)
+}
+pub fn mmap_pages() -> u64 {
+    MMAP_PAGES.load(Ordering::Relaxed)
 }
 
 /// ADR-176：**"号登记了，但这份构建没实现它"的唯一出口**。
@@ -2847,6 +3012,10 @@ fn reset_counters() {
     // ADR-176：**必须一起清**。漏掉的后果是计数器跨用例累积，而累积的计数器对
     // "这一格涨了没有"这种断言是假绿——用例会看着它涨而分不清是不是自己涨的。
     NOSYS_NR.store(0, Ordering::Relaxed);
+    MMAP_CALLS.store(0, Ordering::Relaxed);
+    MMUNMAP_CALLS.store(0, Ordering::Relaxed);
+    MPROTECT_CALLS.store(0, Ordering::Relaxed);
+    MMAP_PAGES.store(0, Ordering::Relaxed);
     KILLS.store(0, Ordering::Relaxed);
     EXITS.store(0, Ordering::Relaxed);
     BAD_PTRS.store(0, Ordering::Relaxed);
@@ -3309,6 +3478,14 @@ pub fn syscall_dispatch(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> boo
         SYS_INPUT_RELEASE => nosys(),
         SYS_AUDIO_STREAM => nosys(),
         SYS_AUDIO_CONTROL => nosys(),
+        // ---- 64–66：内存映射族（ADR-177 切片 2b）。
+        // 与 48–61 那批不同，这三个**有实现**——所以它们是显式的 handler，不是 `nosys()`。
+        #[cfg(feature = "handles")]
+        SYS_MMAP => sys_mmap(frame),
+        #[cfg(feature = "handles")]
+        SYS_MUNMAP => sys_munmap(frame),
+        #[cfg(feature = "handles")]
+        SYS_MPROTECT => sys_mprotect(frame),
         SYS_POKE_BUF => {
             // 内核 → 用户。写成 `Ok(n)` 而不是布尔：`n != want` 就是"中途被接住的故障"，
             // 程序核对字节时看得见的差异与内核报回的数必须一致（两台仪器不能各说各话）。
