@@ -35,10 +35,10 @@ pub const MOD_STACK_KUSER: ModuleId = ModuleId(15);
 ///
 /// 注意 `MAX_TASKS_TOTAL = MAX_TASKS * MAX_CPUS`：8 核从 72 槽变 96 槽，
 /// 凡按它算上界的判据（`tasks_active()`、`t_q2_workload_slots` 的回基线）都要重核。
-pub const MAX_TASKS: usize = 12;
+pub const MAX_TASKS: usize = 64;
 /// `Task::as_slot` 的"内核 AS"哨兵（W3 P5b，ADR-075 决策 2）。
 /// **内核任务恒为它**，所以既有路径一次 CR3 都不多写（矩阵 45 行不该变的论证基础）。
-pub const NO_ASPACE: u8 = 0xFF;
+pub const NO_ASPACE: u16 = 0xFFFF;
 // ADR-041：VA 保留表的容量归 memory 拥有；扩槽要把 memory 的容量一起抬。
 const _: () = assert!(MAX_TASKS <= crate::mm::MAX_TASKS_SUPPORTED);
 /// 全系统可登记的任务数（跨所有 CPU）。用例读 `WORK[i]` / `state_of(i)` 时用的是这个空间里的全局下标。
@@ -131,7 +131,7 @@ pub struct Task {
     /// 收工出口据此置 signal + 减线程计数；收尾判据据此判"用例造的进程线程必须清零"。
     pub proc_id: u16,
     /// 这个任务跑在哪个地址空间里（`NO_ASPACE` = 内核那份）。W3 P5b（ADR-075 决策 2）。
-    pub as_slot: u8,
+    pub as_slot: u16,
     /// 这个任务持有的凭据 id（ADR-150）。`None` = 内核任务 / 还没授凭据。
     /// **不存 `Cred` 本体**：凭据是对象（可授受、可销毁），任务只存引用。
     #[cfg(feature = "handles")]
@@ -2034,7 +2034,7 @@ pub fn wait_for_proc(proc_id: u16, deadline_cycles: u64) -> Option<u32> {
 /// **先数清、确认装得下，再动手**：`push_item` 满了会就地 `drop`，而 `AsMap` 的 Drop 要取 VMM
 /// 并等跨 CPU 回执 ⇒ 持 RUNQ 时做正是 ADR-047 决策 2 禁止的形状。所以这里预检容量，
 /// 搬的过程**没有失败路径**，也不用那个会 drop 的入口。
-pub fn adopt_asmaps(parent: usize, child: usize, as_slot: u8) -> Result<usize, mm::MmError> {
+pub fn adopt_asmaps(parent: usize, child: usize, as_slot: u16) -> Result<usize, mm::MmError> {
     if parent >= MAX_TASKS_TOTAL || child >= MAX_TASKS_TOTAL || parent == child {
         return Err(mm::MmError::Unsupported);
     }
@@ -2346,7 +2346,7 @@ pub fn own_current(item: OwnedItem) -> Result<(), mm::MmError> {
 
 /// 把一个任务登记到某个 AS 上（W3 P5b；用例用，P5c 的 `thread_create` 走同一条）。
 /// **在这里查一次根表并缓存**，换人时就不再取 VMM。只允许本 CPU 的活任务（同 `set_proc_id`）。
-pub fn set_aspace(i: usize, slot: u8) -> bool {
+pub fn set_aspace(i: usize, slot: u16) -> bool {
     if i >= MAX_TASKS_TOTAL || cpu_of(i) != crate::arch::x86_64::cpu::self_slot() {
         return false;
     }
@@ -2364,7 +2364,7 @@ pub fn set_aspace(i: usize, slot: u8) -> bool {
 }
 
 /// 读一个任务的 AS 归属（只读快照，判据用）。
-pub fn aspace_of(i: usize) -> u8 {
+pub fn aspace_of(i: usize) -> u16 {
     if i >= MAX_TASKS_TOTAL {
         return NO_ASPACE;
     }

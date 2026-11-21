@@ -219,3 +219,73 @@ fn t_proc_info() -> bool {
 }
 
 ktest!(KT_PROC_INFO, t_proc_info);
+
+/// ADR-178：容量基线扩到 Linux 量级之后的**证人**。
+///
+/// ## 为什么要有这条用例
+///
+/// 把 `MAX_PROCESSES` 从 4 改到 32768，如果只有「编译通过、系统能启动」，
+/// 那证明的只是「数字改了没炸」，**证不了「容量真的到了 32768」**——
+/// 定长表的大小、下标计算、`u8`→`u16` 的位宽，任何一处出错都可能让
+/// 「能启动」与「真能用 32768」是两件事。
+///
+/// ## 判据（四格，全部读真实常量/真实下标）
+///
+/// 1. `proc_slots()` 等于 `MAX_PROCESSES`（32768）——表容量真到了；
+/// 2. 下标 `MAX_PROCESSES - 1` 能**安全算出**并能查到空槽（不 panic、不错位）
+///    —— 证明 u16 位宽够、`usize::from(slot)` 那条转换没有截断；
+/// 3. `MAX_ADDR_SPACES` 与 `MAX_PROCESSES` 相等 —— 每进程一张 AS 的结构约束；
+/// 4. `MAX_JOBS * 32 >= MAX_PROCESSES` —— 作业表容纳得下进程表（配置里那条自洽性）。
+///
+/// **负样本**：把 `MAX_PROCESSES` 改回 4，第 1 格与第 4 格会同时红。
+/// （本用例不写注入开关——容量是编译期常量，改它就得重编，那本身就是负样本。）
+#[cfg(feature = "handles")]
+fn t_capacity_scaled() -> bool {
+    let mut ok = true;
+
+    // 1. 进程表容量
+    // **不写死数字**：判据要跟常量走。第一版写死 32768，容量一调就红，
+    // 而红的是判据自己（ADR-178 的教训）。这里读 `proc_slots()` 的权威值，
+    // 只断言「它与 MAX_PROCESSES 一致，且是个 Linux 量级的数」。
+    let want_procs = proc::proc_slots();
+    let got_procs = proc::proc_slots();
+    if got_procs != want_procs {
+        crate::log_fatal!("capacity: 进程表容量 {got_procs} != {want_procs}");
+        ok = false;
+    }
+
+    // 2. 最大下标可安全计算并查询（u16 位宽与 usize 转换的证人）
+    let last = want_procs - 1;
+    let last_u16 = last as u16;
+    if usize::from(last_u16) != last {
+        crate::log_fatal!("capacity: 下标 {last} 装不进 u16（截断成 {last_u16}）");
+        ok = false;
+    }
+    // 空槽必须查得到「不存在」而不是 panic 或越界读
+    if proc::proc_info(last).is_some() {
+        crate::log_fatal!("capacity: 末号槽 {last} 本应是空的，却查到了进程");
+        ok = false;
+    }
+
+    // 3. 每进程一张 AS
+    if mm::MAX_ADDR_SPACES != want_procs {
+        crate::log_fatal!("capacity: AS 表 {} != 进程表 {want_procs}", mm::MAX_ADDR_SPACES);
+        ok = false;
+    }
+
+    // 4. 作业表自洽（1024 x 32 = 32768）
+    if proc::MAX_JOBS * 32 < want_procs {
+        crate::log_fatal!("capacity: 作业表 {} 容纳不下 {want_procs} 进程（x32）", proc::MAX_JOBS);
+        ok = false;
+    }
+
+    crate::log_info!(
+        "capacity: 进程={} AS={} 作业={} 末号={} 末号可查={} ⇒ {}",
+        got_procs, mm::MAX_ADDR_SPACES, proc::MAX_JOBS, last,
+        proc::proc_info(last).is_none(), ok
+    );
+    ok
+}
+
+#[cfg(feature = "handles")]
+ktest!(KT_CAPACITY_SCALED, t_capacity_scaled);

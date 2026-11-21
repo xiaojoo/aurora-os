@@ -20718,3 +20718,82 @@ rflags 位（ADR-021：IF 属于 CPU 不属于任务）。注释里的论证是�
 - per-process fd 表（ADR-179 范围）
 - `MAX_CPUS=8` 是否提到 Linux 的 64（涉及 per-CPU 数组全量重算）
 - socket / IPv6 / 真机安装（本轮只做容器基线，未碰这三条线）
+---
+
+## 490. ADR-179 落地：句柄表从定长 `.bss` 改为运行时分配（2026-11-22）
+
+### 使用者裁决
+
+> 直接改动架构吧
+
+### 交付
+
+**句柄槽数组从 `static [Entry; MAX_HANDLES]` 改为 `phys_alloc` 运行时分配。**
+
+形状照抄 ADR-063 的 `bootstrap_frame_info()`（五步：`phys_alloc` → `forget` → HHDM 虚地址 → 存基址 → 存长度）。
+
+关键设计：`SlotArray` 实现 `Index`/`IndexMut`/`iter()`，**34 处调用点一行都没改**——
+改动面从 34 处收缩到 1 个类型定义，让「改架构」与「改语义」彻底分开。
+
+### 三个实测撞出来的坑（每个都是真 bug）
+
+**① 锁序违规**（第一次跑就炸）：
+
+    [fatal] L4 sync: 锁序违规，外层 rank=35 本次 rank=30
+
+`RANK_HANDLE=35` 锁内调 `phys_alloc`（`RANK_PMM=30`）是反向嵌套。`lock-order.md` 对 35 的规矩是
+「表锁内只许调台账、不许调 mm」。修法：**先分配（锁外）、后取锁装基址**。
+
+**② 栈数组 128 KiB**（`MAX_HANDLES=131072` 时）：
+
+    let mut vmos = [0u8; MAX_HANDLES];   // 131072 => 128 KiB 栈数组
+
+`revoke_task`/`reset_for_test` 里这个栈数组直接把内核栈打穿 ⇒ `unexpected vector=8`（Double Fault）。
+修法：新增 `MAX_REVOKE_VMOS = 64`，并给两处写入加边界。
+
+**③ 分到 bootloader 区（最隐蔽）**：
+
+    handle: slots 引导 base=0xffff800000200000 清零后used=0
+    稍后: handle::live 计数 184470 超过容量 4096
+
+`phys_alloc(6)` 从 `1<<order` 页向上找，**分到了物理 2 MiB**——那是 bootloader 实际占用的低端区
+（`init_allocator` 只按 memmap 的 `usable` 放开位图，而 bootloader 区在 memmap 里恰好是 usable、
+内容却不是零）。清零是成功的（`清零后used=0`），但**之后被 bootloader 区的内容覆盖**。
+
+修法：新增 `mm::phys_alloc_above(order, owner, min_phys)`，`handle::init` 从 `max_phys/2` 之上分配。
+修复后 `base=0xffff80000ff80000`（物理 255.5 MiB），`live()` 正常。
+
+### 读数的可信度（如实写）
+
+| 档 | 判定 | ktests | `irt` |
+|---|---|---|---|
+| `handles` | **PASS(33)** | **100/100** | **24** ✅ |
+| 默认 | **PASS(33)** | — | — |
+| `check` | **20/20** | — | — |
+
+`handle: slots 引导 base=0xffff80000ff80000 len=4096 pages=176 清零后used=0` —— 引导路径的读数在日志里。
+
+### 两个容量上限（**实测**，不是猜测）
+
+扩容时撞到两堵墙，都记进了 ADR-179：
+
+| 项 | 上限 | 症状 |
+|---|---|---|
+| `MAX_HANDLES` | 4096（`order=6`，256 KiB 连续） | 131072（`order=11`，8 MiB 连续）时 IOAPIC `irt` 从 24 读成 1 ⇒ HANG |
+| `MAX_VA_RESERVATIONS` | **256** | 65536 时 `t_map_hole` 的 `b回基线=false c帧回=false`（VA 保留表语义被破坏） |
+| `MAX_TASKS` | 64 | 256 时栈溢出（`cr2=0xffff80002041cf08` 撞 `map_device` 的 VA 区） |
+
+**这三条都是「调大反而坏」，而且是布局敏感的**——`.bss` 总量、连续物理块大小、栈数组大小各自不同。
+
+### 与 ADR-178 的关系
+
+ADR-178 定的目标值（32768 进程 / 1024 作业 / 32768 AS）**已落地并验证**（`capacity: 进程=32768 AS=32768 作业=1024 ⇒ true`）。
+但 `MAX_HANDLES` 没能到 131072、`MAX_TASKS` 没能到 256、`MAX_VA_RESERVATIONS` 没能到 65536——
+**这三项的上限是实测出来的，不是设计选择**，已写进 `capacity-baseline.toml` 的 `reason`。
+
+### 未做
+
+- **真正对标 Linux 的 per-process fd 表**（ADR-180）：本 ADR 只把全局表挪出 `.bss`，没改成每进程。
+- `MAX_HANDLES` 想再往上，需要**逐页分配 + 映射**（不是连续物理块），本轮未做。
+- `MAX_VA_RESERVATIONS` 的语义为何被大位图破坏，未查明。
+- 任务表（`tasks: [Task; MAX_TASKS]`）仍是定长 `.bss`，本轮只改了句柄表。

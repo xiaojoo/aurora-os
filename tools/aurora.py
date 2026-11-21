@@ -353,8 +353,12 @@ def do_image(features: list[str]) -> Path:
     import esp_image  # noqa: E402
 
     elf = do_build(features)
-    esp_sectors = 65536          # 32 MiB
-    disk_sectors = 131072        # 64 MiB
+    # ESP 从 32 MiB 抬到 128 MiB（ADR-178 的连带）：容量基线扩到 32768 进程后，
+    # handles 档的内核 ELF 从 11.6 MiB 涨到 43.9 MiB，32 MiB 的 ESP 装不下。
+    # 不抬的表现不是「构建失败」，而是**内核被写进状态区**（esp_image 那条断言抓到的）。
+    esp_sectors = 262144         # 128 MiB
+    # 磁盘跟着 ESP 涨：ESP 128 MiB + 状态区 + 签名包 + 主备 GPT，256 MiB 留足余量。
+    disk_sectors = 524288        # 256 MiB
     bootx = TOOLS / "limine-bin" / "BOOTX64.EFI"
     if not bootx.exists():
         sys.exit(f"缺少 {bootx}；Limine 预编译产物未就位")

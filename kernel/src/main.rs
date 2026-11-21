@@ -494,6 +494,13 @@ fn stage_memory() {
         crate::log_fatal!("mm not ready after takeover");
         exit::finish(exit::Code::BootInvalid);
     }
+    // ADR-179：句柄槽数组从 `.bss` 改为运行时分配。必须在这里（物理分配器已就绪、
+    // 还没有任何任务跑起来）。失败走 boot-invalid —— 绝不允许空表继续跑。
+    #[cfg(feature = "handles")]
+    if let Err(e) = crate::handle::init() {
+        crate::log_fatal!("handle::init 引导失败 {:?}（句柄槽数组分不出）", e);
+        exit::boot_invalid("handle init failed");
+    }
     // P1b：FrameInfo 已接管分配/释放（位图退化为引导期临时量）。引导期那次的逐帧对账
     // 已在 P1a 证红；接管后的正确性由 ktest 等价判据与 fault-double-free 链盯，不再拿
     // 已经停更的位图做影子对账（那会在第一次 alloc 后必然不符）。

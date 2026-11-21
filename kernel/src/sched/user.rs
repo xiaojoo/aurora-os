@@ -1383,7 +1383,7 @@ fn exec_segments(prefix: &[u8], file_len: usize) -> Option<([LoadSeg; LOAD_SEGS_
 /// 子 AS 里 `[va, va+bytes.len())` 与给定字节逐个相等？逐页取叶子、要 present+user、
 /// 走 HHDM 别名读物理帧；未映射、巨页、字节不同都返回 `false`。
 #[cfg(feature = "fs-open")]
-fn child_bytes_eq(as_slot: u8, mut va: u64, mut want: &[u8]) -> bool {
+fn child_bytes_eq(as_slot: u16, mut va: u64, mut want: &[u8]) -> bool {
     while !want.is_empty() {
         let off_in_page = (va & (crate::mm::PAGE as u64 - 1)) as usize;
         let take = core::cmp::min(crate::mm::PAGE - off_in_page, want.len());
@@ -1419,7 +1419,7 @@ fn child_bytes_eq(as_slot: u8, mut va: u64, mut want: &[u8]) -> bool {
 /// S4c（ADR-116）：把子 AS 里**可执行段**的帧封存起来——16 号返回后，父进程即便还握着
 /// 段 VMO 的写句柄，`vmo_write` 也会撞上 `Sealed`（TOCTOU 窗口就此关掉，不再是"只在 16 那一刻"）。
 #[cfg(feature = "fs-open")]
-fn seal_exec_frames(as_slot: u8, segs: &[LoadSeg]) -> bool {
+fn seal_exec_frames(as_slot: u16, segs: &[LoadSeg]) -> bool {
     for s in segs {
         let mut va = s.va;
         let end = match s.va.checked_add(s.len) {
@@ -1445,7 +1445,7 @@ fn seal_exec_frames(as_slot: u8, segs: &[LoadSeg]) -> bool {
 
 /// 一段盘上字节（文件偏移 `file_off` 起）与它落在的每个 `PT_LOAD` 在子 AS 里的副本比。
 #[cfg(feature = "fs-open")]
-fn exec_binding_chunk(as_slot: u8, segs: &[LoadSeg], file_off: u64, data: &[u8]) -> bool {
+fn exec_binding_chunk(as_slot: u16, segs: &[LoadSeg], file_off: u64, data: &[u8]) -> bool {
     let end = match file_off.checked_add(data.len() as u64) {
         Some(e) => e,
         None => return false,
@@ -1518,7 +1518,7 @@ fn argv0_of(args: &[u8]) -> Option<&str> {
 /// 同一块盘"的性质由启动阶段那一次验签已经给出（ADR-115 补记三记这笔取舍）。
 #[cfg(feature = "fs-open")]
 #[inline(never)]
-fn exec_gate(name: &str, as_slot: u8) -> Option<u64> {
+fn exec_gate(name: &str, as_slot: u16) -> Option<u64> {
     use crate::filesystem::fs_open::{self, Opened};
     use crate::filesystem::vfs::AhciDisk;
     use crate::filesystem::vfs_ro::ReadOnlyFs;
@@ -4078,7 +4078,7 @@ fn copy_to_user_locked(src: &[u8], va: u64) -> Result<usize, PtrError> {
 ///
 /// **页内偏移自己加**：`phys_of_in` 返回页基址（`entry & ADDR_MASK` 只有页框号），
 /// 漏了它会「第一个字节对、后面全错」（§466 修过同样的错）。
-pub fn copy_to_user_in(aslot: u8, va: u64, src: &[u8]) -> Result<usize, PtrError> {
+pub fn copy_to_user_in(aslot: u16, va: u64, src: &[u8]) -> Result<usize, PtrError> {
     if src.len() > COPY_MAX {
         return Err(PtrError::TooLong);
     }
@@ -4425,7 +4425,7 @@ pub fn load(bytes: &[u8]) -> Result<Loaded, LoadError> {
 ///    低那一页永不映射当 guard（与 `load()` 同形状）。
 ///
 /// 失败不留半截：已铺的映射都在 `owned` 里，调用方丢弃它即逐条 Drop 退还。
-pub fn load_into(aslot: u8, bytes: &[u8]) -> Result<Loaded, LoadError> {
+pub fn load_into(aslot: u16, bytes: &[u8]) -> Result<Loaded, LoadError> {
     let p = elf::parse(bytes).map_err(LoadError::Elf)?;
     let (image_lo, image_hi, image_pages) = check_image_span(&p)?;
     let mut data_va = 0u64;
@@ -4567,7 +4567,7 @@ pub fn load_into(aslot: u8, bytes: &[u8]) -> Result<Loaded, LoadError> {
 /// - 校验**不跳过**：仍逐页问 `aspace_effective_flags`，必须是用户页；
 /// - 它已登记进 `docs/security/unsafe-whitelist.toml`（U4），
 ///   理由与地址范围写在那里，改这里要同步改那边。
-pub fn copy_from_user_in(aslot: u8, va: u64, dst: &mut [u8]) -> Result<usize, PtrError> {
+pub fn copy_from_user_in(aslot: u16, va: u64, dst: &mut [u8]) -> Result<usize, PtrError> {
     if dst.len() > COPY_MAX {
         return Err(PtrError::TooLong);
     }
@@ -4627,7 +4627,7 @@ pub fn copy_from_user_in(aslot: u8, va: u64, dst: &mut [u8]) -> Result<usize, Pt
 /// 从**指定 AS** 读一个 `u64`（ADR-175）。与 `read_at` 的关系见 `copy_from_user_in`。
 ///
 /// **跨 AS 读应该用这个，不是 `read_at`。** 今天出错的正是「两套并存、用的人选错」。
-pub fn read_at_in(aslot: u8, va: u64) -> Option<u64> {
+pub fn read_at_in(aslot: u16, va: u64) -> Option<u64> {
     let mut b = [0u8; 8];
     match copy_from_user_in(aslot, va, &mut b) {
         Ok(8) => Some(u64::from_le_bytes(b)),

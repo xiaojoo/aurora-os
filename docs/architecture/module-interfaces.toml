@@ -281,6 +281,8 @@ public_api = [
   "mm::max_phys",
   "mm::our_cr3",
   "mm::phys_alloc",
+  # ADR-179：从指定物理地址之上分配（避开 bootloader 占用的低端区）。
+  "mm::phys_alloc_above",
   "mm::reclaim_bootloader_regions",
   "mm::region_count",
   "mm::release_va",
@@ -995,6 +997,8 @@ public_api = [
   "handle::begin_dir_read",
   "handle::next_dir_entry",
   "handle::commit_dir_read",
+  # ADR-179：句柄槽数组从 .bss 改为运行时分配后的引导入口。
+  "handle::init",
 ]
 allowed_callers = ["integration", "sched"]
 dependencies = ["memory", "storage", "sync"]
@@ -1004,7 +1008,7 @@ context = ["KERNEL", "USER_ENTRY"]
 error_classes = ["A", "C"]
 resource_ownership = "16 格句柄表、Rights、owner 两格、slot:u16+gen:u48；两种对象引用：File 是值（port+游标），Vmo 只存槽号（本体在 memory 的 vmo 表里）。表锁内不归还任何页框：VMO 的引用增减一律在放掉 HANDLE(35) 之后做（ADR-074 决策 1）。"
 error_policy = "NoSuchHandle/StaleHandle/NotOwner/Denied/BadRights；越权拒绝并记安全事件。"
-unsafe_scope = []
+unsafe_scope = ["capability/handle:U2"]  # ADR-179: 句柄槽数组运行时分配
 test_targets = ["t_handle_table", "t_handle_syscalls", "t_handle_reap", "t_handle_vmo_release", "t_vmo_syscalls", "t_vmo_numbers_absent", "t_handle_kinds", "t_handle_transfer", "t_process_startup", "t_object_wait", "t_two_containers"]
 status = "部分落地"
 

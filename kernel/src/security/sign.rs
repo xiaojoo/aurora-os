@@ -213,7 +213,7 @@ pub const PKG_PAYLOAD_BYTES: usize = 32_768;
 pub const PKG_BYTES: usize = PAY_OFF + PKG_PAYLOAD_BYTES;
 /// 包在盘上的位置与长度（`tools/esp_image.py` 的 `PKG_START_LBA`/`PKG_SECTORS` 同数）。
 /// 这一段与状态区一样，是 GPT 未分配空隙里的**约定**，还不是一条带 GUID 的分区条目
-pub const PKG_START_LBA: u64 = 67_664;
+pub const PKG_START_LBA: u64 = 264_208;
 pub const SECTOR_BYTES: usize = 512;
 pub const PKG_SECTORS: usize = PKG_BYTES / SECTOR_BYTES;
 pub const SIG_BYTES: usize = SIG_ITEMS * DIGEST_BYTES;

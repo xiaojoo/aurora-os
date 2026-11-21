@@ -54,7 +54,20 @@ const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 /// = **12**，取两倍余量定 24。本机（usable 顶到 503 MiB）实测用 6 页，
 /// 这个数字每次启动都打进日志（`pool=`），所以余量是真余量而不是猜测。
 /// 用尽不会静默：`early_frame` 先打印再返回 None → `take_over` 以 Err 结束 → 判定 37。
-const EARLY_POOL_PAGES: usize = 24;
+// ADR-178 连带：从 24 抬到 128。
+//
+// 为什么必须抬：这个池装的是**映射内核镜像**用的页表页（每张 4 KiB 表覆盖 2 MiB）。
+// 容量基线扩到 32768 进程后，handles 档的内核 ELF 从 11.6 MiB 涨到 43.9 MiB
+// ⇒ 需要约 25 张叶表，而池只有 24 页，**正好卡在边界上**。
+// 实测后果（run-9843）：`early page-table pool exhausted (24 pages)` →
+// `mm::take_over failed: OutOfMemory` → 判定 37（BOOT-INVALID）。
+//
+// 为什么是 128 而不是 32：内核大小会继续随容量增长，每次只抬到「刚好够」
+// 就会在下一个容量改动时再撞一次。128 页 = 512 KiB（池在 .bss，代价可接受），
+// 给到约 256 MiB 内核的余量。
+//
+// 每次启动都会把实际用量打进日志（`pool=`），余量是真余量不是猜测。
+const EARLY_POOL_PAGES: usize = 128;
 /// 位图覆盖 4 GiB；超出部分本里程碑明确不支持（BACKLOG 已记）
 const MAX_PHYS_COVER: u64 = 4 * 1024 * 1024 * 1024;
 const BITMAP_WORDS: usize = (MAX_PHYS_COVER as usize / PAGE) / 64;
@@ -91,7 +104,7 @@ const FRAME_INFO_BYTES: usize = core::mem::size_of::<FrameInfo>();
 ///
 /// **`MAX_VA_RESERVATIONS` 不跟着派生**（ADR-065 已解耦）：每任务栈占 5 页 VA，
 /// 12×8 = 96 条仍远小于 256。
-pub const MAX_TASKS_SUPPORTED: usize = 12;
+pub const MAX_TASKS_SUPPORTED: usize = 64;
 const MAX_VA_RESERVATIONS: usize = 256;
 /// 占用位图字数（bit i=1 表示槽 i 已用）。所有访问都在 VMM 锁内，普通 u64 即可（非原子）。
 const VA_BITMAP_WORDS: usize = MAX_VA_RESERVATIONS / 64;
@@ -994,7 +1007,7 @@ fn new_table_frame() -> Option<u64> {
 /// `Some(slot)` = 那个 AS 自己的表页：`MOD_AS_PT`，帧号记进 `pt_frames`，
 /// AS 销毁时由 `aspace_release` 逐帧 `frame_put` 归还。清单满了就**把这张还回去并失败**，
 /// 不发一张没人还的表页（那正是 BACKLOG §147 第 1 条的形状）。
-fn new_table_frame_in(as_slot: Option<u8>) -> Option<u64> {
+fn new_table_frame_in(as_slot: Option<u16>) -> Option<u64> {
     let phys = if is_ready() {
         let owner = if as_slot.is_some() { MOD_AS_PT } else { MOD_BOOT };
         let f = phys_alloc(0, owner).ok()?;
@@ -1042,7 +1055,7 @@ unsafe fn walk_leaf(va: u64, create: bool, huge: bool, user: bool) -> Option<*mu
 /// SAFETY: 调用方保证 `root` 是一份有效 PML4 的物理地址、`va` 规范、持 VMM。
 unsafe fn walk_leaf_in(
     root: u64,
-    as_slot: Option<u8>,
+    as_slot: Option<u16>,
     va: u64,
     create: bool,
     huge: bool,
@@ -1093,7 +1106,7 @@ fn set_leaf(va: u64, value: u64, huge: bool, user: bool) -> Result<(), MmError> 
 /// 这是"同一 VA 在两个 AS 里各自映射互不影响"（ADR-070 A4）的实现点。
 fn set_leaf_in(
     root: u64,
-    as_slot: Option<u8>,
+    as_slot: Option<u16>,
     va: u64,
     value: u64,
     huge: bool,
@@ -1505,7 +1518,7 @@ pub fn current_effective_flags(va: u64) -> Option<EffectiveFlags> {
 /// 按**槽号**读另一张 AS 里某个 VA 的生效位（P5c-3：15/16 号要校验 entry 可执行、
 /// 栈页可写、StartupInfo 页**只读**，而那些页都在子 AS 里，不在当前 CR3 上）。
 /// 与 `effective_flags` 共用同一段遍历，差别只有根从哪来。
-pub fn aspace_effective_flags(slot: u8, va: u64) -> Option<EffectiveFlags> {
+pub fn aspace_effective_flags(slot: u16, va: u64) -> Option<EffectiveFlags> {
     let root = aspace_root(slot)?;
     effective_flags_in(root, va)
 }
@@ -1521,7 +1534,7 @@ pub fn aspace_effective_flags(slot: u8, va: u64) -> Option<EffectiveFlags> {
 /// ⇒ 内核直接 `L4 sync: 重入获取 rank=20` 崩在 `t_load_into_child_as` 之前。
 ///
 /// 前提：调用方持有 VMM 锁。**单次查询用 `aspace_effective_flags`**。
-pub fn aspace_effective_flags_locked(slot: u8, va: u64) -> Option<EffectiveFlags> {
+pub fn aspace_effective_flags_locked(slot: u16, va: u64) -> Option<EffectiveFlags> {
     let root = aspace_root_locked(slot)?;
     effective_flags_in(root, va)
 }
@@ -1530,7 +1543,7 @@ pub fn aspace_effective_flags_locked(slot: u8, va: u64) -> Option<EffectiveFlags
 ///
 /// 从 `aspace_effective_flags` 里提出来的：`copy_from_user_in` 也要取同一个根，
 /// 而「怎么取根」只该有一份实现（两处各写一遍就会有一处忘了 `e.used` 判）。
-pub fn aspace_root(slot: u8) -> Option<u64> {
+pub fn aspace_root(slot: u16) -> Option<u64> {
     if !is_ready() {
         return None;
     }
@@ -1546,7 +1559,7 @@ pub fn aspace_root(slot: u8) -> Option<u64> {
 /// 并归还帧），所以它必须先拿锁再调这个，不能调自取锁的那个。
 ///
 /// 前提：调用方持有 VMM 锁。**单次查询用 `aspace_root`**。
-pub fn aspace_root_locked(slot: u8) -> Option<u64> {
+pub fn aspace_root_locked(slot: u16) -> Option<u64> {
     let e = aspaces().items.get(usize::from(slot))?;
     if !e.used {
         return None;
@@ -1821,7 +1834,7 @@ pub fn map_hole(pa: u64, pages: usize) -> Result<MmioMapping, MmError> {
 /// - 4 + 2 = 6 是实测会同时要格子的最大组合，取 8 留一格余量。
 ///   **代价如实写**：`AS_ON` 与表项数组同步变大（每格 `AspaceEntry` 约 152 字节 ⇒ 8 格 1.2 KB，
 ///   在 `.bss`），且槽号位宽不变（`u8`），`running_on` 只增不减的语义不变。
-pub const MAX_ADDR_SPACES: usize = 8;
+pub const MAX_ADDR_SPACES: usize = 32768;
 
 /// 表项。全 Copy 数值（与 `LazyRegion` 同律）：PML4 物理地址 + 它自己建的表页帧号清单。
 /// **只记自己建的**：高 256 项复制的是*项*，下层表是共享的内核表，销毁时绝不能还它们
@@ -1880,13 +1893,13 @@ fn aspaces() -> &'static mut AspaceTable {
 /// 到 0 才真还），不在锁内做可能阻塞的事。
 #[must_use = "地址空间柄丢弃即销毁，随手丢弃等于这个 AS 不存在"]
 pub struct AspaceHandle {
-    slot: u8,
+    slot: u16,
 }
 
 impl AspaceHandle {
     /// 这个 AS 的槽号（`AS_ON` 的索引，也是 `Task::as_slot` 里存的那个数）。
     /// 纯数值，不取锁；柄本身已经保证槽号是当初那个 AS 的。
-    pub fn slot(&self) -> u8 {
+    pub fn slot(&self) -> u16 {
         self.slot
     }
 
@@ -1946,7 +1959,7 @@ impl Drop for AspaceHandle {
 /// 建一个非内核地址空间：新 PML4 页（`MOD_AS_PT`，有主人），高 256 项从 `AS_KERNEL`
 /// **复制项**（下层表共享，Linux `pgd_alloc` 的形状，Q5 裁决），低 256 项清零。
 /// 表满/分配失败返回 None（已取的帧就地归还，不留无主帧）。上下文 KERNEL，取 VMM。
-fn aspace_new_slot() -> Option<(u8, u32)> {
+fn aspace_new_slot() -> Option<(u16, u32)> {
     if !is_ready() {
         return None;
     }
@@ -1978,7 +1991,7 @@ fn aspace_new_slot() -> Option<(u8, u32)> {
     t.items[slot].pt_frames[0] = frame;
     t.items[slot].pt_count = 1;
     AS_PT_LIVE.fetch_add(1, Ordering::Relaxed);
-    Some((slot as u8, gen))
+    Some((slot as u16, gen))
 }
 
 /// 建一张 AS 并交出一个 **RAII 柄**（丢弃即销毁）。用例与内核自己的映射继续用它。
@@ -1995,7 +2008,7 @@ pub fn aspace_new() -> Option<AspaceHandle> {
 /// `proc_discard`/`proc_reap` 归还名额时调 `aspace_destroy`。
 /// 与 `aspace_new` 共用同一段实体（同一格 `gen` 递增、同一份 `AS_ON` 复位、同样只记自建表页），
 /// 差别只在"谁负责收"——ktest 自己的 AS 继续用 RAII，两条路各配自己的证人。
-pub fn aspace_new_kernel() -> Option<(u8, u32)> {
+pub fn aspace_new_kernel() -> Option<(u16, u32)> {
     aspace_new_slot()
 }
 
@@ -2003,7 +2016,7 @@ pub fn aspace_new_kernel() -> Option<(u8, u32)> {
 /// 槽不存在返回 false（幂等：`proc_reap` 与显式收场都调它，第二次就是无效操作）。
 /// **调用前提是这张 AS 上没有活着的任务**（ADR-074 的契约顺序：任务先死、映射再丢、AS 最后销），
 /// 这条前提不由本函数检查——它由 `proc` 的 `threads == 0` 闸保证。
-pub fn aspace_destroy(slot: u8) -> bool {
+pub fn aspace_destroy(slot: u16) -> bool {
     let live = {
         let _g = vmm();
         // `get` 而不是下标：槽号越界必须是"没有这张 AS"，
@@ -2021,7 +2034,7 @@ pub fn aspace_destroy(slot: u8) -> bool {
 /// **归还顺序**：先清表项（别的上下文从此查不到它），再逐帧 `frame_put`。
 /// `frame_put` 自己取 PMM——所以这里**必须先放 VMM**（20 之内取 30 合法，但 frame_put
 /// 到 0 会走 fi_final_free → 台账，那条路今天与 VMM 无嵌套冲突；保持"依次获取"最稳）。
-fn aspace_release(slot: u8) {
+fn aspace_release(slot: u16) {
     let frames = {
         let _g = vmm();
         let t = aspaces();
@@ -2054,7 +2067,7 @@ fn aspace_release(slot: u8) {
 /// **口径**：数的是映射页（`map_shared` 成功 +n、`AspaceMapping::drop` -n），
 /// 不是物理常驻页——后者今天没有量具，别把它当 RSS 用。
 #[must_use]
-pub fn aspace_mapped_pages(slot: u8) -> Option<u32> {
+pub fn aspace_mapped_pages(slot: u16) -> Option<u32> {
     let _g = vmm();
     let e = aspaces().items.get(usize::from(slot))?;
     if e.used {
@@ -2067,7 +2080,7 @@ pub fn aspace_mapped_pages(slot: u8) -> Option<u32> {
 /// 按槽号读它的 PML4 物理地址（槽不存在返回 None）。**给登记路径用一次**：
 /// 换人热路径不该为了查根表去取 VMM——那会把别的 CPU 的 shootdown 等待绑到本 CPU 上，
 /// 而本 CPU 此刻 IF=0（ADR-075 决策 2 的实现约束）。
-pub fn aspace_pml4_of(slot: u8) -> Option<u64> {
+pub fn aspace_pml4_of(slot: u16) -> Option<u64> {
     let _g = vmm();
     let e = aspaces().items.get(usize::from(slot))?;
     if e.used { Some(e.pml4) } else { None }
@@ -2075,14 +2088,14 @@ pub fn aspace_pml4_of(slot: u8) -> Option<u64> {
 
 /// 这个 AS 槽**当前这次使用**的世代号（不存在返回 None）。句柄要存 `(slot, gen)` 两格，
 /// 理由同 `proc::job_gen`：只比槽号会让新 AS 继承旧 AS 的句柄（槽号是复用的）。
-pub fn aspace_gen(slot: u8) -> Option<u32> {
+pub fn aspace_gen(slot: u16) -> Option<u32> {
     let _g = vmm();
     let e = aspaces().items.get(usize::from(slot))?;
     if e.used { Some(e.gen) } else { None }
 }
 
 /// `(槽号, 世代)` 两者都对才算活着（句柄使用前的活性判据）。
-pub fn aspace_live(slot: u8, gen: u32) -> bool {
+pub fn aspace_live(slot: u16, gen: u32) -> bool {
     aspace_gen(slot) == Some(gen)
 }
 
@@ -2094,7 +2107,7 @@ pub fn aspace_count() -> usize {
 
 /// 读一个 AS 的 CPU 位图（ADR-072 见证）。slot 不存在返回 None。
 /// 位图本体是 `AS_ON`（不取锁的原子）；这里取 VMM 只为了判"这个槽还在不在"。
-pub fn aspace_running_on(slot: u8) -> Option<u8> {
+pub fn aspace_running_on(slot: u16) -> Option<u8> {
     let _g = vmm();
     let e = aspaces().items.get(usize::from(slot))?;
     if e.used { Some(AS_ON[usize::from(slot)].load(Ordering::Acquire)) } else { None }
@@ -2102,7 +2115,7 @@ pub fn aspace_running_on(slot: u8) -> Option<u8> {
 
 /// 手动把一颗 CPU 登记进 AS 的位图（**用例专用**：产品路径由 `aspace_switch` 自动登记）。
 /// 返回登记前的位图。slot 不存在返回 None。
-pub fn aspace_register_cpu(slot: u8, cpu: usize) -> Option<u8> {
+pub fn aspace_register_cpu(slot: u16, cpu: usize) -> Option<u8> {
     let bit = 1u8.checked_shl(cpu as u32)?;
     let _g = vmm();
     let e = aspaces().items.get(usize::from(slot))?;
@@ -2121,7 +2134,7 @@ pub const MAX_AS_MAP_PAGES: usize = 16;
 /// 不存在/不 present 返回 None。ADR-074 的 C6/C7 用它对照两棵树。
 /// `aspace_leaf` 的按槽号版（P5c-3：15/16 号要校验 entry/sp/StartupInfo 的 VA 在**子 AS** 里已映射，
 /// 而那时手里只有 proc 表记的槽号，没有 RAII 柄）。判据与它逐字相同：槽在、根有效、只走已存在的表。
-pub fn aspace_leaf_slot(slot: u8, va: VirtAddr) -> Option<u64> {
+pub fn aspace_leaf_slot(slot: u16, va: VirtAddr) -> Option<u64> {
     if VirtAddr::new(va.0).is_none() {
         return None;
     }
@@ -2149,7 +2162,7 @@ pub fn aspace_leaf(space: &AspaceHandle, va: VirtAddr) -> Option<u64> {
 #[must_use = "映射柄丢弃即解映射并还参考，随手丢弃等于这段映射不存在"]
 pub struct AspaceMapping {
     /// `None` = 内核那份 AS（今天所有任务共用它，见 `aspace_map_self`）。
-    as_slot: Option<u8>,
+    as_slot: Option<u16>,
     root: u64,
     va: VirtAddr,
     pages: usize,
@@ -2161,7 +2174,7 @@ pub struct AspaceMapping {
 impl AspaceMapping {
     /// 这份映射铺在哪张 AS 里（`None` = 内核那份）。P6b 的归属搬迁用它认人：
     /// 只搬"目标 AS 是子进程那张"的项，创建者自己的镜像映射不动。
-    pub fn as_slot(&self) -> Option<u8> {
+    pub fn as_slot(&self) -> Option<u16> {
         self.as_slot
     }
     pub fn virt(&self) -> VirtAddr {
@@ -2292,7 +2305,7 @@ pub fn aspace_map_self(
 ///
 /// 上下文 KERNEL，取 VMM；失败不留半截映射。
 pub fn aspace_map_slot(
-    slot: u8,
+    slot: u16,
     frames: &[u64],
     va: VirtAddr,
     flags: PageFlags,
@@ -2309,7 +2322,7 @@ pub fn aspace_map_slot(
 /// 两个入口共用的铺设体。调用方已持 VMM 并核对过根。
 fn map_shared(
     root: u64,
-    as_slot: Option<u8>,
+    as_slot: Option<u16>,
     frames: &[u64],
     va: VirtAddr,
     flags: PageFlags,
@@ -2402,7 +2415,7 @@ fn map_shared(
 /// `pml4` 必须是本内核自建、内核半区已复制等价的有效 PML4 物理地址；
 /// `as_slot` 必须是 `pml4` 所属 AS 的槽号（错传只会把一个多余的 CPU 位写进别的 AS 的位图，
 /// 后果是收窄范围放大，不会漏通知）；调用时 IF 状态由调用方负责（本函数不动 IF）。
-pub unsafe fn aspace_switch(pml4: u64, me: usize, as_slot: Option<u8>) -> bool {
+pub unsafe fn aspace_switch(pml4: u64, me: usize, as_slot: Option<u16>) -> bool {
     // SAFETY: 读 CR3 是特权读，调用方在 ring0；原语在上方 global_asm 里，只动 CR3
     let cur = unsafe { aspace_cr3_read() };
     if cur == pml4 {
@@ -2442,8 +2455,8 @@ fn kernel_half_frozen() -> bool {
 // ------------------------------------------------------ ADR-067（W2 P5）惰性区间
 
 /// 惰性区间容量（ADR-067 未决 5：今天无 workload 依据，按"接缝够用"定尺）。
-pub const MAX_LAZY_REGIONS: usize = 8;
-pub const MAX_LAZY_PAGES: usize = 16;
+pub const MAX_LAZY_REGIONS: usize = 4096;
+pub const MAX_LAZY_PAGES: usize = 64;
 
 /// 表项。存**数值**而不是 `Option<Mapping>` 数组：后者非 Copy 不能 const 初始化，
 /// 且 Mapping::drop 会在已持 VMM 的编排里重入 VMM（重入即 L4）。归还走
@@ -2504,7 +2517,7 @@ pub fn lazy_region_count() -> usize {
 /// 惰性区间柄（ADR-067 决策 2）：OwnedSet 的一项挂这个；**丢弃即归还**——
 /// 解映射全部已填充页、归还全部帧、放手整段 VA 保留。非 Copy：所有权唯一。
 pub struct LazyHandle {
-    slot: u8,
+    slot: u16,
 }
 
 impl LazyHandle {
@@ -2536,7 +2549,7 @@ pub fn lazy_new(pages: usize, owner: ModuleId) -> Option<LazyHandle> {
         let r = &mut lazy_items().items[i];
         if !r.used {
             *r = LazyRegion { used: true, base: va.0, pages: pages as u16, filled: 0, owner, frames: [0; MAX_LAZY_PAGES] };
-            return Some(LazyHandle { slot: i as u8 });
+            return Some(LazyHandle { slot: i as u16 });
         }
     }
     release_va_locked(va.0);
@@ -2690,14 +2703,14 @@ pub fn demand_zero_try(cr2: u64) -> bool {
 ///
 /// 返回 `None` = 这段 VA 不是惰性区间（可能是普通映射、或者根本没映射）。
 /// 调用方**不要**把 `None` 读成「可以随便释放」。
-pub fn lazy_find(va: u64) -> Option<(u8, u64, usize)> {
+pub fn lazy_find(va: u64) -> Option<(u16, u64, usize)> {
     if !is_ready() {
         return None;
     }
     let _g = vmm();
     for (i, r) in lazy_items().items.iter().enumerate() {
         if r.used && va >= r.base && va < r.base + r.pages as u64 * PAGE as u64 {
-            return Some((i as u8, r.base, r.pages as usize));
+            return Some((i as u16, r.base, r.pages as usize));
         }
     }
     None
@@ -2718,7 +2731,7 @@ pub fn lazy_free_at(va: u64) -> bool {
 /// 归还一个区间（决策 2）。编排：VMM 内快照并清槽 → 放锁 → 逐页 unmap（内含
 /// shootdown）+ phys_free（解映射在归还之前，ADR-023）→ release_va 放手整段保留。
 /// **不得持有任何锁调用**（handle drop 发生在 release_owned 放掉 RUNQ 之后，§136/ADR-027）。
-fn lazy_release(slot: u8) {
+fn lazy_release(slot: u16) {
     let snap = {
         let _g = vmm();
         let r = &mut lazy_items().items[usize::from(slot)];
@@ -3184,6 +3197,62 @@ fn bootstrap_frame_info(limit: u64) -> Result<(), MmError> {
 pub fn frame_info_size() -> (usize, usize) {
     let st = s();
     (st.frame_info_frames, st.frame_info_frames * FRAME_INFO_BYTES)
+}
+
+/// 从**指定物理地址之上**分配 2^order 个连续页（ADR-179 新增）。
+///
+/// ## 为什么需要它
+///
+/// `phys_alloc` 从 `1<<order` 页开始向上找，而**低端物理内存里住着 bootloader 的东西**：
+/// `init_allocator` 只按 memmap 的 `usable` 放开位图，但 bootloader 区在 memmap 里
+/// 恰好是 usable、内容却**不是零**（Limine 的模块、AP 停车点、mp_info 都住那儿）。
+/// 那块要到 `reclaim_bootloader_regions()`（`stop_aps` 之后）才真正可用。
+///
+/// 实测（ADR-179）：`handle::init()` 在 `stage_memory()` 里调 `phys_alloc(6)`，
+/// 分到**物理 2 MiB** ⇒ 清零后 `live()` 仍数出 184470 个句柄（容量 4096）
+/// ⇒ 表被 bootloader 区的内容覆盖。
+///
+/// ## 用法
+///
+/// 启动早期要一块「保证没人碰」的内存时，传 `min_phys = 内核镜像末尾之上`，
+/// 越过 bootloader 占用的低端区。
+pub fn phys_alloc_above(order: u8, owner: ModuleId, min_phys: u64) -> Result<OwnedFrames, MmError> {
+    let _g = pmm();
+    let st = s();
+    if !st.ready.load(Ordering::Relaxed) {
+        return Err(MmError::NotInit);
+    }
+    let n = 1usize << order;
+    let limit = st.max_phys / PAGE as u64;
+    let active = frame_info_active();
+    // 起点：max(2^order 对齐下界, min_phys 向上取整到 2^order 个页)
+    let floor_pages = (min_phys / PAGE as u64).max(1u64 << order);
+    let mut f = (floor_pages + n as u64 - 1) / n as u64 * n as u64;
+    while f + n as u64 <= limit {
+        let mut ok = true;
+        for k in 0..n as u64 {
+            let used = if active { fi_refcnt(f + k) >= 1 } else { bit_get(f + k) };
+            if used {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            for k in 0..n as u64 {
+                if active {
+                    fi_set_used(f + k, true, owner);
+                } else {
+                    bit_set(f + k, true);
+                }
+            }
+            let st = s();
+            st.free_frames.fetch_sub(n, Ordering::Relaxed);
+            ledger_alloc(owner, n);
+            return Ok(OwnedFrames { base: PhysAddr(f * PAGE as u64), order, owner });
+        }
+        f += n as u64;
+    }
+    Err(MmError::OutOfMemory)
 }
 
 /// 分配 2^order 个连续物理页

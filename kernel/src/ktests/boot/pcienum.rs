@@ -90,8 +90,18 @@ fn t_pci_enum() -> bool {
     let full_ok = r > 0 && n == info.n && next == 0;
 
     // ---- ② 与内核表逐字段一致 + ③ 魔数/版本/记录长自洽。
+    //
+    // **边界必须先判，不能直接切**（ADR-178 连带实测）：`n` 是 `r & 0xffff_ffff`，
+    // 而 `r` 在 syscall 失败时是**负错误码**（高 32 位全 1）⇒ `n` 变成一个巨大的 usize，
+    // `&mut buf[..n * REC]` 当场 panic（现场：`pcienum.rs:94`，判定 39 EXCEPTION）。
+    // 那种写法把「syscall 返回错误」报成了「内核越界崩了」，归因方向完全相反。
+    // 判据：`n * REC` 必须装得进 `buf`，且 `n` 与实际设备数一致。
     let mut buf = [0u8; 4096];
-    let got = n > 0 && get_user(va.0, &mut buf[..n * REC]);
+    let fit = n > 0 && n <= buf.len() / REC;
+    if !fit {
+        crate::log_fatal!("pcienum: 记录数 {n} 装不进 {buf_size} 字节缓冲（REC={REC}）", buf_size = buf.len());
+    }
+    let got = fit && get_user(va.0, &mut buf[..n * REC]);
     let mut fields_ok = got;
     let mut magic_ok = got;
     if got {

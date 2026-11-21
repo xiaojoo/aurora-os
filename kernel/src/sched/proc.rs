@@ -20,12 +20,12 @@
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use crate::mm;
 
-pub const MAX_PROCESSES: usize = 4;
-pub const MAX_JOBS: usize = 4;
+pub const MAX_PROCESSES: usize = 32768;
+pub const MAX_JOBS: usize = 1024;
 /// Task.proc_id 的"无进程"哨兵。
 pub const NO_PROC: u16 = 0xFFFF;
 /// `ProcEntry::aspace` 的"这个进程还没有地址空间"哨兵（与 `sched::NO_ASPACE` 同值不同模块）。
-pub const NO_ASPACE: u8 = 0xFF;
+pub const NO_ASPACE: u16 = 0xFFFF;
 /// signal：bit31 = 0 表示还在跑。
 const SIG_RUNNING: u32 = 0;
 /// signal：bit31 = 1 表示已终止，低 31 位是退出码。
@@ -80,7 +80,7 @@ struct ProcEntry {
     /// **主人是这张表**，不是 RAII 柄：`AspaceHandle` 是 non-Copy 且 Drop 里要取 VMM，
     /// 放进表里既不能 const 初始化也不能在锁内丢（P1 撞过）。销毁走 `mm::aspace_destroy`，
     /// 而且**必须在放掉 VMM 之后**调（它自己要取 VMM，锁内调就是重入 ⇒ L4）。
-    aspace: u8,
+    aspace: u16,
     as_gen: u32,
 }
 
@@ -115,8 +115,9 @@ struct StateCell(core::cell::UnsafeCell<ProcState>);
 unsafe impl Sync for StateCell {}
 
 static S: StateCell = StateCell(core::cell::UnsafeCell::new(ProcState {
-    procs: [PROC_EMPTY, PROC_EMPTY, PROC_EMPTY, PROC_EMPTY],
-    jobs: [JOB_EMPTY, JOB_EMPTY, JOB_EMPTY, JOB_EMPTY],
+    // 用 `[X; N]` 而不是逐项列出：容量改一次就要改 N 个字面量，那种写法一定会漏。
+    procs: [PROC_EMPTY; MAX_PROCESSES],
+    jobs: [JOB_EMPTY; MAX_JOBS],
 }));
 
 /// 持 VMM 时的表引用。
@@ -267,7 +268,7 @@ pub struct ProcInfo {
     /// 终止时的退出码（活着时无意义）。
     pub exit_code: u32,
     /// 名下那张 AS 的槽号（**内部用**，调用方查完页数就丢）。
-    pub aspace: u8,
+    pub aspace: u16,
 }
 
 /// 进程表容量（27 号枚举的游标上界）。
@@ -372,7 +373,7 @@ pub fn proc_discard(proc_id: u16) -> Result<(), ProcError> {
 
 /// 记下这个进程名下那张 AS（`process_create` 用）。槽号与世代一起存，
 /// 理由同句柄：槽号复用，只有 `(slot, gen)` 才能证明"还是当初那张表"。
-pub fn proc_set_aspace(proc_id: u16, slot: u8, gen: u32) -> Result<(), ProcError> {
+pub fn proc_set_aspace(proc_id: u16, slot: u16, gen: u32) -> Result<(), ProcError> {
     mm::with_vmm_lock(|| {
         let s = st();
         let p = s.procs.get_mut(proc_id as usize).ok_or(ProcError::NoSuchProc)?;
@@ -391,7 +392,7 @@ pub fn proc_set_aspace(proc_id: u16, slot: u8, gen: u32) -> Result<(), ProcError
 
 /// 这个进程名下那张 AS 的 `(槽号, 世代)`；没有或进程已不在返回 None。
 /// `gen` 必须与 `proc_gen` 读到的那一次一致（调用方拿 Proc 句柄里的世代来核）。
-pub fn proc_aspace(proc_id: u16, gen: u32) -> Option<(u8, u32)> {
+pub fn proc_aspace(proc_id: u16, gen: u32) -> Option<(u16, u32)> {
     mm::with_vmm_lock(|| {
         let s = st();
         let p = s.procs.get(proc_id as usize)?;
@@ -545,7 +546,7 @@ pub fn job_used_pages(job: u16) -> Option<u64> {
 /// 而槽号复用之后旧映射早该被丢掉了（ADR-074 的契约顺序），所以这里不会退错账；
 /// 真出现"AS 已销毁但映射还在"的反序，`job_of_aspace` 返回 None ⇒ 不退 ⇒ 用量偏高，
 /// 那是**保守方向**（额度只会更紧，不会放宽），由收场判据去抓。
-pub fn job_of_aspace(as_slot: u8) -> Option<u16> {
+pub fn job_of_aspace(as_slot: u16) -> Option<u16> {
     mm::with_vmm_lock(|| {
         let s = st();
         s.procs.iter().find(|p| alive_flag(&p.used) && p.aspace == as_slot).map(|p| p.job)

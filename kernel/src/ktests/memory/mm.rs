@@ -556,9 +556,10 @@ fn t_map_hole() -> bool {
     let rej_usable = pa_usable.map_or(false, |p| mm::map_hole(p, 1).err() == Some(mm::MmError::InvalidAddress));
     let rej_cov = pa_cov.map_or(false, |p| mm::map_hole(p, 1).err() == Some(mm::MmError::Unsupported));
     let rej_zero = mm::map_hole(pa, 0).err() == Some(mm::MmError::InvalidAddress);
+    // 四个子条件分开打（ADR-178）：只打合成值，红了还是不知道是哪一项。
     crate::log_info!(
-        "map_hole(P4): 单属性={} 拒覆盖={} 拒usable={} 往返={} leaf={:#x}",
-        single, rej_cov, rej_usable, roundtrip, leaf);
+        "map_hole(P4): 单属性={} 拒覆盖={} 拒usable={} 往返={} (a保留+1={} b回基线={} c帧回={} d已解映={}) leaf={:#x}",
+        single, rej_cov, rej_usable, roundtrip, rt_a, rt_b, rt_c, rt_d, leaf);
     single && rej_cov && rej_usable && roundtrip && rej_zero && leaf != 0
 }
 ktest!(KT_MAP_HOLE, t_map_hole);
@@ -1045,8 +1046,14 @@ fn t_mmap_family() -> bool {
     f.rax = SYS_MMAP; f.rdi = 0; f.rsi = 0; f.rdx = 0;
     syscall_dispatch(&mut f);
     let len0 = f.rax == user::E_INVALID;
-    // 17 页 > MAX_LAZY_PAGES(16) ⇒ -6（表/名额耗尽，不是参数错）
-    f.rax = SYS_MMAP; f.rdi = 17 * mm::PAGE as u64; f.rsi = 0; f.rdx = 0;
+    // 超过 MAX_LAZY_PAGES ⇒ -6（表/名额耗尽，不是参数错）。
+    //
+    // **不写死页数**（ADR-178 的教训）：原来写死 17 页 = 「比 16 多一页」，
+    // 而 16 是当时的 MAX_LAZY_PAGES。容量基线改到 64 之后，17 页不再超限，
+    // 这一格就从 true 变成 false —— 判据红的是**它自己**，不是被测物。
+    // 判据必须跟着常量走，否则每次调容量都要回来改测试。
+    let too_big_len = (mm::MAX_LAZY_PAGES as u64 + 1) * mm::PAGE as u64;
+    f.rax = SYS_MMAP; f.rdi = too_big_len; f.rsi = 0; f.rdx = 0;
     syscall_dispatch(&mut f);
     let too_big = f.rax == user::E_EXHAUSTED;
     // bit1 可执行 ⇒ -4（W^X）
@@ -2020,7 +2027,7 @@ fn t_handle_transfer() -> bool {
     let created_ok = mm::aspace_count() == as0 + 1 && mm::aspace_live(k1.0, k1.1);
     let first_destroy = mm::aspace_destroy(k1.0);
     let second_destroy = mm::aspace_destroy(k1.0);
-    let out_of_range = mm::aspace_destroy(u8::MAX);
+    let out_of_range = mm::aspace_destroy(u16::MAX);
     let destroy_ok = first_destroy && !second_destroy && !out_of_range
         && mm::aspace_count() == as0;
     // 复用同一格再建一次：世代必须对不上旧读数（与 hkind 的 ABA 格同一口径，但走内核侧入口）

@@ -5,7 +5,7 @@
 >
 > **2026-11-20（ADR-175 跨 AS 读走物理地址）**：`sched/user` U2 9 → 10（`copy_from_user_in` 里 HHDM 别名的单字节读）。**总数 +1**（530 → 531）。
 
-总计 560 处。U1 85 · U2 147 · U3 13 · U4 149 · U5 128 · U6 38
+总计 564 处。U1 85 · U2 151 · U3 13 · U4 149 · U5 128 · U6 38
 
 | 类别 | 含义 | 处数 |
 |---|---|---|
@@ -16,6 +16,18 @@
 | U5 | 用户指针与地址空间访问 | 128 |
 | U6 | 诊断路径的有限现场读取 | 36 |
 
+### capability/handle
+
+| 类别 | 行 | 形状 |
+|---|---|---|
+| U2 | 315 | `unsafe {` （`SlotArray::allocate` 的清零循环：`core::ptr::write(p.add(i), EMPTY)`） |
+| U2 | 326 | `unsafe {` （清零后的校验循环：`core::ptr::read(p.add(i)).used`） |
+| U2 | 353 | `unsafe { core::slice::from_raw_parts(base as *const Entry, len) }` |
+| U2 | 362 | `unsafe { core::slice::from_raw_parts_mut(base as *mut Entry, len) }` |
+
+ADR-179：句柄槽数组从 `.bss` 改为运行时分配。四处的指针来源都是 `phys_alloc_above`
+分出的 MOD_BOOT 连续帧（永不归还）、长度 `MAX_HANDLES`、生命周期整个内核，
+访问都在 `RANK_HANDLE(35)` 锁内。
 ### arch/hooks
 
 | 类别 | 行 | 形状 |

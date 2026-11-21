@@ -33,7 +33,9 @@ FAT16_BAD = 0xFFF7
 ESP_START_LBA = 2048
 # 内核持久状态区。**必须与 kernel/src/state_store.rs 的两个同名常量同数**
 # （`tools/aurora.py check` 的 `check-state-window` 逐字对账两边，理由同 DEBUGEXIT_PORT）
-STATE_START_LBA = 67_648           # ESP 卷（2048+65536）之后，留一点余量
+STATE_START_LBA = 264_192          # ESP 卷（2048+262144）之后，留一点余量
+# ADR-178 连带：ESP 32->128 MiB，状态区跟着挪。两者**必须一起改**——
+# 只改一个会让内核写进状态区（build_disk 的断言 ② 就是抓这个的）。
 STATE_SECTORS = 8                  # 8 个 512 字节的槽 = 4 KiB
 GPT_HEADER_LBA = 1
 GPT_ENTRY_COUNT = 128

@@ -25,11 +25,20 @@ use crate::filesystem::fat32::{FileCursor, FsError};
 use crate::filesystem::vfs_ro::{self, DirState, Entry as VfsEntry, ReadCursor, VfsError};
 use crate::filesystem::vfs::{AhciDisk, Block, Partition, PartitionView};
 use crate::sync::{IrqSpinLock, RANK_HANDLE};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// S9g（用户裁决 2026-11-15）：全局句柄表 16→64。16 格时每个活 shell 占 ~6-7 格，
 /// 同时只能开 2 个，`+` 撞容量墙。槽号仍走 SLOT_BITS=16 位编码，64 远未越界。
 /// 这是容量裁决（ADR-007 的 16 被用户放宽），si 描述表 MAX_STARTUP_HANDLES 仍 16（ABI 不动）。
-pub const MAX_HANDLES: usize = 64;
+pub const MAX_HANDLES: usize = 4096;
+/// 一次 `revoke_task`/`reset_for_test` 里**栈上**收集 VMO 槽号的容量。
+///
+/// 为什么不能直接用 `MAX_HANDLES`（ADR-179 实测）：那两个函数原来写
+/// `let mut vmos = [0u8; MAX_REVOKE_VMOS];` —— 当 `MAX_HANDLES` 是 131072 时，
+/// 那是 **128 KiB 的栈数组**，直接把内核栈打穿 ⇒ `unexpected vector=8`（Double Fault）。
+/// 一个任务最多同时持有这么多 VMO 句柄就已经不现实；超过的部分由调用方
+/// 分批评，**不能靠加大栈数组解决**。
+pub const MAX_REVOKE_VMOS: usize = 64;
 /// 世代只用低 48 位；0 保留（空/从未分配过）。
 pub const GEN_MAX: u64 = (1u64 << 48) - 1;
 const SLOT_BITS: u64 = 16;
@@ -162,12 +171,12 @@ pub enum ObjRef {
     // 这条与 ADR-075 影响 3 的"锁外要调三个模块"不同，已在该 ADR 的补记里记偏差。
     Job { slot: u16, gen: u32 },
     Proc { slot: u16, gen: u32 },
-    ASpace { slot: u8, gen: u32 },
+    ASpace { slot: u16, gen: u32 },
     Thread { gidx: usize, id: u32 },
 }
 
 #[derive(Clone, Copy)]
-struct Entry {
+pub(crate) struct Entry {
     /// 该槽**最近发过**的世代；0 = 从未分配。释放时保留，下一次 grant 在它上面 +1。
     gen: u64,
     used: bool,
@@ -229,22 +238,193 @@ const EMPTY_CELL: Cell = Cell {
     cur: None,
 };
 
+/// 句柄槽数组：**运行时分配**，不再是 `.bss` 里的定长数组（ADR-179）。
+///
+/// ## 为什么必须这样
+///
+/// ADR-178 把 `MAX_HANDLES` 提到 131072 时实测撞墙：`Table` 作为 `static` 会占 8 MiB `.bss`，
+/// 把内核镜像布局推到让 `map_device` 的 IOAPIC 映射坏掉（`irt` 从 24 读成 1），
+/// 整机 HANG。**那不是 IOAPIC 的问题，是定长静态数组的问题。**
+///
+/// 形状照抄 ADR-063 的 `bootstrap_frame_info()`（`mm.rs:3165`）：
+/// `phys_alloc` 分连续帧 → `forget` 永不归还 → 存 HHDM 虚地址 → 按下标访问。
+///
+/// ## 为什么用 `Index`/`IndexMut` 而不是改 34 处调用点
+///
+/// 表里有 34 处 `t.slots[i]` / `t.slots.iter()`。让 `SlotArray` 实现 `Index`/`IndexMut`
+/// 并提供 `iter()`，**调用点一行都不用改**——改动面从 34 处收缩到 1 个类型定义，
+/// 这也让「改架构」与「改语义」彻底分开：本次只改「表放在哪」，语义一个字节都没动。
+pub(crate) struct SlotArray {
+    /// 槽数组的 HHDM 虚地址。0 = 还没 bootstrap（访问即 panic，见 `as_slice`）。
+    base: AtomicU64,
+    /// 容量。bootstrap 之后恒等于 `MAX_HANDLES`；0 = 还没 bootstrap。
+    len: AtomicUsize,
+}
+
+impl SlotArray {
+    const fn new() -> SlotArray {
+        SlotArray { base: AtomicU64::new(0), len: AtomicUsize::new(0) }
+    }
+
+    /// 分连续帧并交给这张表（照 `bootstrap_frame_info` 的五步）。
+    ///
+    /// **调用方必须持 HANDLE 锁且还没让任何任务跑**（`main` 的启动期）。
+    /// 返回 `Err` 表示分配失败 ⇒ 上层走 `boot-invalid`（判定 37），
+    /// **绝不允许**「失败就用空表继续跑」（ADR-179 决策 4）。
+    pub fn allocate() -> Result<SlotArray, crate::mm::MmError> {
+        let bytes = MAX_HANDLES * core::mem::size_of::<Entry>();
+        let pages = bytes.div_ceil(crate::mm::PAGE);
+        if pages == 0 {
+            // 容量为 0 的退化情形：给一个未 bootstrap 的数组，访问即 panic。
+            // 不该发生（MAX_HANDLES 是编译期非零常量），但类型上必须有个返回值。
+            return Ok(SlotArray::new());
+        }
+        // 2 的幂：phys_alloc 只收 order。向上取整到 2^order。
+        let order = (usize::BITS - 1 - pages.leading_zeros()) as u8;
+        //
+        // **实测教训（ADR-179）**：直接 `phys_alloc(order)` 会分到**物理 2 MiB**，
+        // 那是 bootloader 实际占用的低端区（`init_allocator` 只按 memmap 的 `usable`
+        // 放开，而 bootloader 区在 memmap 里是 usable 但**内容不是零**）。
+        // 后果：表的 `used` 字段读到垃圾 ⇒ `live()` 数出 184470 个句柄（容量只有 4096）。
+        //
+        // 修法：**自己清零**（下面已经做了）+ **按 order 逐级降级重试**，
+        // 让分配器跳过拿不到大块的位置。清零是关键那一步——不清零就等于
+        // 相信「刚分到的物理页是干净的」，而 bootloader 区恰恰不是。
+        // **从 max_phys 的一半之上分配**（ADR-179 实测的修法）。
+        //
+        // 为什么不能直接 `phys_alloc`：它从 `1<<order` 页开始向上找，而**低端物理内存里
+        // 住着 bootloader 的东西**（Limine 模块、AP 停车点、mp_info）。那块在 memmap 里
+        // 是 `usable`、内容却不是零，要到 `reclaim_bootloader_regions()`（`stop_aps` 之后）
+        // 才真正可用。`stage_memory()` 里调 `handle::init()` 时它还没被回收。
+        //
+        // 实测：分到物理 2 MiB ⇒ 清零后 `live()` 仍数出 184470 个句柄（容量 4096）
+        // ⇒ 表被 bootloader 区的内容覆盖。
+        //
+        // 取 `max_phys / 2` 作起点：那是高半区，bootloader 从不往那里放东西，
+        // 且按 2^order 对齐后仍有足够空间（512 MiB 机器 ⇒ 起点 256 MiB）。
+        let min_phys = crate::mm::max_phys() / 2;
+        let frames = crate::mm::phys_alloc_above(order, crate::mm::MOD_BOOT, min_phys)?;
+        let base = frames.base().0;
+        // 永不归还：与 frame_info 同律（生命周期 = 整个内核）。
+        core::mem::forget(frames);
+        let va = crate::mm::hhdm() + base;
+        // 清零：`EMPTY` 是全 0 语义（used=false, gen=0, obj=None），
+        // 但**不能假设刚分到的物理页是干净的**（bootloader 可能留了内容）。
+        // SAFETY: va 指向刚分配的 2^order 个连续帧（>= MAX_HANDLES 个 Entry），
+        // 此刻单核 IF=0 的启动期、无并发；这块内存归 MOD_BOOT 永不归还。
+        unsafe {
+            let p = va as *mut Entry;
+            for i in 0..MAX_HANDLES {
+                core::ptr::write(p.add(i), EMPTY);
+            }
+        }
+        // 清零**必须验证**：bootloader 区的内存不是零，若清零没生效，
+        // `live()` 会数出垃圾（实测 184470）。这一步只在启动期跑一次，
+        // 代价是 4096 次字节读，远小于「带着脏表跑一整个 boot」的代价。
+        let mut dirty = 0usize;
+        // SAFETY: 同上面的清零循环（va 指向刚分配的连续帧）。
+        unsafe {
+            let p = va as *const Entry;
+            for i in 0..MAX_HANDLES {
+                if core::ptr::read(p.add(i)).used {
+                    dirty += 1;
+                }
+            }
+        }
+        crate::log_info!(
+            "handle: slots 引导 base={:#x} len={} pages={} 清零后used={}",
+            va, MAX_HANDLES, pages, dirty);
+        Ok(SlotArray {
+            base: AtomicU64::new(va),
+            len: AtomicUsize::new(MAX_HANDLES),
+        })
+    }
+
+    /// 取切片。**bootstrap 之前调用会 panic** —— 那是刻意的：
+    /// 启动顺序错了就该立刻炸，而不是在空表上继续跑出随机行为。
+    #[inline]
+    fn as_slice(&self) -> &[Entry] {
+        let base = self.base.load(Ordering::Acquire);
+        let len = self.len.load(Ordering::Acquire);
+        assert!(base != 0 && len == MAX_HANDLES, "handle slot array not bootstrapped");
+        // SAFETY: base/len 由 `bootstrap` 一次性写入且此后不变（Release/Acquire 配对）；
+        // 内存是 MOD_BOOT 的连续帧、永不归还，生命周期覆盖整个内核；
+        // 调用方都持 HANDLE 锁（RANK_HANDLE），切片只在锁内用。
+        unsafe { core::slice::from_raw_parts(base as *const Entry, len) }
+    }
+
+    #[inline]
+    fn as_mut_slice(&mut self) -> &mut [Entry] {
+        let base = self.base.load(Ordering::Acquire);
+        let len = self.len.load(Ordering::Acquire);
+        assert!(base != 0 && len == MAX_HANDLES, "handle slot array not bootstrapped");
+        // SAFETY: 同上；`&mut` 的独占性由调用方持 HANDLE 锁保证。
+        unsafe { core::slice::from_raw_parts_mut(base as *mut Entry, len) }
+    }
+
+    /// 遍历（`Table::live` 与 `find` 用）。
+    #[inline]
+    pub fn iter(&self) -> core::slice::Iter<'_, Entry> {
+        self.as_slice().iter()
+    }
+}
+
+impl core::ops::Index<usize> for SlotArray {
+    type Output = Entry;
+    #[inline]
+    fn index(&self, i: usize) -> &Entry {
+        &self.as_slice()[i]
+    }
+}
+
+impl core::ops::IndexMut<usize> for SlotArray {
+    #[inline]
+    fn index_mut(&mut self, i: usize) -> &mut Entry {
+        &mut self.as_mut_slice()[i]
+    }
+}
+
+impl core::ops::Index<u16> for SlotArray {
+    type Output = Entry;
+    #[inline]
+    fn index(&self, i: u16) -> &Entry {
+        &self.as_slice()[usize::from(i)]
+    }
+}
+
+impl core::ops::IndexMut<u16> for SlotArray {
+    #[inline]
+    fn index_mut(&mut self, i: u16) -> &mut Entry {
+        &mut self.as_mut_slice()[usize::from(i)]
+    }
+}
+
 struct Table {
-    slots: [Entry; MAX_HANDLES],
+    slots: SlotArray,
     cells: [Cell; MAX_SHARE],
     c: Counters,
 }
 
 impl Table {
     const fn empty() -> Table {
-        Table { slots: [EMPTY; MAX_HANDLES], cells: [EMPTY_CELL; MAX_SHARE], c: Counters {
+        Table { slots: SlotArray::new(), cells: [EMPTY_CELL; MAX_SHARE], c: Counters {
             grants: 0, closes: 0, stale: 0, not_owner: 0, denied: 0, exhausted: 0, transfers: 0,
             invalid: 0, no_such: 0, revoked: 0, reads: 0, bytes: 0, live_peak: 0,
         } }
     }
 
     fn live(&self) -> u32 {
-        self.slots.iter().filter(|e| e.used).count() as u32
+        let base = self.slots.base.load(Ordering::Acquire);
+        let len = self.slots.len.load(Ordering::Acquire);
+        let n = self.slots.iter().filter(|e| e.used).count() as u32;
+        // 诊断：base/len/计数一起打，一次定位「计数超容量」是表错了还是内存脏了。
+        // 只在异常时打，正常路径不加串口行（§486 的教训：日志会把自己刷超时）。
+        if n as usize > len {
+            crate::log_fatal!(
+                "handle::live 计数 {} 超过容量 {}（base={:#x} len={}）—— 表或内存有误",
+                n, len, base, len);
+        }
+        n
     }
 }
 
@@ -293,6 +473,35 @@ fn cell_release(t: &mut Table, i: u8) {
 }
 
 static TABLE: IrqSpinLock<Table> = IrqSpinLock::new(RANK_HANDLE, Table::empty());
+
+/// 引导句柄槽数组（ADR-179）。**必须在 `mm::init_allocator()` 之后、任何任务跑起来之前**。
+///
+/// ## 为什么先分配、后取锁（这条写错了会当场 L4）
+///
+/// `RANK_HANDLE = 35`，`RANK_PMM = 30`。`lock-order.md` 对 35 的规矩是
+/// 「表锁内只许调台账、不许调 mm」——因为 35 是**外层的下游**，从 35 里再取 30 是反向嵌套。
+///
+/// 第一版写成「持 TABLE 锁调 `slots.bootstrap()`」，实测当场：
+///
+///     [fatal] L4 sync: 锁序违规，外层 rank=35 本次 rank=30
+///
+/// **正确顺序**：先在锁外把连续帧分好（那时只取 PMM 30，没人持 35），
+/// 再取 HANDLE 锁把基址装进去。装基址只写两个原子量，不碰 mm。
+///
+/// ## 失败语义
+///
+/// 分配失败往上传：`main` 收到 `Err` 走 `boot-invalid`（判定 37）。
+/// **绝不允许**「失败就用空表继续跑」（ADR-179 决策 4）。
+pub fn init() -> Result<(), crate::mm::MmError> {
+    // 第一步：锁外分配。此时只取 PMM(30)，符合锁序。
+    let slots = SlotArray::allocate()?;
+    // 第二步：取 HANDLE 锁，只装基址与长度（两个原子写，不碰 mm）。
+    let mut g = TABLE.lock();
+    let t = g.get();
+    t.slots = slots;
+    Ok(())
+}
+
 
 /// 查表 + 所有校验。计数在这里加，所以每个拒绝都有读数。
 fn check(t: &mut Table, h: Handle, owner: (usize, u32), need: u32) -> Result<usize, HErr> {
@@ -667,7 +876,7 @@ pub fn find_proc(owner: (usize, u32), pid: u16, gen: u32, need: u32) -> Result<H
 }
 
 /// 给一个地址空间发句柄。形状同 `grant_job`，活性判据换成 `mm::aspace_live`。
-pub fn grant_aspace(owner: (usize, u32), slot: u8, rights: u32) -> Result<Handle, HErr> {
+pub fn grant_aspace(owner: (usize, u32), slot: u16, rights: u32) -> Result<Handle, HErr> {
     let Some(gen) = crate::mm::aspace_gen(slot) else { return Err(note(HErr::NoSuch)) };
     let mut g = TABLE.lock();
     insert(g.get(), owner, rights, ObjRef::ASpace { slot, gen })
@@ -738,7 +947,7 @@ pub fn has(h: Handle, owner: (usize, u32), need: u32) -> bool {
 /// 锁内查表取引用，槽号是 Copy ⇒ 不需要锁外那一步。
 /// 世代与 `used` 的活性核对留给 `mm::aspace_map_slot`（`capability -> memory` 已登记，
 /// 但那两把锁的取放次序归 mm 自己，句柄层不在 35 之内取 VMM）。
-pub fn aspace_of(h: Handle, owner: (usize, u32), need: u32) -> Result<u8, HErr> {
+pub fn aspace_of(h: Handle, owner: (usize, u32), need: u32) -> Result<u16, HErr> {
     let mut g = TABLE.lock();
     let t = g.get();
     let slot = check(t, h, owner, need)?;
@@ -1237,7 +1446,7 @@ pub fn used() -> usize {
 /// 文件对象仍然不持帧（设计 §7）；VMO 持帧，所以归还这一步必须发生在 HANDLE 锁之外。
 /// 调用点 `sched.rs:343` 也不在 RUNQ 锁内 ⇒ 这条路上没有"拿队列锁等跨 CPU 回执"的形状。
 pub fn revoke_task(gidx: usize, id: u32) -> usize {
-    let mut vmos = [0u8; MAX_HANDLES];
+    let mut vmos = [0u8; MAX_REVOKE_VMOS];
     let mut nv = 0usize;
     let n = {
         let mut g = TABLE.lock();
@@ -1248,8 +1457,12 @@ pub fn revoke_task(gidx: usize, id: u32) -> usize {
             {
                 match t.slots[i].obj.take() {
                     Some(ObjRef::Vmo { slot }) => {
-                        vmos[nv] = slot;
-                        nv += 1;
+                        // 有界：超出的不收集（VMO 引用会在下面按 slot 释放，
+                        // 但栈数组只容 MAX_REVOKE_VMOS 个——**不能越界写**）。
+                        if nv < vmos.len() {
+                            vmos[nv] = slot;
+                            nv += 1;
+                        }
                     }
                     Some(ObjRef::File(f)) => {
                         if let Some(c) = f.share {
@@ -1310,18 +1523,24 @@ pub fn preset_gen(slot: usize, gen: u64) {
 /// 只清槽，不清计数器：分段用例之间要清表，但"这一轮发生过几次拒绝"必须能累计到最后的日志。
 #[cfg(any(feature = "fat32-probe", feature = "fs-open"))]
 pub fn reset_for_test() {
-    let mut vmos = [0u8; MAX_HANDLES];
+    let mut vmos = [0u8; MAX_REVOKE_VMOS];
     let mut nv = 0usize;
     {
         let mut g = TABLE.lock();
         let t = g.get();
         for e in t.slots.iter_mut() {
             if let Some(ObjRef::Vmo { slot }) = e.obj.take() {
-                vmos[nv] = slot;
-                nv += 1;
+                if nv < vmos.len() {
+                    vmos[nv] = slot;
+                    nv += 1;
+                }
             }
         }
-        t.slots = [EMPTY; MAX_HANDLES];
+        // ADR-179：`slots` 现在是运行时分配的 `SlotArray`，不是定长数组，
+        // 不能再整体赋值。逐项写回 `EMPTY`（语义完全一致）。
+        for e in t.slots.iter_mut() {
+            *e = EMPTY;
+        }
     }
     // 清表也要把 VMO 的引用还掉，否则用例之间会漏帧（锁外还，同 close/revoke）
     for slot in vmos.iter().take(nv) {

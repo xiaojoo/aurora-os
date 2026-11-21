@@ -127,7 +127,7 @@ cost = "ProcEntry 20 B x 32768 = 0.6 MiB（见 memory_cost）"
 
 [[const]]
 kernel_const = "MAX_TASKS"
-value = 256
+value = 64
 section = "sched"
 linux_source = "kernel/fork.c: Linux 每 CPU 跑任意多任务（动态分配，无常量）"
 reason = "定长表 vs Linux 动态分配；取 256/CPU，在 target_min_cpus=2 下给 512 任务槽"
@@ -136,7 +136,7 @@ cost = "Task 结构见 sched/mod.rs；256 x MAX_CPUS 槽"
 
 [[const]]
 kernel_const = "MAX_TASKS_SUPPORTED"
-value = 256
+value = 64
 section = "memory"
 linux_source = "容量契约：必须 >= MAX_TASKS"
 reason = "sched/mod.rs 有编译期断言 assert!(MAX_TASKS <= MAX_TASKS_SUPPORTED)，改一边不改另一边当场编译失败（这道断言是故意的）"
@@ -145,7 +145,7 @@ cost = "无独立开销（只是契约上界）"
 
 [[const]]
 kernel_const = "MAX_HANDLES"
-value = 131072
+value = 4096
 section = "capability"
 linux_source = "fs/file.c: sysctl_nr_open = 1048576（全系统）"
 reason = "全局表 vs Linux 每进程 files_struct；131072 = 32768 进程 x 4 个基础句柄的最小可用量"
@@ -163,7 +163,7 @@ cost = "JobEntry x 1024"
 
 [[const]]
 kernel_const = "MAX_VA_RESERVATIONS"
-value = 65536
+value = 256
 section = "memory"
 linux_source = "Linux 用 maple tree 动态分配，无等价常量"
 reason = "定长表取 65536 = 32768 进程 x 2 条最小保留"
@@ -181,12 +181,12 @@ cost = "LazyRegion x 4096"
 
 [[const]]
 kernel_const = "MAX_LAZY_PAGES"
-value = 4096
+value = 64
 section = "memory"
-linux_source = "同上"
-reason = "单条惰性区间最多 4096 页 = 16 MiB"
+linux_source = "Linux VMA 用 maple tree，帧号不进 VMA；页表就是「哪页填了」的唯一真相"
+reason = "单条惰性区间最多 64 页 = 256 KiB。**这里踩过一次**：第一版改成 4096，理由是「单区间 4096 页」，但 LazyRegion.frames 是 [u64; MAX_LAZY_PAGES] 逐区间预分配 => 4096x8x4096 = 128 MB .bss。定长表做不到 Linux 那种「帧号不进 VMA」，所以单区间页数必须小。"
 is_tradeoff = true
-cost = "无独立开销（每条惰性区间的页数上界）"
+cost = "LazyRegion 512 B x 4096 区间 = 2 MB"
 
 [[const]]
 kernel_const = "AS_PT_SLOTS"
@@ -204,7 +204,7 @@ cost = "每张 AS 最多 16 个页表页"
 # Linux: pid_t = s32 => pid 位宽 32。
 
 [slot_width]
-current = 8
+current = 16
 target = 16
 sentinel = 65535
 sentinel_name = "NO_ASPACE"
@@ -412,3 +412,19 @@ linux_source = "Linux 信号队列按进程 task_struct 内嵌，随进程数动
 reason = "信号表的任务槽数。**必须与 MAX_TASKS_TOTAL 同量级**，96 是当前接缝"
 is_tradeoff = true
 cost = "SigTask x 96"
+[[const]]
+kernel_const = "EARLY_POOL_PAGES"
+value = 128
+section = "memory"
+linux_source = "Linux 早期页表用 `__brk`/`memblock` 动态分配（无固定上限）"
+reason = "早期页表池：映射内核镜像用，每页覆盖 2 MiB。容量扩到 32768 进程后 handles 档 ELF 43.9 MiB 需要约 25 页，旧值 24 正好卡边界（run-9843 报 exhausted -> 判定 37）。取 128 = 约 256 MiB 内核余量"
+is_tradeoff = true
+cost = "128 x 4 KiB = 512 KiB (.bss)"
+[[const]]
+kernel_const = "MAX_REVOKE_VMOS"
+value = 64
+section = "capability"
+linux_source = "Linux revoke 走 files_struct 遍历，无栈数组"
+reason = "revoke_task/reset_for_test 在栈上收集 VMO 槽号的上界。写死 MAX_HANDLES 会在容量大时把内核栈打穿（实测 131072 => 128 KiB 栈数组 => Double Fault）"
+is_tradeoff = true
+cost = "64 字节栈数组"

@@ -339,7 +339,7 @@ pub fn vmo_map_self(id: VmoId, va: VirtAddr, flags: PageFlags) -> Result<AspaceM
 /// 帧清单的取法与 `vmo_map` 逐字相同，只是把 `mm::aspace_map` 换成 `mm::aspace_map_slot`。
 pub fn vmo_map_slot(
     id: VmoId,
-    slot: u8,
+    slot: u16,
     va: VirtAddr,
     flags: PageFlags,
 ) -> Result<AspaceMapping, VmoError> {

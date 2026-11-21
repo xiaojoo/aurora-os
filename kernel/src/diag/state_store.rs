@@ -21,7 +21,7 @@ use crate::ahci::{self, AhciError};
 
 /// 状态区起始 LBA。**必须与 `tools/esp_image.py` 的同名常量同数**——
 /// 门禁 `check-state-window` 逐字对账（两边各写一份数字而不核对，正是手册 V8 点名的形状）
-pub const STATE_START_LBA: u64 = 67_648;
+pub const STATE_START_LBA: u64 = 264_192;
 /// 一个槽 = 一个扇区（512 字节），8 个槽 ⇒ 整块区域 4 KiB
 pub const SLOT_BYTES: usize = 512;
 pub const N_SLOTS: u8 = 8;
