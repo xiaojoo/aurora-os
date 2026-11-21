@@ -127,8 +127,7 @@ cost = "ProcEntry 20 B x 32768 = 0.6 MiB（见 memory_cost）"
 
 [[const]]
 kernel_const = "MAX_TASKS"
-value = 64
-section = "sched"
+value = 256
 linux_source = "kernel/fork.c: Linux 每 CPU 跑任意多任务（动态分配，无常量）"
 reason = "定长表 vs Linux 动态分配；取 256/CPU，在 target_min_cpus=2 下给 512 任务槽"
 is_tradeoff = true
@@ -136,8 +135,7 @@ cost = "Task 结构见 sched/mod.rs；256 x MAX_CPUS 槽"
 
 [[const]]
 kernel_const = "MAX_TASKS_SUPPORTED"
-value = 64
-section = "memory"
+value = 256
 linux_source = "容量契约：必须 >= MAX_TASKS"
 reason = "sched/mod.rs 有编译期断言 assert!(MAX_TASKS <= MAX_TASKS_SUPPORTED)，改一边不改另一边当场编译失败（这道断言是故意的）"
 is_tradeoff = false
@@ -145,8 +143,7 @@ cost = "无独立开销（只是契约上界）"
 
 [[const]]
 kernel_const = "MAX_HANDLES"
-value = 4096
-section = "capability"
+value = 131072
 linux_source = "fs/file.c: sysctl_nr_open = 1048576（全系统）"
 reason = "全局表 vs Linux 每进程 files_struct；131072 = 32768 进程 x 4 个基础句柄的最小可用量"
 is_tradeoff = true
@@ -163,8 +160,7 @@ cost = "JobEntry x 1024"
 
 [[const]]
 kernel_const = "MAX_VA_RESERVATIONS"
-value = 256
-section = "memory"
+value = 65536
 linux_source = "Linux 用 maple tree 动态分配，无等价常量"
 reason = "定长表取 65536 = 32768 进程 x 2 条最小保留"
 is_tradeoff = true
@@ -425,6 +421,6 @@ kernel_const = "MAX_REVOKE_VMOS"
 value = 64
 section = "capability"
 linux_source = "Linux revoke 走 files_struct 遍历，无栈数组"
-reason = "revoke_task/reset_for_test 在栈上收集 VMO 槽号的上界。写死 MAX_HANDLES 会在容量大时把内核栈打穿（实测 131072 => 128 KiB 栈数组 => Double Fault）"
+reason = "revoke_task/reset_for_test 在栈上收集 VMO 槽号的上界。**不能写 MAX_HANDLES**：那会让栈数组随容量增长（实测 131072 => 128 KiB 栈数组 => Double Fault）。取 64，超出的分批判。"
 is_tradeoff = true
 cost = "64 字节栈数组"

@@ -20797,3 +20797,75 @@ ADR-178 定的目标值（32768 进程 / 1024 作业 / 32768 AS）**已落地并
 - `MAX_HANDLES` 想再往上，需要**逐页分配 + 映射**（不是连续物理块），本轮未做。
 - `MAX_VA_RESERVATIONS` 的语义为何被大位图破坏，未查明。
 - 任务表（`tasks: [Task; MAX_TASKS]`）仍是定长 `.bss`，本轮只改了句柄表。
+---
+
+## 491. 三个「上限」全部推翻：都是栈数组，不是容量墙（2026-11-22）
+
+### 上一轮的错误结论
+
+§490 曾把三个值写成「实测上限」：`MAX_HANDLES=4096`、`MAX_TASKS=64`、`MAX_VA_RESERVATIONS=256`。
+
+**补测之后三个全部推翻：**
+
+| 项 | §490 写的「上限」 | 实测结果 |
+|---|---|---|
+| `MAX_HANDLES` | 4096 | **131072 PASS(33)**，`irt=24`，`base=0xffff800010000000` |
+| `MAX_TASKS` | 64 | **256 PASS(33)**，100/100 |
+| `MAX_VA_RESERVATIONS` | 256 | **65536 PASS(33)**，`map_hole 往返=true` |
+
+### 真正的成因：栈数组跟着容量走
+
+两处（都是既有代码，不是我新写的）：
+
+    capability/handle.rs:  let mut vmos = [0u8; MAX_HANDLES];        // 131072 => 128 KiB 栈数组
+    sched/mod.rs:          let mut list = [0usize; MAX_TASKS_TOTAL]; // 256*8 => 16 KiB 栈数组
+
+**`kill_process_threads` 那处最典型**：反汇编 `sys_process_kill_core` 能看到连减三次
+`subq $0x1000, %rsp` —— 16 KiB 栈帧直接把内核栈打穿，症状是 `unexpected vector=8`（Double Fault）。
+
+**修法**：栈数组一律取小常量 + 边界判断 + 分批判。
+`MAX_REVOKE_VMOS = 64`、`KILL_BATCH = 64`。
+
+### 这条纪律值得单独记住
+
+**同一个容量常量，放在两种地方会造成两种不同的坏：**
+
+| 位置 | 症状 | 解法 |
+|---|---|---|
+| `.bss` 静态数组 | 推高镜像布局 ⇒ IOAPIC `irt` 读成 1 ⇒ HANG | ADR-179 运行时分配 |
+| **栈数组** | 直接打穿内核栈 ⇒ Double Fault | **栈数组不许跟容量走** |
+
+§490 当时只解决了前者（`.bss`），把后者误判成了「容量墙」。
+
+### 最终容量（全部实测通过）
+
+| 常量 | 值 |
+|---|---|
+| `MAX_PROCESSES` / `MAX_ADDR_SPACES` | 32768 / 32768 |
+| `MAX_JOBS` | 1024 |
+| `MAX_HANDLES` | **131072** |
+| `MAX_TASKS` / `MAX_TASKS_SUPPORTED` | **256** / 256 |
+| `MAX_VA_RESERVATIONS` | **65536** |
+| `MAX_LAZY_REGIONS` / `MAX_LAZY_PAGES` | 4096 / 64 |
+| `EARLY_POOL_PAGES` | 128 |
+| `MAX_REVOKE_VMOS` | 64（新增）|
+
+`check` **20/20**，`handles` 档与默认档均 **PASS(33)**。
+
+### 三个失败是既有偶发（有历史证据，不是本轮引入）
+
+多跑 8 次出现 3 次失败，逐个查了历史：
+
+| 用例 | 历史频率 | **最早失败** |
+|---|---|---|
+| `t_sdkdemo` | 24/296 = 8% | **11-21 01:29**（`run-9047`）|
+| `t_q2_workload_slots` | 4/783 = 0.5% | **11-12 23:30**（`run-965`）|
+| `t_map_hole` | 9/920 = 1% | 11-21 19:32（`run-9337`）|
+
+**全部早于今天的改动。** `t_sdkdemo` 的读数 `信箱魔数不对 读到=0x0` 是 §487 记录过的
+「读用户页被拒」同族问题，仍属未归因。
+
+### 未做
+
+- 那三个既有偶发的根因（§484 已裁决「记录，不死磕」）
+- per-process fd 表（ADR-180）

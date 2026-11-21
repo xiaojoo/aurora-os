@@ -532,7 +532,10 @@ fn t_map_hole() -> bool {
     // 往返格拆成四个子条件：合成一个 bool 时，红了不知道是哪一项。
     // 2026-11-21 §479 排查 t_map_hole 偶发（8668 绿 / 2 红）时加的；保留它是因为
     // 它把「哪一项不成立」变成可读的，而代价是四次读数——都是原子量，不取锁。
+    // **打印实际计数**（ADR-179 排查）：只打 true/false 时，
+    // 「保留没涨」与「别的上下文也涨了」看起来一样。
     let rt_a = res1 == res0 + 1;
+
     let rt_b = mm::reservation_count() == res0;
     let rt_c = mm::free_frames() == f0;
     let rt_d = !mm::is_mapped(va.0);

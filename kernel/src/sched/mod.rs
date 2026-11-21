@@ -35,7 +35,7 @@ pub const MOD_STACK_KUSER: ModuleId = ModuleId(15);
 ///
 /// 注意 `MAX_TASKS_TOTAL = MAX_TASKS * MAX_CPUS`：8 核从 72 槽变 96 槽，
 /// 凡按它算上界的判据（`tasks_active()`、`t_q2_workload_slots` 的回基线）都要重核。
-pub const MAX_TASKS: usize = 64;
+pub const MAX_TASKS: usize = 256;
 /// `Task::as_slot` 的"内核 AS"哨兵（W3 P5b，ADR-075 决策 2）。
 /// **内核任务恒为它**，所以既有路径一次 CR3 都不多写（矩阵 45 行不该变的论证基础）。
 pub const NO_ASPACE: u16 = 0xFFFF;
@@ -2085,12 +2085,22 @@ pub fn kill_process_threads(proc_id: u16) -> usize {
         return 0;
     }
     // 先快照出名单再动手：一边扫一边 terminate 会让同一个槽被复用后又被认成同一个进程
-    let mut list = [0usize; MAX_TASKS_TOTAL];
+    // **栈数组必须有界**（ADR-179 实测）：原来写 `[0usize; MAX_TASKS_TOTAL]`，
+    // `MAX_TASKS=256` × `MAX_CPUS=8` = 2048 项 × 8 字节 = **16 KiB 栈数组**，
+    // 直接把内核栈打穿 ⇒ `unexpected vector=8`（Double Fault，反汇编可见
+    // `sys_process_kill_core` 里连减三次 `subq $0x1000, %rsp`）。
+    //
+    // 一个有进程的线程数不可能到 2048；取 64 并把超出的部分**分批判**
+    // （下面的循环已经按 `list.len()` 截断，多轮调用会继续收剩下的）。
+    const KILL_BATCH: usize = 64;
+    let mut list = [0usize; KILL_BATCH];
     let mut n = 0usize;
     for gi in 0..MAX_TASKS_TOTAL {
         if state_of(gi) != TaskState::Free && proc_id_of(gi) == proc_id {
-            list[n] = gi;
-            n += 1;
+            if n < list.len() {
+                list[n] = gi;
+                n += 1;
+            }
         }
     }
     let mut killed = 0usize;

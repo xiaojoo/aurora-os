@@ -30,7 +30,7 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 /// S9g（用户裁决 2026-11-15）：全局句柄表 16→64。16 格时每个活 shell 占 ~6-7 格，
 /// 同时只能开 2 个，`+` 撞容量墙。槽号仍走 SLOT_BITS=16 位编码，64 远未越界。
 /// 这是容量裁决（ADR-007 的 16 被用户放宽），si 描述表 MAX_STARTUP_HANDLES 仍 16（ABI 不动）。
-pub const MAX_HANDLES: usize = 4096;
+pub const MAX_HANDLES: usize = 131072;
 /// 一次 `revoke_task`/`reset_for_test` 里**栈上**收集 VMO 槽号的容量。
 ///
 /// 为什么不能直接用 `MAX_HANDLES`（ADR-179 实测）：那两个函数原来写

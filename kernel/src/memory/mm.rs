@@ -104,8 +104,8 @@ const FRAME_INFO_BYTES: usize = core::mem::size_of::<FrameInfo>();
 ///
 /// **`MAX_VA_RESERVATIONS` 不跟着派生**（ADR-065 已解耦）：每任务栈占 5 页 VA，
 /// 12×8 = 96 条仍远小于 256。
-pub const MAX_TASKS_SUPPORTED: usize = 64;
-const MAX_VA_RESERVATIONS: usize = 256;
+pub const MAX_TASKS_SUPPORTED: usize = 256;
+const MAX_VA_RESERVATIONS: usize = 65536;
 /// 占用位图字数（bit i=1 表示槽 i 已用）。所有访问都在 VMM 锁内，普通 u64 即可（非原子）。
 const VA_BITMAP_WORDS: usize = MAX_VA_RESERVATIONS / 64;
 // 位图按整 word 找空槽，容量必须是 64 的倍数，否则末 word 会找出越界槽号。

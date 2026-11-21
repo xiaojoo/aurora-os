@@ -129,9 +129,22 @@ GPT/FAT16/ESP 分区层、用户态装载器与 shell 外部命令、capability 
 出处，取舍的标 `is_tradeoff` 并写理由。门禁 `check-capacity-baseline`（第 20 道）双向对账——
 源码里每个 `MAX_*` 必须登记，登记的值必须与源码相等。
 
-**当前状态（如实写）**：该门禁 **10 条红**，因为基线已改而内核还没跟上：
-9 条「值不符」+ 1 条「u8 槽号装不下 32768」。这不是回归，是欠账清单。
-**位宽 `u8 → u16` 是其他一切的先决条件**（涉及 9 个文件 59 处）。
+**2026-11-22 更新（ADR-179 落地后）：全部达成，该门禁已绿。**
+
+| 常量 | 值 | 验证 |
+|---|---|---|
+| `MAX_PROCESSES` / `MAX_ADDR_SPACES` | 32768 / 32768 | `capacity: ... ⇒ true` |
+| `MAX_JOBS` | 1024 | 同上 |
+| `MAX_HANDLES` | **131072** | `handle: slots ... len=131072` + `irt=24` |
+| `MAX_TASKS` / `MAX_TASKS_SUPPORTED` | **256** / 256 | 100/100 |
+| `MAX_VA_RESERVATIONS` | **65536** | `map_hole 往返=true` |
+
+**ADR-179 把句柄槽数组从 `.bss` 改成了运行时分配**（`phys_alloc_above` + HHDM），
+所以 131072 不再撑爆镜像布局。
+
+**一条新纪律（两次实测撞出来的）**：**栈数组不许跟容量走。**
+`[0u8; MAX_HANDLES]` 在 131072 时是 128 KiB、`[0usize; MAX_TASKS_TOTAL]` 在 256×8 时是 16 KiB，
+两者都把内核栈打穿（`unexpected vector=8`）。改成小常量 + 边界判断 + 分批判。
 
 <!-- aoci:begin -->
 ## AOCI 仓库认知
