@@ -496,6 +496,12 @@ fn stage_memory() {
     }
     // ADR-179：句柄槽数组从 `.bss` 改为运行时分配。必须在这里（物理分配器已就绪、
     // 还没有任何任务跑起来）。失败走 boot-invalid —— 绝不允许空表继续跑。
+    // ADR-179 补记三：VA 保留项数组也改为运行时分配（65536 条 = 1 MiB，
+    // 定长放 .bss 会重现「推高镜像布局」的问题）。
+    if let Err(e) = mm::bootstrap_va_res() {
+        crate::log_fatal!("mm::bootstrap_va_res 失败 {:?}", e);
+        exit::boot_invalid("va res bootstrap failed");
+    }
     #[cfg(feature = "handles")]
     if let Err(e) = crate::handle::init() {
         crate::log_fatal!("handle::init 引导失败 {:?}（句柄槽数组分不出）", e);

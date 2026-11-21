@@ -283,6 +283,8 @@ public_api = [
   "mm::phys_alloc",
   # ADR-179：从指定物理地址之上分配（避开 bootloader 占用的低端区）。
   "mm::phys_alloc_above",
+  # ADR-179 补记三：VA 保留项数组也改为运行时分配。
+  "mm::bootstrap_va_res",
   "mm::reclaim_bootloader_regions",
   "mm::region_count",
   "mm::release_va",

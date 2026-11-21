@@ -326,7 +326,15 @@ struct State {
     pml4_phys: u64,
     boot_stack: [u8; 64 * 1024],
     region_count: usize,
-    va_res: [VaReservation; MAX_VA_RESERVATIONS],
+    /// VA 保留项数组的 HHDM 虚地址（0 = 还没 bootstrap，ADR-179 补记三）。
+    ///
+    /// **为什么不在 State 里给定长数组**：`MAX_VA_RESERVATIONS=65536` 时
+    /// `[VaReservation; 65536]` 是 **1 MiB**，`State` 在 `.bss` 里，
+    /// 于是又回到 ADR-179 那个「.bss 推高镜像布局」的问题（实测 65536 时
+    /// 连跑 6 次 0 次通过，4096 时 5 次通过）。
+    ///
+    /// 改成运行时分配后，容量不再进 `.bss`。
+    va_res_ptr: AtomicU64,
     /// VA 槽占用位图（bit i=1 表示槽 i 已用，ADR-065）。访问都在 VMM 锁内，普通 u64。
     va_used: [u64; VA_BITMAP_WORDS],
     hhdm: u64,
@@ -353,7 +361,7 @@ static S: StateCell = StateCell(UnsafeCell::new(State {
     pml4_phys: 0,
     boot_stack: [0u8; 64 * 1024],
     region_count: 0,
-    va_res: [VaReservation { base: 0, len: 0 }; MAX_VA_RESERVATIONS],
+    va_res_ptr: AtomicU64::new(0),
     va_used: [0; VA_BITMAP_WORDS],
     hhdm: 0,
     max_phys: 0,
@@ -494,7 +502,7 @@ fn reserved_end(va: u64) -> u64 {
     let st = s();
     for i in 0..MAX_VA_RESERVATIONS {
         if st.va_used[i / 64] >> (i % 64) & 1 == 1 {
-            let r = &st.va_res[i];
+            let r = &va_res_slice()[i];
             if va >= r.base && va < r.base + r.len {
                 return r.base + r.len;
             }
@@ -521,21 +529,44 @@ fn release_va_locked(base: u64) -> bool {
     // 永不映射），所以 `Mapping` 手里的 `virt` 等于 `保留基址 + 一页`。
     // 按基址相等匹配的结果是那两条保留**永远还不回去**：`reservations` 每轮 +3 地涨，
     // 而页框（`live`）却是 0 —— 两个计数器各说对了一半，只看"重装能不能成功"根本看不出来。
-    for i in 0..MAX_VA_RESERVATIONS {
-        if st.va_used[i / 64] >> (i % 64) & 1 == 1 {
-            let r = &st.va_res[i];
+    // **按 word 批扫，跳过全 0 的 word**（ADR-179 补记二的实测教训）：
+    //
+    // 原来写 `for i in 0..MAX_VA_RESERVATIONS`，逐项查位图。这个循环**在持 VMM 锁时**跑，
+    // 而 `MAX_VA_RESERVATIONS` 从 256 提到 65536 之后，最坏迭代数涨了 256 倍 ⇒
+    // 持锁时间显著变长 ⇒ 8 核竞争下其他 CPU 的 tick 等锁超时 ⇒ **级联失败**。
+    //
+    // 实测（同一 ELF 连跑 6 次）：
+    //   MAX_VA_RESERVATIONS=65536 ⇒ PASS=2 FAIL=4（有一次 failed=65 的级联）
+    //   MAX_VA_RESERVATIONS=4096  ⇒ PASS=5 FAIL=1
+    //
+    // 位图里 0 表示该 word 的 64 个槽全空——直接跳过，不必逐项查。
+    // 实际在用的保留数是个位数到几十，所以这条批扫把迭代数从 65536 降到 ~1。
+    for w in 0..VA_BITMAP_WORDS {
+        let word = st.va_used[w];
+        if word == 0 {
+            continue;
+        }
+        for b in 0..64usize {
+            if word >> b & 1 == 0 {
+                continue;
+            }
+            let i = w * 64 + b;
+            let r = &va_res_slice()[i];
             if base >= r.base && base < r.base + r.len {
                 idx = i;
                 len = r.len;
                 break;
             }
         }
+        if idx != usize::MAX {
+            break;
+        }
     }
     if idx == usize::MAX {
         return false;
     }
     // 放手要用**保留自己的基址**去逐页检查，不是用传进来的这个映射的基址
-    let res_base = st.va_res[idx].base;
+    let res_base = va_res_slice()[idx].base;
     let pages = len / PAGE as u64;
     for k in 0..pages {
         if is_mapped(res_base + k * PAGE as u64) {
@@ -547,8 +578,8 @@ fn release_va_locked(base: u64) -> bool {
         }
     }
     st.va_used[idx / 64] &= !(1u64 << (idx % 64));
-    st.va_res[idx].base = 0;
-    st.va_res[idx].len = 0;
+    va_res_slice()[idx].base = 0;
+    va_res_slice()[idx].len = 0;
     VA_RELEASED.fetch_add(1, Ordering::Relaxed);
     true
 }
@@ -572,13 +603,59 @@ pub fn is_reserved(base: u64) -> bool {
     let _g = vmm();
     let st = s();
     (0..MAX_VA_RESERVATIONS).any(|i| {
-        st.va_used[i / 64] >> (i % 64) & 1 == 1 && st.va_res[i].base == base
+        st.va_used[i / 64] >> (i % 64) & 1 == 1 && va_res_slice()[i].base == base
     })
 }
 
 pub fn reservation_count() -> usize {
     let _g = vmm();
     s().va_used.iter().map(|w| w.count_ones() as usize).sum()
+}
+
+/// VA 保留项数组的切片。**调用方必须持 VMM 锁**（与 `register_va`/`release_va` 同一前提）。
+///
+/// 未 bootstrap 时返回空切片 —— 那不是「没有保留」，而是「分配器还没起来」。
+/// 启动路径在 `init_allocator` 之后调 `bootstrap_va_res()`，所以产品路径永远是非空的。
+fn va_res_slice() -> &'static mut [VaReservation] {
+    let st = s();
+    let p = st.va_res_ptr.load(Ordering::Acquire);
+    if p == 0 {
+        return &mut [];
+    }
+    // SAFETY: 指针来自 `bootstrap_va_res` 的 `phys_alloc_above`（MOD_BOOT 连续帧、永不归还），
+    // 长度恒为 MAX_VA_RESERVATIONS；调用方持 VMM 锁 ⇒ 独占。
+    unsafe { core::slice::from_raw_parts_mut(p as *mut VaReservation, MAX_VA_RESERVATIONS) }
+}
+
+/// 引导 VA 保留项数组（ADR-179 补记三）。**必须在 `init_allocator` 之后、任何 `register_va` 之前**。
+///
+/// 分配失败往上传：`main` 走 `boot-invalid`。绝不允许空表继续跑（那样第一次
+/// `register_va` 会静默失败，症状是「VA 发不出去」而不是「启动失败」）。
+pub fn bootstrap_va_res() -> Result<(), MmError> {
+    let _g = vmm();
+    let bytes = MAX_VA_RESERVATIONS * core::mem::size_of::<VaReservation>();
+    let pages = bytes.div_ceil(PAGE);
+    if pages == 0 {
+        return Ok(());
+    }
+    let order = (usize::BITS - 1 - pages.leading_zeros()) as u8;
+    // 与句柄表同一修法：从 max_phys/2 之上分配，避开 bootloader 占用的低端区。
+    let min_phys = max_phys() / 2;
+    let frames = phys_alloc_above(order, MOD_BOOT, min_phys)?;
+    let base = frames.base().0;
+    core::mem::forget(frames);
+    let va = hhdm() + base;
+    // SAFETY: va 指向刚分配的 2^order 个连续帧（>= MAX_VA_RESERVATIONS 个条目），
+    // 启动期单核 IF=0、无并发；归 MOD_BOOT 永不归还。
+    unsafe {
+        let p = va as *mut VaReservation;
+        for i in 0..MAX_VA_RESERVATIONS {
+            core::ptr::write(p.add(i), VaReservation { base: 0, len: 0 });
+        }
+    }
+    s().va_res_ptr.store(va, Ordering::Release);
+    crate::log_info!("va: 保留项数组引导 base={:#x} len={} pages={}", va, MAX_VA_RESERVATIONS, pages);
+    Ok(())
 }
 
 fn register_va(base: u64, len: u64) -> bool {
@@ -588,7 +665,7 @@ fn register_va(base: u64, len: u64) -> bool {
         if st.va_used[w] != u64::MAX {
             let b = (!st.va_used[w]).trailing_zeros() as usize;
             st.va_used[w] |= 1u64 << b;
-            st.va_res[w * 64 + b] = VaReservation { base, len };
+            va_res_slice()[w * 64 + b] = VaReservation { base, len };
             return true;
         }
     }

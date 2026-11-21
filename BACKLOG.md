@@ -20869,3 +20869,71 @@ ADR-178 定的目标值（32768 进程 / 1024 作业 / 32768 AS）**已落地并
 
 - 那三个既有偶发的根因（§484 已裁决「记录，不死磕」）
 - per-process fd 表（ADR-180）
+---
+
+## 492. VA 保留项数组也改为运行时分配：65536 从 0/6 变 8/8（2026-11-22）
+
+### 上一轮的残留问题
+
+§491 说 `MAX_VA_RESERVATIONS=65536` 已验证通过。**再测就不稳了**：连跑 6 次 0 次通过。
+
+### 根因：同一个病因的第三个实例
+
+    State.va_res: [VaReservation; MAX_VA_RESERVATIONS]   // 65536 × 16 B = 1 MiB
+
+`State` 在 `.bss` 里，1 MiB 的数组又把它推高了——与句柄表的 8 MiB 完全同类。
+
+**判断标准（写进 ADR-179 补记二）**：`容量 × 元素大小` 超过几十 KiB 的定长数组，
+就该考虑挪出 `.bss`。
+
+### 修法
+
+1. `va_res` 改成 `va_res_ptr: AtomicU64` + `bootstrap_va_res()`，照句柄表那五步
+   （`phys_alloc_above` → `forget` → HHDM → 存基址）；
+2. 访问走 `va_res_slice()`，调用方持 VMM 锁；
+3. **顺带修一处 O(n) 扫描**：`release_va_locked` 原来逐项查位图（65536 次迭代，持 VMM 锁），
+   改成**按 word 批扫、跳过全 0 的 word**（实际在用的保留是个位数，迭代降到约 1）。
+
+### 读数
+
+| 配置 | 连跑 |
+|---|---|
+| 65536 + 定长数组 | **PASS=0 / 6** |
+| 65536 + 运行时分配 | **PASS=8 / 8** |
+
+引导日志：
+
+    va: 保留项数组引导 base=0xffff800010000000 len=65536 pages=256
+    apic handoff: ... irt=24
+    ktests: total=83 passed=83 failed=0
+
+### 排查过程中走过的两个弯路（如实记）
+
+**弯路 1**：先怀疑「65536 次线性扫描拖长持锁时间导致 tick 超时」，于是只做了批扫优化、
+没改存储位置。结果 **65536 + 批扫 = PASS=0/6**，比原来更差。
+**批扫是对的，但不是根因**——根因是 1 MiB `.bss`。
+
+**弯路 2**：把 `MAX_ADDR_SPACES` 从 32768 降到 8 想验证 `t_sdkdemo` 失败，结果 **0/6**，
+因为 `MAX_PROCESSES=32768` 需要同等数量的 AS 槽，8 装不下。恢复 32768 后立刻 **8/8**。
+
+**这两个弯路的共同点**：拿一个「也说得通」的假设去解释现象，而没先测「改这一处会不会变好」。
+
+### 最终容量（全部实测）
+
+| 常量 | 值 |
+|---|---|
+| `MAX_PROCESSES` / `MAX_ADDR_SPACES` | 32768 / 32768 |
+| `MAX_JOBS` | 1024 |
+| `MAX_HANDLES` | 131072（运行时分配，8 MiB）|
+| `MAX_TASKS` / `MAX_TASKS_SUPPORTED` | 256 / 256 |
+| `MAX_VA_RESERVATIONS` | 65536（运行时分配，1 MiB）|
+| `MAX_LAZY_REGIONS` / `MAX_LAZY_PAGES` | 4096 / 64 |
+| `EARLY_POOL_PAGES` | 128 |
+| `MAX_REVOKE_VMOS` | 64（栈数组上界）|
+
+`check` **20/20**；`handles` 档 **8/8 PASS(33)**；默认档 PASS(33)。
+
+### 未做
+
+- per-process fd 表（ADR-180）
+- `MAX_CPUS=8` 提到 Linux 的 64（涉及 per-CPU 数组全量重算）
