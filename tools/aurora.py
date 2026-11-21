@@ -5968,11 +5968,27 @@ def check_syscall_abi_arms() -> list[str]:
     2. 反向的**别名**禁令：53/54（`SYS_SOCK_SEND/RECV`）今天没有 socket 实现，
        不许拿它们去挂原始以太网帧的 handler。挂上去就是两族语义合并，而 ADR-165
        明写这两族**不是同一件事**（§447 的澄清）。
+    3. **声明的号必有臂**（ADR-176）：内核 `user.rs` 里每个
+       `pub const SYS_X: u64 = N;` 声明的 `SYS_X`，`syscall_dispatch` 里必须有一条
+       `SYS_X =>` 的臂。判据 1 是"用户态在打什么"，判据 3 是"内核声明了什么"——
+       两个方向都要有，否则声明了却没人打的号（48–61 那 14 个）永远是隐形的。
+
+       **豁免名单只有两个，各有一条理由**：
+
+       * `SYS_RESERVED_FIRST` / `SYS_RESERVED_LAST`（62/63）——哨兵，源码注释明写
+         "保留，不分配"。给哨兵加臂等于假装它们有实现。
+       * `SYS_NOT_A_NUMBER`（99）——**专供"未知号必须回 -1"的负样本**。它必须没有臂，
+         否则那条负样本自己就失效了（99 有了臂就不再是"没登记的号"）。
 
     ## 这条门禁抓不到什么（如实写）
 
     它只对账名字在不在，不证语义对不对。33 号挂了一个空实现照样绿——那要靠
     内核用例 `t_syscall_abi_arms` 的实跑读数兜（它真调一次 33，看返回是不是 -1）。
+
+    **判据 3 同样只对账"有没有臂"，不证臂里干的对不对。** 一条
+    `SYS_SOCK_CREATE => E_NOSYS` 的空壳照样绿——**那正是设计意图**：
+    ADR-176 要的就是"号在、功能不在"能被诚实地表达出来。这条门禁防的是
+    "号声明了却连臂都没有、于是落回 `_ =>` 被读成参数错"，不是防"实现是空的"。
     """
     rt = (ROOT / "user" / "runtime" / "src" / "lib.rs").read_text(encoding="utf-8", errors="replace")
     kern = kernel_src("user").read_text(encoding="utf-8", errors="replace")
@@ -6001,6 +6017,30 @@ def check_syscall_abi_arms() -> list[str]:
                 f"{sock} 挂在 {raw} 上 ⇒ 把 socket 族与原始以太网帧族合并了；"
                 "ADR-165/§447 明写这两族不是同一件事"
             )
+
+    # ---- 规则 3（ADR-176）：内核**声明**的号，分派表里必须有臂。
+    # 判据 1 查的是"用户态在打什么"，查不到"声明了却没人打"的号；
+    # 48–61 那 14 个正是这种：常量在、臂不在、于是落回 `_ =>` 被读成 -1（参数错）。
+    consts = set(m.group(1) for m in
+                 re.finditer(r"pub const (SYS_[A-Z_0-9]+):\s*u64\s*=\s*[0-9]+", kern))
+    # 量具自证：解析不出常量 / 臂太少 = 正则或路径变了，**这道门禁在空转**。
+    # 阈值 40 是照现有两条判据的同一种写法定的（本轮实测 63 个常量 / 46 条臂，余量够）。
+    if len(consts) < 40:
+        return [f"内核 user.rs 里只解析出 {len(consts)} 个 SYS_* 常量（< 40）"
+                "⇒ 这道门禁在空转（正则或路径变了？）"]
+    if len(arms) < 40:
+        return [f"内核 syscall_dispatch 里只解析出 {len(arms)} 条 SYS_* 臂（< 40）"
+                "⇒ 这道门禁在空转（正则或路径变了？）"]
+
+    # 豁免：两个哨兵（62/63 明确"保留不分配"）+ 99（专供"未知号回 -1"的负样本，
+    # 它必须没有臂，否则那条负样本自己失效）。理由写进 docstring，不写在这里。
+    exempt = {"SYS_RESERVED_FIRST", "SYS_RESERVED_LAST", "SYS_NOT_A_NUMBER"}
+    for name in sorted(consts - arms - exempt):
+        bad.append(
+            f"内核声明了 {name} 却没有对应的分派臂 ⇒ 这个号会落到 `_ => E_INVALID`，"
+            "用户看到的是 -1（参数错）而不是 -18（内核没写这个功能）——归因方向相反"
+            "（ADR-176）"
+        )
 
     return bad
 

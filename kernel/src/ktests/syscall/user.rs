@@ -449,7 +449,7 @@ fn t_task_exit() -> bool {
 ktest!(KT_TASK_EXIT, t_task_exit);
 
 
-// ---- 33/34/53/54 的分派臂：**用户态真打什么号，内核就必须有那条臂**
+// ---- 33/34/53/54/56/60 的分派臂：**用户态真打什么号，内核就必须有那条臂**
 //
 // ## 为什么这一格单独存在（一次真实事故，BACKLOG §469）
 //
@@ -457,20 +457,32 @@ ktest!(KT_TASK_EXIT, t_task_exit);
 // 而 user/runtime 还在打 33/34 ⇒ ping 全死，1248 份跑后日志里 0 次 ICMP 回话。
 // 当时**没有任何内核用例打这四个号**，所以 ktests 全绿也照样漏。
 //
-// ## 判据（四格，两正两负）
+// ## 判据（六格：两"已知" + 四"已登记未实现"）
 //
 // 33 必须**已知**：调一次，unknown_nr() 不涨（落不落 E_INVALID 由设备决定——
 //   没网卡时 bind_net 失败回 E_IO，那也是"这条臂在"，与"号根本不存在"是两件事）。
 // 34 同上。
-// 53/54 必须**未知**：今天没有 socket 实现，调了必须落 _ => E_INVALID 且 unknown_nr() 涨。
-//   **这一格是防"别名"的那一半**：谁再把 53 挂回 sys_net_send，这里立刻红。
 //
-// 反过来说：若哪天 socket 真实现了，53/54 那两格要按新语义重写，不许直接删——
+// 53/54 必须**已登记但未实现**（ADR-176 之后的新语义）：
+//   调了必须回 -18 E_NOSYS、nosys_nr() 涨 1、**unknown_nr() 不涨**。
+//   **这一格仍然防"别名"**：谁再把 53 挂回 sys_net_send，返回值就不再是 E_NOSYS，这里立刻红。
+// 56（INPUT_READ）/ 60（AUDIO_STREAM）同理——这两格是**抽样覆盖另外两个族**：
+//   48–61 共 14 个号，只证 53/54 两个等于只证了 socket 族。
+//
+// ## 为什么 53/54 那两格不许删（原话保留，仍然有效）
+//
+// 若哪天 socket 真实现了，这两格要按新语义重写，不许直接删——
 // 删掉就回到"没有用例打这些号"的状态，而那次事故正是从那个状态长出来的。
+//
+// ## 为什么这里要数两个计数器而不是一个
+//
+// ADR-176 决策 4：UNKNOWN_NR = "号根本没登记"，NOSYS_NR = "号登记了但没实现"。
+// 这两个数**必须分开断言**——只断言"某个数涨了"的话，一个把 53 从号表里删掉的
+// 改动会让它落到 `_ =>` 去涨 UNKNOWN_NR，而用例照样绿。
 #[cfg(feature = "handles")]
 fn t_syscall_abi_arms() -> bool {
-    use crate::user::{self, syscall_dispatch, SYS_NET_RECV, SYS_NET_SEND,
-                      SYS_SOCK_RECV, SYS_SOCK_SEND};
+    use crate::user::{self, syscall_dispatch, SYS_AUDIO_STREAM, SYS_INPUT_READ,
+                      SYS_NET_RECV, SYS_NET_SEND, SYS_SOCK_RECV, SYS_SOCK_SEND};
     let mut f = crate::arch::x86_64::trap::TrapFrame {
         cr2: 0, r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
         rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0, vector: 0,
@@ -497,30 +509,67 @@ fn t_syscall_abi_arms() -> bool {
     syscall_dispatch(&mut f);
     let recv_known = user::unknown_nr() == u1;
 
-    // ---- 53：必须未知（没有 socket 实现）。unknown_nr 必须**涨**。
+    // ---- 53：已登记但未实现。**回 -18、nosys 涨 1、unknown 不涨**，三个都要成立。
+    // 只判"某个计数器涨了"是不够的：把 53 从号表删掉会让它去涨 unknown_nr 而照样绿。
     let u2 = user::unknown_nr();
+    let n2 = user::nosys_nr();
     f.rax = SYS_SOCK_SEND;
     f.rdi = 0; f.rsi = 0; f.rdx = 0;
     syscall_dispatch(&mut f);
-    let sock_send_unknown = user::unknown_nr() == u2 + 1 && f.rax == user::E_INVALID;
+    let sock_send_nosys = user::nosys_nr() == n2 + 1
+        && user::unknown_nr() == u2
+        && f.rax == user::E_NOSYS;
 
     // ---- 54：同上。
     let u3 = user::unknown_nr();
+    let n3 = user::nosys_nr();
     f.rax = SYS_SOCK_RECV;
     f.rdi = 0; f.rsi = 0; f.rdx = 0;
     syscall_dispatch(&mut f);
-    let sock_recv_unknown = user::unknown_nr() == u3 + 1 && f.rax == user::E_INVALID;
+    let sock_recv_nosys = user::nosys_nr() == n3 + 1
+        && user::unknown_nr() == u3
+        && f.rax == user::E_NOSYS;
 
-    let ok = send_known && recv_known && sock_send_unknown && sock_recv_unknown;
+    // ---- 56（INPUT_READ）：抽样覆盖**输入族**。14 个号只证 53/54 等于只证了 socket 族。
+    let u4 = user::unknown_nr();
+    let n4 = user::nosys_nr();
+    f.rax = SYS_INPUT_READ;
+    f.rdi = 0; f.rsi = 0; f.rdx = 0;
+    syscall_dispatch(&mut f);
+    let input_read_nosys = user::nosys_nr() == n4 + 1
+        && user::unknown_nr() == u4
+        && f.rax == user::E_NOSYS;
+
+    // ---- 60（AUDIO_STREAM）：抽样覆盖**音频族**。
+    let u5 = user::unknown_nr();
+    let n5 = user::nosys_nr();
+    f.rax = SYS_AUDIO_STREAM;
+    f.rdi = 0; f.rsi = 0; f.rdx = 0;
+    syscall_dispatch(&mut f);
+    let audio_stream_nosys = user::nosys_nr() == n5 + 1
+        && user::unknown_nr() == u5
+        && f.rax == user::E_NOSYS;
+
+    let ok = send_known && recv_known
+        && sock_send_nosys && sock_recv_nosys
+        && input_read_nosys && audio_stream_nosys;
+    // 日志要能分辨**四个**计数器（ADR-176 决策 4）：两个 unknown 起点、两个 nosys 起点，
+    // 再加末值。只打一个数的话，红的那一遍分不清是"号没登记"还是"号没实现"。
     crate::log_info!(
-        "abi-arms: 33已知={} 34已知={} 53未知={} 54未知={} ⇒ {}",
-        send_known, recv_known, sock_send_unknown, sock_recv_unknown, ok
+        "abi-arms: 33已知={} 34已知={} 53未实现={} 54未实现={} 56未实现={} 60未实现={} \
+         ⇒ unknown {}→{} nosys {}→{} 判据={}",
+        send_known, recv_known,
+        sock_send_nosys, sock_recv_nosys, input_read_nosys, audio_stream_nosys,
+        u0, user::unknown_nr(), n2, user::nosys_nr(), ok
     );
     if !ok {
         crate::log_fatal!(
-            "abi-arms: 判据不成立（33/34 必须已知、53/54 必须未知）\
-             unknown_nr 起点 u0={} u1={} u2={} u3={} 末值={}",
-            u0, u1, u2, u3, user::unknown_nr()
+            "abi-arms: 判据不成立（33/34 必须已知；53/54/56/60 必须已登记未实现：\
+             回 -18、nosys_nr 涨 1、unknown_nr 不涨）\
+             unknown 起点 u0={} u1={} u2={} u3={} u4={} u5={} 末值={} \
+             nosys 起点 n2={} n3={} n4={} n5={} 末值={}",
+            u0, u1, u2, u3, u4, u5, user::unknown_nr(),
+            n2, n3, n4, n5, user::nosys_nr()
         );
     }
     ok
