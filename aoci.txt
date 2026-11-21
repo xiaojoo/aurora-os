@@ -1,0 +1,7 @@
+#AOCI-ROOT-MANIFEST: 1
+#Format-Version: cognition-volumes/v1
+#Locale: zh-CN
+#Project: Aurora OS 是一个从零开发的 x86-64 裸机内核（Rust no_std、Limine 引导、QEMU q35 验证），用 .ktests 段与串口判定码交付可复现的实测证据，而非文档声明
+#Global-Invariants: 不重写 mm/sched/trap 与已实测的中断、TLB、任务回收、驱动资源语义；驱动只能经 DriverCtx 访问 MMIO/DMA；新增锁必须同步改 lock-order.md 与代码里的 rank；新增 unsafe 必须登记白名单并写明不变量由谁保证；故障路径不分配内存、不等可能已损坏的锁、不吞错；检测到不等于已恢复，验签通过不等于安全启动。
+#Volume: id=meta kind=meta path=aoci.meta.txt format=meta-v1 depends=- state=enabled
+#Volume: id=code kind=code path=aoci.code.txt format=object-fras-v2 depends=meta state=enabled

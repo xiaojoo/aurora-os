@@ -1,0 +1,13 @@
+# 行尾规则。git 的 .gitattributes 里**最后一条匹配的规则胜出**，不是第一条。
+# 所以通配规则必须写在前面，例外写在后面。
+* text=auto
+
+# CRLF 是契约，不是历史遗留：AGENTS.md 写明 tools/aurora.py 与 tools/make_fat32_mem.py
+# 必须保持 CRLF，整文件转成 LF 会让 git diff 显示几千行增删（那不是改动量，是量具在骗人）。
+# -text 表示 git 对这两个文件完全不做行尾转换。
+tools/aurora.py -text
+tools/make_fat32_mem.py -text
+
+# 其余文件只用 text=auto，**不写 eol=lf**：本仓有 192 个 CRLF blob，
+# 强制归一会在下一次 git add --renormalize 时改写它们。
+# AOCI 的 line_ending_tolerance=true 已经容忍纯 CRLF/LF 表示差异，不需要靠 git 保证。

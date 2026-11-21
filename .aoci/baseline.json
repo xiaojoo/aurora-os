@@ -1,0 +1,2992 @@
+{
+  "version": 1,
+  "created_at": "2026-11-21T10:24:18Z",
+  "updated_at": "2026-11-21T10:44:03Z",
+  "files": {
+    ".cargo/config.toml": {
+      "role": "observe",
+      "sha256": "6d12e2e0d494ecf9f456dfe500b795d702ecc15c5404c1962ca95a70d96fd93a",
+      "size": 810,
+      "normalized_sha256": "f42d5b6098e5d579fb4f6dffb41cfd9b9ae84676550c6428cba4d9a72defb5a7"
+    },
+    ".gitattributes": {
+      "role": "observe",
+      "sha256": "0e127d505e9f4b1f6e1ade48aea1373e8f4895844dd66ee663f4865d4b29b2a2",
+      "size": 783,
+      "normalized_sha256": "0e127d505e9f4b1f6e1ade48aea1373e8f4895844dd66ee663f4865d4b29b2a2"
+    },
+    ".gitignore": {
+      "role": "observe",
+      "sha256": "719051640059f94a33138944aea5ca28e41eaef07559f28fe673b8ec213f12b2",
+      "size": 942,
+      "normalized_sha256": "719051640059f94a33138944aea5ca28e41eaef07559f28fe673b8ec213f12b2"
+    },
+    ".idea/aurora-os.iml": {
+      "role": "observe",
+      "sha256": "c96ea0b5b29abb7d5807671dd208fd63f63694dd236335d2fe8c074e89e94aa6",
+      "size": 344,
+      "normalized_sha256": "0ff94b49c61885dd797e3da61dc3444c7ab48f317373ca42681910f1f8413752"
+    },
+    ".idea/misc.xml": {
+      "role": "observe",
+      "sha256": "e01e125c2c2e502ee3a436cff7e7fece381cc74db8011e5d82baecd62f0b3829",
+      "size": 238,
+      "normalized_sha256": "f848c17a11a4b05ad63eaa8a748def035f879035c3c81160ea74a6677092f06c"
+    },
+    ".idea/modules.xml": {
+      "role": "observe",
+      "sha256": "2d6838418efeaa180c2cc2ddfb75d4e19f86369909ab6a417b3751e131c4451d",
+      "size": 277,
+      "normalized_sha256": "772d243d13bc195e929512acc0618249b91df2a2f5342fb707f69f72cf9cf7d7"
+    },
+    ".idea/vcs.xml": {
+      "role": "observe",
+      "sha256": "62be7e0a7f84ab3c35b4d4bafb890a4951d061eadafde1a10aa3f5d0406db5df",
+      "size": 172,
+      "normalized_sha256": "6323e12648862a0a96fc0d7877672817d6cd91e2c2a3c3d78f1090db23c6e88e"
+    },
+    ".idea/workspace.xml": {
+      "role": "observe",
+      "sha256": "40baf6711162894141f62d80825662d770287563664b9e391e6774565fe07e15",
+      "size": 2346,
+      "normalized_sha256": "62fa22c69e3e2e353655c836a578d024e6ed20fde5dcc9c34a445332a9725b84"
+    },
+    ".workbuddy/coord/PROTOCOL.md": {
+      "role": "observe",
+      "sha256": "0da024ed8d68c7b4a43fb79dda9abf7f11a7bc60c0f16e23de5419a6c19a0bf0",
+      "size": 3310,
+      "normalized_sha256": "0da024ed8d68c7b4a43fb79dda9abf7f11a7bc60c0f16e23de5419a6c19a0bf0"
+    },
+    ".workbuddy/coord/coord.py": {
+      "role": "observe",
+      "sha256": "5da4b0fa9be83a24ea081a0ea8158c7d410abb95e268c4bebb3cb18b3ed79ef8",
+      "size": 8690,
+      "normalized_sha256": "5da4b0fa9be83a24ea081a0ea8158c7d410abb95e268c4bebb3cb18b3ed79ef8"
+    },
+    ".workbuddy/coord/events.jsonl": {
+      "role": "observe",
+      "sha256": "9db3800f7b25f12bba563e0183a7356c55bc2d03070aa918111a3e278084c492",
+      "size": 13047,
+      "normalized_sha256": "643517ea96411242dab80f80ed9867b89916f6809b3debb8c456fad1c908f702"
+    },
+    ".workbuddy/coord/state.json": {
+      "role": "observe",
+      "sha256": "68932657c7d64b638bf15a2d882a9847faf16fdd605a69118c5c86f50ef6c0cf",
+      "size": 4038,
+      "normalized_sha256": "12b334fe022302fd49ababbac6f218ed5b6d119e28c613b53a07bd74847d94ed"
+    },
+    ".workbuddy/memory/2026-11-16.md": {
+      "role": "observe",
+      "sha256": "40dad51c839023c094a33a3f1a442ee3c01888a82136d675874cb71f52b4402c",
+      "size": 22015,
+      "normalized_sha256": "40dad51c839023c094a33a3f1a442ee3c01888a82136d675874cb71f52b4402c"
+    },
+    ".workbuddy/memory/2026-11-17.md": {
+      "role": "observe",
+      "sha256": "75bd1aeddffbfabd81c47e035e147e53eb30627fe5bae9dc405915c841fe6534",
+      "size": 3652,
+      "normalized_sha256": "615d2d6c62e8a3260c0319c13c6c9683514dc4ea8c866b40b8ae9051ac9252a9"
+    },
+    "AGENTS.md": {
+      "role": "observe",
+      "sha256": "ace6b2333db2e075f4cac14d429da1af2458fae0330eeeb7207b71aa5166f0cb",
+      "size": 24225,
+      "normalized_sha256": "ace6b2333db2e075f4cac14d429da1af2458fae0330eeeb7207b71aa5166f0cb"
+    },
+    "BACKLOG.md": {
+      "role": "observe",
+      "sha256": "f2fb9e1397783b1953eedcebe1f550dce8910a684cccd498c8d66b9f1f1f969f",
+      "size": 1555956,
+      "normalized_sha256": "f2fb9e1397783b1953eedcebe1f550dce8910a684cccd498c8d66b9f1f1f969f"
+    },
+    "COORD.md": {
+      "role": "observe",
+      "sha256": "d5b041ef00ff452a7900282ed48cc580a9bb4872afd77ddef1aa0f88f63711c0",
+      "size": 21622,
+      "normalized_sha256": "ac96ee53106c123810fd76364fe830dedcbe97af47af99094edbb2f0686d261d"
+    },
+    "Cargo.lock": {
+      "role": "observe",
+      "sha256": "e9daffde76d9fe5691070533f80ada0418f8aff58a8445a1621a796277e7d64f",
+      "size": 704,
+      "normalized_sha256": "e9daffde76d9fe5691070533f80ada0418f8aff58a8445a1621a796277e7d64f"
+    },
+    "Cargo.toml": {
+      "role": "observe",
+      "sha256": "9725ee4193a53c90758cc92df4213a738fb0318ab5cfd1774f3e49570e6368c8",
+      "size": 1200,
+      "normalized_sha256": "9725ee4193a53c90758cc92df4213a738fb0318ab5cfd1774f3e49570e6368c8"
+    },
+    "aoci.code.txt": {
+      "role": "index",
+      "sha256": "f18448ba9c7c6ea1736a0e524b955b0227115ed52b53fafd96aeefa1158319f9",
+      "size": 1164,
+      "normalized_sha256": "f18448ba9c7c6ea1736a0e524b955b0227115ed52b53fafd96aeefa1158319f9"
+    },
+    "aoci.meta.txt": {
+      "role": "index",
+      "sha256": "5ccd06dd2198435423141174e4f3eaed7e7645644070e0b5cc2e20dbc889172a",
+      "size": 2187,
+      "normalized_sha256": "5ccd06dd2198435423141174e4f3eaed7e7645644070e0b5cc2e20dbc889172a"
+    },
+    "aoci.txt": {
+      "role": "index",
+      "sha256": "518730b9292a587a91510761fe36ec0f6c8a28101cc04708d5024c1402cc37c6",
+      "size": 882,
+      "normalized_sha256": "518730b9292a587a91510761fe36ec0f6c8a28101cc04708d5024c1402cc37c6"
+    },
+    "boot/limine.conf": {
+      "role": "observe",
+      "sha256": "ceb9d14a0d1eea5121a30e034b1c17fc532af7c80772c54f76ed7781bb1ef3ea",
+      "size": 762,
+      "normalized_sha256": "ceb9d14a0d1eea5121a30e034b1c17fc532af7c80772c54f76ed7781bb1ef3ea"
+    },
+    "docs/Aurora OS 内核完整化设计方案（AUR-KERNEL-NEXT-1.0）.md": {
+      "role": "observe",
+      "sha256": "8e93cbbc02215a423d2edc4ea64c0b36faba84344b0cf9e2fc4175317ea519e6",
+      "size": 37729,
+      "normalized_sha256": "8e93cbbc02215a423d2edc4ea64c0b36faba84344b0cf9e2fc4175317ea519e6"
+    },
+    "docs/Aurora OS 开发手册（企业级）V1.1.md": {
+      "role": "observe",
+      "sha256": "c07cd741e032cf131f000dcaad8f8a11064f0bd38798dcddbedd3cadc2c8019d",
+      "size": 77783,
+      "normalized_sha256": "c07cd741e032cf131f000dcaad8f8a11064f0bd38798dcddbedd3cadc2c8019d"
+    },
+    "docs/Aurora OS 开发手册（企业级）V1.2.md": {
+      "role": "observe",
+      "sha256": "ad562a3a6888ca8cc4b7a352ee12c92ae3a6a4556a5a1bb593cc7cb8461cc433",
+      "size": 302050,
+      "normalized_sha256": "fe70059dac7e9c62c7c36f9dec8a29058c387741d192c207ea71321e383fa95c"
+    },
+    "docs/Aurora-OS-完整操作系统架构与Shell命令体系建设总设计-V1.0.md": {
+      "role": "observe",
+      "sha256": "0ef0ed0ef6176a984e1cc3a5f570b37c276c9a1abe2189925fd936cb6085976e",
+      "size": 65045,
+      "normalized_sha256": "bc8acd3cdc7494179ae46cfb49f61fd3083d6c1445e8683390b337b7a019a094"
+    },
+    "docs/Aurora-OS-未完成步骤审计-2026-11-19.md": {
+      "role": "observe",
+      "sha256": "592a2854e850af307223546c2d765afd351295b34711eb901962bde9aa307db6",
+      "size": 10457,
+      "normalized_sha256": "592a2854e850af307223546c2d765afd351295b34711eb901962bde9aa307db6"
+    },
+    "docs/Aurora_OS_内核详细架构设计与模块接口规范_V1.0.md": {
+      "role": "observe",
+      "sha256": "6c8933738b9b47e3031e2796ac261a978b3c81c95a9a55b85263e7bc2a7f5ef2",
+      "size": 43282,
+      "normalized_sha256": "6c8933738b9b47e3031e2796ac261a978b3c81c95a9a55b85263e7bc2a7f5ef2"
+    },
+    "docs/BASELINE-RECON-2026-11-21.md": {
+      "role": "observe",
+      "sha256": "583a5de568ebe77ced3b80f81dd830b2888be18d15b8fd786e22af5b936f9ca7",
+      "size": 57166,
+      "normalized_sha256": "583a5de568ebe77ced3b80f81dd830b2888be18d15b8fd786e22af5b936f9ca7"
+    },
+    "docs/GAP-ANALYSIS-2026-11-21.md": {
+      "role": "observe",
+      "sha256": "4436b2073fe02da2049b5b78901189fddfd5673d9245b540fdcf9e9b67224b5e",
+      "size": 13530,
+      "normalized_sha256": "4436b2073fe02da2049b5b78901189fddfd5673d9245b540fdcf9e9b67224b5e"
+    },
+    "docs/T0.1.txt": {
+      "role": "observe",
+      "sha256": "52799402a0407bacd926ae5ef966374cb8d5c997ad4c02813b9a36da939bf4ac",
+      "size": 5259,
+      "normalized_sha256": "e853c722edb2ee460b53019a854c6641802932f2f46ce9f705485d0d9cfed4fd"
+    },
+    "docs/adr/ADR-007-用户权限只从句柄来而两张句柄表分家.md": {
+      "role": "observe",
+      "sha256": "0ae19e1d769d1d4b1493103f2709665efe0d781f13666e7fd3295cd3cab6ffac",
+      "size": 27700,
+      "normalized_sha256": "af2a158421637e2b0f9e08078565b7b41ff730be0a5e8221bafca31dd60cb4ab"
+    },
+    "docs/adr/ADR-014-Limine多核事实与待办.md": {
+      "role": "observe",
+      "sha256": "a3bc4f09a751ad3dc02aa0ae93307040cb5562510d20bb4b44aa9a6c4546e25f",
+      "size": 3090,
+      "normalized_sha256": "a3bc4f09a751ad3dc02aa0ae93307040cb5562510d20bb4b44aa9a6c4546e25f"
+    },
+    "docs/adr/ADR-016-host-平台与统一入口.md": {
+      "role": "observe",
+      "sha256": "3aa3eabc8cbc0b4439527f49c9a270f12c908cb1cf495c3fa0e2ca9fe707feda",
+      "size": 3110,
+      "normalized_sha256": "3aa3eabc8cbc0b4439527f49c9a270f12c908cb1cf495c3fa0e2ca9fe707feda"
+    },
+    "docs/adr/ADR-017-Limine版本固定.md": {
+      "role": "observe",
+      "sha256": "63cb317f69f1d9c7147f242663069e7468348a749638a01d08c58640c4654f29",
+      "size": 2836,
+      "normalized_sha256": "63cb317f69f1d9c7147f242663069e7468348a749638a01d08c58640c4654f29"
+    },
+    "docs/adr/ADR-018-内核堆OOM出口.md": {
+      "role": "observe",
+      "sha256": "cac0038cbf94ed72a42b424e9569fb4a636314d59100b17a89cfaa2b929a5484",
+      "size": 4943,
+      "normalized_sha256": "cac0038cbf94ed72a42b424e9569fb4a636314d59100b17a89cfaa2b929a5484"
+    },
+    "docs/adr/ADR-019-bootloader可回收内存的回收时机.md": {
+      "role": "observe",
+      "sha256": "4028e8c69267602d566461183da09d5ada839a94b49289fb4689a2f8f9fdb62f",
+      "size": 4995,
+      "normalized_sha256": "4028e8c69267602d566461183da09d5ada839a94b49289fb4689a2f8f9fdb62f"
+    },
+    "docs/adr/ADR-020-中断向量EOI与第一把锁.md": {
+      "role": "observe",
+      "sha256": "f3a632404372e01e95a5683341f46122a6e8fd32c7cfcb78a07d3dc418ef5ac0",
+      "size": 9151,
+      "normalized_sha256": "de25d6f413d921ee93522aabab55126425f0b23cb107802e0e753bc3f68d27b7"
+    },
+    "docs/adr/ADR-021-IF归属中断窗口属于CPU.md": {
+      "role": "observe",
+      "sha256": "42cc7d27afc7c57659a66df5d5ea555bed9fd09d9b84c4a780ab1405df9d75b8",
+      "size": 9869,
+      "normalized_sha256": "5d51fb1c8dca32c83bbfc518e1df85071eae71b7c2cf8d617bc590f908ea1acf"
+    },
+    "docs/adr/ADR-022-AP启动失败的降级语义.md": {
+      "role": "observe",
+      "sha256": "d4fa7b14cbfb021456cfca74795512b3e9325127d87969551fc425eb585e2bea",
+      "size": 8271,
+      "normalized_sha256": "a1506b3152896ee3040a93bdca1912c08601183efb96ad4ad736e1b30cb31c8d"
+    },
+    "docs/adr/ADR-023-TLB-shootdown的机制与QEMU量不到的那一半.md": {
+      "role": "observe",
+      "sha256": "f4ba8fb4eed4f858c0ce454bb0896a5b92aa0ad034dec8f0bd8e66015d3d409f",
+      "size": 7289,
+      "normalized_sha256": "f4ba8fb4eed4f858c0ce454bb0896a5b92aa0ad034dec8f0bd8e66015d3d409f"
+    },
+    "docs/adr/ADR-024-per-CPU化的层次与我是谁值600周期.md": {
+      "role": "observe",
+      "sha256": "997d4d49e3259b2fbbc25145e0a9afc9205fbe9250ddb379ffa5c019e1723b80",
+      "size": 10386,
+      "normalized_sha256": "997d4d49e3259b2fbbc25145e0a9afc9205fbe9250ddb379ffa5c019e1723b80"
+    },
+    "docs/adr/ADR-025-ring3入口先用int0x80并把GS窗口留给SYSCALL.md": {
+      "role": "observe",
+      "sha256": "f70bca84304786d6ed1e243241eea26e84b9754232a57c796b221576d39b7333",
+      "size": 13170,
+      "normalized_sha256": "f70bca84304786d6ed1e243241eea26e84b9754232a57c796b221576d39b7333"
+    },
+    "docs/adr/ADR-026-用户半区生效位与按架构偏移声明的字段.md": {
+      "role": "observe",
+      "sha256": "ae577323f9d427bb671bb5451470bc3f2865069c1d2066ee04d79d8b298cd47c",
+      "size": 7967,
+      "normalized_sha256": "ae577323f9d427bb671bb5451470bc3f2865069c1d2066ee04d79d8b298cd47c"
+    },
+    "docs/adr/ADR-027-任务结束与资源回账.md": {
+      "role": "observe",
+      "sha256": "8672045c1d700efc6214d525b52ced01fe6b1a137c5703cd9b5982dada07b9e6",
+      "size": 4795,
+      "normalized_sha256": "8672045c1d700efc6214d525b52ced01fe6b1a137c5703cd9b5982dada07b9e6"
+    },
+    "docs/adr/ADR-028-用户窗口分区与内核拥有的落脚页.md": {
+      "role": "observe",
+      "sha256": "2f1fe0f51911ecaf8034069e3a0e74f1d906b8cb9b8ce9e956dbe835bfe82e43",
+      "size": 6387,
+      "normalized_sha256": "2f1fe0f51911ecaf8034069e3a0e74f1d906b8cb9b8ce9e956dbe835bfe82e43"
+    },
+    "docs/adr/ADR-029-AHCI第一版轮询与现场读数为准.md": {
+      "role": "observe",
+      "sha256": "b3a34547670cc6c25b2a7bba1db8385626cb2b77b38b86497ae838e0a50e4060",
+      "size": 25665,
+      "normalized_sha256": "b3a34547670cc6c25b2a7bba1db8385626cb2b77b38b86497ae838e0a50e4060"
+    },
+    "docs/adr/ADR-030-驱动的唯一接口是能力句柄表.md": {
+      "role": "observe",
+      "sha256": "85addcd6c7b5a095dc5e0118df4d129fa258bdf7731c41ca8495e3c710340dfb",
+      "size": 11528,
+      "normalized_sha256": "85addcd6c7b5a095dc5e0118df4d129fa258bdf7731c41ca8495e3c710340dfb"
+    },
+    "docs/adr/ADR-031-持久状态区的载体与记录格式.md": {
+      "role": "observe",
+      "sha256": "d96c98b98e03c6b4833206ae977505452dbe4ccd2d6fda4e462c92a39abeaa5d",
+      "size": 22397,
+      "normalized_sha256": "d4f3c30eb04c73d54c7fdd58eb7a4f0435dc38b5808cf4cb66a7ea1a9d171493"
+    },
+    "docs/adr/ADR-032-网卡第一帧由宿主机抓包判.md": {
+      "role": "observe",
+      "sha256": "cf425ea07c4b0be15a4cc96579fcf0039a6fc8b7d98001a99cf333f86c3a65ab",
+      "size": 8001,
+      "normalized_sha256": "cf425ea07c4b0be15a4cc96579fcf0039a6fc8b7d98001a99cf333f86c3a65ab"
+    },
+    "docs/adr/ADR-033-更新包用一次性签名而锚点内置.md": {
+      "role": "observe",
+      "sha256": "de92f8abf1b9847ae3598a0a3c97ef21e2a4979a5655f58d8395dfab3b6330e6",
+      "size": 9448,
+      "normalized_sha256": "51e9d0542edbf55463118aeaa6c5ad2bcec899cd18fac1a5817d97d99eacaaa8"
+    },
+    "docs/adr/ADR-034-中断认领表在核内而完成等法两本账分开.md": {
+      "role": "observe",
+      "sha256": "813e789545c8e30842ee2b9fd4d3dcee659f20e54009f92b2b5a2860b37d0172",
+      "size": 17317,
+      "normalized_sha256": "037c3522ab74312fcdbbbab253618830b8c50b500c7f6276826ba8f832f1c9b5"
+    },
+    "docs/adr/ADR-035-日志的整行由一颗行锁保证而停机路径不排队.md": {
+      "role": "observe",
+      "sha256": "9aa18e56212c900bd1894d3aba2fd402ceee9709ace84899f1a183c0d632f1f7",
+      "size": 3310,
+      "normalized_sha256": "a1f35a9e0dbec716256af8d12275d4c2b7414f7685190b01bd191da046f0e269"
+    },
+    "docs/adr/ADR-036-有界等待的上界是时间而标定估计器是相邻间隔.md": {
+      "role": "observe",
+      "sha256": "de7f1cd2fb41f6ded4f21e2b7a59f69b2c104ff116a4ede1501e5cfa16f0ffd0",
+      "size": 6385,
+      "normalized_sha256": "de7f1cd2fb41f6ded4f21e2b7a59f69b2c104ff116a4ede1501e5cfa16f0ffd0"
+    },
+    "docs/adr/ADR-037-窗口边界由设备游标说而层间关系只写方向式.md": {
+      "role": "observe",
+      "sha256": "748bd269d687da7dfa312278896ab16600ac019d755970fcd2531a43ba275953",
+      "size": 5172,
+      "normalized_sha256": "748bd269d687da7dfa312278896ab16600ac019d755970fcd2531a43ba275953"
+    },
+    "docs/adr/ADR-038-FAT32判型只看结构而每个读回的数由第二台实现重算.md": {
+      "role": "observe",
+      "sha256": "f54ce29a2281a20f96b880c7e2a67d7365667485412ba73a36fb00785274e104",
+      "size": 14701,
+      "normalized_sha256": "2a8235ae368ccf9732315e2830485e810798393f7892818346c127c12a06a28f"
+    },
+    "docs/adr/ADR-039-模块接口登记与依赖矩阵基线.md": {
+      "role": "observe",
+      "sha256": "fd17e3f9174d383d58eb1f79b4118cec8de87ecb90d2de11ba2080755be8a09a",
+      "size": 5128,
+      "normalized_sha256": "fe63d5d4eeea724a00adeb42fbaebb9475e7372479790c2e8bb9dfa1938a6985"
+    },
+    "docs/adr/ADR-040-arch与sched用回调表反转依赖.md": {
+      "role": "observe",
+      "sha256": "e16399f63833b8058e207021bdb61e4448bcb916c3643599d1e4e5a1234e694e",
+      "size": 5231,
+      "normalized_sha256": "8df7bcee9ecdea41503717f9c7913c2972c0e1db72681899870266992198b85c"
+    },
+    "docs/adr/ADR-041-VA保留容量归memory而调度器用编译期断言适配.md": {
+      "role": "observe",
+      "sha256": "a52b8ea5a45ceac106dd4f418165c26816738c4d8fc4996be97dcbe284883c5f",
+      "size": 4221,
+      "normalized_sha256": "29eab5f6a83dd68b3929aea62c956e1f8dcbb34a06b43498ea56f40f129cae59"
+    },
+    "docs/adr/ADR-042-crash的当前任务号经hooks取消diagnostics依赖sched.md": {
+      "role": "observe",
+      "sha256": "dbfa2e6dacd98a7d82bc2d33b383103aee622669b0cb5054cd3877ee10504aa9",
+      "size": 3356,
+      "normalized_sha256": "991bdf7185961c220d7ed7bae753c015ba32f2f264016354f48a39b486e43656"
+    },
+    "docs/adr/ADR-043-依赖图只统计产品路径而测试代码不计入接口边.md": {
+      "role": "observe",
+      "sha256": "4693b1d499eb2f026b3ad48d71b129c2aa10063920bb7f8652953f44ebe6807e",
+      "size": 3968,
+      "normalized_sha256": "e5dde8ec0ab932bc187bb1019a8209d339f9d965074aa9fbf2e1c18105cd7719"
+    },
+    "docs/adr/ADR-044-环冻结为基线消环进度改成引用站点数棘轮.md": {
+      "role": "observe",
+      "sha256": "8956bbc262dd4ca4c6fc449d1e4402f6e004bd773b89ec1189cbf87eecd24529",
+      "size": 7336,
+      "normalized_sha256": "1564c3d3798b46834abcecc48cfeb21e7fb050eb43e6a7d8265dbae6ce12ec3e"
+    },
+    "docs/adr/ADR-045-public_api要登记use导入后裸用的符号且只做单向.md": {
+      "role": "observe",
+      "sha256": "5bcd2ae10568e82444c63f3e2f6bd6148de5f218de608151a50af20282a9618c",
+      "size": 7038,
+      "normalized_sha256": "0a41c7d48c6c1be245f8474e67b2695d2ae66d7514aa55f9139a3cdf978f4ae9"
+    },
+    "docs/adr/ADR-046-具名中断向量进登记表并与源码特例判据对账.md": {
+      "role": "observe",
+      "sha256": "8031164acc696ae3a93aa80c1491994177226d3214518ea0412d08a236db459a",
+      "size": 7468,
+      "normalized_sha256": "bbad821c08b6d251c65d125f0993a128c1837bee60ac45420a6f030add359693"
+    },
+    "docs/adr/ADR-047-阻塞等待与定时的接口锁序与resched向量.md": {
+      "role": "observe",
+      "sha256": "4dfbd4ae6af802bc11b7507d8fa3d6ae2f14b2f37c20203ef45ece52e200cd2d",
+      "size": 12756,
+      "normalized_sha256": "57f64a24219f39c772fbc786580b8bda863ca5b4a0f30abb0ea20f36563ac207"
+    },
+    "docs/adr/ADR-048-运行队列写权归锁快照读保持弱读.md": {
+      "role": "observe",
+      "sha256": "9ebbe4558fb3146a2086f03f373ef5f3a431a13605ef37da56491250e3d3368a",
+      "size": 7555,
+      "normalized_sha256": "fa1b571e52367af82cbbe320ff2aea0cb63dce0ce544d2982c95cf241d6b2e63"
+    },
+    "docs/adr/ADR-049-resched向量用自陷建帧单独记账且不发EOI.md": {
+      "role": "observe",
+      "sha256": "c2683f50b02afe8b1f572f6cb9c9747fafb74f75b2b51be2e2b13abe612461b2",
+      "size": 7382,
+      "normalized_sha256": "e0bef5bc0059becfa6e4d97382cb64b42dfa97d829a7dda04b28e93b760ec1f4"
+    },
+    "docs/adr/ADR-050-用例收尾不许留下可运行的用户任务.md": {
+      "role": "observe",
+      "sha256": "61ea054cf687f6e128bd520b741075002678091a1546910b33550257bdc6c672",
+      "size": 6038,
+      "normalized_sha256": "262499fa4fc279f6a3a3307ac970fba322e206711354771b8c0eabf8287f7709"
+    },
+    "docs/adr/ADR-051-释放前提变判据与Blocked及idle的落地顺序.md": {
+      "role": "observe",
+      "sha256": "ed9b86bd1695d940552bf660f7d293696e686c21b31f4ca5c988326fef117764",
+      "size": 6769,
+      "normalized_sha256": "c15d17695d3343c81fcd82fd027bc983f1aa21fb105c6c2fad457a2c31eff7c2"
+    },
+    "docs/adr/ADR-052-兜底idle的两遍扫描与回落条件及静态栈可写段.md": {
+      "role": "observe",
+      "sha256": "98f6c5982f6752526e492b9ac5ce2c64131840eb4a525b217a80d393f148e29f",
+      "size": 7180,
+      "normalized_sha256": "bfad8d73ed6b33aea40f44e529c86ff1b60c40d3a475f5b36ea5ef11d14319ed"
+    },
+    "docs/adr/ADR-053-等待队列依赖反转放锁后切走与P4三段切分.md": {
+      "role": "observe",
+      "sha256": "2378e5247d8074f8c086ca63b9a525c26d2b8fd03671f93e50424d3bf9230322",
+      "size": 7346,
+      "normalized_sha256": "2378e5247d8074f8c086ca63b9a525c26d2b8fd03671f93e50424d3bf9230322"
+    },
+    "docs/adr/ADR-054-等待队列单调用协议防空转判据与变异A的窗口放大.md": {
+      "role": "observe",
+      "sha256": "8fce1d099094b0514839eb2e6082d28360aa0fc66cd06f96dab5691e5545f886",
+      "size": 7328,
+      "normalized_sha256": "eb0430539cecc91803df31da95209196f576e499f5f20d7dfc7f6fa24fc6395a"
+    },
+    "docs/adr/ADR-055-跨核resched独立向量并发EOI与no_eoi锚点改结构判据.md": {
+      "role": "observe",
+      "sha256": "5f5e58d83eebb77ce7170616bdb26eb9e0b30f78e717f10d4eafcbab90de7ce4",
+      "size": 6542,
+      "normalized_sha256": "ea872cbd7d4e1b040d6e2be6d6d6773cd51ce85e16fb07cf6135515504b0df15"
+    },
+    "docs/adr/ADR-056-跨核压力分层与慢轮比例判据.md": {
+      "role": "observe",
+      "sha256": "a2da53f6706e093c36376e45b7d6a5a919289d27bedccb2cc6986fd322559e92",
+      "size": 6523,
+      "normalized_sha256": "8cdc539c9a28f6f8bfa3569764e9e49c7fbd68c49a0d11f1f78de13d8fd4b830"
+    },
+    "docs/adr/ADR-057-idle与AP工人改hlt及regime分界判据.md": {
+      "role": "observe",
+      "sha256": "2f5bced26facf42e70d3b96fff250a9e6d13d9c603b34162f5fbe9219b756396",
+      "size": 6963,
+      "normalized_sha256": "5d6721456b71ede9c9db8e5345c82dc0ae105b87661691d726a2b72c00305773"
+    },
+    "docs/adr/ADR-058-定时器轮放sched与RANK_TIMER及扫轮位置.md": {
+      "role": "observe",
+      "sha256": "c3e40cbd76635cdbe5ac127e7bd45d30cab753a07f018824a16afdbeb48327df",
+      "size": 7058,
+      "normalized_sha256": "96f751514b68b4b2ceed5e5aec6efaa456b024fb49ca8798d0085fc7f78d1059"
+    },
+    "docs/adr/ADR-059-每次hlt前重新开窗口并落地wait_while时限.md": {
+      "role": "observe",
+      "sha256": "13322513a7f33504a8ddba632da3c8b8c2d44eb62bc70d1cfb6757ac42ec58eb",
+      "size": 6491,
+      "normalized_sha256": "6a756fa459def4b071980aad320653884524a343786a89f25eebca04ca50b034"
+    },
+    "docs/adr/ADR-060-崩溃路径当前任务号用不取锁快照退出路径不许级联.md": {
+      "role": "observe",
+      "sha256": "d66d9a0a8ac227fb3f7fbd4c04fd097c29ba73613b1b46a6caea6b7eef63e5c6",
+      "size": 8580,
+      "normalized_sha256": "3fba82747208b4ba044a6d5ebf71f418228b442656f00b4d2542ebbb7a804fdb"
+    },
+    "docs/adr/ADR-061-终止阻塞任务要收两份注册且收尾不许留阻塞任务.md": {
+      "role": "observe",
+      "sha256": "6d2161832a7cb161915e2a99c82132c607c3a89da7c275d14d0120ba7e60f67c",
+      "size": 9658,
+      "normalized_sha256": "2b5cf20e4418e63a9b6d42a7a9fdf2988c733c99a641214cb0c9007600127e39"
+    },
+    "docs/adr/ADR-062-reschedIPI失败计数由注入证明会咬且失败不丢唤醒.md": {
+      "role": "observe",
+      "sha256": "458ac45d6ee7df0f02faab9326d4a0986abf93d0253dd2e38066d6c02c9cfd76",
+      "size": 8578,
+      "normalized_sha256": "8da026d4523a73972753a5f83d7a820c42b4dea0a27140fa2c0a3c095f4be358"
+    },
+    "docs/adr/ADR-063-页帧元数据FrameInfo与引用计数替换静态位图.md": {
+      "role": "observe",
+      "sha256": "76ac3208a0c96d1a873f3bd3d4aa6b6434b1334b579c1968b6956dc7164d6383",
+      "size": 20835,
+      "normalized_sha256": "a8b874194b2dee1356bfd3c7751fd1d3f19baeb56b45a8b4c3913577b7db07fb"
+    },
+    "docs/adr/ADR-064-KBuf大块分配经HHDM直接寻址填ADR-018口子.md": {
+      "role": "observe",
+      "sha256": "be8727782e2bb6feade5d185e91aecd04fcd32711cd202251124e0a73e1e83c1",
+      "size": 10074,
+      "normalized_sha256": "6741fe9c8148018b11c910304f88baa7b3818a2264f585cce96a99473bc4c1af"
+    },
+    "docs/adr/ADR-065-VA保留表扩成256定长区间表加空闲位图.md": {
+      "role": "observe",
+      "sha256": "6292f1052488a19f89152f8339c559cdc07f82def63f3722b6c9bb01d92f8c96",
+      "size": 9345,
+      "normalized_sha256": "0a7165ed0b699006710e38e5003c82641616c018f776aa3d5a8e0085af7e8a59"
+    },
+    "docs/adr/ADR-066-split_huge翻译等价拆大页与map_hole高地址UC窗口.md": {
+      "role": "observe",
+      "sha256": "f458c147960c25af2c6934f42a0378cd853af2b7e8af3ca0ff3d0173927fb0e8",
+      "size": 18643,
+      "normalized_sha256": "f458c147960c25af2c6934f42a0378cd853af2b7e8af3ca0ff3d0173927fb0e8"
+    },
+    "docs/adr/ADR-067-demand-zero单AS按需清零与PF修复接缝.md": {
+      "role": "observe",
+      "sha256": "a42227abe21651226083658d7727801d238cb991457e935f81dcc50acb289549",
+      "size": 16969,
+      "normalized_sha256": "a42227abe21651226083658d7727801d238cb991457e935f81dcc50acb289549"
+    },
+    "docs/adr/ADR-068-中断窗口改嵌套计数且只在最外层动硬件与牌.md": {
+      "role": "observe",
+      "sha256": "d5e9c94afb1fd2def58adb25a8e2dc96cb83e575852acc3e946539fefe4e284d",
+      "size": 10870,
+      "normalized_sha256": "d5e9c94afb1fd2def58adb25a8e2dc96cb83e575852acc3e946539fefe4e284d"
+    },
+    "docs/adr/ADR-069-用例收尾的豁免改成显式常驻名单并扩到所有在线CPU.md": {
+      "role": "observe",
+      "sha256": "7b784c36c306b88d1c3e80ae755e1f0adee96f4b75b39294d5f7188037b231e1",
+      "size": 10994,
+      "normalized_sha256": "7b784c36c306b88d1c3e80ae755e1f0adee96f4b75b39294d5f7188037b231e1"
+    },
+    "docs/adr/ADR-070-每进程一份PML4与AddressSpace对象.md": {
+      "role": "observe",
+      "sha256": "1c089fe166ecb7d6fa086b87482cd5055fc6d2fcff0adf155b6f49b083e5155d",
+      "size": 19862,
+      "normalized_sha256": "1c089fe166ecb7d6fa086b87482cd5055fc6d2fcff0adf155b6f49b083e5155d"
+    },
+    "docs/adr/ADR-071-内核线程等待与Done槽回收以及任务上限分开.md": {
+      "role": "observe",
+      "sha256": "ae3e63f9955d09130282f4da53c0d308310d91010e26f0d6a6421de8b56f9bbd",
+      "size": 27090,
+      "normalized_sha256": "ae3e63f9955d09130282f4da53c0d308310d91010e26f0d6a6421de8b56f9bbd"
+    },
+    "docs/adr/ADR-072-shootdown按AS位图收窄与内核半区仍全广播.md": {
+      "role": "observe",
+      "sha256": "a654dc964bc7ae926e8367093b342667b700909a090132cca17b9fe5b2d850f4",
+      "size": 5370,
+      "normalized_sha256": "a654dc964bc7ae926e8367093b342667b700909a090132cca17b9fe5b2d850f4"
+    },
+    "docs/adr/ADR-073-进程与Job对象及僵尸结局记录与上限实测.md": {
+      "role": "observe",
+      "sha256": "2b3f2c70bd0ac77181ba7cc6f21956fd174695c32767f450fcbba6013c5d6835",
+      "size": 26917,
+      "normalized_sha256": "2b3f2c70bd0ac77181ba7cc6f21956fd174695c32767f450fcbba6013c5d6835"
+    },
+    "docs/adr/ADR-074-VMO持帧对象与句柄表只存引用且释放在锁外.md": {
+      "role": "observe",
+      "sha256": "22c3e252b79c5f4ff854da660ff6d548b797355fb5de0032e7b8722d7846b0ca",
+      "size": 26691,
+      "normalized_sha256": "22c3e252b79c5f4ff854da660ff6d548b797355fb5de0032e7b8722d7846b0ca"
+    },
+    "docs/adr/ADR-075-每进程AS与thread_create-process_start及StartupInfo回填.md": {
+      "role": "observe",
+      "sha256": "5f272392c652f50a858a7ceb2946a297cfc2b6cdb1c2039a135ceb32c311a3ce",
+      "size": 67256,
+      "normalized_sha256": "5f272392c652f50a858a7ceb2946a297cfc2b6cdb1c2039a135ceb32c311a3ce"
+    },
+    "docs/adr/ADR-076-AS与帧归属从任务搬到进程及process_kill.md": {
+      "role": "observe",
+      "sha256": "aede5268673068d2467f6747d9dd568299c2478ca1cd2f53a6349ddf75aa3ee7",
+      "size": 8765,
+      "normalized_sha256": "aede5268673068d2467f6747d9dd568299c2478ca1cd2f53a6349ddf75aa3ee7"
+    },
+    "docs/adr/ADR-077-P7已解锁部分两容器共存判据与旧欠账关闭.md": {
+      "role": "observe",
+      "sha256": "996aeec2350b8510c048fd932f8ccd0bd6967d1483c8f5145ef62697cb857ec6",
+      "size": 11775,
+      "normalized_sha256": "996aeec2350b8510c048fd932f8ccd0bd6967d1483c8f5145ef62697cb857ec6"
+    },
+    "docs/adr/ADR-078-分区能力与mount语义分离及GPT只读解析.md": {
+      "role": "observe",
+      "sha256": "42f4c3ff96a01691d0b810a473130f53c87adf621751ccbdb5522b4f198c1ccd",
+      "size": 58320,
+      "normalized_sha256": "42f4c3ff96a01691d0b810a473130f53c87adf621751ccbdb5522b4f198c1ccd"
+    },
+    "docs/adr/ADR-079-致命现场无锁记录表与宿主机物理地址读回.md": {
+      "role": "observe",
+      "sha256": "071c5265a20647ad94d1dd5b194bb5d3b5cc20afccf7848f3aacc71c7ed12400",
+      "size": 34467,
+      "normalized_sha256": "071c5265a20647ad94d1dd5b194bb5d3b5cc20afccf7848f3aacc71c7ed12400"
+    },
+    "docs/adr/ADR-080-验签进启动决策只检测不拒启.md": {
+      "role": "observe",
+      "sha256": "00ce0fbbdd0906c8e2e46eb7c7a5412743808521246d5b1bfeb32b58c83e23b4",
+      "size": 10570,
+      "normalized_sha256": "00ce0fbbdd0906c8e2e46eb7c7a5412743808521246d5b1bfeb32b58c83e23b4"
+    },
+    "docs/adr/ADR-081-等锁时按条件开窗与堆增长降到rank4的GROW锁.md": {
+      "role": "observe",
+      "sha256": "9a9e48c94046eb2f3cb739cb3bf2bfe45057986c0cf5c3a34edf932409fcd034",
+      "size": 13785,
+      "normalized_sha256": "9a9e48c94046eb2f3cb739cb3bf2bfe45057986c0cf5c3a34edf932409fcd034"
+    },
+    "docs/adr/ADR-082-产品启动路径真起ring3与信箱判据.md": {
+      "role": "observe",
+      "sha256": "d4fc3d7c03ea507c917ce1e7ddf5096f427c84ba03b443800aa99988ead8e56c",
+      "size": 18523,
+      "normalized_sha256": "d4fc3d7c03ea507c917ce1e7ddf5096f427c84ba03b443800aa99988ead8e56c"
+    },
+    "docs/adr/ADR-083-显示子系统第一刀按物理区间自映射并以宿主机PPM为画面判据.md": {
+      "role": "observe",
+      "sha256": "abbfe507596f588afe2ce308c9a063c2c40400e9f3afc01f7e7b524580d36539",
+      "size": 13939,
+      "normalized_sha256": "abbfe507596f588afe2ce308c9a063c2c40400e9f3afc01f7e7b524580d36539"
+    },
+    "docs/adr/ADR-084-PS2键盘并入consoleRead且输入字节按单一证人分账.md": {
+      "role": "observe",
+      "sha256": "a22fce7e16d73d6cc4ecf11aeab4cec2b2470f68e92d07578277bef32339decd",
+      "size": 9847,
+      "normalized_sha256": "a22fce7e16d73d6cc4ecf11aeab4cec2b2470f68e92d07578277bef32339decd"
+    },
+    "docs/adr/ADR-085-实时上屏用同一镜像环承载控制台字节流并以配对dump为画面判据.md": {
+      "role": "observe",
+      "sha256": "f48ea56e06f75ee294d008b838f15d2850b04d33a81e4cbf672f8caa24c84643",
+      "size": 11317,
+      "normalized_sha256": "f48ea56e06f75ee294d008b838f15d2850b04d33a81e4cbf672f8caa24c84643"
+    },
+    "docs/adr/ADR-086-字形改为点阵资产并以读回文本为可读判据.md": {
+      "role": "observe",
+      "sha256": "9c1067033ceb9330b492d02d9b5af94e5824f63da61adcbb19ffa7b8d0e0d8f7",
+      "size": 8055,
+      "normalized_sha256": "9c1067033ceb9330b492d02d9b5af94e5824f63da61adcbb19ffa7b8d0e0d8f7"
+    },
+    "docs/adr/ADR-087-中文与双宽格-格高16与覆盖集字形表.md": {
+      "role": "observe",
+      "sha256": "e8dda1978f4ff58d33c768cc40a1d88b4077359c64d77f97804d6eea435188e1",
+      "size": 7937,
+      "normalized_sha256": "e8dda1978f4ff58d33c768cc40a1d88b4077359c64d77f97804d6eea435188e1"
+    },
+    "docs/adr/ADR-088-fbcon-live走终端模式-2倍字号与Windows配色且冻结闸门只留给取样式变体.md": {
+      "role": "observe",
+      "sha256": "7064f01b6b802a90c624b5d21714a7e6333dc2228b5bc41a3c5f99eb6e9fefe5",
+      "size": 10588,
+      "normalized_sha256": "7064f01b6b802a90c624b5d21714a7e6333dc2228b5bc41a3c5f99eb6e9fefe5"
+    },
+    "docs/adr/ADR-089-行规程最小形态-日志另起一行且输入行固定在底部.md": {
+      "role": "observe",
+      "sha256": "c422b0cf476cc073b05d6bd3308d190129271e4446107de1618fa5858649f571",
+      "size": 4815,
+      "normalized_sha256": "c422b0cf476cc073b05d6bd3308d190129271e4446107de1618fa5858649f571"
+    },
+    "docs/adr/ADR-090-换入用户任务强制开中断窗口-修复ring3关中断自旋.md": {
+      "role": "observe",
+      "sha256": "98b96aa9265e555b5216492e07f31941bb20533f5426711ba3150ab7bc7631ed",
+      "size": 4624,
+      "normalized_sha256": "98b96aa9265e555b5216492e07f31941bb20533f5426711ba3150ab7bc7631ed"
+    },
+    "docs/adr/ADR-091-PS2鼠标与屏幕指针及点击命中.md": {
+      "role": "observe",
+      "sha256": "ff5a00fc5af8694b86182e84628ba7432ca0835444ac7c87ace281390fda8b94",
+      "size": 5198,
+      "normalized_sha256": "ff5a00fc5af8694b86182e84628ba7432ca0835444ac7c87ace281390fda8b94"
+    },
+    "docs/adr/ADR-092-多会话-每会话镜像环与控制台会话号.md": {
+      "role": "observe",
+      "sha256": "7b8039e77f6bda235eebd3d1ab741cccb3607f496d504d080c495b47d7451e3e",
+      "size": 7441,
+      "normalized_sha256": "7b8039e77f6bda235eebd3d1ab741cccb3607f496d504d080c495b47d7451e3e"
+    },
+    "docs/adr/ADR-093-终端外观对齐与局部重画及Ctrl+C行内中断.md": {
+      "role": "observe",
+      "sha256": "7aa05bb037377ec080190f22e26ed871dcf6c0e6f963c66da8a4ce3337f16258",
+      "size": 10114,
+      "normalized_sha256": "7aa05bb037377ec080190f22e26ed871dcf6c0e6f963c66da8a4ce3337f16258"
+    },
+    "docs/adr/ADR-094-终端视口化与裁剪-浮动窗口的前置一层.md": {
+      "role": "observe",
+      "sha256": "efc765b166f745e42afba6f6689af28a678cbdeaec9bde0e1bbf5c9f0e6a5c65",
+      "size": 2250,
+      "normalized_sha256": "efc765b166f745e42afba6f6689af28a678cbdeaec9bde0e1bbf5c9f0e6a5c65"
+    },
+    "docs/adr/ADR-095-浮动窗口-每扇只重画自己的矩形.md": {
+      "role": "observe",
+      "sha256": "f0171902659537cfa6a044ca42c8d79911f785ef8f5431b065f28b357d5fd3ea",
+      "size": 3426,
+      "normalized_sha256": "f0171902659537cfa6a044ca42c8d79911f785ef8f5431b065f28b357d5fd3ea"
+    },
+    "docs/adr/ADR-096-画面正文只放会话输出-日志退回串口.md": {
+      "role": "observe",
+      "sha256": "3f79270b0f18d288b6b7f97c07fd3fc762cd6a30a28197cd8b664413afa9deb5",
+      "size": 7076,
+      "normalized_sha256": "3f79270b0f18d288b6b7f97c07fd3fc762cd6a30a28197cd8b664413afa9deb5"
+    },
+    "docs/adr/ADR-097-停机改成显式动作-关会话不再等于init收工.md": {
+      "role": "observe",
+      "sha256": "7f77169d27551520f7d05062ca03424a05085831c2f05b0c0d01fc0b9fa38b05",
+      "size": 4329,
+      "normalized_sha256": "7f77169d27551520f7d05062ca03424a05085831c2f05b0c0d01fc0b9fa38b05"
+    },
+    "docs/adr/ADR-098-会话自己记账-每会话一张VA表与会话销毁.md": {
+      "role": "observe",
+      "sha256": "71eef956158902399e2ac8346ffef877d4b017d52588796a35a28e89555dd479",
+      "size": 8277,
+      "normalized_sha256": "71eef956158902399e2ac8346ffef877d4b017d52588796a35a28e89555dd479"
+    },
+    "docs/adr/ADR-099-浮窗拖动-按住态轮询与旧矩形并集还原.md": {
+      "role": "observe",
+      "sha256": "b18eff67e021e32f188f724d8b4813bd363d4afc219dceb2dafbcb0630cec4d7",
+      "size": 2733,
+      "normalized_sha256": "b18eff67e021e32f188f724d8b4813bd363d4afc219dceb2dafbcb0630cec4d7"
+    },
+    "docs/adr/ADR-100-标签条语义-hover与x可见性与未读圆点.md": {
+      "role": "observe",
+      "sha256": "6496f31572c4606d8a2b5551a300276b302ddf342bd20563705ac792a9b1bd6e",
+      "size": 2594,
+      "normalized_sha256": "6496f31572c4606d8a2b5551a300276b302ddf342bd20563705ac792a9b1bd6e"
+    },
+    "docs/adr/ADR-101-标签条下拉-会话在上动作在下.md": {
+      "role": "observe",
+      "sha256": "a7b687ef6690035ad48e2d6049f6bed30b81e1ef5945f121d62754bfe0c74fbb",
+      "size": 2062,
+      "normalized_sha256": "a7b687ef6690035ad48e2d6049f6bed30b81e1ef5945f121d62754bfe0c74fbb"
+    },
+    "docs/adr/ADR-102-面板键盘导航-UI键通道与指针仲裁.md": {
+      "role": "observe",
+      "sha256": "1e0c2003304a10513bfa381ba48cd75b54831f20004c8c464727e9d68dc9316c",
+      "size": 4344,
+      "normalized_sha256": "1e0c2003304a10513bfa381ba48cd75b54831f20004c8c464727e9d68dc9316c"
+    },
+    "docs/adr/ADR-103-标签条观感与下拉锚点-悬停改局部重画.md": {
+      "role": "observe",
+      "sha256": "ba6880686f73cf8a8b676642d15b3c8947a72e39df130db1dbe55015155df62b",
+      "size": 3276,
+      "normalized_sha256": "ba6880686f73cf8a8b676642d15b3c8947a72e39df130db1dbe55015155df62b"
+    },
+    "docs/adr/ADR-104-条上控制钮悬停色块-新增fbcon控制钮id.md": {
+      "role": "observe",
+      "sha256": "88628151517311d1c2e03ddce20df27b23bbcbc3c59c7f6eae545df4e9489f0d",
+      "size": 3119,
+      "normalized_sha256": "88628151517311d1c2e03ddce20df27b23bbcbc3c59c7f6eae545df4e9489f0d"
+    },
+    "docs/adr/ADR-105-设置页-运行期会话上限.md": {
+      "role": "observe",
+      "sha256": "7e530b071c2531f355e106b434484f4304579ff5e87c061f95e2a18f4ea8770d",
+      "size": 5300,
+      "normalized_sha256": "7e530b071c2531f355e106b434484f4304579ff5e87c061f95e2a18f4ea8770d"
+    },
+    "docs/adr/ADR-106-文件类系统调用号段与错误码扩展.md": {
+      "role": "observe",
+      "sha256": "bea3473854ecd6d264b69864fa9400e078d2de6ae8c8bb8fb65c3c16348b5838",
+      "size": 8626,
+      "normalized_sha256": "bea3473854ecd6d264b69864fa9400e078d2de6ae8c8bb8fb65c3c16348b5838"
+    },
+    "docs/adr/ADR-107-只读VFS第一刀-open授予句柄与单根单卷挂载.md": {
+      "role": "observe",
+      "sha256": "854f7710fd485c6ae3e9330be0f5c073661ba0506aa1aed1a24b879fbcd93a30",
+      "size": 11730,
+      "normalized_sha256": "854f7710fd485c6ae3e9330be0f5c073661ba0506aa1aed1a24b879fbcd93a30"
+    },
+    "docs/adr/ADR-108-FS-03文件ABI与VFS句柄对象.md": {
+      "role": "observe",
+      "sha256": "8b012a2004dd414b7053491603faae43eaec203e68885928787a6b72ac3b8280",
+      "size": 27490,
+      "normalized_sha256": "ba864a7e7aac85abee19c0500ab801c45a7b417e7d1eff0731470c6aac2baf96"
+    },
+    "docs/adr/ADR-109-多级真卷夹具与fs-open挂载根改口.md": {
+      "role": "observe",
+      "sha256": "d95994a4e64cacc4cdb0d53818fa22cbfc5057b2ddece4a665fe0a38be144bae",
+      "size": 10309,
+      "normalized_sha256": "d95994a4e64cacc4cdb0d53818fa22cbfc5057b2ddece4a665fe0a38be144bae"
+    },
+    "docs/adr/ADR-110-块设备请求层与virtio-blk第一刀.md": {
+      "role": "observe",
+      "sha256": "2ba743e77125ef58d6c784d0515aab06dca1b4acf9569ee1642bfd1abf0948b3",
+      "size": 7381,
+      "normalized_sha256": "2ba743e77125ef58d6c784d0515aab06dca1b4acf9569ee1642bfd1abf0948b3"
+    },
+    "docs/adr/ADR-111-写方向第一刀与可写卷.md": {
+      "role": "observe",
+      "sha256": "a58a1addc058b70a587575b7b4fb4f08edd3385f7b6e6eebd82a5284b9d83f24",
+      "size": 4342,
+      "normalized_sha256": "a58a1addc058b70a587575b7b4fb4f08edd3385f7b6e6eebd82a5284b9d83f24"
+    },
+    "docs/adr/ADR-112-virtio设备表化与第二台virtio-blk.md": {
+      "role": "observe",
+      "sha256": "8fc8aa4ec538091d1c5ff035b766aa9e446bb397b4fedf9c20e3ff6c18a7c458",
+      "size": 4361,
+      "normalized_sha256": "8fc8aa4ec538091d1c5ff035b766aa9e446bb397b4fedf9c20e3ff6c18a7c458"
+    },
+    "docs/adr/ADR-113-块设备身份与按盘分桶计数.md": {
+      "role": "observe",
+      "sha256": "dd3656bea35dd5fd2479029f48f819629749e922b1398a3d90309cfa93bc0327",
+      "size": 3477,
+      "normalized_sha256": "dd3656bea35dd5fd2479029f48f819629749e922b1398a3d90309cfa93bc0327"
+    },
+    "docs/adr/ADR-114-静态挂载表与路径前缀命名空间.md": {
+      "role": "observe",
+      "sha256": "3d162fd1780157e14272dfd87da64a5c71d2eb5c9dfb4147188decbaf4e81749",
+      "size": 3317,
+      "normalized_sha256": "3d162fd1780157e14272dfd87da64a5c71d2eb5c9dfb4147188decbaf4e81749"
+    },
+    "docs/adr/ADR-115-验签接启动的机制.md": {
+      "role": "observe",
+      "sha256": "b9f918dcd0572086d3fc1e39cf06f9bc059e3b5e8b69101bc7644c42f63cff03",
+      "size": 10903,
+      "normalized_sha256": "b9f918dcd0572086d3fc1e39cf06f9bc059e3b5e8b69101bc7644c42f63cff03"
+    },
+    "docs/adr/ADR-116-执行字节的绑定-16号比子AS里那几页.md": {
+      "role": "observe",
+      "sha256": "9fb37bdf36b859444230ef47f8103483a45cfdd86d4d3e0a5bdc0eca0c4aeda2",
+      "size": 6257
+    },
+    "docs/adr/ADR-117-覆盖未知按拒启.md": {
+      "role": "observe",
+      "sha256": "9eb07a8a4d994fe9e79c36a22d27329388d307c9b2ed5f41198c973d105b2e0b",
+      "size": 1853,
+      "normalized_sha256": "041a837d59fa1a8d54f8ac2e276b38f006378ec8d358e19399ba17b024302b79"
+    },
+    "docs/adr/ADR-118-创建删除截断-号段与语义.md": {
+      "role": "observe",
+      "sha256": "9a8de78c68a704e2cd82496210c81654984affa0e1760ec31bca402b81c80741",
+      "size": 5682,
+      "normalized_sha256": "d2c03ff4db574894288dde009dcac7c33054e497b6b232521097a6a6ae8a2403"
+    },
+    "docs/adr/ADR-130-A2用户运行时argv区与标准句柄与退出码语义.md": {
+      "role": "observe",
+      "sha256": "8a841f634fbbbdf77123aa611421b7c2a9bd6ae1091a6dcfb27cc75309c9a756",
+      "size": 4602,
+      "normalized_sha256": "8a841f634fbbbdf77123aa611421b7c2a9bd6ae1091a6dcfb27cc75309c9a756"
+    },
+    "docs/adr/ADR-131-A3用户态装载器与外部ELF启动.md": {
+      "role": "observe",
+      "sha256": "52899139cd4619f75ab45ac33b4e20187a610a051fe594aa0a1488da22c3f226",
+      "size": 16280,
+      "normalized_sha256": "3209388feefb3a189187e9ea9d560953e6411abcd56cacc28b404af6ddf1523a"
+    },
+    "docs/adr/ADR-132-A4进程观测API.md": {
+      "role": "observe",
+      "sha256": "5f300f30596d2e42724d75dcb9d8290316154e8bcb2637c71257b33df5bdc6ad",
+      "size": 8535,
+      "normalized_sha256": "d73d2840254ef6d34fdd95217fb99db44a3c0dc08a0456959a9de408d3892524"
+    },
+    "docs/adr/ADR-133-A4的top纯用户态定期刷新进程表.md": {
+      "role": "observe",
+      "sha256": "f3eb9be6a523e6d1bbf09ec68f14d16eb7b50c594d3c8c01c8fed5f950af9a16",
+      "size": 10262,
+      "normalized_sha256": "f3eb9be6a523e6d1bbf09ec68f14d16eb7b50c594d3c8c01c8fed5f950af9a16"
+    },
+    "docs/adr/ADR-134-kill命令与句柄即capability.md": {
+      "role": "observe",
+      "sha256": "775c9365e5930af7219d741814ae0f5b1097887ccf501f860b9356b40ee63a56",
+      "size": 13827,
+      "normalized_sha256": "775c9365e5930af7219d741814ae0f5b1097887ccf501f860b9356b40ee63a56"
+    },
+    "docs/adr/ADR-135-B4日志出口与30号SYS_LOG_READ.md": {
+      "role": "observe",
+      "sha256": "b3d9d66b259ab98afbe227f9d0db6f4923386d73a6875df4dad82294e4200f52",
+      "size": 9732,
+      "normalized_sha256": "b3d9d66b259ab98afbe227f9d0db6f4923386d73a6875df4dad82294e4200f52"
+    },
+    "docs/adr/ADR-136-B1设备清单出口与31号SYS_PCI_ENUM.md": {
+      "role": "observe",
+      "sha256": "e0bd0b00188a4ab75ef182a1fef741f344f8367e25c858c3f4ec4cf3e727a09f",
+      "size": 7059,
+      "normalized_sha256": "e0bd0b00188a4ab75ef182a1fef741f344f8367e25c858c3f4ec4cf3e727a09f"
+    },
+    "docs/adr/ADR-137-B3时间出口与32号SYS_CLOCK_UPTIME.md": {
+      "role": "observe",
+      "sha256": "e6a5143eb49c24701c9c2548bb7a4b05e2ed14e50d271bd95354d799a7c82753",
+      "size": 7131,
+      "normalized_sha256": "e6a5143eb49c24701c9c2548bb7a4b05e2ed14e50d271bd95354d799a7c82753"
+    },
+    "docs/adr/ADR-138-C2包清单与manifest门禁.md": {
+      "role": "observe",
+      "sha256": "79372535e30fc47e928dc1d4b04188344c9dd1fb8d1075a5af38a5c56598214f",
+      "size": 3997,
+      "normalized_sha256": "79372535e30fc47e928dc1d4b04188344c9dd1fb8d1075a5af38a5c56598214f"
+    },
+    "docs/adr/ADR-139-B2第一刀ARP往返.md": {
+      "role": "observe",
+      "sha256": "87421c40e5ccc5b1e8547c0987fe1fd654a323f675eb488bd5b8b13206678ca6",
+      "size": 4427,
+      "normalized_sha256": "87421c40e5ccc5b1e8547c0987fe1fd654a323f675eb488bd5b8b13206678ca6"
+    },
+    "docs/adr/ADR-140-B2第二刀ICMPping闭环.md": {
+      "role": "observe",
+      "sha256": "d351e4488f3d6ebae9c8ad66717458174c17efaf7273eb2841c28d8407b27ded",
+      "size": 3654,
+      "normalized_sha256": "d351e4488f3d6ebae9c8ad66717458174c17efaf7273eb2841c28d8407b27ded"
+    },
+    "docs/adr/ADR-141-B2第三刀UDP发送与错误回执.md": {
+      "role": "observe",
+      "sha256": "5b10c2bbf5aba70085f4cafd17560753b0eb60605ea29e08e95ecf6aa4404e5c",
+      "size": 4600,
+      "normalized_sha256": "5b10c2bbf5aba70085f4cafd17560753b0eb60605ea29e08e95ecf6aa4404e5c"
+    },
+    "docs/adr/ADR-142-B2第四刀ARP缓存.md": {
+      "role": "observe",
+      "sha256": "d0a3ede2bb5f9299b225803d2fe5a44e52ffb5763e7680b395f77e58df143767",
+      "size": 4526,
+      "normalized_sha256": "d0a3ede2bb5f9299b225803d2fe5a44e52ffb5763e7680b395f77e58df143767"
+    },
+    "docs/adr/ADR-143-B2第五刀网卡三原语与shell ping.md": {
+      "role": "observe",
+      "sha256": "b26933cf8a97b5de8eb831c8fc257ce1598df08e42fa454ff9cd02a955600e39",
+      "size": 5639,
+      "normalized_sha256": "b26933cf8a97b5de8eb831c8fc257ce1598df08e42fa454ff9cd02a955600e39"
+    },
+    "docs/adr/ADR-144-B2第六刀ip link与ip addr.md": {
+      "role": "observe",
+      "sha256": "5d135e59f37da8b4c8f9090087bca140c5eed36d23b48efc4ed2c4a4a3aa403e",
+      "size": 4560,
+      "normalized_sha256": "5d135e59f37da8b4c8f9090087bca140c5eed36d23b48efc4ed2c4a4a3aa403e"
+    },
+    "docs/adr/ADR-145-ip neigh与ARP表只读出口.md": {
+      "role": "observe",
+      "sha256": "b82985577ed4dc4a478922c4232e7903b0e0f89de985ab81e661f3cdef77c0ff",
+      "size": 5270,
+      "normalized_sha256": "b82985577ed4dc4a478922c4232e7903b0e0f89de985ab81e661f3cdef77c0ff"
+    },
+    "docs/adr/ADR-146-ARP表被动学习.md": {
+      "role": "observe",
+      "sha256": "515f80d34e2d219a405cfd241c3978fb009016cabb561c6841a3b7d651aea4ee",
+      "size": 5081,
+      "normalized_sha256": "515f80d34e2d219a405cfd241c3978fb009016cabb561c6841a3b7d651aea4ee"
+    },
+    "docs/adr/ADR-147-B2收官路由判据与ip route.md": {
+      "role": "observe",
+      "sha256": "d3ad423f697a5c2d7e442cb4d8584e588a488dddabd5865b9c00248f157a45d7",
+      "size": 5751,
+      "normalized_sha256": "d3ad423f697a5c2d7e442cb4d8584e588a488dddabd5865b9c00248f157a45d7"
+    },
+    "docs/adr/ADR-148-掩码进35号读数块.md": {
+      "role": "observe",
+      "sha256": "5a20c8a36da11b05efbf0c476825afc6788a199e94b4c327363cb9624ed02127",
+      "size": 4149,
+      "normalized_sha256": "5a20c8a36da11b05efbf0c476825afc6788a199e94b4c327363cb9624ed02127"
+    },
+    "docs/adr/ADR-149-B1验收句lsdev与devctl.md": {
+      "role": "observe",
+      "sha256": "cd1d00a13c2b9ac4c667069aa2c8c87d9f605aa6972ac2fc4dcd55d1b777188a",
+      "size": 5331,
+      "normalized_sha256": "cd1d00a13c2b9ac4c667069aa2c8c87d9f605aa6972ac2fc4dcd55d1b777188a"
+    },
+    "docs/adr/ADR-150-C1第一片凭据对象与whoami-id.md": {
+      "role": "observe",
+      "sha256": "5bf25fa1378841d32f90f590c85f7a0d7a1b16a3e3af8ca9792cf2b94a7eab70",
+      "size": 7014,
+      "normalized_sha256": "5bf25fa1378841d32f90f590c85f7a0d7a1b16a3e3af8ca9792cf2b94a7eab70"
+    },
+    "docs/adr/ADR-151-C1第二片授权闸门与低权限凭据.md": {
+      "role": "observe",
+      "sha256": "4f27c48d1c88abcbcab2f559e5f0161e17a0643e72a88d4eda3b9952987aa23b",
+      "size": 5313,
+      "normalized_sha256": "4f27c48d1c88abcbcab2f559e5f0161e17a0643e72a88d4eda3b9952987aa23b"
+    },
+    "docs/adr/ADR-152-C3第一片分区只读查询.md": {
+      "role": "observe",
+      "sha256": "bef525b223280de77e4a8e538c3804f306bede5cc1edbcc066997745dcd8c900",
+      "size": 6107,
+      "normalized_sha256": "bef525b223280de77e4a8e538c3804f306bede5cc1edbcc066997745dcd8c900"
+    },
+    "docs/adr/ADR-153-D3第一片帧缓冲文本出口.md": {
+      "role": "observe",
+      "sha256": "c9d7da040c3bf8a0beb6d28c735c7bd29153aaf7772204d0e55c1e89c00aec97",
+      "size": 5115,
+      "normalized_sha256": "c9d7da040c3bf8a0beb6d28c735c7bd29153aaf7772204d0e55c1e89c00aec97"
+    },
+    "docs/adr/ADR-154-D4应用SDK样板.md": {
+      "role": "observe",
+      "sha256": "d6fafe699619c4b81f788e45579640ce64847e9c9c5b283314bae281c0ab50f2",
+      "size": 6916,
+      "normalized_sha256": "d6fafe699619c4b81f788e45579640ce64847e9c9c5b283314bae281c0ab50f2"
+    },
+    "docs/adr/ADR-155-A3第一片管道与grep.md": {
+      "role": "observe",
+      "sha256": "33ca6b44d69c99ca90d6be21dd496086bd56cb0d8b9bd005b622d4821bd92c36",
+      "size": 6046,
+      "normalized_sha256": "33ca6b44d69c99ca90d6be21dd496086bd56cb0d8b9bd005b622d4821bd92c36"
+    },
+    "docs/adr/ADR-156-§10.2四个只读命令.md": {
+      "role": "observe",
+      "sha256": "a865bf2d774057ecf89b3f88bb826ca94ea8e0737279aecb1c666c56ee605ffb",
+      "size": 5377,
+      "normalized_sha256": "a865bf2d774057ecf89b3f88bb826ca94ea8e0737279aecb1c666c56ee605ffb"
+    },
+    "docs/adr/ADR-157-§10.3三条系统命令.md": {
+      "role": "observe",
+      "sha256": "e112e84f936d4d7c8547576f5faf132a9f5baf6a7c76cdb15988ceed200a2a54",
+      "size": 5527,
+      "normalized_sha256": "e112e84f936d4d7c8547576f5faf132a9f5baf6a7c76cdb15988ceed200a2a54"
+    },
+    "docs/adr/ADR-158-§10.4第三条nslookup与DNS解析出口.md": {
+      "role": "observe",
+      "sha256": "2b4054df36b5cd949eb04c0d053a74e2bb640860063ef3caa63b5b6d843ba2b3",
+      "size": 6408,
+      "normalized_sha256": "2b4054df36b5cd949eb04c0d053a74e2bb640860063ef3caa63b5b6d843ba2b3"
+    },
+    "docs/adr/ADR-159-D4判据打通.md": {
+      "role": "observe",
+      "sha256": "d66030990bdede7f8ec135a15421269528337e8f8b6ce04534fa8eafc5306163",
+      "size": 4994,
+      "normalized_sha256": "d66030990bdede7f8ec135a15421269528337e8f8b6ce04534fa8eafc5306163"
+    },
+    "docs/adr/ADR-160-§10.2写方向第一片write.md": {
+      "role": "observe",
+      "sha256": "1c2d8c553b9b865a9be497a326942d57cf8681555895295691564e6ed63a7a2e",
+      "size": 5003,
+      "normalized_sha256": "1c2d8c553b9b865a9be497a326942d57cf8681555895295691564e6ed63a7a2e"
+    },
+    "docs/adr/ADR-161-内核源码按逻辑模块分域建子目录且物理路径与逻辑模块名解耦.md": {
+      "role": "observe",
+      "sha256": "2cb591100f089f583d24ac91e21c9b51ed9f3c201c22e52abb754eef2c378ad2",
+      "size": 11099,
+      "normalized_sha256": "2cb591100f089f583d24ac91e21c9b51ed9f3c201c22e52abb754eef2c378ad2"
+    },
+    "docs/adr/ADR-162-推翻裁决4A把USB-HID重新纳入范围.md": {
+      "role": "observe",
+      "sha256": "ec4eb229f0f7433eb2464d61b310ca0b207029cda5171a4a4a05a4603b7e2707",
+      "size": 6405,
+      "normalized_sha256": "ec4eb229f0f7433eb2464d61b310ca0b207029cda5171a4a4a05a4603b7e2707"
+    },
+    "docs/adr/ADR-163-推翻裁决5A把HDA音频重新纳入范围.md": {
+      "role": "observe",
+      "sha256": "f4d00d1b94d74c93e3d4ededb703f18b268606c4b8b6fe61770de5744eaf734d",
+      "size": 4398,
+      "normalized_sha256": "f4d00d1b94d74c93e3d4ededb703f18b268606c4b8b6fe61770de5744eaf734d"
+    },
+    "docs/adr/ADR-164-推翻裁决6A把安装器硬件矩阵与发行重新纳入范围.md": {
+      "role": "observe",
+      "sha256": "323d254bda07ed2e7e57927f87f1a57b35c7f6022ae05d52b51eff3996b5c476",
+      "size": 5772,
+      "normalized_sha256": "323d254bda07ed2e7e57927f87f1a57b35c7f6022ae05d52b51eff3996b5c476"
+    },
+    "docs/adr/ADR-165-容量与编号四处变更.md": {
+      "role": "observe",
+      "sha256": "05dcaf5003c4088f35a13bbae317ef3a5ba07a21b95e5209860eff03a4ad6cc3",
+      "size": 7856,
+      "normalized_sha256": "05dcaf5003c4088f35a13bbae317ef3a5ba07a21b95e5209860eff03a4ad6cc3"
+    },
+    "docs/adr/ADR-166-拆出network逻辑模块与framebuffer按位宽分档.md": {
+      "role": "observe",
+      "sha256": "dddbdfdea6ceca262f145b2a244639fd554a0ec2602ca0ca378c178f97aa81fb",
+      "size": 7797,
+      "normalized_sha256": "dddbdfdea6ceca262f145b2a244639fd554a0ec2602ca0ca378c178f97aa81fb"
+    },
+    "docs/adr/ADR-167-ADR165与166的实施落地及崩溃记录判据改取样链.md": {
+      "role": "observe",
+      "sha256": "9d842e3b4b8916a73c27d8c588f64c5dbafcd8c4d2436bc5bb236db61a93d75b",
+      "size": 8843,
+      "normalized_sha256": "9d842e3b4b8916a73c27d8c588f64c5dbafcd8c4d2436bc5bb236db61a93d75b"
+    },
+    "docs/adr/ADR-168-network协议层搬迁落地与network进环A的取舍.md": {
+      "role": "observe",
+      "sha256": "626aeded1f5630f4ed698d10a1ddd7e635669e2dd439015a76e733119294f534",
+      "size": 5958,
+      "normalized_sha256": "626aeded1f5630f4ed698d10a1ddd7e635669e2dd439015a76e733119294f534"
+    },
+    "docs/adr/ADR-169-NVMe驱动落地到识别容量与数据通路未通.md": {
+      "role": "observe",
+      "sha256": "91e3550ffd47695f615ea9d2cf92bf9cd796b70a6e0cc4c5aac10d926c070e4e",
+      "size": 7720,
+      "normalized_sha256": "91e3550ffd47695f615ea9d2cf92bf9cd796b70a6e0cc4c5aac10d926c070e4e"
+    },
+    "docs/adr/ADR-170-显示与输入的第二台仪器QMP截屏与按键注入进链.md": {
+      "role": "observe",
+      "sha256": "f17fe5aa4d7d74a711bb5a7648650b1ba736a52e7784d381b35fd5168ffe9438",
+      "size": 6126,
+      "normalized_sha256": "f17fe5aa4d7d74a711bb5a7648650b1ba736a52e7784d381b35fd5168ffe9438"
+    },
+    "docs/adr/ADR-171-network协议拆成7个文件并出环.md": {
+      "role": "observe",
+      "sha256": "fca63d0b3560eb332414687eab1d3d56490989a1beeef8d84da11a237ce7b8a2",
+      "size": 5759,
+      "normalized_sha256": "fca63d0b3560eb332414687eab1d3d56490989a1beeef8d84da11a237ce7b8a2"
+    },
+    "docs/adr/ADR-172-NVMe上挂真FAT32卷NvmeDisk接进Block路径.md": {
+      "role": "observe",
+      "sha256": "96adfef3aac2df318d13936247af453685f138409b479b6accd4c13a3f7ecac1",
+      "size": 5600,
+      "normalized_sha256": "96adfef3aac2df318d13936247af453685f138409b479b6accd4c13a3f7ecac1"
+    },
+    "docs/adr/ADR-173-长链抖动归因q2阶段门兜底与判定预算只差一倍.md": {
+      "role": "observe",
+      "sha256": "80ea0f84c4445d9a15187d96e07c4afc8852fa3758efa662e3fc0d11babf39cb",
+      "size": 4748,
+      "normalized_sha256": "80ea0f84c4445d9a15187d96e07c4afc8852fa3758efa662e3fc0d11babf39cb"
+    },
+    "docs/adr/ADR-174-句柄判据从全系统归零改成回到用例基线.md": {
+      "role": "observe",
+      "sha256": "2f403621b1266714e8678ed5e72e93696e22db20cdb7e1c7707e18dffa5642fd",
+      "size": 8001,
+      "normalized_sha256": "2f403621b1266714e8678ed5e72e93696e22db20cdb7e1c7707e18dffa5642fd"
+    },
+    "docs/adr/ADR-175-跨AS读用户内存走物理地址.md": {
+      "role": "observe",
+      "sha256": "501daa4699c43f75b6f62eb9b84b4e99c81be68ef367b539bc20f8a0fbc43123",
+      "size": 21202,
+      "normalized_sha256": "501daa4699c43f75b6f62eb9b84b4e99c81be68ef367b539bc20f8a0fbc43123"
+    },
+    "docs/adr/ADR-176-ENOSYS错误码与已声明未实现系统调用.md": {
+      "role": "observe",
+      "sha256": "2483b86e31e40a3e42689c8f67885e70575a6ec97438d64a5d1deee9f2996153",
+      "size": 15198,
+      "normalized_sha256": "a1213c18c6d7137d768649aea88ed9895e723c9175ba015eafd52a19ef3f9d3f"
+    },
+    "docs/adr/ADR-177-syscall号段64-71与ADR-118号位勘误.md": {
+      "role": "observe",
+      "sha256": "eecfc5d1bb9bce8a628ee2721a2077b1766bb02dfa24980642c0715a5f923654",
+      "size": 15736,
+      "normalized_sha256": "7c4d24c240013237158228bf2273812485a5ba982857ceb40e6f29e755d73eb3"
+    },
+    "docs/adr/ADR-template.md": {
+      "role": "observe",
+      "sha256": "28c63456114f727d717d6ce9e1f6cf5f517fd5ac54ce16fb827f094b885d07e6",
+      "size": 1602,
+      "normalized_sha256": "7eb48e9ebc976fa26fcf2b6f5a2f3ec69fb39068bd6b0112dcd99afef8cdddcb"
+    },
+    "docs/architecture/crates.toml": {
+      "role": "observe",
+      "sha256": "3843c711683c90e4555c1c74721ae237edeefc572cc0caadee8f7432813c7a13",
+      "size": 4795,
+      "normalized_sha256": "3843c711683c90e4555c1c74721ae237edeefc572cc0caadee8f7432813c7a13"
+    },
+    "docs/architecture/lock-order.md": {
+      "role": "observe",
+      "sha256": "9b5d96de167ea159322d9eb992e39805a5aab5a964832183dd59439bed0edf67",
+      "size": 20435,
+      "normalized_sha256": "9b5d96de167ea159322d9eb992e39805a5aab5a964832183dd59439bed0edf67"
+    },
+    "docs/architecture/module-dependencies.md": {
+      "role": "observe",
+      "sha256": "c7fcfa738282e24c3a25d7327c5edc96c4c9c902b627266145023b35ee929421",
+      "size": 11605,
+      "normalized_sha256": "c7fcfa738282e24c3a25d7327c5edc96c4c9c902b627266145023b35ee929421"
+    },
+    "docs/architecture/module-interfaces.toml": {
+      "role": "observe",
+      "sha256": "7869e8695651f0ef158a7f434bb42c910ce90cbe6ccf17f24646b17e1f8c38a6",
+      "size": 38263,
+      "normalized_sha256": "7869e8695651f0ef158a7f434bb42c910ce90cbe6ccf17f24646b17e1f8c38a6"
+    },
+    "docs/architecture/vectors.toml": {
+      "role": "observe",
+      "sha256": "2e34312cd8c48668c4b4751ee2f499958561460ddf7f27f045142c0e09d8ae20",
+      "size": 4032,
+      "normalized_sha256": "2e34312cd8c48668c4b4751ee2f499958561460ddf7f27f045142c0e09d8ae20"
+    },
+    "docs/design/A2-用户运行时与外部命令执行-内核侧设计草案.md": {
+      "role": "observe",
+      "sha256": "b7f000bf146853ea952969c00fdd5feb95243814e07a09c0598af6c4233c154a",
+      "size": 22913,
+      "normalized_sha256": "b7f000bf146853ea952969c00fdd5feb95243814e07a09c0598af6c4233c154a"
+    },
+    "docs/design/A4-进程观测API-草案.md": {
+      "role": "observe",
+      "sha256": "dab68a604947dad2ef5afceb1b08a58858465a10c923be90db4519ced08714e1",
+      "size": 8709,
+      "normalized_sha256": "dfeab094d12a0b139c8aa7ad4b5cc0eaaa92332d94de38d491c148580265397e"
+    },
+    "docs/design/Aurora OS 文件系统与 Shell 命令体系建设设计文档 V1.0.md": {
+      "role": "observe",
+      "sha256": "e2a8cf9ecf17f503fb612d3b21ec9d87d4d13e529c8d293c6d6bde21b7fc4f8a",
+      "size": 36927,
+      "normalized_sha256": "e2a8cf9ecf17f503fb612d3b21ec9d87d4d13e529c8d293c6d6bde21b7fc4f8a"
+    },
+    "docs/design/FS-设计补充-V1.1-基线校正与实施约束.md": {
+      "role": "observe",
+      "sha256": "2b732882834a698548dda2ace49a3eca4639169f9d2156bbbe404242ca152528",
+      "size": 24648,
+      "normalized_sha256": "2b732882834a698548dda2ace49a3eca4639169f9d2156bbbe404242ca152528"
+    },
+    "docs/design/user-ELF跨树字节稳定性-修复方案.md": {
+      "role": "observe",
+      "sha256": "fb7a15b4d366361efd4d938077c740dec2f67c6a038a5733f922863a4d9d8947",
+      "size": 4936,
+      "normalized_sha256": "fb7a15b4d366361efd4d938077c740dec2f67c6a038a5733f922863a4d9d8947"
+    },
+    "docs/design/user-abi-capability.md": {
+      "role": "observe",
+      "sha256": "1a9023445e0409495bfb63ebd1e939e2ffaeeb4665ab442c7e50e8614af406e8",
+      "size": 55166,
+      "normalized_sha256": "1a9023445e0409495bfb63ebd1e939e2ffaeeb4665ab442c7e50e8614af406e8"
+    },
+    "docs/design/w3-立项-依赖图与切片计划.md": {
+      "role": "observe",
+      "sha256": "5f5d31c2e6b12512a75c46f90f0da52a52826fe43a282dfcce32c39768a143eb",
+      "size": 30287,
+      "normalized_sha256": "5f5d31c2e6b12512a75c46f90f0da52a52826fe43a282dfcce32c39768a143eb"
+    },
+    "docs/design/w4-立项-GPT-FAT16与验签进启动路径.md": {
+      "role": "observe",
+      "sha256": "ec631e791f7fd87d0e4d862af9f8cda49baa26ae1312ec3393300e983d7e3398",
+      "size": 24335,
+      "normalized_sha256": "ec631e791f7fd87d0e4d862af9f8cda49baa26ae1312ec3393300e983d7e3398"
+    },
+    "docs/design/完整化路线-M0至M9-依赖重排与四裁决.md": {
+      "role": "observe",
+      "sha256": "4a53cacd752e624470d9119aff5aa3d86007bb3e20d16ccb9cf8c4cafd0b3c7f",
+      "size": 14097,
+      "normalized_sha256": "4a53cacd752e624470d9119aff5aa3d86007bb3e20d16ccb9cf8c4cafd0b3c7f"
+    },
+    "docs/hardware/Aurora-OS-硬件驱动体系总设计-V1.0.md": {
+      "role": "observe",
+      "sha256": "28c761e7e5b103f475c3a924692d4479fc96bebec1d96d7eb81fc892f18f3c42",
+      "size": 69803,
+      "normalized_sha256": "28c761e7e5b103f475c3a924692d4479fc96bebec1d96d7eb81fc892f18f3c42"
+    },
+    "docs/hardware/architecture/MMIO与DMA资源管理设计.md": {
+      "role": "observe",
+      "sha256": "932904149610f9575a4a6f3e6756ffab98ac5f3d156101a0fea6dd99550ad086",
+      "size": 8119,
+      "normalized_sha256": "932904149610f9575a4a6f3e6756ffab98ac5f3d156101a0fea6dd99550ad086"
+    },
+    "docs/hardware/architecture/硬件中断管理设计.md": {
+      "role": "observe",
+      "sha256": "617f6689b91b016c4b511954641d6569a9f12c4948caf19b3dcb8972cca5b165",
+      "size": 6873,
+      "normalized_sha256": "617f6689b91b016c4b511954641d6569a9f12c4948caf19b3dcb8972cca5b165"
+    },
+    "docs/hardware/architecture/统一设备模型设计.md": {
+      "role": "observe",
+      "sha256": "7fd4a5537b3e0af308c160764919bca2dd16072c34b054781fcc4c326cbd6cd0",
+      "size": 8765,
+      "normalized_sha256": "7fd4a5537b3e0af308c160764919bca2dd16072c34b054781fcc4c326cbd6cd0"
+    },
+    "docs/hardware/architecture/驱动故障隔离设计.md": {
+      "role": "observe",
+      "sha256": "a2d798ed1758dc2cff392fed808ac22d78a90ebfe16abb441b62b6c215870681",
+      "size": 7051,
+      "normalized_sha256": "a2d798ed1758dc2cff392fed808ac22d78a90ebfe16abb441b62b6c215870681"
+    },
+    "docs/hardware/architecture/驱动生命周期设计.md": {
+      "role": "observe",
+      "sha256": "691920f76df18729bcdd898b95e384c5336dd90e5230adac4ddc679cc4c5f787",
+      "size": 6989,
+      "normalized_sha256": "691920f76df18729bcdd898b95e384c5336dd90e5230adac4ddc679cc4c5f787"
+    },
+    "docs/hardware/bringup.md": {
+      "role": "observe",
+      "sha256": "abb3ea491d549dfdf83f1686b933fe5561bb816b6881c5e6bd87172200093d04",
+      "size": 14793,
+      "normalized_sha256": "abb3ea491d549dfdf83f1686b933fe5561bb816b6881c5e6bd87172200093d04"
+    },
+    "docs/hardware/display/Framebuffer设计.md": {
+      "role": "observe",
+      "sha256": "cd329bf48875afbe6dfb5e3a54ae082c3f62913fc0487275d67bcbb72f0bbcbc",
+      "size": 8438,
+      "normalized_sha256": "cd329bf48875afbe6dfb5e3a54ae082c3f62913fc0487275d67bcbb72f0bbcbc"
+    },
+    "docs/hardware/display/VirtIO-GPU驱动设计.md": {
+      "role": "observe",
+      "sha256": "9f178031b3624a6b80395825c3239a738454623f62cb0b8eb8fa61f673c7185d",
+      "size": 9420,
+      "normalized_sha256": "9f178031b3624a6b80395825c3239a738454623f62cb0b8eb8fa61f673c7185d"
+    },
+    "docs/hardware/display/显示设备管理设计.md": {
+      "role": "observe",
+      "sha256": "cb55b3a8ff7aad27dbba9b5e669429f31b3fd624aa818911ef86e1aaa9dba2a8",
+      "size": 7562,
+      "normalized_sha256": "cb55b3a8ff7aad27dbba9b5e669429f31b3fd624aa818911ef86e1aaa9dba2a8"
+    },
+    "docs/hardware/input/USB-HID设计.md": {
+      "role": "observe",
+      "sha256": "c832daab797cd022048b187e8cb5afb794a07d14f708cb2552d8de25b658faff",
+      "size": 7034,
+      "normalized_sha256": "c832daab797cd022048b187e8cb5afb794a07d14f708cb2552d8de25b658faff"
+    },
+    "docs/hardware/input/键盘驱动设计.md": {
+      "role": "observe",
+      "sha256": "fe5548d4c8b0e334ef0abf6e2d5b9674e12a4ae918842ae9edb5ebfb4dc59def",
+      "size": 8057,
+      "normalized_sha256": "fe5548d4c8b0e334ef0abf6e2d5b9674e12a4ae918842ae9edb5ebfb4dc59def"
+    },
+    "docs/hardware/input/鼠标驱动设计.md": {
+      "role": "observe",
+      "sha256": "dee2c982602e03b0b82609bdf23af4b654426d9e33aaae40e6ed97fe52e61ba4",
+      "size": 7505,
+      "normalized_sha256": "dee2c982602e03b0b82609bdf23af4b654426d9e33aaae40e6ed97fe52e61ba4"
+    },
+    "docs/hardware/network/VirtIO-Net设计.md": {
+      "role": "observe",
+      "sha256": "d97e40237ef33db0987eb01a68e16e3f4e44201566418cc181b8df83f1e410a2",
+      "size": 5997,
+      "normalized_sha256": "d97e40237ef33db0987eb01a68e16e3f4e44201566418cc181b8df83f1e410a2"
+    },
+    "docs/hardware/network/物理网卡驱动设计.md": {
+      "role": "observe",
+      "sha256": "f34dac9c4ad99cb7876eb639b37c6f80e41e69490c1503bf1e8af508781805db",
+      "size": 7720,
+      "normalized_sha256": "f34dac9c4ad99cb7876eb639b37c6f80e41e69490c1503bf1e8af508781805db"
+    },
+    "docs/hardware/network/网卡驱动设计.md": {
+      "role": "observe",
+      "sha256": "554f858eb921ee9cc55bfaea3186dfd16ae1a554d40a4dbb45be13b8bba452cf",
+      "size": 8721,
+      "normalized_sha256": "554f858eb921ee9cc55bfaea3186dfd16ae1a554d40a4dbb45be13b8bba452cf"
+    },
+    "docs/hardware/storage/NVMe驱动设计.md": {
+      "role": "observe",
+      "sha256": "0d9dd0447a7e3de9080aa1953e37bec93adf442adb52694d4e9e14331a13afc7",
+      "size": 8743,
+      "normalized_sha256": "0d9dd0447a7e3de9080aa1953e37bec93adf442adb52694d4e9e14331a13afc7"
+    },
+    "docs/hardware/testing/QEMU硬件测试规范.md": {
+      "role": "observe",
+      "sha256": "aef08b7cbade1971b5cec289a9911ce5903280fcbaacfd58ec9406133f88d70a",
+      "size": 10027,
+      "normalized_sha256": "aef08b7cbade1971b5cec289a9911ce5903280fcbaacfd58ec9406133f88d70a"
+    },
+    "docs/hardware/testing/真机测试规范.md": {
+      "role": "observe",
+      "sha256": "2691e18dfe6c3b6831ceba95e136e995d94f487777d01ce36cdf5cfe7d8f91d7",
+      "size": 7695,
+      "normalized_sha256": "2691e18dfe6c3b6831ceba95e136e995d94f487777d01ce36cdf5cfe7d8f91d7"
+    },
+    "docs/hardware/testing/硬件兼容性矩阵.md": {
+      "role": "observe",
+      "sha256": "9466a62a35968e85868e3a37386e6da7abccaec189f00f0927cc3a86d41103c9",
+      "size": 8155,
+      "normalized_sha256": "9466a62a35968e85868e3a37386e6da7abccaec189f00f0927cc3a86d41103c9"
+    },
+    "docs/pkg/manifest.json": {
+      "role": "observe",
+      "sha256": "8c17773f823f3f9dee79a68c3fd088d370652bc1ae8d83919598ee8026abf1a3",
+      "size": 387,
+      "normalized_sha256": "67ec23b70581d295bbc29d151b7b86cb8656cf8588aae81c4ccc680feb6c0300"
+    },
+    "docs/release/sbom.json": {
+      "role": "observe",
+      "sha256": "eebe9181b9b38866b64ba737432ca9399d3ad398cfec2631cbf3c24f089e7d06",
+      "size": 1974,
+      "normalized_sha256": "4bcce84276b0c857fce95649fb3d6b7aeb2e81588990d7c509dd6b4e99a3aa6f"
+    },
+    "docs/security/unsafe-census.md": {
+      "role": "observe",
+      "sha256": "7d7fac5d3e25acc3ef6b837bc252332708c75bfad94187e0bae6f0876af4b4f8",
+      "size": 61734,
+      "normalized_sha256": "7d7fac5d3e25acc3ef6b837bc252332708c75bfad94187e0bae6f0876af4b4f8"
+    },
+    "docs/security/unsafe-whitelist.toml": {
+      "role": "observe",
+      "sha256": "919ee64c24e355c9f4a8ba3d8d3ad98fd6eb6936b8e069325a514e373a90e3ce",
+      "size": 14343,
+      "normalized_sha256": "919ee64c24e355c9f4a8ba3d8d3ad98fd6eb6936b8e069325a514e373a90e3ce"
+    },
+    "docs/testing/baselines/2026-11-04T16-11-04Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "ea3c8d5082b45ee865eaea8fd2cf90cb3dcc732e4d2e4c99dc85ea97f41a2e97",
+      "size": 490,
+      "normalized_sha256": "ed3b1aa4b5b430cbd93cc171528c5f97f906fe544ec6057f66b02503375ca836"
+    },
+    "docs/testing/baselines/2026-11-04T16-28-54Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "c981348da2badfca7d94eed07b04e71a6f20d3003cef38194adc9c27e923c393",
+      "size": 489,
+      "normalized_sha256": "7a7f4751c656b2077bbd07a41a51e4365c975c7b592170d46d7a6b221f80cb70"
+    },
+    "docs/testing/baselines/2026-11-04T16-30-07Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "0540375c35f4d788ad5484ed507765184af07a7f73bd23ccff96151bce7abca8",
+      "size": 637,
+      "normalized_sha256": "096dad42e1a1555d1d5c0ef1131a41cfb822d83b7b026355e03dc423fc25a5ae"
+    },
+    "docs/testing/baselines/2026-11-04T17-27-19Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "da5690fa0ed9cd91982dcfe3cd763157586634565e7110972a00b3991e46ec63",
+      "size": 636,
+      "normalized_sha256": "eb78d711eb2169ad617e5a24f3c937a0381cab7ff59ff80a2250399613a2be88"
+    },
+    "docs/testing/baselines/2026-11-04T18-41-04Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "d6554c007340e05995ac4658001200cc2ed315a37d6a40628c5ab34c68b845c0",
+      "size": 960,
+      "normalized_sha256": "1f09604a0b88b224eafbd7661659a9b0d7cb654fcd4e954801732e9387a05d8e"
+    },
+    "docs/testing/baselines/2026-11-04T18-41-31Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "f5ae2c32df9279dd1d853f9f44ee3e9615b2100212dd14b83f3f8c6ca7bcf9fc",
+      "size": 960,
+      "normalized_sha256": "ed31eaf808701f61b6ec0dcb8c5e8756b21414e6f5fc8c7cc4307696787380d9"
+    },
+    "docs/testing/baselines/2026-11-04T18-42-09Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "02c8629ab4d976eb490ed9c6d683634aa3d1146d21205d968c143e582ece9316",
+      "size": 964,
+      "normalized_sha256": "9f46f364a0e4026082815c6f744a6eb557249f9caf1800aefdb0201b7ed02e03"
+    },
+    "docs/testing/baselines/2026-11-04T18-42-38Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "8a2548c309523185b4d1a06ebce009c978b4629f0bb48a451e690242c0a7be2b",
+      "size": 966,
+      "normalized_sha256": "4efa6bcb09123813d3fc18e1e9d2ea78db9181a898eb1c1ad233b5551add2ba3"
+    },
+    "docs/testing/baselines/2026-11-04T18-43-39Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "458e014392ef9b6d65fbee003ccdbaad696a4a1b4ce218f5997b940099cc22b7",
+      "size": 969,
+      "normalized_sha256": "f6a4c44b003438460ff0f3522e3b8f86069277c0d3f4e9802b48299c91e4c137"
+    },
+    "docs/testing/baselines/2026-11-04T18-47-01Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "2d3320439bea3790ee270915656894131dac16f7983d5f930acbf70f0f03e117",
+      "size": 969,
+      "normalized_sha256": "76df861faf996ef77031985dbdfb649898c6dfcf55cbbe530d0a585601179775"
+    },
+    "docs/testing/baselines/2026-11-04T20-58-21Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "ea4f9dbad7f3d748105240166034ae2249fb321d7e218485246dc2bf90da9119",
+      "size": 968,
+      "normalized_sha256": "b140620ca427a3d83f388d9832381ee97af602dd0448836498d62351511eba32"
+    },
+    "docs/testing/baselines/2026-11-04T21-33-08Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "c53956bfd80902ae8c65cbfb07d37df14ec3ac2c892156e07afca98da049512e",
+      "size": 969,
+      "normalized_sha256": "22b8241339d2d2d78baf8f447b16097a5b895ee854072000cda6427c6e562562"
+    },
+    "docs/testing/baselines/2026-11-05T03-47-30Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "d9dca13f76e0ad89240f93d244028e6e175740ec9712549571ccbb8d3109eca0",
+      "size": 969,
+      "normalized_sha256": "b84a4a422a9f7468707ba07fea4f453a686513f93eedc61ded1476422ecb0139"
+    },
+    "docs/testing/baselines/2026-11-05T04-09-30Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "8918b220e87ba11d7308298240b64d32524f055de790e8b546147e13da19cbd1",
+      "size": 983,
+      "normalized_sha256": "a301782a9e04a763e3cdfbdbccc2c2a12ab9b2a033d5942e438e161b83774061"
+    },
+    "docs/testing/baselines/2026-11-05T04-12-24Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "83518622f8fac1cf39ece6d46935205c94814006030412973fa5b3b51d82a148",
+      "size": 970,
+      "normalized_sha256": "5b798d41570c6702c18734fdc0429ad6332b63956256621256a210d60126beb3"
+    },
+    "docs/testing/baselines/2026-11-05T04-20-11Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "b972e65b7971fdcc9cd55165053c27801fab54605640d7419f8f0f5b052ae01e",
+      "size": 965,
+      "normalized_sha256": "961dd38224423bc74131d2e606849c25912b47df41166808bdd20e65a7533daa"
+    },
+    "docs/testing/baselines/2026-11-05T04-28-02Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "26dc981fabf8c67600353257269d19d1764a7ec997fbc31c9f775b48d918d8a6",
+      "size": 964,
+      "normalized_sha256": "51980e420c82c5c98297c8734a635f009b82686dff72cc725ea310cff1955ab6"
+    },
+    "docs/testing/baselines/2026-11-05T05-41-11Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "0bd3ceda59f22955ee182c3101e7736c103a909cd26d150fd2ebb81b3e6a2065",
+      "size": 971,
+      "normalized_sha256": "9a05716db83fe188e8e777d172b31c1af9f17dd84751186de51692ef3cf22d7b"
+    },
+    "docs/testing/baselines/2026-11-05T06-22-07Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "bb91aff24d2e8b650bfd6c210f4f11f682c5ae1389f167cac1558e97182435c6",
+      "size": 969,
+      "normalized_sha256": "8116a8bade8286a9dd66f8d146c1a5bb15ca8ca4dce9dae73d8dd77e1ea5372e"
+    },
+    "docs/testing/baselines/2026-11-05T06-41-14Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "8115f27a498f9ccfef1e687db94915123b6ed40a1dd31d72a8b84dbf9296fc03",
+      "size": 965,
+      "normalized_sha256": "4d965fbcc02d7633de20c2debd18da6f55318a6781c82f4edf0ce3ef42637d06"
+    },
+    "docs/testing/baselines/2026-11-05T07-03-56Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "c7b782bbe020778f105128bc70fd9ed7d16442e5e42815cc94ed09e7de2e0112",
+      "size": 967,
+      "normalized_sha256": "42310e93d9436d9473e028040e9b68cffa7c197bb495c6e6c1f38ac9e46a2295"
+    },
+    "docs/testing/baselines/2026-11-05T07-43-26Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "c0315111e8aac428c2591cb9d4d3e3d3e709e91b8b104a07d0c8eeb8cc162779",
+      "size": 967,
+      "normalized_sha256": "93e1988f7a8dc4d9ca92071a89e97704c5493c3b52e2d4a13dfb50725ac80c2a"
+    },
+    "docs/testing/baselines/2026-11-05T07-55-27Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "4c48f03f7912ec793d475ef2ab3c8492ae71e60d68625a8ca5dd02be7b19ddd6",
+      "size": 969,
+      "normalized_sha256": "f628d32e0d40e76994fd5598c3befca1d95c2e84b895be3f952b592a0f332370"
+    },
+    "docs/testing/baselines/2026-11-05T08-15-07Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "86c1f22f690704efcb7c37b8a4734b98a6f0dcd77fcea945ceb35c9a637f8a05",
+      "size": 969,
+      "normalized_sha256": "5f1923ea5524afe16ad8abe68010bba3a04808cb49c508da7d18dd874f434ac5"
+    },
+    "docs/testing/baselines/2026-11-05T09-07-58Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "be084fa1f2a8c8f11e5536af456b6fdf1791f3ec35bc682e16fc529725134d94",
+      "size": 974,
+      "normalized_sha256": "b5cacd0bc78b46026f3af44566c453f81cb0b1e96c82c010939c492c571a3165"
+    },
+    "docs/testing/baselines/2026-11-05T09-57-24Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "76e3c026f76f590784295439fba748012e248bcad963e7222f5fba2758572b4f",
+      "size": 975,
+      "normalized_sha256": "d6711a305be224b4928b2f48454f4d44a8ae6c08ed835a0903c10dc84734a1bf"
+    },
+    "docs/testing/baselines/2026-11-05T10-42-30Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "dc0d07096a391efa43d22935e3674ad3550b184416946160713eb44e9c9373c5",
+      "size": 976,
+      "normalized_sha256": "c58c4317f6cf631fd88d51a5dbef1a74a3335c9330f6a449c85d00d71b39dda8"
+    },
+    "docs/testing/baselines/2026-11-05T11-54-46Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "e55573b3c02560ce223097bbee30a9b66c46193b8824abcb24da097acb907a8b",
+      "size": 978,
+      "normalized_sha256": "8312a711fda0cdcb647490054087278d33c4e3f0d82ec1e21d3e9b06ba8b1640"
+    },
+    "docs/testing/baselines/2026-11-05T12-06-29Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "5d129ff78ed428349cd20f1fd9bbdf1ed2e32678ee44576697b19b6e79628301",
+      "size": 979,
+      "normalized_sha256": "3453115e7d8effe4043768b614d954ad2bc4e663bd67a4ecfc94079463ec828a"
+    },
+    "docs/testing/baselines/2026-11-05T13-01-03Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "f828ae1daa5e1f50e3940675ead67c7885ec842fc35a6ab2d5938d5bab512271",
+      "size": 977,
+      "normalized_sha256": "637ed0e65444cd03bd4d8b505585bef02179994ea866623e3925cab1f18bce4a"
+    },
+    "docs/testing/baselines/2026-11-05T13-32-23Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "b956d687e73a8265acae372e04dcf5a752dac380927fa38242f9607b322ead97",
+      "size": 977,
+      "normalized_sha256": "fe8cbd1992c7f0ed92a22db59a6dffd6f709447e2b80f45484944fcc64245d18"
+    },
+    "docs/testing/baselines/2026-11-05T14-45-50Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "115aa2a619e0c349f3a8c549a3340a5341753f1d07e944a8cf8b8efc2e8c6164",
+      "size": 970,
+      "normalized_sha256": "92944c26f0b0325d26b035fec74b539c93b8a400a7fe09811a3f75e1769813c9"
+    },
+    "docs/testing/baselines/2026-11-05T15-23-37Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "fdde451d024e0725a96f6371d2daf4b5ffd253091570d9b51d314ffdb8dde128",
+      "size": 1492,
+      "normalized_sha256": "0b7ee1708867d9c8ab9df82dd21ccc471395821474637c77f650b6c18389e838"
+    },
+    "docs/testing/baselines/2026-11-05T15-30-32Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "5a36c8e447110bf5b82b018e2d661018c21e0a35e9ee650ba3b93724d84d9ed8",
+      "size": 1492,
+      "normalized_sha256": "3b33ef4b48c23cfa0bb9cd8371d02f27ed8448c61fefce171cee42238377981f"
+    },
+    "docs/testing/baselines/2026-11-05T15-38-39Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "c603664d427624458eb2c4b431834991e2d42b7558440f8292b2e0a4ec40ae10",
+      "size": 1491,
+      "normalized_sha256": "7951c0b56e78a725a78ee83fd6fd14a8f93c5d0dabb8e647d559b063ddd9fde3"
+    },
+    "docs/testing/baselines/2026-11-05T16-04-55Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "aa1e59fe638199d821debba91ad2eb88d02859bccd7e126509f1198195f50645",
+      "size": 1491,
+      "normalized_sha256": "1886b79858d16f3f1eba7058fa62b0ca5c60c3ca488f58b0b0d9f96f0c1f2f57"
+    },
+    "docs/testing/baselines/2026-11-05T16-21-09Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "4fca1611941f66a85b6940abd94cbd7453d0a7ca8fcb31f62cf30391b23f9cf5",
+      "size": 1494,
+      "normalized_sha256": "b301f8d4a79f786205391e26d96cc7b8b7f0beafd5d6b0ec83ce905b8eb312b7"
+    },
+    "docs/testing/baselines/2026-11-05T16-39-41Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "4ed186d2b57192c65619c0e41feda3816d022fc12b4cc7813708e56883ae65d1",
+      "size": 1500,
+      "normalized_sha256": "4c59777c6a2e0e8f06b2fa47b859e428052445b455c8ac43ed42d1ac3046589a"
+    },
+    "docs/testing/baselines/2026-11-05T17-24-56Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "715012a3c7dce961487b24faaf37db12ec9c4fd6e12af8213331122cab1cb4d9",
+      "size": 1487,
+      "normalized_sha256": "41241a6a57275d963ed2cf16ac8d51881184c8a7f4ac7692b6f87fa7c68498d9"
+    },
+    "docs/testing/baselines/2026-11-05T17-35-39Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "242e093af4c9af975402641bfc94bdcf1529d2f65febce5250c02110a209b123",
+      "size": 1490,
+      "normalized_sha256": "3c2a578914802505cf8971a2e3df1d45f2d96c157bbe20ab43edca45bd866206"
+    },
+    "docs/testing/baselines/2026-11-05T17-49-17Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "4a40256d5163d79988e20e8cd82eed9bc98a5c757001277583bddcb3526f3cfb",
+      "size": 1496,
+      "normalized_sha256": "2dfe03ecaaa8f860efe0d7f1d1f908ef476d67240217db5f0971873c3dd167ae"
+    },
+    "docs/testing/baselines/2026-11-05T18-03-19Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "ca7f0805f8766b45063c0c3cfb4ccce88d947531ecfd5f518ee200c1cc5bcdcc",
+      "size": 1494,
+      "normalized_sha256": "6f379011f47a818a1248aac1df26dd928bc06b5d61e51fd218a8fd8f92bb1cf8"
+    },
+    "docs/testing/baselines/2026-11-05T18-10-39Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "17ac3cb8cb899b6b215e1b1c399c220b8061b6e885cecad07a472b2f0076aec1",
+      "size": 1495,
+      "normalized_sha256": "39efb656186d3c2281cd513dc9112a5e88aa0b5eef37a054a4ae917e4878253f"
+    },
+    "docs/testing/baselines/2026-11-05T19-03-29Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "4ca544bbde0136f9ff13ced92900ad91487c4966ee249877cbd1d17fbab92221",
+      "size": 1498,
+      "normalized_sha256": "c874f7c06c9500e4f6691d4dc53795e049dec5cf2a0eafd64eee2707000c0542"
+    },
+    "docs/testing/baselines/2026-11-05T19-09-05Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "729cba48dba7d178d34e7cda01c081cfd2b80299f8e9d9d4b883dd010da9880d",
+      "size": 1493,
+      "normalized_sha256": "c7137316214c684e131fb6348d80dc2e52e121ddefa5c338fcfb95fcb4c6f252"
+    },
+    "docs/testing/baselines/2026-11-05T19-22-17Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "22591fa8973adb74c3da2f6c2b25ad039e0f91bd1657a0da597f23b8538da724",
+      "size": 1495,
+      "normalized_sha256": "d05c4eb7d001a7758be5e6168d87c892efd731200c7064fc73554b79af149909"
+    },
+    "docs/testing/baselines/2026-11-05T20-04-52Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "29f760c4520efd8b94ca641fbfa1b1e2c1e7099c1973357b64e52e79106d6fc9",
+      "size": 1497,
+      "normalized_sha256": "a970f2d0fd77ebc2955acbaab63b4c2a7efed9d3efe52eb82d520f17f20b94e2"
+    },
+    "docs/testing/baselines/2026-11-05T20-27-59Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "ba9b14b045b62a5eb60b605d1b66709dc3078de91edba90415bf904c35ce8584",
+      "size": 1494,
+      "normalized_sha256": "7ceda95fbc3c8347b4a41ca6913e6f9b3f3d0e3227afeafd477082167f6cfe23"
+    },
+    "docs/testing/baselines/2026-11-05T20-52-09Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "af84233f5423e47306a3c20ecca0449c922238bc5fbb67f8da180b8f5105b20a",
+      "size": 1496,
+      "normalized_sha256": "c650dd7be4c92ea184aca8276e6e44d5ccbf46a104fb7cc1c5b442254b1eaf98"
+    },
+    "docs/testing/baselines/2026-11-06T03-16-25Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "4d80355d3e7da9bb58f82d227a42e292675e219fd3a3858e44ccbc599fd73c8d",
+      "size": 1493,
+      "normalized_sha256": "9807be7045e7ea6396dd0c15da4171353715be1ddf5f5258260ff1780ed8fb51"
+    },
+    "docs/testing/baselines/2026-11-06T03-40-54Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "95cf2b7663e65e7609fde60e7b97aa10bba54c84b53c410a39748c25b90ec9bd",
+      "size": 1497,
+      "normalized_sha256": "512c158a3334c3de8c0f80645c4263eeb933572dace39a348049c28350f2d9cd"
+    },
+    "docs/testing/baselines/2026-11-06T05-17-43Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "d52cac01439f4575807ad8f9d1cc8ee4fa366c1d6acd0b849ee4675a88e9344a",
+      "size": 1497,
+      "normalized_sha256": "ba69a883d24b0c45eaaaa297e023e3df0c2e0f0c8b6d52de47c3d7575294fa11"
+    },
+    "docs/testing/baselines/2026-11-06T05-39-02Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "c0d10b616bf82d7ce3b26d58c988b82105d5cb979215844b5abf7b3e0b20e20b",
+      "size": 1499,
+      "normalized_sha256": "79e4c41865606d1ef2305c5fae1ca1563e23a46a9b60cd03f3c371bb0c3981ea"
+    },
+    "docs/testing/baselines/2026-11-06T06-10-06Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "72ae82ff6fcdef42bcf92499b019e272f9ec259bf8b226d2a3479b1b41394b91",
+      "size": 1503,
+      "normalized_sha256": "f8f08b43232a269e795642d4b934d926b5ff638b6afb170e26b8852a42fcd39c"
+    },
+    "docs/testing/baselines/2026-11-06T07-55-34Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "5638ae2ce31f22729d7c60151eec5b67d1794a562d006a502e999497e25267e8",
+      "size": 1504,
+      "normalized_sha256": "b174e6401cd23e28bfa90b046aa36850bb9f18508b72eb83f524c9968c66e57a"
+    },
+    "docs/testing/baselines/2026-11-06T09-48-03Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "b209cd2cbe544762d4bbd53c0cf7e6ad37dccfe058ad16136aa2e4401ec4a6e5",
+      "size": 1503,
+      "normalized_sha256": "6e99528810357b5b21a9edeca8264e2f4026fc6b7a8d3a94ab52dfd13f723c56"
+    },
+    "docs/testing/baselines/2026-11-06T10-14-07Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "d136c2c95c7bcf46770bd92e991377ff9b8cc0d91d999d0c3b061d52a7a31043",
+      "size": 1499,
+      "normalized_sha256": "f5e30fa0f2962eafbeb8dc2f22bb61b904ab6124aedbec04555250898cfb47b4"
+    },
+    "docs/testing/baselines/2026-11-06T10-45-12Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "b06cea6c980140dce4d3a2c548bb15e9304cf95843e98eb99919e3f66ee23a51",
+      "size": 1506,
+      "normalized_sha256": "b7730b571c5fbe1b41ba8c23af15c26e6aab83d6398a490180cce41b3f8c359a"
+    },
+    "docs/testing/baselines/2026-11-06T11-10-05Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "f0f01f62b608b747bba8f05a9066fe079bb1e245c3165600ff2cb4291e0917e3",
+      "size": 1506,
+      "normalized_sha256": "1277f116a4922363e541dac21508c7c4c6629d9511ce133c7990c8938c7b29a5"
+    },
+    "docs/testing/baselines/2026-11-06T11-10-38Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "ba79494a3589a70431ce9333f5e3535a5f977ee38e8a72551997485ea5cbba60",
+      "size": 1505,
+      "normalized_sha256": "6a3ad83af67394a0ccd4a6466fc6521929e336c09a031287176a55343c6bd787"
+    },
+    "docs/testing/baselines/2026-11-06T11-10-57Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "2fc07b39be39833b023d3903baa853bf1d041a7894bf1515745292870e1163bf",
+      "size": 1506,
+      "normalized_sha256": "fa22bd1e9c2c8dda27ab9c9e636c7a9552b6838abdfc8bc29dc33dcf7f04278d"
+    },
+    "docs/testing/baselines/2026-11-06T12-40-22Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "eaeff93c0bf35792fb8293bb21965a98f7977f4ba8f95222012b7cdd47dbc64f",
+      "size": 1503,
+      "normalized_sha256": "43e79955e0020ef5c4c8e078b362305c07480e710634a453ded874127ba6c718"
+    },
+    "docs/testing/baselines/2026-11-06T14-38-06Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "e28f6b08dad9de1e698084167c2d14a7732965c0f1e2ac1e104c38ebdcd4012c",
+      "size": 1503,
+      "normalized_sha256": "2edfc91999e913f155e3749b2fd074556acf0f75746d1ec9334a1b9a4344aef0"
+    },
+    "docs/testing/baselines/2026-11-06T16-48-29Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "e5376c0155218bc75d3768f11616e4aa52a0fecad4fe30d3f5fd67952514a8e1",
+      "size": 1503,
+      "normalized_sha256": "7c372d8bbd3e1e63602fa4369a73ec9962cdd37db8815ad5a0162ff7f0c22d0b"
+    },
+    "docs/testing/baselines/2026-11-06T17-16-22Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "96286a411a34605f33320d8814482b1080390cdddf7e14eafef07960d34924a6",
+      "size": 1498,
+      "normalized_sha256": "4e6392ca5ef6d1752c4ef652f20e26827127712a403eec1e21f8290b85fbb472"
+    },
+    "docs/testing/baselines/2026-11-06T17-28-32Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "011989274e99ee8c7a9f371cf810b5767087c676aaef58c724b71da0e67bff1c",
+      "size": 1503,
+      "normalized_sha256": "69ec7aa103ea94970411aa8306a4c30841e709cc46b1bf6ca2da87dc8befe506"
+    },
+    "docs/testing/baselines/2026-11-07T05-48-26Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "11cbee4b9d97aadb2854cb1a0674f4acd6040c3ff68e430b5c799a2528513cc6",
+      "size": 1503,
+      "normalized_sha256": "d48ede1807f8b9bb1c7038565fe33ec827700d24a7ea62221fd91ce4ff44aead"
+    },
+    "docs/testing/baselines/2026-11-08T19-00-31Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "7ad1dceecd92f40d7efd686885d47363264e90b45ca59f070a43af42f163cc6f",
+      "size": 1505,
+      "normalized_sha256": "0d70ad0ecb3ea3951af1da0d23c8c90e8d3e5a2e4d276077ad4aefec0f2f8313"
+    },
+    "docs/testing/baselines/2026-11-08T19-32-40Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "1b4c109476886f34c2e20e9dd527c6c66179d1dc81925d6f8672c61b1bbac946",
+      "size": 1504,
+      "normalized_sha256": "74fe30ca0da12d11f6f6f075418a11cbd3dfe137c40baab8df668c3c0585f438"
+    },
+    "docs/testing/baselines/2026-11-09T06-20-09Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "f070d9c6bd03e2fb13ccf1f9dd3331c5cb4b1bb68b9014603cd02af7d767b5a0",
+      "size": 1507,
+      "normalized_sha256": "50f6b1702a58367a27e45ebb2b80c09a8d2bb8a140fab1079c76b89c22477e28"
+    },
+    "docs/testing/baselines/2026-11-09T06-45-59Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "94364f6346d3f0319527b592963e5f0762ec123c355f916a5743ee527ef98081",
+      "size": 1506,
+      "normalized_sha256": "760c22fd5942327d876a92b4b977a79af1a37dca370209b072098f0b532b96ef"
+    },
+    "docs/testing/baselines/2026-11-09T09-23-20Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "a38dcbca1f5e5706d6cd2367c6bc6391a6b3a7c4869ed7073eb463a96b6ab559",
+      "size": 1504,
+      "normalized_sha256": "e702e81a4451113da0326d8b0d13ee43af8e12d8923e98cc529e607bd906dc23"
+    },
+    "docs/testing/baselines/2026-11-09T09-37-44Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "27a83c4e51123f5c90884136846beb6fd6adbbf086dcc5aaea228e6f0f6beacc",
+      "size": 1504,
+      "normalized_sha256": "5b09d5f3384d47301a3ac393a8f6e42039dc3deaf8b451fd7810bbb38448a5aa"
+    },
+    "docs/testing/baselines/2026-11-09T09-53-04Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "bdde27ab306c725fe5ce3735f6402044ae24562ab84b12791d667aff6e1b898a",
+      "size": 1506,
+      "normalized_sha256": "5425deec09f37651d9fdf9d5fce2da71f3c51079d6c06e36cd83d53add94889c"
+    },
+    "docs/testing/baselines/2026-11-09T10-51-57Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "e1642ee3f7e721ef88d21f8f5922b3c3ff85eec857fa397689f1cf0dde0e5953",
+      "size": 1503,
+      "normalized_sha256": "b983351f2cb51d902d6196d070d4f1959d0072703a1bc68e0789467d98b65d23"
+    },
+    "docs/testing/baselines/2026-11-09T11-51-49Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "cbbe23acd5ced52c51b65e9d8fdeec4d60aef6da4dc94b05d27cce95cdb03a1f",
+      "size": 1509,
+      "normalized_sha256": "92f178f4fa40ccabc5fe1a96baaa9f03f7a07d465cb57ea9ca7560b96355fc4c"
+    },
+    "docs/testing/baselines/2026-11-09T11-59-57Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "910740d1a2ab85ae34c3009d8a569f83ea8f061039153e02fcb8eaf5c72b0afa",
+      "size": 1507,
+      "normalized_sha256": "cac26e20fe4820f24ba4f400f944c03cab1f9df824d31da44af7f39557a74d71"
+    },
+    "docs/testing/baselines/2026-11-09T14-16-33Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "00e977d1092ad04ef70646a4ba5a41f22a6d6d7c0166cbfdc35a4e99e69fae30",
+      "size": 1505,
+      "normalized_sha256": "8d063e84792cf772a983b3dfa20222298f6f6d70984acc9233a45e9ab466d3e2"
+    },
+    "docs/testing/baselines/2026-11-09T15-19-04Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "460042def63de61a6d927fdcf3ecb5b671636cf1fe1fb6af61009495c2d4b6fd",
+      "size": 1507,
+      "normalized_sha256": "9228fbd63b1e22471a3b66be512419fd4176f4cc7fb0e66b4d5112d0635f2c74"
+    },
+    "docs/testing/baselines/2026-11-09T15-42-30Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "785dea3bfea44de8f7ff090703c96b0dd937f24e91e6240af25ba82b0d5b3250",
+      "size": 1508,
+      "normalized_sha256": "f8caae5e8a9a8812f8438425389b2ba1226d778e547f31c22f6ac539d1ed8e50"
+    },
+    "docs/testing/baselines/2026-11-09T16-19-39Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "da4dd28801b0a2be7ddff04c8e8ff1605b6c2d4cbffa7d4da35d413f1337d083",
+      "size": 1509,
+      "normalized_sha256": "35ef980d58fe2bded40d0b1317fe22d44795dd2df24ee45ff5cd24fae88dca8d"
+    },
+    "docs/testing/baselines/2026-11-09T16-41-13Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "610e17af5a6d61a92d6b383e36a21d57499e629464462b76582e19aafa2a5db2",
+      "size": 1507,
+      "normalized_sha256": "32df1be802846c3d930785b6f40f4486cbc111c5f4c1441cb0573e9ef419803f"
+    },
+    "docs/testing/baselines/2026-11-09T17-20-15Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "245aeff7abf2ceb7ac02436ed3c4e75a1db9b01a7b824892abdcf4369c261efc",
+      "size": 1508,
+      "normalized_sha256": "2e34271c67b4e091dd7cd35e8ad7eb9f1653c62863e1441f1a47d1417b0b772f"
+    },
+    "docs/testing/baselines/2026-11-09T17-52-54Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "28cba41506b3fda1123d95c9f2ec17723a462b2e08e7040aae21bee28136a6dc",
+      "size": 1509,
+      "normalized_sha256": "b9649dacb0d5e38e94f10f3306146da7dcfe070c38a7f90a29333421951a8d50"
+    },
+    "docs/testing/baselines/2026-11-09T18-38-44Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "8f2cad4883fbbfe63c59b45a116a2244a04930aedb8da3216ce25b27a61e1ae7",
+      "size": 1510,
+      "normalized_sha256": "b304c32d551a10887cb7a6d3c4e15cc87b9fe3f998ecfc4025fd875ab0db2ee4"
+    },
+    "docs/testing/baselines/2026-11-09T19-20-29Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "d4a4b78bca5cc01a3da3342cd338cac5884b28cd6d5f0f6fbf81c10812a15bc0",
+      "size": 1506,
+      "normalized_sha256": "803ff2a4f423492a0a6cb360c774c9f5083e3dc151468acb1b6ed8d32d120acf"
+    },
+    "docs/testing/baselines/2026-11-10T06-05-11Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "b529d64f6abf9d4707ee202bbe4ddde4ee69ed5d1d010799ca66f9fa4c868fa7",
+      "size": 1509,
+      "normalized_sha256": "750d17e855b618b4bcbe5f4e42412230c97e7908cacc7380636dc19c113bdabd"
+    },
+    "docs/testing/baselines/2026-11-10T06-38-55Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "1da2a102e5fbe08f86b501f6bfbcbbc92e129aa347b4a8a879dd868209637255",
+      "size": 1509,
+      "normalized_sha256": "709ceb9da00212c66b96beec27f642e49ddf4d72f96374e6e54d5b2a81b8322d"
+    },
+    "docs/testing/baselines/2026-11-10T07-04-09Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "33786602b52365995776ba3e2017cc01e546cd6974631b2a33fd85b377860894",
+      "size": 1508,
+      "normalized_sha256": "a26f0abe14fe558f203502eaa3093eba7a8d3affedf36edd8ffbea68a93ee402"
+    },
+    "docs/testing/baselines/2026-11-10T07-45-22Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "5efe1ef04241d976297f1da0b979f202de6211e22ec8403a9da79ad5abf339e0",
+      "size": 1508,
+      "normalized_sha256": "72c3017309501734c9817e8e7033390cab086fa2577d0d590217539e86d180eb"
+    },
+    "docs/testing/baselines/2026-11-10T08-26-48Z-p3p4.txt": {
+      "role": "observe",
+      "sha256": "b63637620b2fa1411027544580abf9fea68e802dba21610cc02f6e1a7d5ec42f",
+      "size": 1511,
+      "normalized_sha256": "fd5d1ed0f9674a4ce1fcc1ea170630561112a25116c3409632496fb3272a5e6f"
+    },
+    "docs/testing/p4-tolerance.md": {
+      "role": "observe",
+      "sha256": "1fea3f0ed00c98e8745fcd09b09d979b08aaf5e676f67ad702ab943c65144372",
+      "size": 54622,
+      "normalized_sha256": "e3acfdb64197a7a90d3f30b201d33dfdd3a96b2306f5d45806b5f0e28c6e8f0d"
+    },
+    "kernel/Cargo.toml": {
+      "role": "observe",
+      "sha256": "11b4957f4e9359f7fce23e8a0e4d4b4b2154de73756241fdaef16c139d109626",
+      "size": 21003,
+      "normalized_sha256": "11b4957f4e9359f7fce23e8a0e4d4b4b2154de73756241fdaef16c139d109626"
+    },
+    "kernel/assets/font16x16.hex": {
+      "role": "observe",
+      "sha256": "1e5e2d41850fddbfb5df5590ad217bb5a383d870fb417b8b9b9b0206594e1ba7",
+      "size": 168057,
+      "normalized_sha256": "1e5e2d41850fddbfb5df5590ad217bb5a383d870fb417b8b9b9b0206594e1ba7"
+    },
+    "kernel/assets/font16x16_body.hex": {
+      "role": "observe",
+      "sha256": "8f1b0324ce352b1cf9508e27b2fae14377ea0a19140a500fabef7d70b3fde5f3",
+      "size": 235853,
+      "normalized_sha256": "8f1b0324ce352b1cf9508e27b2fae14377ea0a19140a500fabef7d70b3fde5f3"
+    },
+    "kernel/assets/font16x16_ui.hex": {
+      "role": "observe",
+      "sha256": "e616b94a456d1729fa3cd4c2277f0f527357323f3b9ff1bdd9fb0ada7c61a1ad",
+      "size": 235847,
+      "normalized_sha256": "e616b94a456d1729fa3cd4c2277f0f527357323f3b9ff1bdd9fb0ada7c61a1ad"
+    },
+    "kernel/assets/font8x16.hex": {
+      "role": "observe",
+      "sha256": "aac9667c93a3bb6c16ad8f0fc64e46bacd2082ff5a7edbbe790a2b4015782f3f",
+      "size": 15858,
+      "normalized_sha256": "aac9667c93a3bb6c16ad8f0fc64e46bacd2082ff5a7edbbe790a2b4015782f3f"
+    },
+    "kernel/assets/font8x16_body.hex": {
+      "role": "observe",
+      "sha256": "e22db48babd91e196afa416f8b3e625cea4673d94bb7ee34763e7e301b25ae9a",
+      "size": 14166,
+      "normalized_sha256": "e22db48babd91e196afa416f8b3e625cea4673d94bb7ee34763e7e301b25ae9a"
+    },
+    "kernel/assets/font8x16_ui.hex": {
+      "role": "observe",
+      "sha256": "0ebcb45d939303567b81169115d14c94af23c991c06eb0e58ae75c0879fc8585",
+      "size": 14166,
+      "normalized_sha256": "0ebcb45d939303567b81169115d14c94af23c991c06eb0e58ae75c0879fc8585"
+    },
+    "kernel/fixtures/execprobe.elf": {
+      "role": "observe",
+      "sha256": "a41791f5a04161d6adf3a8a3e3b234af538131c68a18cb032984e1d733bcdd12",
+      "size": 27408
+    },
+    "kernel/fixtures/fat16-mem.img": {
+      "role": "observe",
+      "sha256": "72cbe26b0cb080a586f82a8b8a21edfa584a807d7aa212bd7bd1fafdfbc9bb25",
+      "size": 11776
+    },
+    "kernel/fixtures/fat32-mem.img": {
+      "role": "observe",
+      "sha256": "28f6f1d9cf135d4ab44de4e015a5b9a271cd087f2165139987088cd0eeff89ae",
+      "size": 11264
+    },
+    "kernel/fixtures/fileprobe.elf": {
+      "role": "observe",
+      "sha256": "9202a42941c9355a0825b2c51b28e35e746313b32f1b82a373300c4df8136220",
+      "size": 12944
+    },
+    "kernel/fixtures/hello.elf": {
+      "role": "observe",
+      "sha256": "8e3972a8a788b2d6e8c96aac46d5c522fe9a00d513e42db0b32fad53cd09e447",
+      "size": 17288
+    },
+    "kernel/fixtures/probe.elf": {
+      "role": "observe",
+      "sha256": "4951899204aabd162e6d736ec901ea3b68a42da4a2ece61b9a4919bed7de12c5",
+      "size": 754048
+    },
+    "kernel/fixtures/sdkdemo.elf": {
+      "role": "observe",
+      "sha256": "d83c3981fb6a772fbf5fef8283b8158f5154b1c51d7dd49eb04dbee3d5fff108",
+      "size": 13560
+    },
+    "kernel/fixtures/shell.elf": {
+      "role": "observe",
+      "sha256": "9e1884316c34c34936a32906d785419ae613685a68a7642fbb1375cd7cf45457",
+      "size": 124056
+    },
+    "kernel/linker.ld": {
+      "role": "observe",
+      "sha256": "9e20db6f2cdebfb92632eeef02e5c903c6970b2f3682bee24b55b67d09e94498",
+      "size": 2087,
+      "normalized_sha256": "9e20db6f2cdebfb92632eeef02e5c903c6970b2f3682bee24b55b67d09e94498"
+    },
+    "kernel/src/arch/hooks.rs": {
+      "role": "observe",
+      "sha256": "e10fe7d156940766e92a5d80f8f26578ff316a124bea1d127c060c807a17e1f8",
+      "size": 5052,
+      "normalized_sha256": "64352709a675be88f50bed25cffa4d4f61eff73fa40c3d8329e45cb14d7838fb"
+    },
+    "kernel/src/arch/mod.rs": {
+      "role": "observe",
+      "sha256": "715a0cf9d9c300080ae7e7a295db327e610f9023dcc1219569b54a93ab6213cf",
+      "size": 669,
+      "normalized_sha256": "c4b4528ebb9083ffd832a0b817a806aed8633766922fffe64de2da7e0e64d417"
+    },
+    "kernel/src/arch/x86_64.rs": {
+      "role": "observe",
+      "sha256": "5e0224663375e687b3ced36645f9c18e5d7a5f1349fa36fc4a7ba85b1763547f",
+      "size": 607,
+      "normalized_sha256": "5e0224663375e687b3ced36645f9c18e5d7a5f1349fa36fc4a7ba85b1763547f"
+    },
+    "kernel/src/arch/x86_64/apic.rs": {
+      "role": "observe",
+      "sha256": "b9a41c0442145a0933a22e8555a58e0445199cb79aa8db619118ae378714bfae",
+      "size": 49450,
+      "normalized_sha256": "b9a41c0442145a0933a22e8555a58e0445199cb79aa8db619118ae378714bfae"
+    },
+    "kernel/src/arch/x86_64/cpu.rs": {
+      "role": "observe",
+      "sha256": "b430794e83d3837e6a4ab2582367a2c5a66d74ffc8ff15b28e034bb6f87e325c",
+      "size": 11461,
+      "normalized_sha256": "b430794e83d3837e6a4ab2582367a2c5a66d74ffc8ff15b28e034bb6f87e325c"
+    },
+    "kernel/src/arch/x86_64/cpuid.rs": {
+      "role": "observe",
+      "sha256": "fe9b707f96b849dd22a905456c28d6cf07743b8e51c8415c480a695bc768ce8b",
+      "size": 1841,
+      "normalized_sha256": "e7cac1c589e24026814f0a15fc2dd6a4ef6824e1a3b7f54ab88457db163358f5"
+    },
+    "kernel/src/arch/x86_64/smp.rs": {
+      "role": "observe",
+      "sha256": "e1ff64dfe62ac5c87386a4e369dc8f5c741dabf5d604f2a9670e4668a62b3cde",
+      "size": 43033,
+      "normalized_sha256": "1bdc1281a4b7217d40d0861c3b084ac7e0b118d054b6a013f1b8757e00a4e4e7"
+    },
+    "kernel/src/arch/x86_64/trap.rs": {
+      "role": "observe",
+      "sha256": "1b692937b80c821e3aacaaf4de9d128ff44bd3e746ddbd59ae70eb5ca1989e02",
+      "size": 83848,
+      "normalized_sha256": "dae2df52bea71fd419eaaf281ce0238236f8c7990b1998614ba76947d527b459"
+    },
+    "kernel/src/boot/boot_guard.rs": {
+      "role": "observe",
+      "sha256": "d805fc85a7291c6d4cd60650b66ed204970cd1ad5819414ea8886cada74a82b4",
+      "size": 5642,
+      "normalized_sha256": "d805fc85a7291c6d4cd60650b66ed204970cd1ad5819414ea8886cada74a82b4"
+    },
+    "kernel/src/boot/limine.rs": {
+      "role": "observe",
+      "sha256": "de4b1e1da4196d7169f4f158a3db4bd8d499413257cc1e6be5469d9f41bed660",
+      "size": 21547,
+      "normalized_sha256": "143591b670449339185ae8937b067150d3c301ed57af1c6a6db6ec877efac26d"
+    },
+    "kernel/src/boot/mod.rs": {
+      "role": "observe",
+      "sha256": "6bd301f3f5c791cb05165acddd081908b8845a42d3e03b5d3b2f55b6d070a5bc",
+      "size": 460,
+      "normalized_sha256": "6bd301f3f5c791cb05165acddd081908b8845a42d3e03b5d3b2f55b6d070a5bc"
+    },
+    "kernel/src/bus/acpi.rs": {
+      "role": "observe",
+      "sha256": "df5348798a3b5c1fe883daaa0042f8f2a4e4db2fcf038e6c6990a56ceee2b32f",
+      "size": 25705,
+      "normalized_sha256": "8ab840ea5baa47437a03c02f66fb215b6301fac97b79cb6eb24641dcd16701d4"
+    },
+    "kernel/src/bus/hw.rs": {
+      "role": "observe",
+      "sha256": "7c3e0fe914ee636c14bcec8d07cdbddbbe79fed106a583beb2ca24886b783e1f",
+      "size": 5302,
+      "normalized_sha256": "7c3e0fe914ee636c14bcec8d07cdbddbbe79fed106a583beb2ca24886b783e1f"
+    },
+    "kernel/src/bus/mod.rs": {
+      "role": "observe",
+      "sha256": "53e649b852a15c54ad97330d6083993ad89170c44719506ea37a3449ef69bc11",
+      "size": 420,
+      "normalized_sha256": "53e649b852a15c54ad97330d6083993ad89170c44719506ea37a3449ef69bc11"
+    },
+    "kernel/src/bus/pci.rs": {
+      "role": "observe",
+      "sha256": "cab740c65595cdbd610e26b34737a66d2e5e8a2e998506c42c1ad9420433f433",
+      "size": 21499,
+      "normalized_sha256": "cab740c65595cdbd610e26b34737a66d2e5e8a2e998506c42c1ad9420433f433"
+    },
+    "kernel/src/capability/handle.rs": {
+      "role": "observe",
+      "sha256": "43f5824f071e413170f642b974d03ccf179c91550450f23ae363a78094a46f25",
+      "size": 75211,
+      "normalized_sha256": "e9d0f7babb420b2ba9149acd1465fb1ed1e8e2cd552c9e7fe12b534925522444"
+    },
+    "kernel/src/capability/mod.rs": {
+      "role": "observe",
+      "sha256": "b42055e130f0843d19d449f174458f26ee84dcbe1d8c1b962ce657c90878b11c",
+      "size": 454,
+      "normalized_sha256": "b42055e130f0843d19d449f174458f26ee84dcbe1d8c1b962ce657c90878b11c"
+    },
+    "kernel/src/diag/crash.rs": {
+      "role": "observe",
+      "sha256": "9b302b87c9b8e04046265e5b88de0d9606a428767f4b6c3f1128207b87459066",
+      "size": 20503,
+      "normalized_sha256": "01b7d096dbda4f246af9bcef40474eca65787b01a3854db674614213a84b87fc"
+    },
+    "kernel/src/diag/exit.rs": {
+      "role": "observe",
+      "sha256": "8e6e2713dd743c64847f20a58766471f2eb275cbb90fec382536dd559bf22ec6",
+      "size": 2751,
+      "normalized_sha256": "a6fd468a6c6646f4331e486165b2c6d596e8b708d6366a31e4da35a3caed1fbb"
+    },
+    "kernel/src/diag/mod.rs": {
+      "role": "observe",
+      "sha256": "28087b8782c9749017d6b91f9db9ef9fc983baa266378df957c17c2323555cc6",
+      "size": 466,
+      "normalized_sha256": "28087b8782c9749017d6b91f9db9ef9fc983baa266378df957c17c2323555cc6"
+    },
+    "kernel/src/diag/serial.rs": {
+      "role": "observe",
+      "sha256": "4c61054d0a4b7a98c0e1b76c55db90ef166fc516971e45add5b95319e62c8305",
+      "size": 22659,
+      "normalized_sha256": "0ed8d0e281039d3744af77f8e926029e098c696f9bdc69dbe99542a8cd5900e9"
+    },
+    "kernel/src/diag/state_store.rs": {
+      "role": "observe",
+      "sha256": "74f10545bc6296d60a00e6443cc93a625953ae9a13e224181aaf5a43047b8d2a",
+      "size": 26591,
+      "normalized_sha256": "74f10545bc6296d60a00e6443cc93a625953ae9a13e224181aaf5a43047b8d2a"
+    },
+    "kernel/src/diag/watchdog.rs": {
+      "role": "observe",
+      "sha256": "9ca78a4df7a4ae0d32b2d6b9f596e1152d18890a1892828767cb435b4f1654f2",
+      "size": 5983,
+      "normalized_sha256": "9ca78a4df7a4ae0d32b2d6b9f596e1152d18890a1892828767cb435b4f1654f2"
+    },
+    "kernel/src/display/fbcon.rs": {
+      "role": "observe",
+      "sha256": "e4f08608de2a913480f745bec43dca383dc13b1e23bb0ff2b996d21e8d733193",
+      "size": 960459,
+      "normalized_sha256": "e4f08608de2a913480f745bec43dca383dc13b1e23bb0ff2b996d21e8d733193"
+    },
+    "kernel/src/display/frame.rs": {
+      "role": "observe",
+      "sha256": "7e7cf39b11cb42367c04ca3dc7143f6cfc68a416ce5c91192b3f0eb54198f8ca",
+      "size": 18096,
+      "normalized_sha256": "1974519cb2dfe34191cf2bbd2026b8f939106e364918dbc630d66e08dddc85ea"
+    },
+    "kernel/src/display/mod.rs": {
+      "role": "observe",
+      "sha256": "fe2f0efe98d24b91abf32102529d202448022c7fafede4b635aaa8ae598078c7",
+      "size": 760,
+      "normalized_sha256": "fe2f0efe98d24b91abf32102529d202448022c7fafede4b635aaa8ae598078c7"
+    },
+    "kernel/src/driver/ahci.rs": {
+      "role": "observe",
+      "sha256": "21f9be9ebd8c8116ea0dd3847a32f695bde407f7567846f381dafda1605c1ce1",
+      "size": 83936,
+      "normalized_sha256": "f94c1ed004c7490e2842d436fbfd3dfba9d1589dec3c423c81915d0cb4e09f91"
+    },
+    "kernel/src/driver/mod.rs": {
+      "role": "observe",
+      "sha256": "81eae6e045ace295a84c26e3e7105359c6fbfb25de4d8513df4dbf07df88d0da",
+      "size": 24896,
+      "normalized_sha256": "81eae6e045ace295a84c26e3e7105359c6fbfb25de4d8513df4dbf07df88d0da"
+    },
+    "kernel/src/driver/nvme.rs": {
+      "role": "observe",
+      "sha256": "b59eab1d3dad8e2b8d76695907e2d88ed98d4b3f210e8ad6db5d3ad2f8124901",
+      "size": 32560,
+      "normalized_sha256": "b59eab1d3dad8e2b8d76695907e2d88ed98d4b3f210e8ad6db5d3ad2f8124901"
+    },
+    "kernel/src/driver/virtio.rs": {
+      "role": "observe",
+      "sha256": "757a7633d05ecbdd378076dae66ea91adedd18d4c029d839d5adf7fa08b5b674",
+      "size": 64461,
+      "normalized_sha256": "06bc3f909ae57bf0f4dcbbab7e6b4f71b71b67d4a1431b0def256dd082fa9902"
+    },
+    "kernel/src/filesystem/block_io.rs": {
+      "role": "observe",
+      "sha256": "fdfb535df2041acdf5dd00de9e3a73002ea1987e2c0314dd512b6174d96354f2",
+      "size": 7854,
+      "normalized_sha256": "fdfb535df2041acdf5dd00de9e3a73002ea1987e2c0314dd512b6174d96354f2"
+    },
+    "kernel/src/filesystem/fat32.rs": {
+      "role": "observe",
+      "sha256": "93c6ad4d32d821947c7649292ba52a8001b1c37505940d4e86c5a408d4412884",
+      "size": 51629,
+      "normalized_sha256": "93c6ad4d32d821947c7649292ba52a8001b1c37505940d4e86c5a408d4412884"
+    },
+    "kernel/src/filesystem/fs_open.rs": {
+      "role": "observe",
+      "sha256": "794c0d893a261ed662a4de6ae49feb6b7eeab3b820ad89435a7a1be64f233984",
+      "size": 8629,
+      "normalized_sha256": "794c0d893a261ed662a4de6ae49feb6b7eeab3b820ad89435a7a1be64f233984"
+    },
+    "kernel/src/filesystem/fs_rw.rs": {
+      "role": "observe",
+      "sha256": "57815431154c0f9a2745618b3e0562eb049f96e301197af040c202902d87101c",
+      "size": 1485,
+      "normalized_sha256": "57815431154c0f9a2745618b3e0562eb049f96e301197af040c202902d87101c"
+    },
+    "kernel/src/filesystem/gpt.rs": {
+      "role": "observe",
+      "sha256": "1992fa1cb7a58b6207a1822107bf87359c0ea49d32aa00075d9fc64a2baa21c6",
+      "size": 15995,
+      "normalized_sha256": "1992fa1cb7a58b6207a1822107bf87359c0ea49d32aa00075d9fc64a2baa21c6"
+    },
+    "kernel/src/filesystem/mod.rs": {
+      "role": "observe",
+      "sha256": "5d28b66b1847f96b0d4c0ad6133687ba087c1ae9afe7a9b91ed42af5f920796c",
+      "size": 664,
+      "normalized_sha256": "5d28b66b1847f96b0d4c0ad6133687ba087c1ae9afe7a9b91ed42af5f920796c"
+    },
+    "kernel/src/filesystem/part.rs": {
+      "role": "observe",
+      "sha256": "f244b0c9a7ecde9d5a9868188b344ddd7650477471c78a7df3e6d9a340954318",
+      "size": 5779,
+      "normalized_sha256": "f244b0c9a7ecde9d5a9868188b344ddd7650477471c78a7df3e6d9a340954318"
+    },
+    "kernel/src/filesystem/vfs.rs": {
+      "role": "observe",
+      "sha256": "ff133c7797250f861cf9f9014b4bd9614e8b89183db6516d94ed8888c43608fa",
+      "size": 17494,
+      "normalized_sha256": "ff133c7797250f861cf9f9014b4bd9614e8b89183db6516d94ed8888c43608fa"
+    },
+    "kernel/src/filesystem/vfs_ro.rs": {
+      "role": "observe",
+      "sha256": "d6a20a6886cffc20abd3b5edbeb6b92d42b4f1f733adcfd579a91d652f12f5f7",
+      "size": 46082,
+      "normalized_sha256": "d6a20a6886cffc20abd3b5edbeb6b92d42b4f1f733adcfd579a91d652f12f5f7"
+    },
+    "kernel/src/input/kbd.rs": {
+      "role": "observe",
+      "sha256": "e8f350ce4c64f1f0ca9cdd2f76ebdb3a64e55e2a1bfe3e470bcc4d26cb3556c2",
+      "size": 19212,
+      "normalized_sha256": "baab59c58fb8bc74a170d19c312e6d440499bca4e592db3c54ed99e446baeb3e"
+    },
+    "kernel/src/input/mod.rs": {
+      "role": "observe",
+      "sha256": "b4b1cadc164a73c082033508f93f914071dabd01bb6957e8b4308ff920c39058",
+      "size": 543,
+      "normalized_sha256": "b4b1cadc164a73c082033508f93f914071dabd01bb6957e8b4308ff920c39058"
+    },
+    "kernel/src/input/mouse.rs": {
+      "role": "observe",
+      "sha256": "12fe282f955e52197fbd2797fd08f6801c26af20f9737592059521dab80de99e",
+      "size": 11959,
+      "normalized_sha256": "94235634ee905f32542f7cb675fcac23bc3750466f2b0620db3516f0a6a0bb1e"
+    },
+    "kernel/src/irq/mod.rs": {
+      "role": "observe",
+      "sha256": "27e56edf20ef0d1867e0a3c7510c6b1d6a57027de3c80f9370663c711bb7504c",
+      "size": 14133,
+      "normalized_sha256": "27e56edf20ef0d1867e0a3c7510c6b1d6a57027de3c80f9370663c711bb7504c"
+    },
+    "kernel/src/ktests/boot/acpi.rs": {
+      "role": "observe",
+      "sha256": "b311fd39c629829bdc8a9de6a2c1af683531d2740d9b84873b859b1c9c1916ad",
+      "size": 12054,
+      "normalized_sha256": "8e788b34dd7fa65dd1c83bd12d0b47d22065ffbcf5256de2c21f1ab538836e71"
+    },
+    "kernel/src/ktests/boot/boot.rs": {
+      "role": "observe",
+      "sha256": "54df68e3ad6776ad8e4d3e6cd31ffd1777a1df8a87481a79768a3d38c3a8b85b",
+      "size": 2515,
+      "normalized_sha256": "6a00891bfb26e97615c9f1c07b7b7fbe5f9c41696ca52ef86767dc12ec92cf86"
+    },
+    "kernel/src/ktests/boot/mod.rs": {
+      "role": "observe",
+      "sha256": "0e7d0fc53c96ac4d35678b8c966b311766d970cd11173efca204d7756c61e059",
+      "size": 275,
+      "normalized_sha256": "0e7d0fc53c96ac4d35678b8c966b311766d970cd11173efca204d7756c61e059"
+    },
+    "kernel/src/ktests/boot/pcienum.rs": {
+      "role": "observe",
+      "sha256": "e1aefabbd7690294bf100abf269c8fe229653687668e84fa27913b8052edaeee",
+      "size": 8906,
+      "normalized_sha256": "e1aefabbd7690294bf100abf269c8fe229653687668e84fa27913b8052edaeee"
+    },
+    "kernel/src/ktests/common.rs": {
+      "role": "observe",
+      "sha256": "51e16df63f64269d5401a296e4ba8aceef577da1f7330059bc0ee4f73ad6cbe4",
+      "size": 7282,
+      "normalized_sha256": "51e16df63f64269d5401a296e4ba8aceef577da1f7330059bc0ee4f73ad6cbe4"
+    },
+    "kernel/src/ktests/diag/crash.rs": {
+      "role": "observe",
+      "sha256": "b873aae2b2f8f562a8cf1a77166dabfb768f093253923f3e9916f438a18d1f1e",
+      "size": 24423,
+      "normalized_sha256": "923d1f0ecd654e6e6ed8048921b70432e852040134c3226401c1fefef8677e9c"
+    },
+    "kernel/src/ktests/diag/logread.rs": {
+      "role": "observe",
+      "sha256": "2132b95cbc859fa2b200ae9af78525bdb5fcbe52f5562f1ee1694c57d5039165",
+      "size": 9345,
+      "normalized_sha256": "2132b95cbc859fa2b200ae9af78525bdb5fcbe52f5562f1ee1694c57d5039165"
+    },
+    "kernel/src/ktests/diag/mod.rs": {
+      "role": "observe",
+      "sha256": "388e25345161ff663a925c65e497b143d63ff3668bf3258a86eedf7ea5e37d68",
+      "size": 333,
+      "normalized_sha256": "388e25345161ff663a925c65e497b143d63ff3668bf3258a86eedf7ea5e37d68"
+    },
+    "kernel/src/ktests/diag/state.rs": {
+      "role": "observe",
+      "sha256": "09cff174c8ac23457d2ab901bcdbefce27a506867c3c581c6bbe28aba1c66fbf",
+      "size": 14423,
+      "normalized_sha256": "d371f2bdfc0ec6d7e1d2bd6414775f93514c62362194186e1cd905c4626fdd00"
+    },
+    "kernel/src/ktests/diag/time.rs": {
+      "role": "observe",
+      "sha256": "a8eefbbcbfe108ac92449308775772f9845209c1fca0726639836c33372fa30c",
+      "size": 14864,
+      "normalized_sha256": "9d7748fabffdbff5c7dcd29037945a35841de606a653935d2fc2abd61a4e1edc"
+    },
+    "kernel/src/ktests/diag/uptime.rs": {
+      "role": "observe",
+      "sha256": "3d6ad58202d04efb694faa8118f6c9213d0010f3ded444c5b71e4c161192c66a",
+      "size": 6134,
+      "normalized_sha256": "3d6ad58202d04efb694faa8118f6c9213d0010f3ded444c5b71e4c161192c66a"
+    },
+    "kernel/src/ktests/display/mod.rs": {
+      "role": "observe",
+      "sha256": "4d0adb84c610002ebd25bd913cf381cf6886f308346611a102259bad3cb24185",
+      "size": 5495,
+      "normalized_sha256": "4d0adb84c610002ebd25bd913cf381cf6886f308346611a102259bad3cb24185"
+    },
+    "kernel/src/ktests/driver/driver.rs": {
+      "role": "observe",
+      "sha256": "7e786ce5f13ef66668a7a2767a1c5ae22b536b5a8a44478466f099b49761e182",
+      "size": 86861,
+      "normalized_sha256": "4901bb090f607585f792f74755acf9c0fb993bbfdca62e216e2845122db6ed68"
+    },
+    "kernel/src/ktests/driver/mod.rs": {
+      "role": "observe",
+      "sha256": "4c5f3dcad28ce20a29ee89841424368286bfe62084d1a937515e26b5c325f263",
+      "size": 530,
+      "normalized_sha256": "4c5f3dcad28ce20a29ee89841424368286bfe62084d1a937515e26b5c325f263"
+    },
+    "kernel/src/ktests/driver/nvme.rs": {
+      "role": "observe",
+      "sha256": "adcb317b83b28c9f71a9b88bb57bc5d164453ea83049784fb5c948e48d37659c",
+      "size": 6914,
+      "normalized_sha256": "adcb317b83b28c9f71a9b88bb57bc5d164453ea83049784fb5c948e48d37659c"
+    },
+    "kernel/src/ktests/driver/resource.rs": {
+      "role": "observe",
+      "sha256": "0ac2d07cd3404137e7b394b7bb13c1208ebf34ef96b8a32751acdef0488f6fbc",
+      "size": 1548,
+      "normalized_sha256": "f46b7156a6def588423cf4e79d90b1ea885e649e4fb8dbe7dcb99dd37569fa50"
+    },
+    "kernel/src/ktests/driver/virtio.rs": {
+      "role": "observe",
+      "sha256": "078f12811b6b865d7a929c258703cc77b6df0e58970cd916aee5c2e529ae5c81",
+      "size": 20668,
+      "normalized_sha256": "9bcac56f1b4e226b7cb91dc3b1ea6461c3f13aa7fd7c8fdfaf5005953e245b75"
+    },
+    "kernel/src/ktests/driver/watchdog.rs": {
+      "role": "observe",
+      "sha256": "24be6f02ccfbcf6c39e68b431989a75aa35245cbbab3db1d9da4460dd7a89316",
+      "size": 6862,
+      "normalized_sha256": "ab6ac0c24f977dc73147a619762e1c40274f7c72bce2741e344eab2a1bc3f6d3"
+    },
+    "kernel/src/ktests/memory/heap.rs": {
+      "role": "observe",
+      "sha256": "21237bd73664531631d724eb8737553a2e792a8139409de60583d6fd26b78eb7",
+      "size": 7431,
+      "normalized_sha256": "33ec79901ad159172fd2f3170e94036ac81d94bcceaefeb41d0510e3fa6ac8d3"
+    },
+    "kernel/src/ktests/memory/mm.rs": {
+      "role": "observe",
+      "sha256": "82b331b8651fb8307417f38438a8e595177fad3ab2f6fa2d5ec15c9b87bb8380",
+      "size": 161119,
+      "normalized_sha256": "f19ce799f3d8bb0a2ee62517faab06968a85aabc06a3c23b9f1475180e5f30bc"
+    },
+    "kernel/src/ktests/memory/mod.rs": {
+      "role": "observe",
+      "sha256": "561178aa43d8e70aaa76297d327cd3857112a549f96acfb5a8246694c980f779",
+      "size": 226,
+      "normalized_sha256": "561178aa43d8e70aaa76297d327cd3857112a549f96acfb5a8246694c980f779"
+    },
+    "kernel/src/ktests/mod.rs": {
+      "role": "observe",
+      "sha256": "a21b8a5e5eee00a6b14acaaac00a214941c7d554a8d33515b84ec3ccb531e826",
+      "size": 605,
+      "normalized_sha256": "a21b8a5e5eee00a6b14acaaac00a214941c7d554a8d33515b84ec3ccb531e826"
+    },
+    "kernel/src/ktests/net/mod.rs": {
+      "role": "observe",
+      "sha256": "7410dc94481fb726e6c5b540654f2851d008c55f5e4f94dfc1c4993e42068355",
+      "size": 242,
+      "normalized_sha256": "7410dc94481fb726e6c5b540654f2851d008c55f5e4f94dfc1c4993e42068355"
+    },
+    "kernel/src/ktests/net/net.rs": {
+      "role": "observe",
+      "sha256": "d5a46f3c30dd627aa84cfdfaac6a01503619dce6abf340ed154ff119e4c8d0ba",
+      "size": 25456,
+      "normalized_sha256": "b9081f39cd251535ca55273522986b9f0d8b8bab508ab82041cf1b950a508c18"
+    },
+    "kernel/src/ktests/sched/mod.rs": {
+      "role": "observe",
+      "sha256": "714522f4846614cad01df164556a3a2291d53a7e8209f9de69045b9b8d10714c",
+      "size": 306,
+      "normalized_sha256": "714522f4846614cad01df164556a3a2291d53a7e8209f9de69045b9b8d10714c"
+    },
+    "kernel/src/ktests/sched/procinfo.rs": {
+      "role": "observe",
+      "sha256": "9d9d7f0b63bdb37d22da4fc2e252e53fc9c475634614bb14869e6fee9683f995",
+      "size": 9564,
+      "normalized_sha256": "364752f02ee013c94ceb3bd60163c35258adc24fcf28cfe1d09886b46052bd55"
+    },
+    "kernel/src/ktests/sched/prockill.rs": {
+      "role": "observe",
+      "sha256": "add625b22b3979d99d53686eb2137c5739fe449d3f450a3bf02df978a1db9ee7",
+      "size": 10640,
+      "normalized_sha256": "add625b22b3979d99d53686eb2137c5739fe449d3f450a3bf02df978a1db9ee7"
+    },
+    "kernel/src/ktests/sched/sched.rs": {
+      "role": "observe",
+      "sha256": "defe681e36aef9ad17d53a6a4e675c3d8eacc54482726beca8a7c7449d277c67",
+      "size": 116669,
+      "normalized_sha256": "5a165966286137186aa54f37e7d6cdb5230e8dcb33eed8e9e9e0d68e782b5ea8"
+    },
+    "kernel/src/ktests/security/mod.rs": {
+      "role": "observe",
+      "sha256": "7009082fb9b8eea5ea471de9bbf7766f6c99c89e540f4d60ee72921f25874aa3",
+      "size": 306,
+      "normalized_sha256": "7009082fb9b8eea5ea471de9bbf7766f6c99c89e540f4d60ee72921f25874aa3"
+    },
+    "kernel/src/ktests/security/sdkdemo.rs": {
+      "role": "observe",
+      "sha256": "d566c244bd69eab955d47d7252108785dad8acdbd5f47493eac7e96c808a66a5",
+      "size": 7928,
+      "normalized_sha256": "d566c244bd69eab955d47d7252108785dad8acdbd5f47493eac7e96c808a66a5"
+    },
+    "kernel/src/ktests/security/sign.rs": {
+      "role": "observe",
+      "sha256": "83faa3ffe9f98abe308059bb0ebc7bbfc45ef5182526eac0dcb158343e776123",
+      "size": 10649,
+      "normalized_sha256": "0a1d80756bd139c31bda46fdf8c2dabbcb6b1515e5b1d319e983eb59ead64deb"
+    },
+    "kernel/src/ktests/storage/esp.rs": {
+      "role": "observe",
+      "sha256": "6c5dc70db0a6ed563ca7e66692d0ac5b1a9a881f1712598fa444f7561b46fc8f",
+      "size": 9913,
+      "normalized_sha256": "53fa0314e8961bc2c1d17184846ef3d94760e4a372e0f114d706b1413b6b7ea8"
+    },
+    "kernel/src/ktests/storage/fat16.rs": {
+      "role": "observe",
+      "sha256": "962ca722a3b17f74bcb6cca9d27e29f919f596f68b83e2964914798c06bd3572",
+      "size": 9913,
+      "normalized_sha256": "8f30f8ff9691e91af94f8a252cf007e36310fae793f2ace995ecf9c355387e94"
+    },
+    "kernel/src/ktests/storage/fs.rs": {
+      "role": "observe",
+      "sha256": "9f586c16d88dd3d60b384778fbedb9d607d1cdfb971a666d759a5ceeb9e938c8",
+      "size": 48908,
+      "normalized_sha256": "b72aee2fdea056dd3515c72b8339b1db74e238c888094492ab323c9d7d3f03d0"
+    },
+    "kernel/src/ktests/storage/fs_open.rs": {
+      "role": "observe",
+      "sha256": "713d6299646508dd9452208716b6effeea354d1d6d6d448080f4dc0738ef603c",
+      "size": 48701,
+      "normalized_sha256": "8d7d11274272345a70eb52439e2e7fe2babd0d26b5814d179f861e5eaa48f840"
+    },
+    "kernel/src/ktests/storage/fs_rw.rs": {
+      "role": "observe",
+      "sha256": "93ceff76f5b97c73e8b5b6fcdb9ea7706c27e3bfde100a7db74fef3483cb1cb4",
+      "size": 22037,
+      "normalized_sha256": "93ceff76f5b97c73e8b5b6fcdb9ea7706c27e3bfde100a7db74fef3483cb1cb4"
+    },
+    "kernel/src/ktests/storage/gpt.rs": {
+      "role": "observe",
+      "sha256": "c2650f9299a2ab6fba1c90758c9944773a5dadcf13c02f83749f481ee73f7be2",
+      "size": 22068,
+      "normalized_sha256": "c2650f9299a2ab6fba1c90758c9944773a5dadcf13c02f83749f481ee73f7be2"
+    },
+    "kernel/src/ktests/storage/mod.rs": {
+      "role": "observe",
+      "sha256": "de5f1d8bf342d745eaf2fcde492841507c4c5e382b8c4a9006ea76e761cbb0cf",
+      "size": 719,
+      "normalized_sha256": "de5f1d8bf342d745eaf2fcde492841507c4c5e382b8c4a9006ea76e761cbb0cf"
+    },
+    "kernel/src/ktests/storage/nvme_fat.rs": {
+      "role": "observe",
+      "sha256": "5075babe993b0f39a585d14589fe45f9c90205ed9a817f47008f3b1c1fb4387d",
+      "size": 4543,
+      "normalized_sha256": "5075babe993b0f39a585d14589fe45f9c90205ed9a817f47008f3b1c1fb4387d"
+    },
+    "kernel/src/ktests/storage/vfs_ro.rs": {
+      "role": "observe",
+      "sha256": "70d045812f78212ceddce3dbf930de0d033b83dd2edd070db145f303e2f09c24",
+      "size": 46167,
+      "normalized_sha256": "70d045812f78212ceddce3dbf930de0d033b83dd2edd070db145f303e2f09c24"
+    },
+    "kernel/src/ktests/syscall/elf.rs": {
+      "role": "observe",
+      "sha256": "adf8fe00f4e43856ff3aeda7da62d8f68eca57fa531c3fcdb916d39b4e86e339",
+      "size": 53287,
+      "normalized_sha256": "e868dc313abff569a5c499f25c46ccde82b36bbe84ff48879388cf2cbe837820"
+    },
+    "kernel/src/ktests/syscall/mod.rs": {
+      "role": "observe",
+      "sha256": "0153d5e544989abf24de0380574166538a8f03635618fc34c20fe8c1e589551a",
+      "size": 269,
+      "normalized_sha256": "0153d5e544989abf24de0380574166538a8f03635618fc34c20fe8c1e589551a"
+    },
+    "kernel/src/ktests/syscall/syscall.rs": {
+      "role": "observe",
+      "sha256": "8d45b0a244f632bf0aec1173d5a01a504077740b4bfc7725ae6f59d2d790023e",
+      "size": 24056,
+      "normalized_sha256": "1d2f8e9b70a96eae5d2aa4fd87be2df06c2005047648ddc5fda5b22ad2ffd35b"
+    },
+    "kernel/src/ktests/syscall/user.rs": {
+      "role": "observe",
+      "sha256": "721375c73fb5435b25236d29d17154912c12c82d95a821c0b734886d786cb4c2",
+      "size": 37440,
+      "normalized_sha256": "ae523847472d0dc736cf698630129c8a26c86485d0d7b60db7df031efeaff0bf"
+    },
+    "kernel/src/main.rs": {
+      "role": "observe",
+      "sha256": "7ff3bc310f55241aee08be143b28f517a1bcc62598be3becc141125ac5565335",
+      "size": 187058,
+      "normalized_sha256": "7ff3bc310f55241aee08be143b28f517a1bcc62598be3becc141125ac5565335"
+    },
+    "kernel/src/memory/heap.rs": {
+      "role": "observe",
+      "sha256": "6bca7ddf9cf63d56aa45f7af2ff693f8eea49ed5a618329afb39efe1509e1a13",
+      "size": 16802,
+      "normalized_sha256": "6bca7ddf9cf63d56aa45f7af2ff693f8eea49ed5a618329afb39efe1509e1a13"
+    },
+    "kernel/src/memory/mm.rs": {
+      "role": "index",
+      "sha256": "c40b5e33a53e3aaaa9b05b16a13d892b32f858f003bb4c75d577a7bac745ed23",
+      "size": 161388,
+      "normalized_sha256": "361fd970be836bde3498b065eef512473cb04a135b4ea0e28a172c514b62fdaa"
+    },
+    "kernel/src/memory/mod.rs": {
+      "role": "observe",
+      "sha256": "a588f5d3ed6a98807f145c6885ca446bbf7b8a67d5dc0e6d4ed31da43625dc8c",
+      "size": 358,
+      "normalized_sha256": "a588f5d3ed6a98807f145c6885ca446bbf7b8a67d5dc0e6d4ed31da43625dc8c"
+    },
+    "kernel/src/memory/sysinfo.rs": {
+      "role": "observe",
+      "sha256": "aad82a6bb8662fd3b7c01b6348c1bd93da1d32b05add5dd02ff3e68c46a9587c",
+      "size": 3699,
+      "normalized_sha256": "aad82a6bb8662fd3b7c01b6348c1bd93da1d32b05add5dd02ff3e68c46a9587c"
+    },
+    "kernel/src/memory/vmo.rs": {
+      "role": "observe",
+      "sha256": "c986fa190dbc9b617472fae3add846c4206620bad510bddd179081b3918a4781",
+      "size": 15694,
+      "normalized_sha256": "4cb408ec18dc304d90727fb3ddc8384ab1ac0098490c4acc7a36cd2bc9d6aad8"
+    },
+    "kernel/src/network/arp.rs": {
+      "role": "observe",
+      "sha256": "55de2a8e03294903ba464d21cf72a026bb76fa5b537fe4fdb567f6315ab0220f",
+      "size": 4093,
+      "normalized_sha256": "55de2a8e03294903ba464d21cf72a026bb76fa5b537fe4fdb567f6315ab0220f"
+    },
+    "kernel/src/network/arp_table.rs": {
+      "role": "observe",
+      "sha256": "0bf2328e7ea007bd12bd8ba14c6e4841a5753777ff35a33162388251a2dfc448",
+      "size": 3820,
+      "normalized_sha256": "0bf2328e7ea007bd12bd8ba14c6e4841a5753777ff35a33162388251a2dfc448"
+    },
+    "kernel/src/network/dhcp.rs": {
+      "role": "observe",
+      "sha256": "5290a0e5ed1cc5a82a44303812d17c3a59e74d3000286d958c07aecb059a1cea",
+      "size": 7573,
+      "normalized_sha256": "5290a0e5ed1cc5a82a44303812d17c3a59e74d3000286d958c07aecb059a1cea"
+    },
+    "kernel/src/network/dns.rs": {
+      "role": "observe",
+      "sha256": "a7216a3fdcca5770ce697a1b49e859dc84cdbafe1f1582688dbb5b683ad61738",
+      "size": 11796,
+      "normalized_sha256": "a7216a3fdcca5770ce697a1b49e859dc84cdbafe1f1582688dbb5b683ad61738"
+    },
+    "kernel/src/network/eth.rs": {
+      "role": "observe",
+      "sha256": "3a23098e29322bd5b0038e4d1269d5b8c8ce3f3f256f2fcf2024cc3089cfa318",
+      "size": 2964,
+      "normalized_sha256": "053d3e3ffedf42032abf4730eb04d8a01cdbc77d0a2f78f38ff51c9007ced198"
+    },
+    "kernel/src/network/icmp.rs": {
+      "role": "observe",
+      "sha256": "77588cbe006ede682d19a7b2825f7a0536bf8ceab70307e0dc90392d1e38720a",
+      "size": 4537,
+      "normalized_sha256": "77588cbe006ede682d19a7b2825f7a0536bf8ceab70307e0dc90392d1e38720a"
+    },
+    "kernel/src/network/ipv4.rs": {
+      "role": "observe",
+      "sha256": "8ad832a649380e75b22ed8d41086721c5fc3550ab3abe4502d4b9a3c855f5ea9",
+      "size": 3941,
+      "normalized_sha256": "8ad832a649380e75b22ed8d41086721c5fc3550ab3abe4502d4b9a3c855f5ea9"
+    },
+    "kernel/src/network/mod.rs": {
+      "role": "observe",
+      "sha256": "1916f64a704dbe3bd162679959513e628f1f827794bbe184dcab4a0b29665260",
+      "size": 3164,
+      "normalized_sha256": "1916f64a704dbe3bd162679959513e628f1f827794bbe184dcab4a0b29665260"
+    },
+    "kernel/src/network/proto.rs": {
+      "role": "observe",
+      "sha256": "97488e25de33d9d6dea135cb237093d84d1dce7841768fb173c332fdb1d79de3",
+      "size": 836,
+      "normalized_sha256": "97488e25de33d9d6dea135cb237093d84d1dce7841768fb173c332fdb1d79de3"
+    },
+    "kernel/src/resource/mod.rs": {
+      "role": "observe",
+      "sha256": "3bc9a1a4906ea7716029616c532e4ebc91c7f98f94833ce93e7a9ad6af61f8f1",
+      "size": 4672,
+      "normalized_sha256": "2a0c5cc33340e47f30f0497586379bdfecf1e26bc32dc9bb19ec8ac973fd128f"
+    },
+    "kernel/src/sched/elf.rs": {
+      "role": "observe",
+      "sha256": "42753e20f698ec94b1bce3958f609480460941224e6fcf347b44d2c8755ad97c",
+      "size": 14739,
+      "normalized_sha256": "42753e20f698ec94b1bce3958f609480460941224e6fcf347b44d2c8755ad97c"
+    },
+    "kernel/src/sched/mod.rs": {
+      "role": "observe",
+      "sha256": "791e6a4a43059f209d1b863eac99ccead4b643770086d864f30a09679cee8a36",
+      "size": 131717,
+      "normalized_sha256": "791e6a4a43059f209d1b863eac99ccead4b643770086d864f30a09679cee8a36"
+    },
+    "kernel/src/sched/proc.rs": {
+      "role": "observe",
+      "sha256": "052dbc312f0eb437836649bfd7f68aec73f6513c4f7fc6c7e6fbaf9524a9b5e8",
+      "size": 23132,
+      "normalized_sha256": "052dbc312f0eb437836649bfd7f68aec73f6513c4f7fc6c7e6fbaf9524a9b5e8"
+    },
+    "kernel/src/sched/signal.rs": {
+      "role": "observe",
+      "sha256": "2e1377a0174bb954724fb45df6d402f912c4fff430ebd9e4dc0bd1574caee4df",
+      "size": 8508,
+      "normalized_sha256": "2e1377a0174bb954724fb45df6d402f912c4fff430ebd9e4dc0bd1574caee4df"
+    },
+    "kernel/src/sched/user.rs": {
+      "role": "observe",
+      "sha256": "6c1414c82a5ad65ade5e8a2e1c6c4191b22d991798f0e3f37c56d1c8f7f2bf08",
+      "size": 227073,
+      "normalized_sha256": "6c1414c82a5ad65ade5e8a2e1c6c4191b22d991798f0e3f37c56d1c8f7f2bf08"
+    },
+    "kernel/src/security/cred.rs": {
+      "role": "observe",
+      "sha256": "3241a6606588217f0ebec3bf9a44a061c946dbcd4edb5d530eeb9b9f65d3b601",
+      "size": 8685,
+      "normalized_sha256": "3241a6606588217f0ebec3bf9a44a061c946dbcd4edb5d530eeb9b9f65d3b601"
+    },
+    "kernel/src/security/mod.rs": {
+      "role": "observe",
+      "sha256": "2fd9d1ac894d7f0629e14ef2b36f3af81111b20deac1a8b532ae7c1012d39a24",
+      "size": 337,
+      "normalized_sha256": "2fd9d1ac894d7f0629e14ef2b36f3af81111b20deac1a8b532ae7c1012d39a24"
+    },
+    "kernel/src/security/sign.rs": {
+      "role": "observe",
+      "sha256": "76b969f8331c0b31f7a19181ecbbec8034bb1e4b5f04f74ccc6675de057951e6",
+      "size": 22745,
+      "normalized_sha256": "3fd3c737fa5336ff32521ff2c410f5c9b7daf180339416894c547f4a8041924b"
+    },
+    "kernel/src/sync/mod.rs": {
+      "role": "observe",
+      "sha256": "300778c01eba4b27fa66393968b7b9a5794ba2c35a8f0a49e78b5e1a0b145d3f",
+      "size": 32709,
+      "normalized_sha256": "e7f1fce87745675c4320380330d86044a90ce25d01e17c93e172ef96679e2b87"
+    },
+    "kernel/src/testing/ktest.rs": {
+      "role": "observe",
+      "sha256": "026598b9a32d7d6f3f1e791e603470909f66d9e6b8b77e0dd94e468d35acc255",
+      "size": 3097,
+      "normalized_sha256": "026598b9a32d7d6f3f1e791e603470909f66d9e6b8b77e0dd94e468d35acc255"
+    },
+    "kernel/src/testing/mod.rs": {
+      "role": "observe",
+      "sha256": "4fe888bb4e74d017fd3caf71bb0ee98342db79d1a04995a1df2ae6e14608f39b",
+      "size": 354,
+      "normalized_sha256": "4fe888bb4e74d017fd3caf71bb0ee98342db79d1a04995a1df2ae6e14608f39b"
+    },
+    "kernel/src/time/clock.rs": {
+      "role": "observe",
+      "sha256": "ebe191a817f9282b5a1e236b6d1357826f364531dccb9d0ea4b138e8431cc72a",
+      "size": 11172,
+      "normalized_sha256": "129153978690e9f22260a2429c0125ac37406d2ae28b5e6181435bf439c9f56f"
+    },
+    "kernel/src/time/mod.rs": {
+      "role": "observe",
+      "sha256": "de2228d7e16152881b0dfe7e5d03a70eba954b84cc560a3e7ca076b1eac5f3f5",
+      "size": 420,
+      "normalized_sha256": "de2228d7e16152881b0dfe7e5d03a70eba954b84cc560a3e7ca076b1eac5f3f5"
+    },
+    "kernel/src/time/tsc.rs": {
+      "role": "observe",
+      "sha256": "3f57db57bb808b90b26165ef74fc0e583cfbe63be2a2a2725f0f424687ca25b4",
+      "size": 4858,
+      "normalized_sha256": "3f57db57bb808b90b26165ef74fc0e583cfbe63be2a2a2725f0f424687ca25b4"
+    },
+    "rust-toolchain.toml": {
+      "role": "observe",
+      "sha256": "8bff7c06d94a7839872d4e6853a5db39b3b3e2f14ad13e46af7e3a22e490b08e",
+      "size": 728,
+      "normalized_sha256": "8bff7c06d94a7839872d4e6853a5db39b3b3e2f14ad13e46af7e3a22e490b08e"
+    },
+    "tools/aurora.py": {
+      "role": "observe",
+      "sha256": "1e34aff3d4c01f9dec0b3bafb6d43c09b7343a27a5a445d8e3c476eb8981d2f3",
+      "size": 628466,
+      "normalized_sha256": "d2d823ba57bc9c51df40f3fd6ea7e7e703cbf3a4fee6430010450fefd5360965"
+    },
+    "tools/esp_image.py": {
+      "role": "observe",
+      "sha256": "55ed9ee84f8b87e0c2519577896fde4ee72d0ebc83f639ff1bb3179fc8c427ea",
+      "size": 35723,
+      "normalized_sha256": "67fa2080deabfe195d85e276c61cf8df2bbc3ed5baf1615652414fb6b920f5b8"
+    },
+    "tools/fetch.py": {
+      "role": "observe",
+      "sha256": "540b6c99500c31640567fa2262029d675ca0d16abb12be42a496c285b414e9b3",
+      "size": 6374,
+      "normalized_sha256": "e9285d9c1dfbf98cbf82fad55e49829b75f7ffee3e1f2fc00af1414312718229"
+    },
+    "tools/fixtures/fat32-small.img.zz": {
+      "role": "observe",
+      "sha256": "77fbbd571729ec7eb56ce786e8af8bb887e019de9b5758af44304614760ffe93",
+      "size": 40895
+    },
+    "tools/fixtures/fat32-wide.img.zz": {
+      "role": "observe",
+      "sha256": "5621d7a75a33051d685c18a3f09fdde13049fc96b616e73bc30e7f91f4f0869c",
+      "size": 262652
+    },
+    "tools/make_fat16_mem.py": {
+      "role": "observe",
+      "sha256": "9e9767acab766318ec91c9b1768177d6b280072cba9707eeb5ad2afddce6e447",
+      "size": 4055,
+      "normalized_sha256": "3951abefede783e3aa431b7577fabee30d12d3ca9b189aab83614cb064bda4c6"
+    },
+    "tools/make_fat32_deep.py": {
+      "role": "observe",
+      "sha256": "7727e9afcacd10e6f11eec79da8d3a0e5810ef246cfe7976676990c7344bea21",
+      "size": 22143,
+      "normalized_sha256": "e23399768e8febd8386d0505ac7e387577d8f11ffc5a27df22fd969cc6973cc6"
+    },
+    "tools/make_fat32_mem.py": {
+      "role": "observe",
+      "sha256": "39c47e424f6261d94f6dfdd01585391444912a51ab6c15a28d84b4bd1ccbc44e",
+      "size": 10134,
+      "normalized_sha256": "e15493246c4447ec1dc279dc2cda539038ca1f309205041f2a599e9b7b786ceb"
+    },
+    "tools/make_fat32_rw.py": {
+      "role": "observe",
+      "sha256": "45d69a7cb5e3d3bfa13e521c8c795311163e220117fc56b18de5c9184c13ef18",
+      "size": 8386,
+      "normalized_sha256": "45d69a7cb5e3d3bfa13e521c8c795311163e220117fc56b18de5c9184c13ef18"
+    },
+    "tools/make_gpt_disk.py": {
+      "role": "observe",
+      "sha256": "c5848ee4d988d213cf4e56f0e55b0887b3ff1e8c590217f181b1662318ac2bf0",
+      "size": 6139,
+      "normalized_sha256": "6b2d51729b8c17080528b8ec06876b3162e3d4b05a807f009a1d22aa6f4f1390"
+    },
+    "tools/patch_fat32_file.py": {
+      "role": "observe",
+      "sha256": "72bbaf69f5e4d0d43ce0ce668ddb4c600f49d4398c810bcfd48bb6f8b35b77e3",
+      "size": 5382,
+      "normalized_sha256": "72bbaf69f5e4d0d43ce0ce668ddb4c600f49d4398c810bcfd48bb6f8b35b77e3"
+    },
+    "tools/pkg_manifest.py": {
+      "role": "observe",
+      "sha256": "ed1e2258d82715979086a4684e8bc6dbc16dafc6b4e08e507db5108065a56e07",
+      "size": 6384,
+      "normalized_sha256": "ed1e2258d82715979086a4684e8bc6dbc16dafc6b4e08e507db5108065a56e07"
+    },
+    "tools/validate_esp.py": {
+      "role": "observe",
+      "sha256": "ad48b1e7d1b159e32df7d73d5e5bc7a7db62ead827955a41f43cad0c49ddbc81",
+      "size": 27372,
+      "normalized_sha256": "2c9773ea2ed12766cca30f344e388b22cfa8371b6d29f6914a983e0a4474cd89"
+    },
+    "tools/versions.toml": {
+      "role": "observe",
+      "sha256": "60d795ab3650251ca3646d1d60da4c5c348fd651a7c66a5d569542edd416cbff",
+      "size": 2282,
+      "normalized_sha256": "60d795ab3650251ca3646d1d60da4c5c348fd651a7c66a5d569542edd416cbff"
+    },
+    "user/execprobe/Cargo.toml": {
+      "role": "observe",
+      "sha256": "7b7e634637b2e93755ab3c87cb64fef18d1ad9282fdc8535931a7a03bbe4b7c1",
+      "size": 581,
+      "normalized_sha256": "7b7e634637b2e93755ab3c87cb64fef18d1ad9282fdc8535931a7a03bbe4b7c1"
+    },
+    "user/execprobe/link.ld": {
+      "role": "observe",
+      "sha256": "6711599e38e28071697bb6d650dea6ce80373c526aa5047554a8d18455fd724d",
+      "size": 2504,
+      "normalized_sha256": "1dbdd3711b84ab772398ee5513a9d587c41092511ed945dbee1e5ae5f132fa90"
+    },
+    "user/execprobe/src/main.rs": {
+      "role": "observe",
+      "sha256": "8e1392b5cc3b55f902231dd324eb445054c40f5edec1bf7645f710445f81efea",
+      "size": 18115,
+      "normalized_sha256": "c72e0647c77345223b2269686c3f69ae7776a82a77678481fda65bb5aec0fe19"
+    },
+    "user/fileprobe/Cargo.toml": {
+      "role": "observe",
+      "sha256": "36410aee103693a2a15811443a59a6b6b9f762c9cc11dd79dd6425cecea6f0cc",
+      "size": 799,
+      "normalized_sha256": "36410aee103693a2a15811443a59a6b6b9f762c9cc11dd79dd6425cecea6f0cc"
+    },
+    "user/fileprobe/link.ld": {
+      "role": "observe",
+      "sha256": "ada042e8d181c02799c604a36743740edfd1164dc8ac28477a541efc300a857c",
+      "size": 1597,
+      "normalized_sha256": "ada042e8d181c02799c604a36743740edfd1164dc8ac28477a541efc300a857c"
+    },
+    "user/fileprobe/src/main.rs": {
+      "role": "observe",
+      "sha256": "47aac30ae31a72e046db34780b63be1725bdc480be35f29ebc9c74b0eb790b40",
+      "size": 17169,
+      "normalized_sha256": "c5bbb8883a92f66a6f00402b46d9947438bd4b3590f9f7e0ef291f18920237b2"
+    },
+    "user/hello/Cargo.toml": {
+      "role": "observe",
+      "sha256": "8e67c03c2cd7a258d500ad31d300517cc02b3f77980d401e3acdd7ae90b8b2bc",
+      "size": 569,
+      "normalized_sha256": "8e67c03c2cd7a258d500ad31d300517cc02b3f77980d401e3acdd7ae90b8b2bc"
+    },
+    "user/hello/link.ld": {
+      "role": "observe",
+      "sha256": "53f7fb308983eee0334da482002f53854d80907c6690a63cec218f63ecbaee3b",
+      "size": 1746,
+      "normalized_sha256": "53f7fb308983eee0334da482002f53854d80907c6690a63cec218f63ecbaee3b"
+    },
+    "user/hello/src/main.rs": {
+      "role": "observe",
+      "sha256": "88b8042500d7e0699390cbb76e0ed13e9de65a7ec651083569a1f948a029bc62",
+      "size": 29375,
+      "normalized_sha256": "88b8042500d7e0699390cbb76e0ed13e9de65a7ec651083569a1f948a029bc62"
+    },
+    "user/probe/Cargo.toml": {
+      "role": "observe",
+      "sha256": "9834a1167e97bc723f4c636820eaa09a6dc926b892e22ea5f8d475c832a388e1",
+      "size": 810,
+      "normalized_sha256": "9834a1167e97bc723f4c636820eaa09a6dc926b892e22ea5f8d475c832a388e1"
+    },
+    "user/probe/link.ld": {
+      "role": "observe",
+      "sha256": "15b3bdfe437a915531d7e21c073763c656c3cca169a2bb3e089da9961faf1955",
+      "size": 1694,
+      "normalized_sha256": "15b3bdfe437a915531d7e21c073763c656c3cca169a2bb3e089da9961faf1955"
+    },
+    "user/probe/src/main.rs": {
+      "role": "observe",
+      "sha256": "530f78318a9dc1fc0d6dbb2dc35514c6a5e796828b139cd105a047dcdc86f6ea",
+      "size": 18900,
+      "normalized_sha256": "530f78318a9dc1fc0d6dbb2dc35514c6a5e796828b139cd105a047dcdc86f6ea"
+    },
+    "user/runtime/Cargo.toml": {
+      "role": "observe",
+      "sha256": "1c7fe032bdc7e0ef2984c9f22d294b24bf423f263f1d0e38627490cdd8eaf788",
+      "size": 526,
+      "normalized_sha256": "1c7fe032bdc7e0ef2984c9f22d294b24bf423f263f1d0e38627490cdd8eaf788"
+    },
+    "user/runtime/src/elf.rs": {
+      "role": "observe",
+      "sha256": "984670c0332d7f4a52252e03c2ee302191be6bd267b8c7b2600e66e953ea7d90",
+      "size": 8453,
+      "normalized_sha256": "6d6d99c85cd9a60abd1d3ee8c3da23d62a952b86338e5354a3a5643988a23dcd"
+    },
+    "user/runtime/src/exec.rs": {
+      "role": "observe",
+      "sha256": "a31535bb80759354922943ff2ffa0a5caf7230b97a0bb281b0ee5d0c629ecc3b",
+      "size": 10227,
+      "normalized_sha256": "368c64847d7b184b9e924849bd5f8a9f055deec348f0f7e67a55bd3083a2ef7b"
+    },
+    "user/runtime/src/lib.rs": {
+      "role": "observe",
+      "sha256": "a6326cb97d2aa020b9a2fb111661ba1d830ea5ec808227318373bb72641da3a4",
+      "size": 65863,
+      "normalized_sha256": "a6326cb97d2aa020b9a2fb111661ba1d830ea5ec808227318373bb72641da3a4"
+    },
+    "user/sdkdemo/Cargo.toml": {
+      "role": "observe",
+      "sha256": "793aee1dabe3447641f87006e4c23915851fccae6bdc192f5b2a44b0efb46260",
+      "size": 888,
+      "normalized_sha256": "793aee1dabe3447641f87006e4c23915851fccae6bdc192f5b2a44b0efb46260"
+    },
+    "user/sdkdemo/link.ld": {
+      "role": "observe",
+      "sha256": "31cd2a77ae6f7521af4c99bad9ab9071159dc1eef602b9c79039e30940bffdf2",
+      "size": 1580,
+      "normalized_sha256": "31cd2a77ae6f7521af4c99bad9ab9071159dc1eef602b9c79039e30940bffdf2"
+    },
+    "user/sdkdemo/src/main.rs": {
+      "role": "observe",
+      "sha256": "96fbdad049234658ad45e3aa488b9f367904a98bcc25085bc79cacd060ab620d",
+      "size": 9786,
+      "normalized_sha256": "96fbdad049234658ad45e3aa488b9f367904a98bcc25085bc79cacd060ab620d"
+    },
+    "user/shell/Cargo.toml": {
+      "role": "observe",
+      "sha256": "1799194556b682c0f80e13aede3317fea988c1b2aa7def1076ca7636181f4967",
+      "size": 798,
+      "normalized_sha256": "1799194556b682c0f80e13aede3317fea988c1b2aa7def1076ca7636181f4967"
+    },
+    "user/shell/link.ld": {
+      "role": "observe",
+      "sha256": "c90a6a99337c89f78ff2134ca98926edebac0bfb8ca8c789a1b9f17509af2645",
+      "size": 1904,
+      "normalized_sha256": "c90a6a99337c89f78ff2134ca98926edebac0bfb8ca8c789a1b9f17509af2645"
+    },
+    "user/shell/src/main.rs": {
+      "role": "observe",
+      "sha256": "ba708fb9b2fedff4b1db9114333317052f6d5de1e7894e32f501664123148ab6",
+      "size": 25888,
+      "normalized_sha256": "315bc2839aa0bc179dfe6595c87ba7c6faa50f582efe2d677a5d9a6880c72cb5"
+    },
+    "user/shell/src/parser.rs": {
+      "role": "observe",
+      "sha256": "99d56cff0cfa2c6bab0d2e1a54e05c1edaabb38b6cf6ded3ef74bcea38896407",
+      "size": 9780,
+      "normalized_sha256": "99d56cff0cfa2c6bab0d2e1a54e05c1edaabb38b6cf6ded3ef74bcea38896407"
+    },
+    "user/shell/src/registry.rs": {
+      "role": "observe",
+      "sha256": "36b96e82836b798178ec94cca68f62d728d47660585e93358add30ab3a865f2a",
+      "size": 87929,
+      "normalized_sha256": "36b96e82836b798178ec94cca68f62d728d47660585e93358add30ab3a865f2a"
+    }
+  },
+  "managed_scope": {
+    "version": "managed-scope-baseline/v1",
+    "policy_identity": "c53d9e30b0d582a4dbe043a3639ae222876b5ce831506baf2677a05fc1f9ff20",
+    "observe_change_policy": "informational",
+    "budget_policy_identity": "15e9b37a6c57e9bf03c9df3d0d049eb5b9a7f5540f9d34960408114e2538a32d",
+    "budget_policy": {
+      "version": "cognition-budget-policy/v1",
+      "mode": "enforce",
+      "whole_index": {
+        "target_tokens": 200000,
+        "warning_tokens": 300000,
+        "max_tokens": 400000
+      },
+      "r": [
+        {
+          "min_c": 1,
+          "max_c": 4,
+          "target_tokens": 25,
+          "max_tokens": 50
+        },
+        {
+          "min_c": 5,
+          "max_c": 7,
+          "target_tokens": 45,
+          "max_tokens": 90
+        },
+        {
+          "min_c": 8,
+          "max_c": 8,
+          "target_tokens": 70,
+          "max_tokens": 140
+        },
+        {
+          "min_c": 9,
+          "max_c": 9,
+          "target_tokens": 90,
+          "max_tokens": 180
+        }
+      ],
+      "s": [
+        {
+          "min_c": 1,
+          "max_c": 4,
+          "target_tokens": 20,
+          "max_tokens": 40
+        },
+        {
+          "min_c": 5,
+          "max_c": 7,
+          "target_tokens": 40,
+          "max_tokens": 80
+        },
+        {
+          "min_c": 8,
+          "max_c": 8,
+          "target_tokens": 70,
+          "max_tokens": 140
+        },
+        {
+          "min_c": 9,
+          "max_c": 9,
+          "target_tokens": 100,
+          "max_tokens": 200
+        }
+      ]
+    },
+    "apply_authorization_mode": "auto"
+  }
+}

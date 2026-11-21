@@ -1,0 +1,6 @@
+#AOCI-CODE-VOLUME: 1
+
+===/<repository>/===
+
+===/<repository>/kernel/src/memory/===
+mm.rs[CB9L]: F:内核唯一的物理内存与地址空间权威：分配与回收帧、建与拆页表、维护映射所有权，并保证多 CPU 下 TLB 与共享帧一致 | R:code:kernel/src/memory/mod.rs,code:kernel/src/memory/heap.rs,code:kernel/src/memory/vmo.rs,code:kernel/src/sched/mod.rs,code:kernel/src/arch/x86_64/trap.rs,code:kernel/src/sync/mod.rs,code:kernel/src/arch/x86_64/cpu.rs,code:kernel/src/arch/x86_64/apic.rs | A:map,unmap,phys_alloc,frame_get/frame_put,aspace_new,MAX_ADDR_SPACES | S:shootdown_self 不拿锁、不分配、不打印：请求方正持 VMM(20) 等回执，处理方取任何锁都可能跨 CPU 互等，而 sync 的重入检测只比令牌、判不出别人持锁。它即使读到 SD_VA=0 也必须回执，请求方按在线 CPU 逐个收执，少一个就超时升 L4。aspace_switch 与 aspace_register_cpu 不取 VMM：换人点 IF=0，取锁会把本 CPU 的回执绑在别人的锁上（M13 实测互等）。销毁 AS 只还 pt_frames 记的自建表页，高 256 项的下层表是共享内核表，还它等于抽掉内核半区。
