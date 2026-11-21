@@ -472,6 +472,155 @@ fn cell_release(t: &mut Table, i: u8) {
     }
 }
 
+// ---------------------------------------------------------------- ADR-180：per-process fd 表
+
+/// fd 表容量（起步）。Linux 的 `NR_OPEN_DEFAULT = BITS_PER_LONG = 64`
+///（`include/linux/fdtable.h`），我们取同一个数。
+pub const FD_TABLE_INIT: usize = 64;
+
+/// fd 表的**最大**容量。Linux 的 `RLIMIT_NOFILE` 软限默认 1024
+///（`include/uapi/linux/limits.h` `NR_OPEN`），我们不做得比它大。
+pub const FD_TABLE_MAX: usize = 1024;
+
+/// 一个进程的 fd 表（ADR-180）。**每进程一份，首次 open 时分配**。
+///
+/// ## 为什么不是内嵌定长数组
+///
+/// `[u32; 64]` 内嵌进 `ProcEntry` 是 256 B × 32768 进程 = **8 MiB `.bss`**，
+/// 那正是 ADR-179 撞过的坑（推高镜像布局 ⇒ IOAPIC `irt` 读成 1 ⇒ HANG）。
+///
+/// Linux 的 `files_struct` 由 kmem_cache 按需分配、fd 数组按需增长；本类型等价。
+///
+/// ## 形状
+///
+/// `entries[i]` = fd `i` 对应的**句柄值**（`u64`，与 `Handle` 同宽），0 = 该 fd 空闲。
+/// 句柄值本身不可能是 0（`Handle::unpack` 把 0 判为非法），所以 0 可以安全地当哨兵。
+pub struct FdTable {
+    /// 表本体的 HHDM 虚地址。0 = 还没分配。
+    base: AtomicU64,
+    /// 当前容量（`FD_TABLE_INIT` 或翻倍后的值）。0 = 还没分配。
+    cap: AtomicUsize,
+    /// 已用个数（判据与 `close` 的快速路径用）。
+    used: AtomicUsize,
+}
+
+impl FdTable {
+    pub const fn new() -> FdTable {
+        FdTable { base: AtomicU64::new(0), cap: AtomicUsize::new(0), used: AtomicUsize::new(0) }
+    }
+
+    /// 首次使用前分配表本体。**调用方持 HANDLE 锁**（与 `TABLE` 同一把）。
+    ///
+    /// 返回 `Err` 表示物理内存不足 ⇒ 上层回 `-6`（表/名额耗尽），
+    /// **不是** `-1`（参数形状不对）。
+    fn ensure(&self) -> Result<(), HErr> {
+        if self.base.load(Ordering::Acquire) != 0 {
+            return Ok(());
+        }
+        let bytes = FD_TABLE_INIT * core::mem::size_of::<u64>();
+        let pages = bytes.div_ceil(crate::mm::PAGE);
+        let order = (usize::BITS - 1 - pages.leading_zeros()) as u8;
+        // 与句柄表同一修法：从 max_phys/2 之上分配，避开 bootloader 占用的低端区。
+        let min_phys = crate::mm::max_phys() / 2;
+        let frames = crate::mm::phys_alloc_above(order, crate::mm::MOD_BOOT, min_phys)
+            .map_err(|_| HErr::Exhausted)?;
+        let base = frames.base().0;
+        core::mem::forget(frames);
+        let va = crate::mm::hhdm() + base;
+        // SAFETY: va 指向刚分配的连续帧（>= FD_TABLE_INIT 个 u32），
+        // 调用方持 HANDLE 锁 ⇒ 独占；归 MOD_BOOT 永不归还。
+        unsafe {
+            let p = va as *mut u64;
+            for i in 0..FD_TABLE_INIT {
+                core::ptr::write(p.add(i), 0);
+            }
+        }
+        self.base.store(va, Ordering::Release);
+        self.cap.store(FD_TABLE_INIT, Ordering::Release);
+        Ok(())
+    }
+
+    /// 表切片。未分配时返回空。**调用方持 HANDLE 锁**。
+    fn as_slice(&self) -> &[u64] {
+        let base = self.base.load(Ordering::Acquire);
+        let cap = self.cap.load(Ordering::Acquire);
+        if base == 0 || cap == 0 {
+            return &[];
+        }
+        // SAFETY: base/cap 由 `ensure` 一次性写入（Release/Acquire 配对）；
+        // 内存是 MOD_BOOT 的连续帧、永不归还；调用方持 HANDLE 锁。
+        unsafe { core::slice::from_raw_parts(base as *const u64, cap) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u64] {
+        let base = self.base.load(Ordering::Acquire);
+        let cap = self.cap.load(Ordering::Acquire);
+        if base == 0 || cap == 0 {
+            return &mut [];
+        }
+        // SAFETY: 同上；`&mut` 的独占性由调用方持 HANDLE 锁 + `&mut self` 共同保证。
+        unsafe { core::slice::from_raw_parts_mut(base as *mut u64, cap) }
+    }
+
+    /// 装一个句柄进最小空闲 fd，返回 fd。
+    ///
+    /// **满了不扩容**（本轮）：`FD_TABLE_MAX` 之内的扩容要重分配 + 拷贝，
+    /// 而拷贝必须在锁内、又不能让别的 CPU 看到半张表。那需要一套发布协议，
+    /// 本轮先做「64 个够用」的形状，扩容留到有真实调用者时再定（ADR-180 未决 3）。
+    pub fn install(&mut self, h: Handle) -> Result<u32, HErr> {
+        self.ensure()?;
+        let cap = self.cap.load(Ordering::Acquire);
+        let slice = self.as_mut_slice();
+        for i in 0..cap {
+            if slice[i] == 0 {
+                slice[i] = h.0;
+                self.used.fetch_add(1, Ordering::Relaxed);
+                return Ok(i as u32);
+            }
+        }
+        Err(HErr::Exhausted)
+    }
+
+    /// fd → 句柄。fd 越界或该位为空 ⇒ `None`。
+    pub fn lookup(&self, fd: u32) -> Option<Handle> {
+        let slice = self.as_slice();
+        let v = *slice.get(fd as usize)?;
+        if v == 0 { None } else { Some(Handle(v)) }
+    }
+
+    /// 释放一个 fd，返回它原来装的句柄（`None` = 本来就空）。
+    pub fn release(&mut self, fd: u32) -> Option<Handle> {
+        let slice = self.as_mut_slice();
+        let slot = slice.get_mut(fd as usize)?;
+        let v = *slot;
+        if v == 0 {
+            return None;
+        }
+        *slot = 0;
+        self.used.fetch_sub(1, Ordering::Relaxed);
+        Some(Handle(v))
+    }
+
+    /// 当前已用个数。
+    pub fn used(&self) -> usize {
+        self.used.load(Ordering::Relaxed)
+    }
+
+    /// 把 0/1/2 预置成给定的三个句柄（ADR-180 决策 2）。
+    ///
+    /// **必须在进程创建时调**：POSIX 程序不传 fd 就写 1，不预置等于任何 libc
+    /// 程序的第一行输出就失败。
+    pub fn preset_std(&mut self, stdin: Handle, stdout: Handle, stderr: Handle) -> Result<(), HErr> {
+        self.ensure()?;
+        let slice = self.as_mut_slice();
+        slice[0] = stdin.0;
+        slice[1] = stdout.0;
+        slice[2] = stderr.0;
+        self.used.store(3, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
 static TABLE: IrqSpinLock<Table> = IrqSpinLock::new(RANK_HANDLE, Table::empty());
 
 /// 引导句柄槽数组（ADR-179）。**必须在 `mm::init_allocator()` 之后、任何任务跑起来之前**。

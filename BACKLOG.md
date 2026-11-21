@@ -20937,3 +20937,81 @@ ADR-178 定的目标值（32768 进程 / 1024 作业 / 32768 AS）**已落地并
 
 - per-process fd 表（ADR-180）
 - `MAX_CPUS=8` 提到 Linux 的 64（涉及 per-CPU 数组全量重算）
+---
+
+## 493. ADR-180 落地：per-process fd 表的内核侧（2026-11-22）
+
+### 为什么做这个
+
+**socket 的第一个参数是地址族**（`int socket(int domain, int type, int protocol)`），
+而 fd 是「进程私有索引」。没有 fd 表，`socket()` 只能返回全局句柄，**IPv6 无处安放**。
+
+所以 ADR-180 是 socket + IPv6 的**前置**，不是可选项。
+
+### 现状（实测）
+
+| 项 | 现状 |
+|---|---|
+| 内核句柄 | **全局一张表**，131072 格 |
+| 用户态表示 | `pub type Handle = u64`（`user/runtime/src/lib.rs:32`）|
+| fd 概念 | **完全不存在**（`grep -r "\bfd\b" user/` 零命中）|
+
+### 交付
+
+**① `handle::FdTable`**（`kernel/src/capability/handle.rs`）
+
+| 项 | 值 | 依据 |
+|---|---|---|
+| `FD_TABLE_INIT` | 64 | Linux `NR_OPEN_DEFAULT = BITS_PER_LONG = 64` |
+| `FD_TABLE_MAX` | 1024 | Linux `RLIMIT_NOFILE` 软限 `NR_OPEN = 1024` |
+| 表项 | `u64`（与 `Handle` 同宽）| 句柄值本身是 u64，用 u32 装不下 |
+
+五个操作：`preset_std`（预置 0/1/2）、`install`、`lookup`、`release`、`used`。
+
+**为什么不在 `ProcEntry` 里内嵌 `[u64; 64]`**：256 B × 32768 进程 = **16 MiB `.bss`**，
+正是 ADR-179 撞过的坑。改成存 HHDM 指针、首次 `install` 时分配——
+这与 Linux 的 `files_struct`（kmem_cache 按需分配）等价。
+
+**② `ProcEntry.fd_table: AtomicU64`** + `proc_fd_table` / `proc_set_fd_table` 访问器。
+
+**为什么表住在 `proc` 而不是 `handle`**：fd 表的主人是进程（Linux 的 `files_struct`
+挂在 `task_struct` 上）。放进 `handle` 会让 `capability` 反过来依赖 `sched`，
+而今天 `sched → capability` 已经存在，反向再加一条会成环。
+
+**③ `t_fd_table` 用例（六格）**
+
+     fd: 预置std=true 装=true 独立=true 释放=true 空释放=true 越界安全=true 末used=4 ⇒ true
+
+### 负样本（变异证红）
+
+把 `install` 的「找空槽」判断去掉、无条件写 0 号位：
+
+    fd: 装不成立 fd=0 used=4
+    fd: 两次装不独立 fd_b=0 3=None 4=None
+    fd: 释放不成立 got=Some(Handle(slot=11 gen=0x1)) used=4
+    ⇒ false，判定 FAIL(35)
+
+**三格同时红**，证明判据咬得住。恢复后 `t_fd_table -> ok`。
+
+### 读数
+
+| 项 | 结果 |
+|---|---|
+| `check` | **20/20** |
+| `handles` 档 | PASS(33)，**101/101**（新增 `t_fd_table` 后从 100 变 101）|
+
+### ABI 没动（这是刻意的）
+
+**旧号一个不动**：8/9/10/22/24/25/26 继续收/回 `Handle`。
+
+后果：现有 **7 个用户程序一行不用改**；新 fd 号与旧句柄号可以并存，迁移是渐进的；
+失败可回退（旧路径一直在）。
+
+### 未做（ADR-180 未决）
+
+1. **fd 号段分配**（哪个 syscall 号做 `open_fd`/`read_fd`/`close_fd`）——下一轮裁决
+2. **`dup2` 语义**（覆盖目标 fd）——要动 `dup` 的既有语义，需单独 ADR
+3. **fd 表扩容**（64 → 1024 的翻倍）——要重分配 + 拷贝，且不能让别的 CPU 看到半张表，需要发布协议
+4. **fd 表释放时机**（进程退出时逐项 close 还是整表丢弃）
+5. **用户态 fd API**（7 个程序不改是硬要求，但新 API 需要有人写）
+6. **把 fd 表接进 `proc_create`**（今天 `fd_table` 字段存在但没人写）——这是下一步的入口

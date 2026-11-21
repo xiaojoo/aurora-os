@@ -17,7 +17,7 @@
 //! - **计数读数**（`proc_count`/`job_count`）也不取锁：用例收尾的扫描（`main.rs::finish_sweep`）
 //!   按 ADR-069 是"只读快照、不拿锁"的，为此两张表的 `used` 都是 `AtomicBool`。
 
-use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering, AtomicU64};
 use crate::mm;
 
 pub const MAX_PROCESSES: usize = 32768;
@@ -82,6 +82,12 @@ struct ProcEntry {
     /// 而且**必须在放掉 VMM 之后**调（它自己要取 VMM，锁内调就是重入 ⇒ L4）。
     aspace: u16,
     as_gen: u32,
+    /// 这个进程的 fd 表（ADR-180）。**存的是 HHDM 虚地址，不是内嵌数组**。
+    ///
+    /// 为什么不内嵌 `[u64; 64]`：256 B x 32768 进程 = 16 MiB `.bss`，
+    /// 正是 ADR-179 撞过的坑。Linux 的 `files_struct` 也是按需分配的。
+    /// 0 = 还没分配（首次 `install`/`preset_std` 时才分）。
+    fd_table: AtomicU64,
 }
 
 const JOB_EMPTY: JobEntry = JobEntry {
@@ -101,6 +107,7 @@ const PROC_EMPTY: ProcEntry = ProcEntry {
     job: 0,
     threads: AtomicU16::new(0),
     signal: AtomicU32::new(SIG_RUNNING),
+    fd_table: AtomicU64::new(0),
 };
 
 struct ProcState {
@@ -400,6 +407,46 @@ pub fn proc_aspace(proc_id: u16, gen: u32) -> Option<(u16, u32)> {
             return None;
         }
         Some((p.aspace, p.as_gen))
+    })
+}
+
+/// 读/写一个进程的 fd 表（ADR-180）。**调用方持 VMM 锁**（与 `proc_aspace` 同一前提）。
+///
+/// 返回 `None` = 进程不存在、已终止、或世代不符。
+///
+/// ## 为什么放在 `proc` 而不是 `handle`
+///
+/// fd 表的主人**是进程**（Linux 的 `files_struct` 挂在 `task_struct` 上）。
+/// 放进 `handle` 会让 `capability` 反过来依赖 `sched`，而今天 `sched → capability`
+/// 已经存在，反向再加一条会成环。所以表住在 `proc`，`handle` 只提供「fd → 句柄」
+/// 的语义层（后续切片）。
+pub fn proc_fd_table(proc_id: u16, gen: u32) -> Option<*mut crate::handle::FdTable> {
+    mm::with_vmm_lock(|| {
+        let s = st();
+        let p = s.procs.get(proc_id as usize)?;
+        if !alive_flag(&p.used) || p.gen != gen {
+            return None;
+        }
+        let ptr = p.fd_table.load(Ordering::Acquire);
+        if ptr == 0 {
+            return None;
+        }
+        Some(ptr as *mut crate::handle::FdTable)
+    })
+}
+
+/// 给进程装一张 fd 表（ADR-180）。**`ptr` 必须来自 `handle` 侧的一次分配**。
+///
+/// 返回 `false` = 进程不存在或世代不符。
+pub fn proc_set_fd_table(proc_id: u16, gen: u32, ptr: u64) -> bool {
+    mm::with_vmm_lock(|| {
+        let s = st();
+        let Some(p) = s.procs.get(proc_id as usize) else { return false };
+        if !alive_flag(&p.used) || p.gen != gen {
+            return false;
+        }
+        p.fd_table.store(ptr, Ordering::Release);
+        true
     })
 }
 

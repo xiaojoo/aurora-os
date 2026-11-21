@@ -411,6 +411,9 @@ public_api = [
   "proc::proc_attach_thread",
   "proc::proc_detach_thread",
   "proc::proc_aspace",
+  # ADR-180：fd 表的主人挂在进程上。
+  "proc::proc_fd_table",
+  "proc::proc_set_fd_table",
   "proc::proc_set_aspace",
   "proc::job_charge_pages",
   "proc::job_refund_pages",
@@ -1001,6 +1004,8 @@ public_api = [
   "handle::commit_dir_read",
   # ADR-179：句柄槽数组从 .bss 改为运行时分配后的引导入口。
   "handle::init",
+  # ADR-180：per-process fd 表。
+  "handle::FdTable",
 ]
 allowed_callers = ["integration", "sched"]
 dependencies = ["memory", "storage", "sync"]

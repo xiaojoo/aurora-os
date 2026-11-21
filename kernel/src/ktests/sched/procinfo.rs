@@ -289,3 +289,110 @@ fn t_capacity_scaled() -> bool {
 
 #[cfg(feature = "handles")]
 ktest!(KT_CAPACITY_SCALED, t_capacity_scaled);
+
+/// ADR-180：per-process fd 表的**证人**。
+///
+/// ## 为什么要有这条用例
+///
+/// `FdTable` 是新增类型，`ProcEntry.fd_table` 是新增字段。如果只有「编译通过」，
+/// 证明的只是「类型定义没写错」，**证不了「装/查/释放/预置 std 都真的对」**。
+///
+/// 判据五格：
+///
+/// 1. **预置 std**：`preset_std` 之后 fd 0/1/2 各指向给定句柄，`used()==3`；
+/// 2. **装**：`install` 拿到最小空闲 fd（3），`lookup(3)` 回到那个句柄；
+/// 3. **不重复**：再装一次拿到 4（不是覆盖 3）；
+/// 4. **释放**：`release(3)` 返回原句柄、`lookup(3)` 变 `None`、`used()` 减 1；
+/// 5. **空槽释放**：`release` 一个空 fd 返回 `None`（不是 panic）。
+///
+/// **负样本**：把 `install` 的 `slice[i] == 0` 判断去掉（改成无条件写 0 号位），
+/// 第 2 格与第 3 格会同时红。
+#[cfg(feature = "handles")]
+fn t_fd_table() -> bool {
+    // 用真实的句柄值形状（Handle 的 unpack 要求 slot/gen 非 0），
+    // 但这条用例**不碰真句柄表**——它只验 fd 表本身的装/查/放。
+    let mk = |slot: u64, gen: u64| crate::handle::Handle((gen << 16) | slot);
+    let h_in = mk(1, 1);
+    let h_out = mk(2, 1);
+    let h_err = mk(3, 1);
+    let h_a = mk(10, 1);
+    let h_b = mk(11, 1);
+
+    let mut t = crate::handle::FdTable::new();
+    let mut ok = true;
+
+    // 1. 预置 std
+    if t.preset_std(h_in, h_out, h_err).is_err() {
+        crate::log_fatal!("fd: preset_std 失败");
+        return false;
+    }
+    let std_ok = t.lookup(0) == Some(h_in)
+        && t.lookup(1) == Some(h_out)
+        && t.lookup(2) == Some(h_err)
+        && t.used() == 3;
+    if !std_ok {
+        crate::log_fatal!("fd: 预置 std 不成立 used={} 0={:?} 1={:?} 2={:?}",
+            t.used(), t.lookup(0), t.lookup(1), t.lookup(2));
+        ok = false;
+    }
+
+    // 2. 装 -> 最小空闲 fd 是 3
+    let fd_a = match t.install(h_a) {
+        Ok(f) => f,
+        Err(e) => {
+            crate::log_fatal!("fd: install 失败 {:?}", e);
+            return false;
+        }
+    };
+    let install_ok = fd_a == 3 && t.lookup(fd_a) == Some(h_a) && t.used() == 4;
+    if !install_ok {
+        crate::log_fatal!("fd: 装不成立 fd={} used={}", fd_a, t.used());
+        ok = false;
+    }
+
+    // 3. 再装 -> 4（不是覆盖 3）
+    let fd_b = match t.install(h_b) {
+        Ok(f) => f,
+        Err(e) => {
+            crate::log_fatal!("fd: 第二次 install 失败 {:?}", e);
+            return false;
+        }
+    };
+    let distinct_ok = fd_b == 4 && t.lookup(3) == Some(h_a) && t.lookup(4) == Some(h_b);
+    if !distinct_ok {
+        crate::log_fatal!("fd: 两次装不独立 fd_b={} 3={:?} 4={:?}",
+            fd_b, t.lookup(3), t.lookup(4));
+        ok = false;
+    }
+
+    // 4. 释放 3
+    let released = t.release(fd_a);
+    let release_ok = released == Some(h_a) && t.lookup(fd_a).is_none() && t.used() == 4;
+    if !release_ok {
+        crate::log_fatal!("fd: 释放不成立 got={:?} used={}", released, t.used());
+        ok = false;
+    }
+
+    // 5. 释放空槽 -> None（不是 panic）
+    let empty_release = t.release(fd_a).is_none();
+    if !empty_release {
+        crate::log_fatal!("fd: 释放空槽应当返回 None");
+        ok = false;
+    }
+
+    // 越界 fd 也要安全
+    let oob = t.lookup(9999).is_none() && t.release(9999).is_none();
+    if !oob {
+        crate::log_fatal!("fd: 越界 fd 不安全");
+        ok = false;
+    }
+
+    crate::log_info!(
+        "fd: 预置std={} 装={} 独立={} 释放={} 空释放={} 越界安全={} 末used={} ⇒ {}",
+        std_ok, install_ok, distinct_ok, release_ok, empty_release, oob, t.used(), ok
+    );
+    ok
+}
+
+#[cfg(feature = "handles")]
+ktest!(KT_FD_TABLE, t_fd_table);
