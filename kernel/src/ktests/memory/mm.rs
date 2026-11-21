@@ -529,8 +529,14 @@ fn t_map_hole() -> bool {
     let leaf = mm::leaf_value(va.0).unwrap_or(0);
     let res1 = mm::reservation_count();
     drop(mh);
-    let roundtrip = res1 == res0 + 1 && mm::reservation_count() == res0
-        && mm::free_frames() == f0 && !mm::is_mapped(va.0);
+    // 往返格拆成四个子条件：合成一个 bool 时，红了不知道是哪一项。
+    // 2026-11-21 §479 排查 t_map_hole 偶发（8668 绿 / 2 红）时加的；保留它是因为
+    // 它把「哪一项不成立」变成可读的，而代价是四次读数——都是原子量，不取锁。
+    let rt_a = res1 == res0 + 1;
+    let rt_b = mm::reservation_count() == res0;
+    let rt_c = mm::free_frames() == f0;
+    let rt_d = !mm::is_mapped(va.0);
+    let roundtrip = rt_a && rt_b && rt_c && rt_d;
     // 拒绝格：扫内存映射找 usable 基址与"覆盖内非 usable"基址，不写死本机布局
     let mut pa_usable = None;
     let mut pa_cov = None;
