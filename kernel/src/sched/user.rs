@@ -339,6 +339,19 @@ pub enum AbiError {
     IsDir = 11,
     /// -15：ABI 形状合法但本构建不支持（FS-03 的非零 flags 与目录 seek）。
     NotSupported = 15,
+    /// -18：**号登记了，但这份构建没实现它**（ADR-176，2026-11-21 使用者裁决）。
+    ///
+    /// 为什么必须与 `Invalid`(-1) 分开：**归因方向相反**。`-1` 的语义是"参数形状不对"，
+    /// 调用方拿到它会去检查自己的参数——而真相是内核根本没写这个功能。
+    /// 一个正确的程序被引导去改一个没写错的地方，而且它**永远不报错**，只会让每个
+    /// 调用方各自困惑一次。48–61 那 14 个预留号今天正是这个形状。
+    ///
+    /// 号位为什么是 18 而不是 16：`-16 EBUSY`/`-17 EEXIST` 已被 ADR-118 占走，
+    /// `-9/-12/-13/-14` 已被 ADR-106 批了号位。新码一律**追加在末尾**——
+    /// 插在中间会让 `as i64` 的判别值整体位移，那是一次静默的 ABI 破坏。
+    ///
+    /// 证人：`KT_SYSCALL_ABI_ARMS` 的 53/54/56/60 四格（真调一次，看 rax 与 nosys_nr）
+    NoSys = 18,
 }
 
 /// `ErrorCode` → `rax` 里那个补码。写成 `const fn` 是为了让下面三个公开常量在编译期就算出来，
@@ -361,6 +374,7 @@ impl AbiError {
             AbiError::NotDir => "-ENOTDIR（不是目录）",
             AbiError::IsDir => "-EISDIR（是目录）",
             AbiError::NotSupported => "-ENOTSUP（本构建不支持该操作）",
+            AbiError::NoSys => "-ENOSYS（号登记了，但这份构建没实现它）",
         }
     }
 }
@@ -378,6 +392,8 @@ pub const E_NOT_FOUND: u64 = err_ret(AbiError::NotFound);
 pub const E_NOT_DIR: u64 = err_ret(AbiError::NotDir);
 pub const E_IS_DIR: u64 = err_ret(AbiError::IsDir);
 pub const E_NOT_SUPPORTED: u64 = err_ret(AbiError::NotSupported);
+/// ADR-176：号登记了但没实现。**不是** `E_INVALID`——见 `AbiError::NoSys` 的注释。
+pub const E_NOSYS: u64 = err_ret(AbiError::NoSys);
 
 /// 句柄层错误 → 用户可见的 `rax`。`pub(crate)` 只为 ktest 能拿**同一张表**验 `-7` 那一格
 /// （`sys_file_read` 自己的分支用它）；用例里另抄一份映射就是在给这张表写第三个副本。
@@ -2771,6 +2787,17 @@ static PROG_PTR: ProgCell = ProgCell(core::cell::UnsafeCell::new(None));
 
 static SYSCALLS_SERVED: AtomicU64 = AtomicU64::new(0);
 static UNKNOWN_NR: AtomicU64 = AtomicU64::new(0);
+/// ADR-176：**号登记了但没实现**的次数，与 `UNKNOWN_NR` 分开数。
+///
+/// 为什么必须分开：`UNKNOWN_NR` 是靠 `_ =>` 自增的。一旦给 48–61 加了显式臂，
+/// 这些号就再也走不到 `_`，于是 `UNKNOWN_NR` 数不到它们了——而
+/// `t_syscall_abi_arms` 断言"53/54 必须未知且 unknown_nr 涨"。两个计数器混用会让
+/// 那条断言要么变红、要么被改成一句不再有意义的断言。
+///
+/// 分开之后语义干净：`UNKNOWN_NR` = **号根本没登记**，`NOSYS_NR` = **号登记了但没实现**。
+/// 两者之和才是"内核没服务这个调用"，而分开之后"号表缺了一格"与"实现欠了一刀"
+/// 可以被分别数出来（同 ADR-030 决定 2：`no_such`/`stale` 分开计数的那种形状）。
+static NOSYS_NR: AtomicU64 = AtomicU64::new(0);
 static KILLS: AtomicU64 = AtomicU64::new(0);
 static EXITS: AtomicU64 = AtomicU64::new(0);
 /// 被指针校验挡下来的次数（判据要能区分"内核拒了"与"内核根本没检查"）
@@ -2781,6 +2808,23 @@ pub fn served() -> u64 {
 }
 pub fn unknown_nr() -> u64 {
     UNKNOWN_NR.load(Ordering::Relaxed)
+}
+/// ADR-176：号登记了但没实现的次数（与 `unknown_nr` 分开数，理由见 `NOSYS_NR`）。
+pub fn nosys_nr() -> u64 {
+    NOSYS_NR.load(Ordering::Relaxed)
+}
+
+/// ADR-176：**"号登记了，但这份构建没实现它"的唯一出口**。
+///
+/// 14 条 `SYS_* => nosys()` 臂共用它，避免 14 份 `fetch_add + E_NOSYS` 的重复
+/// （重复的那 14 份里只要有一份忘了自增，那个号就永远不进 `nosys_nr`，
+/// 而"14 个号都进过计数器"正是 ktest 要证的）。
+///
+/// 自增用 `Relaxed`：这个计数器只被读数与断言用，不参与任何同步决策
+/// （与 `UNKNOWN_NR` 同一种口径）。
+fn nosys() -> u64 {
+    NOSYS_NR.fetch_add(1, Ordering::Relaxed);
+    E_NOSYS
 }
 pub fn kills() -> u64 {
     KILLS.load(Ordering::Relaxed)
@@ -2800,6 +2844,9 @@ pub fn bad_ptrs() -> u64 {
 fn reset_counters() {
     SYSCALLS_SERVED.store(0, Ordering::Relaxed);
     UNKNOWN_NR.store(0, Ordering::Relaxed);
+    // ADR-176：**必须一起清**。漏掉的后果是计数器跨用例累积，而累积的计数器对
+    // "这一格涨了没有"这种断言是假绿——用例会看着它涨而分不清是不是自己涨的。
+    NOSYS_NR.store(0, Ordering::Relaxed);
     KILLS.store(0, Ordering::Relaxed);
     EXITS.store(0, Ordering::Relaxed);
     BAD_PTRS.store(0, Ordering::Relaxed);
@@ -3231,6 +3278,37 @@ pub fn syscall_dispatch(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> boo
         SYS_PROC_ENUM => sys_proc_enum(frame),
         #[cfg(feature = "handles")]
         SYS_PROC_STAT => sys_proc_stat(frame),
+        // ---- 48–61：**已声明未实现**（ADR-165 决策 4 预留，ADR-176 给它们诚实的错误码）
+        //
+        // 这 14 个号今天只有常量、没有实现。此前它们落到 `_ =>` 回 `-1 EINVAL`，
+        // 而 `-1` 的语义是"参数形状不对"——用户程序会被引导去检查一个没写错的参数，
+        // **归因方向完全相反**。现在它们各有显式臂，回 `-18 ENOSYS`，
+        // 并把次数记进 `NOSYS_NR`（与 `UNKNOWN_NR` 分开，理由见那两个 static 的注释）。
+        //
+        // **为什么不加 `#[cfg]` 门控**（这是刻意的，不是漏写）：
+        // 48–61 属于 network / input / audio 三族，今天三族都不存在。若给这些臂挂上
+        // `#[cfg(feature = "network")]` 之类的门，那么在**别的 feature 组合下这些臂会消失**，
+        // 于是「声明的号必有臂」这条门禁（`check-syscall-abi-arms` 规则 3，ADR-176 决策 5）
+        // 又会在那个组合下漏掉同一批号——门禁会随构建配置时绿时红，而它的红会被读成
+        // "这次改动坏了"。这些臂必须**无条件存在**：它们声明的正是"这个号在、功能不在"。
+        //
+        // 落地的分片：socket 族等 ADR-166 的 network 模块、输入族等 ADR-162 的 USB HID、
+        // 音频族等 ADR-163 的 HDA。实现落地时把对应那一行换成真 handler，
+        // 并按 ADR-176「验收」重写 `t_syscall_abi_arms` 里那一格（**不许直接删**）。
+        SYS_SOCK_CREATE => nosys(),
+        SYS_SOCK_BIND => nosys(),
+        SYS_SOCK_LISTEN => nosys(),
+        SYS_SOCK_CONNECT => nosys(),
+        SYS_SOCK_ACCEPT => nosys(),
+        SYS_SOCK_SEND => nosys(),
+        SYS_SOCK_RECV => nosys(),
+        SYS_SOCK_CLOSE => nosys(),
+        SYS_INPUT_READ => nosys(),
+        SYS_INPUT_POLL => nosys(),
+        SYS_INPUT_GRAB => nosys(),
+        SYS_INPUT_RELEASE => nosys(),
+        SYS_AUDIO_STREAM => nosys(),
+        SYS_AUDIO_CONTROL => nosys(),
         SYS_POKE_BUF => {
             // 内核 → 用户。写成 `Ok(n)` 而不是布尔：`n != want` 就是"中途被接住的故障"，
             // 程序核对字节时看得见的差异与内核报回的数必须一致（两台仪器不能各说各话）。
