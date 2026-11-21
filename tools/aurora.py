@@ -6795,46 +6795,101 @@ CPU_SITE_RE = re.compile(
     r"cs=(?P<cs>0x[0-9a-f]+) rflags=(?P<fl>0x[0-9a-f]+) rsp=(?P<rsp>0x[0-9a-f]+)")
 
 
-def crash_cross(log1: str, log2: str) -> tuple[bool, bool, bool]:
+
+
+def crash_record_on_disk(img: bytes) -> dict | None:
+    """从**盘上的字节**解出"这一遍启动会读回的那条崩溃记录"（ADR-167 三的取样点）。
+
+    规则必须与内核 state_store::read_crash 逐条同判，否则两台仪器会给出两种结论：
+      1. 扫 8 个槽，只看头部（magic/版本/size 界内）；
+      2. 头部有效且 kind == KIND_CRASH 的进候选；
+      3. 候选按 seq 从大到小试，**第一个正文解得开的**就是答案（"头部有效 != 正文解得开"）。
+
+    返回 None = 盘上没有可解的崩溃记录（第一次启动就是这种）。
+    """
+    sys.path.insert(0, str(ROOT / "tools"))
+    import esp_image, struct  # noqa: E402
+    base = esp_image.STATE_START_LBA * esp_image.SECTOR
+    cands: list[tuple[int, int]] = []
+    for slot in range(esp_image.STATE_SECTORS):
+        off = base + slot * esp_image.SECTOR
+        if off + esp_image.SECTOR > len(img):
+            continue
+        buf = img[off:off + esp_image.SECTOR]
+        size, magic, version, kind = struct.unpack_from("<IIII", buf, 0)
+        if magic != esp_image.STATE_MAGIC or version not in (esp_image.STATE_VERSION, esp_image.STATE_VERSION2):
+            continue
+        if size == 0 or esp_image.STATE_HDR + size + 8 > len(buf):
+            continue
+        if kind != esp_image.STATE_KIND_CRASH:
+            continue
+        cands.append((struct.unpack_from("<Q", buf, 16)[0], slot))
+    for seq, slot in sorted(cands, reverse=True):
+        off = base + slot * esp_image.SECTOR
+        rec = esp_image.state_decode(img[off:off + esp_image.SECTOR])
+        if "why" in rec or rec.get("kind") != esp_image.STATE_KIND_CRASH:
+            continue
+        if rec.get("seq") != seq:
+            continue
+        rec = dict(rec)
+        rec["slot"] = slot
+        return rec
+    return None
+
+def crash_cross(log1: str, log2: str, host_before: dict | None = None) -> tuple[bool, bool, bool]:
     """崩溃记录的跨重启对账，两遍必须来自**同一个变体**（否则镜像会被重建、记录被抹掉）。
 
+    **取样链（ADR-167 三，2026-11-21 改）**：
+        旧：第一遍串口 DUMP  <->  第二遍串口 BACK
+        新：第二遍启动**前**盘上那条  <->  第二遍串口 BACK
+    为什么必须改（446 实测）：`fault-double-free` 每遍都崩，第二遍自己又写一条把第一遍
+    那条挤掉（seq 1 -> 2、slot 0 -> 1），所以"第二遍读回第一遍那条"与档语义**不可能同时
+    成立**。旧判据过去绿过，靠的是"第二遍恰好没崩"这种非预期状态 —— 那不是判据。
+
     返回三格：
-    * `report_ok`：第二遍读回的与第一遍落盘的逐字段相同（命名组逐个比 —— 加了 rsp/rbp/cr2
-      之后位置下标错过一次，而"错过"的表现是判据在比不同的两格却照样绿）；
-      并且第一帧必须就是 `rip` 那一格（帧数组与出事地址绑在一起对）。
-    * `host_ok`：宿主机按 ADR-031 那套偏移把盘上那条重解一遍，逐字段相同（第二台仪器）。
+    * `report_ok`：第二遍读回的那条**自洽**（第一帧就是 `rip`、帧数 >= 1），且 seq 不低于
+      第一遍落盘那条（单调，不许回退）。**这一格不再要求两遍逐字段相同**——那正是旧判据
+      在每遍都崩的档上永远为假的原因。
+    * `host_ok`：第二遍启动**前**宿主机从盘上解出的那条 == 第二遍读回的（第二台仪器，
+      按 ADR-031 那套偏移独立解）。这才是判据名字要证的事：**上一遍留在盘上的，这一遍读得回来**。
+      `host_before is None` 且第二遍也没读到 = 两边都说"没有"，算成立。
     * `site_ok`：落盘那条与**同一次启动串口打的异常现场**同一条（`fault-crash-oops` 才有；
       没有真实现场的构建这一格不参与判定，由调用方决定怎么用它）。
     """
     m_dump = CRASH_DUMP_RE.search(log1)
     m_back = CRASH_BACK_RE.search(log2)
-    report_ok = bool(
-        m_dump and m_back
-        and all(m_dump.group(k) == m_back.group(k) for k in
-                ("slot", "seq", "vec", "err", "cpu", "rip", "rsp", "cr2", "nfr"))
-        and m_dump.group("rip") == m_back.group("f0"))
+    # ---- report_ok：第二遍读回的那条**自洽**，且 seq 不回退。
+    #
+    # 旧写法要求两遍逐字段相同；`fault-double-free` 每遍都崩 ⇒ 第二遍自己又写一条 ⇒
+    # 那一格**永远为假**（446 实测：seq 1->2、slot 0->1、rip 变 0x0）。
+    # 现在问的是这条记录自己说不说得通，以及序号有没有倒退（倒退 = 读到了旧槽）。
+    # **没放宽成"有一行就算"**：第一帧必须等于 rip、帧数 >= 1、seq 必须 >= 第一遍那条。
+    report_ok = False
+    if m_back:
+        nfr_b = int(m_back.group("nfr"))
+        seq_b = int(m_back.group("seq"))
+        seq_d = int(m_dump.group("seq")) if m_dump else 0
+        report_ok = (nfr_b >= 1
+                     and m_back.group("f0") == m_back.group("rip")
+                     and seq_b >= seq_d)
+
+    # ---- host_ok：第二遍启动**前**盘上那条 == 第二遍读回的（ADR-167 三）。
+    #
+    # 这是判据名字要证的事：**上一遍留在盘上的，这一遍读得回来**。
+    # 两边都说"没有"也算成立（第一次启动就是这种）；只有一边有 = 红。
     host_ok = False
-    if m_dump:
-        sys.path.insert(0, str(ROOT / "tools"))
-        import esp_image  # noqa: E402
-        lba, slot, sb, seq = (int(m_dump.group(i)) for i in ("lba", "slot", "sb", "seq"))
-        off = lba * 512 + slot * sb
-        img = IMAGE.read_bytes()
-        if off + sb <= len(img):
-            rec = esp_image.state_decode(img[off:off + sb])
-            nfr = int(m_dump.group("nfr"))
-            host_ok = (rec.get("kind") == int(m_dump.group("kind"))
-                       and rec.get("seq") == seq and rec.get("version") == int(m_dump.group("ver"))
-                       and rec.get("vector") == int(m_dump.group("vec"))
-                       and rec.get("error_code") == int(m_dump.group("err"))
-                       and rec.get("cpu") == int(m_dump.group("cpu"))
-                       and rec.get("rip") == int(m_dump.group("rip"), 16)
-                       and rec.get("rsp") == int(m_dump.group("rsp"), 16)
-                       and rec.get("rbp") == int(m_dump.group("rbp"), 16)
-                       and rec.get("cr2") == int(m_dump.group("cr2"), 16)
-                       and rec.get("frame_count") == nfr
-                       and len(rec.get("frames", [])) == nfr
-                       and (nfr == 0 or rec["frames"][0] == rec["rip"]))
+    if host_before is None and m_back is None:
+        host_ok = True
+    elif host_before is not None and m_back is not None:
+        host_ok = (int(m_back.group("seq")) == host_before["seq"]
+                   and int(m_back.group("slot")) == host_before["slot"]
+                   and int(m_back.group("vec")) == host_before["vector"]
+                   and int(m_back.group("err")) == host_before["error_code"]
+                   and int(m_back.group("cpu")) == host_before["cpu"]
+                   and int(m_back.group("rip"), 16) == host_before["rip"]
+                   and int(m_back.group("rsp"), 16) == host_before["rsp"]
+                   and int(m_back.group("cr2"), 16) == host_before["cr2"]
+                   and int(m_back.group("nfr")) == host_before["frame_count"])
     site = CPU_SITE_RE.search(log1)
     # 现场那一行与记录里的字段**不能按字符串比**：`crash: 落盘` 把错误码打成十进制，
     # `dump_frame` 打成 `0x…`（实测这两边一位不同，红的是我的比较法而不是被测物）。
@@ -9248,10 +9303,15 @@ def do_test(timeout: int) -> int:
     # 第二遍读到的才是第一遍留在盘上的那条；换成另一个变体就会重建镜像、把记录一起抹掉。
     IMAGE.unlink(missing_ok=True)
     cbv1, cbrc1, cblog1 = do_run(["fault-double-free"], timeout)
+    # ADR-167 三：**第二遍启动之前**，宿主机自己从盘上解出"这一遍会读回的那条"。
+    # 这是新取样链的前半 —— 旧写法拿第一遍的串口 DUMP 当基准，而 fault-double-free
+    # 每遍都崩，第二遍自己又写一条，于是"两遍逐字段相同"永远不成立。
+    cb_before = crash_record_on_disk(IMAGE.read_bytes()) if IMAGE.exists() else None
     cbv2, cbrc, cblog2 = do_run(["fault-double-free"], timeout)
-    crash_report_ok, crash_host_ok, _ = crash_cross(cblog1, cblog2)
+    crash_report_ok, crash_host_ok, _ = crash_cross(cblog1, cblog2, host_before=cb_before)
     crash_back_ok = crash_report_ok and crash_host_ok and cbv1 == "EXCEPTION" and cbv2 == "EXCEPTION"
-    print(f"    两遍判定={cbv1}/{cbv2} 内核自报对上={crash_report_ok} 宿主机解出同一条={crash_host_ok}")
+    print(f"    两遍判定={cbv1}/{cbv2} 启动前盘上 seq={cb_before['seq'] if cb_before else '无'} "
+          f"自洽={crash_report_ok} 读回=盘上那条={crash_host_ok}")
     IMAGE.unlink(missing_ok=True)
 
     print("=== 崩溃现场是真异常给的：同一份镜像连跑两遍 fault-crash-oops ===")
@@ -9262,8 +9322,9 @@ def do_test(timeout: int) -> int:
     # M6-e 起再加一维：帧数组逐条由 ELF 符号表解成函数名，前两层必须是
     # 「故意越界那个函数」与「ktest 运行器」——函数边界内核给不出（`.symtab` 不在运行时镜像里）。
     oov1, _orc1, oolog1 = do_run(["fault-crash-oops"], timeout)
+    oo_before = crash_record_on_disk(IMAGE.read_bytes()) if IMAGE.exists() else None
     oov2, oorrc, oolog2 = do_run(["fault-crash-oops"], timeout)
-    oo_report_ok, oo_host_ok, oo_site_ok = crash_cross(oolog1, oolog2)
+    oo_report_ok, oo_host_ok, oo_site_ok = crash_cross(oolog1, oolog2, host_before=oo_before)
     oo_sym_ok, oo_sym_why = crash_frames_symbolized(oolog1)
     m_oo = CRASH_DUMP_RE.search(oolog1)
     oops_ok = bool(oo_report_ok and oo_host_ok and oo_site_ok and oo_sym_ok
