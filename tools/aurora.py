@@ -4473,7 +4473,22 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
         tag = f" 启动产物={kv.get('variant', '?')}/elf {kv.get('elf_sha256', '?')[:12]}"
     else:
         tag = " 警告：无 image-info.txt，无法确认启动的是哪个产物"
-    print(f"判定={verdict} qemu_rc={rc} 用时={time.time() - t0:.1f}s{tag}")
+    _elapsed = time.time() - t0
+    print(f"判定={verdict} qemu_rc={rc} 用时={_elapsed:.1f}s{tag}")
+    # **用时入库**（BACKLOG §473 / 裁决 C）：每次跑都记，不只 HANG 那次。
+    #
+    # 为什么：§472 发现 HANG 的用时恰好等于预算，而正常只有 6 秒——
+    # **20 倍**。那是「慢」不是「停」，而 HANG 这个二值判定把两件事混成了一件。
+    # 记下来之后才能回答「这次比这个变体的常态慢了几倍」。
+    try:
+        _variant = kv.get('variant', '?') if fp.exists() else '?'
+        _elf = kv.get('elf_sha256', '?')[:12] if fp.exists() else '?'
+        with RUN_TIMES.open('a', encoding='utf-8', newline='') as _f:
+            _f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\t"
+                     f"{_variant}\t{verdict}\t{_elapsed:.2f}\t{_elf}\n")
+    except OSError as _e:
+        # 记不下来不该让判定红：它是量具的旁路，不是判据。
+        print(f"   用时入库失败（不影响判定）：{_e!r}")
     return verdict, rc, log
 
 
@@ -4556,6 +4571,77 @@ def check_serial_rx(log: str) -> list[str]:
     if routes != 1 or budgets != 1:
         bad.append(f"路由/预算证人应各 1 条，实际 {routes}/{budgets} 条")
     return bad
+
+
+RUN_TIMES = BUILD / "run-times.tsv"
+
+
+def run_times_read(since: str | None = None) -> dict[str, list[float]]:
+    """读 `build/run-times.tsv`，返回 `{变体: [用时秒, ...]}`。
+
+    `since` 给一个 UTC 时刻（`2026-11-21T06:00:00Z` 形如）时只算**晚于它**的样本。
+    **为什么需要它**：`normal` 在整链里跑 9 次、`gpt-probe` 6 次，
+    而判定要看「**本次整链**内该变体的最差那次」——不能把上一轮整链的算进来。
+
+    格式：`<UTC>\t<变体>\t<判定>\t<用时>\t<ELF 前12>`（`do_run` 每次跑追加一行）。
+    坏行跳过而不是报错——它是量具的旁路，不该因为一行脏数据让判定红。
+    """
+    out: dict[str, list[float]] = {}
+    if not RUN_TIMES.exists():
+        return out
+    for ln in RUN_TIMES.read_text(encoding="utf-8").splitlines():
+        parts = ln.split("\t")
+        if len(parts) < 4:
+            continue
+        if since is not None and parts[0] < since:
+            continue
+        try:
+            secs = float(parts[3])
+        except ValueError:
+            continue
+        out.setdefault(parts[1], []).append(secs)
+    return out
+
+
+def perf_median(times: dict[str, list[float]], variant: str) -> float | None:
+    """该变体的**正常基线**用时：最低那三分之一的中位数。少于 3 个样本返回 None。
+
+    ## 为什么不是中位数（实测推翻）
+
+    `handles` 档 5 个样本：`HANG 300.06 / PASS 6.52 / HANG 300.05 / PASS 6.51 / HANG 300.05`
+
+    中位数 = 300.05，本次 = 300.05，比值 = **1.00x** ⇒ **「慢」反而不被标记**。
+    因为慢的那几次占了多数，中位数跟着它们走。
+
+    ## 为什么是双峰
+
+    TCG 的翻译缓存撞上限后，**一次跑里后续所有用例都慢**——所以「慢」不是
+    偶发离群，而是双峰分布：
+
+        快峰：6.5 秒（没撞缓存）
+        慢峰：300 秒（撞了缓存，撞满预算）
+
+    **双峰分布的中位数没有意义。**
+
+    ## 低分位为什么对
+
+    取「排序后最低那三分之一的中位数」：
+
+    - 不会被慢峰拉走；
+    - 比单取 `min` 稳（`min` 对单次异常快敏感）；
+    - 是**实测出来的**，不是编的基准。
+
+    若所有样本都慢，低分位也慢 ⇒ 那时比值接近 1 ⇒ 不比偏离
+    （因为「这台机器今天就这样」）。**那是正确的行为**：没有「正常」可比。
+    """
+    xs = sorted(times.get(variant, []))
+    if len(xs) < 3:
+        return None
+    # 最低那三分之一（至少 1 个，最多 n//2 个）
+    k = max(1, len(xs) // 3)
+    low = xs[:k]
+    n = len(low)
+    return low[n // 2] if n % 2 else (low[n // 2 - 1] + low[n // 2]) / 2.0
 
 
 def check_disk_content(log: str) -> list[str]:
@@ -9098,6 +9184,10 @@ def _top_pages_nondecreasing(log: str) -> bool:
 def do_test(timeout: int) -> int:
     """正向必须 33、负样本必须 35。只跑正向的话，永远分不清“代码没问题”
     和“判定链根本没生效”。"""
+    # **本次整链的起始时刻**（BACKLOG §473 裁决 C）：
+    # 判定「变体用时偏离」时只看晚于它的样本——`normal` 在整链里跑 9 次，
+    # 不能把上一轮整链的样本算进本轮。
+    _chain_t0 = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
     print("=== 正向 ===")
     v, rc, log = do_run([], timeout)
     good = v == "PASS"
@@ -9296,6 +9386,41 @@ def do_test(timeout: int) -> int:
     _nf = re.search(r"nvme-fat: 读回 DATA\.BIN 大小=(\d+) 走过字节=(\d+) 簇数=(\d+)", nvflog)
     if _nf:
         print(f"    DATA.BIN 大小={_nf.group(1)} 走过={_nf.group(2)} 簇数={_nf.group(3)}")
+
+    # =====================================================================
+    # 裁决 C（BACKLOG §473）：把「慢」做成可见的量。
+    #
+    # §472 的发现：`a2-exec-bad` 连跑 8 次有 4 次 HANG，而正常 6.0 秒、
+    # HANG 120.0 秒——**正好 20 倍**。根因是 QEMU 跑 TCG，翻译块缓存撞上限时整跑变慢。
+    #
+    # 「HANG」这个二值判定把「真死锁」与「慢」混成了一件。这一行把它们分开：
+    # 它红**不代表内核错**，代表这次宿主比该变体的常态慢了 3 倍以上。
+    # 只看**本次整链**的样本（`_chain_t0` 在 `do_test` 开头记的）。
+    _times = run_times_read(since=_chain_t0)
+    _all_times = run_times_read()
+    _slow: list[str] = []
+    _perf_lines: list[str] = []
+    for _v, _xs in sorted(_times.items()):
+        # **基线用全部历史**（样本多才稳），**本次看整链内最差那次**（不摊薄）。
+        _med = perf_median(_all_times, _v)
+        _cur = max(_xs)
+        if _med is None:
+            _perf_lines.append(f"{_v}: 历史样本不足 3 ⇒ 不谈偏离（本轮最差 {_cur:.1f}s）")
+            continue
+        _ratio = _cur / _med if _med > 0 else 0.0
+        _perf_lines.append(f"{_v}: 本次最差 {_cur:.1f}s / 基线 {_med:.1f}s = {_ratio:.2f}x（本轮 {len(_xs)} 跑）")
+        if _ratio > 3.0:
+            _slow.append(f"{_v}: {_ratio:.2f}x（最差 {_cur:.1f}s，基线 {_med:.1f}s）")
+    perf_verdict = "CONTENT-MISMATCH" if _slow else "PASS"
+    perfrc = 33
+    perflog = "\n".join(_perf_lines)
+    print("=== 变体用时偏离中位数（裁决 C：把「慢」与「死锁」分开）===")
+    for _ln in _perf_lines:
+        print("    " + _ln)
+    for _ln in _slow:
+        print("    偏慢:", _ln)
+    if not _times:
+        print("    （run-times.tsv 还没有样本；下一次跑整链就有基准了）")
 
     print("=== 崩溃记录跨重启读回：同一份镜像连跑两遍 fault-double-free ===")
     # §9.7 的另一半只能跨重启量：崩溃时写下的摘要，要被**下一次启动**读回来。
@@ -10124,6 +10249,11 @@ def do_test(timeout: int) -> int:
         # 内核从**真实 PS/2 端口**收到 97。`t_ps2_kbd_decode` 只证解码，
         # 这一行证两端（端口 → 解码 → 环）。
         ("按键注入与输入通路对账", kbd_verdict, kbdrc, "PASS", 33),
+        # 裁决 C（BACKLOG §473）：把「慢」做成可见的量，而不是二值 HANG。
+        #
+        # §472 发现 HANG 的用时恰好等于预算，而正常只有 6 秒——20 倍。
+        # 那是「慢」不是「停」。这一行红**不代表内核错**，代表这次宿主慢。
+        ("变体用时偏离中位数", perf_verdict, perfrc, "PASS", 33),
         # M8-a①：驱动说发出去的那一帧，宿主机必须在 QEMU 的抓包文件里读到逐字节相同的那一个
         ("网卡第一帧与 pcap 对账", net_verdict, ntrc, "PASS", 33),
         # M8-a②：对端答了，内核读回来的那一包由宿主机第二次独立解一遍，且地址必须是宿主机定的那一个
@@ -10247,6 +10377,7 @@ def do_test(timeout: int) -> int:
 "帧缓冲图案与显存对账": fblog,
 "NVMe 卷上读出文件与宿主机对账": nvflog,
 "按键注入与输入通路对账": kbdlog,
+"变体用时偏离中位数": perflog,
         "网卡第一帧与 pcap 对账": ntlog,
         "第一条协议往返与 pcap 对账": rtlog,
         "SHA-256 十三向量与 hashlib 对账": shlog,
