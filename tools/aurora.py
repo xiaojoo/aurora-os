@@ -9575,7 +9575,23 @@ def do_test(timeout: int) -> int:
     for x in sig_bad:
         print("    对账:", x)
     sha_bad = check_sha256(shlog)
-    sha_verdict = shv if shv != "PASS" else ("PASS" if not sha_bad else "CONTENT-MISMATCH")
+    # §481：**这一行只判 SHA-256，不判整档。**
+    #
+    # 原来的写法是 `shv if shv != "PASS" else ...` —— 整档任何一个用例红了，这一行就红。
+    # 实测（§481 整链）：`sig-check` 档里 `t_crash` 偶发一次红（8298 绿 / 1 红，
+    # 是 §446 记的恒红项），于是「SHA-256 十三向量」那一行报 FAIL，
+    # 而读数里根本没有 SHA-256 的问题——**看读数的人会去查错地方**。
+    #
+    # 判据改成：SHA-256 对账有问题 ⇒ CONTENT-MISMATCH（这才是这一行要证的）；
+    # 对账没问题但整档红了 ⇒ **单独报一句**，不污染这一行的判定。
+    if sha_bad:
+        sha_verdict = "CONTENT-MISMATCH"
+    else:
+        sha_verdict = "PASS"
+        if shv != "PASS":
+            # 整档红了但不是 SHA 的错：明说，别让它冒充这一行的结论
+            print(f"    注意：sig-check 整档判定 {shv}（rc={shrc}），但 SHA-256 对账本身全对；"
+                  "该档里还有别的用例，它的红由它自己那一行负责")
     for x in sha_bad:
         print("    对账:", x)
     IMAGE.unlink(missing_ok=True)
