@@ -19509,3 +19509,110 @@ abi-arms: 33已知=true 34已知=true 53未实现=true 54未实现=true 56未实
    第一次负样本"没生效"就是它，量具自己错了却看起来像被测物没坏）
 3. **`C6 真机` 不能并行**——`bringup.md` 第 1 节原文「尚无目标机型……没有机型就没有 M7 的通过」。
    它卡在硬件不在代码，把它排进并行开发计划是错的
+
+---
+
+## 475. 切片 2：COW 落地（ADR-177）+ 号段 64–71 裁决（2026-11-21）
+
+### 号段裁决（ADR-177）
+
+**开 64–71 新段**（推翻 ADR-165「64 及以上重新裁决」——本文就是那次裁决）：
+
+    64-66  SYS_MMAP / SYS_MUNMAP / SYS_MPROTECT     内存族
+    67-69  SYS_SIGACTION / SYS_SIGRETURN / SYS_SIGMASK  信号族
+    70-71  SYS_FS_CREATE / SYS_FS_UNLINK            文件族
+    72+    重新裁决，不自动延续
+
+**62/63 不动**（源码注释明写「保留，不分配」）。
+
+### ADR-118 号位勘误（实测）
+
+ADR-118（2026-11-18）给 `create`/`unlink`/`truncate` 的 30/34/35 **全部已被占用且已上线**：
+
+| 号 | ADR-118 原意 | 代码实际是 | 出处 |
+|---|---|---|---|
+| 30 | `truncate` | `SYS_LOG_READ` | ADR-135（同日） |
+| 34 | `create` | `SYS_NET_RECV` | ADR-143（同日） |
+| 35 | `unlink` | `SYS_NET_INFO` | ADR-143（同日） |
+
+**成因**：ADR-118/135/136/137/143 全是同一天写的，ADR-118 引用的是 ADR-106（11-15）的旧号段表。
+它自己勘了 27/28，**没勘 30/34/35**。已给 ADR-118 加补记，`create`/`unlink` 改用 70/71，
+`truncate` 本段不做。**全仓没有代码用 34/35 做 create/unlink，换号影响为 0。**
+
+### 为什么先做 COW 而不是 mmap
+
+**实测**：`fork` 在 `kernel/src` 命中 **0**，完整化方案 D1 建议 capability-native「不要 fork」。
+所以 COW 今天**没有消费者**——单独做它就是一个没人用的机制（违反 AGENTS.md 硬约束 2）。
+
+**COW 的消费者是 `mprotect`**：匿名映射 + 降权只读 + 写入触发复制，这条链自己就能证 COW 是活的。
+所以本切片只落**机制**，64/65/66 三个号与 syscall 留给下一刀。
+
+### 实现
+
+- `P_COW = 1 << 9`（PTE 软件位，Intel SDM 明写 bit 9–11 对软件可用；现有代码只用 0/1/2/3/4/7/63）
+- `mark_cow(va)` / `mark_cow_in(root, va)`：映射时降权（清 P_WRITE、置 P_COW）
+- `cow_try(cr2)` / `cow_try_for_root(root, va)`：**与 `demand_zero_try` 并列，不是包含**
+  —— 前者要求「页不存在」，后者要求「页存在但不可写」，条件互斥
+- 三段落：查 COW 页 → 查引用计数（**只剩自己就原地恢复，不分配**）→ 真复制
+- `trap.rs` 加一条并列分支：`error_code & 0x1 != 0 && & 0x2 != 0 && & 0x10 == 0`
+
+### 顺带修一个既有 bug
+
+`AspaceMapping::drop` 原来按**构造时记的帧号** `frame_put`。COW 换叶子后叶子指的不是那个帧了，
+于是旧帧被 put 两次（**实测 `L4 integrity: DoubleFree base=0x2f000 owner=3`**），
+新帧永远没人归还（静默漏帧）。改成**清叶子之前先读叶子实际指向的帧号**，两边账自然守恒。
+
+### 读数
+
+| 项 | 值 |
+|---|---|
+| `check` | **19/19**（rc=0） |
+| `ktests` | **83/83 passed**（+1：`t_cow_share`） |
+| `run` | **PASS(33)**，6.3s |
+| 真实改动量 | **735 增 / 45 删**（见下条事故） |
+
+真机读数原文：
+
+    cow: 共享=true 降权A=true 降权B=true A复制=true copied 0->1 B原值=true A换帧=true B保帧=true failed=0 ⇒ true
+
+**`B原值=true` 是全部价值所在**：A 侧写入之后 B 侧仍看到原来的 0xA5。
+
+### 负样本（变异证红）
+
+`mark_cow_in` 强制返回 false ⇒
+
+    cow: 降权A=false 降权B=false A复制=false copied 0->0 ⇒ false
+    [fatal] cow: 判据不成立（两 AS 共享一帧，A 写后 B 必须看到原值）
+    判定=FAIL qemu_rc=35   ktests: 83 passed, 1 failed
+
+还原后重跑 PASS(33)。
+
+### 本轮踩的两个坑（都记下来）
+
+**① 我删 worktree 时毁掉了主树 `.tools`（cargo/rustup/qemu/limine 全空）。**
+成因：worktree 的 `.tools/*` 是指向主树的 **junction**（COORD.md §8 教的），
+而 `git worktree remove --force` **跟随 junction 删进了主树**。
+恢复：rustup-init 装回 1.99.1 + 4 组件 + target、7z 解包 QEMU 安装程序、下载 limine-binary.zip。
+**验证等价的最强证据：`hello.elf` sha = `8e3972a8a788`，与 COORD.md 记的 2026-11-16 期望值逐字相同。**
+**纪律**：删 worktree 前必须先拆 junction（`[System.IO.Directory]::Delete(path, false)`）。
+
+**② 同仓库三种行尾，写变异脚本按错的找会静默匹配不到。**
+- `tools/aurora.py` CRLF
+- `kernel/src/memory/mm.rs` / `ktests/memory/mm.rs` **CRLF**
+- `kernel/src/sched/user.rs` / `sched/mod.rs` **LF**
+
+第一次 COW 负样本「没生效」就是按 CRLF 找 LF 文件。第二次是 Python 写文件时用 `newline=""`
+把两个 CRLF 文件整体转成 LF ⇒ `git diff` 报 **6745 增 / 6055 删**，真实改动只有 735/45。
+**那是量具在骗人，不是改动量**（AGENTS.md 79f 同一条）。已用 amend 修正。
+
+**③ cargo 缓存假象**：还原变异后 `build` 报 `Finished in 0.03s` 且二进制字节数没变，
+但跑出来仍是变异行为。碰一下源文件强制重编才正确。**「build 绿」不等于「跑的是新代码」。**
+
+### 未做
+
+- **64/65/66（mmap/munmap/mprotect）三个号本身没落**——本切片只落 COW 机制
+- 67–71（信号族、文件族）全部未做
+- 判定表整链未跑
+- **整跑偶发 HANG 一次**：120s 停在 `spawn: S3 前 map`，红过的用例=无，同构建重跑 PASS(33)。
+  与 §468–§473 长链抖动、§474 记的 `spawn: S2 前 phys_alloc` 同族。**未验证，不下结论**
+- COW 的「原值不变」目前只有内核侧自证，**没有宿主机第二台仪器**（ADR-177 验收里要求的那条）
