@@ -1,0 +1,414 @@
+# Aurora OS 容量基线（Linux 对齐版）
+#
+# 读者：写内核容量常量的人、改门禁的人。
+#
+# ## 这个文件为什么存在
+#
+# 之前所有容量常量都是「按开发机够用」定的：`MAX_PROCESSES = 4`、`MAX_ADDR_SPACES = 8`、
+# `MAX_HANDLES = 64`。源码注释里自己写着「今天无 workload 依据，按接缝够用定尺」——
+# 那是开发期的合理做法，**但不能当硬件参考**：它在 4 核 2 GiB 的 QEMU 里够用，
+# 装到真机上立刻撞墙（4 个进程、64 个句柄，连 shell 跑几条命令都不够）。
+#
+# 本文件把基线改成 **Linux 主线的实测常量**，每个值都带源码出处。
+# 规则：**没有 Linux 依据的值不许出现在这里**；对 Linux 做取舍的必须写 `is_tradeoff` 与 `reason`。
+#
+# ## 权威来源（Linux 主线源码，非二手文档）
+#
+#   include/linux/threads.h         PID_MAX_DEFAULT / PID_MAX_LIMIT
+#   kernel/fork.c                   MAX_THREADS = FUTEX_TID_MASK / MIN_THREADS / set_max_threads()
+#   include/uapi/linux/limits.h     NR_OPEN
+#   fs/file.c                       sysctl_nr_open
+#   include/linux/fdtable.h         NR_OPEN_DEFAULT
+#   include/asm-generic/resource.h  INIT_RLIMITS
+#
+# ## 与门禁的关系
+#
+# `python tools/aurora.py check` 的 `check-capacity-baseline` 拿本文件与
+# `kernel/src/**/*.rs` 里的容量常量双向对账：
+#   ① 本文件每个 `[[const]]` 声明的 `kernel_const` 必须在源码里存在且 `value` 相等；
+#   ② 源码里每个 `pub const MAX_*: usize` 必须在本文件登记（新增容量必须给出依据）。
+# 少一边都红——与 `crates.toml` / `module-interfaces.toml` 同一套纪律。
+
+[meta]
+version = 1
+basis = "linux-mainline"
+# 目标硬件下限（不是开发机！）。低于它的配置只用于 CI 冒烟，不作为容量参考。
+target_min_ram_mib = 1024
+target_min_cpus = 2
+note = "本文件不再以当前开发机为依据；改任何值先改对应 [[const]] 的 linux_source"
+
+# ---------------------------------------------------------------- Linux 权威常量
+# 这些是 Linux 的原始值，Aurora 不改它们，只作推导依据。
+
+[[linux]]
+name = "PID_MAX_DEFAULT"
+value = 32768
+source = "include/linux/threads.h"
+expr = "0x8000 (CONFIG_BASE_SMALL 时 0x1000)"
+
+[[linux]]
+name = "PID_MAX_LIMIT"
+value = 4194304
+source = "include/linux/threads.h"
+expr = "4*1024*1024 (sizeof(long)>4)"
+
+[[linux]]
+name = "MAX_THREADS"
+value = 1073741823
+source = "kernel/fork.c"
+expr = "FUTEX_TID_MASK = 2^30-1"
+
+[[linux]]
+name = "MIN_THREADS"
+value = 20
+source = "kernel/fork.c"
+expr = "MIN_THREADS = 20"
+
+[[linux]]
+name = "NR_OPEN"
+value = 1024
+source = "include/uapi/linux/limits.h"
+expr = "NR_OPEN = 1024"
+
+[[linux]]
+name = "sysctl_nr_open"
+value = 1048576
+source = "fs/file.c"
+expr = "1024*1024"
+
+[[linux]]
+name = "NR_OPEN_DEFAULT"
+value = 64
+source = "include/linux/fdtable.h"
+expr = "BITS_PER_LONG"
+
+# ---------------------------------------------------------------- 线程上限公式
+#
+# Linux 不在编译期定死线程数，而是运行时算：
+#
+#     threads = (nr_pages * PAGE_SIZE) / (THREAD_SIZE * 8)
+#     threads = clamp(threads, MIN_THREADS=20, MAX_THREADS=2^30-1)
+#
+# **含义：线程结构只许占物理内存的 1/8。**（那个 `* 8` 就是它）
+# 依据：kernel/fork.c set_max_threads()
+#
+# 按 target_min_ram_mib=1024、THREAD_SIZE=USER_KSTACK_PAGES*4096=32 KiB 算：
+#   1 GiB / 8 / 32 KiB = 4096 个线程
+
+[thread_limit]
+formula = "ram_bytes / 8 / (USER_KSTACK_PAGES * 4096)"
+floor = 20
+ceil = 1073741823
+linux_source = "kernel/fork.c: set_max_threads() / MIN_THREADS=20 / MAX_THREADS=FUTEX_TID_MASK"
+at_1gib = 4096
+at_4gib = 16384
+at_16gib = 65536
+
+# ---------------------------------------------------------------- Aurora 常量
+# 每个 [[const]] 都必须被 check-capacity-baseline 与源码双向核对。
+
+[[const]]
+kernel_const = "MAX_PROCESSES"
+value = 32768
+section = "process"
+linux_source = "include/linux/threads.h: PID_MAX_DEFAULT = 0x8000（作定长表容量）"
+reason = "与 Linux 一致取 PID 默认上限 32768；定长表省掉分配器"
+is_tradeoff = false
+cost = "AspaceEntry 152 B x 32768 = 4.75 MiB 静态表（见 memory_cost）"
+
+[[const]]
+kernel_const = "MAX_ADDR_SPACES"
+value = 32768
+section = "aspace"
+linux_source = "对齐 MAX_PROCESSES（Linux: 进程与 mm_struct 一比一）"
+reason = "每进程一张 AS，故 AS 表容量必须等于进程表容量；等号是硬要求"
+is_tradeoff = false
+cost = "ProcEntry 20 B x 32768 = 0.6 MiB（见 memory_cost）"
+
+[[const]]
+kernel_const = "MAX_TASKS"
+value = 256
+section = "sched"
+linux_source = "kernel/fork.c: Linux 每 CPU 跑任意多任务（动态分配，无常量）"
+reason = "定长表 vs Linux 动态分配；取 256/CPU，在 target_min_cpus=2 下给 512 任务槽"
+is_tradeoff = true
+cost = "Task 结构见 sched/mod.rs；256 x MAX_CPUS 槽"
+
+[[const]]
+kernel_const = "MAX_TASKS_SUPPORTED"
+value = 256
+section = "memory"
+linux_source = "容量契约：必须 >= MAX_TASKS"
+reason = "sched/mod.rs 有编译期断言 assert!(MAX_TASKS <= MAX_TASKS_SUPPORTED)，改一边不改另一边当场编译失败（这道断言是故意的）"
+is_tradeoff = false
+cost = "无独立开销（只是契约上界）"
+
+[[const]]
+kernel_const = "MAX_HANDLES"
+value = 131072
+section = "capability"
+linux_source = "fs/file.c: sysctl_nr_open = 1048576（全系统）"
+reason = "全局表 vs Linux 每进程 files_struct；131072 = 32768 进程 x 4 个基础句柄的最小可用量"
+is_tradeoff = true
+cost = "Entry 结构见 handle.rs；131072 格全局表"
+
+[[const]]
+kernel_const = "MAX_JOBS"
+value = 1024
+section = "sched"
+linux_source = "Linux 无 Job 概念（Windows 才有）"
+reason = "1024 作业 x 32 进程 = 32768 进程，与 pid_max_default 自洽"
+is_tradeoff = true
+cost = "JobEntry x 1024"
+
+[[const]]
+kernel_const = "MAX_VA_RESERVATIONS"
+value = 65536
+section = "memory"
+linux_source = "Linux 用 maple tree 动态分配，无等价常量"
+reason = "定长表取 65536 = 32768 进程 x 2 条最小保留"
+is_tradeoff = true
+cost = "VA 保留表 65536 格 + 位图"
+
+[[const]]
+kernel_const = "MAX_LAZY_REGIONS"
+value = 4096
+section = "memory"
+linux_source = "Linux demand-zero 按需（无等价常量）"
+reason = "定长 4096，支持 4096 个并存惰性映射"
+is_tradeoff = true
+cost = "LazyRegion x 4096"
+
+[[const]]
+kernel_const = "MAX_LAZY_PAGES"
+value = 4096
+section = "memory"
+linux_source = "同上"
+reason = "单条惰性区间最多 4096 页 = 16 MiB"
+is_tradeoff = true
+cost = "无独立开销（每条惰性区间的页数上界）"
+
+[[const]]
+kernel_const = "AS_PT_SLOTS"
+value = 16
+section = "aspace"
+linux_source = "Linux 页表按需分配，无固定上限"
+reason = "定长 16 是本项目接缝；AS 容量扩到 32768 后此值需重估（已知欠账）"
+is_tradeoff = true
+cost = "每张 AS 最多 16 个页表页"
+
+# ---------------------------------------------------------------- 位宽（扩容的前提）
+#
+# **这一条是本轮的关键**：旧 as_slot: u8 / aspace: u8 => 上限 254（255 是 NO_ASPACE），
+# 所以「扩到 1024/32768」在位宽不改时**结构上不可能**（不是没试，是装不下）。
+# Linux: pid_t = s32 => pid 位宽 32。
+
+[slot_width]
+current = 8
+target = 16
+sentinel = 65535
+sentinel_name = "NO_ASPACE"
+linux_source = "include/linux/types.h: pid_t = __kernel_pid_t = int（s32，位宽 32）"
+reason = "目标取 u16：65535 上限 > 32768 且留哨兵余量；取 u32 会让 ProcEntry/AspaceEntry 变大但收益为零"
+affected_files = 9
+affected_sites = 59
+
+# ---------------------------------------------------------------- 内存自检
+#
+# 改任何容量后必须重算这两段；门禁会核对 expected_static_kib。
+
+[memory_cost]
+proc_entry_bytes = 20
+aspace_entry_bytes = 152
+static_kib_formula = "(MAX_PROCESSES*proc_entry_bytes + MAX_ADDR_SPACES*aspace_entry_bytes) / 1024"
+expected_static_kib = 5504
+expected_static_pct_of_min_ram = 0.54
+verdict = "target_min_ram_mib=1024 下静态表占 0.54%，可接受"
+
+per_process_pml4_bytes = 4096
+per_process_kstack_bytes = 32768
+full_load_gib = 1.15
+full_load_note = "32768 进程全开需 ~1.15 GiB，超过 target_min_ram_mib=1024。这是已知边界，不是 bug：真实负载不会 32768 进程同时跑满；静态表启动即占，运行时按需才涨"
+# ---------------------------------------------------------------- 平台与硬件探测
+# 这一组跟 Linux 的 Kconfig / ACPI 表上限对应。
+
+[[const]]
+kernel_const = "MAX_CPUS"
+value = 8
+section = "arch"
+linux_source = "arch/x86/Kconfig: CONFIG_NR_CPUS（x86_64 默认 64，可配）"
+reason = "取 8 是取舍：per-CPU 定长数组全按它静态分配；Linux 用 NR_CPUS 动态"
+is_tradeoff = true
+cost = "per-CPU 数组 x 8；MAX_TASKS_TOTAL = 256*8 = 2048"
+
+[[const]]
+kernel_const = "MAX_CPUS_SEEN"
+value = 16
+section = "boot"
+linux_source = "ACPI MADT 无 CPU 数上限；Linux 用 NR_CPUS 截断"
+reason = "Limine SMP 响应里见到过几个 CPU 的表长，取 MAX_CPUS 两倍留余量"
+is_tradeoff = true
+cost = "Limine CPU 记录 x 16"
+
+[[const]]
+kernel_const = "MAX_IOAPICS"
+value = 4
+section = "bus"
+linux_source = "ACPI MADT 可含多个 IOAPIC；Linux 按表长动态"
+reason = "x86 平台实测最多 1-2 个 IOAPIC；4 是留一倍余量的取舍"
+is_tradeoff = true
+cost = "IoApicEntry x 4"
+
+[[const]]
+kernel_const = "MAX_OVERRIDES"
+value = 24
+section = "bus"
+linux_source = "ACPI MADT Interrupt Source Override 条目数无上限；Linux 按表长遍历"
+reason = "实测平台 0-8 条；24 是留三倍余量的取舍"
+is_tradeoff = true
+cost = "OverrideEntry x 24"
+
+[[const]]
+kernel_const = "MAX_TABLES"
+value = 48
+section = "bus"
+linux_source = "ACPI RSDT/XSDT 表数无上限；Linux 按长度遍历"
+reason = "实测平台 10-20 张；48 是留两倍余量的取舍"
+is_tradeoff = true
+cost = "表头记录 x 48"
+
+[[const]]
+kernel_const = "MAX_DEVICES"
+value = 64
+section = "bus"
+linux_source = "Linux PCI 总线按需遍历，无固定设备数上限"
+reason = "取 64：单机 PCI 设备很少超过 40；定长表省掉分配器"
+is_tradeoff = true
+cost = "PciDevice x 64"
+
+# ---------------------------------------------------------------- 本项目特有（Linux 无等价物）
+
+[[const]]
+kernel_const = "MAX_VMOS"
+value = 16
+section = "memory"
+linux_source = "Linux 用 shmem/tmpfs inode 承载共享内存，无 VMO 概念"
+reason = "本项目 VMO 是显式对象；16 是当前接缝，扩到产品级需与 MAX_HANDLES 一起重估"
+is_tradeoff = true
+cost = "VmoEntry x 16"
+
+[[const]]
+kernel_const = "MAX_VMO_PAGES"
+value = 16
+section = "memory"
+linux_source = "Linux shmem 单文件大小无此限制"
+reason = "单个 VMO 最多 16 页 = 64 KiB；接缝值，非 Linux 对齐值"
+is_tradeoff = true
+cost = "无独立开销（单 VMO 页数上界）"
+
+[[const]]
+kernel_const = "MAX_OWNED"
+value = 16
+section = "sched"
+linux_source = "Linux 用引用计数（mm/users）动态管理，无 OwnedSet"
+reason = "任务持有的资源集合表长；16 覆盖 1 栈 + 1 AS + 若干段，产品级需重估"
+is_tradeoff = true
+cost = "OwnedEntry x 16 / 任务"
+
+[[const]]
+kernel_const = "MAX_STARTUP_HANDLES"
+value = 16
+section = "abi"
+linux_source = "Linux execve 无启动句柄概念（进程继承 fd 表）"
+reason = "ABI 承诺的一部分（StartupInfo 描述表长），改动即破坏 ABI，需 ADR"
+is_tradeoff = true
+cost = "StartupHandle 描述 x 16（用户态可见，ABI 冻结）"
+
+[[const]]
+kernel_const = "MAX_WAITERS"
+value = 16
+section = "sync"
+linux_source = "Linux wait_queue_head 是链表，无固定等待者上限"
+reason = "定长等待者表；16 是接缝。超过则唤醒失败，调用方必须处理"
+is_tradeoff = true
+cost = "Waiter x 16 / 队列"
+
+[[const]]
+kernel_const = "MAX_WAIT_QUEUES"
+value = 16
+section = "sync"
+linux_source = "Linux 等待队列按需分配"
+reason = "全局等待队列表长；16 是接缝"
+is_tradeoff = true
+cost = "WaitQueue x 16"
+
+[[const]]
+kernel_const = "MAX_AS_MAP_PAGES"
+value = 16
+section = "aspace"
+linux_source = "Linux 页表按需，无每 AS 映射页数上限"
+reason = "每张 AS 记的映射页数上界；与 AS_PT_SLOTS 同口径，AS 扩容后需重估"
+is_tradeoff = true
+cost = "无独立开销（每 AS 记账上界）"
+
+[[const]]
+kernel_const = "MAX_COMPONENTS"
+value = 16
+section = "filesystem"
+linux_source = "Linux VFS 路径解析用动态 nameidata，无固定组件数"
+reason = "路径最多 16 个组件；超过返错。产品级需按 PATH_MAX 重估"
+is_tradeoff = true
+cost = "无独立开销（解析栈上界）"
+
+[[const]]
+kernel_const = "MAX_LOAD_SEGMENTS"
+value = 8
+section = "elf"
+linux_source = "Linux ELF 装载按程序头数量动态遍历（无上限）"
+reason = "ELF 程序头最多 8 个；真实程序常见 3-5 个"
+is_tradeoff = true
+cost = "LoadSegment x 8"
+
+[[const]]
+kernel_const = "MAX_MODULES"
+value = 64
+section = "resource"
+linux_source = "Linux 模块数动态（链表）"
+reason = "资源台账模块数，诊断用途；64 足够"
+is_tradeoff = true
+cost = "ModuleEntry x 64"
+
+[[const]]
+kernel_const = "MAX_FRAMES"
+value = 32
+section = "diag"
+linux_source = "Linux 无等价物（这是 Aurora 的持久状态区）"
+reason = "启动循环保护的帧记录表长；32 是接缝"
+is_tradeoff = true
+cost = "FrameRecord x 32"
+
+[[const]]
+kernel_const = "MAX_VBLK"
+value = 4
+section = "driver"
+linux_source = "Linux 块设备数按需（无上限）"
+reason = "virtio-blk 设备最多 4 台；ADR-112 已实测两台并存"
+is_tradeoff = true
+cost = "VblkEntry x 4"
+[[const]]
+kernel_const = "MAX_REGIONS"
+value = 96
+section = "memory"
+linux_source = "Linux 用 maple tree 动态管理 VMA，无固定区间数上限"
+reason = "物理内存区段表长（EARLY 阶段按内存映射条数）；96 是接缝"
+is_tradeoff = true
+cost = "Region x 96"
+
+[[const]]
+kernel_const = "MAX_SIG_TASKS"
+value = 96
+section = "sched"
+linux_source = "Linux 信号队列按进程 task_struct 内嵌，随进程数动态"
+reason = "信号表的任务槽数。**必须与 MAX_TASKS_TOTAL 同量级**，96 是当前接缝"
+is_tradeoff = true
+cost = "SigTask x 96"

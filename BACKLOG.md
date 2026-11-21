@@ -20616,3 +20616,105 @@ rflags 位（ADR-021：IF 属于 CPU 不属于任务）。注释里的论证是�
 | `t_map_hole` 偶发（0.03%） | 未归因，§484 记了三步「让下次撞到时能读出成因」 |
 | `t_crash` 偶发（1/8298） | §446 恒红项同族 |
 | 探针信箱为什么读不到 | 本轮只钉到 `被拒`，**没查到页表为什么没走完** |
+---
+
+## 489. 容量基线改为 Linux 对齐，并以第 20 道门禁强制（2026-11-22）
+
+### 使用者裁决
+
+> 你在项目配置中写个硬性配置吧，当前计算机只是参考，里面的一些配置要按 Linux 配置参数来，
+> 如果 Linux 有待优化的可以在基础上优化，但是要有依据，不要以开发机的配置做硬件参考。
+
+### 动手前查到的**结构性障碍**（这是本轮最重要的发现）
+
+`MAX_PROCESSES` 提不上去不是「没改数字」，是**装不下**：
+
+    pub const NO_ASPACE: u8 = 0xFF;   // 哨兵
+    pub as_slot: u8,                  // 上限 255
+    aspace: u8,                       // 上限 255
+
+每进程一张 AS，AS 槽号是 `u8` ⇒ **理论上限 254**。所以「扩到 1024/32768」在位宽不改时**结构上不可能**。
+（u8 槽号分布在 9 个文件、59 处。）
+
+### 交付了什么
+
+**① `docs/architecture/capacity-baseline.toml`（28 个 Aurora 常量 + 7 个 Linux 基线）**
+
+三层结构：`[[linux]]`（Linux 原始值，只作依据）/ `[[const]]`（Aurora 的值，每项带 `linux_source`）/
+`[slot_width]` + `[memory_cost]`（自检）。
+
+**规则：没有 Linux 依据的值不许登记；取舍的必须写 `reason`。**
+
+**② Linux 依据（全部取自主线源码，非二手文档）**
+
+| 常量 | 值 | 出处 |
+|---|---|---|
+| `PID_MAX_DEFAULT` | 32768（0x8000） | `include/linux/threads.h` |
+| `PID_MAX_LIMIT` | 4194304 | `include/linux/threads.h` |
+| `MAX_THREADS` | 2^30-1 | `kernel/fork.c`（`FUTEX_TID_MASK`） |
+| `MIN_THREADS` | 20 | `kernel/fork.c` |
+| `NR_OPEN` | 1024 | `include/uapi/linux/limits.h` |
+| `sysctl_nr_open` | 1048576 | `fs/file.c` |
+| `NR_OPEN_DEFAULT` | 64 | `include/linux/fdtable.h` |
+
+**最有价值的一条是公式不是常量**（`kernel/fork.c` `set_max_threads()`）：
+
+    threads = (nr_pages * PAGE_SIZE) / (THREAD_SIZE * 8)
+    threads = clamp(threads, 20, 2^30-1)
+
+**含义：线程结构只许占物理内存的 1/8。** 那个 `* 8` 就是这条纪律，已照此写进配置。
+
+**③ 目标值**
+
+| 常量 | 旧 | 新 | 依据 |
+|---|---|---|---|
+| `MAX_PROCESSES` | 4 | **32768** | 对齐 `PID_MAX_DEFAULT` |
+| `MAX_ADDR_SPACES` | 8 | **32768** | 每进程一张 AS，必须相等 |
+| `MAX_HANDLES` | 64 | **131072** | `sysctl_nr_open` 的保守子集（取舍） |
+| `MAX_JOBS` | 4 | **1024** | Linux 无 Job；1024×32=32768 自洽（取舍） |
+| `MAX_TASKS` | 12 | **256** | Linux 动态分配；256/CPU 是定长取舍 |
+| `MAX_VA_RESERVATIONS` | 256 | **65536** | Linux 用 maple tree（取舍） |
+| 槽号位宽 | u8 | **u16** | Linux `pid_t` = s32 |
+
+**内存代价已算并写进配置**：静态表 ~5.4 MiB（1024 MiB 下占 0.54%）；
+32768 进程全开需 ~1.15 GiB，**超过 target_min_ram=1024，这是已知边界不是 bug**。
+
+**④ 门禁 `check-capacity-baseline`（第 20 道）**
+
+四条判据：①登记的值必须在源码里存在且相等 ②源码每个 `MAX_*` 必须登记
+③`is_tradeoff` 必须有 `reason` ④`MAX_ADDR_SPACES` 必须装得进槽号位宽。
+
+### 门禁自己做错了一次（如实记）
+
+第一版只扫 `pub const MAX_*`，于是 `AS_PT_SLOTS`（每张 AS 的页表页上界，货真价实的容量）
+**漏网**——门禁报「登记了但源码里没有」，查半天才发现它压根不在扫描范围。
+**那种漏网比不扫更坏**：门禁看起来在工作，实际有一类容量永远不受检。
+
+放宽成「名字含 MAX/SLOTS/PAGES/...」也错了（同一轮实测）：一口气卷进 **38 个协议常量**——
+`COPY_MAX=4096` 是协议上限不是表长、`NAME_MAX=12`/`PATH_MAX=256` 是格式宽度、
+`NET_TX_MAX=1514` 是 MTU、`IDT_ENTRIES=256` 是 x86 硬件规定（不由我们选）。
+要求它们「举证 Linux 依据」是错的要求。
+
+**最终判据：`MAX_` 前缀 = 我们选的容量。** 非 MAX_ 的例外必须显式登记。
+
+### 负样本（变异证红，都跑过）
+
+| 负样本 | 实测 |
+|---|---|
+| 把某容量改成与基线一致 | 条款 **10 → 9**，该条消失 ✅ |
+| 新增一个未登记容量 | 精确点名 `MAX_UNREGISTERED_TEST = 123` ✅ |
+
+### 当前状态（如实写）
+
+`check` 现在 **10 条红**。这不是回归，是**门禁刚立、内核还没跟上**：
+9 条「值不符」+ 1 条「u8 槽号装不下 32768」。**这份红就是欠账清单。**
+
+**位宽 `u8 → u16` 是其他一切的先决条件**（9 个文件 59 处）。
+
+### 未做
+
+- **位宽扩容**（本 ADR 只裁决「必须是 u16 才装得下」，实施顺序下一轮定）
+- **9 个容量的实际改值**（门禁那 9 条红）
+- per-process fd 表（ADR-179 范围）
+- `MAX_CPUS=8` 是否提到 Linux 的 64（涉及 per-CPU 数组全量重算）
+- socket / IPv6 / 真机安装（本轮只做容器基线，未碰这三条线）

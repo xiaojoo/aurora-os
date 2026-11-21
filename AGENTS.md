@@ -25,8 +25,9 @@ capability 的产品路径也已接通（`handles` 档 init 授 Job+Console，22
 `build` / `image` / `run` / `test` / `bench` / `check` / `ktests` / `release`。
 不要凭印象编命令或参数；不确定就跑 `--help`。
 
-- `check`：**19 道静态门禁**（lints-wired、unsafe、crates、module-interfaces、vector-table、interface-change、driver-ctx、state-window、virtio-pattern、
-  fat32-ports、net-pattern、sha-primitives、sig-anchor、pkg-manifest、sbom、matrix-wiring、verdict、**syscall-abi-arms**、nofloat）。
+- `check`：**20 道静态门禁**（lints-wired、unsafe、crates、module-interfaces、vector-table、interface-change、driver-ctx、state-window、virtio-pattern、
+  fat32-ports、net-pattern、sha-primitives、sig-anchor、pkg-manifest、sbom、matrix-wiring、verdict、**syscall-abi-arms**、
+  **capacity-baseline**、nofloat）。
   `check-syscall-abi-arms` 是 2026-11-21 加的，**三条判据**：①用户态 `syscall_abi(SYS_X)` 的每个名字，内核分派表里必须有同名臂；
   ②53/54 不许挂原始以太网帧的 handler（两族语义不合并）；③（ADR-176）内核**声明**的每个 `pub const SYS_X` 也必须有臂，
   豁免仅 `SYS_RESERVED_FIRST/LAST`（哨兵）与 `SYS_NOT_A_NUMBER`（99，专供「未知号回 -1」的负样本）。
@@ -119,6 +120,18 @@ GPT/FAT16/ESP 分区层、用户态装载器与 shell 外部命令、capability 
 （2026-11-21 更正：旧措辞「单地址空间（per-AS 页表未做）」已过期——`aspace_new_kernel` /
 `aspace_root` / `cr3_writes` 都在，换人路径按 AS 真写 CR3，判据 `ktests/memory/mm.rs:613`）、
 `MAX_CPUS = 8`、驱动句柄表 8+8 写死、`MAX_OWNED = 16`、资源台账按模块聚合而非逐句柄。
+
+**2026-11-22 更正（ADR-178）**：上面这一整段容量数字（`MAX_ADDR_SPACES = 8`、`MAX_CPUS = 8`、
+`MAX_OWNED = 16`、驱动句柄 8+8 …）都是**按开发机拍的**，源码注释里自己写着「今天无 workload
+依据，按接缝够用定尺」。**不要再把它们当硬件参考。**
+
+容量基线的唯一来源现在是 `docs/architecture/capacity-baseline.toml`：每个值都带 Linux 主线源码
+出处，取舍的标 `is_tradeoff` 并写理由。门禁 `check-capacity-baseline`（第 20 道）双向对账——
+源码里每个 `MAX_*` 必须登记，登记的值必须与源码相等。
+
+**当前状态（如实写）**：该门禁 **10 条红**，因为基线已改而内核还没跟上：
+9 条「值不符」+ 1 条「u8 槽号装不下 32768」。这不是回归，是欠账清单。
+**位宽 `u8 → u16` 是其他一切的先决条件**（涉及 9 个文件 59 处）。
 
 <!-- aoci:begin -->
 ## AOCI 仓库认知

@@ -6137,6 +6137,133 @@ def check_nofloat(elf: Path) -> list[str]:
     return []
 
 
+def check_capacity_baseline() -> list[str]:
+    """容量基线双向对账（`docs/architecture/capacity-baseline.toml`）。
+
+    ## 为什么需要这道门
+
+    之前所有容量常量都是「按开发机够用」定的：`MAX_PROCESSES = 4`、`MAX_ADDR_SPACES = 8`、
+    `MAX_HANDLES = 64`。源码注释里自己写着「今天无 workload 依据，按接缝够用定尺」。
+    那在 4 核 2 GiB 的 QEMU 里够用，**装到真机上立刻撞墙**——4 个进程、64 个句柄，
+    连 shell 跑几条命令都不够。
+
+    ## 判据（与 `crates.toml` / `module-interfaces.toml` 同一套纪律：双向）
+
+    ① 本文件每个 `[[const]]` 声明的 `kernel_const` 必须在源码里存在，且值相等；
+    ② 源码里每个 `pub const MAX_*: usize = N` 必须在本文件登记。
+
+    少一边都红。② 那一条的作用是**逼新加的容量必须给出 Linux 依据**——
+    不登记就红，而不是悄悄地又按「开发机够用」定一个数。
+
+    ## 为什么只比 `usize` 的 `MAX_*`
+
+    它们才是容量（表长、循环上界）。`MAX_CPUS` 也在这条线上，但它同时受 `nr_cpu_ids`
+    与 ACPI MADT 约束，属于「硬件探测」而不是「我们选的值」——仍要求登记，
+    理由写在 `[[const]]` 的 `reason` 里。
+    """
+    reg = ROOT / "docs" / "architecture" / "capacity-baseline.toml"
+    if not reg.exists():
+        return ["缺 docs/architecture/capacity-baseline.toml（容量基线的唯一来源）"]
+
+    try:
+        import tomllib
+
+        data = tomllib.loads(reg.read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001 —— 解析失败要原样报出来，不能吞
+        return [f"capacity-baseline.toml 解析失败: {e}"]
+
+    declared: dict[str, int] = {}
+    for ent in data.get("const", []):
+        name = ent.get("kernel_const", "")
+        val = ent.get("value")
+        if not name or not isinstance(val, int):
+            return [f"[[const]] 项缺 kernel_const/value: {ent!r}"]
+        if name in declared:
+            return [f"capacity-baseline.toml 重复登记 {name}"]
+        # 每个登记项都必须有依据：没有依据的容量就是「按开发机拍的」
+        if not ent.get("linux_source"):
+            return [f"{name} 缺 linux_source（没有 Linux 依据的容量不许登记）"]
+        if ent.get("is_tradeoff") and not ent.get("reason"):
+            return [f"{name} 标了 is_tradeoff 但没写 reason"]
+        declared[name] = val
+
+    # ---- ① 收源码里的容量常量
+    found: dict[str, tuple[int, str]] = {}
+    # ## 判据范围：为什么是「MAX_ 前缀」而不是「看起来像容量」
+    #
+    # 第一版只扫 `pub const MAX_*`，于是 `AS_PT_SLOTS`（每张 AS 的页表页上界，
+    # 货真价实的容量）**漏网**——门禁自己报「登记了但源码里没有」，查半天才发现
+    # 是它压根不在扫描范围。那种漏网比不扫更坏：门禁看起来在工作，实际有一类容量永远不受检。
+    #
+    # 但把范围放宽成「名字里含 MAX/SLOTS/PAGES/...」也错了，实测（同一轮）：
+    # 它一口气卷进 38 个协议常量——`COPY_MAX`(4096) 是**协议上限**不是表长，
+    # `NAME_MAX=12` / `PATH_MAX=256` 是**格式宽度**，`NET_TX_MAX=1514` 是**MTU**，
+    # `IDT_ENTRIES=256` 是**硬件规定**（x86 IDT 就 256 项，不由我们选）。
+    # 把它们拉进「举证 Linux 依据」是错的要求：它们本来就没有可选的余地。
+    #
+    # **所以判据是：`MAX_` 前缀 = 我们选的容量。** 非 MAX_ 的容量例外必须显式登记在
+    # `[[const]]` 里（`AS_PT_SLOTS` 就是这么登记的），走「登记了但源码里找不到」那条
+    # 分支时会用宽松正则再确认一次源码里是否真有这个名字与值。
+    #
+    # 这条取舍如实记在这里，而不是假装「扫描覆盖了所有容量」。
+    pat = re.compile(r"^\s*(?:pub )?const (MAX_[A-Z0-9_]+): usize = (\d+);", re.M)
+    # 登记项里的非 MAX_ 名字（如 AS_PT_SLOTS）用这条去源码里核实
+    any_pat = re.compile(r"^\s*(?:pub )?const ([A-Za-z_][A-Za-z0-9_]*): usize = (\d+);", re.M)
+    for src in (ROOT / "kernel" / "src").rglob("*.rs"):
+        try:
+            text = src.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for m in pat.finditer(text):
+            name, val = m.group(1), int(m.group(2))
+            if name not in found:
+                found[name] = (val, str(src.relative_to(ROOT)).replace("\\", "/"))
+
+    bad: list[str] = []
+
+    # 登记项里的非 MAX_ 名字（`AS_PT_SLOTS` 那一类）不在 `found` 里，用宽松正则补查。
+    extra_found: dict[str, tuple[int, str]] = {}
+    for m in any_pat.finditer("".join(p.read_text(encoding="utf-8", errors="replace")
+                                        for p in (ROOT / "kernel" / "src").rglob("*.rs"))):
+        nm = m.group(1)
+        if nm not in extra_found:
+            extra_found[nm] = (int(m.group(2)), "")
+
+    for name, want in declared.items():
+        got = found.get(name) or extra_found.get(name)
+        if got is None:
+            bad.append(f"登记了但源码里没有: {name}")
+        elif got[0] != want:
+            where = f"（{got[1]}）" if got[1] else ""
+            bad.append(f"{name} 值不符: 基线={want} 源码={got[0]}{where}")
+
+    for name, (val, where) in sorted(found.items()):
+        if name not in declared:
+            bad.append(
+                f"源码有但未登记: {name} = {val}（{where}）"
+                " —— 新容量必须先在 capacity-baseline.toml 写明 Linux 依据"
+            )
+
+    # ---- ② 位宽前提：槽号位宽必须容得下 AS 表容量
+    sw = data.get("slot_width", {})
+    if sw:
+        cur_bits = sw.get("current")
+        tgt_bits = sw.get("target")
+        max_as = declared.get("MAX_ADDR_SPACES")
+        if isinstance(tgt_bits, int) and isinstance(max_as, int) and max_as > 0:
+            if max_as >= (1 << tgt_bits):
+                bad.append(
+                    f"MAX_ADDR_SPACES={max_as} 装不进 {tgt_bits} 位槽号（上界 {(1 << tgt_bits) - 1}）"
+                )
+        if isinstance(cur_bits, int) and isinstance(max_as, int) and max_as > 0:
+            if max_as >= (1 << cur_bits):
+                bad.append(
+                    f"当前槽号是 {cur_bits} 位（上界 {(1 << cur_bits) - 1}），"
+                    f"装不下 MAX_ADDR_SPACES={max_as} —— 先做位宽扩容（slot_width.target）"
+                )
+
+    return bad
+
 def check_crates_listed() -> list[str]:
     """正文/代码引用的 crate 必须都登记在 docs/architecture/crates.toml（§2.5 R10）。"""
     reg = ROOT / "docs" / "architecture" / "crates.toml"
@@ -7930,6 +8057,7 @@ def do_check(elf: Path | None) -> int:
         "check-matrix-wiring": lambda: check_matrix_wiring(),
         "check-verdict": lambda: check_verdict_contract(),
         "check-syscall-abi-arms": lambda: check_syscall_abi_arms(),
+        "check-capacity-baseline": lambda: check_capacity_baseline(),
         "check-nofloat": (lambda: check_nofloat(elf)) if elf else (lambda: ["未提供内核镜像路径"]),
     }
     rc = 0
