@@ -110,12 +110,29 @@ fn t_clock_uptime() -> bool {
     // ---- ③ 理性上界：本用例起跑时刻用 TSC 直接量，uptime(现在) − uptime(那时)
     //     不可能超过"两次 TSC 读数的差"换算出的微秒（同一把尺子的两种走法，
     //     走 syscall 的那条绕了 trap+分派，只会更慢不会更快）。
-    let c0 = crate::tsc::now();
+    // **§482 修：TSC 的取样区间必须覆盖两次 uptime 读数的全程。**
+    //
+    // 原来的写法是 `c0 → u0 → c1 → u1`，`span = c1 - c0` 只量了两次 uptime 调用
+    // **之间**的空隙，而 `u1 - u0` 包含的是**两次调用本身的耗时**（每次约 22 µs 的
+    // syscall 路径）。于是判据 `u1 - u0 <= span` 在结构上就不可能成立——
+    // 除非 `read_uptime` 是零开销的。
+    //
+    // 实测（§482 整链，`A2越界argv被校验拒` 那一行）：`a=3824170 b=3824238` ⇒ 68 cycles
+    // ≈ 0.02 µs，而 `u0=3861321 u1=3861366` ⇒ 45 µs。**45 >> 0.02**，必红。
+    // 它偶尔绿，是因为两次调用落在同一个 tick 内、`u1 - u0 == 0`。
+    //
+    // 正确的区间：`c_lo` 在**第一次读之前**、`c_hi` 在**第二次读之后**，
+    // 于是 `u1 - u0` 必然落在 `[c_lo, c_hi]` 之内——那才是这条判据想证的
+    // 「uptime 不会比 TSC 走得快」。
+    let c_lo = crate::tsc::now();
     let u0 = read_uptime();
     let c1 = crate::tsc::now();
     let u1 = read_uptime();
-    let span_us = clock::micros(c1.wrapping_sub(c0)).unwrap_or(0);
+    let c_hi = crate::tsc::now();
+    let span_us = clock::micros(c_hi.wrapping_sub(c_lo)).unwrap_or(0);
+    // `+1` 是微秒换算的取整余量（两次 `micros` 各可能丢不到 1 µs）。
     let bound_ok = u1 >= u0 && (u1 - u0) <= span_us as i64 + 1;
+    let _ = c1; // 中间那次读数留着：它是「两次调用之间确实有空隙」的证人，不参与判据
 
     // ---- ④ 重锚计数为 0。
     let reanchor_ok = clock::reanchors() == 0;

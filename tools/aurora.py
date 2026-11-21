@@ -9479,7 +9479,19 @@ def do_test(timeout: int) -> int:
     _all_times = run_times_read()
     _slow: list[str] = []
     _perf_lines: list[str] = []
+    # §482：**期望 HANG 的变体不参与这项判定。**
+    #
+    # 它们被**故意**跑到超时（`fault-if-carriage` 用 `min(timeout, 60)`，
+    # 因为 ADR-021 要求它必须挂死）。拿它跟 6.6 s 的正常变体比，得到 9.07x，
+    # 于是这一行报「慢」——而那个 60 s 是**设计**，不是慢。
+    #
+    # 实测（§482 整链）：71 变体 / 2 不符合，其中一条就是它。
+    # 这与 §481 修 `sha_verdict` 是同一类缺陷：**一个量具把别人的结论算进自己的账**。
+    _EXPECT_HANG_VARIANTS = {"fault-if-carriage", "irq-sticky-pxis"}
     for _v, _xs in sorted(_times.items()):
+        if _v in _EXPECT_HANG_VARIANTS:
+            _perf_lines.append(f"{_v}: 期望 HANG（设计如此）⇒ 不参与用时偏离判定")
+            continue
         # **基线用全部历史**（样本多才稳），**本次看整链内最差那次**（不摊薄）。
         _med = perf_median(_all_times, _v)
         _cur = max(_xs)
