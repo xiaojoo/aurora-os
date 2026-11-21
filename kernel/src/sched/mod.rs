@@ -1145,6 +1145,25 @@ pub fn if_loads() -> (usize, usize) {
 static SWITCH_PROBE: [core::sync::atomic::AtomicU64; 8] =
     [const { core::sync::atomic::AtomicU64::new(0) }; 8];
 
+/// 读 `SWITCH_PROBE` 的只读快照（§488）。
+///
+/// ## 为什么需要它（一个量具把自己证伪了）
+///
+/// §487 想在窗口结束时问「探针被换入过几次」，用的是 `runs_of(t)`。
+/// 那个读数在成功跑和失败跑里**都是 0** —— 于是当时判成「探针没被调度」。
+/// **那个判断是错的**：`reap()` 把槽标 `Free` 时会把 `runs` 清零
+/// （`mod.rs:528`），而窗口结束时探针通常已被回收 ⇒ **`runs_of` 必然读到 0**。
+/// 那个量具**只能读出 0**，它证明不了任何东西。
+///
+/// `SWITCH_PROBE` 不在槽里，`reap` 不清它 ⇒ 它记的「最后一次换入的 gidx」
+/// 才是能回答「窗口里最后换进来的是谁」的量。
+pub fn switch_probe(slot: usize) -> u64 {
+    if slot >= 8 {
+        return 0;
+    }
+    SWITCH_PROBE[slot].load(Ordering::Relaxed)
+}
+
 pub fn frame_if_bit(slot_task: usize) -> Option<bool> {
     frame_rflags_of(slot_task).map(|f| f & RFLAGS_IF != 0)
 }
