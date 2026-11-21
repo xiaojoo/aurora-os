@@ -4648,14 +4648,53 @@ pub fn read_at_in(aslot: u8, va: u64) -> Option<u64> {
     }
 }
 
+/// 这条日志的**上界**（§486）。
+///
+/// ## 为什么必须有上界（一次实测的自激）
+///
+/// `read_at` 会被**循环**调用：`fs_open` 的 `slot()` 每轮读 5 个格，
+/// 而窗口内循环了 5413 轮。失败时每格打一行 ⇒ **2561 行**。
+/// 每行约 150 字节、115200 8N1 下约 **13 ms/行** ⇒ **33 秒**，
+/// 而那个窗口只有 **0.5 秒**。
+///
+/// **于是失败路径把自己锁死**：
+///
+///     读失败 → 打一行(13ms) → 探针拿不到 CPU → 更读失败 → 更多日志
+///
+/// 判据被自己的诊断输出淹死了。实测（`run-9794`）：失败跑 2561 行、成功跑 **1 行**。
+///
+/// ## 为什么是「上限」而不是「删掉」
+///
+/// 前几行仍然要打：它是「为什么读不到」的唯一现场（`NotMapped` / `NotSharedWithUser` /
+/// `NotUserRange` 三种成因的处置方向完全不同）。**无界**才是问题，有界不是。
+///
+/// 上限取 8：一次失败调用链里前 8 格足够说明成因，之后计数、不再打。
+const READ_AT_LOG_MAX: u64 = 8;
+static READ_AT_REFUSED: AtomicU64 = AtomicU64::new(0);
+
 pub fn read_at(va: u64) -> Option<u64> {
     match peek_u64(va) {
         Ok(v) => Some(v),
         Err(e) => {
-            crate::log_info!("abi: 读用户页被拒 va={va:#x} —— {}", PtrError::describe(e));
+            // 先计数再判要不要打：**计数器永远准确**，日志有上界。
+            // 两者分开是刻意的——判据要的是计数，读的人要的是成因。
+            let n = READ_AT_REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= READ_AT_LOG_MAX {
+                crate::log_info!("abi: 读用户页被拒 va={va:#x} —— {}", PtrError::describe(e));
+            } else if n == READ_AT_LOG_MAX + 1 {
+                crate::log_warn!(
+                    "abi: 读用户页被拒已超过 {} 次，之后只计数不再打（避免日志把自己刷超时）",
+                    READ_AT_LOG_MAX
+                );
+            }
             None
         }
     }
+}
+
+/// 累计被拒次数（判据用它，不用日志行数——日志有上界，计数没有）。
+pub fn read_at_refused() -> u64 {
+    READ_AT_REFUSED.load(Ordering::Relaxed)
 }
 
 /// 容器加载那条路径的判据要能自己说明失败原因，这里给一份人话（同 `elf::describe`）。
