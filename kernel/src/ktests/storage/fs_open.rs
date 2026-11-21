@@ -779,6 +779,11 @@ fn t_fs_open_ring3() -> bool {
     let mut rounds = 0u64;
     let mut in_window = true;
     let mut box_ = [0u64; FP_CELLS];
+    // §486 插桩：记录窗口前后的「本 CPU 换人次」与「tick 次」，用来分三种成因：
+    // ① tick 没进来（ticks 不涨）；② tick 进了但没换到探针（ticks 涨、switches 不涨）；
+    // ③ 换到了但探针没写 DONE（都涨、哨兵仍不到）。三种的修法完全不同。
+    let bsp = crate::arch::x86_64::cpu::self_slot();
+    let (sw0, tk0) = crate::sched::stats_of(bsp);
     // 两段窗口：第一段只等 `DONE`，看到就**退出**——`with_interrupts` 退出时 `cli`，
     // 于是下面的整页快照与异步 reaper 互斥（reap 只在 tick 的抢占点上跑）。
     // 旧版把快照放在整段窗口之后、中间还隔着 2M 周期自旋：那期间任何一次 tick 都会把
@@ -802,6 +807,8 @@ fn t_fs_open_ring3() -> bool {
     });
     // IF 关着：先复核哨兵，再整页取快照。这两步之间不会有 tick。
     in_window = slot(data, fp::DONE) == fp::DONE_VAL;
+    // §486 插桩：窗口后的计数。只记不打（下面一起打），避免再多占串口。
+    let (sw1, tk1) = crate::sched::stats_of(bsp);
     if in_window {
         let mut nread = 0usize;
         while nread < FP_CELLS {
@@ -903,6 +910,13 @@ fn t_fs_open_ring3() -> bool {
 
     // §355 附：这格不过探针、不过槽、不过快照——用来把"abi=0"钉到链上的哪一段。
     crate::log_info!("fs-open-ring3: abi直读={:#x} 探针槽={:#x}", crate::user::abi_word(), abi);
+    // §486 插桩：窗口前后本 CPU 的换人次与 tick 次。
+    // 三成因对照：sw 不涨=没换到任何人；tk 不涨=tick 根本没进来；
+    // 都涨但 DONE 不到=换到了别的任务/探针没写槽。
+    crate::log_info!(
+        "fs-open-ring3: 窗口前后 换人 {}→{} tick {}→{} rounds={} served={} 被拒={} 探针runs={}",
+        sw0, sw1, tk0, tk1, rounds, user::served(), user::read_at_refused(), crate::sched::runs_of(t)
+    );
     crate::log_info!(
         "fs-open-ring3: 取证 读回={} 首8={:#x} 字节和={} 尾字节数={} 尾首8={:#x} 尾和={} stat大小={} 首簇={} 条目={} 名字和={} 大小和={} 多级读回={} 多级首8={:#x} 多级和={} 多级首簇={} proj条目={} proj名字和={} 表清空={} 回收={} rounds={} served={} 诊断mul={:#x} 诊断add={:#x} ⇒ {}",
         box_[(fp::READ_TOTAL / 8) as usize],
