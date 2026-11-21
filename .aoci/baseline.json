@@ -1,7 +1,7 @@
 {
   "version": 1,
   "created_at": "2026-11-21T10:24:18Z",
-  "updated_at": "2026-11-21T10:44:03Z",
+  "updated_at": "2026-11-21T16:41:09Z",
   "files": {
     ".cargo/config.toml": {
       "role": "observe",
@@ -16,10 +16,9 @@
       "normalized_sha256": "0e127d505e9f4b1f6e1ade48aea1373e8f4895844dd66ee663f4865d4b29b2a2"
     },
     ".gitignore": {
-      "role": "observe",
-      "sha256": "719051640059f94a33138944aea5ca28e41eaef07559f28fe673b8ec213f12b2",
-      "size": 942,
-      "normalized_sha256": "719051640059f94a33138944aea5ca28e41eaef07559f28fe673b8ec213f12b2"
+      "sha256": "5343bee25b092cc6e65362eeb07df79f4efb306ea76884de5788ab27ee6726e2",
+      "size": 1080,
+      "normalized_sha256": "5343bee25b092cc6e65362eeb07df79f4efb306ea76884de5788ab27ee6726e2"
     },
     ".idea/aurora-os.iml": {
       "role": "observe",

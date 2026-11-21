@@ -363,7 +363,11 @@
       }
     ]
   },
-  "installed_agents": [],
+  "installed_agents": [
+    "claude",
+    "codex",
+    "qoder"
+  ],
   "automation": {
     "mode": "auto"
   },
