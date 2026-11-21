@@ -2578,6 +2578,14 @@ pub unsafe fn preempt_point(frame: u64, cpu: usize) {
     //
     // 为什么不用「frame 是不是合成的那一个」判断：`frame` 会在首次保存时被改写，
     // 而改写与「这一跑是不是第一次」之间没有原子性。用一个显式标记更可靠。
+    // `fault-if-carriage` 负样本**必须把两条保护一起关掉**才能证明规则不是修辞：
+    // 只关 ADR-021 那条（`if_open = frame_if_bit(next)`）而留下 `never_ran`，
+    // 首次运行仍然会被开窗 ⇒ 负样本静默失效。实测（§481）：那次整链里
+    // `IF 归任务就挂死` 从 HANG 变成了 PASS(33) —— 负样本失去了触发条件。
+    //
+    // 这不是「负样本坏了」，而是**它证的东西变了**：它原来证「窗口规则必要」，
+    // 现在只证「`never_ran` 分支也能救」。两条都关掉，才回到原来证的那一条。
+    #[cfg(not(feature = "fault-if-carriage"))]
     if rq(cpu).tasks[nslot].user || rq(cpu).tasks[nslot].never_ran {
         if_open = true;
     }
