@@ -1900,6 +1900,37 @@ def kt_all_green(log: str) -> bool:
     return bool(kt) and kt.group("passed") == kt.group("total") and kt.group("failed") == "0"
 
 
+def ktest_named(log: str, name: str) -> str:
+    """从串口里读**某一条 ktest 的结论**，返回 'ok' / 'failed' / ''（没跑到）。
+
+    ## 为什么要这个助手（§485）
+
+    `kt_all_green` 只能回答「这一档全绿吗」。而本轮新加的四个用例
+    （`t_cow_share` / `t_mmap_family` / `t_signal_roundtrip` / `t_fs_create_unlink`）
+    各在一档里与几十条别的用例同跑——**整档绿不等于它们跑了，整档红也不等于它们红了**。
+
+    实测过的形状：§482 那次整链里「SHA-256 十三向量」报红，红的却是同档的 `t_crash`。
+    一条用例的红被算到另一行的账上，读数就会指向错的地方。
+    这个助手让每一行**点名要自己的那一条**。
+
+    ## 两种 tag 都要收
+
+    成功是 `[test] 0x… <name> -> ok`，失败是 `[FAIL] 0x… <name> -> failed`。
+    只收 `[test]` 的话「红过的用例」永远是空——那个坑 §479 已经踩过一次。
+    """
+    m = re.search(r"\[(?:test|FAIL)\] 0x[0-9a-f]+ " + re.escape(name) + r" -> (ok|failed)", log)
+    return m.group(1) if m else ""
+
+
+def ktest_row(log: str, name: str, want: str = "ok") -> list[str]:
+    """把 `ktest_named` 的结果翻成判定行的 bad 列表。`want` 是期望的结论。"""
+    got = ktest_named(log, name)
+    if not got:
+        return [f"串口里没有 `{name}` 的结论（这一档没跑到它，或它没注册）"]
+    if got != want:
+        return [f"`{name}` 的结论是 {got}，期望 {want}"]
+    return []
+
 def check_fs_open_ring3(log: str) -> list[str]:
     """FS-03 判定行：ring3 任务自己读回来的数，由宿主机按当时那块多级卷独立重算。
 
@@ -9744,6 +9775,31 @@ def do_test(timeout: int) -> int:
     pb_verdict = pbv if pbv != "PASS" else ("PASS" if not pb_bad else "CONTENT-MISMATCH")
     for x in pb_bad:
         print("    对账:", x)
+    # ---- §485：ADR-177 的三个内核用例，**各拿自己那一条的结论**。
+    #
+    # 为什么单独成行：它们与 `handles` 档里几十条别的用例同跑，
+    # 「整档绿」不等于「它们跑了」，「整档红」也不等于「它们红了」。
+    # §482 那次整链里「SHA-256 十三向量」报红、红的却是同档的 `t_crash` —— 同一类错。
+    # **每个用例跑自己那一跑**（`check-matrix-wiring` 的纪律：每行必须各拿自己那一跑的
+    # 日志与退出码）。共用 `pblog` 等于借别人的证据，而门禁正是拦这个。
+    cow_bad = []
+    cow_v, cow_rc, cow_log = do_run(["handles"], timeout)
+    cow_bad += ktest_row(cow_log, "t_cow_share")
+    cow_verdict = cow_v if cow_v != "PASS" and not cow_bad else ("PASS" if not cow_bad else "FAIL")
+    for x in cow_bad:
+        print("    COW:", x)
+    mm_bad = []
+    mm_v, mm_rc, mm_log = do_run(["handles"], timeout)
+    mm_bad += ktest_row(mm_log, "t_mmap_family")
+    mm_verdict = mm_v if mm_v != "PASS" and not mm_bad else ("PASS" if not mm_bad else "FAIL")
+    for x in mm_bad:
+        print("    mmap族:", x)
+    sig_bad = []
+    sig_v, sig_rc, sig_log = do_run(["handles"], timeout)
+    sig_bad += ktest_row(sig_log, "t_signal_roundtrip")
+    sig_verdict = sig_v if sig_v != "PASS" and not sig_bad else ("PASS" if not sig_bad else "FAIL")
+    for x in sig_bad:
+        print("    信号族:", x)
 
     print("=== GPT 分区表：内核读回的每个数由 validate_esp.py 独立重算（ADR-078 决策 5，第二台仪器）===")
     # 内核那侧的 t_gpt 比的是"自己算的和自己读的"，外加一张合成盘把 16 道闸各证红一次。
@@ -9986,6 +10042,13 @@ def do_test(timeout: int) -> int:
     frw_verdict = frwv if frwv != "PASS" else ("PASS" if not frw_bad else "CONTENT-MISMATCH")
     for x in frw_bad:
         print("    对账:", x)
+    # ---- §485：ADR-177 的文件族用例。同样点名，不靠整档。
+    fsc_bad = []
+    fsc_v, fsc_rc, fsc_log = do_run(["fs-rw"], timeout)
+    fsc_bad += ktest_row(fsc_log, "t_fs_create_unlink")
+    fsc_verdict = fsc_v if fsc_v != "PASS" and not fsc_bad else ("PASS" if not fsc_bad else "FAIL")
+    for x in fsc_bad:
+        print("    文件族:", x)
 
     print("=== ADR-112：两台 virtio-blk 并存——口序/容量/图案/队列，宿主机 qemu-img 对账 ===")
     IMAGE.unlink(missing_ok=True)
@@ -10430,6 +10493,12 @@ def do_test(timeout: int) -> int:
         ("多级LFN校验和被改只塌长名", dlfn_verdict, dlfrc, "FAIL", 35),
         # ADR-111 决策 3：写方向。内核绿而宿主机从**跑完的卷**上解出的字节对不上 ⇒ CONTENT-MISMATCH
         ("FS写方向与可写卷对账", frw_verdict, frwrc, "PASS", 33),
+        # §485：ADR-177 的四个内核用例各成一行。它们原来只在构建时跑 ktests，
+        # 整链里没有一行点名——红的时候只能靠间接推断是哪一个坏了。
+        ("COW 两AS共享写不串味", cow_verdict, cow_rc, "PASS", 33),
+        ("mmap/munmap/mprotect 三号闭环", mm_verdict, mm_rc, "PASS", 33),
+        ("信号 sigaction/sigreturn 往返", sig_verdict, sig_rc, "PASS", 33),
+        ("文件族 create/unlink 生命周期", fsc_verdict, fsc_rc, "PASS", 33),
         # ADR-110 决策 1：块请求层的四格语义与五计数（核内按增量断言，这里做链级确认）
         ("块请求层超时取消半途", b_verdict, brc, "PASS", 33),
         # ADR-112：两台 virtio-blk。内核绿而宿主机容量集合/BDF 序对不上 ⇒ CONTENT-MISMATCH
@@ -10515,6 +10584,10 @@ def do_test(timeout: int) -> int:
         "FS-03ring3探针与多级真卷对账": frlog,
         "多级LFN校验和被改只塌长名": dlfnlog,
         "FS写方向与可写卷对账": frwlog,
+        "COW 两AS共享写不串味": cow_log,
+        "mmap/munmap/mprotect 三号闭环": mm_log,
+        "信号 sigaction/sigreturn 往返": sig_log,
+        "文件族 create/unlink 生命周期": fsc_log,
         "块请求层超时取消半途": blog,
         "virtio 两台并存": tvlog,
         "多级首簇高半抹零读到别处": dhihlog,
