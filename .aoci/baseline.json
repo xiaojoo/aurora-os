@@ -1,7 +1,7 @@
 {
   "version": 1,
   "created_at": "2026-11-21T10:24:18Z",
-  "updated_at": "2026-11-21T19:19:03Z",
+  "updated_at": "2026-11-21T19:40:28Z",
   "files": {
     ".cargo/config.toml": {
       "role": "observe",
@@ -118,9 +118,9 @@
     },
     "aoci.code.txt": {
       "role": "index",
-      "sha256": "0371e4adf0ad485b1f52fb60f07cce15eed1b10a6c1a0be2a2ef97c40f181ef8",
-      "size": 1528,
-      "normalized_sha256": "5e2df1205f5b5ab44bbb342f27f795d533e65290cefe7885622542c24e917286"
+      "sha256": "5746435e0f3f2ca4912d691e8e47bcb18e6c901c9bdc421bc87f7c880830de47",
+      "size": 1612,
+      "normalized_sha256": "91ff61bd6508b3fdddb96f01e4819c030172bbe6970acc6f25f91eacb434c359"
     },
     "aoci.meta.txt": {
       "role": "index",
@@ -2521,9 +2521,9 @@
     },
     "kernel/src/memory/mm.rs": {
       "role": "index",
-      "sha256": "d08e98dc5ef472238a34c4f80f625162f59f6a187f678502804ef582c0fbe742",
-      "size": 164620,
-      "normalized_sha256": "18a81210c6cb434b4a59e2d0fa01e259d0949f0bcdb89a89416557a1fd035552"
+      "sha256": "72696e692ba82dbaf25a7534883c9e61d353c98a7547a1818fe609240e0256b6",
+      "size": 168460,
+      "normalized_sha256": "14153b04753ebe5fa9c67c9fc76b4219573af8205ce0feb10b9c22407868221e"
     },
     "kernel/src/memory/mod.rs": {
       "role": "observe",
