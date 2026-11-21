@@ -104,6 +104,14 @@ KERNEL_BASE = 0xFFFFFFFF80000000
 # -cpu max 是**必需**而非偏好：默认 qemu64 实测 smep/smap/xsave/x2apic 全为 false，
 # 而 §5.1（V1.2 R17）已把 SMEP/SMAP 定为必需项，用默认 CPU 等于在“硬件不支持”的拓扑上做验收。
 QEMU_SMP = "4"
+# ADR-177 §480：加速器开关。**默认空 = 不加 -accel，走 QEMU 自己的默认（TCG）**，
+# 所以既有判定的启动参数逐字不变。
+#
+# 为什么要有它：§472 记的「TCG 慢 20 倍」从来只有**推断**没有直接测量，
+# 而它污染整链读数（§479：39 条不符合里 35 条是慢）。要分离「代码慢」与
+# 「模拟器慢」，唯一干净的对照是**同一份镜像换加速器跑**。
+# 取值：""（默认，TCG）/ "tcg" / "whpx"。
+QEMU_ACCEL = ""
 QEMU_MEM = "512M"
 # 第 30 行的窗口按"每秒几万条 raise"的量级定，不是按一次观测值定（BACKLOG 71）
 STORM_TIMEOUT = 6
@@ -4247,6 +4255,11 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
 
     cmd = [
         str(QEMU), "-M", "q35", "-m", QEMU_MEM, "-smp", QEMU_SMP, "-cpu", QEMU_CPU,
+    ]
+    # §480：只有显式指定时才加 `-accel`。默认不加 ⇒ 既有判定的启动参数逐字不变。
+    if QEMU_ACCEL:
+        cmd += ["-accel", QEMU_ACCEL]
+    cmd += [
         "-drive", f"if=pflash,format=raw,readonly=on,file={code}",
         "-drive", f"if=pflash,format=raw,file={vars_run}",
         "-drive", f"format=raw,file={IMAGE}",
@@ -4431,6 +4444,32 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
     keep = BUILD / f"run-{RUN_SEQ:03d}.log"
     keep.write_text(log, encoding="utf-8")
     print(f"   串口留档: {keep.name}")
+    # §480：**先看内核自己写的退出码，再看 QEMU 进程的退出码。**
+    #
+    # 为什么必须这样：QEMU 的 `file:` 串口后端在退出时要 flush，而内核在写完
+    # `qemu-exit=` 那一行之后**立刻**写 debugexit 端口。两者竞争 ⇒ QEMU 有时不退，
+    # 被外层超时杀掉，`rc` 变成 -1。
+    #
+    # 实测（2026-11-21 §480，同一份镜像）：`-serial file:` 时 **2/3 不退**，
+    # `-serial null` 时 **0/3 不退**。所以这是**量具**的问题，不是内核的问题——
+    # 而把它记成 HANG 会让「内核明明 PASS 了」变成一条红，进而污染整链读数。
+    #
+    # 判据：串口里那行 `[exit] … qemu-exit=N` 是**内核自己写的**，N 就是它的判定。
+    # 进程没退只说明 QEMU 没走完收尾，不改变内核已经给出的结论。
+    kernel_rc = None
+    for ln in log.splitlines():
+        if "qemu-exit=" in ln:
+            try:
+                kernel_rc = int(ln.rsplit("qemu-exit=", 1)[1].strip())
+            except ValueError:
+                kernel_rc = None
+    if kernel_rc is not None and rc == -1:
+        # 内核报了退出码，但 QEMU 没退 ⇒ 按内核的码判，并**显式记下这件事**。
+        # 不静默：`qemu_rc` 仍然原样带出去，读数里能看见「这次是超时收尾的」。
+        rc = kernel_rc
+        kernel_rc_used = True
+    else:
+        kernel_rc_used = False
     if rc == 33:
         verdict = "PASS"
     elif rc in (35, 37, 39):
@@ -10614,7 +10653,15 @@ def main() -> int:
             p.add_argument("--host-fault", default="",
                            choices=["", *sorted(FAT_HOST_FAULTS), *sorted(DEEP_HOST_FAULTS),
                                     *sorted(GPT_HOST_FAULTS), *sorted(PKG_HOST_FAULTS)])
+        # §480：加速器。只给 `run`/`bench` —— 判定链要固定用默认（TCG），
+        # 否则「整链读数」这条历史曲线会被换加速器的那一次打断。
+        # 收下却不读它就是「看着开了其实没开」那种绿，所以这里**真的接进 do_run**。
+        p.add_argument("--accel", default="", choices=["", "tcg", "whpx"])
     a = ap.parse_args()
+    # §480：把 `--accel` 落进模块级变量。**只有 `run`/`bench` 有这个参数**，
+    # 其余子命令 `getattr` 拿不到 ⇒ 保持空 ⇒ 不加 `-accel`（与改动前逐字相同）。
+    global QEMU_ACCEL
+    QEMU_ACCEL = getattr(a, "accel", "")
     feats = [f for f in a.features.split(",") if f]
     if a.cmd == "build":
         do_build(feats)
