@@ -423,3 +423,117 @@ fn t_fs_rw_open_write() -> bool {
     ok && open_ok && c == 0 && live == h0
 }
 ktest!(KT_FS_RW_OPEN_WRITE, t_fs_rw_open_write);
+
+
+// ---- 70/71：文件族 create/unlink（ADR-177 切片 2c）
+//
+// ## 这一格证什么
+//
+// 在**真盘**（口 4 的可写卷）上走一遍完整生命周期：
+//   A：create 一个不存在的 8.3 名 ⇒ 返回 0、计数涨；
+//   B：再 create 同名 ⇒ 回 -1（AlreadyExists，今天没有 EEXIST）；
+//   C：`lookup` 能查到它、size=0、首簇=0（空文件不分配簇）；
+//   D：unlink ⇒ 返回 0、计数涨；
+//   E：unlink 之后 `lookup` 回 -8（找不到）；
+//   F：unlink 一个不存在的名字 ⇒ -8；
+//   G：名字不合 8.3（长名）⇒ -1。
+//
+// ## 为什么 B/C 两格是重点
+//
+// B 证「查重」真的在工作——不查重会建出两条同名目录项，那是一种**读起来完全正常**
+// 的卷损坏（`lookup` 找到第一条，第二条永远看不见但占着槽）。
+// C 证「空文件不分配簇」：FAT32 允许 first_cluster=0 + size=0，多分配一簇就是泄漏。
+#[cfg(all(feature = "handles", feature = "fs-open", feature = "fs-rw"))]
+fn t_fs_create_unlink() -> bool {
+    use crate::arch::x86_64::trap::TrapFrame;
+    use crate::user::{self, syscall_dispatch, SYS_FS_CREATE, SYS_FS_UNLINK};
+    use crate::filesystem::fs_rw;
+    // 用例自足三条
+    crate::sched::init_boot_task();
+    crate::sched::start_workers();
+    crate::arch::x86_64::apic::timer_start().ok();
+
+    let name = b"/TMPNEW.TXT";
+    // 路径要能被 copy_from_user 读到：现建一页真用户页并映射进当前 AS。
+    // 不用 lazy（那要等缺页），直接 phys_alloc + map。
+    let Ok(pf) = mm::phys_alloc(0, mm::MOD_TEST) else {
+        crate::log_fatal!("fs-create: 路径页分配失败");
+        return false;
+    };
+    let path_va = mm::USER_MMAP_BASE + 0x8000;
+    let path_map = match mm::map(mm::VirtAddr(path_va), pf, mm::PageFlags::USER_RW) {
+        Ok(m) => m,
+        Err(_) => {
+            crate::log_fatal!("fs-create: 路径页映射失败");
+            return false;
+        }
+    };
+    for (i, &b) in name.iter().enumerate() {
+        crate::user::write_at(path_va + i as u64, b as u64);
+    }
+    let mut f = TrapFrame {
+        cr2: 0, r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
+        rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0, vector: 0,
+        error_code: 0, rip: 0, cs: 0, rflags: 0, rsp: 0, ss: 0,
+    };
+
+    let c0 = user::fs_create_calls();
+    // ---- A：create
+    f.rax = SYS_FS_CREATE; f.rdi = path_va; f.rsi = name.len() as u64; f.rdx = 0;
+    syscall_dispatch(&mut f);
+    let created = f.rax == 0 && user::fs_create_calls() == c0 + 1;
+
+    // ---- B：再 create 同名 ⇒ -1
+    f.rax = SYS_FS_CREATE; f.rdi = path_va; f.rsi = name.len() as u64; f.rdx = 0;
+    syscall_dispatch(&mut f);
+    let dup_rejected = f.rax == user::E_INVALID;
+
+    // ---- C：查得到、size=0、首簇=0
+    let (size0, cluster0) = match fs_rw::mount() {
+        Ok(fs) => match fs.lookup("/TMPNEW.TXT") {
+            Ok(e) => (e.size, e.first_cluster),
+            Err(_) => (0xFFFF_FFFF, 0xFFFF_FFFF),
+        },
+        Err(_) => (0xFFFF_FFFF, 0xFFFF_FFFF),
+    };
+    let empty_file = size0 == 0 && cluster0 == 0;
+
+    // ---- D：unlink
+    let u0 = user::fs_unlink_calls();
+    f.rax = SYS_FS_UNLINK; f.rdi = path_va; f.rsi = name.len() as u64; f.rdx = 0;
+    syscall_dispatch(&mut f);
+    let unlinked = f.rax == 0 && user::fs_unlink_calls() == u0 + 1;
+
+    // ---- E：unlink 之后查不到
+    let gone = match fs_rw::mount() {
+        Ok(fs) => fs.lookup("/TMPNEW.TXT").is_err(),
+        Err(_) => false,
+    };
+
+    // ---- F：unlink 不存在的名字 ⇒ -8
+    f.rax = SYS_FS_UNLINK; f.rdi = path_va; f.rsi = name.len() as u64; f.rdx = 0;
+    syscall_dispatch(&mut f);
+    let unlink_missing = f.rax == user::E_NOT_FOUND;
+
+    // ---- G：长名 ⇒ -1（8.3 之外的形状明确拒）
+    let long_name = b"/TOOLONGNAME.TXT";
+    for (i, &b) in long_name.iter().enumerate() {
+        crate::user::write_at(path_va + i as u64, b as u64);
+    }
+    f.rax = SYS_FS_CREATE; f.rdi = path_va; f.rsi = long_name.len() as u64; f.rdx = 0;
+    syscall_dispatch(&mut f);
+    let long_rejected = f.rax == user::E_INVALID;
+
+    let ok = created && dup_rejected && empty_file && unlinked && gone && unlink_missing && long_rejected;
+    crate::log_info!(
+        "fs族: A建={} B重名拒={} C空文件(size={} 簇={}) D删={} E已消失={} F删不存在={} G长名拒={} ⇒ {}",
+        created, dup_rejected, size0, cluster0, unlinked, gone, unlink_missing, long_rejected, ok
+    );
+    if !ok {
+        crate::log_fatal!("fs族: 判据不成立（见上面每一格）");
+    }
+    drop(path_map);
+    ok
+}
+#[cfg(all(feature = "handles", feature = "fs-open", feature = "fs-rw"))]
+ktest!(KT_FS_CREATE_UNLINK, t_fs_create_unlink);

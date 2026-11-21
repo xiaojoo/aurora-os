@@ -19,3 +19,11 @@ static DISK: AhciDisk = AhciDisk { port: PORT };
 pub fn mount() -> Result<ReadOnlyFs<'static>, VfsError> {
     ReadOnlyFs::mount(&DISK)
 }
+
+/// 口 4 那块盘本身（写方向要拿它当 `&dyn Block`：`create`/`unlink` 直接改扇区，
+/// 不走 `ReadOnlyFs` 的只读视图）。
+///
+/// 返回 `&'static` 是因为 `DISK` 是 static 且 `AhciDisk` 无状态（只有一个口号）。
+pub fn disk() -> &'static dyn crate::filesystem::vfs::Block {
+    &DISK
+}

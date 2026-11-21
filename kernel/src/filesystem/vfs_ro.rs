@@ -81,6 +81,14 @@ pub enum VfsError {
     BadOffset,
     /// open flags 含本构建尚未批准的能力位
     BadFlags,
+    /// 名字不合 8.3（含长名、非法字符、双点）：ADR-118 明写长名创建不在这一刀
+    BadName,
+    /// 同目录里已有同名短名项（`create` 的拒绝格）。
+    /// **与 `BadFlags` 分开**：这是「目标已存在」，调用方该去 open 而不是改参数。
+    /// 今天映射成 `-1`——`EEXIST` 没有号位（ADR-177 决策 4：不预先编号）。
+    AlreadyExists,
+    /// 目录里没有空槽了（整条目录链都满）
+    DirFull,
 }
 
 impl VfsError {
@@ -96,6 +104,9 @@ impl VfsError {
             VfsError::DirTooLong => "目录项超限",
             VfsError::BadOffset => "偏移越过 EOF",
             VfsError::BadFlags => "open flags 非法",
+            VfsError::BadName => "名字不合 8.3",
+            VfsError::AlreadyExists => "目标已存在",
+            VfsError::DirFull => "目录已满",
         }
     }
 }
@@ -717,6 +728,314 @@ pub fn seek_disk(disk: &dyn Block, cur: &mut ReadCursor, newpos: u32) -> Result<
     pending.clusters = target;
     *cur = pending;
     Ok(newpos)
+}
+// ---------------------------------------------------------------- 写方向：创建与删除
+// （ADR-177 决策 1 的文件族 70/71；ADR-118 的原意，换号后落地）
+
+/// 一条目录项的固定长度（FAT32 规范）。
+const DIR_ENTRY: usize = 32;
+/// 目录项首字节的两个哨兵：`0x00` = 本扇区之后再无条目；`0xE5` = 已删除、可复用。
+const DIR_END: u8 = 0x00;
+const DIR_FREED: u8 = 0xE5;
+/// 普通文件属性（目录是 0x10，长名是 0x0F）。
+const ATTR_ARCHIVE: u8 = 0x20;
+
+/// 把一份 FAT 表里某个簇的项写成 `value`（`v.fat_count` 份都要写，否则两份 FAT 不一致）。
+///
+/// **为什么两份都要写**：只改一份，另一份就是坏的。某些工具与 Windows 的 chkdsk 会读第二份，
+/// 而本仓的宿主机对账（`fat32_host_volume`）也读它。少写一份 = 卷在另一个读者眼里是坏的。
+fn fat_set_disk(disk: &dyn Block, v: &Bpb, cluster: u32, value: u32) -> Result<(), FsError> {
+    if cluster < MIN_CLUSTER {
+        return Err(FsError::BadCluster(cluster));
+    }
+    let byte_off = cluster as usize * v.fat_entry_bytes;
+    let in_sec = byte_off % SECTOR_BYTES;
+    if in_sec + v.fat_entry_bytes > SECTOR_BYTES {
+        return Err(FsError::BadCluster(cluster));
+    }
+    // FAT 区从保留扇区开始，第 i 份在 i * sectors_per_fat 之后
+    for copy in 0..v.fat_count as u64 {
+        let lba = v.reserved_sectors as u64
+            + copy * v.sectors_per_fat as u64
+            + (byte_off / SECTOR_BYTES) as u64;
+        let mut sec = [0u8; SECTOR_BYTES];
+        block_io::read_checked(disk, lba, &mut sec, &block_io::Budget::UNBOUNDED).map_err(FsError::Io)?;
+        if v.fat_entry_bytes == fat32::FAT16_ENTRY_BYTES {
+            // 高 16 位在 FAT16 里是保留的，写 0 而不是把 value 的高位带进去
+            let le = (value as u16).to_le_bytes();
+            sec[in_sec..in_sec + 2].copy_from_slice(&le);
+        } else {
+            // **只改低 28 位**：高 4 位是保留位，规范要求写 0，
+            // 而读出时 `& cluster_mask` 会掩掉它们——不在这里清，两份 FAT 就会在保留位上分叉。
+            let old = u32_at(&sec, in_sec);
+            let merged = (old & !v.cluster_mask) | (value & v.cluster_mask);
+            sec[in_sec..in_sec + 4].copy_from_slice(&merged.to_le_bytes());
+        }
+        disk.write_sectors(lba, &sec).map_err(FsError::Io)?;
+    }
+    Ok(())
+}
+
+/// 找**第一个空闲簇**并把它标成链尾（EOC）。返回簇号。
+///
+/// 从 `MIN_CLUSTER` 线性扫到 `max_good_cluster`：没有 FSInfo 的空闲簇提示就退化成线性扫，
+/// 这是慢但**正确**的路。用 FSInfo 的提示要先证明提示可信，而今天没有那个证明。
+fn alloc_cluster(disk: &dyn Block, v: &Bpb) -> Result<u32, FsError> {
+    let mut c = MIN_CLUSTER;
+    while c <= v.max_good_cluster && ((c - MIN_CLUSTER) as u64) < v.clusters {
+        let next = fat_next_disk(disk, v, c)?;
+        if next == 0 {
+            // 空闲：标成链尾
+            let eoc = if v.fat_entry_bytes == fat32::FAT16_ENTRY_BYTES {
+                fat32::FAT16_EOC_MARKER
+            } else {
+                fat32::EOC_MARKER
+            };
+            fat_set_disk(disk, v, c, eoc)?;
+            return Ok(c);
+        }
+        c += 1;
+    }
+    Err(FsError::NoFreeCluster)
+}
+
+/// 把 8.3 短名编码成 11 字节的目录项名字段（名字 8 字节 + 扩展名 3 字节，空格填充）。
+///
+/// 只收 8.3：带长名或含非法字符一律 `None`（ADR-118：长名创建不在这一刀）。
+fn encode_short_name(path: &[u8]) -> Option<[u8; 11]> {
+    let mut out = [b' '; 11];
+    if path.is_empty() || path.len() > 12 {
+        return None;
+    }
+    let mut name_len = 0usize;
+    let mut ext_len = 0usize;
+    let mut in_ext = false;
+    for &b in path {
+        if b == b'.' {
+            if in_ext || name_len == 0 {
+                return None; // 双点、点开头都不合法
+            }
+            in_ext = true;
+            continue;
+        }
+        let up = b.to_ascii_uppercase();
+        // 合法字符：字母数字与 $%'-_@~`!(){}^#&
+        let ok = up.is_ascii_alphanumeric()
+            || matches!(up, b'$' | b'%' | b'\'' | b'-' | b'_' | b'@' | b'~' | b'`' | b'!' | b'(' | b')' | b'{' | b'}' | b'^' | b'#' | b'&');
+        if !ok {
+            return None;
+        }
+        if in_ext {
+            if ext_len == 3 {
+                return None;
+            }
+            out[8 + ext_len] = up;
+            ext_len += 1;
+        } else {
+            if name_len == 8 {
+                return None;
+            }
+            out[name_len] = up;
+            name_len += 1;
+        }
+    }
+    if name_len == 0 {
+        return None;
+    }
+    Some(out)
+}
+
+/// 在一段目录链里找第一个可写的空槽。返回 `(扇区 LBA, 扇区内偏移)`。
+///
+/// 两种空槽都算：`0x00`（此后再无条目）与 `0xE5`（已删除）。
+/// **`0x00` 之后的部分不需要清零**：规范规定 `0x00` 就是结尾，后面本来就不被读。
+fn find_free_slot(disk: &dyn Block, v: &Bpb, dir_cluster: u32) -> Result<Option<(u64, usize)>, FsError> {
+    let mut c = dir_cluster;
+    let mut guard = 0u32;
+    loop {
+        guard += 1;
+        if guard > 4096 {
+            return Err(FsError::BadCluster(dir_cluster)); // 链成环
+        }
+        let base = cluster_to_lba(v, c);
+        for s in 0..v.sectors_per_cluster as u64 {
+            let lba = base + s;
+            let mut sec = [0u8; SECTOR_BYTES];
+            block_io::read_checked(disk, lba, &mut sec, &block_io::Budget::UNBOUNDED).map_err(FsError::Io)?;
+            for i in 0..(SECTOR_BYTES / DIR_ENTRY) {
+                let off = i * DIR_ENTRY;
+                if sec[off] == DIR_END || sec[off] == DIR_FREED {
+                    return Ok(Some((lba, off)));
+                }
+            }
+        }
+        let next = fat_next_disk(disk, v, c)?;
+        if next == 0 || next >= fat32::EOC_MARKER {
+            return Ok(None); // 链走完，目录满
+        }
+        c = next;
+    }
+}
+
+/// 在 `dir_cluster` 目录里建一个**空文件**（size 0、首簇 0），返回它的目录项位置。
+///
+/// 空文件不分配簇：FAT32 规范允许 `first_cluster=0` + `size=0` 表示空文件。
+/// 第一次写入时才分配（那是扩展那一刀，不在本切片）。
+///
+/// 已存在同名 ⇒ `AlreadyExists`（调用方映射成 `-1`：今天没有 `EEXIST`，见 ADR-177 决策 4）。
+pub fn create_in_dir(
+    disk: &dyn Block,
+    v: &Bpb,
+    dir_cluster: u32,
+    name: &[u8],
+) -> Result<(u64, usize), VfsError> {
+    let short = encode_short_name(name).ok_or(VfsError::BadName)?;
+    // 先查重名：同目录里已有这个 8.3 名就不建
+    let mut c = dir_cluster;
+    let mut guard = 0u32;
+    loop {
+        guard += 1;
+        if guard > 4096 {
+            return Err(VfsError::Fs(FsError::BadCluster(dir_cluster)));
+        }
+        let base = cluster_to_lba(v, c);
+        for s in 0..v.sectors_per_cluster as u64 {
+            let lba = base + s;
+            let mut sec = [0u8; SECTOR_BYTES];
+            block_io::read_checked(disk, lba, &mut sec, &block_io::Budget::UNBOUNDED).map_err(io)?;
+            for i in 0..(SECTOR_BYTES / DIR_ENTRY) {
+                let off = i * DIR_ENTRY;
+                let first = sec[off];
+                if first == DIR_END {
+                    break; // 这一段之后没有条目了，跳出去看下一个扇区/簇
+                }
+                if first == DIR_FREED {
+                    continue;
+                }
+                if sec[off + OFF_ATTR] & 0x0F == 0x0F {
+                    continue; // 长名项，不是短名
+                }
+                if sec[off..off + 11] == short {
+                    return Err(VfsError::AlreadyExists);
+                }
+            }
+        }
+        let next = fat_next_disk(disk, v, c)?;
+        if next == 0 || next >= fat32::EOC_MARKER {
+            break;
+        }
+        c = next;
+    }
+    // 找空槽并写目录项
+    let (lba, off) = find_free_slot(disk, v, dir_cluster)?.ok_or(VfsError::DirFull)?;
+    let mut sec = [0u8; SECTOR_BYTES];
+    block_io::read_checked(disk, lba, &mut sec, &block_io::Budget::UNBOUNDED).map_err(io)?;
+    let mut e = [0u8; DIR_ENTRY];
+    e[..11].copy_from_slice(&short);
+    e[OFF_ATTR] = ATTR_ARCHIVE;
+    // 时间戳：ADR-107 §6 的「合成时间」口径——不写墙钟，写卷内既有约定。
+    // 这里全 0 是**刻意的**：本仓没有可信墙钟源，编一个时间戳比留 0 更糟。
+    e[OFF_CREATE_TENTHS] = 0;
+    e[OFF_CREATE_TIME] = 0;
+    e[OFF_CREATE_DATE] = 0;
+    e[OFF_ACCESS_DATE] = 0;
+    e[OFF_WRITE_TIME] = 0;
+    e[OFF_WRITE_DATE] = 0;
+    // first_cluster 高 16 位在 FAT32 才有意义，FAT16 写 0
+    if v.fat_entry_bytes == 4usize {
+        e[OFF_CLUSTER_HI..OFF_CLUSTER_HI + 2].copy_from_slice(&0u16.to_le_bytes());
+    }
+    e[OFF_CLUSTER_LO..OFF_CLUSTER_LO + 2].copy_from_slice(&0u16.to_le_bytes());
+    e[OFF_SIZE..OFF_SIZE + 4].copy_from_slice(&0u32.to_le_bytes());
+    sec[off..off + DIR_ENTRY].copy_from_slice(&e);
+    disk.write_sectors(lba, &sec).map_err(io)?;
+    Ok((lba, off))
+}
+
+/// 删除 `dir_cluster` 目录里名为 `name` 的文件：目录项首字节置 `0xE5`，簇链归还。
+///
+/// **只删文件不删目录**：目录删除要判「空不空」，那是另一条判据。
+/// **不校验打开中的句柄**：句柄层在 `capability`，`vfs_ro` 看不到它；
+/// 这一条留给 syscall 侧（ADR-118 原意是 `-16 EBUSY`，今天没有那个码）。
+pub fn unlink_in_dir(
+    disk: &dyn Block,
+    v: &Bpb,
+    dir_cluster: u32,
+    name: &[u8],
+) -> Result<(), VfsError> {
+    let short = encode_short_name(name).ok_or(VfsError::BadName)?;
+    let mut c = dir_cluster;
+    let mut guard = 0u32;
+    loop {
+        guard += 1;
+        if guard > 4096 {
+            return Err(VfsError::Fs(FsError::BadCluster(dir_cluster)));
+        }
+        let base = cluster_to_lba(v, c);
+        for s in 0..v.sectors_per_cluster as u64 {
+            let lba = base + s;
+            let mut sec = [0u8; SECTOR_BYTES];
+            block_io::read_checked(disk, lba, &mut sec, &block_io::Budget::UNBOUNDED).map_err(io)?;
+            let mut dirty = false;
+            for i in 0..(SECTOR_BYTES / DIR_ENTRY) {
+                let off = i * DIR_ENTRY;
+                let first = sec[off];
+                if first == DIR_END {
+                    break;
+                }
+                if first == DIR_FREED {
+                    continue;
+                }
+                if sec[off + OFF_ATTR] & 0x0F == 0x0F {
+                    continue;
+                }
+                if sec[off..off + 11] != short {
+                    continue;
+                }
+                if sec[off + OFF_ATTR] & 0x10 != 0 {
+                    return Err(VfsError::IsDir); // 目录不在这一刀
+                }
+                // 先读首簇与大小，再改目录项
+                let hi = if v.fat_entry_bytes == 4usize {
+                    u16_at(&sec, off + OFF_CLUSTER_HI) as u32
+                } else {
+                    0
+                };
+                let lo = u16_at(&sec, off + OFF_CLUSTER_LO) as u32;
+                let first_cluster = (hi << 16) | lo;
+                sec[off] = DIR_FREED;
+                dirty = true;
+                disk.write_sectors(lba, &sec).map_err(io)?;
+                // 释放簇链：**目录项先落盘再放链**。
+                // 反过来的话，中途掉电会留下一条「指向已释放簇的目录项」——
+                // 那是比泄漏更糟的形状（读它会读到别人的数据）。
+                if first_cluster >= MIN_CLUSTER {
+                    let mut cc = first_cluster;
+                    let mut g2 = 0u32;
+                    while cc >= MIN_CLUSTER && cc <= v.max_good_cluster {
+                        g2 += 1;
+                        if g2 > 1_000_000 {
+                            return Err(VfsError::Fs(FsError::BadCluster(cc)));
+                        }
+                        let next = fat_next_disk(disk, v, cc)?;
+                        fat_set_disk(disk, v, cc, 0)?;
+                        if next == 0 || next >= fat32::EOC_MARKER {
+                            break;
+                        }
+                        cc = next;
+                    }
+                }
+                let _ = dirty;
+                return Ok(());
+            }
+        }
+        let next = fat_next_disk(disk, v, c)?;
+        if next == 0 || next >= fat32::EOC_MARKER {
+            break;
+        }
+        c = next;
+    }
+    Err(VfsError::NotFound)
 }
 
 fn cluster_to_lba(v: &Bpb, c: u32) -> u64 {

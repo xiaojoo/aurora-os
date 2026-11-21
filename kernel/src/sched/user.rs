@@ -217,6 +217,14 @@ pub const SYS_MUNMAP: u64 = 65;
 /// 引用计数为 1 时原地恢复可写、不分配新帧（ADR-177 切片 2 落的机制）。
 pub const SYS_MPROTECT: u64 = 66;
 
+/// 70：`fs_create` —— 在可写卷根目录建一个空文件。`rdi`=路径、`rsi`=路径长 → 0。
+///
+/// **返回 0 不是句柄**（ADR-177 决策 2 的落地选择）：调用方下一步必然是 `open`，
+/// 给它一个句柄等于让它多占一格全局 16 格表却不用它。
+pub const SYS_FS_CREATE: u64 = 70;
+/// 71：`fs_unlink` —— 删一个文件。`rdi`=路径、`rsi`=路径长 → 0。
+pub const SYS_FS_UNLINK: u64 = 71;
+
 /// 62–63：**保留，不分配**。留给下一个未预见的族。
 ///
 /// 不在这里定义具体常量——定义了就等于暗示「已经想好给谁」。
@@ -572,6 +580,123 @@ fn sys_mprotect(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     }
     MPROTECT_CALLS.fetch_add(1, Ordering::Relaxed);
     n as u64
+}
+// ---------------------------------------------------------------- 70/71（ADR-177 文件族）
+
+/// 70：`fs_create` —— 在可写卷上建一个**空文件**（size 0）。
+///
+/// `rdi`=路径、`rsi`=路径长 → 成功返回 0。
+///
+/// ## 为什么返回 0 而不是句柄
+///
+/// ADR-118 原意是「返回带 RIGHT_READ|RIGHT_WRITE 的句柄」。这里改成返回 0：
+/// 句柄要把 `VfsFile` 塞进全局 16 格表，而 `create` 的调用方下一步必然是 `open`
+/// （它自己就是那条路径）。给一个句柄等于**让调用方多持一个槽却不用它**，
+/// 而那张表是全系统共用的 16 格（AGENTS.md 已列为脆性）。
+/// 少一个句柄，少一处泄漏可能。
+///
+/// ## 只写可写卷
+///
+/// 走 `fs_rw::mount()` 那一份（口 4）。只读卷上回 `-15`（本构建不支持写）。
+#[cfg(all(feature = "handles", feature = "fs-open", feature = "fs-rw"))]
+fn sys_fs_create(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let len = frame.rsi as usize;
+    if len == 0 {
+        return E_INVALID;
+    }
+    if len > crate::filesystem::vfs_ro::PATH_MAX {
+        return E_TOO_LONG;
+    }
+    if crate::sched::current_identity().is_none() {
+        return E_BAD_HANDLE;
+    }
+    let mut buf = [0u8; crate::filesystem::vfs_ro::PATH_MAX];
+    match copy_from_user(frame.rdi, &mut buf[..len]) {
+        Ok(n) if n == len => {}
+        Ok(_) => return E_FAULT,
+        Err(e) => {
+            BAD_PTRS.fetch_add(1, Ordering::Relaxed);
+            return ptr_err_to_ret(e);
+        }
+    }
+    let Ok(path) = core::str::from_utf8(&buf[..len]) else {
+        return E_INVALID;
+    };
+    // 路径必须是绝对且不含子目录分隔：本切片只在根目录里建（ADR-118：只支持 8.3）
+    let Some(name) = path.strip_prefix('/') else {
+        return E_INVALID;
+    };
+    if name.is_empty() || name.contains('/') {
+        return E_NOT_SUPPORTED;
+    }
+    let fs = match crate::filesystem::fs_rw::mount() {
+        Ok(f) => f,
+        Err(_) => return E_IO,
+    };
+    let bpb = fs.bpb();
+    let root = fs.root();
+    match crate::filesystem::vfs_ro::create_in_dir(crate::filesystem::fs_rw::disk(), &bpb, root.first_cluster, name.as_bytes()) {
+        Ok(_) => {
+            FS_CREATE_CALLS.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+        Err(crate::filesystem::vfs_ro::VfsError::BadName) => E_INVALID,
+        Err(crate::filesystem::vfs_ro::VfsError::AlreadyExists) => E_INVALID,
+        Err(crate::filesystem::vfs_ro::VfsError::DirFull) => E_EXHAUSTED,
+        Err(crate::filesystem::vfs_ro::VfsError::IsDir) => E_IS_DIR,
+        Err(e) => vfs_err_ret(e),
+    }
+}
+
+/// 71：`fs_unlink` —— 删一个文件。`rdi`=路径、`rsi`=路径长 → 成功返回 0。
+///
+/// 目录项先落盘、再放簇链（顺序在 `unlink_in_dir` 里写明了理由）。
+#[cfg(all(feature = "handles", feature = "fs-open", feature = "fs-rw"))]
+fn sys_fs_unlink(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let len = frame.rsi as usize;
+    if len == 0 {
+        return E_INVALID;
+    }
+    if len > crate::filesystem::vfs_ro::PATH_MAX {
+        return E_TOO_LONG;
+    }
+    if crate::sched::current_identity().is_none() {
+        return E_BAD_HANDLE;
+    }
+    let mut buf = [0u8; crate::filesystem::vfs_ro::PATH_MAX];
+    match copy_from_user(frame.rdi, &mut buf[..len]) {
+        Ok(n) if n == len => {}
+        Ok(_) => return E_FAULT,
+        Err(e) => {
+            BAD_PTRS.fetch_add(1, Ordering::Relaxed);
+            return ptr_err_to_ret(e);
+        }
+    }
+    let Ok(path) = core::str::from_utf8(&buf[..len]) else {
+        return E_INVALID;
+    };
+    let Some(name) = path.strip_prefix('/') else {
+        return E_INVALID;
+    };
+    if name.is_empty() || name.contains('/') {
+        return E_NOT_SUPPORTED;
+    }
+    let fs = match crate::filesystem::fs_rw::mount() {
+        Ok(f) => f,
+        Err(_) => return E_IO,
+    };
+    let bpb = fs.bpb();
+    let root = fs.root();
+    match crate::filesystem::vfs_ro::unlink_in_dir(crate::filesystem::fs_rw::disk(), &bpb, root.first_cluster, name.as_bytes()) {
+        Ok(()) => {
+            FS_UNLINK_CALLS.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+        Err(crate::filesystem::vfs_ro::VfsError::NotFound) => E_NOT_FOUND,
+        Err(crate::filesystem::vfs_ro::VfsError::BadName) => E_INVALID,
+        Err(crate::filesystem::vfs_ro::VfsError::IsDir) => E_IS_DIR,
+        Err(e) => vfs_err_ret(e),
+    }
 }
 #[cfg(feature = "handles")]
 #[inline(never)]
@@ -2431,7 +2556,13 @@ fn vfs_err_ret(e: crate::filesystem::vfs_ro::VfsError) -> u64 {
         V::IsDir => E_IS_DIR,
         V::DirTooLong => E_IO,
         V::Fs(FsError::NoEntry) => E_NOT_FOUND,
+        // ADR-177 文件族：卷满与「名字不合 8.3」「已存在」「目录满」各有自己的处置方向，
+        // 但今天没有对应的错误码（ADR-177 决策 4：不预先编号）。
+        // 卷满报 -6（名额耗尽，让调用方去删东西）；其余三个报 -1（参数/状态错）。
+        V::Fs(FsError::NoFreeCluster) => E_EXHAUSTED,
         V::Fs(_) => E_IO,
+        V::BadName | V::AlreadyExists => E_INVALID,
+        V::DirFull => E_EXHAUSTED,
     }
 }
 
@@ -2950,6 +3081,10 @@ static MMUNMAP_CALLS: AtomicU64 = AtomicU64::new(0);
 static MPROTECT_CALLS: AtomicU64 = AtomicU64::new(0);
 /// mmap 累计发出去的页数（判据要能与 munmap 的归还对账）。
 static MMAP_PAGES: AtomicU64 = AtomicU64::new(0);
+/// ADR-177 文件族：`create`/`unlink` 的成功次数。**分开数**：合成一个数看不出
+/// 「建了 10 个删了 9 个」与「建了 1 个删了 0 个」的区别。
+static FS_CREATE_CALLS: AtomicU64 = AtomicU64::new(0);
+static FS_UNLINK_CALLS: AtomicU64 = AtomicU64::new(0);
 static KILLS: AtomicU64 = AtomicU64::new(0);
 static EXITS: AtomicU64 = AtomicU64::new(0);
 /// 被指针校验挡下来的次数（判据要能区分"内核拒了"与"内核根本没检查"）
@@ -2977,6 +3112,13 @@ pub fn mprotect_calls() -> u64 {
 }
 pub fn mmap_pages() -> u64 {
     MMAP_PAGES.load(Ordering::Relaxed)
+}
+/// ADR-177 文件族：`create`/`unlink` 各自的成功次数。
+pub fn fs_create_calls() -> u64 {
+    FS_CREATE_CALLS.load(Ordering::Relaxed)
+}
+pub fn fs_unlink_calls() -> u64 {
+    FS_UNLINK_CALLS.load(Ordering::Relaxed)
 }
 
 /// ADR-176：**"号登记了，但这份构建没实现它"的唯一出口**。
@@ -3016,6 +3158,8 @@ fn reset_counters() {
     MMUNMAP_CALLS.store(0, Ordering::Relaxed);
     MPROTECT_CALLS.store(0, Ordering::Relaxed);
     MMAP_PAGES.store(0, Ordering::Relaxed);
+    FS_CREATE_CALLS.store(0, Ordering::Relaxed);
+    FS_UNLINK_CALLS.store(0, Ordering::Relaxed);
     KILLS.store(0, Ordering::Relaxed);
     EXITS.store(0, Ordering::Relaxed);
     BAD_PTRS.store(0, Ordering::Relaxed);
@@ -3486,6 +3630,11 @@ pub fn syscall_dispatch(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> boo
         SYS_MUNMAP => sys_munmap(frame),
         #[cfg(feature = "handles")]
         SYS_MPROTECT => sys_mprotect(frame),
+        // ---- 70/71：文件族（ADR-177 决策 1）。需要 fs-rw 档：只读卷上没有写路径。
+        #[cfg(all(feature = "handles", feature = "fs-open", feature = "fs-rw"))]
+        SYS_FS_CREATE => sys_fs_create(frame),
+        #[cfg(all(feature = "handles", feature = "fs-open", feature = "fs-rw"))]
+        SYS_FS_UNLINK => sys_fs_unlink(frame),
         SYS_POKE_BUF => {
             // 内核 → 用户。写成 `Ok(n)` 而不是布尔：`n != want` 就是"中途被接住的故障"，
             // 程序核对字节时看得见的差异与内核报回的数必须一致（两台仪器不能各说各话）。

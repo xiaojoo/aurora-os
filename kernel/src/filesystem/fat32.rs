@@ -207,6 +207,9 @@ pub enum FsError {
     ChainEndsLate { bytes: usize, size: u32, cluster: u32, next: u32 },
     /// 目录里没找到
     NoEntry,
+    /// 卷上已经没有空闲簇（ADR-177 文件族：`create` 分配时扫完整条 FAT 都没找到）。
+    /// **与 `Io` 分开**：这是「盘是好的，但满了」，处置方向是让调用方删东西，不是重试。
+    NoFreeCluster,
     /// 目录项的簇号落在数据区之外
     EntryOutsideData(u32),
     /// 底层块设备失败，**原样带出去**（成因不许被文件系统层抹平）
@@ -232,6 +235,7 @@ impl FsError {
             FsError::ChainEndsEarly { .. } => "簇链提前收尾",
             FsError::ChainEndsLate { .. } => "簇链超出大小",
             FsError::NoEntry => "目录无此项",
+            FsError::NoFreeCluster => "卷上无空闲簇",
             FsError::EntryOutsideData(_) => "项落在数据区外",
             FsError::Io(_) => "块设备失败",
         }
