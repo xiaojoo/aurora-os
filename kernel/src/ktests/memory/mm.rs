@@ -1006,6 +1006,113 @@ fn dz_wait_kills(target: u64) -> bool {
     crate::user::kills() >= target
 }
 
+// ---- COW（ADR-177 切片 2）：两个 AS 共享一帧，一个写，另一个必须看到原值
+//
+// ## 这一格证什么
+//
+// COW 的全部价值就是「共享的页在被写时不会串味」。所以判据必须是**两边的值**：
+// 写方看到新值、**另一方看到旧值**。只证前者等于没证——写自己的页本来就会成功。
+//
+// ## 为什么不用 fork
+//
+// `fork` 在 `kernel/src` 命中 0，完整化方案 D1 明确建议 capability-native「不要 fork」。
+// 所以这里用 `aspace_map` 把**同一批帧**映进两个 AS —— 那正是 COW 要处理的形状，
+// 而且它不需要 fork 存在。
+fn t_cow_share() -> bool {
+    if !mm::is_ready() {
+        crate::log_fatal!("cow: mm 没就绪");
+        return false;
+    }
+    // 基线只取自己的计数面（绝对 free/live 会被别的用例的延迟回收污染，同 t_demand_zero）
+    let copied0 = mm::cow_copied();
+    let excl0 = mm::cow_exclusive();
+    let failed0 = mm::cow_failed();
+
+    // 一页真帧，内容写成可辨识的图案
+    let Ok(frames) = mm::phys_alloc(0, mm::MOD_TEST) else {
+        crate::log_fatal!("cow: phys_alloc 失败");
+        return false;
+    };
+    let pa = frames.base().0;
+    let fno = pa / mm::PAGE as u64;
+    let hhdm = mm::hhdm();
+    // SAFETY: pa 来自 phys_alloc 独占；HHDM 覆盖；页对齐；写满一页不越界
+    unsafe {
+        let p = (pa + hhdm) as *mut u8;
+        for i in 0..mm::PAGE {
+            core::ptr::write_volatile(p.add(i), 0xA5);
+        }
+    }
+
+    // 两个 AS 各映同一帧。aspace_map 内部会 frame_get ⇒ 计数 +1/次
+    let Some(a1) = mm::aspace_new() else {
+        crate::log_fatal!("cow: aspace_new 1 失败");
+        drop(frames);
+        return false;
+    };
+    let Some(a2) = mm::aspace_new() else {
+        crate::log_fatal!("cow: aspace_new 2 失败");
+        drop(frames);
+        return false;
+    };
+    let va = mm::USER_MMAP_BASE + 0x2000;
+    let m1 = mm::aspace_map(&a1, &[fno], mm::VirtAddr(va), mm::PageFlags::USER_RW, mm::MOD_TEST);
+    let m2 = mm::aspace_map(&a2, &[fno], mm::VirtAddr(va), mm::PageFlags::USER_RW, mm::MOD_TEST);
+    let mapped_ok = m1.is_ok() && m2.is_ok();
+    if !mapped_ok {
+        crate::log_fatal!("cow: 两 AS 共享映射失败 m1={} m2={}", m1.is_ok(), m2.is_ok());
+        drop(frames);
+        return false;
+    }
+    let (Ok(m1), Ok(m2)) = (m1, m2) else {
+        crate::log_fatal!("cow: 映射句柄解构失败");
+        drop(frames);
+        return false;
+    };
+
+    // 映射之后**降权**：两个 AS 里这一页都必须是 COW 页（可读不可写）
+    let r1 = a1.pml4().unwrap_or(0);
+    let r2 = a2.pml4().unwrap_or(0);
+    let cow_a1 = mm::mark_cow_in(r1, va);
+    let cow_a2 = mm::mark_cow_in(r2, va);
+
+    // ---- A 侧写入 ⇒ 走 cow_try_for_root
+    let copied_before = mm::cow_copied();
+    let a_ok = mm::cow_try_for_root(r1, va);
+    let copied_after = mm::cow_copied();
+    // B 侧那一帧必须还是原来的 0xA5（**这一格是全部价值所在**）
+    // SAFETY: pa 仍归本用例；HHDM 覆盖；只读
+    let b_intact = unsafe { core::ptr::read_volatile((pa + hhdm) as *const u8) == 0xA5 };
+    // A 侧现在指向**另一个**帧（复制发生了）
+    let a_frame = mm::aspace_leaf_frame(r1, va);
+    let a_copied = a_frame.is_some() && a_frame != Some(fno);
+    // B 侧还指着原帧
+    let b_frame = mm::aspace_leaf_frame(r2, va);
+    let b_kept = b_frame == Some(fno);
+
+    let ok = mapped_ok && cow_a1 && cow_a2
+        && a_ok && copied_after == copied_before + 1
+        && b_intact && a_copied && b_kept
+        && mm::cow_failed() == failed0;
+
+    crate::log_info!(
+        "cow: 共享={} 降权A={} 降权B={} A复制={} copied {}->{} B原值={} A换帧={} B保帧={} failed={} ⇒ {}",
+        mapped_ok, cow_a1, cow_a2, a_ok, copied_before, copied_after,
+        b_intact, a_copied, b_kept, mm::cow_failed() - failed0, ok
+    );
+    if !ok {
+        crate::log_fatal!(
+            "cow: 判据不成立（两 AS 共享一帧，A 写后 B 必须看到原值）excl 基线={} 末值={}",
+            excl0, mm::cow_exclusive()
+        );
+    }
+    drop(m1);
+    drop(m2);
+    drop(frames);
+    ok
+}
+ktest!(KT_COW_SHARE, t_cow_share);
+
 fn t_demand_zero() -> bool {
     // 用例自足（§86e 的教训，实测复现于 fault-double-free 档）：链接顺序可能把本用例
     // 排在第一个用户任务测试之前，那一刻启动上下文还没登记进 RQ，spawn/yield 全部落空。
@@ -2842,31 +2949,53 @@ fn t_load_into_child_as() -> bool {
             (false, 0, 0, 0, 0, 0)
         }
     };
-    // ---- `read_at_in` 负样本（ADR-175 / BACKLOG §466）
-    //
-    // 挂在这里的理由：这是全仓**唯一**真的建了子 AS 的用例（`load_into`），
-    // 所以 `read_at_in(aslot, …)` 有真实目标可读。
-    //
-    // **判别点怎么选**：`hello.elf` 的第二个 LOAD 段在 `va=0x100001000`、
-    // 只有 8 字节、内容是 `0xa701020304050607`（独特魔数）。它满足两个条件：
-    // 子 AS 里读得到（正向）、内核 AS 里读不到或读到别的（反向）。
-    //
-    // **原来的判别点错了**（实测）：用 `image_lo`（段跨度起点）期望 ELF 魔数，
-    // 但那里是 `.rodata` 内容（全 `0x48`），而且**内核 AS 读到同一个值**——
-    // 那个点判不出两张 AS 的差别。
-    //
-    // **必须赶在 `aspace_destroy` 之前**：销毁之后那棵树就没了（§465 记的同一类）。
-    const SENTINEL_VA: u64 = 0x1_0000_1000;
+    // ---- `read_at_in` 负样本（ADR-175 / BACKLOG §466）
+
+    //
+
+    // 挂在这里的理由：这是全仓**唯一**真的建了子 AS 的用例（`load_into`），
+
+    // 所以 `read_at_in(aslot, …)` 有真实目标可读。
+
+    //
+
+    // **判别点怎么选**：`hello.elf` 的第二个 LOAD 段在 `va=0x100001000`、
+
+    // 只有 8 字节、内容是 `0xa701020304050607`（独特魔数）。它满足两个条件：
+
+    // 子 AS 里读得到（正向）、内核 AS 里读不到或读到别的（反向）。
+
+    //
+
+    // **原来的判别点错了**（实测）：用 `image_lo`（段跨度起点）期望 ELF 魔数，
+
+    // 但那里是 `.rodata` 内容（全 `0x48`），而且**内核 AS 读到同一个值**——
+
+    // 那个点判不出两张 AS 的差别。
+
+    //
+
+    // **必须赶在 `aspace_destroy` 之前**：销毁之后那棵树就没了（§465 记的同一类）。
+
+    const SENTINEL_VA: u64 = 0x1_0000_1000;
+
     // **小端**：内存里是字节 a7 01 02 03 04 05 06 07，
     // 按 LE 读成 u64 就是 0x0706_0504_0302_01a7。
     // 第一版写成 0xa701_0203_0405_0607（大端形式）⇒ N1 红，而读数本身是对的。
-    const SENTINEL: u64 = 0x0706_0504_0302_01a7;
-    let read_child = crate::user::read_at_in(aslot, SENTINEL_VA);
-    // N1：按子 AS 读得到哨兵 ⇒ API 真的能用
-    let n1 = read_child == Some(SENTINEL);
-    // N2：按**内核 AS** 读同一个 VA ⇒ 必须读不到或读到别的。
-    //     若 `read_at_in` 忽略 `aslot`、总走当前 CR3，它就会读到哨兵 ⇒ 判据红。
-    //     **把「选错 AS」从取决于 tick 变成必然红。**
+    const SENTINEL: u64 = 0x0706_0504_0302_01a7;
+
+    let read_child = crate::user::read_at_in(aslot, SENTINEL_VA);
+
+    // N1：按子 AS 读得到哨兵 ⇒ API 真的能用
+
+    let n1 = read_child == Some(SENTINEL);
+
+    // N2：按**内核 AS** 读同一个 VA ⇒ 必须读不到或读到别的。
+
+    //     若 `read_at_in` 忽略 `aslot`、总走当前 CR3，它就会读到哨兵 ⇒ 判据红。
+
+    //     **把「选错 AS」从取决于 tick 变成必然红。**
+
     // **不能用 slot 0**：实测 `aslot` 本身就是 0（`aspace_new_kernel` 从空槽里
     // 挑第一个），那样 N2 变成「同一个 AS 读两次」⇒ 必然相等 ⇒ 判据永远红。
     // 用 `NO_ASPACE`（255，确定越界）。
@@ -2876,12 +3005,18 @@ fn t_load_into_child_as() -> bool {
 
     let n2 = read_absent.is_none();
 
-    // N3：明显没映射的高地址 ⇒ 必须 Err（`NotMapped`）
-    let hole = crate::elf::USER_VA_TOP - mm::PAGE as u64;
-    let n3 = crate::user::read_at_in(aslot, hole).is_none();
-    // N4：同一组读也用 `read_at`（当前 CR3）做一遍——它读子 AS 的 VA 应该失败。
-    //     这一格证明两个 API 的**语义确实不同**，不是别名。
-    let n4 = crate::user::read_at(SENTINEL_VA) != Some(SENTINEL);
+    // N3：明显没映射的高地址 ⇒ 必须 Err（`NotMapped`）
+
+    let hole = crate::elf::USER_VA_TOP - mm::PAGE as u64;
+
+    let n3 = crate::user::read_at_in(aslot, hole).is_none();
+
+    // N4：同一组读也用 `read_at`（当前 CR3）做一遍——它读子 AS 的 VA 应该失败。
+
+    //     这一格证明两个 API 的**语义确实不同**，不是别名。
+
+    let n4 = crate::user::read_at(SENTINEL_VA) != Some(SENTINEL);
+
     // ---- `copy_to_user_in` 负样本（ADR-175 §八 未决 3 的补做）
     //
     // `hello.elf` 的三个段：代码 R+X、只读 R、数据 R+W。
@@ -2913,17 +3048,28 @@ fn t_load_into_child_as() -> bool {
         );
     }
 
-    let read_at_in_ok = n1 && n2 && n3 && n4;
-    crate::log_info!(
-        "load_into: read_at_in 子AS读={:?} 不存在AS读={:?} 洞={} read_at对照={} ⇒ {}",
-        read_child, read_absent, n3, n4, read_at_in_ok
-    );
-    if !read_at_in_ok {
-        crate::log_fatal!(
-            "load_into: read_at_in 判据不成立 N1={} N2={} N3={} N4={}",
-            n1, n2, n3, n4
-        );
-    }
+    let read_at_in_ok = n1 && n2 && n3 && n4;
+
+    crate::log_info!(
+
+        "load_into: read_at_in 子AS读={:?} 不存在AS读={:?} 洞={} read_at对照={} ⇒ {}",
+
+        read_child, read_absent, n3, n4, read_at_in_ok
+
+    );
+
+    if !read_at_in_ok {
+
+        crate::log_fatal!(
+
+            "load_into: read_at_in 判据不成立 N1={} N2={} N3={} N4={}",
+
+            n1, n2, n3, n4
+
+        );
+
+    }
+
     drop(r);
     let destroyed = mm::aspace_destroy(aslot);
     let frames_back = mm::free_frames() == f0;

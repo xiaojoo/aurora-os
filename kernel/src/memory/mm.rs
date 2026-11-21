@@ -35,6 +35,15 @@ const P_USER: u64 = 1 << 2;
 const P_PWT: u64 = 1 << 3;
 const P_PCD: u64 = 1 << 4;
 const P_HUGE: u64 = 1 << 7;
+/// **软件位**：这一页是 COW 页（ADR-177 切片 2）。硬件不解释 bit 9–11，
+/// 由内核自己用。选 bit 9 而不是 AVL 之外的位置：Intel SDM Vol.3A 4.5 明写
+/// bit 9–11 对软件可用，且现有代码只用了 0/1/2/3/4/7/63，9 是空的。
+///
+/// **为什么必须有这个位**：COW 页与"普通只读页"在硬件看来**完全一样**
+/// （都是 P_WRITE=0 的可读页）。没有这个位，缺页处理就分不清
+/// "用户真去写一个只读页（该杀）"和"用户写一个共享页（该复制）"——
+/// 分不清的后果是把正常程序杀掉，或者把该杀的程序放过去改了别人的页。
+const P_COW: u64 = 1 << 9;
 const P_NX: u64 = 1 << 63;
 const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
@@ -2188,6 +2197,19 @@ impl Drop for AspaceMapping {
                     // SAFETY: root 刚核对过（或就是内核根），这段叶子是本结构铺的，持 VMM
                     if let Some(leaf) = unsafe { walk_leaf_in(self.root, None, a, false, false, false) } {
                         // SAFETY: 上一行返回的是有效表项指针
+                        //
+                        // ADR-177 切片 2：**清叶子之前先读它现在指向哪个帧**。
+                        // 原来这里只清叶子、归还时按 `self.frames`（构造时记的帧号）put。
+                        // COW 换过叶子之后，叶子指的已经不是构造时那一帧了——
+                        // 按旧帧号 put 会让旧帧被多 put 一次（DoubleFree，实测撞过
+                        // `L4 integrity: DoubleFree base=0x2f000 owner=3`），
+                        // 而新帧永远没人归还（静默漏帧）。
+                        // 读**叶子实际指向的那一帧**让两边账自然守恒：
+                        // COW 负责 put 旧帧，这里负责 put 新帧。
+                        let actual = unsafe { *leaf };
+                        if actual & P_PRESENT != 0 {
+                            out[k] = (actual & ADDR_MASK) / PAGE as u64;
+                        }
                         unsafe { *leaf = 0 };
                         tlb_invalidate(a);
                         // 清完叶子才等回执，回执收齐之前不还帧（ADR-023/072）。
@@ -2621,6 +2643,313 @@ fn lazy_release(slot: u8) {
 /// （直接调 unmap 会重入 VMM ⇒ L4）。
 fn unmap_locked(va: VirtAddr, pages: usize) {
     unmap_pages(va, pages);
+}
+
+// ---------------------------------------------------------------- COW（ADR-177 切片 2）
+
+/// COW 复制成功的次数（判据要能分辨「复制了」与「根本没走到」）。
+static COW_COPIED: AtomicUsize = AtomicUsize::new(0);
+/// COW 因为**引用计数已经只剩自己**而原地恢复可写的次数。
+/// 与 `COW_COPIED` 分开数：两者都让写入成功，但前者分配了新帧、后者没分配。
+/// 合成一个数会让「复制真的发生了」这件事没有证据（同 ADR-030 决定 2 的分号理由）。
+static COW_EXCLUSIVE: AtomicUsize = AtomicUsize::new(0);
+/// COW 失败的次数（分配失败、页表写失败）。失败**不吞**：调用方据此走 Kill 路径。
+static COW_FAILED: AtomicUsize = AtomicUsize::new(0);
+
+pub fn cow_copied() -> usize {
+    COW_COPIED.load(Ordering::Relaxed)
+}
+pub fn cow_exclusive() -> usize {
+    COW_EXCLUSIVE.load(Ordering::Relaxed)
+}
+pub fn cow_failed() -> usize {
+    COW_FAILED.load(Ordering::Relaxed)
+}
+
+/// 把一个可写页登记成 **COW 页**：清 P_WRITE、置 P_COW。
+///
+/// 调用点只有共享路径（`map_shared` 已经 `frame_get` 过 ⇒ 引用计数 ≥ 2）。
+/// 返回是否真的改了页表项。
+///
+/// **为什么要在映射时就降权**：如果先给可写、等第一次写再降权，那「两个 AS 共享
+/// 同一帧但都可写」的窗口里任何一方写都会改到对方的页 —— 这正是 COW 要防的事，
+/// 而窗口期恰好是它没防住的时候。
+pub fn mark_cow(va: VirtAddr) -> bool {
+    if !is_ready() {
+        return false;
+    }
+    let _g = vmm();
+    let root = our_cr3();
+    if root == 0 {
+        return false;
+    }
+    // SAFETY: root 是本 CPU 当前 PML4；va 页对齐；持 VMM；不建表（create=false）
+    let Some(leaf) = (unsafe { walk_leaf_in(root, None, va.0, false, false, true) }) else {
+        return false;
+    };
+    // SAFETY: walk_leaf_in 返回的是有效表项指针
+    unsafe {
+        let v = *leaf;
+        if v & P_PRESENT == 0 {
+            return false;
+        }
+        *leaf = (v & !P_WRITE) | P_COW;
+    }
+    tlb_invalidate(va.0);
+    true
+}
+
+/// 缺页处理里的 COW 分支。**返回 true 表示「这一页已经处理好，重执行即可」**。
+///
+/// 调用前提（由 `trap.rs` 保证，缺一不可）：
+/// 1. 来自 ring3；
+/// 2. 是**写**故障（`error_code & 0x2 != 0`）—— 读故障不可能是 COW；
+/// 3. 页**存在**（`error_code & 0x1 != 0`）—— 不存在是 demand-zero 的地盘；
+/// 4. 不是取指故障（`error_code & 0x10 == 0`）。
+///
+/// 与 `demand_zero_try` 是**并列**关系不是包含关系：那一条要求「页不存在」，
+/// 这一条要求「页存在但不可写」，两个条件互斥。合在一起会分不清「该补页」与
+/// 「该复制」，而那两件事的失败后果完全不同（前者是内存不够，后者是共享被破坏）。
+pub fn cow_try(cr2: u64) -> bool {
+    if !is_ready() {
+        return false;
+    }
+    let va = cr2 & !(PAGE as u64 - 1);
+    let root = our_cr3();
+    if root == 0 {
+        return false;
+    }
+    // 第一段：只读地确认「这确实是一页 COW 页」，并取出它当前指向的帧。
+    // 锁内只做这件事，分配与铺页都在后面 —— 与 demand_zero_try 同一编排。
+    let frame = {
+        let _g = vmm();
+        // SAFETY: root 是当前 PML4；va 页对齐；持 VMM；create=false（COW 不建表）
+        let Some(leaf) = (unsafe { walk_leaf_in(root, None, va, false, false, true) }) else {
+            return false;
+        };
+        // SAFETY: 有效表项指针
+        let v = unsafe { *leaf };
+        if v & P_PRESENT == 0 {
+            return false; // 不存在 ⇒ 不是 COW 的活（demand-zero 或该杀）
+        }
+        if v & P_COW == 0 {
+            return false; // 不是 COW 页 ⇒ 真·只读页被写，交给 Kill 路径
+        }
+        if v & P_WRITE != 0 {
+            // COW 位还在但已经可写：说明别处刚恢复过，直接放行（重执行会成功）
+            return true;
+        }
+        (v & ADDR_MASK) / PAGE as u64
+    };
+
+    // 第二段：查引用计数。**只剩自己 ⇒ 不需要复制**，原地恢复可写即可。
+    // 这条路径省一次分配，而且它是「共享真的发生过、现在不共享了」的直接证据。
+    let exclusive = {
+        let _g = pmm();
+        frame_refcnt_shared(frame) == 1
+    };
+    if exclusive {
+        let _g = vmm();
+        // SAFETY: 重新取叶子（第一段的指针已随锁释放失效）
+        if let Some(leaf) = unsafe { walk_leaf_in(root, None, va, false, false, true) } {
+            // SAFETY: 有效表项指针
+            unsafe {
+                let v = *leaf;
+                if v & P_PRESENT != 0 && v & P_COW != 0 && (v & ADDR_MASK) / PAGE as u64 == frame {
+                    *leaf = (v | P_WRITE) & !P_COW;
+                    tlb_invalidate(va);
+                    COW_EXCLUSIVE.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        // 页表项在锁间隙被别人改了（并发 COW）⇒ 当作已处理，重执行即可
+        return true;
+    }
+
+    // 第三段：真复制。分配 → 拷内容 → 换叶子 → 放旧引用。
+    let Ok(new_frames) = phys_alloc(0, crate::vmo::MOD_VMO) else {
+        COW_FAILED.fetch_add(1, Ordering::Relaxed);
+        return false; // 分配失败不吞：false ⇒ 走 Kill 路径
+    };
+    let np = new_frames.base().0;
+    let old_pa = frame * PAGE as u64;
+    // SAFETY: np 来自 phys_alloc 独占；old_pa 是当前映射着的帧；两者都在 HHDM 覆盖内；
+    // 页对齐；拷贝 PAGE 字节不越界。
+    unsafe {
+        let hhdm = s().hhdm;
+        core::ptr::copy_nonoverlapping((old_pa + hhdm) as *const u8, (np + hhdm) as *mut u8, PAGE);
+    }
+    // 新帧要由「映射」持有：map 会替我们 frame_get 一次，而 phys_alloc 已经给了 1 个引用，
+    // 所以先把 phys_alloc 那份 forget 掉，让 map 的引用成为唯一一份。
+    core::mem::forget(new_frames);
+    let m = match map(VirtAddr(va), owned_frame(np), PageFlags::USER_RW) {
+        Ok(m) => m,
+        Err(_) => {
+            COW_FAILED.fetch_add(1, Ordering::Relaxed);
+            if let Err(e) = phys_free(PhysAddr(np), 0, crate::vmo::MOD_VMO) {
+                free_violation(e, PhysAddr(np), crate::vmo::MOD_VMO);
+            }
+            return false;
+        }
+    };
+    core::mem::forget(m); // 与 demand_zero_try 同一手法：归还入口是 unmap 路径
+    // 放掉旧帧那一份引用（原来这个 AS 持有它）。计数降到 0 时由 frame_put 自己回收。
+    if let Err(e) = frame_put(frame) {
+        free_violation(e, PhysAddr(old_pa), crate::vmo::MOD_VMO);
+    }
+    COW_COPIED.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// 读帧的引用计数（**公开的只读视图**）。与 `fi_refcnt` 分开：后者要求调用方
+/// 已持 PMM 且帧号在界内，是内部助手；这个是给 COW 第二段用的安全入口。
+fn frame_refcnt_shared(f: u64) -> u32 {
+    let st = s();
+    if f >= st.frame_info_frames as u64 {
+        return 0;
+    }
+    let arr = st.frame_info.load(Ordering::Relaxed) as *const FrameInfo;
+    // SAFETY: arr 覆盖 frame_info_frames 个条目，f 已在界内；只读原子量。
+    unsafe { (*arr.add(f as usize)).refcnt.load(Ordering::Relaxed) }
+}
+
+/// 从一个裸帧号造一个 `OwnedFrames`（仅供 COW 的「已 forget 旧引用」路径）。
+///
+/// **为什么需要它**：`map` 收 `OwnedFrames`，而 COW 手里的新帧是从 `phys_alloc`
+/// 来的、已经 forget 过（所有权转给了这里）。没有这个构造器就只能再 alloc 一次，
+/// 那是多分配一页。
+///
+/// SAFETY 由调用方保证：`frame` 是一页、当前无人持有 `OwnedFrames`、owner 是 MOD_VMO。
+/// 测试与诊断用：把一个**指定 AS 根**的某一页降权成 COW 页。
+///
+/// 与 `mark_cow` 的差别只在根的来源：那个用 `our_cr3()`（当前 CPU），这个收一个显式根。
+/// **为什么必须有它**：`mark_cow` 只能降权「当前正在用的那张表」，而 COW 的判据要
+/// 同时降权两个 AS —— 另一个 AS 不是当前 CR3，`mark_cow` 碰不到它。
+pub fn mark_cow_in(root: u64, va: u64) -> bool {
+    if !is_ready() || root == 0 {
+        return false;
+    }
+    let _g = vmm();
+    // SAFETY: root 由调用方给出（须是有效 PML4）；va 页对齐；持 VMM；不建表
+    let Some(leaf) = (unsafe { walk_leaf_in(root, None, va, false, false, true) }) else {
+        return false;
+    };
+    // SAFETY: 有效表项指针
+    unsafe {
+        let v = *leaf;
+        if v & P_PRESENT == 0 {
+            return false;
+        }
+        *leaf = (v & !P_WRITE) | P_COW;
+    }
+    tlb_invalidate(va);
+    true
+}
+
+/// 读一个**指定 AS 根**在某个 VA 上映射的帧号（没映射 ⇒ None）。
+/// 判据用它证「复制之后 A 侧换了一个帧」。
+pub fn aspace_leaf_frame(root: u64, va: u64) -> Option<u64> {
+    if !is_ready() || root == 0 {
+        return None;
+    }
+    let _g = vmm();
+    // SAFETY: root 由调用方给出；va 页对齐；持 VMM；不建表
+    let leaf = unsafe { walk_leaf_in(root, None, va, false, false, true) }?;
+    // SAFETY: 有效表项指针
+    let v = unsafe { *leaf };
+    if v & P_PRESENT == 0 {
+        return None;
+    }
+    Some((v & ADDR_MASK) / PAGE as u64)
+}
+
+/// 取一个 `AspaceHandle` 的根（判据要拿它调 `*_in` 系列）。
+pub fn aspace_root_of(h: &AspaceHandle) -> Option<u64> {
+    aspace_root(h.slot())
+}
+
+/// `cow_try` 的**显式根**版本：处理某个 AS 根下的 COW 写故障。
+///
+/// `cow_try` 用 `our_cr3()`（本 CPU 当前表），而判据要处理**另一个 AS** 的页。
+/// 两者共享同一套三段落逻辑，所以这里只做「换根」，不复制实现。
+pub fn cow_try_for_root(root: u64, va_hint: u64) -> bool {
+    if !is_ready() || root == 0 {
+        return false;
+    }
+    let va = va_hint & !(PAGE as u64 - 1);
+    let frame = {
+        let _g = vmm();
+        // SAFETY: root 由调用方给出；va 页对齐；持 VMM；不建表
+        let Some(leaf) = (unsafe { walk_leaf_in(root, None, va, false, false, true) }) else {
+            return false;
+        };
+        // SAFETY: 有效表项指针
+        let v = unsafe { *leaf };
+        if v & P_PRESENT == 0 || v & P_COW == 0 {
+            return false;
+        }
+        if v & P_WRITE != 0 {
+            return true;
+        }
+        (v & ADDR_MASK) / PAGE as u64
+    };
+    let exclusive = {
+        let _g = pmm();
+        frame_refcnt_shared(frame) == 1
+    };
+    if exclusive {
+        let _g = vmm();
+        // SAFETY: 重新取叶子；持 VMM
+        if let Some(leaf) = unsafe { walk_leaf_in(root, None, va, false, false, true) } {
+            // SAFETY: 有效表项指针
+            unsafe {
+                let v = *leaf;
+                if v & P_PRESENT != 0 && v & P_COW != 0 && (v & ADDR_MASK) / PAGE as u64 == frame {
+                    *leaf = (v | P_WRITE) & !P_COW;
+                    tlb_invalidate(va);
+                    COW_EXCLUSIVE.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        return true;
+    }
+    let Ok(new_frames) = phys_alloc(0, crate::vmo::MOD_VMO) else {
+        COW_FAILED.fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
+    let np = new_frames.base().0;
+    let old_pa = frame * PAGE as u64;
+    // SAFETY: np 独占；old_pa 是当前映射着的帧；都在 HHDM 内；页对齐
+    unsafe {
+        let hhdm = s().hhdm;
+        core::ptr::copy_nonoverlapping((old_pa + hhdm) as *const u8, (np + hhdm) as *mut u8, PAGE);
+    }
+    core::mem::forget(new_frames);
+    // 直接换叶子（不走 map：map 用 our_cr3，这里要换的是 root 那张表）
+    {
+        let _g = vmm();
+        // SAFETY: root 有效；va 页对齐；持 VMM
+        let Some(leaf) = (unsafe { walk_leaf_in(root, None, va, false, false, true) }) else {
+            COW_FAILED.fetch_add(1, Ordering::Relaxed);
+            let _ = phys_free(PhysAddr(np), 0, crate::vmo::MOD_VMO);
+            return false;
+        };
+        // SAFETY: 有效表项指针
+        unsafe {
+            let v = *leaf;
+            *leaf = (v & !ADDR_MASK) | (np | P_WRITE) ;
+            *leaf &= !P_COW;
+        }
+        tlb_invalidate(va);
+    }
+    if let Err(e) = frame_put(frame) {
+        free_violation(e, PhysAddr(old_pa), crate::vmo::MOD_VMO);
+    }
+    COW_COPIED.fetch_add(1, Ordering::Relaxed);
+    true
+}
+fn owned_frame(frame: u64) -> OwnedFrames {
+    OwnedFrames { base: PhysAddr(frame * PAGE as u64), order: 0, owner: crate::vmo::MOD_VMO }
 }
 
 // ------------------------------------------------------------------ 锁

@@ -189,6 +189,7 @@ public_api = [
   "mm::KBuf",
   "mm::LazyHandle",
   "mm::demand_zero_try",
+  "mm::cow_try",
   "mm::lazy_new",
   "mm::demand_zero_count",
   "mm::demand_zero_lost",

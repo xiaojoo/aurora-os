@@ -31,6 +31,9 @@ pub struct SchedHooks {
     /// 返回 true = 页此刻已映射、重执行将成功；false = 不修，走既有 Kill/Fatal 判据。
     /// 走表而不是直调 `mm::`：环内 `arch->memory` 棘轮只许降不许升（ADR-040 的先例通道）。
     pub demand_zero: fn(u64) -> bool,
+    /// ADR-177 切片 2：COW 写故障的处理接缝。**与 `demand_zero` 并列，不是它的扩展**——
+    /// 那一条要求「页不存在」，这一条要求「页存在但不可写」，两个条件互斥。
+    pub cow: fn(u64) -> bool,
     pub exit_current: fn(usize),
     /// 安全契片由 sched 安装；调用点必须在异常出口。
     pub preempt_point: fn(u64, usize),
@@ -58,6 +61,12 @@ fn no_id() -> usize {
 fn no_demand_zero(_: u64) -> bool {
     false
 }
+
+/// 默认实现：不处理。未装 `sched` 时 COW 故障按原路径（ring3 => Kill）走，
+/// 与装之前的行为**逐字相同**——这是「接缝不改变默认行为」的那条纪律。
+fn no_cow(_: u64) -> bool {
+    false
+}
 fn no_exit(_: usize) {}
 fn no_preempt(_: u64, _: usize) {}
 
@@ -73,6 +82,7 @@ static HOOKS: HooksCell = HooksCell(UnsafeCell::new(SchedHooks {
     current_id: no_id,
     current_id_snapshot: no_id,
     demand_zero: no_demand_zero,
+    cow: no_cow,
     exit_current: no_exit,
     preempt_point: no_preempt,
 }));

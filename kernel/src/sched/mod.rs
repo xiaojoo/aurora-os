@@ -2589,6 +2589,7 @@ pub fn install_arch_hooks() {
         preempt_point: preempt_hook,
         // ADR-067/P5：#PF 修复接缝装的是 mm 的实现（sched 只是安装方，不加自己的逻辑）。
         demand_zero: mm::demand_zero_try,
+        cow: mm::cow_try,
     });
 }
 

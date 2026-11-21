@@ -991,6 +991,21 @@ pub fn dispatch(frame: &mut TrapFrame) -> Action {
         {
             return Action::Resume;
         }
+        // ADR-177 切片 2：**COW 写故障**。与上一条是**并列**关系不是包含关系——
+        // 那一条要求 `error_code & 0x1 == 0`（页不存在），这一条要求 `& 0x1 != 0`
+        // （页存在）且 `& 0x2 != 0`（是写）。两个条件互斥，所以顺序不影响判定，
+        // 但**必须分开写**：合成一条会分不清「该补页」与「该复制」，而这两件事的
+        // 失败后果完全不同（前者是内存不够，后者是共享被破坏）。
+        //
+        // 为什么还要查 `& 0x2`：读故障不可能是 COW（共享页是可读的，读不会触发
+        // 保护故障）。真·只读页被写也会走到这里，但 `cow_try` 会因为 P_COW=0 返回
+        // false，落到下面的 Kill 路径——**那条路径一个字都没改**。
+        if from_user(frame) && frame.error_code & 0x1 != 0 && frame.error_code & 0x2 != 0
+            && frame.error_code & 0x10 == 0
+            && (crate::hooks::sched().cow)(frame.cr2)
+        {
+            return Action::Resume;
+        }
         // **标签跟着决定走**：同一行现场，ring3 来的叫 `kill`，内核自己的才叫 `fatal`。
         // 之前一律打 `fatal`，结果"越界的用户任务被隔离掉"这条判据在串口上读起来
         // 像内核要挂了——症状与后果不符，排查时会往错的方向走（§9.2 的分级就是为这个）。
