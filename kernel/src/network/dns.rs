@@ -17,6 +17,9 @@ pub const DNS_QUERY_PORT: u16 = 1053;
 
 
 pub const DNS_QTYPE_A: u16 = 1;
+/// ADR-182 决策 4：AAAA 记录（IPv6 地址）。与 `A` **并列不替代**——
+/// 一个名字可能只有 A、只有 AAAA、或两者都有。
+pub const DNS_QTYPE_AAAA: u16 = 28;
 pub const DNS_QCLASS_IN: u16 = 1;
 /// DNS 帧总长 = eth 14 + IPv4 20 + UDP 8 + DNS 查询（问 localhost），垫到 60。
 /// 问 localhost：slirp 的 DNS 对它有本地答案（127.0.0.1），**不依赖外网**。
@@ -148,6 +151,52 @@ fn dns_first_a(buf: &[u8], d: usize, ancount: u16) -> [u8; 4] {
     [0; 4]
 }
 
+/// 从 DNS 应答里取**第一条 AAAA 记录**的地址（ADR-182 决策 4）。
+///
+/// 与 [`dns_first_a`] 同一条走法，只是认 `TYPE == 28` 且 `RDLENGTH == 16`。
+///
+/// **返回 `Option` 而不是全零**：`::`（全零）是合法的 IPv6 地址，不能当哨兵。
+pub fn dns_first_aaaa(buf: &[u8], dns_start: usize, ancount: u16) -> Option<[u8; 16]> {
+    let mut p = dns_start + 12;
+    // 先跳过问题段（QDCOUNT 通常 1，但按字段读更稳）
+    let qd = if buf.len() >= dns_start + 6 {
+        u16::from_be_bytes([buf[dns_start + 4], buf[dns_start + 5]])
+    } else {
+        0
+    };
+    for _ in 0..qd {
+        p = dns_skip_name(buf, p)?;
+        p += 4; // QTYPE + QCLASS
+        if p > buf.len() {
+            return None;
+        }
+    }
+    let mut ai = 0u16;
+    while ai < ancount {
+        if p >= buf.len() {
+            return None;
+        }
+        p = dns_skip_name(buf, p)?;
+        if p + 10 > buf.len() {
+            return None;
+        }
+        let rtype = u16::from_be_bytes([buf[p], buf[p + 1]]);
+        let rdlen = usize::from(u16::from_be_bytes([buf[p + 8], buf[p + 9]]));
+        let rd = p + 10;
+        if rd + rdlen > buf.len() {
+            return None;
+        }
+        if rtype == DNS_QTYPE_AAAA && rdlen == 16 {
+            let mut a = [0u8; 16];
+            a.copy_from_slice(&buf[rd..rd + 16]);
+            return Some(a);
+        }
+        p = rd + rdlen;
+        ai += 1;
+    }
+    None
+}
+
 /// 跳过一段 DNS 名字，返回**它之后**的偏移。压缩指针最多跳 [`DNS_MAX_PTR_JUMPS`] 次，
 /// 且只认"指向更靠前"的指针（防自指循环）。失败返回 `None`。
 fn dns_skip_name(buf: &[u8], start: usize) -> Option<usize> {
@@ -259,6 +308,12 @@ pub struct DnsReply {
     /// ADR-158：第一条 A 记录的地址（`ancount == 0` 或没有 A 记录时全 0）。
     /// **`[0,0,0,0]` 不是合法地址**，所以"全 0"能当"没有"的哨兵。
     pub a_record: [u8; 4],
+    /// ADR-182：第一条 AAAA 记录的地址。`None` = 没有 AAAA 记录。
+    ///
+    /// **为什么用 `Option` 而不是全零哨兵**：IPv6 的 `::`（全零）是**合法地址**，
+    /// 不能当「没有」用。这与 `a_record` 的 `[0,0,0,0]` 哨兵不同——那个能用是因为
+    /// `0.0.0.0` 不是可路由的单播地址。
+    pub aaaa_record: Option<[u8; 16]>,
     pub used_idx: u16,
     pub used_len: u32,
     pub used_id: u32,
@@ -290,6 +345,7 @@ pub fn parse_dns_reply(buf: &[u8], used_idx: u16, used_len: u32, used_id: u32) -
         rcode: buf[d+3] & 0x0F,
         ancount,
         a_record: dns_first_a(buf, d, ancount),
+        aaaa_record: dns_first_aaaa(buf, d, ancount),
         used_idx,
         used_len,
         used_id,

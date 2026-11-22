@@ -870,3 +870,125 @@ fn t_socket_family() -> bool {
 
 #[cfg(feature = "handles")]
 ktest!(KT_SOCKET_FAMILY, t_socket_family);
+
+/// ADR-182：IPv6 的**证人**。
+///
+/// ## 判据七格
+///
+/// 1. **EUI-64**：由 MAC 推出的接口标识，U/L 位已取反；
+/// 2. **链路本地地址**：`fe80::/64` + EUI-64，且 `is_link_local()` 为真；
+/// 3. **被请求节点组播**：`ff02::1:ffXX:XXXX` 的后 24 位来自目标地址；
+/// 4. **IPv6+UDP 往返**：打帧再解帧，地址/端口/载荷全部一致；
+/// 5. **IPv6 头没有校验和**：UDP 起点在 `14+40`（不是 `14+40+12`）；
+/// 6. **NDP NS 往返**：解析回的目标地址与 MAC 选项一致，hop limit = 255；
+/// 7. **hop limit ≠ 255 的 NDP 必须被拒**（RFC 4861 §7.1.1）。
+///
+/// **负样本**：把 `eui64_from_mac` 的 `^ 0x02` 去掉，第 1、2 格同时红。
+#[cfg(feature = "handles")]
+fn t_ipv6_core() -> bool {
+    use crate::network::{ipv6, ndp};
+    let mut ok = true;
+
+    // 1. EUI-64：MAC 02:00:00:00:00:01 => 00:00:00:FF:FE:00:00:01
+    let mac = [0x02u8, 0x00, 0x00, 0x00, 0x00, 0x01];
+    let eui = ipv6::eui64_from_mac(&mac);
+    // U/L 位取反：0x02 ^ 0x02 = 0x00
+    let eui_ok = eui[0] == 0x00
+        && eui[1] == 0x00
+        && eui[2] == 0x00
+        && eui[3] == 0xFF
+        && eui[4] == 0xFE
+        && eui[5] == 0x00
+        && eui[6] == 0x00
+        && eui[7] == 0x01;
+    if !eui_ok {
+        crate::log_fatal!("ipv6: EUI-64 不对 {:02x?}", eui);
+        ok = false;
+    }
+
+    // 2. 链路本地
+    let ll = ipv6::link_local_from_mac(&mac);
+    let ll_addr = ipv6::IpAddr::V6(ll);
+    let ll_ok = ll[0] == 0xFE && ll[1] == 0x80 && ll_addr.is_link_local() && !ll_addr.is_v4();
+    if !ll_ok {
+        crate::log_fatal!("ipv6: 链路本地不对 {:02x?}", ll);
+        ok = false;
+    }
+
+    // 3. 被请求节点组播
+    let target = ll;
+    let mcast = ipv6::solicited_node_multicast(&target);
+    let mcast_ok = mcast[0] == 0xFF
+        && mcast[1] == 0x02
+        && mcast[11] == 0x01
+        && mcast[12] == 0xFF
+        && mcast[13] == target[13]
+        && mcast[14] == target[14]
+        && mcast[15] == target[15];
+    if !mcast_ok {
+        crate::log_fatal!("ipv6: 被请求节点组播不对 {:02x?}", mcast);
+        ok = false;
+    }
+
+    // 4. IPv6 + UDP 往返
+    let payload = b"hello-ipv6";
+    let mut f = [0u8; 256];
+    let dmac = [0x33u8, 0x33, 0xFF, 0, 0, 1];
+    let flen = ipv6::build_udp6_frame(
+        &mut f, &dmac, &mac, &ll, &mcast, 1234, 5678, payload,
+    );
+    let mut rt_ok = false;
+    let mut no_cksum_ok = false;
+    if let Some(n) = flen {
+        // 5. IPv6 头没有校验和：UDP 起点 = 14 + 40 = 54
+        //    若错当成 IPv4 那样有 12 字节校验和区，UDP 会在 66
+        no_cksum_ok = n == 14 + 40 + 8 + payload.len()
+            && f[54..56] == 1234u16.to_be_bytes();
+        if let Some((s, d, sp, dp, pl)) = ipv6::parse_udp6_frame(&f[..n]) {
+            rt_ok = s == ll && d == mcast && sp == 1234 && dp == 5678 && pl == payload;
+        }
+    }
+    if !rt_ok || !no_cksum_ok {
+        crate::log_fatal!("ipv6: UDP 往返={} 无校验和={} flen={:?}", rt_ok, no_cksum_ok, flen);
+        ok = false;
+    }
+
+    // 6. NDP NS 往返
+    let mut nf = [0u8; 256];
+    let mut ns_ok = false;
+    if let Some(n) = ndp::build_ns(&mut nf, &mac, &ll, &target) {
+        if let Some(msg) = ndp::parse_nd(&nf[..n]) {
+            ns_ok = msg.kind == ndp::ICMPV6_NS
+                && msg.target == target
+                && msg.lladdr == Some(mac)
+                && msg.src_ip == ll;
+        }
+    }
+    if !ns_ok {
+        crate::log_fatal!("ipv6: NDP NS 往返不成立");
+        ok = false;
+    }
+
+    // 7. hop limit ≠ 255 的 NDP 必须被拒
+    let mut bad = [0u8; 256];
+    let mut hop_ok = false;
+    if let Some(n) = ndp::build_ns(&mut bad, &mac, &ll, &target) {
+        let good = ndp::parse_nd(&bad[..n]).is_some();
+        bad[14 + 7] = 64; // hop limit 改成 64（被路由器转发过的形状）
+        let rejected = ndp::parse_nd(&bad[..n]).is_none();
+        hop_ok = good && rejected;
+    }
+    if !hop_ok {
+        crate::log_fatal!("ipv6: hop limit 检查不成立（≠255 的 NDP 应被拒）");
+        ok = false;
+    }
+
+    crate::log_info!(
+        "ipv6: eui64={} 链路本地={} 组播={} udp往返={} 无校验和={} ndp={} hop255={} ⇒ {}",
+        eui_ok, ll_ok, mcast_ok, rt_ok, no_cksum_ok, ns_ok, hop_ok, ok
+    );
+    ok
+}
+
+#[cfg(feature = "handles")]
+ktest!(KT_IPV6_CORE, t_ipv6_core);
