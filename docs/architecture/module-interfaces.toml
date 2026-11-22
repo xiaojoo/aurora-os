@@ -497,7 +497,8 @@ public_api = [
   "sync::IrqGuard",
   "sync::RANK_HANDLE",
 ]
-allowed_callers = ["arch", "capability", "integration", "memory", "resource", "sched", "network"]
+allowed_callers = [
+  "driver","arch", "capability", "integration", "memory", "resource", "sched", "network"]
 dependencies = ["arch", "diagnostics", "time"]
 forbidden_dependencies = []
 known_violations = []
@@ -666,7 +667,8 @@ public_api = [
   "nvme::read_lba", "nvme::write_lba"
 ]
 allowed_callers = ["diagnostics", "integration", "sched", "storage", "network"]
-dependencies = ["arch", "boot", "irq", "memory", "network", "pci", "time"]
+dependencies = [
+  "sync","arch", "boot", "irq", "memory", "network", "pci", "time"]
 forbidden_dependencies = ["storage"]
 known_violations = []
 context = ["KERNEL"]
@@ -1132,6 +1134,7 @@ known_scc = [
 ]
 
 [baseline.ring_edge_sites]
+  "driver->sync" = 1
 "driver->network" = 2
   "network->sync" = 3
   "network->driver" = 6

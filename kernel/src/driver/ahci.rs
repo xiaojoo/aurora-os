@@ -332,6 +332,28 @@ pub struct Stats {
 }
 
 static PORT_STATE: [AtomicU8; 32] = [const { AtomicU8::new(0) }; 32];
+
+/// 块设备传输的互斥（ADR-190）。
+///
+/// ## 为什么必须有它
+///
+/// `OFF_DATA` 是**全局单块** DMA 缓冲（232 KiB，所有端口共用）。
+/// 传输流程是「往缓冲里填 → 发命令 → 等完成 → 从缓冲里读」，
+/// 而这三步之间**没有任何互斥**。
+///
+/// 实测后果（ADR-190 的取证）：
+///
+/// - `t_fat32` 两卷读同一个 `HELLO.ELF`，字节数/簇数/尾字节全同、**哈希不同**（22% 失败）；
+/// - `t_ahci_write` 的图案被别的写覆盖（`图案不一致=3570 被盖字节=3570`）；
+/// - `t_fat32_cursor_disks` 15%、`t_fat32_mem` 10%、`t_fs_open_syscalls` 19.7% —— 同一病根。
+///
+/// 之前那些用例「各自用不同端口/不同 LBA」的修法只解决了表层：**端口不同但缓冲是同一块**。
+///
+/// ## 为什么 rank 是 37
+///
+/// 句柄层（`RANK_HANDLE=35`）在锁外做磁盘 IO ⇒ 它调传输时不持 HANDLE；
+/// 传输内部不取任何别的锁（纯 MMIO + 轮询）⇒ 37 是安全下界。
+static XFER: crate::sync::IrqSpinLock<()> = crate::sync::IrqSpinLock::new(crate::sync::RANK_BLOCK, ());
 static PORT_RESETS: [AtomicU32; 32] = [const { AtomicU32::new(0) }; 32];
 /// 每个端口因"发射被吞"而重置的次数，与 §8.2 的故障预算分开数（见 `recover_for_issue`）
 static PORT_ISSUE_RESETS: [AtomicU32; 32] = [const { AtomicU32::new(0) }; 32];
@@ -1384,6 +1406,12 @@ pub fn read_bytes(num: u8, lba: u64, dst: &mut [u8]) -> Result<Xfer, AhciError> 
 /// 收成一个函数而不是复制一份，是因为"写"最容易出的错就是复制时把完成判据改掉一格
 /// （§12.4.1 规则 3 与 BACKLOG ⑧ 同一课：两条路径上有一条永远不红的判据）。
 fn transfer(num: u8, lba: u64, count: u16, write: bool) -> Result<Xfer, AhciError> {
+    // **整个传输（填缓冲→发命令→等完成→读缓冲）必须互斥**（ADR-190）：
+    // `OFF_DATA` 是全局单块缓冲，两个调用方交错就会互相覆盖。
+    //
+    // 锁的粒度是「一次传输」而不是「一整个 walk」：`walk` 逐簇读，
+    // 每次 `read_checked` 各自拿锁。这样长读不会把别的调用方饿死。
+    let _g = XFER.lock();
     let mut r = transfer_inner(num, lba, count, write);
     // 发射被吞（写 `PxCI`=1 读回 0）时，这条命令**设备根本没收到**——不是"可能已经落盘的写
     // 失败了"，所以恢复之后重发一次是安全的。实测本机偶发就打在"刚起完口的第一条命令"上

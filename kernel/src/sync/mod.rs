@@ -65,6 +65,15 @@ pub const RANK_HANDLE: LockRank = LockRank(35);
 /// 用户态 syscall 侧调，不从中断里调 —— 若将来接到真收包中断，
 /// 这一行要改成 `true` 并重跑 ADR-081 决策 2 的判据。
 pub const RANK_NET: LockRank = LockRank(36);
+/// 块设备传输（`driver/ahci.rs` 的 `XFER`，ADR-190）。
+///
+/// **为什么必须比 `RANK_HANDLE(35)` 深**：句柄层在锁外做磁盘 IO（取票/提交两段），
+/// 所以它调用传输时**不持** HANDLE；但传输本身要防「两个调用方同时用同一块
+/// DMA 缓冲」。
+///
+/// **为什么不能复用 `RANK_NET(36)`**：那是 socket 表的锁，与块设备无关，
+/// 合用会让「socket 里读盘」变成同等级重入。
+pub const RANK_BLOCK: LockRank = LockRank(37);
 pub const RANK_LEDGER: LockRank = LockRank(40);
 pub const RANK_ACPI: LockRank = LockRank(50);
 /// 跨核竞争用例专用（`smp::CONTENTION_LOCK`）。排在最内层是因为它**不嵌套任何东西**：
