@@ -442,8 +442,13 @@ pub fn plan_init(
 
 /// xHCI 的 `ModuleId`（驱动资源台账用）。
 ///
-/// **必须唯一**：`driver/mod.rs` 的台账按 ModuleId 聚合，撞了就会互相顶账。
-const MOD_XHCI: crate::mm::ModuleId = crate::mm::ModuleId(88);
+/// **必须唯一**：台账按 ModuleId 聚合，撞了就会互相顶账。
+///
+/// **必须 < `resource::MAX_MODULES`(64)**（ADR-211 实测撞过）：
+/// 第一版取 88，越界 ⇒ 每次 `alloc_dma` 都算一次 `unknown_module_hits` ⇒
+/// `t_resource_ledger_balanced` 的 `unknown_hits == 0` 那一条当场红。
+/// 已用的是 0-3、10-21、40，这里取 **41**。
+const MOD_XHCI: crate::mm::ModuleId = crate::mm::ModuleId(41);
 
 /// 一次真实 probe 的读数（ADR-210）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -520,5 +525,183 @@ pub fn probe_device(dev: &crate::bus::pci::Dev) -> Result<Reading, ProbeError> {
         scratchpad: cap.max_scratchpad(),
         doorbell_offset: cap.doorbell_offset,
         bar_len,
+    })
+}
+
+// ---------------------------------------------------------------- ADR-211：真写寄存器
+
+/// USBCMD 位（spec §5.4.1）。
+pub const USBCMD_RUN: u32 = 1 << 0;
+pub const USBCMD_HCRST: u32 = 1 << 1;
+pub const USBCMD_INTE: u32 = 1 << 2;
+
+/// USBSTS 位（spec §5.4.2）。
+pub const USBSTS_HCH: u32 = 1 << 0;
+pub const USBSTS_CNR: u32 = 1 << 11;
+
+/// 等 CNR/HCH 的自旋上界。
+///
+/// **为什么是 2_000_000**：与 NVMe 的 `wait_cqe` 同一个量级（那里也是 2e6）。
+/// 这个数不是推导值，是「比任何真设备都宽、又不至于让判据挂死」的经验值。
+pub const SPIN_LIMIT: u32 = 2_000_000;
+
+/// 初始化失败原因（ADR-211）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunError {
+    /// 写寄存器失败。
+    Io,
+    /// HCRST 之后 CNR 一直不清。
+    ResetTimeout,
+    /// 置 RS=1 之后 HCH 一直不清（控制器没进入运行态）。
+    RunTimeout,
+    /// 分配命令环 / DCBAA 失败。
+    NoDma,
+    /// 形状校验失败（复用 ADR-209 的判定）。
+    BadCap,
+}
+
+/// 一次真实初始化的读数（ADR-211）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RunReading {
+    pub cap: Reading,
+    /// 命令环的总线地址。
+    pub cmd_ring_bus: u64,
+    /// DCBAA 的总线地址。
+    pub dcbaa_bus: u64,
+    /// 复位后读回的 USBSTS（用于证「CNR 真的清了」）。
+    pub usbsts_after_reset: u32,
+    /// 运行后读回的 USBSTS。
+    pub usbsts_after_run: u32,
+    /// 运行后读回的 USBCMD（证 RS 位真的置上了）。
+    pub usbcmd_after_run: u32,
+}
+
+/// **对一个 xHCI 设备做真实初始化**（ADR-211）。
+///
+/// ## 与 ADR-209 的分工
+///
+/// ADR-209 的 `plan_init` 是**纯函数**：算序列。这里**真的执行那个序列**。
+///
+/// ## 执行顺序（与 `plan_init` 一致）
+///
+/// 1. 分配一页 DMA：命令环（前 4 KiB 的一页，256 个 TRB）
+/// 2. 分配一页 DMA：DCBAA（Device Context Base Address Array，至少 1 项）
+/// 3. 两块都清零 —— **脏数据会让「第一条完成」看起来已经到了**（NVMe 的同一条教训）
+/// 4. 写 USBCMD.HCRST=1，等 CNR=0
+/// 5. 写 DCBAAP、CRCR
+/// 6. 写 CONFIG（MaxSlotsEn）
+/// 7. 写 USBCMD.RS=1 + INTE=1，等 HCH=0
+///
+/// ## 一个刻意的保守
+///
+/// **不启动命令环的消费者**：TRB 环写好了、CRCR 指过去了，但没有投递任何命令。
+/// 端口枚举（Enable Slot）是下一层的事。今天只证「控制器真的进了运行态」。
+pub fn run_device(dev: &crate::bus::pci::Dev) -> Result<RunReading, RunError> {
+    use crate::driver::{DriverCtx, DriverError};
+    let ctx = DriverCtx::for_device(MOD_XHCI, *dev);
+    let mmio = ctx.map_mmio(0).map_err(|_| RunError::Io)?;
+    let bar_len = ctx.mmio_len(mmio).map_err(|_| RunError::Io)?;
+
+    // ---- 1) 读 CAP 并校验（复用 ADR-210 的解码）
+    let cap0 = ctx.read32(mmio, CAP_CAPLENGTH).map_err(|_| RunError::Io)?;
+    let hcsparams1 = ctx.read32(mmio, CAP_HCSPARAMS1).map_err(|_| RunError::Io)?;
+    let hccparams1 = ctx.read32(mmio, CAP_HCCPARAMS1).map_err(|_| RunError::Io)?;
+    let doorbell = ctx.read32(mmio, CAP_DOORBELL_OFFSET).map_err(|_| RunError::Io)?;
+    let cap = CapSnapshot {
+        cap_length: (cap0 & 0xFF) as u8,
+        hcsparams1,
+        hccparams1,
+        doorbell_offset: doorbell,
+    };
+    let op = cap.op_offset().ok_or(RunError::BadCap)?;
+    if cap.doorbell_offset().is_none() {
+        return Err(RunError::BadCap);
+    }
+    let cap_read = Reading {
+        cap_length: cap.cap_length,
+        max_slots: cap.max_slots(),
+        max_intrs: cap.max_intrs(),
+        max_ports: cap.max_ports(),
+        ac64: cap.ac64(),
+        csz: cap.csz(),
+        scratchpad: cap.max_scratchpad(),
+        doorbell_offset: cap.doorbell_offset,
+        bar_len,
+    };
+
+    // ---- 2) 两块 DMA：命令环一页 + DCBAA 一页
+    // **分开两次 `alloc_dma`**：命令环必须 64 字节对齐（CRCR 低 6 位是标志），
+    // DCBAA 也是。一页对齐天然满足，而两块放一起会让「谁对齐了」变含糊。
+    let ring = ctx.alloc_dma(crate::mm::PAGE).map_err(|_| RunError::NoDma)?;
+    let dcbaa = ctx.alloc_dma(crate::mm::PAGE).map_err(|_| RunError::NoDma)?;
+    let ring_bus = ctx.bus_addr(ring).map_err(|_| RunError::NoDma)?;
+    let dcbaa_bus = ctx.bus_addr(dcbaa).map_err(|_| RunError::NoDma)?;
+    // 清零：脏数据会让硬件把旧 TRB 当成有效项（与 NVMe 那条同一教训）。
+    ctx.dma_fill(ring, 0, 0, crate::mm::PAGE).map_err(|_| RunError::Io)?;
+    ctx.dma_fill(dcbaa, 0, 0, crate::mm::PAGE).map_err(|_| RunError::Io)?;
+
+    // ---- 3) 复位：HCRST=1（硬件自清），等 CNR=0
+    let cmd_off = op + OP_USBCMD;
+    let sts_off = op + OP_USBSTS;
+    ctx.write32(mmio, cmd_off, USBCMD_HCRST).map_err(|_| RunError::Io)?;
+    let mut spins = 0u32;
+    loop {
+        if spins >= SPIN_LIMIT {
+            return Err(RunError::ResetTimeout);
+        }
+        spins += 1;
+        let sts = ctx.read32(mmio, sts_off).map_err(|_| RunError::Io)?;
+        // HCRST 自清 + CNR 清 ⇒ 复位完成
+        let cmd = ctx.read32(mmio, cmd_off).map_err(|_| RunError::Io)?;
+        if cmd & USBCMD_HCRST == 0 && sts & USBSTS_CNR == 0 {
+            break;
+        }
+        crate::tsc::spin(100);
+    }
+    let usbsts_after_reset = ctx.read32(mmio, sts_off).map_err(|_| RunError::Io)?;
+
+    // ---- 4) DCBAAP / CRCR / CONFIG
+    // 64 位寄存器用两次 32 位写（低半在前，spec 要求）。
+    let dcbaap_off = op + OP_DCBAAP;
+    ctx.write32(mmio, dcbaap_off, (dcbaa_bus & 0xFFFF_FFFF) as u32).map_err(|_| RunError::Io)?;
+    ctx.write32(mmio, dcbaap_off + 4, (dcbaa_bus >> 32) as u32).map_err(|_| RunError::Io)?;
+
+    // CRCR：低 6 位是标志（RCS 在 bit 0）。命令环初始 cycle=1。
+    let crcr_off = op + OP_CRCR;
+    let crcr_lo = ((ring_bus & !0x3F) | 1) as u32;
+    ctx.write32(mmio, crcr_off, crcr_lo).map_err(|_| RunError::Io)?;
+    ctx.write32(mmio, crcr_off + 4, (ring_bus >> 32) as u32).map_err(|_| RunError::Io)?;
+
+    // CONFIG：MaxSlotsEn
+    ctx.write32(mmio, op + OP_CONFIG, u32::from(cap.max_slots())).map_err(|_| RunError::Io)?;
+
+    // ---- 5) 运行：RS=1 + INTE=1，等 HCH=0
+    ctx.write32(mmio, cmd_off, USBCMD_RUN | USBCMD_INTE).map_err(|_| RunError::Io)?;
+    let mut spins = 0u32;
+    loop {
+        if spins >= SPIN_LIMIT {
+            return Err(RunError::RunTimeout);
+        }
+        spins += 1;
+        let sts = ctx.read32(mmio, sts_off).map_err(|_| RunError::Io)?;
+        if sts & USBSTS_HCH == 0 {
+            break;
+        }
+        crate::tsc::spin(100);
+    }
+    let usbsts_after_run = ctx.read32(mmio, sts_off).map_err(|_| RunError::Io)?;
+    let usbcmd_after_run = ctx.read32(mmio, cmd_off).map_err(|_| RunError::Io)?;
+    // DMA 句柄**故意泄漏**（不 release）：控制器在跑，环必须一直有效。
+    // 这与 NVMe 同一条：设备活着，缓冲就得活着。
+    core::mem::forget(ring);
+    core::mem::forget(dcbaa);
+    let _ = DriverError::Io;
+    Ok(RunReading {
+        cap: cap_read,
+        cmd_ring_bus: ring_bus,
+        dcbaa_bus,
+        usbsts_after_reset,
+        usbsts_after_run,
+        usbcmd_after_run,
     })
 }

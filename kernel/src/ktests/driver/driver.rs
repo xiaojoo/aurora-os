@@ -2165,3 +2165,86 @@ fn t_xhci_probe() -> bool {
 
 #[cfg(all(feature = "handles", feature = "xhci"))]
 ktest!(KT_XHCI_PROBE, t_xhci_probe);
+
+/// ADR-211：**xHCI 真实初始化**的证人（切片 H 第四层）。
+///
+/// ## 要证什么
+///
+/// 前三层：TRB 字节层 → 能力解码 → 真读 CAP。这一层**第一次真的写寄存器**。
+///
+/// ## 判据八格
+///
+/// 1. `run_device` 成功（复位 + 配置 + 运行整条序列跑完）；
+/// 2. **复位后 CNR 清了**（`usbsts_after_reset & CNR == 0`）；
+/// 3. **运行后 HCH 清了**（`usbsts_after_run & HCH == 0`）；
+/// 4. **USBCMD 里 RS 位真的置上了**（`usbcmd_after_run & RUN != 0`）；
+/// 5. 命令环地址 **64 字节对齐**（CRCR 低 6 位是标志）；
+/// 6. DCBAA 地址 **64 字节对齐**；
+/// 7. 两个地址**不相同**（分开分配，不是同一块）；
+/// 8. 能力读数与 ADR-210 的 `probe_device` **一致**（同一条解码路径）。
+///
+/// **负样本**：把 `USBCMD_RUN` 去掉（只写 INTE）⇒ 第 3、4 格红
+/// （控制器不进入运行态，HCH 保持 1）。
+#[cfg(all(feature = "handles", feature = "xhci"))]
+fn t_xhci_run() -> bool {
+    use crate::driver::xhci::{self, USBSTS_CNR, USBSTS_HCH, USBCMD_RUN};
+    let mut ok = true;
+
+    let dev = match crate::pci::first_of_triple(0x0c, 0x03, 0x30) {
+        Some(d) => d,
+        None => {
+            crate::log_fatal!("xhci-run: 没有 xHCI 设备");
+            return false;
+        }
+    };
+
+    // ① 初始化
+    let rd = match xhci::run_device(&dev) {
+        Ok(r) => r,
+        Err(e) => {
+            crate::log_fatal!("xhci-run: run_device 失败 {:?}", e);
+            return false;
+        }
+    };
+
+    // ②③④ 状态位
+    let cnr_ok = rd.usbsts_after_reset & USBSTS_CNR == 0;
+    let hch_ok = rd.usbsts_after_run & USBSTS_HCH == 0;
+    let rs_ok = rd.usbcmd_after_run & USBCMD_RUN != 0;
+    if !cnr_ok || !hch_ok || !rs_ok {
+        crate::log_fatal!("xhci-run: 状态不对 cnr_clear={} hch_clear={} rs={}",
+            cnr_ok, hch_ok, rs_ok);
+        ok = false;
+    }
+
+    // ⑤⑥⑦ 地址
+    let ring_align = rd.cmd_ring_bus & 0x3F == 0;
+    let dcbaa_align = rd.dcbaa_bus & 0x3F == 0;
+    let distinct = rd.cmd_ring_bus != rd.dcbaa_bus;
+    if !ring_align || !dcbaa_align || !distinct {
+        crate::log_fatal!("xhci-run: 地址不对 ring={:#x} dcbaa={:#x} align={}/{} distinct={}",
+            rd.cmd_ring_bus, rd.dcbaa_bus, ring_align, dcbaa_align, distinct);
+        ok = false;
+    }
+
+    // ⑧ 与 probe_device 一致
+    let probe = xhci::probe_device(&dev);
+    let consistent = matches!(probe, Ok(p) if p.max_ports == rd.cap.max_ports
+        && p.max_slots == rd.cap.max_slots
+        && p.cap_length == rd.cap.cap_length);
+    if !consistent {
+        crate::log_fatal!("xhci-run: 与 probe_device 读数不一致");
+        ok = false;
+    }
+
+    crate::log_info!(
+        "xhci-run: 初始化=true cnr清={} hch清={} rs={} ring对齐={} dcbaa对齐={} 分开={} 一致={} ｜ ring={:#x} dcbaa={:#x} sts_after_reset={:#x} sts_after_run={:#x} cmd={:#x} ⇒ {}",
+        cnr_ok, hch_ok, rs_ok, ring_align, dcbaa_align, distinct, consistent,
+        rd.cmd_ring_bus, rd.dcbaa_bus, rd.usbsts_after_reset, rd.usbsts_after_run,
+        rd.usbcmd_after_run, ok
+    );
+    ok
+}
+
+#[cfg(all(feature = "handles", feature = "xhci"))]
+ktest!(KT_XHCI_RUN, t_xhci_run);
