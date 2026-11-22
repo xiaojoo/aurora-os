@@ -1666,19 +1666,27 @@ fn t_handle_proc_owner() -> bool {
     }
 
     // ④ `NO_PROC` 的句柄不许跨任务（拿 boot 任务的句柄给上面那些线程读）
-    let h_np = match handle::grant_console(me, RIGHT_READ, 0) {
-        Ok(v) => v,
+    // ④ `NO_PROC` 的句柄不许跨任务（拿 boot 任务的句柄给上面那些线程读）
+    //
+    // **不提前 return**（ADR-191 的教训又漏了一次，2026-11-22 实测）：
+    // 提前返回会让 `HPROC_GO` 永远为 0（worker 白转 0.126 s），
+    // 且 `jobs` 全部泄漏 ⇒ 后面每个用例的收尾不变量闸都红。
+    let mut no_proc_cross = false;
+    match handle::grant_console(me, RIGHT_READ, 0) {
+        Ok(h_np) => {
+            no_proc_cross = handle::resolve(h_np, owner_a, RIGHT_READ).is_err();
+            // 立刻关掉：这个句柄只用一格，留着会漏到收尾闸
+            let _ = handle::close(h_np, me);
+        }
         Err(_) => {
             crate::log_fatal!("hproc: 第二个 grant 失败");
-            return false;
+            ok = false;
         }
-    };
-    let no_proc_cross = handle::resolve(h_np, owner_a, RIGHT_READ).is_err();
+    }
     if !no_proc_cross {
         crate::log_fatal!("hproc: 无进程身份的句柄被跨任务访问了");
         ok = false;
     }
-
     // ⑤ 转移之后 `owner_proc` 跟着走
     // **`transfer` 返回新句柄值**（世代号 bump 过），旧值当场 Stale。
     // 第一版拿旧值去 resolve 新主人 ⇒ 恒 `Stale` ⇒ 第 5 格假红（实测）。
@@ -1693,7 +1701,6 @@ fn t_handle_proc_owner() -> bool {
 
     // ---- 收场：**先放工人走**，再收句柄与进程
     HPROC_GO.store(1, core::sync::atomic::Ordering::Release);
-    let _ = handle::close(h_np, me);
     match moved_h {
         Some(nh) => {
             let _ = handle::close(nh, owner_b);
