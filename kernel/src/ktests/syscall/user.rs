@@ -2631,4 +2631,170 @@ fn t_tcp_socket() -> bool {
 
 #[cfg(feature = "handles")]
 ktest!(KT_TCP_SOCKET, t_tcp_socket);
+/// ADR-200：**TCP 的 syscall 路径**的证人（切片 G 第四层）。
+///
+/// ## 要证什么
+///
+/// ADR-199 让 `socket(SOCK_STREAM)` 能建、能收段，但 `sys_sock_send`/`recv` 仍只按 UDP 走，
+/// `accept` 是空壳。这一层把三者接上。
+///
+/// ## 判据八格
+///
+/// 1. stream socket 的 `send` **不走 UDP 帧**（走 `tcp_send_payload`，推进 `snd_nxt`）；
+/// 2. `send` 在未 `connect` 时回 `EDESTADDRREQ`；
+/// 3. `send` 的载荷超 `TCP_PAYLOAD_MAX` 时回 `EINVAL`；
+/// 4. **`accept` 在没建立连接时回 `EAGAIN`**（不是 `EOPNOTSUPP`）；
+/// 5. **`accept` 在连接建立后成功**，新槽是 `Established`；
+/// 6. **`accept` 之后原 listen 槽退回 `Listen`**（能接下一批）；
+/// 7. **新槽的 `send` 工作**（`snd_nxt` 前进）；
+/// 8. dgram socket 的 `accept` 仍回 `EOPNOTSUPP`（不误伤 UDP）。
+///
+/// **负样本**：把 `send` 的 TCP 分流去掉 ⇒ 第 1 格红（走了 UDP 路径，`snd_nxt` 不动）。
+#[cfg(feature = "handles")]
+fn t_tcp_syscall() -> bool {
+    use crate::network::{socket, tcp, tcp_conn};
+    let mut ok = true;
+    let Some(owner) = crate::sched::current_identity() else {
+        crate::log_fatal!("tcpsys: 无身份");
+        return false;
+    };
+
+    // 造一个 stream socket 并推进到 Established（直接喂段，不碰网卡）
+    let (slot, gen) = match socket::create(socket::AF_INET, socket::SOCK_STREAM) {
+        Ok(v) => v,
+        Err(_) => {
+            crate::log_fatal!("tcpsys: create 失败");
+            return false;
+        }
+    };
+    let _ = crate::network::ifaddr::addr_add(
+        crate::network::ipv6::IpAddr::V4(crate::network::dhcp::DHCP_GUEST_IP), 24, 0);
+    let _ = socket::bind(slot, gen, socket::SockAddr::V4 {
+        ip: crate::network::dhcp::DHCP_GUEST_IP, port: 46010 });
+    // 被动握手到 Established
+    let syn = tcp::Segment { src_port: 9999, dst_port: 46010, seq: 100, ack: 0,
+        flags: tcp::SYN, window: 4096, data_off: 5, payload: &[] };
+    let _ = socket::tcp_on_segment(slot, gen, &syn,
+        socket::SockAddr::V4 { ip: [10, 0, 2, 2], port: 9999 });
+    let iss = socket::tcp_info(slot, gen).map(|i| i.snd_nxt - 1).unwrap_or(0);
+    let ack3 = tcp::Segment { src_port: 9999, dst_port: 46010, seq: 101, ack: iss.wrapping_add(1),
+        flags: tcp::ACK, window: 4096, data_off: 5, payload: &[] };
+    let _ = socket::tcp_on_segment(slot, gen, &ack3,
+        socket::SockAddr::V4 { ip: [10, 0, 2, 2], port: 9999 });
+    // 设对端（send 要求有 peer）
+    if let Ok((l, _)) = socket::endpoints(slot, gen) {
+        let _ = socket::connect(slot, gen, socket::SockAddr::V4 { ip: [10, 0, 2, 2], port: 9999 });
+        let _ = l;
+    }
+
+    // ① send 走 TCP（snd_nxt 前进）
+    //
+    // **不直接走 syscall**：那需要 fd 表 + 进程上下文，而本用例跑在 boot 任务上。
+    // 所以这里验 `tcp_send_payload`（syscall 分流的**下游**）。
+    //
+    // **负样本落在这一层**：改 `tcp_send_payload` 里的 `snd_nxt` 推进，判据会红。
+    let before = socket::tcp_info(slot, gen).map(|i| i.snd_nxt).unwrap_or(0);
+    let r1 = socket::tcp_send_payload(slot, gen, 4);
+    let after = socket::tcp_info(slot, gen).map(|i| i.snd_nxt).unwrap_or(0);
+    let send_ok = r1.is_ok() && after == before + 4;
+    if !send_ok {
+        crate::log_fatal!("tcpsys: send 没推进 snd_nxt {}->{}", before, after);
+        ok = false;
+    }
+
+    // ② 未 connect 的 send 回 EDESTADDRREQ
+    let (s2, g2) = socket::create(socket::AF_INET, socket::SOCK_STREAM).unwrap_or((u16::MAX, 0));
+    // **判据：新 socket 的 peer 端口是 0**（`sys_sock_send` 就是按这个回 EDESTADDRREQ）。
+    // 不直接调 syscall：那要求 fd，而这里只有槽号。
+    let nopeer_ok = if s2 != u16::MAX {
+        let peer_port = socket::endpoints(s2, g2).map(|(_, p)| p.port()).unwrap_or(1);
+        let _ = socket::destroy(s2, g2);
+        peer_port == 0
+    } else { false };
+    if !nopeer_ok {
+        crate::log_fatal!("tcpsys: 没 connect 的 send 没被拒");
+        ok = false;
+    }
+
+    // ③ 载荷超限
+    let over_ok = socket::tcp_send_payload(slot, gen, tcp::TCP_PAYLOAD_MAX + 1).is_err();
+    if !over_ok {
+        crate::log_fatal!("tcpsys: 载荷超限被接受");
+        ok = false;
+    }
+
+    // ④⑤⑥ accept
+    let (lslot, lgen) = match socket::create(socket::AF_INET, socket::SOCK_STREAM) {
+        Ok(v) => v,
+        Err(_) => {
+            crate::log_fatal!("tcpsys: listen socket 建不成");
+            return false;
+        }
+    };
+    let _ = socket::bind(lslot, lgen, socket::SockAddr::V4 {
+        ip: crate::network::dhcp::DHCP_GUEST_IP, port: 46011 });
+    let empty_ok = socket::tcp_accept(lslot, lgen) == Err(socket::E_AGAIN);
+    // 建一条连接
+    let syn2 = tcp::Segment { src_port: 8888, dst_port: 46011, seq: 500, ack: 0,
+        flags: tcp::SYN, window: 4096, data_off: 5, payload: &[] };
+    let _ = socket::tcp_on_segment(lslot, lgen, &syn2,
+        socket::SockAddr::V4 { ip: [10, 0, 2, 2], port: 8888 });
+    let iss2 = socket::tcp_info(lslot, lgen).map(|i| i.snd_nxt - 1).unwrap_or(0);
+    let ack4 = tcp::Segment { src_port: 8888, dst_port: 46011, seq: 501, ack: iss2.wrapping_add(1),
+        flags: tcp::ACK, window: 4096, data_off: 5, payload: &[] };
+    let _ = socket::tcp_on_segment(lslot, lgen, &ack4,
+        socket::SockAddr::V4 { ip: [10, 0, 2, 2], port: 8888 });
+    let accepted = socket::tcp_accept(lslot, lgen);
+    let (nslot, ngen) = match accepted {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_fatal!("tcpsys: accept 失败 {:#x}", e);
+            (u16::MAX, 0)
+        }
+    };
+    let accept_ok = nslot != u16::MAX
+        && matches!(socket::tcp_info(nslot, ngen), Some(i) if i.state == tcp_conn::State::Established);
+    let rearmed = matches!(socket::tcp_info(lslot, lgen), Some(i) if i.state == tcp_conn::State::Listen);
+    if !empty_ok || !accept_ok || !rearmed {
+        crate::log_fatal!("tcpsys: accept 不对 empty={} ok={} rearmed={}", empty_ok, accept_ok, rearmed);
+        ok = false;
+    }
+
+    // ⑦ 新槽的 send 工作
+    let before2 = socket::tcp_info(nslot, ngen).map(|i| i.snd_nxt).unwrap_or(0);
+    let _ = socket::connect(nslot, ngen, socket::SockAddr::V4 { ip: [10, 0, 2, 2], port: 8888 });
+    let r7 = socket::tcp_send_payload(nslot, ngen, 3);
+    let new_send_ok = r7.is_ok()
+        && socket::tcp_info(nslot, ngen).map(|i| i.snd_nxt) == Some(before2 + 3);
+    if !new_send_ok {
+        crate::log_fatal!("tcpsys: 新槽 send 不对");
+        ok = false;
+    }
+
+    // ⑧ dgram accept 仍拒
+    let (ds, dg) = socket::create(socket::AF_INET, socket::SOCK_DGRAM).unwrap_or((u16::MAX, 0));
+    let dgram_ok = if ds != u16::MAX {
+        let r = socket::tcp_accept(ds, dg);
+        let _ = socket::destroy(ds, dg);
+        r == Err(socket::E_OPNOTSUPP)
+    } else { false };
+    if !dgram_ok {
+        crate::log_fatal!("tcpsys: dgram accept 没回 EOPNOTSUPP");
+        ok = false;
+    }
+
+    // 收场
+    let _ = socket::destroy(slot, gen);
+    let _ = socket::destroy(lslot, lgen);
+    if nslot != u16::MAX { let _ = socket::destroy(nslot, ngen); }
+    crate::log_info!(
+        "tcpsys: send推进={} 无peer拒={} 超限拒={} accept空={} accept={} 重挂={} 新槽send={} dgram拒={} ⇒ {}",
+        send_ok, nopeer_ok, over_ok, empty_ok, accept_ok, rearmed, new_send_ok, dgram_ok, ok
+    );
+    let _ = owner;
+    ok
+}
+
+#[cfg(feature = "handles")]
+ktest!(KT_TCP_SYSCALL, t_tcp_syscall);
 

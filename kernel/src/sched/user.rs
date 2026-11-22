@@ -2985,12 +2985,147 @@ fn sys_sock_connect(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
 fn sys_sock_accept(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
     match socket_arg(frame.rdi, owner) {
-        Ok((slot, _)) => {
-            crate::log_warn!("sock: accept 在 DGRAM socket 上无意义（槽 {}），回 -95", slot);
-            crate::network::socket::E_OPNOTSUPP
+        Ok((slot, gen)) => {
+            // **stream socket 走 TCP accept**（ADR-200）
+            if crate::network::socket::tcp_info(slot, gen).is_some() {
+                match crate::network::socket::tcp_accept(slot, gen) {
+                    Ok((ns, ng)) => {
+                        // 把新槽装进 fd 表并返回 fd（与 `socket()` 同一条路）
+                        let Some((pid, pgen)) = current_proc() else {
+                            let _ = crate::network::socket::destroy(ns, ng);
+                            return E_BAD_HANDLE;
+                        };
+                        let Ok(h) = crate::handle::grant_socket(
+                            owner, ns, ng,
+                            crate::handle::RIGHT_READ | crate::handle::RIGHT_WRITE,
+                        ) else {
+                            let _ = crate::network::socket::destroy(ns, ng);
+                            return E_BAD_HANDLE;
+                        };
+                        let Some(mut t) = crate::proc::proc_fd_table(pid, pgen) else {
+                            let _ = crate::handle::close(h, owner);
+                            let _ = crate::network::socket::destroy(ns, ng);
+                            return E_BAD_HANDLE;
+                        };
+                        match t.install(h) {
+                            Ok(fd) => {
+                                let _ = crate::proc::proc_set_fd_table(pid, pgen, t.base(), t.cap());
+                                fd as u64
+                            }
+                            Err(e) => {
+                                let _ = crate::handle::close(h, owner);
+                                let _ = crate::network::socket::destroy(ns, ng);
+                                handle_err(e)
+                            }
+                        }
+                    }
+                    Err(e) => e,
+                }
+            } else {
+                crate::log_warn!("sock: accept 在 DGRAM socket 上无意义（槽 {}），回 -95", slot);
+                crate::network::socket::E_OPNOTSUPP
+            }
         }
         Err(e) => e,
     }
+}
+
+/// **TCP 发送的 syscall 侧实现**（ADR-200）。
+///
+/// ## 与 UDP 路径的区别
+///
+/// UDP 的 `send` 构造「以太 + IPv4 + UDP + 载荷」一整帧。TCP 的段是**状态机驱动的**：
+///
+/// 1. `tcp_send_payload` 取「当前 `snd_nxt` + 要回的标志」并推进序号；
+/// 2. 这里把段装进 IPv4 帧发出去。
+///
+/// **顺序不能反**：序号必须来自状态机，而状态机在 `TABLE`（`RANK_NET`）里，
+/// 所以「取序号」与「发帧」是两步（发帧要碰设备，不该在锁内）。
+#[cfg(feature = "handles")]
+fn tcp_send(slot: u16, gen: u32, uptr: u64, len: usize) -> u64 {
+    use crate::network::{socket, tcp};
+    if len == 0 || len > tcp::TCP_PAYLOAD_MAX {
+        return E_INVALID;
+    }
+    let (local, peer) = match socket::endpoints(slot, gen) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    // TCP 必须有对端（`connect` 过）
+    if peer.port() == 0 {
+        return u64::MAX - 88; // EDESTADDRREQ
+    }
+    // 只支持 IPv4（IPv6 的 TCP 没做，明确拒而不是静默按 v4 发）
+    let (sip, sp) = match local.as_v4() {
+        Some(e) => (e.ip, e.port),
+        None => return E_OPNOTSUPP,
+    };
+    let (dip, dp) = match peer.as_v4() {
+        Some(e) => (e.ip, e.port),
+        None => return E_OPNOTSUPP,
+    };
+    // ① 从状态机取段（推进 snd_nxt）
+    let reply = match socket::tcp_send_payload(slot, gen, len) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    // ② 读用户载荷
+    let mut payload = [0u8; tcp::TCP_PAYLOAD_MAX];
+    match copy_from_user(uptr, &mut payload[..len]) {
+        Ok(n) if n == len => {}
+        _ => return E_FAULT,
+    }
+    // ③ 装帧
+    if crate::virtio::bind_net().is_err() {
+        return E_IO;
+    }
+    let our_mac = crate::virtio::net_info().map(|i| i.mac).unwrap_or([0u8; 6]);
+    let Some((dst_mac, _)) = net_macs_for(dip) else { return E_IO };
+    let mut f = [0u8; 1536];
+    // 以太(14) + IPv4(20) + TCP(20) + 载荷
+    let total = 14 + 20 + tcp::TCP_HDR_MIN + len;
+    if total > f.len() {
+        return E_INVALID;
+    }
+    // 以太头
+    f[0..6].copy_from_slice(&dst_mac);
+    f[6..12].copy_from_slice(&our_mac);
+    f[12..14].copy_from_slice(&crate::network::dhcp::NET_TYPE_IPV4);
+    // IPv4 头
+    let ip = &mut f[14..34];
+    ip[0] = 0x45; // version 4, IHL 5
+    ip[1] = 0;
+    ip[2..4].copy_from_slice(&((20 + tcp::TCP_HDR_MIN + len) as u16).to_be_bytes());
+    ip[4..6].copy_from_slice(&0u16.to_be_bytes()); // id
+    ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // DF
+    ip[8] = 64; // TTL
+    ip[9] = 6; // TCP
+    ip[10..12].copy_from_slice(&0u16.to_be_bytes());
+    ip[12..16].copy_from_slice(&sip);
+    ip[16..20].copy_from_slice(&dip);
+    let ipck = crate::network::ipv4::ip_cksum(ip);
+    ip[10..12].copy_from_slice(&ipck.to_be_bytes());
+    // TCP 段
+    let n = match tcp::build_segment(
+        &mut f[34..],
+        &sip,
+        &dip,
+        sp,
+        dp,
+        reply.seq,
+        reply.ack,
+        reply.flags,
+        reply.window,
+        &payload[..len],
+    ) {
+        Some(n) => n,
+        None => return E_INVALID,
+    };
+    let _ = reply.payload_len;
+    if crate::virtio::send_raw(&f[..34 + n]).is_err() {
+        return E_IO;
+    }
+    len as u64
 }
 
 /// 53：`send(h, buf, len, flags)` → 发出的字节数。
@@ -3002,13 +3137,19 @@ fn sys_sock_accept(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
 fn sys_sock_send(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
     let len = frame.rdx as usize;
-    if len == 0 || len > crate::network::udp::UDP_PAYLOAD_MAX {
-        return E_INVALID;
-    }
     let (slot, gen) = match socket_arg(frame.rdi, owner) {
         Ok(v) => v,
         Err(e) => return e,
     };
+    // **TCP 分流**（ADR-200）：stream socket 走段构造，不是 UDP 帧。
+    //
+    // 判据是「这个槽有没有 tcp 状态」，不是「frame 里的 type」—— 后者可伪造。
+    if crate::network::socket::tcp_info(slot, gen).is_some() {
+        return tcp_send(slot, gen, frame.rsi, len);
+    }
+    if len == 0 || len > crate::network::udp::UDP_PAYLOAD_MAX {
+        return E_INVALID;
+    }
     let (mut local, peer) = match crate::network::socket::endpoints(slot, gen) {
         Ok(v) => v,
         Err(e) => return e,

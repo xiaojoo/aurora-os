@@ -643,6 +643,15 @@ public_api = [
   "tcp_conn::ConnState", "tcp_conn::State", "tcp_conn::Reaction",
   "tcp_conn::Reply", "tcp_conn::on_segment", "tcp_conn::close_send_fin",
   "tcp_conn::close_send_fin_from_close_wait",
+  "socket::tcp_info",
+  "socket::tcp_accept",
+  "socket::tcp_send_payload",
+  "socket::tcp_listen",
+  "socket::tcp_start_connect",
+  "socket::tcp_on_segment",
+  "socket::tcp_close",
+  "socket::TcpInfo",
+  "socket::SocketTcp",
 ]
 # 今天**无人调用**（协议还在 driver 里）；按实测填空，搬迁后再长出来。
 allowed_callers = ["driver", "capability", "sched"]

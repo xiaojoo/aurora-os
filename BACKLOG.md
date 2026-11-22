@@ -22779,3 +22779,87 @@ ADR-197/198 做出了段格式与状态机，但 `socket(SOCK_STREAM)` 仍回 `E
 且 `send` 走 `udp::build_frame`。`accept` 也还没实现。
 
 所以：**socket 层能建 TCP、能收段，但用户态还不能真的发 TCP 数据。**
+---
+
+## 518. ADR-200 落地：TCP 的 syscall 路径（切片 G 第四层，G 收口）（2026-11-22）
+
+### 补的是最后一块
+
+ADR-199 让 `socket(SOCK_STREAM)` 能建、能收段，但 `sys_sock_send`/`recv` 仍只按 UDP 走，
+`accept` 是空壳。这一层把三者接上。
+
+### 交付
+
+1. **`sys_sock_send` 的 TCP 分流**：判据是「这个槽有没有 tcp 状态」，**不是 frame 里的 type**
+   （后者可伪造）。分流后走 `tcp_send`：取段（推进 `snd_nxt`）、读用户载荷、装 IPv4 帧发出。
+2. **`tcp_send_payload`**：状态不对回 `E_OPNOTSUPP`，长度超限回 `E_INVAL`。
+3. **`tcp_accept`**：从 `Listen` 槽把已建立的连接搬到新槽，原槽退回 `Listen`（换新 ISS）。
+4. **`recv` 一行没动** —— 因为 ADR-199 已把 TCP 载荷塞进同一个接收队列。
+
+### 决策：`accept` 没有 backlog 队列
+
+真实 TCP 从**已完成队列**取连接。这里没有队列：`Listen` 槽收到 SYN 进 `SynReceived`，
+收到 ACK 进 `Established`，`accept` 把那条搬走。
+
+**代价：同一时刻一个 `Listen` 槽只能承载一条连接。** 已写进未决 1。
+
+### 判据八格
+
+    tcpsys: send推进=true 无peer拒=true 超限拒=true accept空=true
+            accept=true 重挂=true 新槽send=true dgram拒=true ⇒ true
+
+### 一次「负样本没咬住」（本会话第七次同类错误）
+
+**第一次负样本改的是 `sys_sock_send` 的分流**，但判据直接调 `socket::tcp_send_payload` ——
+**判据验的东西和它声称覆盖的东西不是一回事**，负样本没红。
+
+我试过让判据走真 syscall 路径（装 fd 再调 53 号），但那条路要 `current_proc()` + fd 表，
+而用例跑在 boot 任务上没有进程上下文。
+
+**最终做法**：判据验 `tcp_send_payload`（分流的**下游**），负样本也落在这一层。
+
+这是**诚实的降级**：判据覆盖「段构造推进序号」，**不覆盖**「`sys_sock_send` 会不会走到这里」。
+后者靠 `t_tcp_socket` 与代码审查。**我把它写出来，而不是假装覆盖了。**
+
+### 正确的负样本
+
+去掉 `tcp_send_payload` 里的 `snd_nxt` 推进：
+
+    tcpsys: send 没推进 snd_nxt 268435461->268435461
+    tcpsys: 新槽 send 不对
+    FAIL t_tcp_syscall
+
+**两格同时红**（① 与 ⑦），都依赖同一个推进。
+
+### 读数
+
+| 项 | 结果 |
+|---|---|
+| `check` | **20/20** |
+| `handles` 档 5 连跑 | **5 次全部跑满 117 条**，`PASS(33)` **4 次**，1 次既有 `t_sdkdemo` |
+
+（这 5 连跑之前还跑过 3 次，其中 2 次撞上既有 8.7% 的 HANG —— 那是 `t_syscall_abi_arms` 之后
+收尾路径卡住，样本早于本轮改动，不是本轮引入。）
+
+### TCP 现在的真实能力
+
+| 能做 | 不能做 |
+|---|---|
+| `socket(SOCK_STREAM)` | 重传（丢一个段就永久卡住）|
+| `listen` / `connect` | 滑动窗口（会淹没接收方）|
+| `accept`（无 backlog）| 乱序重组 |
+| `send`（真发 IPv4 帧）| TIME_WAIT 重发 ACK |
+| `recv`（复用 UDP 队列）| 拥塞控制 |
+| 握手与挥手 | **IPv6 的 TCP**（明确回 `E_OPNOTSUPP`）|
+
+**切片 G 到此收口。** 一个最小的、可用的、可证伪的 TCP 通了。
+
+### 未做（G 的完整形态需要这些）
+
+1. **`accept` 的 backlog 队列**
+2. **重传**（没有定时器）
+3. **滑动窗口**
+4. **乱序重组**
+5. **IPv6 的 TCP**
+6. **判据没覆盖 `sys_sock_send` 的分流本身**
+7. **拥塞控制**（明确不做）

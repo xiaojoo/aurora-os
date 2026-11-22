@@ -797,3 +797,121 @@ pub fn tcp_close(slot: u16, gen: u32) -> Result<Option<crate::network::tcp_conn:
         None => Ok(None),
     })
 }
+
+/// **TCP 发送**：把 `payload` 作为数据段发出去，返回要发的段（ADR-200）。
+///
+/// ## 为什么返回段而不是自己发
+///
+/// 与 `tcp_start_connect` 同一条：socket 层不碰设备。
+///
+/// ## 状态不对时回 `E_OPNOTSUPP`
+///
+/// 只有 `Established` / `CloseWait` 能发数据（`State::can_send`）。
+///
+/// **`CloseWait` 也算能发**：对端关了写方向，本端还能把剩余数据写完（半关闭）。
+pub fn tcp_send_payload(
+    slot: u16,
+    gen: u32,
+    payload_len: usize,
+) -> Result<crate::network::tcp_conn::Reply, u64> {
+    use crate::network::tcp;
+    let mut g = TABLE.lock();
+    let t = g.get();
+    let s = t.slots.get_mut(slot as usize).ok_or(E_BAD_FD)?;
+    if s.used.load(Ordering::Acquire) == 0 || s.gen.load(Ordering::Acquire) != gen {
+        return Err(E_BAD_FD);
+    }
+    if s.ty != SOCK_STREAM {
+        return Err(E_OPNOTSUPP);
+    }
+    if payload_len == 0 || payload_len > tcp::TCP_PAYLOAD_MAX {
+        return Err(E_INVAL);
+    }
+    s.tcp.with(|o| match o {
+        Some(st) => {
+            if !st.state.can_send() {
+                return Err(E_OPNOTSUPP);
+            }
+            let r = crate::network::tcp_conn::Reply {
+                seq: st.snd_nxt,
+                ack: st.rcv_nxt,
+                flags: tcp::ACK | tcp::PSH,
+                window: st.rcv_wnd,
+                payload_len: payload_len as u16,
+            };
+            st.snd_nxt = st.snd_nxt.wrapping_add(payload_len as u32);
+            Ok(r)
+        }
+        None => Err(E_INVAL),
+    })
+}
+
+/// **`accept`**：从 `Listen` 槽上分出一个新的已连接槽（ADR-200）。
+///
+/// ## 简化说明（如实记）
+///
+/// 真实 TCP 的 `accept` 从**已完成队列**里取一条（三次握手由内核完成，应用只取结果）。
+///
+/// 这里没有队列：`Listen` 槽收到 SYN 之后直接进 `SynReceived`，再收到 ACK 进 `Established`，
+/// 而 `accept` **把那个已建立的连接搬到新槽**，原槽退回 `Listen`。
+///
+/// **代价**：同一时刻一个 `Listen` 槽只能承载一条连接（没有 backlog）。
+/// 对今天的用例够用；真实服务端需要队列。已写进未决 1。
+///
+/// 返回 `(新槽, 新世代)`；没有已建立的连接时回 `E_AGAIN`（非阻塞）。
+pub fn tcp_accept(listen_slot: u16, listen_gen: u32) -> Result<(u16, u32), u64> {
+    use crate::network::tcp_conn::State;
+    let mut g = TABLE.lock();
+    let t = g.get();
+    // ① 先确认 listen 槽确实是 stream socket 且已建立
+    {
+        let s = t.slots.get(listen_slot as usize).ok_or(E_BAD_FD)?;
+        if s.used.load(Ordering::Acquire) == 0 || s.gen.load(Ordering::Acquire) != listen_gen {
+            return Err(E_BAD_FD);
+        }
+        if s.ty != SOCK_STREAM {
+            return Err(E_OPNOTSUPP);
+        }
+        let ready = s.tcp.get().map(|st| st.state == State::Established).unwrap_or(false);
+        if !ready {
+            return Err(E_AGAIN);
+        }
+    }
+    // ② 搬到一个新槽
+    let new_slot = t
+        .slots
+        .iter()
+        .position(|s| s.used.load(Ordering::Acquire) == 0)
+        .ok_or(E_EXHAUSTED)?;
+    // 先把已建立的连接快照出来
+    let established = t.slots[listen_slot as usize].tcp.get();
+    let local = t.slots[listen_slot as usize].local;
+    let peer = t.slots[listen_slot as usize].peer;
+    let domain = t.slots[listen_slot as usize].domain;
+    // ③ 建新槽
+    {
+        let s = &mut t.slots[new_slot];
+        s.gen.store(s.gen.load(Ordering::Acquire).wrapping_add(1), Ordering::Release);
+        s.domain = domain;
+        s.ty = SOCK_STREAM;
+        s.local = local;
+        s.peer = peer;
+        s.rx_head.store(0, Ordering::Relaxed);
+        s.rx_tail.store(0, Ordering::Relaxed);
+        s.rx_count.store(0, Ordering::Relaxed);
+        s.refs.store(1, Ordering::Release);
+        s.tcp.with(|o| *o = established);
+        s.used.store(1, Ordering::Release);
+    }
+    // ④ 原槽退回 `Listen`（用同一个 ISS 重新开）
+    {
+        let s = &mut t.slots[listen_slot as usize];
+        let iss = s.tcp.get().map(|st| st.iss).unwrap_or(0x1000_0000);
+        // 换一个 ISS：同一条连接不该复用同一个初始序号
+        let new_iss = iss.wrapping_add(0x1000);
+        let fresh = crate::network::tcp_conn::ConnState::listen(new_iss);
+        s.tcp.with(|o| *o = Some(fresh));
+        s.peer = SockAddr::V4 { ip: [0; 4], port: 0 };
+    }
+    Ok((new_slot as u16, t.slots[new_slot].gen.load(Ordering::Acquire)))
+}
