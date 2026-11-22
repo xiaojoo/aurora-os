@@ -984,3 +984,164 @@ pub fn tcp_arm_retx_timer(slot: u16) -> Option<u16> {
         (backoff / 1000) as u64,
     )
 }
+
+/// **定时器分派**（ADR-204）：把一个到期项交给对应的子系统。
+///
+/// 返回是否真的处理了（`false` = 不认识这类 / 无事可做）。
+///
+/// ## 与 `tcp_handle_timer` 的分工
+///
+/// - `tcp_handle_timer` 只认 `Kind::TcpRetransmit`，返回要重发的段，**不发**；
+/// - 这里负责「拿到段之后真的发出去」，并把失败记录进计数。
+///
+/// 分开的理由与 `tcp_send` 那条同源：**socket 层不碰设备**，但「发」这一步必须有人做。
+/// 放在这里是因为 `drain_bottom`（sched 层）不该知道怎么装 TCP 帧。
+///
+/// ## 没有定时器保护时的行为
+///
+/// 重传一定要求「时钟已标定」。标定没起来时 `tcp_arm_retx_timer` 回 `None`，
+/// 那条连接**没有被重传保护** —— 这里不因此报错，只计数，让调用方能看到。
+pub fn dispatch_timer(kind: crate::time::timer::Kind, token: u64) -> bool {
+    match kind {
+        crate::time::timer::Kind::TcpRetransmit => {
+            let slot = token as u16;
+            let Some((s, g, reply)) = tcp_handle_timer(kind, token) else {
+                return false;
+            };
+            RETX_FIRED.fetch_add(1, Ordering::Relaxed);
+            // 真的发出去
+            let sent = tcp_retransmit_send(s, g, &reply);
+            if sent {
+                RETX_SENT.fetch_add(1, Ordering::Relaxed);
+                // 再登记下一次（指数退避已经在 `on_retx_timeout` 里翻倍过了）
+                let _ = tcp_arm_retx_timer(s);
+            } else {
+                RETX_FAILED.fetch_add(1, Ordering::Relaxed);
+            }
+            true
+        }
+        // USB / 块层还没消费定时器
+        _ => false,
+    }
+}
+
+/// 重传触发/发出/失败计数（ADR-204 的判据用）。
+pub fn retx_stats() -> (u64, u64, u64) {
+    (
+        RETX_FIRED.load(Ordering::Relaxed),
+        RETX_SENT.load(Ordering::Relaxed),
+        RETX_FAILED.load(Ordering::Relaxed),
+    )
+}
+
+static RETX_FIRED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static RETX_SENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static RETX_FAILED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// **MAC 解析的注入点**（ADR-204）。
+///
+/// 为什么注入而不是直接调：`mac_of` 在 `sched/user.rs` 里（它要查 ARP 表 + 可能发 NS），
+/// 而 `network` 不能依赖 `sched`（那会造出一个新的强连通分量）。
+///
+/// 与 `install_proc_of` / `install_as_of_task` 同一个模式 —— 这是本仓库第四次用它。
+static MAC_OF: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// 装 MAC 解析函数（启动期调一次）。
+pub fn install_mac_of(f: fn([u8; 4]) -> Option<[u8; 6]>) {
+    MAC_OF.store(f as usize as u64, Ordering::Release);
+}
+
+fn mac_of(ip: [u8; 4]) -> Option<[u8; 6]> {
+    let p = MAC_OF.load(Ordering::Acquire);
+    if p == 0 {
+        return None;
+    }
+    // SAFETY: 指针由 `install_mac_of` 写入，来源是 `fn` 指针（长度/对齐/生命周期
+    // 都由 Rust 类型系统保证）；只读一次，调用期间不变。
+    let f: fn([u8; 4]) -> Option<[u8; 6]> = unsafe { core::mem::transmute(p as usize) };
+    f(ip)
+}
+
+
+/// **重传段装帧并发出**（ADR-204）。
+///
+/// ## 载荷从哪来
+///
+/// 重传要发**同样的载荷**，但 `RetxState` 只记了长度、没存内容（存内容要每连接一份缓冲，
+/// 那是 `MAX_SOCKETS × 1460 = 374 KiB`，不可接受）。
+///
+/// **所以今天重传发的是「空载荷 + 正确的序号与长度」** —— 那不对，但对端会看到
+/// 「序号对了但数据没了」，而这正是本 ADR 要暴露的缺口。已写进未决 1。
+///
+/// **更准确地说：这个函数现在只把「重传事件」变成了「一个带正确头部、零载荷的段」。**
+/// 它证明了接线通了，但没证明数据能重传。
+fn tcp_retransmit_send(slot: u16, gen: u32, reply: &crate::network::tcp_conn::Reply) -> bool {
+    use crate::network::tcp;
+    let Ok((local, peer)) = endpoints(slot, gen) else {
+        return false;
+    };
+    let _ = 0;
+    let (Some(l), Some(p)) = (local.as_v4(), peer.as_v4()) else {
+        return false;
+    };
+    if crate::virtio::bind_net().is_err() {
+        return false;
+    }
+    let our_mac = crate::virtio::net_info().map(|i| i.mac).unwrap_or([0u8; 6]);
+    let Some(dst_mac) = mac_of(p.ip) else {
+        return false;
+    };
+    let mut f = [0u8; 1536];
+    f[0..6].copy_from_slice(&dst_mac);
+    f[6..12].copy_from_slice(&our_mac);
+    f[12..14].copy_from_slice(&crate::network::dhcp::NET_TYPE_IPV4);
+    let ip = &mut f[14..34];
+    ip[0] = 0x45;
+    ip[1] = 0;
+    ip[2..4].copy_from_slice(&((20 + tcp::TCP_HDR_MIN) as u16).to_be_bytes());
+    ip[4..6].copy_from_slice(&0u16.to_be_bytes());
+    ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+    ip[8] = 64;
+    ip[9] = 6;
+    ip[10..12].copy_from_slice(&0u16.to_be_bytes());
+    ip[12..16].copy_from_slice(&l.ip);
+    ip[16..20].copy_from_slice(&p.ip);
+    let ipck = crate::network::ipv4::ip_cksum(ip);
+    ip[10..12].copy_from_slice(&ipck.to_be_bytes());
+    // **零载荷**（见文档注释里的诚实说明）
+    let n = match tcp::build_segment(
+        &mut f[34..],
+        &l.ip,
+        &p.ip,
+        l.port,
+        p.port,
+        reply.seq,
+        reply.ack,
+        reply.flags,
+        reply.window,
+        &[],
+    ) {
+        Some(n) => n,
+        None => return false,
+    };
+    crate::virtio::send_raw(&f[..34 + n]).is_ok()
+}
+
+/// 注入点装上没有（判据用）。
+pub fn mac_of_installed() -> bool {
+    MAC_OF.load(Ordering::Acquire) != 0
+}
+
+/// **判据专用**：把注入点清空，用来验证「未装时回 `None`」。
+///
+/// **不暴露给产品路径**：产品路径永远不该「拆掉」注入点。
+#[cfg(feature = "handles")]
+pub fn install_mac_of_unset_for_test() {
+    MAC_OF.store(0, Ordering::Release);
+}
+
+/// 判据用：探一下 `mac_of` 的行为（不触发副作用）。
+#[cfg(feature = "handles")]
+pub fn mac_of_probe(ip: [u8; 4]) -> Option<[u8; 6]> {
+    mac_of(ip)
+}

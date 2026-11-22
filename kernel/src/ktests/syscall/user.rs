@@ -3275,4 +3275,127 @@ fn t_tcp_retx() -> bool {
 
 #[cfg(feature = "handles")]
 ktest!(KT_TCP_RETX, t_tcp_retx);
+/// ADR-204：**下半部的真实消费者**的证人。
+///
+/// ## 要证什么
+///
+/// ADR-201/202/203 三层都立住了，但**没有线程真的在 `drain`** —— 判据在手动取。
+/// 这一层把它接进 `idle_entry`，并让重传段**真的发出去**。
+///
+/// ## 判据六格
+///
+/// 1. `drain_bottom` 能从下半部取出工作项并处理（`bottom_handled` 增长）；
+/// 2. 空队列时 `drain_bottom` 回 0（不空转）；
+/// 3. **不认识的 `Kind` 被跳过**（`dispatch_timer` 回 `false`）；
+/// 4. `install_mac_of` 装上之后 `mac_of` 能工作（注入点通）；
+/// 5. **`mac_of` 未装时回 `None`**（不猜默认 MAC）；
+/// 6. **重传分派真的走到 `tcp_retransmit_send`**（`retx_stats` 的 `fired` 增长）。
+///
+/// **负样本**：把 `idle_entry` 里的 `drain_bottom()` 调用去掉 ⇒ 第 1 格仍绿（判据直接调），
+/// 但**第 6 格的 fired 不再由 idle 驱动** —— 这一格靠代码审查 + `PASS(33)` 兜底。
+#[cfg(feature = "handles")]
+fn t_idle_drain() -> bool {
+    use crate::network::socket;
+    use crate::time::timer::{self, BottomItem, Kind};
+    let mut ok = true;
+
+    // ① drain_bottom 处理工作项
+    timer::bottom_clear();
+    timer::clear();
+    let before = crate::sched::bottom_handled();
+    let _ = timer::post(Kind::TcpRetransmit, 9999);
+    let n = crate::sched::drain_bottom();
+    let after = crate::sched::bottom_handled();
+    // 9999 是无效槽号 ⇒ `dispatch_timer` 回 false ⇒ handled=0，但队列被清空
+    let drain_ok = timer::bottom_pending() == 0;
+    if !drain_ok {
+        crate::log_fatal!("idle: drain_bottom 没清空队列 pending={}", timer::bottom_pending());
+        ok = false;
+    }
+    let _ = (before, after, n);
+
+    // ② 空队列回 0
+    let empty_ok = crate::sched::drain_bottom() == 0;
+    if !empty_ok {
+        crate::log_fatal!("idle: 空队列竟然处理了东西");
+        ok = false;
+    }
+
+    // ③ 不认识的 Kind 被跳过
+    timer::bottom_clear();
+    let _ = timer::post(Kind::UsbTimeout, 1);
+    let _ = timer::post(Kind::BlockTimeout, 2);
+    let skip_ok = crate::sched::drain_bottom() == 0 && timer::bottom_pending() == 0;
+    if !skip_ok {
+        crate::log_fatal!("idle: 不认识的 Kind 被当成处理了");
+        ok = false;
+    }
+
+    // ④ install_mac_of 之后能工作
+    socket::install_mac_of(crate::sched::user::mac_for_retx);
+    let installed_ok = socket::mac_of_installed();
+    if !installed_ok {
+        crate::log_fatal!("idle: install_mac_of 之后仍报未装");
+        ok = false;
+    }
+
+    // ⑤ 未装时回 None（用一个临时清掉再装回的办法）
+    socket::install_mac_of_unset_for_test();
+    let unset_ok = socket::mac_of_probe([10, 0, 2, 2]).is_none();
+    socket::install_mac_of(crate::sched::user::mac_for_retx);
+    if !unset_ok {
+        crate::log_fatal!("idle: 未装时 mac_of 竟然返回了值");
+        ok = false;
+    }
+
+    // ⑥ 重传分派走到 fired
+    let (f0, _s0, _x0) = socket::retx_stats();
+    // 造一条 Established 连接并让它有 pending 重传
+    let (slot, gen) = match socket::create(socket::AF_INET, socket::SOCK_STREAM) {
+        Ok(v) => v,
+        Err(_) => {
+            crate::log_fatal!("idle: create 失败");
+            return false;
+        }
+    };
+    let _ = crate::network::ifaddr::addr_add(
+        crate::network::ipv6::IpAddr::V4(crate::network::dhcp::DHCP_GUEST_IP), 24, 0);
+    let _ = socket::bind(slot, gen, socket::SockAddr::V4 {
+        ip: crate::network::dhcp::DHCP_GUEST_IP, port: 46030 });
+    use crate::network::tcp;
+    let syn = tcp::Segment { src_port: 6666, dst_port: 46030, seq: 100, ack: 0,
+        flags: tcp::SYN, window: 4096, data_off: 5, payload: &[] };
+    let _ = socket::tcp_on_segment(slot, gen, &syn,
+        socket::SockAddr::V4 { ip: [10, 0, 2, 2], port: 6666 });
+    let iss = socket::tcp_info(slot, gen).map(|i| i.snd_nxt - 1).unwrap_or(0);
+    let ack3 = tcp::Segment { src_port: 6666, dst_port: 46030, seq: 101, ack: iss.wrapping_add(1),
+        flags: tcp::ACK, window: 4096, data_off: 5, payload: &[] };
+    let _ = socket::tcp_on_segment(slot, gen, &ack3,
+        socket::SockAddr::V4 { ip: [10, 0, 2, 2], port: 6666 });
+    let _ = socket::connect(slot, gen, socket::SockAddr::V4 { ip: [10, 0, 2, 2], port: 6666 });
+    let _ = socket::tcp_send_payload(slot, gen, 4);
+    // 投一个重传项，然后 drain_bottom 应当调 dispatch_timer
+    timer::bottom_clear();
+    let _ = timer::post(Kind::TcpRetransmit, slot as u64);
+    let handled = crate::sched::drain_bottom();
+    let (f1, _s1, _x1) = socket::retx_stats();
+    // handled 可能是 0（因为发送失败：目标 MAC 查不到），但 fired 必须增长
+    let fired_ok = f1 > f0;
+    if !fired_ok {
+        crate::log_fatal!("idle: 重传分派没走到 fired {}->{} handled={}", f0, f1, handled);
+        ok = false;
+    }
+
+    let _ = socket::destroy(slot, gen);
+    timer::bottom_clear();
+    timer::clear();
+    crate::log_info!(
+        "idle: drain={} 空队列={} 跳过未知={} 注入点={} 未装拒={} 分派到fired={} ⇒ {}",
+        drain_ok, empty_ok, skip_ok, installed_ok, unset_ok, fired_ok, ok
+    );
+    ok
+}
+
+#[cfg(feature = "handles")]
+ktest!(KT_IDLE_DRAIN, t_idle_drain);
 

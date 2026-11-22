@@ -460,6 +460,7 @@ public_api = [
   "user::syscall_dispatch",
   "sched::current_cred",
   "sched::set_cred",
+  "user::mac_for_retx",
 ]
 allowed_callers = ["integration"]
 dependencies = [
@@ -643,7 +644,8 @@ public_api = [
   "tcp_conn::ConnState", "tcp_conn::State", "tcp_conn::Reaction",
   "tcp_conn::Reply", "tcp_conn::on_segment", "tcp_conn::close_send_fin",
   "tcp_conn::close_send_fin_from_close_wait",
-  "socket::tcp_info",
+  "socket::dispatch_timer", "socket::install_mac_of", "socket::mac_of_installed",
+  "socket::retx_stats", "socket::tcp_info",
   "socket::tcp_accept",
   "socket::tcp_send_payload",
   "socket::tcp_listen",
@@ -654,7 +656,8 @@ public_api = [
   "socket::SocketTcp",
 ]
 # 今天**无人调用**（协议还在 driver 里）；按实测填空，搬迁后再长出来。
-allowed_callers = ["driver", "capability", "sched"]
+allowed_callers = ["driver", "capability", "sched", "integration"]
+
 # 依赖方向是 **network → driver（单向）**：协议通过驱动的收发原语工作。
 # 反向依赖会让驱动不得不认识协议，那正是 ADR-166 要拆掉的东西。
 # 今天**无源码依赖**：`network/mod.rs` 只 use 了 core。
@@ -1146,7 +1149,7 @@ public_api = [
   "main::mp_snapshot",
 ]
 allowed_callers = []
-dependencies = ["arch", "boot", "capability", "diagnostics", "driver", "irq", "memory", "pci", "security", "sched", "storage", "sync", "testing", "time", "display", "input"]
+dependencies = ["arch", "boot", "capability", "diagnostics", "driver", "irq", "memory", "pci", "security", "sched", "storage", "sync", "testing", "time", "display", "input", "network"]
 forbidden_dependencies = []
 known_violations = []
 context = ["BOOT", "KERNEL"]
@@ -1168,7 +1171,7 @@ known_scc = [
   "driver->sync" = 1
 "driver->network" = 2
   "network->sync" = 3
-  "network->driver" = 6
+  "network->driver" = 9
 "arch->boot" = 2
 "arch->diagnostics" = 19
 "arch->irq" = 2
@@ -1176,7 +1179,7 @@ known_scc = [
 "arch->pci" = 6
 "arch->sync" = 3
 "arch->time" = 23
-  "network->time" = 4
+  "network->time" = 6
 "boot->diagnostics" = 11
 "diagnostics->arch" = 32
 "diagnostics->driver" = 15

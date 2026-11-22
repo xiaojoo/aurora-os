@@ -1339,6 +1339,16 @@ fn idle_entry() -> ! {
         if task_wake_tick() {
             continue;
         }
+        // **下半部**（ADR-204）：有活干就立刻再转一圈，不 `hlt`。
+        //
+        // 位置在 `hlt` **之前**：`hlt` 要等到下一次中断才醒，而下半部队列里
+        // 可能已经排了活（比如刚才那次 tick 投进来的重传）。
+        //
+        // **有界**：`drain_bottom` 一次最多处理 `MAX_BOTTOM`(32) 条，不无限循环。
+        if drain_bottom() > 0 {
+            BOTTOM_HANDLED.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
         if cpu < crate::arch::x86_64::cpu::MAX_CPUS {
             IDLE_HLT[cpu].fetch_add(1, Ordering::Relaxed);
         }
@@ -2723,3 +2733,48 @@ pub(crate) mod elf;
 pub(crate) mod proc;
 pub(crate) mod signal;
 pub(crate) mod user;
+
+// ---------------------------------------------------------------- ADR-204：下半部的真实消费者
+
+/// **处理下半部队列**（ADR-204）。
+///
+/// ## 为什么放在 `idle_entry`
+///
+/// 需要「一个在安全上下文里、能反复跑、不占调度配额」的地方。`idle_entry` 正是：
+/// 它只在没有别的可运行任务时被选中，而且循环里本来就有「转一圈再查」的节奏
+/// （`task_wake_tick` 那段注释记的就是这个形状）。
+///
+/// ## 三条纪律（都来自 `idle_entry` 现有的注释）
+///
+/// 1. **有界**：一次最多处理 `MAX_BOTTOM` 条，不无限循环 —— 否则 idle 会饿死调度。
+/// 2. **不阻塞**：不等待、不睡眠、不取可能被别人长期持有的锁。
+/// 3. **不分配**：故障路径不分配（AGENTS.md 硬约束 6），而这里连正常路径也不分配。
+///
+/// ## 返回值
+///
+/// 返回处理了几条。调用方用它决定「要不要立刻再转一圈」——
+/// 有活干时不该 `hlt`（那是下一次中断才醒）。
+pub fn drain_bottom() -> usize {
+    let mut items = [crate::time::timer::BottomItem {
+        kind: crate::time::timer::Kind::Generic,
+        token: 0,
+    }; crate::time::timer::MAX_BOTTOM];
+    let n = crate::time::timer::drain(&mut items);
+    if n == 0 {
+        return 0;
+    }
+    let mut handled = 0usize;
+    for i in 0..n {
+        if crate::network::socket::dispatch_timer(items[i].kind, items[i].token) {
+            handled += 1;
+        }
+    }
+    handled
+}
+
+/// 累计处理过的下半部条数（判据用）。
+pub fn bottom_handled() -> u64 {
+    BOTTOM_HANDLED.load(Ordering::Relaxed)
+}
+
+static BOTTOM_HANDLED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);

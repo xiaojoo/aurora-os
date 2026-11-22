@@ -3246,7 +3246,19 @@ fn sys_sock_send(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
 /// 数据帧走组播仍然能到（目标主机一定在自己的组播组里）。
 ///
 /// 这样第一帧多绕一圈，第二帧起就是单播。
+#[cfg(feature = "handles")]/// **MAC 解析的对外包装**（ADR-204）：给 `network/socket.rs` 的注入点用。
+///
+/// `None` = 查不到（ARP 表里没有且 NDP 也无解）—— **不猜一个默认 MAC**，
+/// 那会把重传段发给错误的机器。
+///
+/// 与 `net_macs_for` 的区别：那个返回 `Option<(mac, port)>`（UDP 用），
+/// 这个只返回 MAC，且**失败就是失败**（重传不该静默降级）。
 #[cfg(feature = "handles")]
+pub fn mac_for_retx(ip: [u8; 4]) -> Option<[u8; 6]> {
+    net_macs_for(ip).map(|(m, _)| m)
+}
+
+
 fn ndp_mac_for(dst_ip: &[u8; 16]) -> [u8; 6] {
     use crate::network::ndp;
     if let Some(mac) = ndp::nd_lookup(dst_ip) {

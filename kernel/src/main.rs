@@ -287,6 +287,9 @@ extern "C" fn after_switch(_: usize) -> ! {
     sched::install_wait_ops();
     sched::install_proc_of();
     sched::install_as_of_task();
+    // **MAC 解析的注入点**（ADR-204）：`network` 不能依赖 `sched`，
+    // 但重传发段要查 ARP 表。与上面三条同一个模式 —— 这是第四次用它。
+    crate::network::socket::install_mac_of(crate::sched::user::mac_for_retx);
     // Task C（V1.0 §14）：启动编排按阶段函数组织；顺序与日志契约不变。
     stage_memory();
     stage_cpu_protections();
