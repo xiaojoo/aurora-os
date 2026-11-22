@@ -250,3 +250,218 @@ pub fn read_checked(
         Some(e) => Err(e),
     }
 }
+
+// ---------------------------------------------------------------- ADR-214：请求队列
+
+/// 队列容量（ADR-214）。
+///
+/// ## 为什么是 32
+///
+/// 每条 `Request` 约 40 字节 ⇒ 32 条 = **1.25 KiB**，进 `.bss` 可忽略。
+///
+/// 需求侧：一次文件读可能拆成十几条块请求（FAT 链跳转 + 目录项扫描），
+/// 32 覆盖「一条路径解析」的量级。满了 `submit` 回 `None`（不静默丢弃）。
+pub const QUEUE_MAX: usize = 32;
+
+/// 一条待执行的请求（ADR-214）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Request {
+    pub lba: u64,
+    pub sectors: u32,
+    /// 调用方的标识（回调时原样带回）。**不解释它的含义** —— 那是调用方的事。
+    pub token: u64,
+    /// 提交顺序（用于稳定排序：同 LBA 时保持提交序）。
+    pub seq: u32,
+}
+
+/// 队列的执行结果（ADR-214）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DrainReport {
+    /// 实际下发的请求数（合并之后）。
+    pub issued: u32,
+    /// 合并掉了多少条（原始提交数 - issued）。
+    pub merged: u32,
+    /// 成功完成的扇区总数。
+    pub sectors_ok: u64,
+    /// 第一条失败的请求（`None` = 全成功）。
+    pub failed_at: Option<u64>,
+}
+
+struct Queue {
+    items: [Request; QUEUE_MAX],
+    /// 已入队的条数（未排序）。
+    len: usize,
+    /// 提交序号（单调递增，用于稳定排序）。
+    seq: u32,
+    /// 累计统计（判据用）。
+    submitted: u32,
+    drained: u32,
+    refused: u32,
+}
+
+struct QueueCell(core::cell::UnsafeCell<Queue>);
+// SAFETY: 读写全在 `QUEUE_LOCK` 内；载荷全为 Copy。
+unsafe impl Sync for QueueCell {}
+
+static QUEUE: QueueCell = QueueCell(core::cell::UnsafeCell::new(Queue {
+    items: [Request { lba: 0, sectors: 0, token: 0, seq: 0 }; QUEUE_MAX],
+    len: 0,
+    seq: 0,
+    submitted: 0,
+    drained: 0,
+    refused: 0,
+}));
+
+/// 队列的锁。**叶子锁**：临界区里只读写那 32 条 `Request`。
+static QUEUE_LOCK: crate::sync::IrqSpinLock<()> =
+    crate::sync::IrqSpinLock::new(crate::sync::RANK_BLOCK, ());
+
+/// **提交一条请求**（ADR-214）。
+///
+/// 返回 `false` = 队列满（**不静默丢弃**，调用方必须处理）。
+///
+/// ## 为什么不在这里执行
+///
+/// 与 ADR-201 的定时器同一条纪律：**入队与执行分开**。
+/// 入队要能在任何上下文（包括中断）里做；执行要碰设备。
+pub fn submit(lba: u64, sectors: u32, token: u64) -> bool {
+    if sectors == 0 {
+        return false;
+    }
+    let _g = QUEUE_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let q = unsafe { &mut *QUEUE.0.get() };
+    if q.len >= QUEUE_MAX {
+        q.refused += 1;
+        return false;
+    }
+    q.seq = q.seq.wrapping_add(1);
+    q.items[q.len] = Request { lba, sectors, token, seq: q.seq };
+    q.len += 1;
+    q.submitted += 1;
+    true
+}
+
+/// 队列里排着几条（判据用）。
+pub fn pending() -> usize {
+    let _g = QUEUE_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    unsafe { (*QUEUE.0.get()).len }
+}
+
+/// `(提交, 执行, 拒收)` 累计（判据用）。
+pub fn queue_stats() -> (u32, u32, u32) {
+    let _g = QUEUE_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let q = unsafe { &*QUEUE.0.get() };
+    (q.submitted, q.drained, q.refused)
+}
+
+/// 清空队列（判据用）。
+pub fn queue_clear() {
+    let _g = QUEUE_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let q = unsafe { &mut *QUEUE.0.get() };
+    q.len = 0;
+    q.seq = 0;
+    q.submitted = 0;
+    q.drained = 0;
+    q.refused = 0;
+}
+
+/// **把队列排序并合并相邻请求**（ADR-214）。
+///
+/// ## 排序：按 LBA 升序，同 LBA 按提交序
+///
+/// 这是**电梯算法的静态形态**：把「按提交顺序下发」换成「按盘上位置下发」，
+/// 减少磁头/寻道来回（对 AHCI 是减少命令切换，对真盘是减少寻道）。
+///
+/// 同 LBA 按提交序保持**稳定**：判据要能预期输出。
+///
+/// ## 合并规则
+///
+/// 两条请求满足「前一条的末尾 == 后一条的开头」就合并成一条。
+/// 合并后 `token` 取**前一条的** —— 这是有意的简化：一条合并请求只回调一次，
+/// 用第一个提交者的 token。已写进未决 1。
+fn sort_and_merge(items: &mut [Request], len: usize) -> usize {
+    // 插入排序：len <= 32，且它**稳定**（同 LBA 保持提交序）。
+    for i in 1..len {
+        let key = items[i];
+        let mut j = i;
+        while j > 0 {
+            let prev = items[j - 1];
+            let swap = prev.lba > key.lba || (prev.lba == key.lba && prev.seq > key.seq);
+            if !swap {
+                break;
+            }
+            items[j] = items[j - 1];
+            j -= 1;
+        }
+        items[j] = key;
+    }
+    // 合并相邻
+    let mut out = 0usize;
+    for i in 0..len {
+        if out > 0 {
+            let prev = items[out - 1];
+            let end = prev.lba.saturating_add(u64::from(prev.sectors));
+            if end == items[i].lba {
+                // 合并：延长前一条
+                items[out - 1].sectors = prev.sectors.saturating_add(items[i].sectors);
+                continue;
+            }
+        }
+        items[out] = items[i];
+        out += 1;
+    }
+    out
+}
+
+/// **执行整个队列**（ADR-214）。
+///
+/// 排序 → 合并 → 逐条调 `disk.read_sectors`（经 `read_at` 保留死线/取消语义）。
+///
+/// 返回执行报告；**第一条失败就停**（不继续发后面的，因为失败通常意味着盘没了）。
+pub fn drain(disk: &dyn Block, budget: &Budget<'_>) -> DrainReport {
+    let mut items = [Request { lba: 0, sectors: 0, token: 0, seq: 0 }; QUEUE_MAX];
+    let len = {
+        let _g = QUEUE_LOCK.lock();
+        // SAFETY: 持锁期间独占。
+        let q = unsafe { &mut *QUEUE.0.get() };
+        let n = q.len;
+        items[..n].copy_from_slice(&q.items[..n]);
+        q.len = 0;
+        q.drained += 1;
+        n
+    };
+    if len == 0 {
+        return DrainReport { issued: 0, merged: 0, sectors_ok: 0, failed_at: None };
+    }
+    let issued = sort_and_merge(&mut items, len);
+    let mut sectors_ok = 0u64;
+    let mut failed_at = None;
+    for i in 0..issued {
+        let r = items[i];
+        // 逐扇区读（保持 `read_at` 的死线/取消语义）
+        let mut buf = [0u8; 512];
+        let mut done = 0u32;
+        while done < r.sectors {
+            let out = read_at(disk, r.lba + u64::from(done), &mut buf, budget);
+            if out.error.is_some() {
+                failed_at = Some(r.token);
+                break;
+            }
+            done += 1;
+        }
+        if failed_at.is_some() {
+            break;
+        }
+        sectors_ok += u64::from(r.sectors);
+    }
+    DrainReport {
+        issued: issued as u32,
+        merged: (len - issued) as u32,
+        sectors_ok,
+        failed_at,
+    }
+}

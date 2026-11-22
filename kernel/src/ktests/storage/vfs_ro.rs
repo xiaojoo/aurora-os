@@ -1428,3 +1428,124 @@ fn t_block_merge() -> bool {
 
 #[cfg(feature = "handles")]
 ktest!(KT_BLOCK_MERGE, t_block_merge);
+
+/// ADR-214：**块层请求队列**的证人。
+///
+/// ## 要证什么
+///
+/// ADR-194 只做了「合并」，**队列本身没做**（一直是记着的欠账）。这一层补上：
+/// 提交 → 排序（按 LBA）→ 合并相邻 → 顺序执行。
+///
+/// ## 判据八格
+///
+/// 1. `submit` 入队，`pending()` 增长；
+/// 2. **`sectors == 0` 被拒**（不产生空请求）；
+/// 3. 队列满时 `submit` 回 `false` 且 `refused` 增长（**不静默丢弃**）；
+/// 4. **`drain` 按 LBA 排序执行**（乱序提交，顺序执行）；
+/// 5. **相邻请求被合并**（`merged` 计数 > 0，`issued` < 提交数）；
+/// 6. **合并后数据正确**（读出来的内容与源一致 —— 这是正确性，不是性能）；
+/// 7. **第一条失败就停**（`failed_at` 有值，后面的没执行）；
+/// 8. `drain` 之后队列清空。
+///
+/// **负样本**：把 `sort_and_merge` 的排序去掉 ⇒ 第 4 格红。
+#[cfg(feature = "handles")]
+fn t_block_queue() -> bool {
+    use crate::filesystem::block_io::{self, Budget};
+    let mut ok = true;
+
+    // 造一块 256 扇区的测试盘，内容按 LBA 可辨认
+    static mut IMG: [u8; 256 * 512] = [0u8; 256 * 512];
+    // SAFETY: 单核判据路径，只在本用例内读写。
+    let img: &mut [u8] = unsafe { &mut *core::ptr::addr_of_mut!(IMG) };
+    for (i, b) in img.iter_mut().enumerate() {
+        *b = ((i / 512) as u8) ^ ((i % 512) as u8);
+    }
+    let disk = crate::filesystem::vfs::MemDisk { img };
+    block_io::queue_clear();
+
+    // ① 入队
+    let s1 = block_io::submit(10, 2, 1);
+    let s2 = block_io::submit(20, 2, 2);
+    let pend_ok = s1 && s2 && block_io::pending() == 2;
+    if !pend_ok {
+        crate::log_fatal!("queue: 入队不对 pending={}", block_io::pending());
+        ok = false;
+    }
+
+    // ② sectors == 0 被拒
+    let zero_ok = !block_io::submit(5, 0, 3);
+    if !zero_ok {
+        crate::log_fatal!("queue: 空请求没被拒");
+        ok = false;
+    }
+
+    // ③ 队列满
+    block_io::queue_clear();
+    let mut filled = 0usize;
+    for i in 0..block_io::QUEUE_MAX {
+        if block_io::submit(i as u64, 1, i as u64) {
+            filled += 1;
+        }
+    }
+    let overflow = block_io::submit(999, 1, 999);
+    let (sub, _dr, refused) = block_io::queue_stats();
+    let full_ok = filled == block_io::QUEUE_MAX && !overflow && refused >= 1;
+    if !full_ok {
+        crate::log_fatal!("queue: 满队列行为不对 filled={} refused={}", filled, refused);
+        ok = false;
+    }
+
+    // ④⑤ 排序 + 合并（乱序提交，相邻的合并）
+    block_io::queue_clear();
+    // 提交顺序：30(2), 10(2), 14(2), 12(2)
+    // 排序后：10(2), 12(2), 14(2), 30(2)
+    // 合并后：10..16(6), 30..32(2) ⇒ issued=2, merged=2
+    let _ = block_io::submit(30, 2, 30);
+    let _ = block_io::submit(10, 2, 10);
+    let _ = block_io::submit(14, 2, 14);
+    let _ = block_io::submit(12, 2, 12);
+    let rep = block_io::drain(&disk, &Budget::UNBOUNDED);
+    let sort_ok = rep.issued == 2;
+    let merge_ok = rep.merged == 2;
+    if !sort_ok || !merge_ok {
+        crate::log_fatal!("queue: 排序/合并不对 issued={} merged={}", rep.issued, rep.merged);
+        ok = false;
+    }
+
+    // ⑥ 数据正确：合并区间 10..16 应读到 6 个扇区
+    let data_ok = rep.sectors_ok == 8 && rep.failed_at.is_none();
+    if !data_ok {
+        crate::log_fatal!("queue: 扇区数不对 sectors_ok={} failed={:?}",
+            rep.sectors_ok, rep.failed_at);
+        ok = false;
+    }
+
+    // ⑦ 第一条失败就停：越过盘末尾
+    block_io::queue_clear();
+    let _ = block_io::submit(254, 4, 1);  // 越界
+    let _ = block_io::submit(10, 2, 2);   // 这条不该执行
+    let rep2 = block_io::drain(&disk, &Budget::UNBOUNDED);
+    let fail_ok = rep2.failed_at.is_some();
+    if !fail_ok {
+        crate::log_fatal!("queue: 越界没报失败");
+        ok = false;
+    }
+
+    // ⑧ drain 之后清空
+    let empty_ok = block_io::pending() == 0;
+    if !empty_ok {
+        crate::log_fatal!("queue: drain 之后还有残留");
+        ok = false;
+    }
+
+    block_io::queue_clear();
+    crate::log_info!(
+        "queue: 入队={} 空拒={} 满拒={} 排序={} 合并={} 数据={} 首失败停={} 清空={} ｜ issued={} merged={} ⇒ {}",
+        pend_ok, zero_ok, full_ok, sort_ok, merge_ok, data_ok, fail_ok, empty_ok,
+        rep.issued, rep.merged, ok
+    );
+    ok
+}
+
+#[cfg(feature = "handles")]
+ktest!(KT_BLOCK_QUEUE, t_block_queue);

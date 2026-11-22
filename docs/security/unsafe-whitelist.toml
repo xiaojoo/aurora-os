@@ -120,13 +120,13 @@ U2 = 10
 # `mm` 的 U2 不变：`phys_of_in` 是**从 `phys_of` 提出来的**，遍历体原样搬走，
 # 两个函数各一处 `unsafe {`，总数仍 55。`aspace_root` 自身没有 unsafe 块。
 # 对账：530+1=531、U2 119+1=120。
-total = 616
+total = 623
 U1 = 85
 U2 = 162
 U3 = 13
-U4 = 188
+U4 = 194
 U5 = 128
-U6 = 40
+U6 = 41
 
 [modules."arch/hooks"]
 U4 = 3
@@ -182,6 +182,9 @@ U4 = 16
 [modules."driver/virtio"]
 U4 = 8
 
+[modules."filesystem/block_io"]
+U4 = 6
+
 [modules."filesystem/fs_open"]
 U2 = 2
 
@@ -190,7 +193,7 @@ U2 = 2
 U4 = 5
 
 [modules."ktests/storage/vfs_ro"]
-U6 = 2
+U6 = 3
 
 [modules."irq/mod"]
 U4 = 9

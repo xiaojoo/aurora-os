@@ -5,7 +5,7 @@
 >
 > **2026-11-20（ADR-175 跨 AS 读走物理地址）**：`sched/user` U2 9 → 10（`copy_from_user_in` 里 HHDM 别名的单字节读）。**总数 +1**（530 → 531）。
 
-总计 616 处。U1 85 · U2 162 · U3 13 · U4 188 · U5 128 · U6 40
+总计 623 处。U1 85 · U2 162 · U3 13 · U4 194 · U5 128 · U6 41
 
 | 类别 | 含义 | 处数 |
 |---|---|---|
@@ -29,6 +29,21 @@ ADR-179：句柄槽数组从 `.bss` 改为运行时分配。四处的指针来�
 分出的 MOD_BOOT 连续帧（永不归还）、长度 `MAX_HANDLES`、生命周期整个内核，
 访问都在 `RANK_HANDLE(35)` 锁内。
 
+
+### filesystem/block_io
+
+| 类别 | 行 | 形状 |
+|---|---|---|
+| U4 | 291 | `unsafe impl Sync for QueueCell {}` （请求队列静态量）|
+| U4 | 312 | `unsafe { &mut *QUEUE.0.get() }` （`submit`）|
+| U4 | 330 | `unsafe { (*QUEUE.0.get()).len }` （`pending`）|
+| U4 | 340 | `unsafe { &*QUEUE.0.get() }` （`queue_stats`）|
+| U4 | 351 | `unsafe { &mut *QUEUE.0.get() }` （`queue_clear`）|
+| U4 | 400 | `unsafe { &mut *QUEUE.0.get() }` （`drain` 取快照）|
+
+ADR-214：请求队列的 32 条 `Request` 进 `.bss`，六处指针都指向 `QUEUE`，
+生命周期整个内核，访问都在 `QUEUE_LOCK`（`RANK_BLOCK=37`）内。
+载荷全为 Copy 数值。
 ### filesystem/vfs_ro
 
 | 类别 | 行 | 形状 |
