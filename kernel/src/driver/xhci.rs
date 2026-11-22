@@ -691,6 +691,15 @@ pub fn run_device(dev: &crate::bus::pci::Dev) -> Result<RunReading, RunError> {
     }
     let usbsts_after_run = ctx.read32(mmio, sts_off).map_err(|_| RunError::Io)?;
     let usbcmd_after_run = ctx.read32(mmio, cmd_off).map_err(|_| RunError::Io)?;
+    // **CRCR 必须在 RS=1 之后写**（ADR-213 实测）：
+    //
+    // 第一版在 RS=1 之前写 CRCR，读回 `crcr_lo=0x91001`（RCS=1 但 **CRR=0**）——
+    // 说明控制器认为命令环没在运行 ⇒ 敲 Doorbell 无效 ⇒ Enable Slot 永远超时。
+    //
+    // 顺序：HCRST → DCBAAP → CONFIG → RS=1（等 HCH=0）→ **CRCR**。
+    let crcr = op + OP_CRCR;
+    ctx.write32(mmio, crcr, ((ring_bus & !0x3F) | 1) as u32).map_err(|_| RunError::Io)?;
+    ctx.write32(mmio, crcr + 4, (ring_bus >> 32) as u32).map_err(|_| RunError::Io)?;
     // DMA 句柄**故意泄漏**（不 release）：控制器在跑，环必须一直有效。
     // 这与 NVMe 同一条：设备活着，缓冲就得活着。
     core::mem::forget(ring);
@@ -880,4 +889,403 @@ pub fn setup_event_ring(dev: &crate::bus::pci::Dev) -> Result<EventRingReading, 
         iman: iman_after,
         erstsz: erstsz_after,
     })
+}
+
+// ---------------------------------------------------------------- ADR-213：命令环消费者 + Enable Slot
+
+/// 命令环的 Doorbell 号（spec §5.6：Doorbell 0 = 命令环）。
+pub const DOORBELL_COMMAND: usize = 0;
+
+/// 等事件的自旋上界。
+///
+/// **与 `SPIN_LIMIT` 分开**：命令完成通常比复位快得多，但依赖设备；
+/// 独立常量让「哪个超时」在日志里可区分。
+pub const CMD_SPIN_LIMIT: u32 = 1_000_000;
+
+/// xHCI 的运行期状态（ADR-213）。
+///
+/// ## 为什么必须存下来
+///
+/// ADR-211 的 `run_device` 把两个 DMA 句柄 `forget` 掉了 —— 那在当时是对的
+/// （控制器在跑，缓冲要活着），但**后续无法再写命令环**：
+/// 没有 `DmaHandle` 就只能按总线地址硬算，而 `DriverCtx` 的纪律是「DMA 只能经 volatile 访问器」。
+///
+/// 所以这一层把句柄存进状态 —— 与 NVMe 的 `STATE` 同一个形状。
+struct State {
+    ctx: crate::driver::DriverCtx,
+    mmio: crate::driver::MmioHandle,
+    /// 命令环的 DMA 句柄（一页 = 256 TRB）。
+    cmd: crate::driver::DmaHandle,
+    /// 事件环段的 DMA 句柄（一页 = 256 TRB）。
+    event: crate::driver::DmaHandle,
+    /// DCBAA 的 DMA 句柄（一页）。
+    dcbaa: crate::driver::DmaHandle,
+    cmd_bus: u64,
+    event_bus: u64,
+    op: usize,
+    rt: usize,
+    doorbell_offset: usize,
+    /// 命令环的生产者游标（下一个可写位置）。
+    cmd_enqueue: usize,
+    /// 命令环的生产者 cycle 位。
+    cmd_cycle: bool,
+    /// 事件环的消费者游标。
+    event_dequeue: usize,
+    /// 事件环的消费者 cycle 位。
+    event_cycle: bool,
+    /// 段内 TRB 个数。
+    seg_trbs: usize,
+}
+
+struct StateCell(core::cell::UnsafeCell<Option<State>>);
+// SAFETY: 读写全在 `STATE_LOCK` 内；`State` 只含 Copy 句柄与整数。
+unsafe impl Sync for StateCell {}
+
+static STATE: StateCell = StateCell(core::cell::UnsafeCell::new(None));
+static STATE_LOCK: crate::sync::IrqSpinLock<()> =
+    // **必须比 `RANK_VMM(20)` 浅**（ADR-213 实测撞过）：
+    //
+    // 第一版用 `RANK_BLOCK(37)`，而 `bring_up` 在持本锁时调 `alloc_dma`
+    // ⇒ 先取 37 再取 20 ⇒ `L4 sync: 锁序违规，外层 rank=37 本次 rank=20` ⇒ 整机 39。
+    //
+    // 这条锁保护的是「xHCI 状态 + 命令环游标」，而它内部要分配 DMA（取 VMM），
+    // 所以它在锁序里必须**在 VMM 之上**（rank 更小）。
+    // 取 `RANK_GROW(4)`：比 TIMER(6)/RUNQ(8)/HEAP(10)/VMM(20) 都浅，
+    // 而它内部确实会走到那些锁。
+    crate::sync::IrqSpinLock::new_isr_taken(crate::sync::RANK_GROW, ());
+
+/// 一次命令的失败原因（ADR-213）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CmdError {
+    /// 写寄存器 / DMA 失败。
+    Io,
+    /// 等 Command Completion Event 超时。
+    Timeout,
+    /// 事件到了但 Completion Code 非 1（1 = Success）。
+    Failed(u8),
+    /// 事件类型不对。
+    WrongEvent,
+    /// 还没初始化（`bring_up` 没跑过）。
+    NotReady,
+    /// 命令环满。
+    RingFull,
+}
+
+/// 一次 Enable Slot 的读数（ADR-213）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlotReading {
+    /// 控制器分配的槽号（1..MaxSlots）。
+    pub slot_id: u8,
+    /// Completion Code（1 = Success）。
+    pub code: u8,
+    /// 命令 TRB 写在环的第几格。
+    pub trb_index: usize,
+}
+
+/// **把控制器带起来并保存状态**（ADR-213）。
+///
+/// 这是 ADR-211 `run_device` 的替代：同样的 5 步序列，但**把句柄存下来**
+/// 而不是 `forget`，这样后续才能写命令环。
+///
+/// 幂等：已初始化就直接回读数。
+pub fn bring_up(dev: &crate::bus::pci::Dev) -> Result<RunReading, RunError> {
+    let _g = STATE_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let slot = unsafe { &mut *STATE.0.get() };
+    if let Some(st) = slot.as_ref() {
+        let _ = st;
+        // 已初始化：返回当前读数（幂等）。
+        //
+        // **不重跑序列**：HCRST 会把控制器复位，环与 DCBAA 全部失效。
+        let p = probe_device(dev).map_err(|_| RunError::Io)?;
+        let dcbaa_bus = st.ctx.bus_addr(st.dcbaa).unwrap_or(0);
+        return Ok(RunReading {
+            cap: p,
+            cmd_ring_bus: st.cmd_bus,
+            dcbaa_bus,
+            usbsts_after_reset: 0,
+            usbsts_after_run: 0,
+            usbcmd_after_run: 0,
+        });
+    }
+    let ctx = crate::driver::DriverCtx::for_device(MOD_XHCI, *dev);
+    let mmio = ctx.map_mmio(0).map_err(|_| RunError::Io)?;
+    let bar_len = ctx.mmio_len(mmio).map_err(|_| RunError::Io)?;
+    let cap0 = ctx.read32(mmio, CAP_CAPLENGTH).map_err(|_| RunError::Io)?;
+    let hcsparams1 = ctx.read32(mmio, CAP_HCSPARAMS1).map_err(|_| RunError::Io)?;
+    let hccparams1 = ctx.read32(mmio, CAP_HCCPARAMS1).map_err(|_| RunError::Io)?;
+    let doorbell = ctx.read32(mmio, CAP_DOORBELL_OFFSET).map_err(|_| RunError::Io)?;
+    let rtsoff = ctx.read32(mmio, CAP_RTSOFF).map_err(|_| RunError::Io)?;
+    let cap = CapSnapshot {
+        cap_length: (cap0 & 0xFF) as u8,
+        hcsparams1,
+        hccparams1,
+        doorbell_offset: doorbell,
+    };
+    let op = cap.op_offset().ok_or(RunError::BadCap)?;
+    let db = cap.doorbell_offset().ok_or(RunError::BadCap)?;
+    let rt = op + rtsoff as usize;
+    if rt + RT_ERDP + 4 > bar_len {
+        return Err(RunError::BadCap);
+    }
+
+    // 三块 DMA：命令环 / 事件环 / DCBAA（各一页）
+    let cmd = ctx.alloc_dma(crate::mm::PAGE).map_err(|_| RunError::NoDma)?;
+    let event = ctx.alloc_dma(crate::mm::PAGE).map_err(|_| RunError::NoDma)?;
+    let dcbaa = ctx.alloc_dma(crate::mm::PAGE).map_err(|_| RunError::NoDma)?;
+    let cmd_bus = ctx.bus_addr(cmd).map_err(|_| RunError::NoDma)?;
+    let event_bus = ctx.bus_addr(event).map_err(|_| RunError::NoDma)?;
+    let dcbaa_bus = ctx.bus_addr(dcbaa).map_err(|_| RunError::NoDma)?;
+    ctx.dma_fill(cmd, 0, 0, crate::mm::PAGE).map_err(|_| RunError::Io)?;
+    ctx.dma_fill(event, 0, 0, crate::mm::PAGE).map_err(|_| RunError::Io)?;
+    ctx.dma_fill(dcbaa, 0, 0, crate::mm::PAGE).map_err(|_| RunError::Io)?;
+
+    // ERST 表项写进事件环段的最后一页之后不行 —— 这里另用一块：
+    // 复用 `dcbaa` 页的前 16 字节？**不行**：DCBAA 要放设备上下文指针。
+    // 所以 ERST 也单独分配。
+    let erst = ctx.alloc_dma(crate::mm::PAGE).map_err(|_| RunError::NoDma)?;
+    let erst_bus = ctx.bus_addr(erst).map_err(|_| RunError::NoDma)?;
+    ctx.dma_fill(erst, 0, 0, crate::mm::PAGE).map_err(|_| RunError::Io)?;
+    let seg_trbs = crate::mm::PAGE / TRB_BYTES;
+    let mut entry = [0u8; ERST_ENTRY_BYTES];
+    if !build_erst_entry(&mut entry, event_bus, seg_trbs as u32) {
+        return Err(RunError::NoDma);
+    }
+    for (i, b) in entry.iter().enumerate() {
+        ctx.dma_write8(erst, i, *b).map_err(|_| RunError::Io)?;
+    }
+
+    // 复位 → 配置 → 运行（与 ADR-211 同一序列）
+    let cmd_off = op + OP_USBCMD;
+    let sts_off = op + OP_USBSTS;
+    ctx.write32(mmio, cmd_off, USBCMD_HCRST).map_err(|_| RunError::Io)?;
+    let mut spins = 0u32;
+    loop {
+        if spins >= SPIN_LIMIT {
+            return Err(RunError::ResetTimeout);
+        }
+        spins += 1;
+        let c = ctx.read32(mmio, cmd_off).map_err(|_| RunError::Io)?;
+        let s = ctx.read32(mmio, sts_off).map_err(|_| RunError::Io)?;
+        if c & USBCMD_HCRST == 0 && s & USBSTS_CNR == 0 {
+            break;
+        }
+        crate::tsc::spin(100);
+    }
+    let usbsts_after_reset = ctx.read32(mmio, sts_off).map_err(|_| RunError::Io)?;
+    // DCBAAP
+    let dcbaap = op + OP_DCBAAP;
+    ctx.write32(mmio, dcbaap, (dcbaa_bus & 0xFFFF_FFFF) as u32).map_err(|_| RunError::Io)?;
+    ctx.write32(mmio, dcbaap + 4, (dcbaa_bus >> 32) as u32).map_err(|_| RunError::Io)?;
+    // CONFIG
+    ctx.write32(mmio, op + OP_CONFIG, u32::from(cap.max_slots())).map_err(|_| RunError::Io)?;
+    // 事件环（RT 段）
+    ctx.write32(mmio, rt + RT_ERSTSZ, 1).map_err(|_| RunError::Io)?;
+    ctx.write32(mmio, rt + RT_ERSTBA, (erst_bus & 0xFFFF_FFFF) as u32).map_err(|_| RunError::Io)?;
+    ctx.write32(mmio, rt + RT_ERSTBA + 4, (erst_bus >> 32) as u32).map_err(|_| RunError::Io)?;
+    let erdp = (event_bus & !0x7) | u64::from(ERDP_EHB);
+    ctx.write32(mmio, rt + RT_ERDP, (erdp & 0xFFFF_FFFF) as u32).map_err(|_| RunError::Io)?;
+    ctx.write32(mmio, rt + RT_ERDP + 4, (erdp >> 32) as u32).map_err(|_| RunError::Io)?;
+    let iman = ctx.read32(mmio, rt + RT_IMAN).map_err(|_| RunError::Io)?;
+    ctx.write32(mmio, rt + RT_IMAN, iman | IMAN_IE).map_err(|_| RunError::Io)?;
+    // 运行
+    ctx.write32(mmio, cmd_off, USBCMD_RUN | USBCMD_INTE).map_err(|_| RunError::Io)?;
+    let mut spins = 0u32;
+    loop {
+        if spins >= SPIN_LIMIT {
+            return Err(RunError::RunTimeout);
+        }
+        spins += 1;
+        let s = ctx.read32(mmio, sts_off).map_err(|_| RunError::Io)?;
+        if s & USBSTS_HCH == 0 {
+            break;
+        }
+        crate::tsc::spin(100);
+    }
+    let usbsts_after_run = ctx.read32(mmio, sts_off).map_err(|_| RunError::Io)?;
+    let usbcmd_after_run = ctx.read32(mmio, cmd_off).map_err(|_| RunError::Io)?;
+
+    *slot = Some(State {
+        ctx,
+        mmio,
+        cmd,
+        event,
+        dcbaa,
+        cmd_bus,
+        event_bus,
+        op,
+        rt,
+        doorbell_offset: db,
+        cmd_enqueue: 0,
+        cmd_cycle: true,
+        event_dequeue: 0,
+        event_cycle: true,
+        seg_trbs,
+    });
+    let _ = erst; // ERST 句柄故意不存：控制器已读走表项，后续不再改
+    Ok(RunReading {
+        cap: Reading {
+            cap_length: cap.cap_length,
+            max_slots: cap.max_slots(),
+            max_intrs: cap.max_intrs(),
+            max_ports: cap.max_ports(),
+            ac64: cap.ac64(),
+            csz: cap.csz(),
+            scratchpad: cap.max_scratchpad(),
+            doorbell_offset: cap.doorbell_offset,
+            bar_len,
+        },
+        cmd_ring_bus: cmd_bus,
+        dcbaa_bus,
+        usbsts_after_reset,
+        usbsts_after_run,
+        usbcmd_after_run,
+    })
+}
+
+/// **构造一个命令 TRB**（ADR-213）。
+///
+/// ## 与 `build_trb` 的区别
+///
+/// `build_trb` 只填 parameter/status/control。命令 TRB 还需要：
+///
+/// - **Cycle bit** 在 control 的 bit 0；
+/// - **Slot ID** 在 control 的 bit 31:24；
+/// - **Slot Type** 在 control 的 bit 20:16（只有 Enable Slot 用）。
+///
+/// 这里显式收 `slot_id`：Enable Slot 时它是 0（还没有槽），
+/// 而 Address Device 时它是刚拿到的那个 —— 混淆会让命令投错设备。
+pub fn build_cmd_trb(
+    out: &mut [u8; TRB_BYTES],
+    ty: TrbType,
+    slot_id: u8,
+    parameter: u64,
+    cycle: bool,
+) -> bool {
+    out[0..8].copy_from_slice(&parameter.to_le_bytes());
+    out[8..12].copy_from_slice(&0u32.to_le_bytes());
+    let control = ((ty as u32) << 10)
+        | ((slot_id as u32) << 24)
+        | if cycle { 1 } else { 0 };
+    out[12..16].copy_from_slice(&control.to_le_bytes());
+    true
+}
+
+/// **发一条 Enable Slot 命令并等完成事件**（ADR-213）。
+///
+/// ## 这是 USB 的第一个完整闭环
+///
+/// ```
+/// 写 TRB 到命令环 → 敲 Doorbell → 轮询事件环 → 读 Completion Code + Slot ID
+/// ```
+///
+/// 前面五层都只到「配好了」或「进了运行态」，**没有一次往返**。
+///
+/// ## 事件环的 cycle 判据是**反的**
+///
+/// 硬件写事件时把 Cycle bit 写成**与消费者相反**的值。所以「有新事件」的判据是
+/// `trb.cycle != consumer_cycle` —— 而命令环的生产者是 `== producer_cycle`。
+/// **方向相反是 xHCI 最容易搞混的地方。**
+pub fn enable_slot() -> Result<SlotReading, CmdError> {
+    let _g = STATE_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let Some(st) = (unsafe { &mut *STATE.0.get() }).as_mut() else {
+        return Err(CmdError::NotReady);
+    };
+    // ---- 1) 写 Enable Slot TRB 到命令环
+    let idx = st.cmd_enqueue;
+    let mut trb = [0u8; TRB_BYTES];
+    // Slot Type = 0（USB2 协议），在 control bit 20:16。
+    build_cmd_trb(&mut trb, TrbType::EnableSlot, 0, 0, st.cmd_cycle);
+    // 手工补 Slot Type（build_cmd_trb 的 slot_id 参数是 bit 31:24，不是 20:16）
+    let control = u32::from_le_bytes([trb[12], trb[13], trb[14], trb[15]]);
+    let control = control & !(0x1F << 16); // Slot Type = 0
+    trb[12..16].copy_from_slice(&control.to_le_bytes());
+    let off = idx * TRB_BYTES;
+    for (i, b) in trb.iter().enumerate() {
+        st.ctx.dma_write8(st.cmd, off + i, *b).map_err(|_| CmdError::Io)?;
+    }
+    // 前移生产者游标
+    st.cmd_enqueue += 1;
+    if st.cmd_enqueue >= st.seg_trbs - 1 {
+        st.cmd_enqueue = 0;
+        st.cmd_cycle = !st.cmd_cycle;
+    }
+    // ---- 2) 敲 Doorbell 0
+    st.ctx
+        .write32(st.mmio, st.doorbell_offset + DOORBELL_COMMAND * 4, 1)
+        .map_err(|_| CmdError::Io)?;
+    // ---- 2b) 读回命令环第 0 格，证 TRB 真的写进去了
+    let mut back = [0u8; TRB_BYTES];
+    for (i, b) in back.iter_mut().enumerate() {
+        *b = st.ctx.dma_read8(st.cmd, i).map_err(|_| CmdError::Io)?;
+    }
+    let back_ctrl = u32::from_le_bytes([back[12], back[13], back[14], back[15]]);
+    let crcr_lo = st.ctx.read32(st.mmio, st.op + OP_CRCR).unwrap_or(0);
+    let db = st.ctx.read32(st.mmio, st.doorbell_offset + DOORBELL_COMMAND * 4).unwrap_or(0);
+    crate::log_info!(
+        "xhci: enable_slot 投递 trb_ctrl={:#x} 读回={:#x} crcr_lo={:#x} db={:#x} cmd_bus={:#x} ev_bus={:#x}",
+        u32::from_le_bytes([trb[12], trb[13], trb[14], trb[15]]), back_ctrl, crcr_lo, db,
+        st.cmd_bus, st.event_bus
+    );
+    // ---- 3) 轮询事件环
+    let mut spins = 0u32;
+    loop {
+        if spins >= CMD_SPIN_LIMIT {
+            // **超时时把现场打出来**：只有「超时」两个字，无法区分
+            // 「Doorbell 没敲对」「命令环指针错」「事件环没使能」三种成因。
+            let crcr_lo = st.ctx.read32(st.mmio, st.op + OP_CRCR).unwrap_or(0);
+            let crcr_hi = st.ctx.read32(st.mmio, st.op + OP_CRCR + 4).unwrap_or(0);
+            let usbsts = st.ctx.read32(st.mmio, st.op + OP_USBSTS).unwrap_or(0);
+            let iman = st.ctx.read32(st.mmio, st.rt + RT_IMAN).unwrap_or(0);
+            let erstsz = st.ctx.read32(st.mmio, st.rt + RT_ERSTSZ).unwrap_or(0);
+            let mut raw = [0u8; TRB_BYTES];
+            for (i, b) in raw.iter_mut().enumerate() {
+                *b = st.ctx.dma_read8(st.event, i).unwrap_or(0);
+            }
+            let d0 = u32::from_le_bytes([raw[12], raw[13], raw[14], raw[15]]);
+            crate::log_fatal!(
+                "xhci: enable_slot 超时 crcr={:#x}{:08x} usbsts={:#x} iman={:#x} erstsz={} ev0_ctrl={:#x} cmd_idx={} ev_deq={} cycle={}/{}",
+                crcr_hi, crcr_lo, usbsts, iman, erstsz, d0, idx, st.event_dequeue,
+                st.cmd_cycle, st.event_cycle
+            );
+            return Err(CmdError::Timeout);
+        }
+        spins += 1;
+        if st.event_dequeue >= st.seg_trbs {
+            st.event_dequeue = 0;
+            st.event_cycle = !st.event_cycle;
+        }
+        let eoff = st.event_dequeue * TRB_BYTES;
+        let mut buf = [0u8; TRB_BYTES];
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = st.ctx.dma_read8(st.event, eoff + i).map_err(|_| CmdError::Io)?;
+        }
+        let Some(ev) = parse_trb(&buf) else {
+            crate::tsc::spin(100);
+            continue;
+        };
+        // **事件环判据是反的**：硬件 cycle 与消费者相反 ⇒ 有新事件
+        if ev.cycle == st.event_cycle {
+            crate::tsc::spin(100);
+            continue;
+        }
+        // 是 Command Completion Event 吗？
+        if ev.ty != TrbType::CommandCompletionEvent {
+            return Err(CmdError::WrongEvent);
+        }
+        let code = ev.completion_code();
+        // 事件 TRB 的 Slot ID 在 control bit 31:24
+        let slot_id = ((ev.control >> 24) & 0xFF) as u8;
+        // 消费掉这一条：前移 dequeue 并写 ERDP（含 EHB）
+        st.event_dequeue += 1;
+        let next = st.event_dequeue * TRB_BYTES;
+        let erdp = (st.event_bus + next as u64) | u64::from(ERDP_EHB);
+        let _ = st.ctx.write32(st.mmio, st.rt + RT_ERDP, (erdp & 0xFFFF_FFFF) as u32);
+        let _ = st.ctx.write32(st.mmio, st.rt + RT_ERDP + 4, (erdp >> 32) as u32);
+        if code != 1 {
+            return Err(CmdError::Failed(code));
+        }
+        return Ok(SlotReading { slot_id, code, trb_index: idx });
+    }
 }

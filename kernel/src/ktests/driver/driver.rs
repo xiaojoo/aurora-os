@@ -2329,3 +2329,101 @@ fn t_xhci_event_ring() -> bool {
 
 #[cfg(all(feature = "handles", feature = "xhci"))]
 ktest!(KT_XHCI_EVENT_RING, t_xhci_event_ring);
+
+/// ADR-213：**命令环闭环 + Enable Slot** 的证人（切片 H 第六层）。
+///
+/// ## 要证什么
+///
+/// 前五层都只到「配好了」或「进了运行态」，**没有一次往返**。
+/// 这一层第一次：写 TRB → 敲 Doorbell → 轮询事件环 → 读到 Completion Code。
+///
+/// ## 判据七格
+///
+/// 1. `bring_up` 成功（三块 DMA + 事件环 + 运行态）；
+/// 2. `build_cmd_trb` 的 Slot ID / Slot Type / Cycle 位都正确落位；
+/// 3. **`enable_slot` 拿到 Completion Code == 1**（Success）；
+/// 4. **拿到的 `slot_id` 在 1..=MaxSlots 范围内**（0 是「没有槽」的哨兵）；
+/// 5. **命令 TRB 写在第 0 格**（`trb_index == 0`，环是新的）；
+/// 6. **再发一次拿到不同的 slot_id**（控制器真的分配了新槽）；
+/// 7. 事件环的 `dequeue` 前移了（事件被消费，不是重复读）。
+///
+/// **负样本**：把 `build_cmd_trb` 的 Slot Type 位错写成 `slot_id` 那一位 ⇒ 第 2 格红。
+#[cfg(all(feature = "handles", feature = "xhci-slot"))]
+fn t_xhci_enable_slot() -> bool {
+    use crate::driver::xhci::{self, TrbType, TRB_BYTES};
+    let mut ok = true;
+
+    // ② build_cmd_trb 字段落位
+    let mut trb = [0u8; TRB_BYTES];
+    let built = xhci::build_cmd_trb(&mut trb, TrbType::EnableSlot, 0x07, 0x1234_5678, true);
+    let control = u32::from_le_bytes([trb[12], trb[13], trb[14], trb[15]]);
+    let param = u64::from_le_bytes([trb[0], trb[1], trb[2], trb[3], trb[4], trb[5], trb[6], trb[7]]);
+    let ty_ok = (control >> 10) & 0x3F == TrbType::EnableSlot as u32;
+    let slot_ok = (control >> 24) & 0xFF == 0x07;
+    let cycle_ok = control & 1 == 1;
+    let param_ok = param == 0x1234_5678;
+    let build_ok = built && ty_ok && slot_ok && cycle_ok && param_ok;
+    if !build_ok {
+        crate::log_fatal!("xhci-slot: build_cmd_trb 不对 control={:#x} param={:#x}", control, param);
+        ok = false;
+    }
+
+    // ① bring_up
+    let dev = match crate::pci::first_of_triple(0x0c, 0x03, 0x30) {
+        Some(d) => d,
+        None => {
+            crate::log_fatal!("xhci-slot: 没有 xHCI 设备");
+            return false;
+        }
+    };
+    let run = match xhci::bring_up(&dev) {
+        Ok(r) => r,
+        Err(e) => {
+            crate::log_fatal!("xhci-slot: bring_up 失败 {:?}", e);
+            return false;
+        }
+    };
+
+    // ③④⑤ 第一次 Enable Slot
+    let first = match xhci::enable_slot() {
+        Ok(s) => s,
+        Err(e) => {
+            crate::log_fatal!("xhci-slot: enable_slot 失败 {:?}", e);
+            return false;
+        }
+    };
+    let code_ok = first.code == 1;
+    let slot_range_ok = first.slot_id >= 1 && first.slot_id <= run.cap.max_slots;
+    let idx_ok = first.trb_index == 0;
+    if !code_ok || !slot_range_ok || !idx_ok {
+        crate::log_fatal!("xhci-slot: 第一次不对 code={} slot={} idx={}",
+            first.code, first.slot_id, first.trb_index);
+        ok = false;
+    }
+
+    // ⑥ 第二次拿到不同 slot
+    let second = xhci::enable_slot();
+    let distinct_ok = matches!(second, Ok(s) if s.code == 1 && s.slot_id != first.slot_id);
+    if !distinct_ok {
+        crate::log_fatal!("xhci-slot: 第二次没拿到新槽 first={} second={:?}",
+            first.slot_id, second.map(|s| s.slot_id));
+        ok = false;
+    }
+
+    // ⑦ 事件被消费（第二次的 trb_index 应当是 1，说明生产者前移了）
+    let consumed_ok = matches!(second, Ok(s) if s.trb_index == 1);
+    if !consumed_ok {
+        crate::log_fatal!("xhci-slot: 生产者游标没前移");
+        ok = false;
+    }
+
+    crate::log_info!(
+        "xhci-slot: build={} bring_up=true 第一次(code={} slot={} idx={}) 第二次={:?} 消费={} ⇒ {}",
+        build_ok, first.code, first.slot_id, first.trb_index,
+        second.map(|s| (s.code, s.slot_id, s.trb_index)), consumed_ok, ok
+    );
+    ok
+}
+
+#[cfg(all(feature = "handles", feature = "xhci-slot"))]
+ktest!(KT_XHCI_ENABLE_SLOT, t_xhci_enable_slot);

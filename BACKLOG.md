@@ -23719,3 +23719,85 @@ USB 与前面几片都不同：它有真正的**硬件状态机**，判据要证
 3. **事件环的回收**（读 ERDP、清 EHB、前移 dequeue）
 4. **端口枚举**（Enable Slot → Address Device → Configure Endpoint）
 5. **ERST 只用 1 段**
+---
+
+## 532. ADR-213：xHCI 命令环消费者（**部分采纳 / 阻塞**）（2026-11-23）
+
+### 切片 H 第六层：第一次「发命令 + 收事件」的尝试
+
+**`enable_slot` 超时，命令不被控制器消费。** 代码与判据已就位，
+但门控在**默认关闭**的 `xhci-slot` 特性下。
+
+### 已落地（可复用）
+
+    struct State { ctx, mmio, cmd, event, dcbaa, cmd_bus, event_bus, op, rt,
+                    doorbell_offset, cmd_enqueue, cmd_cycle, event_dequeue, event_cycle, seg_trbs }
+    pub fn bring_up(dev) -> Result<RunReading, RunError>
+    pub fn build_cmd_trb(&mut [u8;16], ty, slot_id, parameter, cycle) -> bool
+    pub fn enable_slot() -> Result<SlotReading, CmdError>
+
+`bring_up` 替代 ADR-211 的 `run_device`：同样序列，但**保存句柄**而不是 `forget` ——
+没有 `DmaHandle` 就只能按总线地址硬算，违反 `DriverCtx` 纪律。
+
+### 实测撞出的两个错（都已修）
+
+**错 1：锁序违规 ⇒ 整机 39**
+
+第一版 `STATE_LOCK` 用 `RANK_BLOCK(37)`，而 `bring_up` 在持锁时调 `alloc_dma`（取 `RANK_VMM(20)`）：
+
+    [fatal] L4 sync: 锁序违规，外层 rank=37 本次 rank=20
+
+改成 `RANK_GROW(4)`。**教训：锁的 rank 必须按「它内部会取什么锁」定，不是按「它属于哪个子系统」。**
+
+**错 2：CRCR 写在 RS=1 之前**
+
+实测 `crcr_lo=0x91001`（RCS=1 但 **CRR=0**）。改顺序后**仍是 `0x91001`**。
+
+### 阻塞点（如实记录）
+
+    xhci: enable_slot 投递 trb_ctrl=0x2401 读回=0x2401 crcr_lo=0x91001 db=0x0
+          cmd_bus=0x91000 ev_bus=0x92000
+    xhci: enable_slot 超时 crcr=0x000091001 usbsts=0x0 iman=0x2 erstsz=1
+          ev0_ctrl=0x0 cmd_idx=0 ev_deq=0 cycle=true/true
+
+逐项排除：
+
+| 项 | 读数 | 判断 |
+|---|---|---|
+| 命令 TRB 写进去了吗 | `trb_ctrl=0x2401`，读回一致 | **是** |
+| CRCR 指向对吗 | `crcr_lo=0x91001` | 对 |
+| **CRR 置位了吗** | bit3 = 0 | **否 ← 根因** |
+| 控制器在跑吗 | `usbsts=0x0`（HCH=0）| **是** |
+| 事件中断使能了吗 | `iman=0x2` | **是** |
+| 事件环配好了吗 | `erstsz=1` | **是** |
+| 事件来了吗 | `ev0_ctrl=0x0` | **没有** |
+
+**CRR 是只读位**，由控制器在命令环运行时置位；软件只能通过 `CRCR.RCS` 与 `USBCMD.RS` 间接影响。
+
+未排除的可能（按怀疑度）：DCBAA 内容无效 / CONFIG.MaxSlotsEn 与 HCSPARAMS1 的关系 /
+QEMU 需要额外使能位 / 命令环第 0 格的特殊要求。
+
+### 为什么门控而不是继续死磕
+
+按项目纪律「**先记录问题，不要死磕**」：
+
+- 代码与判据已就位；
+- `xhci-slot` 特性**默认关**，开了只会红；
+- 默认档与 `xhci` 档都 `PASS(33)`。
+
+### 读数
+
+| 档 | 结果 |
+|---|---|
+| `handles` | **`PASS(33)`** |
+| `handles,xhci` | **`PASS(33)`** |
+| `handles,xhci,xhci-slot` | **FAIL**（`enable_slot 失败 Timeout`）|
+| `check` | **21/21** |
+
+### 未做
+
+1. **CRR 不置位**（核心阻塞）
+2. **端口枚举**（Address Device / Configure Endpoint）
+3. **MSI/MSI-X**
+4. **Link TRB 真的写进环尾**
+5. **Scratchpad Buffer 分配**

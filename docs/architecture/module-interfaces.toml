@@ -1176,7 +1176,7 @@ known_scc = [
 
 [baseline.ring_edge_sites]
   "time->sync" = 4
-  "driver->sync" = 1
+  "driver->sync" = 3
 "driver->network" = 2
   "network->sync" = 5
   "network->driver" = 9
@@ -1198,9 +1198,9 @@ known_scc = [
 "driver->arch" = 55
 "driver->boot" = 1
 "driver->irq" = 19
-"driver->memory" = 31
-"driver->pci" = 31
-"driver->time" = 15
+"driver->memory" = 40
+"driver->pci" = 32
+"driver->time" = 19
 "irq->arch" = 29
 "irq->memory" = 1
 "memory->arch" = 61

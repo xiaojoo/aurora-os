@@ -5,7 +5,7 @@
 >
 > **2026-11-20（ADR-175 跨 AS 读走物理地址）**：`sched/user` U2 9 → 10（`copy_from_user_in` 里 HHDM 别名的单字节读）。**总数 +1**（530 → 531）。
 
-总计 613 处。U1 85 · U2 162 · U3 13 · U4 185 · U5 128 · U6 40
+总计 616 处。U1 85 · U2 162 · U3 13 · U4 188 · U5 128 · U6 40
 
 | 类别 | 含义 | 处数 |
 |---|---|---|
@@ -223,6 +223,18 @@ ADR-194：`t_block_merge` 的两个 `static mut`。**故意进 `.bss` 而不进�
 | U2 | 236 | `unsafe { BACK[self.back_idx(x, y)] = packed; ROW_DIRTY[y as usize] = true;` |
 | U2 | 295 | `return Ok(unsafe { BACK[self.back_idx(x, y)] }); } self.region.read32(off).map_err(FrameError::Map)` |
 
+
+### driver/xhci
+
+| 类别 | 行 | 形状 |
+|---|---|---|
+| U4 | 942 | `unsafe impl Sync for StateCell {}` （运行期状态静态量）|
+| U4 | 982 | `unsafe { &mut *STATE.0.get() }` （`bring_up`，持 STATE_LOCK）|
+| U4 | 1152 | `unsafe { &mut *STATE.0.get() }` （`enable_slot`，持 STATE_LOCK）|
+
+ADR-213：xHCI 的运行期状态（三块 DMA 句柄 + 环游标）进 `.bss`，
+三处指针都指向 `STATE` 这个静态量，生命周期整个内核，
+访问都在 `STATE_LOCK`（`RANK_GROW=4`）内。载荷全为 Copy 句柄与整数。
 ### driver/ahci
 
 | 类别 | 行 | 形状 |

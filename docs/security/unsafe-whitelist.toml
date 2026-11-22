@@ -84,6 +84,9 @@ U4 = 6
 U2 = 1
 U4 = 6
 
+[modules."driver/xhci"]
+U4 = 3
+
 [modules."driver/nvme"]
 U4 = 7
 [modules."capability/handle"]
@@ -117,11 +120,11 @@ U2 = 10
 # `mm` 的 U2 不变：`phys_of_in` 是**从 `phys_of` 提出来的**，遍历体原样搬走，
 # 两个函数各一处 `unsafe {`，总数仍 55。`aspace_root` 自身没有 unsafe 块。
 # 对账：530+1=531、U2 119+1=120。
-total = 613
+total = 616
 U1 = 85
 U2 = 162
 U3 = 13
-U4 = 185
+U4 = 188
 U5 = 128
 U6 = 40
 
