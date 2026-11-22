@@ -572,7 +572,7 @@ owner = "network"
 layer = "service"
 source_modules = [
   "network", "network/arp", "network/arp_table", "network/dhcp", "network/dns", "network/eth",
-  "network/icmp", "network/ipv4", "network/proto", "network/socket", "network/udp"
+  "network/icmp", "network/ipv4", "network/ipv6", "network/ndp", "network/proto", "network/socket", "network/udp"
 ]
 # 今天只有边界声明与 `NetError`：协议实现仍在 `driver/virtio.rs` 里，**待搬迁**
 # （ADR-166 未决 1）。先登记"这个域存在、依赖谁、谁能调"，搬迁时往这里加成员。
@@ -609,7 +609,14 @@ public_api = [
   "socket::used", "socket::enqueue",
   "udp::UdpEndpoint", "udp::UDP_PAYLOAD_MAX", "udp::UDP_HDR", "udp::IP_HDR",
   "udp::ETH_HDR", "udp::build_frame", "udp::parse_frame", "udp::udp_checksum",
-]
+  "ipv6::build_udp6_frame", "ipv6::solicited_node_multicast", "ipv6::udp6_checksum",
+  "ipv6::IpAddr", "ipv6::NET_TYPE_IPV6", "ipv6::IP6_HDR", "ipv6::IP6_ADDR_LEN",
+  "ipv6::IP6_MIN_MTU", "ipv6::eui64_from_mac", "ipv6::link_local_from_mac",
+  "ipv6::parse_udp6_frame", "ipv6::is_ipv4_frame", "ipv6::is_ipv6_frame",
+  "ipv6::IP6_ALL_NODES_LL", "ipv6::IP6_UNSPECIFIED",
+  "ndp::build_ns", "ndp::build_na", "ndp::parse_nd", "ndp::NdMessage",
+  "ndp::ICMPV6_NS", "ndp::ICMPV6_NA", "ndp::NDP_FRAME_BYTES", "ndp::is_all_nodes",
+  "socket::SockAddr",]
 # 今天**无人调用**（协议还在 driver 里）；按实测填空，搬迁后再长出来。
 allowed_callers = ["driver", "capability", "sched"]
 # 依赖方向是 **network → driver（单向）**：协议通过驱动的收发原语工作。

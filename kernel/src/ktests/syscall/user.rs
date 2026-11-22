@@ -776,19 +776,26 @@ fn t_socket_family() -> bool {
         ok = false;
     }
 
-    // 2+3. AF_INET6 / SOCK_STREAM 回 ENOSYS（不是 EINVAL）
-    let v6 = crate::network::socket::create(
+    // 2. AF_INET6 **现在能建**（ADR-182 决策 5 落地）；SOCK_STREAM 仍回 ENOSYS
+    //
+    // 旧判据是「AF_INET6 必须回 -38」——那是 IPv6 还没实现时写的。
+    // 实现之后**判据必须跟着实现走**，否则功能上线时这条用例反而变红。
+    let (v6_slot, v6_gen) = match crate::network::socket::create(
         crate::network::socket::AF_INET6,
         crate::network::socket::SOCK_DGRAM,
-    )
-    .is_err();
-    let v6_ret = crate::network::socket::create(
-        crate::network::socket::AF_INET6,
-        crate::network::socket::SOCK_DGRAM,
-    )
-    .err()
-    .unwrap_or(0);
-    let v6_ok = v6 && v6_ret == crate::network::socket::E_NOSYS;
+    ) {
+        Ok(v) => v,
+        Err(_) => (u16::MAX, 0),
+    };
+    // 空端点必须是 V6 族（否则 send 会走 IPv4 分支）
+    let v6_ok = v6_slot != u16::MAX
+        && crate::network::socket::endpoints(v6_slot, v6_gen)
+            .map(|(l, _p)| l.is_v6())
+            .unwrap_or(false);
+    let v6_ret: u64 = if v6_ok { 0 } else { crate::network::socket::E_NOSYS };
+    if v6_slot != u16::MAX {
+        let _ = crate::network::socket::destroy(v6_slot, v6_gen);
+    }
     let stream_ret = crate::network::socket::create(
         crate::network::socket::AF_INET,
         crate::network::socket::SOCK_STREAM,
@@ -802,7 +809,7 @@ fn t_socket_family() -> bool {
     }
 
     // 4. bind + 重复 bind
-    let ep = crate::network::udp::UdpEndpoint { ip: [127, 0, 0, 1], port: 45999 };
+    let ep = crate::network::socket::SockAddr::V4 { ip: [127, 0, 0, 1], port: 45999 };
     let bind_ok = crate::network::socket::bind(slot, gen, ep).is_ok();
     let (slot2, gen2) = match crate::network::socket::create(
         crate::network::socket::AF_INET,

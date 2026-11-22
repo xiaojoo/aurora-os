@@ -2466,37 +2466,71 @@ fn sys_sysinfo(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
 
 // ---------------------------------------------------------------- ADR-181：socket 族（48–55）
 
-/// 从用户内存读一个 `sockaddr_in`（16 字节，ADR-181 决策 4）。
+/// 从用户内存读一个 `sockaddr`（双族，ADR-182 决策 5）。
 ///
 /// 布局与 Linux **字节级一致**：
 ///
-///     struct sockaddr_in {
-///         u16 sin_family;   // 偏移 0
-///         u16 sin_port;     // 偏移 2，网络序
-///         u32 sin_addr;     // 偏移 4，网络序
-///         u8  sin_zero[8];  // 偏移 8
+///     struct sockaddr_in {            // 16 字节
+///         u16 sin_family;             // 偏移 0
+///         u16 sin_port;               // 偏移 2，网络序
+///         u32 sin_addr;               // 偏移 4，网络序
+///         u8  sin_zero[8];            // 偏移 8
 ///     };
 ///
-/// **端口和地址都是网络序（大端）**，所以 `u16::from_be_bytes` 直接读。
+///     struct sockaddr_in6 {           // 28 字节
+///         u16 sin6_family;            // 偏移 0
+///         u16 sin6_port;              // 偏移 2，网络序
+///         u32 sin6_flowinfo;          // 偏移 4
+///         u8  sin6_addr[16];          // 偏移 8
+///         u32 sin6_scope_id;          // 偏移 24
+///     };
+///
+/// **两族的偏移不同**（IPv4 地址在 4、IPv6 在 8），这是最容易读错位的地方。
 #[cfg(feature = "handles")]
-fn read_sockaddr_in(ptr: u64) -> Result<crate::network::udp::UdpEndpoint, u64> {
-    let mut b = [0u8; 16];
-    match copy_from_user(ptr, &mut b) {
-        Ok(16) => {}
-        _ => return Err(E_FAULT),
-    }
-    let family = u16::from_ne_bytes([b[0], b[1]]);
-    if family != crate::network::socket::AF_INET {
-        // AF_INET6 也走这里：今天回 ENOSYS（族没实现），不是 EINVAL（参数写错）
-        if family == crate::network::socket::AF_INET6 {
-            return Err(crate::network::socket::E_NOSYS);
-        }
+fn read_sockaddr(ptr: u64, len: u64) -> Result<crate::network::socket::SockAddr, u64> {
+    use crate::network::socket::{SockAddr, AF_INET, AF_INET6};
+    if len < 2 {
         return Err(E_INVALID);
     }
-    Ok(crate::network::udp::UdpEndpoint {
-        port: u16::from_be_bytes([b[2], b[3]]),
-        ip: [b[4], b[5], b[6], b[7]],
-    })
+    // 先只读 2 字节拿族号——族决定了后面要读多少
+    let mut fam = [0u8; 2];
+    match copy_from_user(ptr, &mut fam) {
+        Ok(2) => {}
+        _ => return Err(E_FAULT),
+    }
+    let family = u16::from_ne_bytes(fam);
+    if family == AF_INET {
+        if len < 16 {
+            return Err(E_INVALID);
+        }
+        let mut b = [0u8; 16];
+        match copy_from_user(ptr, &mut b) {
+            Ok(16) => {}
+            _ => return Err(E_FAULT),
+        }
+        Ok(SockAddr::V4 {
+            port: u16::from_be_bytes([b[2], b[3]]),
+            ip: [b[4], b[5], b[6], b[7]],
+        })
+    } else if family == AF_INET6 {
+        if len < 28 {
+            return Err(E_INVALID);
+        }
+        let mut b = [0u8; 28];
+        match copy_from_user(ptr, &mut b) {
+            Ok(28) => {}
+            _ => return Err(E_FAULT),
+        }
+        let mut ip = [0u8; 16];
+        ip.copy_from_slice(&b[8..24]);
+        Ok(SockAddr::V6 {
+            port: u16::from_be_bytes([b[2], b[3]]),
+            ip,
+        })
+    } else {
+        // 未知族 ⇒ 参数写错（-1），不是「没实现」（-38）
+        Err(E_INVALID)
+    }
 }
 
 /// 48：`socket(domain, type, protocol)` → 句柄。
@@ -2541,14 +2575,12 @@ fn sys_sock_create(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
 #[inline(never)]
 fn sys_sock_bind(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
-    if frame.rdx != 16 {
-        return E_INVALID;
-    }
+    // 长度由 `read_sockaddr` 按族自己判（IPv4 16 / IPv6 28）
     let (slot, gen) = match socket_slot_of(frame.rdi, owner) {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let ep = match read_sockaddr_in(frame.rsi) {
+    let ep = match read_sockaddr(frame.rsi, frame.rdx) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -2580,14 +2612,12 @@ fn sys_sock_listen(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
 #[inline(never)]
 fn sys_sock_connect(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
-    if frame.rdx != 16 {
-        return E_INVALID;
-    }
+    // 长度由 `read_sockaddr` 按族自己判（IPv4 16 / IPv6 28）
     let (slot, gen) = match socket_slot_of(frame.rdi, owner) {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let ep = match read_sockaddr_in(frame.rsi) {
+    let ep = match read_sockaddr(frame.rsi, frame.rdx) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -2631,13 +2661,21 @@ fn sys_sock_send(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
         Ok(v) => v,
         Err(e) => return e,
     };
-    if peer.port == 0 {
+    if peer.port() == 0 {
         // 没 connect 就 send：Linux 回 EDESTADDRREQ（-89）。
         return u64::MAX - 88;
     }
-    if local.port == 0 {
-        // 临时端口：从 49152 起按槽号错开（IANA 动态端口段）
-        local.port = 49152 + slot;
+    // 临时端口：从 49152 起按槽号错开（IANA 动态端口段）
+    if local.port() == 0 {
+        let p = 49152 + slot;
+        local = match local {
+            crate::network::socket::SockAddr::V4 { ip, .. } => {
+                crate::network::socket::SockAddr::V4 { ip, port: p }
+            }
+            crate::network::socket::SockAddr::V6 { ip, .. } => {
+                crate::network::socket::SockAddr::V6 { ip, port: p }
+            }
+        };
         if let Err(e) = crate::network::socket::bind(slot, gen, local) {
             return e;
         }
@@ -2647,19 +2685,43 @@ fn sys_sock_send(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
         Ok(n) if n == len => {}
         _ => return E_FAULT,
     }
-    // 惰性 bind 网卡（与 33 号同一条：shell 会话里没人先调 bind_net）
+    // 惰性 bind 网卡（与 33 号同一条：shell 会话里没人先 bind_net）
     if crate::virtio::bind_net().is_err() {
         return E_IO;
     }
-    let (dst_mac, src_mac) = match net_macs_for(peer.ip) {
-        Some(v) => v,
-        None => return E_IO,
-    };
+    let our_mac = crate::virtio::net_info().map(|i| i.mac).unwrap_or([0u8; 6]);
     let mut f = [0u8; 1536];
-    let Some(flen) = crate::network::udp::build_frame(
-        &mut f, &dst_mac, &src_mac, local, peer, &payload[..len],
-    ) else {
-        return E_INVALID;
+    // **按族分流**（ADR-182 决策 5）：两个族的帧格式完全不同，不能混。
+    let flen = match (local, peer) {
+        (
+            crate::network::socket::SockAddr::V4 { ip: sip, port: sp },
+            crate::network::socket::SockAddr::V4 { ip: dip, port: dp },
+        ) => {
+            let Some((dst_mac, _)) = net_macs_for(dip) else { return E_IO };
+            let l = crate::network::udp::UdpEndpoint { ip: sip, port: sp };
+            let r = crate::network::udp::UdpEndpoint { ip: dip, port: dp };
+            match crate::network::udp::build_frame(&mut f, &dst_mac, &our_mac, l, r, &payload[..len]) {
+                Some(n) => n,
+                None => return E_INVALID,
+            }
+        }
+        (
+            crate::network::socket::SockAddr::V6 { ip: sip, port: sp },
+            crate::network::socket::SockAddr::V6 { ip: dip, port: dp },
+        ) => {
+            // IPv6 的目标 MAC：先查 NDP 缓存（本轮用 ARP 表按低 32 位复用，
+            // 真正的 NDP 缓存是未决），查不到就用被请求节点组播的组播 MAC。
+            let dst_mac = ndp_mac_for(&dip);
+            match crate::network::ipv6::build_udp6_frame(
+                &mut f, &dst_mac, &our_mac, &sip, &dip, sp, dp, &payload[..len],
+            ) {
+                Some(n) => n,
+                None => return E_INVALID,
+            }
+        }
+        // 族不一致 ⇒ 参数写错。**不静默按 IPv4 发**：
+        // 那会把一个 IPv6 地址的低 32 位当 IPv4 发出去，对端收到的是垃圾。
+        _ => return E_INVALID,
     };
     if crate::virtio::send_raw(&f[..flen]).is_err() {
         return E_IO;
@@ -2667,6 +2729,19 @@ fn sys_sock_send(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     len as u64
 }
 
+/// 取发往某个 IPv6 地址的目标 MAC。
+///
+/// 本轮**没有独立的 NDP 邻居缓存**（ADR-182 未决）：
+/// 用「被请求节点组播」的组播 MAC 作为默认目标。
+///
+/// 这在链路本地单跳场景下**能工作**：目标主机一定会收到发给它自己组播组的帧，
+/// 然后按 IPv6 头里的单播目的地址决定收不收。代价是同一链路上所有同组播组的
+/// 主机都会收到一份——比真正的 NDP 缓存低效，但正确。
+#[cfg(feature = "handles")]
+fn ndp_mac_for(dst_ip: &[u8; 16]) -> [u8; 6] {
+    let mcast = crate::network::ipv6::solicited_node_multicast(dst_ip);
+    [0x33, 0x33, mcast[12], mcast[13], mcast[14], mcast[15]]
+}
 /// 54：`recv(h, buf, len, flags)` → 收到的字节数。
 ///
 /// **非阻塞**：队列空回 `-11`（EAGAIN）。阻塞版要等 `RANK_WAITQ` 接入，是未决。

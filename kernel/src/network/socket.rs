@@ -45,16 +45,88 @@ pub const E_OPNOTSUPP: u64 = u64::MAX - 94;  // -95 EOPNOTSUPP
 pub const E_ADDRINUSE: u64 = u64::MAX - 97;  // -98 EADDRINUSE
 pub const E_EXHAUSTED: u64 = u64::MAX - 5;   // -6  ENOMEM
 
+/// 一个 socket 端点：两个族并列（ADR-182 决策 5 / ADR-183）。
+///
+/// ## 为什么不用 `udp::UdpEndpoint`
+///
+/// 那个类型是 `{ ip: [u8; 4], port: u16 }` —— **装不下 IPv6**。
+/// 但它是 IPv4 路径上**实测在跑**的类型，改它等于改 `udp.rs` 的全部调用点。
+///
+/// 所以 socket 层自己用一个能装两族的枚举，IPv4 值从 `UdpEndpoint` 转换过来。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SockAddr {
+    V4 { ip: [u8; 4], port: u16 },
+    V6 { ip: [u8; 16], port: u16 },
+}
+
+impl SockAddr {
+    pub const fn port(&self) -> u16 {
+        match self {
+            SockAddr::V4 { port, .. } => *port,
+            SockAddr::V6 { port, .. } => *port,
+        }
+    }
+
+    pub const fn is_v6(&self) -> bool {
+        matches!(self, SockAddr::V6 { .. })
+    }
+
+    /// 未绑定/未连接的哨兵（端口 0 且地址全零）。
+    ///
+    /// **族也要判**：`V4{0.0.0.0:0}` 与 `V6{:::0}` 都是「空」，
+    /// 但它们的族不同——一个 `AF_INET6` socket 的空端点必须是 `V6`，
+    /// 否则 `send` 会走进 IPv4 分支。
+    pub fn is_empty(&self) -> bool {
+        match self {
+            SockAddr::V4 { ip, port } => *port == 0 && ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0,
+            SockAddr::V6 { ip, port } => {
+                if *port != 0 {
+                    return false;
+                }
+                let mut i = 0;
+                while i < 16 {
+                    if ip[i] != 0 {
+                        return false;
+                    }
+                    i += 1;
+                }
+                true
+            }
+        }
+    }
+
+    /// IPv4 视图（`send` 走 `udp::build_frame` 时用）。
+    pub const fn as_v4(&self) -> Option<udp::UdpEndpoint> {
+        match self {
+            SockAddr::V4 { ip, port } => Some(udp::UdpEndpoint { ip: *ip, port: *port }),
+            SockAddr::V6 { .. } => None,
+        }
+    }
+
+    /// IPv6 视图（`send` 走 `ipv6::build_udp6_frame` 时用）。
+    pub const fn as_v6(&self) -> Option<([u8; 16], u16)> {
+        match self {
+            SockAddr::V4 { .. } => None,
+            SockAddr::V6 { ip, port } => Some((*ip, *port)),
+        }
+    }
+
+    /// 由 IPv4 端点构造（既有路径的转换入口）。
+    pub const fn from_v4(e: udp::UdpEndpoint) -> SockAddr {
+        SockAddr::V4 { ip: e.ip, port: e.port }
+    }
+}
+
 /// 一个数据报在队列里的一份拷贝。
 #[derive(Clone, Copy)]
 pub struct Datagram {
-    pub src: UdpEndpoint,
+    pub src: SockAddr,
     pub len: u16,
     pub data: [u8; UDP_PAYLOAD_MAX],
 }
 
 const DG_EMPTY: Datagram = Datagram {
-    src: UdpEndpoint { ip: [0; 4], port: 0 },
+    src: SockAddr::V4 { ip: [0; 4], port: 0 },
     len: 0,
     data: [0; UDP_PAYLOAD_MAX],
 };
@@ -67,9 +139,9 @@ pub struct Socket {
     domain: u16,
     ty: u16,
     /// 本地端点（`bind` 之后有效）。
-    local: UdpEndpoint,
+    local: SockAddr,
     /// 默认对端（`connect` 之后有效）。UDP 的 connect 只是记住对端。
-    peer: UdpEndpoint,
+    peer: SockAddr,
     /// 接收队列头/尾与计数（环形）。
     rx_head: AtomicU32,
     rx_tail: AtomicU32,
@@ -82,8 +154,8 @@ const SOCK_EMPTY: Socket = Socket {
     gen: AtomicU32::new(0),
     domain: 0,
     ty: 0,
-    local: UdpEndpoint { ip: [0; 4], port: 0 },
-    peer: UdpEndpoint { ip: [0; 4], port: 0 },
+    local: SockAddr::V4 { ip: [0; 4], port: 0 },
+    peer: SockAddr::V4 { ip: [0; 4], port: 0 },
     rx_head: AtomicU32::new(0),
     rx_tail: AtomicU32::new(0),
     rx_count: AtomicU32::new(0),
@@ -98,14 +170,11 @@ static TABLE: IrqSpinLock<SocketTable> = IrqSpinLock::new(RANK_NET, SocketTable 
 
 /// 建一个 socket，返回 `(槽号, 世代)`。
 ///
-/// `domain` 只收 `AF_INET`；`AF_INET6` 回 `E_NOSYS`（**不是** `E_INVAL`——
+/// `domain` 收 `AF_INET` 与 `AF_INET6`（ADR-182 决策 5 落地：IPv6 已能建 socket）。
 /// 调用方要能分辨「参数写错」与「这个族还没实现」，ADR-181 决策 2）。
 /// `ty` 只收 `SOCK_DGRAM`；`SOCK_STREAM` 回 `E_NOSYS`（ADR-181 决策 1）。
 pub fn create(domain: u16, ty: u16) -> Result<(u16, u32), u64> {
-    if domain == AF_INET6 {
-        return Err(E_NOSYS);
-    }
-    if domain != AF_INET {
+    if domain != AF_INET && domain != AF_INET6 {
         return Err(E_INVAL);
     }
     if ty == SOCK_STREAM {
@@ -125,8 +194,15 @@ pub fn create(domain: u16, ty: u16) -> Result<(u16, u32), u64> {
     s.gen.store(s.gen.load(Ordering::Acquire).wrapping_add(1), Ordering::Release);
     s.domain = domain;
     s.ty = ty;
-    s.local = UdpEndpoint { ip: [0; 4], port: 0 };
-    s.peer = UdpEndpoint { ip: [0; 4], port: 0 };
+    // **空端点的族必须与 domain 一致**（ADR-182）：
+    // 一个 AF_INET6 socket 的空端点若是 V4，`send` 会走进 IPv4 分支。
+    if domain == AF_INET6 {
+        s.local = SockAddr::V6 { ip: [0; 16], port: 0 };
+        s.peer = SockAddr::V6 { ip: [0; 16], port: 0 };
+    } else {
+        s.local = SockAddr::V4 { ip: [0; 4], port: 0 };
+        s.peer = SockAddr::V4 { ip: [0; 4], port: 0 };
+    }
     s.rx_head.store(0, Ordering::Relaxed);
     s.rx_tail.store(0, Ordering::Relaxed);
     s.rx_count.store(0, Ordering::Relaxed);
@@ -159,7 +235,7 @@ pub fn live(slot: u16, gen: u32) -> bool {
 }
 
 /// `bind`：记住本地端点。
-pub fn bind(slot: u16, gen: u32, local: UdpEndpoint) -> Result<(), u64> {
+pub fn bind(slot: u16, gen: u32, local: SockAddr) -> Result<(), u64> {
     let mut g = TABLE.lock();
     let t = g.get();
     let Some(s) = t.slots.get_mut(usize::from(slot)) else {
@@ -169,12 +245,12 @@ pub fn bind(slot: u16, gen: u32, local: UdpEndpoint) -> Result<(), u64> {
         return Err(E_BAD_FD);
     }
     // 同端口重复绑定：本表没有"地址族共享"的概念，只查精确相同
-    if local.port != 0 {
+    if local.port() != 0 {
         for (i, o) in t.slots.iter().enumerate() {
             if i == usize::from(slot) || o.used.load(Ordering::Acquire) == 0 {
                 continue;
             }
-            if o.local.port == local.port && o.local.ip == local.ip {
+            if o.local == local {
                 return Err(E_ADDRINUSE);
             }
         }
@@ -184,7 +260,7 @@ pub fn bind(slot: u16, gen: u32, local: UdpEndpoint) -> Result<(), u64> {
 }
 
 /// `connect`：UDP 的 connect 只是记住默认对端。
-pub fn connect(slot: u16, gen: u32, peer: UdpEndpoint) -> Result<(), u64> {
+pub fn connect(slot: u16, gen: u32, peer: SockAddr) -> Result<(), u64> {
     let mut g = TABLE.lock();
     let t = g.get();
     let Some(s) = t.slots.get_mut(usize::from(slot)) else {
@@ -198,7 +274,7 @@ pub fn connect(slot: u16, gen: u32, peer: UdpEndpoint) -> Result<(), u64> {
 }
 
 /// 取本地/对端端点（`send`/`recv` 用）。
-pub fn endpoints(slot: u16, gen: u32) -> Result<(UdpEndpoint, UdpEndpoint), u64> {
+pub fn endpoints(slot: u16, gen: u32) -> Result<(SockAddr, SockAddr), u64> {
     let mut g = TABLE.lock();
     let t = g.get();
     let Some(s) = t.slots.get(usize::from(slot)) else {
@@ -211,12 +287,12 @@ pub fn endpoints(slot: u16, gen: u32) -> Result<(UdpEndpoint, UdpEndpoint), u64>
 }
 
 /// 往接收队列里放一个数据报。队列满 ⇒ 丢新包，返回 `false`。
-pub fn enqueue(dst_port: u16, src: UdpEndpoint, payload: &[u8]) -> bool {
+pub fn enqueue(dst_port: u16, src: SockAddr, payload: &[u8]) -> bool {
     let mut g = TABLE.lock();
     let t = g.get();
     // 找绑定在这个端口的 socket（端口 0 的 socket 收不到包）
     let Some(idx) = t.slots.iter().position(|s| {
-        s.used.load(Ordering::Acquire) != 0 && s.local.port == dst_port && dst_port != 0
+        s.used.load(Ordering::Acquire) != 0 && s.local.port() == dst_port && dst_port != 0
     }) else {
         return false;
     };
@@ -235,7 +311,7 @@ pub fn enqueue(dst_port: u16, src: UdpEndpoint, payload: &[u8]) -> bool {
 }
 
 /// 从接收队列取一个数据报。空 ⇒ `None`（调用方回 `E_AGAIN`）。
-pub fn dequeue(slot: u16, gen: u32, out: &mut [u8]) -> Result<(UdpEndpoint, usize), u64> {
+pub fn dequeue(slot: u16, gen: u32, out: &mut [u8]) -> Result<(SockAddr, usize), u64> {
     let mut g = TABLE.lock();
     let t = g.get();
     let Some(s) = t.slots.get_mut(usize::from(slot)) else {
