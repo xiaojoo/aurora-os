@@ -23473,3 +23473,62 @@ USB 与前面几片都不同：它有真正的**硬件状态机**，判据要证
 4. **事件环**（Transfer Event / Command Completion 的消费）
 5. **设备类驱动**（HID / 大容量存储）
 6. **QEMU xHCI 的端到端验证** —— 今天没有任何真实设备参与
+---
+
+## 528. ADR-209 落地：xHCI 能力解码与初始化序列（切片 H 第二层）（2026-11-23）
+
+### 为什么还是纯函数
+
+当前 QEMU 配置只有 6 台 PCI 设备，**没有 xHCI**（class 0x0c/0x03）。真机初始化无法在这里验证，
+所以继续走 ADR-208 的路线：**输入寄存器快照 → 输出配置动作序列**，
+判据可以喂任意快照（包括损坏的）。
+
+### 交付
+
+    CapSnapshot { cap_length, hcsparams1, hccparams1, doorbell_offset }
+    InitError { NoSlots, BadCapLength, BadDoorbell, No64Bit, NoPorts, BadAlignment }
+    OpWrite { UsbCmd, Crcr, Dcbaap, Config }
+    plan_init(&cap, cmd_ring_bus, dcbaa_bus) -> Result<[OpWrite;5], InitError>
+
+### 决策 1：先形状校验，再能力校验，最后产出写序列
+
+一个形状非法的寄存器（比如 CAPLength=0x10）不该先报「没有端口」——
+**根因优先级要让判据能定位**。
+
+### 决策 2：错误码按成因分开
+
+第一版把 DMA 未对齐复用了 `BadCapLength(0)`，那会让调用方分不清该改驱动还是改分配器。
+补了 `BadAlignment(u64)` 带出那个地址。
+
+**「能力寄存器形状」和「软件给的缓冲没对齐」是完全不同的成因，不能混成一个码。**
+
+### 决策 3：5 步序列的顺序是硬约束
+
+    1) USBCMD HCRST=1    复位（硬件自清）
+    2) DCBAAP  表指针
+    3) CRCR    命令环指针（cycle=1）
+    4) CONFIG  MaxSlotsEn
+    5) USBCMD  RS=1 + IE=1   运行 + 中断使能
+
+**复位必须第一步、运行必须最后一步**。负样本把复位去掉 ⇒ 顺序格当场红。
+
+### 判据七格
+
+    xhci-init: 解码=true op=true db=true 序列=true 顺序=true 拒绝=true 对齐=true ⇒ true
+
+负样本（去掉第一步复位）⇒「序列不对 plan=true order=false」。
+
+### 读数
+
+| 项 | 结果 |
+|---|---|
+| `check` | **21/21** |
+| `handles` 档 | `t_xhci_init` 七格全绿；唯一失败是既有 `t_map_hole` |
+
+### 未做
+
+1. **真的读写 CAP/OP 寄存器** —— 需要 `DriverCtx::map_mmio/read32/write32`，且要有 xHCI 设备
+2. **QEMU 配置加 xHCI 设备** —— 否则真机路径永远测不到
+3. **等 CNR=0 的轮询**
+4. **Scratchpad Buffer 分配** —— 解码了张数但没分配
+5. **端口枚举**（Enable Slot → Address Device → Configure Endpoint）

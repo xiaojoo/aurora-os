@@ -254,3 +254,166 @@ pub const OP_FRINDEX: usize = 0x0C;
 pub const OP_CRCR: usize = 0x18;
 pub const OP_DCBAAP: usize = 0x30;
 pub const OP_CONFIG: usize = 0x38;
+
+// ---------------------------------------------------------------- ADR-209：xHCI 能力解码与初始化序列
+
+/// **能力寄存器快照**（ADR-209）。
+///
+/// 只含初始化真正要读的四个寄存器。判据可以喂任意快照（包括损坏的），
+/// 而不需要真的 xHCI 设备 —— 这是这一层能被纯函数证伪的关键。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CapSnapshot {
+    pub cap_length: u8,
+    pub hcsparams1: u32,
+    pub hccparams1: u32,
+    pub doorbell_offset: u32,
+}
+
+impl CapSnapshot {
+    /// MaxSlotsEn（HCSPARAMS1 bit 7:0）。**0 表示这个控制器不支持任何槽**，
+    /// 初始化必须拒绝而不是继续。
+    pub fn max_slots(&self) -> u8 {
+        (self.hcsparams1 & 0xFF) as u8
+    }
+
+    /// MaxIntrs（bit 18:8）。
+    pub fn max_intrs(&self) -> u16 {
+        ((self.hcsparams1 >> 8) & 0x7FF) as u16
+    }
+
+    /// MaxPorts（bit 31:24）。
+    pub fn max_ports(&self) -> u8 {
+        ((self.hcsparams1 >> 24) & 0xFF) as u8
+    }
+
+    /// AC64（HCCPARAMS1 bit 0）：1 = 支持 64 位寻址，0 = 只有 32 位。
+    pub fn ac64(&self) -> bool {
+        self.hccparams1 & 1 != 0
+    }
+
+    /// CSZ（bit 3）：1 = 控制端点用 64 字节 TRB，0 = 32 字节。
+    pub fn csz(&self) -> bool {
+        self.hccparams1 >> 3 & 1 != 0
+    }
+
+    /// Max Scratchpad Buffers（bit 12:7）。**acyclic 的数目**，
+    /// 决定要分配几张 Scratchpad Buffer Array 表项。
+    pub fn max_scratchpad(&self) -> u16 {
+        ((self.hccparams1 >> 7) & 0x1F) as u16
+    }
+
+    /// 运行寄存器的基址偏移 = CAPLength（spec §5.3）。
+    ///
+    /// **必须是 32 的倍数**（spec 要求 CAPLength 是 4 的倍数且最小 0x20）。
+    pub fn op_offset(&self) -> Option<usize> {
+        let n = self.cap_length as usize;
+        if n < 0x20 || n % 4 != 0 {
+            return None;
+        }
+        Some(n)
+    }
+
+    /// Doorbell 数组基址偏移（spec §5.3）。
+    ///
+    /// **必须落在 CAP 区域内**（`doorbell_offset >= cap_length`），
+    /// 而且不能是 0（0 表示这个寄存器不存在）。
+    pub fn doorbell_offset(&self) -> Option<usize> {
+        let n = self.doorbell_offset as usize;
+        let cap = self.cap_length as usize;
+        if n == 0 || n < cap || n % 4 != 0 {
+            return None;
+        }
+        Some(n)
+    }
+}
+
+/// 初始化失败原因（ADR-209）。
+///
+/// **不用 `bool`**：「没有设备」「寄存器形状非法」「能力不支持」是三种不同的处置。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InitError {
+    /// MaxSlotsEn == 0：控制器不支持任何设备槽。
+    NoSlots,
+    /// CAPLength 非法（< 0x20 或不是 4 的倍数）。
+    BadCapLength(u8),
+    /// Doorbell 偏移非法（0 / 在 CAP 内 / 没对齐）。
+    BadDoorbell(u32),
+    /// 32 位 DMA 与要求不符（今天要求 AC64=1 —— 见决策）。
+    No64Bit,
+    /// MaxPorts == 0：没有下游端口。
+    NoPorts,
+    /// DMA 缓冲没有 64 字节对齐（命令环 / DCBAA）。
+    ///
+    /// 原本这里复用了 `BadCapLength(0)`，那是错的：
+    /// 「能力寄存器形状」和「软件给的缓冲没对齐」是完全不同的成因，
+    /// 混成一个码会让调用方无法区分该改驱动还是改分配器。
+    BadAlignment(u64),
+}
+
+/// 初始化要写的 OP 寄存器（ADR-209）。
+///
+/// **只描述「写什么」，不真的写** —— 真写要经 `DriverCtx::write32`，
+/// 而那需要真实设备。分开之后，判据可以验证整条初始化序列。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpWrite {
+    /// USBCMD：先写 HCRST=1 复位，再等 CNR=0，再写 RS=1 运行。
+    UsbCmd { reset: bool, run: bool, interrupts: bool },
+    /// CRCR：Command Ring Control（低 6 位标志 + 指针）。
+    Crcr { ring: u64, cycle: bool },
+    /// DCBAAP：Device Context Base Address Array 指针。
+    Dcbaap { table: u64 },
+    /// CONFIG：MaxSlotsEn 写回（启用槽）。
+    Config { max_slots: u8 },
+}
+
+/// **从能力快照推导初始化序列**（ADR-209 的核心纯函数）。
+///
+/// 输入：CAP 寄存器快照 + 两个 DMA 缓冲的总线地址（命令环、DCBAA 表）。
+/// 输出：`Ok(序列)` 或 `Err(具体失败)`。
+///
+/// ## 为什么返回序列而不是直接操作
+///
+/// 与前几片同一条纪律：**只有纯函数能被判据完整证伪**。
+/// 真机接线是下一步的事；先把「序列推导对不对」证了。
+pub fn plan_init(
+    cap: &CapSnapshot,
+    cmd_ring_bus: u64,
+    dcbaa_bus: u64,
+) -> Result<[OpWrite; 5], InitError> {
+    // 顺序有意义：先形状校验，再能力校验，最后才产出写序列。
+    if cap.op_offset().is_none() {
+        return Err(InitError::BadCapLength(cap.cap_length));
+    }
+    if cap.doorbell_offset().is_none() {
+        return Err(InitError::BadDoorbell(cap.doorbell_offset));
+    }
+    if cap.max_slots() == 0 {
+        return Err(InitError::NoSlots);
+    }
+    if cap.max_ports() == 0 {
+        return Err(InitError::NoPorts);
+    }
+    if !cap.ac64() {
+        return Err(InitError::No64Bit);
+    }
+    // 命令环必须 64 字节对齐（spec §4.9: CRCR 低 6 位是标志）。
+    if cmd_ring_bus & 0x3F != 0 {
+        return Err(InitError::BadAlignment(cmd_ring_bus));
+    }
+    // DCBAA 必须 64 字节对齐。
+    if dcbaa_bus & 0x3F != 0 {
+        return Err(InitError::BadAlignment(dcbaa_bus));
+    }
+    Ok([
+        // 1) 复位：HCRST=1（硬件会自清）
+        OpWrite::UsbCmd { reset: true, run: false, interrupts: false },
+        // 2) DCBAA 指针
+        OpWrite::Dcbaap { table: dcbaa_bus },
+        // 3) 命令环指针（cycle=1 初始）
+        OpWrite::Crcr { ring: cmd_ring_bus, cycle: true },
+        // 4) CONFIG：启用全部槽
+        OpWrite::Config { max_slots: cap.max_slots() },
+        // 5) 运行：RS=1 + IE=1（中断使能）
+        OpWrite::UsbCmd { reset: false, run: true, interrupts: true },
+    ])
+}

@@ -1974,3 +1974,111 @@ fn t_xhci_trb() -> bool {
 }
 
 ktest!(KT_XHCI_TRB, t_xhci_trb);
+
+/// ADR-209：**xHCI 能力解码与初始化序列**的证人（切片 H 第二层）。
+///
+/// ## 要证什么
+///
+/// H 第一层做了 TRB 字节层；这一层把「读 CAP → 算出该写哪些 OP 寄存器」做成纯函数。
+/// 判据可以喂任意寄存器快照（包括损坏的），不需要真实 xHCI 设备。
+///
+/// ## 判据九格
+///
+/// 1. 能力字段解码：`max_slots` / `max_intrs` / `max_ports` / `ac64` / `csz` / `scratchpad`；
+/// 2. `op_offset()` = CAPLength，且非法值（<0x20 / 非 4 倍数）回 `None`；
+/// 3. `doorbell_offset()` 必须在 CAP 外且对齐；
+/// 4. **正常快照产出 5 步序列**：复位 → DCBAA → CRCR → CONFIG → 运行；
+/// 5. **顺序对**：复位在第一步、运行在最后一步（这是硬约束）；
+/// 6. `MaxSlotsEn=0` 回 `NoSlots`（不是静默继续）；
+/// 7. `MaxPorts=0` 回 `NoPorts`；
+/// 8. `AC64=0` 回 `No64Bit`；
+/// 9. **DMA 没对齐回 `BadAlignment`**（不是 `BadCapLength` —— 两种成因必须分开）。
+///
+/// **负样本**：把序列里「复位」和「运行」两步对调 ⇒ 第 5 格红。
+fn t_xhci_init() -> bool {
+    use crate::driver::xhci::{plan_init, CapSnapshot, InitError, OpWrite};
+    let mut ok = true;
+
+    // 合法快照：CAPLength=0x40, MaxSlots=8, MaxIntrs=16, MaxPorts=4, AC64=1, CSZ=1, scratch=2
+    let cap = CapSnapshot {
+        cap_length: 0x40,
+        hcsparams1: (4u32 << 24) | (16u32 << 8) | 8u32,
+        hccparams1: 1u32 | (1u32 << 3) | (2u32 << 7),
+        doorbell_offset: 0x1000,
+    };
+    let decode_ok = cap.max_slots() == 8
+        && cap.max_intrs() == 16
+        && cap.max_ports() == 4
+        && cap.ac64()
+        && cap.csz()
+        && cap.max_scratchpad() == 2;
+    if !decode_ok {
+        crate::log_fatal!("xhci-init: 能力字段解码不对");
+        ok = false;
+    }
+
+    // ② op_offset
+    let op_ok = cap.op_offset() == Some(0x40)
+        && CapSnapshot { cap_length: 0x10, ..cap }.op_offset().is_none()
+        && CapSnapshot { cap_length: 0x21, ..cap }.op_offset().is_none();
+    if !op_ok {
+        crate::log_fatal!("xhci-init: op_offset 判定不对");
+        ok = false;
+    }
+
+    // ③ doorbell
+    let db_ok = cap.doorbell_offset() == Some(0x1000)
+        && CapSnapshot { doorbell_offset: 0, ..cap }.doorbell_offset().is_none()
+        && CapSnapshot { doorbell_offset: 0x20, ..cap }.doorbell_offset().is_none()
+        && CapSnapshot { doorbell_offset: 0x1001, ..cap }.doorbell_offset().is_none();
+    if !db_ok {
+        crate::log_fatal!("xhci-init: doorbell 判定不对");
+        ok = false;
+    }
+
+    // ④⑤ 序列与顺序
+    let plan = plan_init(&cap, 0x2000, 0x3000);
+    let plan_ok = plan.is_ok();
+    let seq = plan.unwrap_or([OpWrite::UsbCmd { reset:false, run:false, interrupts:false }; 5]);
+    let len_ok = seq.len() == 5;
+    let order_ok = len_ok
+        && matches!(seq[0], OpWrite::UsbCmd { reset: true, run: false, .. })
+        && matches!(seq[1], OpWrite::Dcbaap { table: 0x3000 })
+        && matches!(seq[2], OpWrite::Crcr { ring: 0x2000, cycle: true })
+        && matches!(seq[3], OpWrite::Config { max_slots: 8 })
+        && matches!(seq[4], OpWrite::UsbCmd { reset: false, run: true, interrupts: true });
+    if !plan_ok || !order_ok {
+        crate::log_fatal!("xhci-init: 序列不对 plan={} order={}", plan_ok, order_ok);
+        ok = false;
+    }
+
+    // ⑥⑦⑧ 能力拒绝
+    let no_slots = plan_init(&CapSnapshot { hcsparams1: cap.hcsparams1 & !0xFF, ..cap }, 0x2000, 0x3000);
+    let no_ports = plan_init(&CapSnapshot { hcsparams1: cap.hcsparams1 & !(0xFF << 24), ..cap }, 0x2000, 0x3000);
+    let no_64 = plan_init(&CapSnapshot { hccparams1: cap.hccparams1 & !1, ..cap }, 0x2000, 0x3000);
+    let reject_ok = no_slots == Err(InitError::NoSlots)
+        && no_ports == Err(InitError::NoPorts)
+        && no_64 == Err(InitError::No64Bit);
+    if !reject_ok {
+        crate::log_fatal!("xhci-init: 能力拒绝不对");
+        ok = false;
+    }
+
+    // ⑨ 对齐错误码分开
+    let bad_ring = plan_init(&cap, 0x2001, 0x3000);
+    let bad_dcbaa = plan_init(&cap, 0x2000, 0x3001);
+    let align_ok = bad_ring == Err(InitError::BadAlignment(0x2001))
+        && bad_dcbaa == Err(InitError::BadAlignment(0x3001));
+    if !align_ok {
+        crate::log_fatal!("xhci-init: 对齐错误码没分开");
+        ok = false;
+    }
+
+    crate::log_info!(
+        "xhci-init: 解码={} op={} db={} 序列={} 顺序={} 拒绝={} 对齐={} ⇒ {}",
+        decode_ok, op_ok, db_ok, plan_ok, order_ok, reject_ok, align_ok, ok
+    );
+    ok
+}
+
+ktest!(KT_XHCI_INIT, t_xhci_init);
