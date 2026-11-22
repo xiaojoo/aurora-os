@@ -531,8 +531,27 @@ pub fn region_count() -> usize {
 /// `va` 落在某条保留里时返回该保留的末（不含），否则 0
 fn reserved_end(va: u64) -> u64 {
     let st = s();
-    for i in 0..MAX_VA_RESERVATIONS {
-        if st.va_used[i / 64] >> (i % 64) & 1 == 1 {
+    // **与 `release_va_locked` 同一套位图批扫**（ADR-207）。
+    //
+    // 这里原来是 `for i in 0..MAX_VA_RESERVATIONS` 逐项查 —— `MAX_VA_RESERVATIONS`
+    // 从 256 提到 65536 之后，最坏迭代数涨了 256 倍，而**本函数在某些路径上持 VMM 锁**。
+    //
+    // `release_va_locked` 的注释（ADR-179 补记二）早就记过同一个教训并改成了批扫，
+    // **但这里漏了** —— 实测 `t_sdkdemo` 4/10 红，日志里反复出现
+    // `va: 保留 0x100002000(+12288B) 第 2 页仍已映射，不放手`。
+    //
+    // 位图里 0 表示该 word 的 64 个槽全空 —— 直接跳过。实际在用的保留数是个位数到几十，
+    // 批扫把迭代数从 65536 降到 ~1。
+    for w in 0..VA_BITMAP_WORDS {
+        let word = st.va_used[w];
+        if word == 0 {
+            continue;
+        }
+        for b in 0..64usize {
+            if word >> b & 1 == 0 {
+                continue;
+            }
+            let i = w * 64 + b;
             let r = &va_res_slice()[i];
             if va >= r.base && va < r.base + r.len {
                 return r.base + r.len;
