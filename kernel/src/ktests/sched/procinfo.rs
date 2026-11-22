@@ -499,3 +499,108 @@ fn t_proc_fd_table() -> bool {
 
 #[cfg(feature = "handles")]
 ktest!(KT_PROC_FD_TABLE, t_proc_fd_table);
+
+/// ADR-180 未决 3：fd 表扩容。
+///
+/// ## 判据四格
+///
+/// 1. **装满 64 格**（`FD_TABLE_INIT`），`install` 全成功；
+/// 2. **第 65 个触发扩容**，返回 fd 64（不是 `Exhausted`）；
+/// 3. **扩容后旧数据不丢**：fd 0..63 的句柄逐个还在；
+/// 4. **容量写回主人**：`proc_fd_table` 重建的视图也看得见 fd 64。
+///
+/// 第 4 格是关键：`FdTable` 只是视图，容量记在 `ProcEntry.fd_cap`。
+/// 若 `install` 扩了容却没写回主人，下次重建视图只看得见前 64 格 ——
+/// **新扩的那些格写了也读不到**。
+///
+/// **负样本**：把 `proc_set_fd_cap` 那一步去掉，第 4 格立刻红。
+#[cfg(feature = "handles")]
+fn t_fd_table_grow() -> bool {
+    let mk = |slot: u64| crate::handle::Handle((1u64 << 16) | slot);
+
+    let Ok(job) = proc::job_create(None, 4, 64) else {
+        crate::log_fatal!("fdgrow: job_create 失败");
+        return false;
+    };
+    let Ok(p) = proc::proc_create(job) else {
+        crate::log_fatal!("fdgrow: proc_create 失败");
+        let _ = proc::job_destroy(job);
+        return false;
+    };
+    let g = proc::proc_gen(p).unwrap_or(0);
+
+    let mut ok = true;
+
+    // 1+2. 装满 64 格，第 65 个应触发扩容并返回 fd 64
+    let mut installed = 0usize;
+    let mut first_beyond = None;
+    if let Some(mut t) = proc::proc_fd_table(p, g) {
+        for i in 0..=crate::handle::FD_TABLE_INIT {
+            match t.install(mk((i as u64) + 1)) {
+                Ok(fd) => {
+                    installed += 1;
+                    if i == crate::handle::FD_TABLE_INIT {
+                        first_beyond = Some(fd);
+                    }
+                }
+                Err(e) => {
+                    crate::log_fatal!("fdgrow: 第 {} 个 install 失败 {:?}", i, e);
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        // 3. 旧数据不丢
+        let mut kept = 0usize;
+        for i in 0..crate::handle::FD_TABLE_INIT {
+            if t.lookup(i as u32) == Some(mk((i as u64) + 1)) {
+                kept += 1;
+            }
+        }
+        let kept_ok = kept == crate::handle::FD_TABLE_INIT;
+        if !kept_ok {
+            crate::log_fatal!("fdgrow: 扩容后旧数据丢了 {}/{}", kept, crate::handle::FD_TABLE_INIT);
+            ok = false;
+        }
+        // 把新容量写回主人（`install` 扩了容，但主人还不知道）
+        // **base 与 cap 一起写回**（实测教训）：`grow()` 换了新表，
+        // 只写 cap 不写 base 的话，重建的视图会按新容量去读旧表。
+        let new_cap = t.cap();
+        let new_base = t.base();
+        if !proc::proc_set_fd_table(p, g, new_base, new_cap) {
+            crate::log_fatal!("fdgrow: 写回 base/cap 失败");
+            ok = false;
+        }
+    } else {
+        crate::log_fatal!("fdgrow: 取不到 fd 表");
+        ok = false;
+    }
+
+    // 4. 重建的视图看得见 fd 64（容量已写回）
+    let rebuilt_ok = match proc::proc_fd_table(p, g) {
+        Some(t) => t.lookup(crate::handle::FD_TABLE_INIT as u32).is_some() && t.used() > crate::handle::FD_TABLE_INIT,
+        None => false,
+    };
+    if !rebuilt_ok {
+        crate::log_fatal!("fdgrow: 重建视图看不见扩容后的 fd（容量没写回主人？）");
+        ok = false;
+    }
+
+    let beyond_ok = first_beyond == Some(crate::handle::FD_TABLE_INIT as u32);
+    if !beyond_ok {
+        crate::log_fatal!("fdgrow: 第 65 个 fd = {:?} 期望 {:?}", first_beyond, crate::handle::FD_TABLE_INIT);
+        ok = false;
+    }
+
+    crate::log_info!(
+        "fdgrow: 装={} 第65个={:?} 旧数据保留={} 重建可见={} ⇒ {}",
+        installed, first_beyond, true, rebuilt_ok, ok
+    );
+
+    proc::proc_discard(p);
+    let _ = proc::job_destroy(job);
+    ok
+}
+
+#[cfg(feature = "handles")]
+ktest!(KT_FD_TABLE_GROW, t_fd_table_grow);

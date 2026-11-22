@@ -17,7 +17,7 @@
 //! - **计数读数**（`proc_count`/`job_count`）也不取锁：用例收尾的扫描（`main.rs::finish_sweep`）
 //!   按 ADR-069 是"只读快照、不拿锁"的，为此两张表的 `used` 都是 `AtomicBool`。
 
-use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering, AtomicU64};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering, AtomicU64, AtomicUsize};
 use crate::mm;
 
 pub const MAX_PROCESSES: usize = 32768;
@@ -98,6 +98,12 @@ struct ProcEntry {
     /// 正是 ADR-179 撞过的坑。Linux 的 `files_struct` 也是按需分配的。
     /// 0 = 还没分配（首次 `install`/`preset_std` 时才分）。
     fd_table: AtomicU64,
+    /// fd 表的**当前容量**（ADR-180 未决 3 落地）。0 = 还没分配。
+    ///
+    /// **为什么要单独存**：`handle::FdTable` 只是那块内存的一个视图，
+    /// 而 `ProcEntry` 是主人。扩容后容量不再是编译期常量 `FD_TABLE_INIT`，
+    /// 必须有人记住「现在多大」，否则重建视图时只看得见前 64 格。
+    fd_cap: AtomicUsize,
 }
 
 const JOB_EMPTY: JobEntry = JobEntry {
@@ -118,6 +124,7 @@ const PROC_EMPTY: ProcEntry = ProcEntry {
     threads: AtomicU16::new(0),
     signal: AtomicU32::new(SIG_RUNNING),
     fd_table: AtomicU64::new(0),
+    fd_cap: AtomicUsize::new(0),
 };
 
 struct ProcState {
@@ -449,17 +456,18 @@ pub fn proc_aspace(proc_id: u16, gen: u32) -> Option<(u16, u32)> {
 /// 已经存在，反向再加一条会成环。所以表住在 `proc`，`handle` 只提供「fd → 句柄」
 /// 的语义层（后续切片）。
 pub fn proc_fd_table(proc_id: u16, gen: u32) -> Option<crate::handle::FdTable> {
-    // 先查有没有（快路径，只持 VMM）。
+    // 快路径：已经分配过就按它记的容量重建视图。
     let existing = mm::with_vmm_lock(|| {
         let s = st();
         let p = s.procs.get(proc_id as usize)?;
         if !alive_flag(&p.used) || p.gen != gen {
             return None;
         }
-        Some(p.fd_table.load(Ordering::Acquire))
+        Some((p.fd_table.load(Ordering::Acquire), p.fd_cap.load(Ordering::Acquire)))
     })?;
-    if existing != 0 {
-        return Some(crate::handle::FdTable::from_ptr(existing));
+    if existing.0 != 0 {
+        // **容量必须从 `ProcEntry` 读**（ADR-180 未决 3）：扩容后它不再是常量。
+        return Some(crate::handle::FdTable::from_ptr(existing.0, existing.1));
     }
     // 懒分配：**锁外**分（走 PMM，不能持 VMM），再锁内装。
     let base = crate::handle::FdTable::allocate().ok()?;
@@ -472,29 +480,40 @@ pub fn proc_fd_table(proc_id: u16, gen: u32) -> Option<crate::handle::FdTable> {
         // 竞争兜底：若别的线程已经装了，用它的（把自己刚分的还回去）。
         let cur = p.fd_table.load(Ordering::Acquire);
         if cur != 0 {
-            return Some((cur, true));
+            return Some((cur, p.fd_cap.load(Ordering::Acquire), true));
         }
         p.fd_table.store(base, Ordering::Release);
-        Some((base, false))
+        p.fd_cap.store(crate::handle::FD_TABLE_INIT, Ordering::Release);
+        Some((base, crate::handle::FD_TABLE_INIT, false))
     })?;
-    let (use_base, was_race) = stored;
+    let (use_base, use_cap, was_race) = stored;
     if was_race {
         mm::release_fd_table(base, FD_TABLE_BYTES);
     }
-    Some(crate::handle::FdTable::from_ptr(use_base))
+    Some(crate::handle::FdTable::from_ptr(use_base, use_cap))
 }
 
-/// 给进程装一张 fd 表（ADR-180）。**`ptr` 必须来自 `handle` 侧的一次分配**。
+/// 扩容之后把**新基址与新容量**写回 `ProcEntry`（ADR-180 未决 3）。
+///
+/// ## 为什么 base 也要写（实测教训）
+///
+/// `FdTable` 只是那块内存的一个**视图**。`grow()` 换了一张新表（新 base），
+/// 但主人（`ProcEntry.fd_table`）仍然指着**旧表**。
+///
+/// 第一版只写回 `cap` 不写 `base`，实测 `fdgrow: 重建视图看不见扩容后的 fd`：
+/// 重建的视图 base 是旧的、cap 是新的 —— 它按 128 格去读一张 64 格的旧表，
+/// 读到的是旧表之后的内存（脏的）。
 ///
 /// 返回 `false` = 进程不存在或世代不符。
-pub fn proc_set_fd_table(proc_id: u16, gen: u32, ptr: u64) -> bool {
+pub fn proc_set_fd_table(proc_id: u16, gen: u32, base: u64, cap: usize) -> bool {
     mm::with_vmm_lock(|| {
         let s = st();
-        let Some(p) = s.procs.get(proc_id as usize) else { return false };
+        let Some(p) = s.procs.get_mut(proc_id as usize) else { return false };
         if !alive_flag(&p.used) || p.gen != gen {
             return false;
         }
-        p.fd_table.store(ptr, Ordering::Release);
+        p.fd_table.store(base, Ordering::Release);
+        p.fd_cap.store(cap, Ordering::Release);
         true
     })
 }

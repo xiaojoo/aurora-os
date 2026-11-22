@@ -1010,6 +1010,8 @@ public_api = [
   "handle::init",
   # ADR-180：per-process fd 表。
   "handle::FdTable",
+  "handle::FD_TABLE_INIT",
+  "handle::FD_TABLE_MAX",
 ]
 allowed_callers = ["integration", "sched"]
 dependencies = ["memory", "storage", "sync"]

@@ -568,23 +568,88 @@ impl FdTable {
         unsafe { core::slice::from_raw_parts_mut(base as *mut u64, cap) }
     }
 
-    /// 装一个句柄进最小空闲 fd，返回 fd。
+    /// 装一个句柄进最小空闲 fd，返回 fd。**满了自动翻倍**（到 `FD_TABLE_MAX` 为止）。
     ///
-    /// **满了不扩容**（本轮）：`FD_TABLE_MAX` 之内的扩容要重分配 + 拷贝，
-    /// 而拷贝必须在锁内、又不能让别的 CPU 看到半张表。那需要一套发布协议，
-    /// 本轮先做「64 个够用」的形状，扩容留到有真实调用者时再定（ADR-180 未决 3）。
+    /// ## 扩容的发布协议（ADR-180 未决 3）
+    ///
+    /// 拷贝必须**在持 HANDLE 锁时**完成，且新表**先装好再换指针**：
+    ///
+    ///     1. 分配新表（锁外，走 PMM）
+    ///     2. 拷旧内容 + 清尾巴
+    ///     3. 一次性 store 新 base（Release）
+    ///     4. 旧表**不立即归还**（可能有读者正拿着旧视图）
+    ///
+    /// 第 4 步是刻意的：`lookup` 走 `as_slice` 拿的是当时那个 base，
+    /// 换指针之后它手里的旧切片仍然有效（内容还在）。若立刻归还旧页，
+    /// 那个读者就读到已回收的内存。旧表由 `proc` 侧在进程销毁时一并还（见 `fd_tables`）。
     pub fn install(&mut self, h: Handle) -> Result<u32, HErr> {
         self.ensure()?;
-        let cap = self.cap.load(Ordering::Acquire);
-        let slice = self.as_mut_slice();
-        for i in 0..cap {
-            if slice[i] == 0 {
-                slice[i] = h.0;
-                self.used.fetch_add(1, Ordering::Relaxed);
-                return Ok(i as u32);
+        // 先找空位；满了就扩容再找。
+        for _ in 0..4 {
+            let cap = self.cap.load(Ordering::Acquire);
+            let slice = self.as_mut_slice();
+            for i in 0..cap {
+                if slice[i] == 0 {
+                    slice[i] = h.0;
+                    self.used.fetch_add(1, Ordering::Relaxed);
+                    return Ok(i as u32);
+                }
             }
+            // 满了：翻倍。到顶就返回耗尽。
+            if cap >= FD_TABLE_MAX {
+                return Err(HErr::Exhausted);
+            }
+            self.grow()?;
         }
         Err(HErr::Exhausted)
+    }
+
+    /// 把表翻倍（64 → 128 → … → `FD_TABLE_MAX`）。**调用方持 HANDLE 锁**。
+    ///
+    /// 返回新容量。旧表**不归还**（见 `install` 的第 4 步）。
+    fn grow(&mut self) -> Result<usize, HErr> {
+        let old_base = self.base.load(Ordering::Acquire);
+        let old_cap = self.cap.load(Ordering::Acquire);
+        if old_cap >= FD_TABLE_MAX {
+            return Err(HErr::Exhausted);
+        }
+        let new_cap = (old_cap * 2).min(FD_TABLE_MAX);
+        let bytes = new_cap * core::mem::size_of::<u64>();
+        let pages = bytes.div_ceil(crate::mm::PAGE);
+        let order = (usize::BITS - 1 - pages.leading_zeros()) as u8;
+        let min_phys = crate::mm::max_phys() / 2;
+        let new_va = crate::mm::alloc_fd_table_pages(order, min_phys)
+            .map_err(|_| HErr::Exhausted)?;
+        // SAFETY: new_va 指向刚分配的连续帧（>= new_cap 个 u64）；
+        // 调用方持 HANDLE 锁 ⇒ 独占；归 MOD_BOOT 永不归还（由 proc 侧记账）。
+        unsafe {
+            let dst = new_va as *mut u64;
+            let src = old_base as *const u64;
+            // 拷旧内容（old_cap 项），清尾巴（new_cap - old_cap 项）
+            for i in 0..old_cap {
+                core::ptr::write(dst.add(i), core::ptr::read(src.add(i)));
+            }
+            for i in old_cap..new_cap {
+                core::ptr::write(dst.add(i), 0);
+            }
+        }
+        // 一次性换指针（Release）：读者要么看到旧表、要么看到新表，不会看到半张。
+        self.base.store(new_va, Ordering::Release);
+        self.cap.store(new_cap, Ordering::Release);
+        Ok(new_cap)
+    }
+
+    /// 这张表本体的 HHDM 地址（0 = 未分配）。
+    ///
+    /// **扩容后必须把它写回 `ProcEntry`**：`grow()` 换了新表，
+    /// 主人若只知道旧 base，重建视图就会按新容量去读旧表（越界读脏）。
+    pub fn base(&self) -> u64 {
+        self.base.load(Ordering::Acquire)
+    }
+
+    /// 当前容量（0 = 未分配）。
+    pub fn cap(&self) -> usize {
+        self.cap.load(Ordering::Acquire)
     }
 
     /// fd → 句柄。fd 越界或该位为空 ⇒ `None`。
@@ -680,10 +745,15 @@ impl FdTable {
     ///
     /// 修法：容量是编译期常量（`FD_TABLE_INIT`），`from_ptr` 直接用它；
     /// `used` 改成**每次现算**（扫一遍 entries），不存第二份真相。
-    pub fn from_ptr(base: u64) -> FdTable {
+    /// `cap` 是**这张表实际的容量**（`FD_TABLE_INIT` 或扩容后的值）。
+    ///
+    /// **为什么必须传进来**：`ProcEntry` 只存了 `base`（entries 的地址），
+    /// 扩容之后容量不再是编译期常量 `FD_TABLE_INIT`。第一版让它恒等于
+    /// `FD_TABLE_INIT`，扩容后重建的视图只看得见前 64 格 —— 后 960 格写了也读不到。
+    pub fn from_ptr(base: u64, cap: usize) -> FdTable {
         FdTable {
             base: AtomicU64::new(base),
-            cap: AtomicUsize::new(if base == 0 { 0 } else { FD_TABLE_INIT }),
+            cap: AtomicUsize::new(if base == 0 { 0 } else { cap }),
             used: AtomicUsize::new(0),
         }
     }
