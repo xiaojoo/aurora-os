@@ -1483,3 +1483,235 @@ fn t_fd_number() -> bool {
 }
 
 ktest!(KT_FD_NUMBER, t_fd_number);
+
+
+/// 工人收工标志。
+///
+/// **不能用 `halt_forever()`**（实测 HANG）：那个函数关中断永久停住，
+/// `terminate_task` 再也收不掉它，整个用例链卡死。
+/// 用「自旋等标志」的形状（与 `q2_worker` 同一套），收场时置 1 让它自己退出。
+#[cfg(feature = "handles")]
+static HPROC_GO: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// 两条内核线程的入口：占住一个 (任务, 进程) 对，等收工标志。
+#[cfg(feature = "handles")]
+fn hproc_worker() -> ! {
+    // 有界自旋：即使收工标志永远不来也会自己退出，不会把用例链挂死。
+    let t0 = crate::time::tsc::now();
+    while HPROC_GO.load(core::sync::atomic::Ordering::Acquire) == 0 {
+        if crate::time::tsc::now().wrapping_sub(t0) > 400_000_000 {
+            break;
+        }
+        crate::time::tsc::spin(20_000);
+    }
+    // 收工走 `finish_current` + 有界自旋（与 `p3_worker` 同一套）：
+    // `exit_current` 返回 `()` 而本函数是 `-> !`，且它直接 `terminate_task` 会把
+    // 自己脚下的栈抽掉。`finish_current` 标 Done，下一次 tick 换走。
+    crate::sched::finish_current();
+    loop {
+        crate::time::tsc::spin(1000);
+    }
+}
+
+/// ADR-191：**句柄 owner 认进程，不只认任务**的证人。
+///
+/// ## 为什么要造真线程
+///
+/// 第一版在 boot 任务上跑，两格都打「无对象可测」——**判据绿但关键路径没验**。
+/// 这一版用 `proc_attach_thread` + `set_proc_id` 造两条**同进程**的内核线程，
+/// 让「同进程放行」与「别进程拒绝」都真的有对象可测。
+///
+/// ## 判据五格
+///
+/// 1. 同任务访问自己的句柄 ⇒ 通过；
+/// 2. **同进程的另一线程** ⇒ 通过（本轮新能力）；
+/// 3. 别的进程的任务 ⇒ `NotOwner`；
+/// 4. `NO_PROC` 的句柄不许跨任务（无进程身份时不能靠「都是 NO_PROC」放行）；
+/// 5. 转移之后 `owner_proc` 跟着新主人走。
+///
+/// **负样本**：去掉 `same_proc` 那一支 ⇒ 第 2 格红。
+#[cfg(feature = "handles")]
+fn t_handle_proc_owner() -> bool {
+    use crate::handle::{self, RIGHT_READ};
+    use crate::proc;
+    use crate::sched;
+    let mut ok = true;
+    sched::init_boot_task();
+    sched::start_workers();
+    HPROC_GO.store(0, core::sync::atomic::Ordering::Release);
+    let Some(me) = sched::current_identity() else {
+        crate::log_fatal!("hproc: 拿不到当前身份");
+        return false;
+    };
+    let h_before = handle::live();
+
+    // ---- 造两个进程，各挂两条线程
+    let mut pids = [proc::NO_PROC; 2];
+    // **用 `Option` 而不是 `0` 做哨兵**（实测）：`job_create` 返回的第一个 id 就是 **0**，
+    // 用 `!= 0` 判「有没有」会把合法 job 0 当成没有 ⇒ 漏销毁 1 个 ⇒
+    // 后面每个用例的收尾闸都红（`t_handle_proc_owner 之后仍有 1 个 Job 没销毁`）。
+    let mut jobs: [Option<u16>; 2] = [None; 2];
+    let mut gids: [[usize; 2]; 2] = [[0; 2]; 2];
+    let mut threads_ok = 0usize;
+    for pi in 0..2 {
+        // **失败不提前返回**（实测教训）：提前 `return` 会把前面已建的 Job 留在表里，
+        // 后面每个用例的「收尾不变量」闸都会红（一次漏 2 个 Job ⇒ 3 个用例级联失败）。
+        // 这里改成记 `ok = false` 后继续，统一走到收场。
+        let job = match proc::job_create(None, 4, 64) {
+            Ok(j) => j,
+            Err(_) => {
+                crate::log_fatal!("hproc: job_create 失败");
+                ok = false;
+                break;
+            }
+        };
+        jobs[pi] = Some(job);
+        let pid = match proc::proc_create(job) {
+            Ok(p) => p,
+            Err(_) => {
+                crate::log_fatal!("hproc: proc_create 失败");
+                ok = false;
+                continue;
+            }
+        };
+        pids[pi] = pid;
+        for ti in 0..2 {
+            let g = match sched::spawn(hproc_worker) {
+                Ok(g) => g,
+                Err(_) => {
+                    crate::log_fatal!("hproc: spawn 失败");
+                    break;
+                }
+            };
+            if proc::proc_attach_thread(pid).is_ok() && sched::set_proc_id(g, pid) {
+                gids[pi][ti] = g;
+                threads_ok += 1;
+            } else {
+                let _ = sched::terminate_task(g);
+            }
+        }
+    }
+    if threads_ok < 4 {
+        crate::log_fatal!("hproc: 只建成 {}/4 条线程", threads_ok);
+        ok = false;
+    }
+
+    // ---- 用进程 0 的第一条线程做主人，建一个句柄
+    let owner_a = match sched::identity_of(gids[0][0]) {
+        Some(v) => v,
+        None => {
+            crate::log_fatal!("hproc: 取不到线程身份");
+            ok = false;
+            HPROC_GO.store(1, core::sync::atomic::Ordering::Release);
+            for q in 0..2 {
+                if let Some(j) = jobs[q] { let _ = proc::job_destroy(j); }
+            }
+            return false;
+        }
+    };
+    // **转移要 `RIGHT_TRANSFER`**（实测：只给 READ 时 `transfer` 回 `Denied`，
+    // 第 5 格当场红）。建句柄时就要把这一位带上，否则那一格测的是权限不是归属。
+    let h = match handle::grant_console(
+        owner_a,
+        RIGHT_READ | crate::handle::RIGHT_TRANSFER,
+        0,
+    ) {
+        Ok(h) => h,
+        Err(_) => {
+            crate::log_fatal!("hproc: grant_console 失败");
+            ok = false;
+            HPROC_GO.store(1, core::sync::atomic::Ordering::Release);
+            for q in 0..2 {
+                if let Some(j) = jobs[q] { let _ = proc::job_destroy(j); }
+            }
+            return false;
+        }
+    };
+
+    // ① 同任务
+    let same_task = handle::resolve(h, owner_a, RIGHT_READ).is_ok();
+    if !same_task {
+        crate::log_fatal!("hproc: 同任务访问失败");
+        ok = false;
+    }
+
+    // ② **同进程的另一条线程**（这是本轮的核心）
+    let owner_a2 = sched::identity_of(gids[0][1]).unwrap_or((usize::MAX, 0));
+    let same_proc = handle::resolve(h, owner_a2, RIGHT_READ).is_ok();
+    if !same_proc {
+        crate::log_fatal!("hproc: 同进程的另一条线程被拒（应为通过）");
+        ok = false;
+    }
+
+    // ③ 别的进程的线程必须被拒
+    let owner_b = sched::identity_of(gids[1][0]).unwrap_or((usize::MAX, 0));
+    let foreign_rejected = handle::resolve(h, owner_b, RIGHT_READ).is_err();
+    if !foreign_rejected {
+        crate::log_fatal!("hproc: 别的进程竟然通过了");
+        ok = false;
+    }
+
+    // ④ `NO_PROC` 的句柄不许跨任务（拿 boot 任务的句柄给上面那些线程读）
+    let h_np = match handle::grant_console(me, RIGHT_READ, 0) {
+        Ok(v) => v,
+        Err(_) => {
+            crate::log_fatal!("hproc: 第二个 grant 失败");
+            return false;
+        }
+    };
+    let no_proc_cross = handle::resolve(h_np, owner_a, RIGHT_READ).is_err();
+    if !no_proc_cross {
+        crate::log_fatal!("hproc: 无进程身份的句柄被跨任务访问了");
+        ok = false;
+    }
+
+    // ⑤ 转移之后 `owner_proc` 跟着走
+    // **`transfer` 返回新句柄值**（世代号 bump 过），旧值当场 Stale。
+    // 第一版拿旧值去 resolve 新主人 ⇒ 恒 `Stale` ⇒ 第 5 格假红（实测）。
+    let moved_h = handle::transfer(h, owner_a, owner_b).ok();
+    let moved = moved_h.is_some();
+    let after_owner_ok = moved_h.is_some_and(|nh| handle::resolve(nh, owner_b, RIGHT_READ).is_ok());
+    let old_denied = moved && handle::resolve(h, owner_a, RIGHT_READ).is_err();
+    if !after_owner_ok || !old_denied {
+        crate::log_fatal!("hproc: 转移后归属不对 新={} 旧拒={}", after_owner_ok, old_denied);
+        ok = false;
+    }
+
+    // ---- 收场：**先放工人走**，再收句柄与进程
+    HPROC_GO.store(1, core::sync::atomic::Ordering::Release);
+    let _ = handle::close(h_np, me);
+    match moved_h {
+        Some(nh) => {
+            let _ = handle::close(nh, owner_b);
+        }
+        None => {
+            let _ = handle::close(h, owner_a);
+        }
+    }
+    for pi in 0..2 {
+        for ti in 0..2 {
+            if gids[pi][ti] != 0 {
+                let _ = sched::terminate_task(gids[pi][ti]);
+                let _ = proc::proc_detach_thread(pids[pi]);
+            }
+        }
+        if pids[pi] != proc::NO_PROC {
+            let _ = proc::proc_reap(pids[pi]);
+        }
+        // **Job 必须销毁**（实测：漏 2 个 Job 让后面 3 个用例的收尾闸全红）
+        if let Some(j) = jobs[pi] {
+            let _ = proc::job_destroy(j);
+        }
+    }
+    crate::log_info!(
+        "hproc: jobs={:?} pids={:?} 线程={} 同任务={} 同进程={} 别进程拒={} 无进程不跨={} 转移后={} 旧拒={} 句柄={}->{} ⇒ {}",
+        jobs, pids,
+        threads_ok, same_task, same_proc, foreign_rejected, no_proc_cross,
+        after_owner_ok, old_denied, h_before, handle::live(), ok
+    );
+    ok
+}
+
+// NEGATIVE SAMPLE: 暂时不收集，看 t_irq_ahci 是否恢复
+#[cfg(feature = "handles")]
+ktest!(KT_HANDLE_PROC_OWNER, t_handle_proc_owner);

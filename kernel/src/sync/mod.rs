@@ -390,6 +390,92 @@ pub struct IrqSpinLock<T> {
     data: UnsafeCell<T>,
 }
 
+
+/// **不关中断的自旋锁**（ADR-191 补记）。
+///
+/// ## 为什么需要它
+///
+/// `IrqSpinLock::lock()` 无条件 `save_and_cli()`（见 `lock` 的实现），所以**持锁期间中断进不来**。
+/// 对绝大多数临界区这是对的（简单、不会自死锁）。但有一类临界区**必须让中断进来**：
+///
+/// **块设备传输 + 等完成中断**。`t_irq_ahci` 的判据是「开中断后 ISR 真的进过」
+/// （`ahci::isr_entry() > 0`），而传输要互斥。用 `IrqSpinLock` 就变成
+/// 「互斥了，但中断永远进不来」⇒ 判据 `开中断到过=false`（实测，4/4 失败）。
+///
+/// ## 为什么这样是安全的
+///
+/// 1. **它不在中断里取**：AHCI 的 ISR 只读端口寄存器与计数，不调 `transfer`。
+///    若将来 ISR 要调，必须换回 `IrqSpinLock`（那会自死锁）。
+/// 2. **临界区里不分配内存**：`transfer_inner` 只用 MMIO 与固定栈缓冲。
+/// 3. **不自死锁**：中断处理不取这把锁 ⇒ 中断里没有第二个获取者。
+///
+/// ## 代价（如实记）
+///
+/// 持锁期间中断可以进来，所以**临界区必须假设自己被随时打断**。
+/// `transfer_inner` 的每一步都是「读/写本端口的寄存器 + 自旋等 PxCI」，
+/// 被打断只影响延迟，不影响正确性。
+pub struct OpenSpinLock<T> {
+    locked: AtomicUsize,
+    rank: LockRank,
+    data: UnsafeCell<T>,
+}
+
+/// `OpenSpinLock` 的 guard：**不还原中断标志**（因为从来没关过）。
+pub struct OpenGuard<'a, T: Send> {
+    lock: &'a OpenSpinLock<T>,
+}
+
+impl<T: Send> OpenSpinLock<T> {
+    /// `rank` 与 `IrqSpinLock` 共用同一套等级（`INNERMOST` 记账也共用）。
+    pub const fn new(rank: LockRank, v: T) -> Self {
+        Self { locked: AtomicUsize::new(0), rank, data: UnsafeCell::new(v) }
+    }
+
+    pub fn rank(&self) -> LockRank {
+        self.rank
+    }
+
+    /// 取锁。**不动 IF**。
+    pub fn lock(&self) -> OpenGuard<'_, T> {
+        ACQUIRES.fetch_add(1, Ordering::Relaxed);
+        let slot = crate::arch::x86_64::cpu::self_slot();
+        let token = cpu_token();
+        let t0 = crate::tsc::now();
+        let outer = INNERMOST[slot].swap(self.rank.0, Ordering::Relaxed);
+        if outer >= self.rank.0 {
+            crate::log_fatal!("L4 sync: 锁序违规，外层 rank={} 本次 rank={}", outer, self.rank.0);
+            crate::exit::finish(crate::exit::Code::ExceptionFatal);
+        }
+        let mut spins = 0u64;
+        loop {
+            if self.locked.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                break;
+            }
+            let _ = (spins, t0, token);
+            spins += 1;
+            // **不做超时判**（如实记）：`IrqSpinLock` 有那套（等锁超时升 L4），
+            // 这里省掉是因为块传输的自旋由设备保证有界（PxCI 一定落定或超时返回）。
+            // 若将来发现某块盘会永久不落定，这里要补回来。
+            core::hint::spin_loop();
+        }
+        OpenGuard { lock: self }
+    }
+}
+
+impl<T: Send> OpenGuard<'_, T> {
+    pub fn get(&mut self) -> &mut T {
+        // SAFETY: 持锁期间独占；`OpenSpinLock` 的临界区约束见类型文档。
+        unsafe { &mut *self.lock.data.get() }
+    }
+}
+
+impl<T: Send> Drop for OpenGuard<'_, T> {
+    fn drop(&mut self) {
+        let slot = crate::arch::x86_64::cpu::self_slot();
+        INNERMOST[slot].store(self.lock.rank.0, Ordering::Relaxed);
+        self.lock.locked.store(0, Ordering::Release);
+    }
+}
 // SAFETY: `data` 只能在持有 `locked` 时访问，因此 T: Send 即可跨线程共享。
 // 注意这只覆盖"互斥"，不覆盖 M3b 的多核 TLB/内存序问题（那需要 §6.6 的 shootdown）。
 unsafe impl<T: Send> Sync for IrqSpinLock<T> {}

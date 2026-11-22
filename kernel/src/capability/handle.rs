@@ -44,6 +44,41 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 #[cfg(feature = "fs-open")]
 pub const MAX_HANDLES: usize = 16384;
 #[cfg(not(feature = "fs-open"))]
+
+/// 查「这个任务属于哪个进程」的函数指针（ADR-191）。
+///
+/// ## 为什么是函数指针而不是直接调 `sched`
+///
+/// `capability` 直接调 `sched::proc_id_of` 会形成**双向依赖**：`sched` 已经依赖
+/// `capability`（`revoke_task`、`FdTable`），再加反向边就是新的强连通分量
+/// `[capability, sched]`（`check-module-interfaces` 当场红，实测）。
+///
+/// 这是仓库里已有的解法（`sync::install_wait_ops` 同一模式）：**被依赖方提供注入点，
+/// 依赖方在启动期装进去**。
+static PROC_OF: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// 启动期安装一次（由 `sched` 调，与 `sync::install_wait_ops` 同一时点）。
+pub fn install_proc_of(f: fn(usize) -> u16) {
+    PROC_OF.store(f as usize as u64, core::sync::atomic::Ordering::Release);
+}
+
+/// 查任务所属进程；没装或越界时回 `NO_PROC`（**不 panic、不猜**）。
+#[inline]
+fn proc_of(gidx: usize) -> u16 {
+    let v = PROC_OF.load(core::sync::atomic::Ordering::Acquire);
+    if v == 0 {
+        // **不引用 `crate::proc::NO_PROC`**（ADR-191）：那个符号属于 `sched` 模块，
+        // 在非测试函数里引用它会造出 `capability -> sched` 的反向边 ⇒
+        // 新强连通分量 `[capability, sched]`（门禁当场红，实测）。
+        // 这里用同值字面量；值由 `sched` 侧的一致性断言守（见 `install_proc_of`）。
+        return u16::MAX;
+    }
+    // SAFETY: 只可能是 `install_proc_of` 装进来的 `fn(usize) -> u16`，
+    // 那个签名与这里的转换一一对应；指针在启动期装一次、之后只读。
+    let f: fn(usize) -> u16 = unsafe { core::mem::transmute(v as usize) };
+    f(gidx)
+}
+
 pub const MAX_HANDLES: usize = 131072;
 /// 一次 `revoke_task`/`reset_for_test` 里**栈上**收集 VMO 槽号的容量。
 ///
@@ -200,6 +235,16 @@ pub(crate) struct Entry {
     used: bool,
     owner_gidx: u16,
     owner_id: u32,
+    /// 句柄所属的**进程**（ADR-191）。`NO_PROC` = 无进程上下文（boot 任务）。
+    ///
+    /// ## 为什么要这一格
+    ///
+    /// 原来只有 `owner_gidx`/`owner_id`，那是**任务**身份。于是同一进程的两个线程
+    /// 不能共享 fd——线程 B 用线程 A 装的 fd 会拿到 `-4 NotOwner`（Linux 里 fd 属于
+    /// `files_struct`，线程共享）。
+    ///
+    /// `check` 现在多一条路：**同进程也放行**。旧行为（同任务）保持。
+    owner_proc: u16,
     rights: u32,
     obj: Option<ObjRef>,
 }
@@ -209,6 +254,7 @@ const EMPTY: Entry = Entry {
     used: false,
     owner_gidx: 0,
     owner_id: 0,
+    owner_proc: u16::MAX, // = `NO_PROC`，断言在 `sched::install_proc_of`（ADR-191）
     rights: 0,
     obj: None,
 };
@@ -858,7 +904,22 @@ fn check(t: &mut Table, h: Handle, owner: (usize, u32), need: u32) -> Result<usi
         t.c.stale += 1;
         return Err(HErr::Stale);
     }
-    if e.owner_gidx as usize != owner.0 || e.owner_id != owner.1 {
+    // **同任务或同进程都算主人**（ADR-191）。
+    //
+    // 同任务：原来的语义，保持不变（boot 任务、单线程进程都走这条）。
+    // 同进程：**新的一条**。Linux 里 fd 属于 `files_struct`，同一进程的线程共享；
+    // 我们原来只比任务身份，于是线程 B 拿线程 A 的 fd 会 `-4 NotOwner`。
+    //
+    // 判据的顺序有讲究：先比任务（快、无依赖），不等再查进程。
+    // `proc_id_of` 是只读快照、不取锁，所以能在 `TABLE` 锁内调。
+    let same_task = e.owner_gidx as usize == owner.0 && e.owner_id == owner.1;
+    let same_proc = !same_task
+        // **不引用 `crate::proc::NO_PROC`**（ADR-191）：那是 `sched` 模块的符号，
+        // 在非测试函数里引用会造出 `capability -> sched` 反向边。用同值字面量，
+        // 由 `sched::install_proc_of` 里的 `assert!(NO_PROC == u16::MAX)` 守一致。
+        && e.owner_proc != u16::MAX
+        && proc_of(owner.0) == e.owner_proc;
+    if !same_task && !same_proc {
         t.c.not_owner += 1;
         return Err(HErr::NotOwner);
     }
@@ -881,6 +942,7 @@ fn insert(t: &mut Table, owner: (usize, u32), rights: u32, obj: ObjRef) -> Resul
         used: true,
         owner_gidx: owner.0 as u16,
         owner_id: owner.1,
+        owner_proc: proc_of(owner.0),
         rights,
         obj: Some(obj),
     };
@@ -1332,6 +1394,7 @@ pub fn transfer(h: Handle, from: (usize, u32), to: (usize, u32)) -> Result<Handl
     e.gen = next;
     e.owner_gidx = to.0 as u16;
     e.owner_id = to.1;
+    e.owner_proc = proc_of(to.0);
     t.c.transfers += 1;
     Ok(Handle::pack(slot as u16, next))
 }
@@ -1361,6 +1424,7 @@ pub fn transfer_rollback(new_h: Handle, to: (usize, u32), from: (usize, u32)) ->
     e.gen = next;
     e.owner_gidx = from.0 as u16;
     e.owner_id = from.1;
+    e.owner_proc = proc_of(from.0);
     t.c.transfers += 1;
     Ok(Handle::pack(slot, next))
 }

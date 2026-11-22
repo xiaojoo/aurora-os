@@ -1049,6 +1049,7 @@ public_api = [
   "handle::grant_socket",
   "handle::FD_TABLE_INIT",
   "handle::FD_TABLE_MAX",
+  "handle::install_proc_of",
 ]
 allowed_callers = ["integration", "sched"]
 dependencies = ["memory", "storage", "sync", "network"]
@@ -1169,8 +1170,8 @@ known_scc = [
 "pci->memory" = 9
 "resource->memory" = 1
 "resource->sync" = 2
-"sync->arch" = 12
-"sync->diagnostics" = 3
-"sync->time" = 3
+"sync->arch" = 18
+"sync->diagnostics" = 4
+"sync->time" = 4
 "time->arch" = 1
 "time->diagnostics" = 3

@@ -971,6 +971,17 @@ fn current_id_no_lock() -> usize {
 
 /// 把调度器实现装进 `sync` 的等待回调表（ADR-053 决策 1 的反转）。
 /// `sync` 因此不引用 `sched`，依赖方向不变、环 A 不动。启动期装一次，之后只读。
+/// 把 `proc_id_of` 交给 `capability`（ADR-191）。
+///
+/// 与 `install_wait_ops` 同一模式：**避免 `capability -> sched` 的反向边**。
+/// 那个反向边会形成新的强连通分量 `[capability, sched]`（门禁当场红）。
+pub fn install_proc_of() {
+    // **一致性断言**：`capability` 侧用 `u16::MAX` 当「没有进程」的哨兵，
+    // 它必须等于 `NO_PROC`。这里断言一次，改一边不改另一边会当场崩。
+    const _: () = assert!(crate::proc::NO_PROC == u16::MAX);
+    crate::handle::install_proc_of(proc_id_of);
+}
+
 pub fn install_wait_ops() {
     // 阻塞者总是当前任务，所以 ops 传来的下标只作校验用，实际改的是 current
     fn block_for_wait(_task: usize, token: crate::sync::WaitToken) -> bool {

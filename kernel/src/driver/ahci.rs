@@ -353,7 +353,13 @@ static PORT_STATE: [AtomicU8; 32] = [const { AtomicU8::new(0) }; 32];
 ///
 /// 句柄层（`RANK_HANDLE=35`）在锁外做磁盘 IO ⇒ 它调传输时不持 HANDLE；
 /// 传输内部不取任何别的锁（纯 MMIO + 轮询）⇒ 37 是安全下界。
-static XFER: crate::sync::IrqSpinLock<()> = crate::sync::IrqSpinLock::new(crate::sync::RANK_BLOCK, ());
+// **用 `OpenSpinLock` 而不是 `IrqSpinLock`**（ADR-191 补记）：
+// `IrqSpinLock::lock()` 无条件 `save_and_cli()`，持锁期间中断进不来，而
+// `t_irq_ahci` 的判据要求「开中断后 ISR 真的进过」⇒ 实测 `开中断到过=false`，4/4 失败。
+//
+// `OpenSpinLock` 只做互斥、不动 IF：正好是「传输互斥 + 等完成中断」需要的形状。
+// 安全性见 `sync::OpenSpinLock` 的类型文档（它不在 ISR 里取、临界区不分配）。
+static XFER: crate::sync::OpenSpinLock<()> = crate::sync::OpenSpinLock::new(crate::sync::RANK_BLOCK, ());
 static PORT_RESETS: [AtomicU32; 32] = [const { AtomicU32::new(0) }; 32];
 /// 每个端口因"发射被吞"而重置的次数，与 §8.2 的故障预算分开数（见 `recover_for_issue`）
 static PORT_ISSUE_RESETS: [AtomicU32; 32] = [const { AtomicU32::new(0) }; 32];

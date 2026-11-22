@@ -22107,3 +22107,95 @@ fn transfer(num: u8, lba: u64, count: u16, write: bool) -> Result<Xfer, AhciErro
 2. **`t_fat32_cursor_disks` 15.1% / `t_fat32_mem` 10.0% / `t_fs_open_syscalls` 19.7%** ——
    同一病根，本轮的锁应该也覆盖了，但**没有逐个验证**
 3. **`OFF_DATA` 按端口分区**（更彻底，但要缩每端口容量或扩 `RING_PAGES`）
+---
+
+## 509. ADR-191 落地：句柄 owner 认进程（线程共享 fd）（2026-11-22）
+
+### 五样对象化，第一片（A）
+
+Linux 对比里排第 3 的「句柄/文件表语义」，拆成三小片：本片做**线程共享 fd**。
+
+### 根因：owner 是任务身份，不是进程身份
+
+`Entry` 原来只有 `owner_gidx` + `owner_id`。于是**同一进程的两个线程不能共享 fd** ——
+线程 B 用线程 A 装的 fd 会拿到 `-4 NotOwner`。
+
+### 交付
+
+`Entry` 加 `owner_proc: u16`；`check` 放行「同任务**或**同进程」。
+
+**无进程身份（`NO_PROC`）时不走同进程那条路**：否则两个 boot 任务会因「都是 NO_PROC」
+互相通过，那是提权。有专门判据。
+
+### 判据七格（`t_handle_proc_owner`）
+
+    hproc: jobs=[Some(0), Some(1)] pids=[0, 1] 线程=4 同任务=true 同进程=true
+           别进程拒=true 无进程不跨=true 转移后=true 旧拒=true 句柄=0->0 ⇒ true
+
+**用真线程测**：`proc_attach_thread` + `set_proc_id` 造两条同进程的内核线程。
+
+第一版在 boot 任务上跑，两格都打「无对象可测」——**判据绿但关键路径没验**。
+这是本会话第四次同类错误。
+
+### 五个实测撞出来的坑
+
+**① `halt_forever()` 让用例链卡死** —— 它关中断永久停住，`terminate_task` 收不掉。
+改成「有界自旋等标志 + `finish_current()`」。
+
+**② `transfer` 要 `RIGHT_TRANSFER`** —— 只给 READ 时第 5 格红，测的是权限不是归属。
+
+**③ `transfer` 返回新句柄值** —— 拿旧值去 `resolve` 新主人恒 `Stale`。
+
+**④ 提前 `return` 漏 Job** —— 一次漏 2 个 ⇒ 3 个用例级联失败。
+
+**⑤ 哨兵值冲突** —— `job_create` 返回的第一个 id 就是 **0**，用 `!= 0` 判「有没有」
+会把合法 job 0 当成没有。改成 `Option<u16>`。
+
+### 架构门禁抓到一个真环
+
+`capability` 直接调 `sched::proc_id_of` 会形成**新强连通分量 `[capability, sched]`**。
+
+解法用仓库既有的 `install_*_ops` 模式：函数指针注入。
+
+**连带一个坏味道，如实记**：`NO_PROC` 在 `capability` 侧用字面量 `u16::MAX`，
+因为引用 `crate::proc::NO_PROC` 就会造出那条反向边。一致性由
+`sched::install_proc_of` 里的 `const _: () = assert!(NO_PROC == u16::MAX);` 守。
+
+### 最重要的发现：ADR-190 的锁打断了 AHCI 中断
+
+`IrqSpinLock::lock()` **无条件 `save_and_cli()`**，于是持锁期间中断进不来，
+而 `t_irq_ahci` 要求「开中断后 ISR 真的进过」⇒ `开中断到过=false`，**4/4 失败**。
+
+| 版本 | 开中断到过 | 判定 |
+|---|---|---|
+| 去掉 `XFER.lock()` | **true** | **PASS(33)** |
+| `IrqSpinLock`（ADR-190） | false | FAIL(35) |
+
+**同一把锁：修好了 `t_fat32`（22% → 5/5 全绿），打断了 `t_irq_ahci`。**
+
+修法：新增 `sync::OpenSpinLock`（只互斥、不动 IF）。换之后 `开中断到过=true`。
+
+### 仍未修好
+
+`t_irq_ahci` **仍偶发红**：
+
+    PASS: 开中断到过=true  赛跑最大间隔=848
+    FAIL: 开中断到过=false 赛跑最大间隔=0
+
+**`赛跑=0` 说明中断一次都没在轮询之前到达** —— 锁粒度是「一次传输」，
+而一次传输只有几十微秒，中断窗口太短。**这是 ADR-190 锁粒度的遗留问题。**
+
+### 读数
+
+| 项 | 结果 |
+|---|---|
+| `check` | **20/20** |
+| `handles` 档 | 4 次跑 1 次全绿（108/108）|
+
+### 未做
+
+1. **`close_on_exec`**（fd 继承语义）
+2. **引用计数**（切片 B）
+3. **`revoke_task` 按进程清**（现在仍按任务清）
+4. **`t_irq_ahci` 的时序问题**（ADR-190 锁粒度遗留）
+5. **切片 C/D/E**：VMA 归属、块层队列、VFS 三层
