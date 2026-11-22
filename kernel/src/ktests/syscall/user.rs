@@ -2172,4 +2172,157 @@ fn t_driver_match() -> bool {
 
 #[cfg(feature = "handles")]
 ktest!(KT_DRIVER_MATCH, t_driver_match);
+/// ADR-197：**TCP 段格式与校验和**的证人（切片 G 第一层）。
+///
+/// ## 判据八格
+///
+/// 1. 构造 + 解析往返：字段逐个相同；
+/// 2. **`seq_len` 把 SYN/FIN 各算一个字节**（这是最易写错的一格）；
+/// 3. 校验和：构造时填的与独立重算的一致；
+/// 4. **校验和能发现一位翻转**（改一个字节 ⇒ 不再一致）；
+/// 5. 头部长度越界（< 20）被拒；
+/// 6. 头部长度越界（> 60）被拒；
+/// 7. 头部长度超过实际长度被拒；
+/// 8. 载荷超 `TCP_PAYLOAD_MAX` 时构造回 `None`（不静默截短）。
+///
+/// **负样本**：把 `seq_len` 里的 `SYN` 那支去掉 ⇒ 第 2 格红。
+#[cfg(feature = "handles")]
+fn t_tcp_segment() -> bool {
+    use crate::network::tcp;
+    let mut ok = true;
+    let src = [10, 0, 2, 15];
+    let dst = [10, 0, 2, 2];
+    let mut buf = [0u8; 128];
+
+    // ① 构造 + 解析往返
+    let n = match tcp::build_segment(
+        &mut buf, &src, &dst, 12345, 80, 1000, 2000,
+        tcp::SYN | tcp::ACK, 8192, b"hello",
+    ) {
+        Some(n) => n,
+        None => {
+            crate::log_fatal!("tcp: build_segment 回 None");
+            return false;
+        }
+    };
+    let seg = match tcp::parse_segment(&buf[..n]) {
+        Some(s) => s,
+        None => {
+            crate::log_fatal!("tcp: parse_segment 回 None");
+            return false;
+        }
+    };
+    let roundtrip = seg.src_port == 12345
+        && seg.dst_port == 80
+        && seg.seq == 1000
+        && seg.ack == 2000
+        && seg.is_syn()
+        && seg.is_ack()
+        && !seg.is_fin()
+        && seg.window == 8192
+        && seg.data_off == 5
+        && seg.payload == b"hello";
+    if !roundtrip {
+        crate::log_fatal!("tcp: 往返不对");
+        ok = false;
+    }
+
+    // ② seq_len：SYN 占一格、FIN 占一格、纯数据按长度
+    let syn_len_ok = seg.seq_len() == 6; // 5 字节数据 + SYN 1 字节
+    let fin_seg = tcp::Segment {
+        src_port: 0, dst_port: 0, seq: 0, ack: 0,
+        flags: tcp::FIN, window: 0, data_off: 5, payload: &[],
+    };
+    let fin_len_ok = fin_seg.seq_len() == 1;
+    let syn_fin_seg = tcp::Segment {
+        src_port: 0, dst_port: 0, seq: 0, ack: 0,
+        flags: tcp::SYN | tcp::FIN, window: 0, data_off: 5, payload: &[],
+    };
+    let syn_fin_ok = syn_fin_seg.seq_len() == 2;
+    let data_seg = tcp::Segment {
+        src_port: 0, dst_port: 0, seq: 0, ack: 0,
+        flags: tcp::ACK, window: 0, data_off: 5, payload: b"abc",
+    };
+    let data_len_ok = data_seg.seq_len() == 3;
+    let seq_len_ok = syn_len_ok && fin_len_ok && syn_fin_ok && data_len_ok;
+    if !seq_len_ok {
+        crate::log_fatal!(
+            "tcp: seq_len 不对 syn={} fin={} syn+fin={} data={}",
+            syn_len_ok, fin_len_ok, syn_fin_ok, data_len_ok
+        );
+        ok = false;
+    }
+
+    // ③ 校验和：**用「整段校验和为 0」这个性质**（RFC 1071 的自校验）
+    //
+    // 第一版写的是「填进去的值 == 重算的值」，实测重算回 **0x0000** ——
+    // 因为重算时把**已经填好的校验和字段**也算进去了，而按定义那种和必然是 0。
+    // 这不是 bug，是校验和的自校验性质；判据要按这条写。
+    let ck_field = u16::from_be_bytes([buf[16], buf[17]]);
+    let ck_self = tcp::tcp_checksum(&src, &dst, &buf[..n]);
+    let ck_ok = ck_field != 0 && ck_self == 0;
+    if !ck_ok {
+        crate::log_fatal!("tcp: 校验和不对 填={:#06x} 自校验={:#06x}", ck_field, ck_self);
+        ok = false;
+    }
+
+    // ④ 改一个字节 ⇒ 校验和不再一致
+    let mut bad = buf;
+    bad[20] ^= 0x01; // 载荷第一个字节
+    let ck_bad = tcp::tcp_checksum(&src, &dst, &bad[..n]);
+    // 翻转之后自校验**不再为 0** ⇒ 能发现
+    let detect_ok = ck_bad != 0;
+    if !detect_ok {
+        crate::log_fatal!("tcp: 校验和没发现一位翻转");
+        ok = false;
+    }
+
+    // ⑤ 头部长度 < 20 被拒
+    let mut short = buf;
+    short[12] = 4 << 4; // data_off = 4 ⇒ 16 字节
+    let reject_short = tcp::parse_segment(&short[..n]).is_none();
+    if !reject_short {
+        crate::log_fatal!("tcp: 头长 16 竟然被接受");
+        ok = false;
+    }
+
+    // ⑥ 头部长度 > 60 被拒
+    let mut long = buf;
+    long[12] = 16 << 4; // data_off = 16 ⇒ 64 字节
+    let reject_long = tcp::parse_segment(&long[..n]).is_none();
+    if !reject_long {
+        crate::log_fatal!("tcp: 头长 64 竟然被接受");
+        ok = false;
+    }
+
+    // ⑦ 头部长度超过实际长度被拒
+    let mut over = buf;
+    over[12] = 15 << 4; // data_off = 15 ⇒ 60 字节 > n-20
+    let reject_over = tcp::parse_segment(&over[..20]).is_none();
+    if !reject_over {
+        crate::log_fatal!("tcp: 头长超过实际长度竟然被接受");
+        ok = false;
+    }
+
+    // ⑧ 载荷超限回 None
+    let big = [0u8; tcp::TCP_PAYLOAD_MAX + 1];
+    let mut out2 = [0u8; tcp::TCP_HDR_MIN + tcp::TCP_PAYLOAD_MAX + 1];
+    let reject_big = tcp::build_segment(
+        &mut out2, &src, &dst, 1, 2, 0, 0, tcp::ACK, 0, &big,
+    )
+    .is_none();
+    if !reject_big {
+        crate::log_fatal!("tcp: 载荷超限竟然被接受");
+        ok = false;
+    }
+
+    crate::log_info!(
+        "tcp: 往返={} seq_len={} 校验和={} 发现翻转={} 短头拒={} 长头拒={} 超长拒={} 载荷超限拒={} ⇒ {}",
+        roundtrip, seq_len_ok, ck_ok, detect_ok, reject_short, reject_long, reject_over, reject_big, ok
+    );
+    ok
+}
+
+#[cfg(feature = "handles")]
+ktest!(KT_TCP_SEGMENT, t_tcp_segment);
 

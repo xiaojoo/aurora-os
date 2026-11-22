@@ -27,6 +27,7 @@ pub mod ipv6;
 pub mod ndp;
 pub mod proto;
 pub mod socket;
+pub mod tcp;
 pub mod udp;
 
 
