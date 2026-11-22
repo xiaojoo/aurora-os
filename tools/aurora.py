@@ -6118,6 +6118,59 @@ def check_syscall_abi_arms() -> list[str]:
 
     return bad
 
+def check_ktest_anchors() -> list[str]:
+    """`ktest!` 上方不许残留「暂时不收集」这类调试注释（ADR-206）。
+
+    这一格防的是一件很具体的事（2026-11-22 实测）：
+
+    ```rust
+    // NEGATIVE SAMPLE: 暂时不收集，看 t_irq_ahci 是否恢复
+    ktest!(KT_HANDLE_PROC_OWNER, t_handle_proc_owner);
+    ```
+
+    注释说「不收集」，而收集语句就在下面 —— 用例**一直跑着**，但那条注释让后来的人
+    （包括写它的我自己）以为它没跑，于是排查 HANG 时跳过了它，白查了两轮。
+
+    **注释与代码不一致本身就是缺陷**，而且是最难的一类：它不会让任何测试变红，
+    只会让人读错。
+
+    判据：每个 `ktest!(` 之前的连续注释块里，不许出现「不收集 / 禁用 / 暂时关掉」
+    这类**声称不生效**的字样。**要真不收集就删掉那一行，而不是留一句注释。**
+    """
+    bad: list[str] = []
+    # 声称「不生效」的词。宁可窄一点：只抓这次真实撞到的那一类。
+    phrases = ("暂时不收集", "不收集", "暂时禁用", "暂时关掉", "已停用")
+    for p in sorted((ROOT / "kernel" / "src").rglob("*.rs")):
+        try:
+            lines = p.read_text(encoding="utf-8").splitlines()
+        except (UnicodeDecodeError, OSError):
+            continue
+        rel = p.relative_to(ROOT).as_posix()
+        for i, line in enumerate(lines):
+            if "ktest!(" not in line:
+                continue
+            # 只看紧邻的上方连续注释（不跨空行）
+            j = i - 1
+            while j >= 0 and lines[j].lstrip().startswith("//"):
+                for ph in phrases:
+                    if ph in lines[j]:
+                        bad.append(
+                            f"{rel}:{j + 1} 的注释说「{ph}」，但下一行的 `ktest!` 仍然收集 —— "
+                            "注释与代码不一致（要真不收集就删掉那一行）"
+                        )
+                        break
+                j -= 1
+            # 同一行末尾的注释也算
+            tail = line.split("//", 1)
+            if len(tail) == 2:
+                for ph in phrases:
+                    if ph in tail[1]:
+                        bad.append(
+                            f"{rel}:{i + 1} 的 `ktest!` 行尾注释说「{ph}」，但它仍然收集"
+                        )
+                        break
+    return bad
+
 def check_nofloat(elf: Path) -> list[str]:
     """镜像里不允许出现 SSE/x87 指令：本目标默认不发浮点，但这个保证可被单个
     #[target_feature] 或 C 侧选项悄悄拆掉，而 §5.3 的入口桩不保存浮点状态。"""
@@ -8062,6 +8115,7 @@ def do_check(elf: Path | None) -> int:
         "check-verdict": lambda: check_verdict_contract(),
         "check-syscall-abi-arms": lambda: check_syscall_abi_arms(),
         "check-capacity-baseline": lambda: check_capacity_baseline(),
+        "check-ktest-anchors": lambda: check_ktest_anchors(),
         "check-nofloat": (lambda: check_nofloat(elf)) if elf else (lambda: ["未提供内核镜像路径"]),
     }
     rc = 0
