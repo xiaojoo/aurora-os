@@ -74,6 +74,12 @@ pub const RANK_NET: LockRank = LockRank(36);
 /// **为什么不能复用 `RANK_NET(36)`**：那是 socket 表的锁，与块设备无关，
 /// 合用会让「socket 里读盘」变成同等级重入。
 pub const RANK_BLOCK: LockRank = LockRank(37);
+/// dentry 缓存（`filesystem/vfs_ro.rs` 的 `DENTRY_LOCK`，ADR-195）。
+///
+/// **叶子锁**：临界区里只读写缓存表本身，不取任何别的锁。
+/// 比 `RANK_BLOCK(37)` 深：路径解析可能发生在持有块层锁的上下文里（虽然今天没有），
+/// 而缓存命中时**不碰盘**，所以放在 38 是安全的。
+pub const RANK_DENTRY: LockRank = LockRank(38);
 pub const RANK_LEDGER: LockRank = LockRank(40);
 pub const RANK_ACPI: LockRank = LockRank(50);
 /// 跨核竞争用例专用（`smp::CONTENTION_LOCK`）。排在最内层是因为它**不嵌套任何东西**：

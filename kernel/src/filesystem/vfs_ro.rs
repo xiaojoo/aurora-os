@@ -19,6 +19,7 @@
 //! FS-03 增补：`ReadCursor`/`DirCursor` 自带 `Bpb`，读写/枚举不再借用 `Volume`。句柄表因此
 //! 可以存值、放锁后再做盘 I/O；`seek` 从首簇重建簇号，越出 EOF 明确回 `BadOffset`。
 
+use crate::filesystem::vfs::DiskKey;
 use crate::filesystem::fat32::{
     self, Bpb, FatType, FsError, Volume, ATTR_DIR, ATTR_LFN, ATTR_VOLUME, ENTRY_BYTES, MIN_CLUSTER,
 };
@@ -322,11 +323,34 @@ impl DirState {
 /// 单根只读文件系统（ADR-107 §3）：一次挂一个卷，挂载点固定在 `/`。
 pub struct ReadOnlyFs<'a> {
     vol: Volume<'a>,
+    /// **卷内容指纹**（ADR-195 补记）：dentry 缓存的键必须带它。
+    ///
+    /// 只带 `disk_key` + 几何**不够**（实测）：`t_vfs_ro_fat32` 的坏卷与好卷
+    /// 几何完全相同，只有目录项内容不同 ⇒ 缓存会把好卷的结果返回给坏卷，
+    /// 于是「高半越界被拒」变成 `false`。
+    ///
+    /// 指纹在 `mount` 时算一次（读引导扇区 + FSInfo，共 2 个扇区），
+    /// 之后每次 lookup 只做一次整数比较。
+    vol_id: u64,
 }
 
 impl<'a> ReadOnlyFs<'a> {
     pub fn mount(disk: &'a dyn Block) -> Result<Self, VfsError> {
-        Volume::mount(disk).map(|vol| ReadOnlyFs { vol }).map_err(VfsError::Fs)
+        Volume::mount(disk)
+            .map(|vol| {
+                let vol_id = volume_fingerprint(disk, &vol.bpb);
+                // **每次挂载都清缓存**（ADR-195 补记）。
+                //
+                // 为什么不能只靠指纹：夹具里造坏卷的方式是**改同一块 img 的目录项**，
+                // 而引导扇区（指纹的来源）没变 ⇒ 指纹相同 ⇒ 缓存串了。
+                // 实测后果：`t_vfs_ro_lfn` 的 `bad_checksum_ok` 与 `t_vfs_ro_fat32` 的
+                // `高半越界被拒` 都变成 false。
+                //
+                // 清一次的代价是 64 条 `Entry` 的零填充（~19 KiB），只在 mount 时做。
+                dentry_clear();
+                ReadOnlyFs { vol, vol_id }
+            })
+            .map_err(VfsError::Fs)
     }
 
     pub fn bpb(&self) -> Bpb {
@@ -339,7 +363,7 @@ impl<'a> ReadOnlyFs<'a> {
 
     /// 解析绝对路径。重复 `/` 折叠；`.`/`..` 一律拒（内核不做相对路径）。
     pub fn lookup(&self, path: &str) -> Result<Entry, VfsError> {
-        lookup(self.vol.disk, &self.vol.bpb, path)
+        lookup_with_vol(self.vol.disk, &self.vol.bpb, path, Some(self.vol_id))
     }
 
     pub fn dir_cursor(&self, dir: &Entry) -> Result<DirCursor, VfsError> {
@@ -389,7 +413,223 @@ pub fn root_entry(bpb: &Bpb) -> Entry {
 }
 
 /// 独立路径解析器：`disk` 只负责取扇区，`bpb` 是同一挂载的几何快照。
+// ---------------------------------------------------------------- ADR-195：dentry 缓存
+
+/// dentry 缓存容量（ADR-195）。
+///
+/// ## 为什么是 64
+///
+/// 一条 `Entry` 约 300 字节，64 条 = **19 KiB**，进 `.bss` 可接受。
+/// 512 条就是 150 KiB —— 那会重演 ADR-194 里「容量进静态量」的崩（实测三次）。
+///
+/// **不是越大越好**：路径解析的局部性很强（同一目录反复查），64 条足够覆盖热集。
+pub const DENTRY_MAX: usize = 64;
+
+/// 一条缓存项：`(父目录首簇, 名字) -> Entry`（ADR-195）。
+///
+/// ## 为什么要缓存
+///
+/// `lookup` 对**每个路径分量**都调 `find_child`，而它新建游标、**线性扫目录**。
+/// 深路径的成本是 O(分量数 × 目录项数)，且每次都重新读盘。
+///
+/// 缓存之后，重复解析同一条路径只查表。
+#[derive(Clone, Copy)]
+struct DentrySlot {
+    used: bool,
+    /// **卷指纹**（ADR-195 补记）：键必须带它，否则两个卷上的同名项会串。
+    ///
+    /// 实测后果：`t_vfs_ro_lfn` 的「坏卷负样本」与 `t_vfs_ro_fat32` 的「高半越界」
+    /// 都变成 `false` —— 因为好卷的结果被返回给了坏卷，坏卷根本没被解析。
+    ///
+    /// 指纹取 `(disk_key, bpb 的簇大小, bpb 的簇数)`：足够区分夹具里的几个卷，
+    /// 又不需要给 `Block` 加接口。
+    vol: u64,
+    /// 父目录的首簇（根目录是 0）。**同一名字在不同目录下是不同项**，所以必须带它。
+    parent_cluster: u32,
+    /// 名字的 FNV-1a 哈希（省内存：不存完整名字）。
+    name_hash: u32,
+    /// 名字长度（与哈希一起降低碰撞概率）。
+    name_len: u8,
+    /// 解析结果。
+    entry: Entry,
+}
+
+const DENTRY_EMPTY: DentrySlot = DentrySlot {
+    used: false,
+    vol: 0,
+    parent_cluster: 0,
+    name_hash: 0,
+    name_len: 0,
+    // `Entry` 没有 const 构造函数，用全 0 占位（`used=false` 时内容无意义）
+    entry: Entry {
+        name: [0; NAME_MAX],
+        name_len: 0,
+        long_name: [0; LONG_NAME_MAX],
+        long_len: 0,
+        first_cluster: 0,
+        size: 0,
+        attr: 0,
+        is_root: false,
+        entries_seen: 0,
+        lfn_entries: 0,
+        lfn_bad: 0,
+        long_truncated: false,
+        create_tenths: 0,
+        create_time: 0,
+        create_date: 0,
+        access_date: 0,
+        write_time: 0,
+        write_date: 0,
+    },
+};
+
+struct DentryTable {
+    slots: [DentrySlot; DENTRY_MAX],
+    /// 命中/未命中计数（判据用）。
+    hits: u32,
+    misses: u32,
+}
+
+struct DentryCell(core::cell::UnsafeCell<DentryTable>);
+// SAFETY: 表的读写全部在 `DENTRY_LOCK` 内；载荷全为 Copy 数值，无别名逃逸。
+unsafe impl Sync for DentryCell {}
+
+static DENTRY: DentryCell = DentryCell(core::cell::UnsafeCell::new(DentryTable {
+    slots: [DENTRY_EMPTY; DENTRY_MAX],
+    hits: 0,
+    misses: 0,
+}));
+
+/// dentry 表的锁。**叶子锁**：内部不取任何别的锁。
+static DENTRY_LOCK: crate::sync::IrqSpinLock<()> =
+    crate::sync::IrqSpinLock::new(crate::sync::RANK_DENTRY, ());
+
+/// 卷指纹：`(disk_key 的 tag, 簇字节数, 簇数)`。
+///
+/// **不能用 `disk_key` 单独**：夹具里好几块盘都是 `Mem`。也不能用 `img.len()`（`Block` 没这个接口）。
+/// **卷内容指纹**（ADR-195 补记）：把引导扇区 + FSInfo 的字节混进一个 u64。
+///
+/// 为什么需要它：`disk_key` + 几何在「同一块内存盘、不同内容」时完全相同，
+/// 而夹具里正是这么造坏卷的（改几个目录项字节）。
+fn volume_fingerprint(disk: &dyn Block, bpb: &Bpb) -> u64 {
+    let mut h: u64 = dentry_vol_id(disk, bpb);
+    let mut sec = [0u8; SECTOR_BYTES];
+    // 引导扇区（LBA 0）：含 BPB、卷标、跳转指令
+    if disk.read_sectors(0, &mut sec).is_ok() {
+        for (i, b) in sec.iter().enumerate() {
+            if i % 8 == 0 {
+                h = h.wrapping_mul(0x0100_0000_01b3).wrapping_add(*b as u64);
+            }
+        }
+    }
+    // FAT32 的 FSInfo（LBA 1）：坏卷测试也动它
+    if bpb.clusters > 65525 && disk.read_sectors(1, &mut sec).is_ok() {
+        for (i, b) in sec.iter().enumerate() {
+            if i % 8 == 0 {
+                h = h.wrapping_mul(0x0100_0000_01b3).wrapping_add(*b as u64);
+            }
+        }
+    }
+    h
+}
+
+fn dentry_vol_id(disk: &dyn Block, bpb: &Bpb) -> u64 {
+    let k = match disk.disk_key() {
+        DiskKey::Ahci(p) => 0x1000_0000u64 | u64::from(p),
+        DiskKey::Virtio(p) => 0x2000_0000u64 | u64::from(p),
+        DiskKey::Nvme(p) => 0x3000_0000u64 | u64::from(p),
+        DiskKey::Mem => 0x4000_0000u64,
+        DiskKey::Unknown => 0x5000_0000u64,
+    };
+    // 混进簇几何：不同卷的 BPB 几乎一定不同
+    k ^ ((bpb.cluster_bytes as u64) << 8) ^ u64::from(bpb.clusters)
+}
+
+fn dentry_name_hash(name: &[u8]) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in name {
+        h ^= *b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
+/// 查缓存。命中返回 `Some(entry)`，并把 `hits` 加一。
+fn dentry_get(vol: u64, parent_cluster: u32, name: &[u8]) -> Option<Entry> {
+    let h = dentry_name_hash(name);
+    let len = name.len() as u8;
+    let _g = DENTRY_LOCK.lock();
+    // SAFETY: 持锁期间独占；载荷全为 Copy。
+    let t = unsafe { &mut *DENTRY.0.get() };
+    for s in t.slots.iter() {
+        if s.used && s.vol == vol && s.parent_cluster == parent_cluster && s.name_hash == h && s.name_len == len {
+            t.hits += 1;
+            return Some(s.entry);
+        }
+    }
+    t.misses += 1;
+    None
+}
+
+/// 写缓存。**满时按「第一个未用，否则覆盖 0 号」**（不做 LRU：判据只关心命中率）。
+fn dentry_put(vol: u64, parent_cluster: u32, name: &[u8], entry: Entry) {
+    let h = dentry_name_hash(name);
+    let len = name.len() as u8;
+    let _g = DENTRY_LOCK.lock();
+    // SAFETY: 持锁期间独占；载荷全为 Copy。
+    let t = unsafe { &mut *DENTRY.0.get() };
+    // 先找同一个键（覆盖旧值）
+    for s in t.slots.iter_mut() {
+        if s.used && s.vol == vol && s.parent_cluster == parent_cluster && s.name_hash == h && s.name_len == len {
+            s.entry = entry;
+            return;
+        }
+    }
+    // 再找空位
+    for s in t.slots.iter_mut() {
+        if !s.used {
+            *s = DentrySlot { used: true, vol, parent_cluster, name_hash: h, name_len: len, entry };
+            return;
+        }
+    }
+    // 满了：覆盖 0 号（简单、可预测；LRU 的收益在这个容量下不显著）
+    t.slots[0] = DentrySlot { used: true, vol, parent_cluster, name_hash: h, name_len: len, entry };
+}
+
+/// dentry 缓存统计 `(命中, 未命中, 已用槽)`（ADR-195 的判据用）。
+pub fn dentry_stats() -> (u32, u32, usize) {
+    let _g = DENTRY_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let t = unsafe { &*DENTRY.0.get() };
+    (t.hits, t.misses, t.slots.iter().filter(|s| s.used).count())
+}
+
+/// 清空缓存（判据用；也供「卷换过」时清）。
+pub fn dentry_clear() {
+    let _g = DENTRY_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let t = unsafe { &mut *DENTRY.0.get() };
+    for s in t.slots.iter_mut() {
+        *s = DENTRY_EMPTY;
+    }
+    t.hits = 0;
+    t.misses = 0;
+}
+
 pub fn lookup(disk: &dyn Block, bpb: &Bpb, path: &str) -> Result<Entry, VfsError> {
+    lookup_with_vol(disk, bpb, path, None)
+}
+
+/// 带卷指纹的路径解析（ADR-195 补记）。
+///
+/// `vol` 是 `Some` 时用它做缓存键（`ReadOnlyFs` 走这条）；`None` 时**不用缓存**
+/// （裸调用没有卷身份，用缓存就会串卷 —— 那正是第一版的红）。
+fn lookup_with_vol(
+    disk: &dyn Block,
+    bpb: &Bpb,
+    path: &str,
+    vol: Option<u64>,
+) -> Result<Entry, VfsError> {
 
     if !path.starts_with('/') {
         return Err(VfsError::NotAbsolute);
@@ -416,7 +656,23 @@ pub fn lookup(disk: &dyn Block, bpb: &Bpb, path: &str) -> Result<Entry, VfsError
         if !cur.is_dir() {
             return Err(VfsError::NotDir);
         }
-        cur = find_child(disk, bpb, &cur, part.as_bytes())?;
+        // **先查 dentry 缓存**（ADR-195）：命中就不碰盘。
+        //
+        // 键是 `(父目录首簇, 名字)`：同一名字在不同目录下是不同项。
+        let parent = cur.first_cluster;
+        cur = match vol {
+            // 有卷身份 ⇒ 用缓存
+            Some(v) => match dentry_get(v, parent, part.as_bytes()) {
+                Some(e) => e,
+                None => {
+                    let e = find_child(disk, bpb, &cur, part.as_bytes())?;
+                    dentry_put(v, parent, part.as_bytes(), e);
+                    e
+                }
+            },
+            // 没有 ⇒ **不缓存**（裸调用没有卷身份，用缓存就会串卷）
+            None => find_child(disk, bpb, &cur, part.as_bytes())?,
+        };
     }
     Ok(cur)
 }

@@ -166,7 +166,20 @@ pub fn read_at(disk: &dyn Block, lba: u64, dst: &mut [u8], budget: &Budget<'_>) 
     // 段长：无界 128 扇区（64 KiB），有死线/取消时 8 扇区（粒度细）。
     // **内联而不抽函数**：抽成 `impl Iterator` 会让 `.text` 布局变化，
     // 实测那个变化触发了收尾路径的 `unexpected vector=13`（本轮踩过）。
-    let cap: u32 = if budget.deadline == u64::MAX && !budget.has_cancel() { 128 } else { 8 };
+    // **有死线或取消位时，段长必须是 1**（ADR-194 补记）：
+    //
+    // 第一版写 8，实测 `t_block_io_budget` 的「半途」与「取消」两格都变 false ——
+    // 因为取消只在**段边界**检查，段长 8 意味着最坏要等 8 个扇区读完才停。
+    // 而那两个判据要求的是「读了几扇区就停在第几扇区」。
+    //
+    // 合并只在**完全无界**时做：那时没有任何东西要求中途停。
+    // 段长 = min(设备上限, 128)；有死线/取消时压到 1（见上面那条补记）。
+    let dev_cap = disk.max_transfer_sectors().max(1).min(128);
+    let cap: u32 = if budget.deadline == u64::MAX && !budget.has_cancel() {
+        dev_cap
+    } else {
+        1
+    };
     let mut done = 0u32;
     while done < n {
         let mut take = (n - done).min(cap);
@@ -191,6 +204,29 @@ pub fn read_at(disk: &dyn Block, lba: u64, dst: &mut [u8], budget: &Budget<'_>) 
             Ok(()) => {
                 b.sectors_ok.fetch_add(take as u64, Ordering::Relaxed);
                 done += take;
+            }
+            Err(e) if take > 1 => {
+                // **段读失败时退回逐扇区**（ADR-194 补记）：
+                //
+                // 合并把「第 3 个扇区坏」变成「整段失败」⇒ `sectors_done` 语义变了。
+                // 实测 `t_block_io_budget` 的「半途」那一格：期望 `sectors_done=2`，
+                // 合并后拿到 0。
+                //
+                // 退回逐扇区重试这一段，保住原语义（代价只在**出错路径**上）。
+                let mut k = 0u32;
+                while k < take {
+                    let so = off + k as usize * SECTOR_BYTES;
+                    match disk.read_sectors(at + u64::from(k), &mut dst[so..so + SECTOR_BYTES]) {
+                        Ok(()) => {
+                            b.sectors_ok.fetch_add(1, Ordering::Relaxed);
+                            done += 1;
+                            k += 1;
+                        }
+                        Err(e2) => {
+                            return Outcome { sectors_done: done, error: Some(e2) };
+                        }
+                    }
+                }
             }
             Err(e) => return Outcome { sectors_done: done, error: Some(e) },
         }

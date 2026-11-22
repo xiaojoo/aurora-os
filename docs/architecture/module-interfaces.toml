@@ -500,6 +500,7 @@ public_api = [
   "sync::RANK_HANDLE",
 ]
 allowed_callers = [
+  "storage",
   "driver","arch", "capability", "integration", "memory", "resource", "sched", "network"]
 dependencies = ["arch", "diagnostics", "time"]
 forbidden_dependencies = []
@@ -777,10 +778,12 @@ public_api = [
   "vfs::FileStat", "vfs::Partition", "vfs::PartitionView", "vfs::DiskKey",
   "filesystem/part::PART_RECORD_LEN", "filesystem/part::PartError",
   "filesystem/part::PartInfo", "filesystem/part::part_read_block",
-  "filesystem/part::part_read_from", "filesystem::part", "gpt::HEADER_LBA"
+  "filesystem/part::part_read_from", "filesystem::part", "gpt::HEADER_LBA",
+  "vfs_ro::dentry_stats", "vfs_ro::dentry_clear", "vfs_ro::DENTRY_MAX",
 ]
 allowed_callers = ["capability", "integration", "sched"]
-dependencies = ["driver"]
+dependencies = [
+  "sync", "driver"]
 forbidden_dependencies = []
 known_violations = []
 context = ["KERNEL", "IRQ_OFF", "ISR_TOP"]

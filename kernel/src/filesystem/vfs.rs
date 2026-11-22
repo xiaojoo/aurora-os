@@ -155,6 +155,19 @@ pub trait Block {
     fn disk_key(&self) -> DiskKey {
         DiskKey::Unknown
     }
+
+    /// **一次传输最多几个扇区**（ADR-194 补记）。
+    ///
+    /// 默认 **1 = 不可合并**：
+    ///
+    /// - 测试盘（`TestDisk`/`BudgetDisk`）按**调用序号**造失败（`fail_at`），
+    ///   合并会让调用序号对不上 ⇒ 那些判据失效（实测 `t_block_io_budget` 半途/计数两格红）。
+    /// - 夹具盘（`MemDisk`）没必要合并（内存拷贝，没有命令开销）。
+    ///
+    /// 真驱动覆写成设备的上限（AHCI 是 928，这里取 128 留余量）。
+    fn max_transfer_sectors(&self) -> u32 {
+        1
+    }
 }
 
 /// 打开一个文件要交回来的东西：大小、起始簇，以及**扫描的覆盖面**。
@@ -206,6 +219,10 @@ impl Block for AhciDisk {
     fn disk_key(&self) -> DiskKey {
         DiskKey::Ahci(self.port)
     }
+    /// 真驱动可以合并（ADR-194 补记）：128 扇区留足余量。
+    fn max_transfer_sectors(&self) -> u32 {
+        128
+    }
 }
 
 /// virtio-blk 的 `Block` 适配器（AGENTS 缺口 4 / BACKLOG 78h-3 的第一格）。
@@ -242,6 +259,10 @@ impl Block for VirtioDisk {
 
     fn disk_key(&self) -> DiskKey {
         DiskKey::Virtio(self.index)
+    }
+    /// 真驱动可以合并（ADR-194 补记）：128 扇区留足余量。
+    fn max_transfer_sectors(&self) -> u32 {
+        128
     }
 }
 
@@ -303,6 +324,10 @@ impl Block for NvmeDisk {
     fn disk_key(&self) -> DiskKey {
         // 今天只支持单台，所以槽号恒 0。表化留给「多台 NVMe」那次。
         DiskKey::Nvme(0)
+    }
+    /// 真驱动可以合并（ADR-194 补记）：128 扇区留足余量。
+    fn max_transfer_sectors(&self) -> u32 {
+        128
     }
 }
 

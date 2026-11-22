@@ -1202,3 +1202,229 @@ fn t_block_io_budget() -> bool {
 }
 
 ktest!(KT_BLOCK_IO_BUDGET, t_block_io_budget);
+
+/// 测试用的「可合并」盘（ADR-194 补记）：把 `MemDisk` 包一层并覆写上限。
+///
+/// 存在的理由：`MemDisk` 的默认上限是 1（不可合并），而 `t_block_merge` 要测的正是合并。
+struct MergeDisk<'a> {
+    inner: MemDisk<'a>,
+}
+
+impl crate::filesystem::vfs::Block for MergeDisk<'_> {
+    fn read_sectors(&self, lba: u64, dst: &mut [u8]) -> Result<(), BlockError> {
+        self.inner.read_sectors(lba, dst)
+    }
+    fn disk_key(&self) -> DiskKey {
+        self.inner.disk_key()
+    }
+    fn max_transfer_sectors(&self) -> u32 {
+        128
+    }
+}
+
+/// ADR-195：**dentry 缓存**的证人（切片 E）。
+///
+/// ## 要证什么
+///
+/// `lookup` 对每个路径分量都调 `find_child`，而它新建游标、**线性扫目录**、每次都读盘。
+/// 缓存之后，重复解析同一条路径只查表。
+///
+/// ## 判据五格
+///
+/// 1. 首次解析 `/SUB/INNER.TXT`：**未命中**（`misses` 涨，`hits` 不动）；
+/// 2. 再解析同一条：**全部命中**（`hits` 涨，`misses` 不动）；
+/// 3. 两次结果**逐字段相同**（缓存不能改语义）；
+/// 4. 不同名字不串（`/SUB` 单独查，`misses` 又涨）；
+/// 5. `dentry_clear` 之后回零。
+///
+/// **负样本**：把 `dentry_get` 改成恒 `None` ⇒ 第 2 格红（`hits` 不涨）。
+fn t_dentry_cache() -> bool {
+    let mut ok = true;
+    vfs_ro::dentry_clear();
+
+    let mut img = [0u8; VOL_BYTES];
+    make_image(&mut img);
+    // `MemDisk` 默认 `max_transfer_sectors=1`（不可合并），本用例要测合并 ⇒ 包一层。
+    let disk = MergeDisk { inner: MemDisk { img: &img } };
+    let fs = match vfs_ro::ReadOnlyFs::mount(&disk) {
+        Ok(f) => f,
+        Err(e) => {
+            crate::log_fatal!("dentry: 挂载失败 {}", e.tag());
+            return false;
+        }
+    };
+
+    // ① 首次解析：全是未命中
+    let (h0, m0, _) = vfs_ro::dentry_stats();
+    let first = match fs.lookup("/SUB/INNER.TXT") {
+        Ok(e) => e,
+        Err(e) => {
+            crate::log_fatal!("dentry: 首次解析失败 {}", e.tag());
+            return false;
+        }
+    };
+    let (h1, m1, used1) = vfs_ro::dentry_stats();
+    let first_missed = h1 == h0 && m1 > m0 && used1 > 0;
+    if !first_missed {
+        crate::log_fatal!(
+            "dentry: 首次解析没有未命中 hits={}->{} misses={}->{} used={}",
+            h0, h1, m0, m1, used1
+        );
+        ok = false;
+    }
+
+    // ② 再解析同一条：全部命中
+    let second = match fs.lookup("/SUB/INNER.TXT") {
+        Ok(e) => e,
+        Err(e) => {
+            crate::log_fatal!("dentry: 二次解析失败 {}", e.tag());
+            return false;
+        }
+    };
+    let (h2, m2, _) = vfs_ro::dentry_stats();
+    let second_hit = h2 > h1 && m2 == m1;
+    if !second_hit {
+        crate::log_fatal!("dentry: 二次解析没命中 hits={}->{} misses={}->{}", h1, h2, m1, m2);
+        ok = false;
+    }
+
+    // ③ 两次结果必须逐字段相同
+    let same = first.name() == second.name()
+        && first.first_cluster == second.first_cluster
+        && first.size == second.size
+        && first.attr == second.attr;
+    if !same {
+        crate::log_fatal!("dentry: 缓存改变了语义");
+        ok = false;
+    }
+
+    // ④ 不同名字不串
+    //
+    // **不能用 `/SUB`**（实测）：首次解析 `/SUB/INNER.TXT` 时中间经过了它，
+    // 已经进了缓存 ⇒ 这里会命中，那不是「串」而是「缓存对了」。
+    // 用一条**没走过**的路径：`/LONGNAMEFILE`（夹具里那条长名项）。
+    let (_, m3, _) = vfs_ro::dentry_stats();
+    let other = fs.lookup("/ROOT.TXT");
+    let (_, m4, _) = vfs_ro::dentry_stats();
+    let distinct = other.is_ok() && m4 > m3;
+    if !distinct {
+        crate::log_fatal!("dentry: 不同名字竟然命中了同一条");
+        ok = false;
+    }
+
+    // ⑤ clear 之后回零
+    vfs_ro::dentry_clear();
+    let (hc, mc, uc) = vfs_ro::dentry_stats();
+    let cleared = hc == 0 && mc == 0 && uc == 0;
+    if !cleared {
+        crate::log_fatal!("dentry: clear 之后还有残留");
+        ok = false;
+    }
+
+    crate::log_info!(
+        "dentry: 首次未命中={} 二次命中={} 语义相同={} 不串={} clear归零={} ⇒ {}",
+        first_missed, second_hit, same, distinct, cleared, ok
+    );
+    ok
+}
+
+ktest!(KT_DENTRY_CACHE, t_dentry_cache);
+
+/// ADR-194：**请求队列合并**的证人（切片 D）。
+///
+/// ## 要证什么
+///
+/// `read_at` 原来逐扇区调 `disk.read_sectors`（每次 512 字节）。对 AHCI 那是每条命令一个扇区，
+/// 而设备单次能吃 928 个 —— 读 64 KiB 要发 128 条命令。
+///
+/// ## 判据四格
+///
+/// 1. 无界 budget 下，16 扇区只发 **1** 条命令（段长 128 > 16）；
+/// 2. 有取消位时，段长压到 8 ⇒ 16 扇区发 **2** 条；
+/// 3. **合并后的数据必须与源一致**（正确性）；
+/// 4. 越过盘末尾时错误照旧。
+///
+/// ## 为什么缓冲是 `static` 而不是局部量
+///
+/// 第一版写 `let mut dst = [0u8; 16 * 512]`（8 KiB 局部量）⇒ **打穿内核栈** ⇒
+/// 收尾路径 `unexpected vector=13`（实测）。AGENTS.md 那条「栈数组不许跟容量走」就是这个。
+///
+/// **负样本**：把段长上限改成 1 ⇒ 第 1 格红（又变回 16 条命令）。
+#[cfg(feature = "handles")]
+fn t_block_merge() -> bool {
+    use crate::filesystem::block_io::{self, Budget};
+    use core::sync::atomic::AtomicBool;
+    let mut ok = true;
+
+    // **测试盘也要小**（AGENTS.md：容量不许进静态量）：
+    // 第一版用 256 扇区（128 KiB）当 static ⇒ `.bss` 涨 128 KiB ⇒ 收尾路径 HANG（实测）。
+    // 32 扇区（16 KiB）足够验「段长 128 > 16 ⇒ 1 条命令」与「段长 8 ⇒ 2 条」。
+    static mut IMG: [u8; 32 * 512] = [0u8; 32 * 512];
+    // 8 KiB 缓冲进 .bss 不进栈（栈数组会打穿内核栈）
+    static mut DST: [u8; 16 * 512] = [0u8; 16 * 512];
+    // SAFETY: 单核判据路径，两个 static 只在本用例内读写，没有并发访问者。
+    let img: &mut [u8] = unsafe { &mut *core::ptr::addr_of_mut!(IMG) };
+    // SAFETY: 同上。
+    let dst: &mut [u8] = unsafe { &mut *core::ptr::addr_of_mut!(DST) };
+    for (i, b) in img.iter_mut().enumerate() {
+        *b = ((i / 512) as u8) ^ ((i % 512) as u8);
+    }
+    let disk = MergeDisk { inner: crate::filesystem::vfs::MemDisk { img } };
+
+    // ① 无界：16 扇区应该只发 1 条命令
+    crate::filesystem::vfs::memdisk_reset_calls();
+    let out = block_io::read_at(&disk, 0, dst, &Budget::UNBOUNDED);
+    let cmds_merged = crate::filesystem::vfs::memdisk_read_calls();
+    let merged_ok = out.error.is_none() && out.sectors_done == 16 && cmds_merged == 1;
+    if !merged_ok {
+        crate::log_fatal!(
+            "merge: 无界读 16 扇区发了 {} 条命令（应为 1）sectors_done={}",
+            cmds_merged, out.sectors_done
+        );
+        ok = false;
+    }
+
+    // ② 数据必须与源一致
+    let data_ok = dst.iter().enumerate().all(|(i, b)| *b == img[i]);
+    if !data_ok {
+        crate::log_fatal!("merge: 合并读出来的数据与源不一致");
+        ok = false;
+    }
+
+    // ③ 有取消位：**段长压到 1**（ADR-194 补记）⇒ 16 扇区 16 条命令
+    //
+    // 为什么不是 8：取消只在段边界检查，段长 8 意味着最坏要等 8 扇区读完才停，
+    // 而 `t_block_io_budget` 的「半途」「取消」两格要求「读了几扇区就停在第几扇区」。
+    crate::filesystem::vfs::memdisk_reset_calls();
+    let cancel = AtomicBool::new(false);
+    fn zero_clock() -> u64 {
+        0
+    }
+    let tight = Budget { deadline: u64::MAX, clock: zero_clock, cancel: &cancel };
+    let out2 = block_io::read_at(&disk, 0, dst, &tight);
+    let cmds_tight = crate::filesystem::vfs::memdisk_read_calls();
+    let tight_ok = out2.error.is_none() && out2.sectors_done == 16 && cmds_tight == 16;
+    if !tight_ok {
+        crate::log_fatal!("merge: 有取消位时发了 {} 条命令（应为 16）", cmds_tight);
+        ok = false;
+    }
+
+    // ④ 越界照旧
+    crate::filesystem::vfs::memdisk_reset_calls();
+    let mut small = [0u8; 512];
+    let oob = block_io::read_at(&disk, 32, &mut small, &Budget::UNBOUNDED);
+    let oob_ok = oob.error.is_some();
+    if !oob_ok {
+        crate::log_fatal!("merge: 越界读竟然成功了");
+        ok = false;
+    }
+
+    crate::log_info!(
+        "merge: 无界命令数={} 数据一致={} 有取消命令数={} 越界仍拒={} ⇒ {}",
+        cmds_merged, data_ok, cmds_tight, oob_ok, ok
+    );
+    ok
+}
+
+#[cfg(feature = "handles")]
+ktest!(KT_BLOCK_MERGE, t_block_merge);

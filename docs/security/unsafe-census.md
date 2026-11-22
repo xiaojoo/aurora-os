@@ -5,7 +5,7 @@
 >
 > **2026-11-20（ADR-175 跨 AS 读走物理地址）**：`sched/user` U2 9 → 10（`copy_from_user_in` 里 HHDM 别名的单字节读）。**总数 +1**（530 → 531）。
 
-总计 580 处。U1 85 · U2 161 · U3 13 · U4 153 · U5 128 · U6 40
+总计 585 处。U1 85 · U2 161 · U3 13 · U4 158 · U5 128 · U6 40
 
 | 类别 | 含义 | 处数 |
 |---|---|---|
@@ -28,6 +28,32 @@
 ADR-179：句柄槽数组从 `.bss` 改为运行时分配。四处的指针来源都是 `phys_alloc_above`
 分出的 MOD_BOOT 连续帧（永不归还）、长度 `MAX_HANDLES`、生命周期整个内核，
 访问都在 `RANK_HANDLE(35)` 锁内。
+
+### filesystem/vfs_ro
+
+| 类别 | 行 | 形状 |
+|---|---|---|
+| U4 | 511 | `unsafe impl Sync for DentryCell {}` （dentry 缓存表的静态量）|
+| U4 | 545 | `unsafe { &mut *DENTRY.0.get() }` （`dentry_get` 持锁期间）|
+| U4 | 566 | `unsafe { &mut *DENTRY.0.get() }` （`dentry_put` 持锁期间）|
+| U4 | 585 | `unsafe { &*DENTRY.0.get() }` （`dentry_stats` 持锁期间）|
+| U4 | 596 | `unsafe { &mut *DENTRY.0.get() }` （`dentry_clear` 持锁期间）|
+
+ADR-195：dentry 缓存的 64 条 `DentrySlot` 进 `.bss`。五处指针都指向 `DENTRY` 这个
+静态量，长度 `DENTRY_MAX`，生命周期整个内核，访问都在 `RANK_DENTRY(38)` 锁内。
+载荷全为 `Copy` 数值（`Entry` 是 `Copy`），无别名逃逸。
+
+### ktests/storage/vfs_ro
+
+| 类别 | 行 | 形状 |
+|---|---|---|
+| U6 | 1245 | `unsafe { &mut *core::ptr::addr_of_mut!(IMG) }` （判据的测试盘）|
+| U6 | 1248 | `unsafe { &mut *core::ptr::addr_of_mut!(DST) }` （判据的读缓冲）|
+
+ADR-194：`t_block_merge` 的两个 `static mut`。**故意进 `.bss` 而不进栈**：
+64 KiB 栈数组会打穿内核栈（AGENTS.md 那条纪律），而 128 KiB static 会让收尾路径 HANG。
+所以最终缩到 16 KiB + 8 KiB。两处都只在单核判据路径上读写，没有并发访问者。
+
 ### arch/hooks
 
 | 类别 | 行 | 形状 |
