@@ -224,6 +224,15 @@ pub const SYS_MPROTECT: u64 = 66;
 pub const SYS_FS_CREATE: u64 = 70;
 /// 71：`fs_unlink` —— 删一个文件。`rdi`=路径、`rsi`=路径长 → 0。
 pub const SYS_FS_UNLINK: u64 = 71;
+// ---- ADR-186：fd 号段（72–75）
+/// 把一个句柄装进当前进程的 fd 表，返回 fd。
+pub const SYS_FD_INSTALL: u64 = 72;
+/// fd → 句柄。
+pub const SYS_FD_LOOKUP: u64 = 73;
+/// 释放 fd（**不销毁对象**，对象仍归句柄层）。
+pub const SYS_FD_CLOSE: u64 = 74;
+/// 枚举当前进程的 fd（每条 8 字节：fd + kind）。
+pub const SYS_FD_LIST: u64 = 75;
 
 /// 67：`sigaction` —— 注册信号处理函数。`rdi`=signo、`rsi`=handler、`rdx`=flags → 旧 handler。
 ///
@@ -2464,6 +2473,132 @@ fn sys_sysinfo(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     }
 }
 
+// ---------------------------------------------------------------- ADR-186：fd 号段（72–75）
+
+/// 取当前进程的 `(proc_id, gen)`。**fd 表挂在进程上，不挂在任务上**。
+///
+/// 链路：`current_identity()` → `(任务全局下标, 任务 id)` → `proc_id_of` → `proc_gen`。
+#[cfg(feature = "handles")]
+fn current_proc() -> Option<(u16, u32)> {
+    let (gi, _tid) = crate::sched::current_identity()?;
+    let pid = crate::sched::proc_id_of(gi);
+    if pid == crate::proc::NO_PROC {
+        return None;
+    }
+    let gen = crate::proc::proc_gen(pid)?;
+    Some((pid, gen))
+}
+
+/// 72：`fd_install(h)` → fd。
+///
+/// 把句柄装进当前进程的 fd 表，返回最小的空闲 fd（0/1/2 是标准流，从 3 起）。
+///
+/// **句柄本身不被消费**：它仍然可以用旧号（8/9/10/22…）操作。
+/// fd 只是它的另一个名字。
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_fd_install(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
+    let Some((pid, gen)) = current_proc() else { return E_BAD_HANDLE };
+    // 先验句柄有效（不然会把垃圾装进 fd 表）
+    if crate::handle::resolve(crate::handle::Handle(frame.rdi), owner, 0).is_err() {
+        return E_BAD_HANDLE;
+    }
+    let Some(mut t) = crate::proc::proc_fd_table(pid, gen) else {
+        return E_BAD_HANDLE;
+    };
+    match t.install(crate::handle::Handle(frame.rdi)) {
+        Ok(fd) => {
+            // 扩容之后容量变了，必须写回主人（ADR-180 补记二）
+            let _ = crate::proc::proc_set_fd_table(pid, gen, t.base(), t.cap());
+            fd as u64
+        }
+        Err(e) => handle_err(e),
+    }
+}
+
+/// 73：`fd_lookup(fd)` → 句柄。
+///
+/// fd 不存在或那一格是空的 ⇒ `-9`（EBADF）。
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_fd_lookup(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let Some((pid, gen)) = current_proc() else { return E_BAD_HANDLE };
+    let Some(t) = crate::proc::proc_fd_table(pid, gen) else {
+        return crate::network::socket::E_BAD_FD;
+    };
+    match t.lookup(frame.rdi as u32) {
+        Some(h) => h.0,
+        None => crate::network::socket::E_BAD_FD,
+    }
+}
+
+/// 74：`fd_close(fd)` → 0。
+///
+/// ## 只释放 fd，不销毁对象（ADR-186 决策 4）
+///
+/// POSIX 的 `close` 是「减少一个引用」。我们的句柄层**没有引用计数**，
+/// 所以保守地只清 fd 那一格——**泄漏一个句柄比误销毁好**。
+///
+/// 真正的销毁仍走 8 号（`handle_close`）。
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_fd_close(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let Some((pid, gen)) = current_proc() else { return E_BAD_HANDLE };
+    let Some(mut t) = crate::proc::proc_fd_table(pid, gen) else {
+        return crate::network::socket::E_BAD_FD;
+    };
+    match t.release(frame.rdi as u32) {
+        Some(_) => 0,
+        None => crate::network::socket::E_BAD_FD,
+    }
+}
+
+/// 75：`fd_list(buf, cap)` → 条数。
+///
+/// 每条 8 字节：`fd: u32 | kind: u32`。
+///
+/// **带 kind**：用户态光知道「fd 3 存在」没用，它要知道「这是 socket 还是文件」。
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_fd_list(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
+    let Some((pid, gen)) = current_proc() else { return E_BAD_HANDLE };
+    let cap = frame.rsi as usize;
+    let want = cap / 8;
+    if want == 0 {
+        return E_INVALID;
+    }
+    let Some(t) = crate::proc::proc_fd_table(pid, gen) else {
+        return 0; // 还没分配 fd 表 ⇒ 零条，不是错误
+    };
+    let total = t.cap();
+    let mut out = [0u8; 8 * 16];
+    let mut n = 0usize;
+    let limit = want.min(16);
+    for fd in 0..total {
+        if n >= limit {
+            break;
+        }
+        let Some(h) = t.lookup(fd as u32) else { continue };
+        let kind = match crate::handle::resolve(h, owner, 0) {
+            Ok((o, _)) => kind_of(&o),
+            // 句柄已失效但 fd 还在：报 KIND_FILE 不对，报 0 表示「未知」
+            Err(_) => 0,
+        };
+        out[n * 8..n * 8 + 4].copy_from_slice(&(fd as u32).to_le_bytes());
+        out[n * 8 + 4..n * 8 + 8].copy_from_slice(&kind.to_le_bytes());
+        n += 1;
+    }
+    if n == 0 {
+        return 0;
+    }
+    match copy_to_user(&out[..n * 8], frame.rdi) {
+        Ok(m) if m == n * 8 => n as u64,
+        _ => E_FAULT,
+    }
+}
+
 // ---------------------------------------------------------------- ADR-181：socket 族（48–55）
 
 /// 从用户内存读一个 `sockaddr`（双族，ADR-182 决策 5）。
@@ -2560,10 +2695,36 @@ fn sys_sock_create(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
         Ok(v) => v,
         Err(e) => return e,
     };
-    match crate::handle::grant_socket(owner, slot, gen, crate::handle::RIGHT_READ | crate::handle::RIGHT_WRITE) {
-        Ok(h) => h.0,
+    let h = match crate::handle::grant_socket(
+        owner, slot, gen,
+        crate::handle::RIGHT_READ | crate::handle::RIGHT_WRITE,
+    ) {
+        Ok(h) => h,
         Err(e) => {
             // 授句柄失败要把 socket 槽还回去，否则每次失败漏一格
+            crate::network::socket::destroy(slot, gen);
+            return handle_err(e);
+        }
+    };
+    // **返回 fd，不是句柄**（ADR-186 决策 3）：POSIX 的 `socket()` 返回 fd。
+    // 句柄仍然存在（可以用 73 号从 fd 查回来），只是不再直接暴露给用户态。
+    let Some((pid, pgen)) = current_proc() else {
+        let _ = crate::handle::close(h, owner);
+        crate::network::socket::destroy(slot, gen);
+        return E_BAD_HANDLE;
+    };
+    let Some(mut t) = crate::proc::proc_fd_table(pid, pgen) else {
+        let _ = crate::handle::close(h, owner);
+        crate::network::socket::destroy(slot, gen);
+        return E_BAD_HANDLE;
+    };
+    match t.install(h) {
+        Ok(fd) => {
+            let _ = crate::proc::proc_set_fd_table(pid, pgen, t.base(), t.cap());
+            fd as u64
+        }
+        Err(e) => {
+            let _ = crate::handle::close(h, owner);
             crate::network::socket::destroy(slot, gen);
             handle_err(e)
         }
@@ -2576,7 +2737,7 @@ fn sys_sock_create(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
 fn sys_sock_bind(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
     // 长度由 `read_sockaddr` 按族自己判（IPv4 16 / IPv6 28）
-    let (slot, gen) = match socket_slot_of(frame.rdi, owner) {
+    let (slot, gen) = match socket_arg(frame.rdi, owner) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -2598,7 +2759,7 @@ fn sys_sock_bind(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
 #[inline(never)]
 fn sys_sock_listen(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
-    match socket_slot_of(frame.rdi, owner) {
+    match socket_arg(frame.rdi, owner) {
         Ok((slot, _)) => {
             crate::log_warn!("sock: listen 在 DGRAM socket 上无意义（槽 {}），回 -95", slot);
             crate::network::socket::E_OPNOTSUPP
@@ -2613,7 +2774,7 @@ fn sys_sock_listen(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
 fn sys_sock_connect(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
     // 长度由 `read_sockaddr` 按族自己判（IPv4 16 / IPv6 28）
-    let (slot, gen) = match socket_slot_of(frame.rdi, owner) {
+    let (slot, gen) = match socket_arg(frame.rdi, owner) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -2632,7 +2793,7 @@ fn sys_sock_connect(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
 #[inline(never)]
 fn sys_sock_accept(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
-    match socket_slot_of(frame.rdi, owner) {
+    match socket_arg(frame.rdi, owner) {
         Ok((slot, _)) => {
             crate::log_warn!("sock: accept 在 DGRAM socket 上无意义（槽 {}），回 -95", slot);
             crate::network::socket::E_OPNOTSUPP
@@ -2653,7 +2814,7 @@ fn sys_sock_send(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     if len == 0 || len > crate::network::udp::UDP_PAYLOAD_MAX {
         return E_INVALID;
     }
-    let (slot, gen) = match socket_slot_of(frame.rdi, owner) {
+    let (slot, gen) = match socket_arg(frame.rdi, owner) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -2786,7 +2947,7 @@ fn sys_sock_recv(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     // 而 Linux 的 syscall ABI 本来就把第 4 参放 r10。
     let src_out = frame.r10;
     let wait_ms = frame.r8;
-    let (slot, gen) = match socket_slot_of(frame.rdi, owner) {
+    let (slot, gen) = match socket_arg(frame.rdi, owner) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -2854,8 +3015,12 @@ fn write_sockaddr(ptr: u64, addr: crate::network::socket::SockAddr) -> Result<()
 #[inline(never)]
 fn sys_sock_close(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
-    let h = crate::handle::Handle(frame.rdi);
-    let (slot, gen) = match socket_slot_of(frame.rdi, owner) {
+    // **先解出真正的句柄**（ADR-186）：用户态传的可能是 fd，不是句柄。
+    let h = match resolve_arg_to_handle(frame.rdi, owner) {
+        Ok(h) => h,
+        Err(e) => return e,
+    };
+    let (slot, gen) = match socket_slot_of(h.0, owner) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -2864,7 +3029,66 @@ fn sys_sock_close(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
         return handle_err(e);
     }
     crate::network::socket::destroy(slot, gen);
+    // 若是 fd 传进来的，fd 那一格也要清掉（否则留着指向已销毁的 socket）
+    if frame.rdi < 0x1_0000 {
+        if let Some((pid, pgen)) = current_proc() {
+            if let Some(mut t) = crate::proc::proc_fd_table(pid, pgen) {
+                let _ = t.release(frame.rdi as u32);
+            }
+        }
+    }
     0
+}
+
+/// 把「fd 或句柄」统一解析成句柄（ADR-186）。
+#[cfg(feature = "handles")]
+fn resolve_arg_to_handle(arg: u64, owner: (usize, u32)) -> Result<crate::handle::Handle, u64> {
+    if arg < 0x1_0000 {
+        if let Some((pid, gen)) = current_proc() {
+            if let Some(t) = crate::proc::proc_fd_table(pid, gen) {
+                if let Some(h) = t.lookup(arg as u32) {
+                    return Ok(h);
+                }
+            }
+        }
+        return Err(crate::network::socket::E_BAD_FD);
+    }
+    // 句柄路径：验一下有效性
+    match crate::handle::resolve(crate::handle::Handle(arg), owner, 0) {
+        Ok(_) => Ok(crate::handle::Handle(arg)),
+        Err(e) => Err(handle_err(e)),
+    }
+}
+/// 把「用户态传进来的参数」解析成 socket 的 `(slot, gen)`。
+///
+/// ## 为什么需要这个
+///
+/// ADR-186 起 `socket()` 返回 **fd**，但用户态后续调 `bind`/`send`/`recv`/`close`
+/// 传的还是那个 fd。而 `socket_slot_of` 要的是**句柄**。
+///
+/// ## 兼容两种输入
+///
+/// - **fd**（小整数，`< 1<<32` 且 fd 表里有那一格）：走 fd → 句柄 → socket；
+/// - **句柄**（带世代号的 64 位值）：直接按句柄解。
+///
+/// **为什么保留句柄路径**：旧的 `t_socket_family` 用例、以及「先 `fd_lookup` 再调」的写法
+/// 都还在用句柄。两种并存没有歧义：fd 的值域是小整数，句柄的值域是 `(gen<<16)|slot`，
+/// 两者的位宽差得很远（实测句柄最小也是 0x10001）。
+#[cfg(feature = "handles")]
+pub(crate) fn socket_arg(arg: u64, owner: (usize, u32)) -> Result<(u16, u32), u64> {
+    // fd 只可能是小整数；句柄至少 0x10000（gen 从 1 起、左移 16）
+    if arg < 0x1_0000 {
+        if let Some((pid, gen)) = current_proc() {
+            if let Some(t) = crate::proc::proc_fd_table(pid, gen) {
+                if let Some(h) = t.lookup(arg as u32) {
+                    return socket_slot_of(h.0, owner);
+                }
+            }
+        }
+        // fd 表里没有 ⇒ 按 EBADF 回，不要退化成「按句柄试」
+        return Err(crate::network::socket::E_BAD_FD);
+    }
+    socket_slot_of(arg, owner)
 }
 
 /// 从句柄解出 `(slot, gen)`。**只接受 `ObjRef::Socket`**。
@@ -4251,6 +4475,10 @@ pub fn syscall_dispatch(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> boo
         // 落地的分片：socket 族等 ADR-166 的 network 模块、输入族等 ADR-162 的 USB HID、
         // 音频族等 ADR-163 的 HDA。实现落地时把对应那一行换成真 handler，
         // 并按 ADR-176「验收」重写 `t_syscall_abi_arms` 里那一格（**不许直接删**）。
+        SYS_FD_INSTALL => sys_fd_install(frame),
+        SYS_FD_LOOKUP => sys_fd_lookup(frame),
+        SYS_FD_CLOSE => sys_fd_close(frame),
+        SYS_FD_LIST => sys_fd_list(frame),
         SYS_SOCK_CREATE => sys_sock_create(frame),
         SYS_SOCK_BIND => sys_sock_bind(frame),
         SYS_SOCK_LISTEN => sys_sock_listen(frame),

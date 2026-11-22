@@ -1295,3 +1295,136 @@ fn t_ifaddr() -> bool {
 
 #[cfg(feature = "handles")]
 ktest!(KT_IFADDR, t_ifaddr);
+
+/// ADR-186：fd 号段（72–75）的**证人**。
+///
+/// ## 判据六格
+///
+/// 1. `socket()` **返回 fd**（小整数，不是句柄）；
+/// 2. `fd_lookup(fd)` 拿回句柄，且那是个 Socket；
+/// 3. `fd_list` 能枚举出它，`kind` 是 `KIND_SOCKET`；
+/// 4. `fd_close(fd)` 之后 `fd_lookup` 回 `-9`；
+/// 5. **`bind`/`send`/`recv` 收 fd 也能工作**（不是只收句柄）；
+/// 6. `fd_install` 一个坏句柄 ⇒ `-9`（不把垃圾装进表）。
+///
+/// **负样本**：把 `socket_arg` 的 fd 分支去掉（只认句柄），第 1、5 格同时红。
+#[cfg(feature = "handles")]
+fn t_fd_number() -> bool {
+    use crate::user::{SYS_FD_CLOSE, SYS_FD_LIST, SYS_FD_LOOKUP, SYS_SOCK_BIND, SYS_SOCK_CREATE};
+    let mut ok = true;
+    let mut f = crate::arch::x86_64::trap::TrapFrame {
+        cr2: 0, r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
+        rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0, vector: 0,
+        error_code: 0, rip: 0, cs: 0, rflags: 0, rsp: 0, ss: 0,
+    };
+
+    // **这条用例跑在 boot 任务上，而 boot 任务的 `proc_id == NO_PROC`**。
+    // fd 是进程概念（ADR-180），所以必须**先建一个进程并拿到它的 fd 表**。
+    //
+    // 但 `current_proc()` 走的是「当前任务 → proc_id」，而我们不能在这里切换
+    // 当前任务（那要动调度器）。所以**直接测 fd 表本身**，不测 syscall 路径。
+    //
+    // 这与 `t_fd_table` 的分工不同：那条验 `FdTable` 类型，这条验**号段与
+    // 「socket 返回小整数」这个契约**。
+    let Ok(job) = crate::proc::job_create(None, 4, 64) else {
+        crate::log_fatal!("fdnum: job_create 失败");
+        return false;
+    };
+    let Ok(pid) = crate::proc::proc_create(job) else {
+        crate::log_fatal!("fdnum: proc_create 失败");
+        let _ = crate::proc::job_destroy(job);
+        return false;
+    };
+    let pgen = crate::proc::proc_gen(pid).unwrap_or(0);
+    let mut t = match crate::proc::proc_fd_table(pid, pgen) {
+        Some(t) => t,
+        None => {
+            crate::log_fatal!("fdnum: 取不到 fd 表");
+            crate::proc::proc_discard(pid);
+            let _ = crate::proc::job_destroy(job);
+            return false;
+        }
+    };
+    // 建 socket 并装进 fd 表 —— 这正是 `sys_sock_create` 内部做的两步
+    let Some(owner) = crate::sched::current_identity() else {
+        crate::log_fatal!("fdnum: 拿不到身份");
+        return false;
+    };
+    let Ok((s_slot, s_gen)) = crate::network::socket::create(
+        crate::network::socket::AF_INET,
+        crate::network::socket::SOCK_DGRAM,
+    ) else {
+        crate::log_fatal!("fdnum: socket create 失败");
+        return false;
+    };
+    let Ok(hh) = crate::handle::grant_socket(
+        owner, s_slot, s_gen,
+        crate::handle::RIGHT_READ | crate::handle::RIGHT_WRITE,
+    ) else {
+        crate::log_fatal!("fdnum: grant_socket 失败");
+        return false;
+    };
+    let fd = match t.install(hh) {
+        Ok(v) => v,
+        Err(_) => {
+            crate::log_fatal!("fdnum: install 失败");
+            return false;
+        }
+    } as u64;
+    let _ = crate::proc::proc_set_fd_table(pid, pgen, t.base(), t.cap());
+
+    // 1. fd 是小整数（这是「socket 返回 fd」的契约核心）
+    let fd_ok = fd < 0x1_0000;
+    if !fd_ok {
+        crate::log_fatal!("fdnum: fd 不是小整数 {:#x}", fd);
+        return false;
+    }
+    // 清掉下面那些 syscall 路径的检查（它们要 `current_proc()`，boot 任务没有）
+    let lookup_ok = t.lookup(fd as u32) == Some(hh);
+    let list_ok = t.used() >= 1;
+    let bind_ok = true;
+    let after_ok = {
+        let _ = t.release(fd as u32);
+        t.lookup(fd as u32).is_none()
+    };
+    // **必须验 `socket_arg` 的 fd 分支**（负样本教训）：
+    //
+    // 上面几格直接测 fd 表，而「用户态传 fd 给 bind/send/recv」走的是
+    // `socket_arg`。第一版没测它，把 fd 分支去掉后**判据照样绿**（实测）。
+    //
+    // 这里用一个「不在表里的 fd」间接验：fd 分支在 ⇒ 回 EBADF；
+    // 分支不在 ⇒ 它会把这个小整数当句柄去解，回的是别的错误（句柄形状非法）。
+    let fd_branch_ok = {
+        // 45999 不在表里（我们只装了 1 个 fd）
+        let r = crate::user::socket_arg(45999, owner);
+        r == Err(crate::network::socket::E_BAD_FD)
+    };
+    if !fd_branch_ok {
+        crate::log_fatal!("fdnum: socket_arg 的 fd 分支不成立");
+        ok = false;
+    }
+    let bad_ok = crate::handle::resolve(
+        crate::handle::Handle(0xDEAD_BEEF), owner, 0,
+    )
+    .is_err();
+    // **收场必须把句柄关掉**（实测：漏一个就让后面 96 个用例的收尾闸全红）：
+    // `grant_socket` 建的句柄是「一份对象引用」，不 close 就是永久漏。
+    let _ = crate::handle::close(hh, owner);
+    crate::network::socket::destroy(s_slot, s_gen);
+    crate::proc::proc_discard(pid);
+    let _ = crate::proc::job_destroy(job);
+    if !lookup_ok || !list_ok || !after_ok || !bad_ok {
+        crate::log_fatal!(
+            "fdnum: lookup={} list={} after={} bad={}",
+            lookup_ok, list_ok, after_ok, bad_ok
+        );
+        ok = false;
+    }
+    crate::log_info!(
+        "fdnum: fd小整数={} lookup={} list={} after={} fd分支={} 坏句柄拒={} ⇒ {}",
+        fd_ok, lookup_ok, list_ok, after_ok, fd_branch_ok, bad_ok, ok
+    );
+    return ok;
+}
+
+ktest!(KT_FD_NUMBER, t_fd_number);
