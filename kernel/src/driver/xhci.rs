@@ -242,10 +242,30 @@ impl RingCursor {
 
 /// xHCI 能力寄存器偏移（spec §5.3）。
 /// 只列初始化路径会读的，避免造没有调用者的常量表。
+// **偏移必须逐个核对**（ADR-210 实测撞过）：
+//
+// 第一版把 HCCPARAMS1 写在 0x08、DBOFF 写在 0x0C —— 那是错的。
+// xHCI spec §5.3 的实际布局是：
+//
+//   0x00 CAPLENGTH(1B) + RSVD(1B) + HCIVERSION(2B)
+//   0x04 HCSPARAMS1
+//   0x08 HCSPARAMS2   <- 我原来当成了 HCCPARAMS1
+//   0x0C HCSPARAMS3   <- 我原来当成了 DBOFF
+//   0x10 HCCPARAMS1
+//   0x14 DBOFF
+//   0x18 RTSOFF
+//   0x1C HCCPARAMS2
+//
+// 实测症状：`db=0x00000000`（读到 HCSPARAMS3=0）⇒ `BadCap`。
+// 而 `hccp=0x0000000f` 其实是 HCSPARAMS2（Max Scratchpad 位）。
 pub const CAP_CAPLENGTH: usize = 0x00;
 pub const CAP_HCSPARAMS1: usize = 0x04;
-pub const CAP_HCCPARAMS1: usize = 0x08;
-pub const CAP_DOORBELL_OFFSET: usize = 0x0C;
+pub const CAP_HCSPARAMS2: usize = 0x08;
+pub const CAP_HCSPARAMS3: usize = 0x0C;
+pub const CAP_HCCPARAMS1: usize = 0x10;
+pub const CAP_DOORBELL_OFFSET: usize = 0x14;
+pub const CAP_RTSOFF: usize = 0x18;
+pub const CAP_HCCPARAMS2: usize = 0x1C;
 
 /// 运行寄存器偏移（spec §5.4）。
 pub const OP_USBCMD: usize = 0x00;
@@ -416,4 +436,89 @@ pub fn plan_init(
         // 5) 运行：RS=1 + IE=1（中断使能）
         OpWrite::UsbCmd { reset: false, run: true, interrupts: true },
     ])
+}
+
+// ---------------------------------------------------------------- ADR-210：真设备 probe
+
+/// xHCI 的 `ModuleId`（驱动资源台账用）。
+///
+/// **必须唯一**：`driver/mod.rs` 的台账按 ModuleId 聚合，撞了就会互相顶账。
+const MOD_XHCI: crate::mm::ModuleId = crate::mm::ModuleId(88);
+
+/// 一次真实 probe 的读数（ADR-210）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reading {
+    pub cap_length: u8,
+    pub max_slots: u8,
+    pub max_intrs: u16,
+    pub max_ports: u8,
+    pub ac64: bool,
+    pub csz: bool,
+    pub scratchpad: u16,
+    pub doorbell_offset: u32,
+    /// BAR 长度（字节）—— 用来证「映射窗口够大」。
+    pub bar_len: usize,
+}
+
+/// probe 失败原因（ADR-210）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeError {
+    NoDevice,
+    /// BAR0 不是内存型，或映射失败。
+    NoMmio,
+    /// 读寄存器失败。
+    Io,
+    /// CAP 形状非法（见 `InitError`）。
+    BadCap,
+}
+
+/// **对一个 xHCI 设备做真实 probe**（ADR-210）：映射 BAR0、读 CAP、校验形状。
+///
+/// ## 今天不做什么
+///
+/// **不写任何寄存器**。`plan_init`（ADR-209）算出的 5 步序列还没执行 ——
+/// 那一步要等 CNR=0、要分配命令环与 DCBAA、要处理 HCRST 的时序。
+///
+/// 今天证的是三件事：**设备在、BAR 能映射、CAP 能读出且形状合法**。
+/// 这三件事是后续一切的前提，而且它们**失败时成因清楚**。
+pub fn probe_device(dev: &crate::bus::pci::Dev) -> Result<Reading, ProbeError> {
+    use crate::driver::{DriverCtx, DriverError};
+    let ctx = DriverCtx::for_device(MOD_XHCI, *dev);
+    let mmio = ctx.map_mmio(0).map_err(|e| match e {
+        DriverError::NoDevice => ProbeError::NoMmio,
+        _ => ProbeError::NoMmio,
+    })?;
+    let bar_len = ctx.mmio_len(mmio).map_err(|_| ProbeError::Io)?;
+    // CAP 在偏移 0：先读 CAPLENGTH/HCSPARAMS1/HCCPARAMS1/DOORBELL。
+    // **顺序按 spec**：CAPLENGTH 在 0x00 的低字节，HCSPARAMS1 在 0x04。
+    let cap0 = ctx.read32(mmio, CAP_CAPLENGTH).map_err(|_| ProbeError::Io)?;
+    let hcsparams1 = ctx.read32(mmio, CAP_HCSPARAMS1).map_err(|_| ProbeError::Io)?;
+    let hccparams1 = ctx.read32(mmio, CAP_HCCPARAMS1).map_err(|_| ProbeError::Io)?;
+    let doorbell = ctx.read32(mmio, CAP_DOORBELL_OFFSET).map_err(|_| ProbeError::Io)?;
+    let cap = CapSnapshot {
+        cap_length: (cap0 & 0xFF) as u8,
+        hcsparams1,
+        hccparams1,
+        doorbell_offset: doorbell,
+    };
+    // 形状校验：复用 ADR-209 的解码（那两个 `Option` 就是校验器）。
+    if cap.op_offset().is_none() || cap.doorbell_offset().is_none() {
+        // **把读到的原始值打出来**：形状校验失败时，「哪个字段不对」比「失败了」重要得多。
+        crate::log_fatal!(
+            "xhci: CAP 形状非法 cap0={:#010x} caplen={:#x} hcsp={:#010x} hccp={:#010x} db={:#010x}",
+            cap0, cap.cap_length, hcsparams1, hccparams1, doorbell
+        );
+        return Err(ProbeError::BadCap);
+    }
+    Ok(Reading {
+        cap_length: cap.cap_length,
+        max_slots: cap.max_slots(),
+        max_intrs: cap.max_intrs(),
+        max_ports: cap.max_ports(),
+        ac64: cap.ac64(),
+        csz: cap.csz(),
+        scratchpad: cap.max_scratchpad(),
+        doorbell_offset: cap.doorbell_offset,
+        bar_len,
+    })
 }

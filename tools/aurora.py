@@ -468,7 +468,10 @@ NVME_PATTERN = 0x7E
 
 VBLK2_MIB = 96
 VBLK2_PATTERN = 0x3C
-NVME_FEATURES = {"nvme"}
+NVME_FEATURES = {"nvme"}
+# ADR-210：xHCI 设备。**必须挂在 QEMU 上**，否则 USB 的每一层都只能
+# 证「推导对」，不能证「真的能跑」（AGENTS.md：涉及硬件的结论要有第二台仪器对账）。
+XHCI_FEATURES = {"xhci"}
 # NVMe 单独一块盘：命名空间大小由 `-device nvme` 的 drive= 决定，
 # 与 AHCI/virtio 的口/槽无关。复用会让「NVMe 容量对账」与别的盘混在一起。
 VBLK2_FEATURES = {"virtio-two-probe"}
@@ -4372,6 +4375,12 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
             cmd += [
                 "-trace", f"enable=pci_nvme_*,file={_trace}",
             ]
+    if XHCI_FEATURES & set(features):
+        # `qemu-xhci`：QEMU 的 xHCI 控制器（class 0x0c/0x03/0x30）。
+        # 不写死 BDF —— 驱动按 PCI class 找，与 AHCI/virtio 同一条纪律。
+        # `p2=`/`p3=` 给两个下游端口：判据要验「端口数读对了」，
+        # 而 QEMU 默认 p2=4；显式写 2 让 MaxPorts 有一个可对账的期望值。
+        cmd += ["-device", "qemu-xhci,id=xhci0,p2=2,p3=0"]
     # 一次性实验用的附加参数（例如 `-device intel-iommu,intremap=on` 去真正解析 DMAR）。
     # 走环境变量而不是加一堆子命令开关：这类实验今天要做、明天可能就废，不该进判定链的默认路径。
     # ADR-143：网卡设备**无条件挂给 QEMU**（之前只有 virtio-net 档有。实测 a3-shell 档的 ping 找不到设备 ⇒ NoDevice）。设备在但没人 claim 对其它档无害。

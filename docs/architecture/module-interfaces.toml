@@ -680,7 +680,7 @@ unsafe_scope = []
 module_id = "driver"
 owner = "driver"
 layer = "hal"
-source_modules = ["driver", "driver/ahci", "driver/virtio", "driver/nvme"]
+source_modules = ["driver", "driver/ahci", "driver/virtio", "driver/nvme", "driver/xhci"]
 public_api = [
   "driver::DriverCtx", "driver::DmaHandle", "driver::DriverError", "driver::IrqHandle",
   "driver::MmioHandle", "ahci::REG_CAP", "ahci::REG_GHC", "ahci::SECTOR", "ahci::boot_port",
@@ -692,6 +692,10 @@ public_api = [
   "nvme::init", "virtio::probe", "driver::MatchRule", "driver::ProbeOutcome",
   "driver::DriverEntry", "driver::MAX_DRIVERS", "driver::register", "driver::registered", "driver::driver_name",
   "driver::registry_clear", "driver::probe_device", "driver::register_builtin", "driver::matching_rules",
+  "xhci::probe_device", "xhci::Reading", "xhci::ProbeError", "xhci::CapSnapshot",
+  "xhci::plan_init", "xhci::InitError", "xhci::OpWrite", "xhci::TrbType",
+  "xhci::parse_trb", "xhci::build_trb", "xhci::RingCursor", "xhci::TRB_BYTES",
+  "xhci::TRB_RING_SIZE",
 ]
 allowed_callers = ["diagnostics", "integration", "sched", "storage", "network"]
 dependencies = [
@@ -1191,8 +1195,8 @@ known_scc = [
 "driver->arch" = 55
 "driver->boot" = 1
 "driver->irq" = 19
-"driver->memory" = 21
-"driver->pci" = 27
+"driver->memory" = 22
+"driver->pci" = 29
 "driver->time" = 13
 "irq->arch" = 29
 "irq->memory" = 1

@@ -2082,3 +2082,86 @@ fn t_xhci_init() -> bool {
 }
 
 ktest!(KT_XHCI_INIT, t_xhci_init);
+
+/// ADR-210：**xHCI 真设备 probe** 的证人（切片 H 第三层）。
+///
+/// ## 要证什么
+///
+/// ADR-208/209 都是纯函数判据。这一层**真的去读 QEMU 挂上来的 xHCI 设备的 CAP 寄存器**。
+///
+/// ## 判据七格
+///
+/// 1. PCI 枚举里**能找到** class 0x0c/0x03 的设备；
+/// 2. `probe_device` 成功（BAR0 能映射、CAP 能读）；
+/// 3. **CAPLength 合法**（>= 0x20 且 4 对齐）；
+/// 4. **Doorbell 偏移合法**（在 CAP 外、4 对齐）；
+/// 5. **MaxPorts == 2**（QEMU 命令行写的 `p2=2`，这是可对账的期望值）；
+/// 6. **MaxSlots > 0** 且 `AC64 == true`（QEMU xHCI 是 64 位设备）；
+/// 7. BAR 长度足够覆盖 CAP + Doorbell（否则后续访问会越界）。
+///
+/// **负样本**：把 `p2=2` 改成 `p2=4` ⇒ 第 5 格红（证明这条判据真的在读设备）。
+#[cfg(all(feature = "handles", feature = "xhci"))]
+fn t_xhci_probe() -> bool {
+    use crate::driver::xhci;
+    let mut ok = true;
+
+    // ① 找设备
+    let dev = match crate::pci::first_of_triple(0x0c, 0x03, 0x30) {
+        Some(d) => d,
+        None => {
+            crate::log_fatal!("xhci-probe: PCI 里没有 class 0x0c/0x03 的设备");
+            return false;
+        }
+    };
+    let found_ok = true;
+
+    // ② probe
+    let rd = match xhci::probe_device(&dev) {
+        Ok(r) => r,
+        Err(e) => {
+            crate::log_fatal!("xhci-probe: probe 失败 {:?}", e);
+            return false;
+        }
+    };
+
+    // ③④ CAPLength / Doorbell
+    let cap_len_ok = rd.cap_length >= 0x20 && rd.cap_length % 4 == 0;
+    let db_ok = rd.doorbell_offset >= rd.cap_length as u32 && rd.doorbell_offset % 4 == 0;
+    if !cap_len_ok || !db_ok {
+        crate::log_fatal!("xhci-probe: 形状非法 caplen={:#x} db={:#x}",
+            rd.cap_length, rd.doorbell_offset);
+        ok = false;
+    }
+
+    // ⑤ MaxPorts == 2（QEMU 命令行 p2=2）
+    let ports_ok = rd.max_ports == 2;
+    if !ports_ok {
+        crate::log_fatal!("xhci-probe: MaxPorts={} 期望 2（QEMU p2=2）", rd.max_ports);
+        ok = false;
+    }
+
+    // ⑥ MaxSlots / AC64
+    let slots_ok = rd.max_slots > 0 && rd.ac64;
+    if !slots_ok {
+        crate::log_fatal!("xhci-probe: slots={} ac64={}", rd.max_slots, rd.ac64);
+        ok = false;
+    }
+
+    // ⑦ BAR 覆盖 CAP + Doorbell
+    let need = (rd.doorbell_offset as usize).saturating_add(4);
+    let bar_ok = rd.bar_len >= need;
+    if !bar_ok {
+        crate::log_fatal!("xhci-probe: BAR 太短 {} < {}", rd.bar_len, need);
+        ok = false;
+    }
+
+    crate::log_info!(
+        "xhci-probe: 找到={} caplen={:#x} slots={} intrs={} ports={} ac64={} csz={} scratch={} db={:#x} bar={} ⇒ {}",
+        found_ok, rd.cap_length, rd.max_slots, rd.max_intrs, rd.max_ports,
+        rd.ac64, rd.csz, rd.scratchpad, rd.doorbell_offset, rd.bar_len, ok
+    );
+    ok
+}
+
+#[cfg(all(feature = "handles", feature = "xhci"))]
+ktest!(KT_XHCI_PROBE, t_xhci_probe);

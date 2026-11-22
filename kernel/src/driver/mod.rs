@@ -735,6 +735,24 @@ fn probe_nvme(_dev: &crate::bus::pci::Dev) -> ProbeOutcome {
     }
 }
 
+/// xHCI 的 probe 适配器：`class=0x0c, subclass=0x03`（USB 控制器，ADR-210）。
+///
+/// ## 今天只做「读能力寄存器并校验」
+///
+/// 控制器初始化序列（ADR-209 的 `plan_init`）**还没接到真设备** ——
+/// 那一步要真的写 USBCMD/CRCR/DCBAAP，且要等 CNR=0，属于下一层。
+///
+/// 今天证的是：**设备在、BAR 能映射、CAP 能读出且形状合法**。
+/// 这三件事任一失败都回 `NotMine`（让别的驱动试），而不是 `Failed` ——
+/// 因为「读不到能力寄存器」可能只是这一台设备还没上电。
+#[cfg(feature = "xhci")]
+fn probe_xhci(dev: &crate::bus::pci::Dev) -> ProbeOutcome {
+    match crate::driver::xhci::probe_device(dev) {
+        Ok(_) => ProbeOutcome::Claimed,
+        Err(_) => ProbeOutcome::NotMine,
+    }
+}
+
 /// 注册全部内置驱动（ADR-196）。**启动期调一次**。
 ///
 /// 返回注册成功的个数；表满或重复注册由调用方看返回值（不静默）。
@@ -760,6 +778,15 @@ pub fn register_builtin() -> usize {
         name: "virtio-net",
         rule: MatchRule::new(0x02, 0x00),
         probe: probe_virtio,
+    }) {
+        n += 1;
+    }
+    // xHCI：class 0x0c subclass 0x03（USB 控制器，ADR-210）
+    #[cfg(feature = "xhci")]
+    if register(DriverEntry {
+        name: "xhci",
+        rule: MatchRule::new(0x0c, 0x03),
+        probe: probe_xhci,
     }) {
         n += 1;
     }
