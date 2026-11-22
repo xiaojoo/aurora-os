@@ -21694,3 +21694,71 @@ fd 号段通了，但 0/1/2 是空的 —— **任何 POSIX 程序的第一行 `
 2. **`read`/`write` 的 fd 版**（今天要 `fd_lookup` 再调旧的号）
 3. **句柄引用计数**（`fd_close` 只释放 fd，不减少句柄引用）
 4. **`dup2`**
+---
+
+## 503. ADR-188 落地：`read`/`write` 的 fd 版（76/77）（2026-11-22）
+
+### 补的是「两步变一步」
+
+ADR-186/187 之后，一个 POSIX 程序的 `printf` 要走两步：
+
+    h = fd_lookup(1)           // 73 号：fd → 句柄
+    console_write(h, buf, n)   // 20 号：句柄 → 写
+
+**两步不是 libc 的形状**：`write(fd, buf, n)` 是一个 syscall。
+
+### 交付
+
+| 号 | 名字 | 签名 |
+|---|---|---|
+| 76 | `SYS_FD_READ` | `(fd, buf, len)` |
+| 77 | `SYS_FD_WRITE` | `(fd, buf, len)` |
+
+**参数顺序与 POSIX 一致**。
+
+按 fd 指向的对象类型分派：**Console 已接**，VfsFile/Socket 回 `-95` 并记日志点名。
+
+### 三个实测撞出来的坑
+
+**① `TrapFrame` 不是 `Copy`**：第一版想「换个 rdi 再调一遍 `sys_console_io`」，
+编译不过。抽成 `console_io_sid(sid, uptr, want, write)` 是唯一干净的做法。
+
+**② `VfsFile` 有 `#[cfg(feature = "fs-open")]` 门控**：`handles` 档没开它，
+直接 match 编译不过。加同样的 cfg。
+
+**③ 插入位置吃掉了 `E_INVALID` 的 `pub`**：我的脚本在第 440 行前插常量，
+把它变成了私有 ⇒ 20 个测试编译失败。
+
+### 判据八格（`t_fd_number`）
+
+    fdnum: fd小整数=true lookup=true list=true after=true fd分支=true stdio=true fdIO=true 坏句柄拒=true ⇒ true
+
+### 负样本（变异证红）——这次是最强的一次
+
+去掉 `console_io_sid` 里的 `want > CONSOLE_MAX` 检查：
+
+    判定=EXCEPTION qemu_rc=39 用时=2.9s
+
+**直接崩了**：999999 字节的写入越界。不需要判据变红，**崩溃本身就是证红**——
+那条边界检查是真实的内存安全栅栏，不是装饰。
+
+### 读数
+
+| 项 | 结果 |
+|---|---|
+| `check` | **20/20** |
+| `handles` 档 | **108/108**，连跑 5 次 **3 次全绿** |
+
+失败 2 次全是既有 `t_sdkdemo`（历史 8%）。
+
+### 一个如实记的边界
+
+`fd_io` 在**没有进程上下文**时回 `EBAD_HANDLE`（boot 任务 `proc_id == NO_PROC`）。
+用例专门验了这一格——**没有进程上下文时 fd IO 必须明确拒绝，不能静默成功**。
+
+### 未做
+
+1. **VfsFile 分派**（复用 10/23 号，但那个要 `ReadTicket`，锁序要重新审）
+2. **Socket 分派**（复用 53/54，但 socket 的 `send` 要 `connect` 过）
+3. **`readv`/`writev`**
+4. **`lseek` 的 fd 版**

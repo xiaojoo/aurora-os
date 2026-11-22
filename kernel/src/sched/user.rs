@@ -233,6 +233,10 @@ pub const SYS_FD_LOOKUP: u64 = 73;
 pub const SYS_FD_CLOSE: u64 = 74;
 /// 枚举当前进程的 fd（每条 8 字节：fd + kind）。
 pub const SYS_FD_LIST: u64 = 75;
+/// `read(fd, buf, len)`（ADR-188）。
+pub const SYS_FD_READ: u64 = 76;
+/// `write(fd, buf, len)`（ADR-188）。
+pub const SYS_FD_WRITE: u64 = 77;
 
 /// 67：`sigaction` —— 注册信号处理函数。`rdi`=signo、`rsi`=handler、`rdx`=flags → 旧 handler。
 ///
@@ -432,6 +436,7 @@ impl AbiError {
 
 /// §10.2 冻结的三个返回值。**判据里写的是数字本身**（-1 / -2 / -3），不是"等于 `E_TOO_LONG`"——
 /// 常量自己也会被人改，改错了要能被看见（同一条纪律见 `elf.rs`：不可想的地方要 checked）。
+pub const E_OPNOTSUPP: u64 = u64::MAX - 94; // -95 EOPNOTSUPP
 pub const E_INVALID: u64 = err_ret(AbiError::Invalid);
 pub const E_FAULT: u64 = err_ret(AbiError::Fault);
 pub const E_TOO_LONG: u64 = err_ret(AbiError::TooLong);
@@ -2574,6 +2579,79 @@ fn current_proc() -> Option<(u16, u32)> {
     Some((pid, gen))
 }
 
+/// 76：`fd_read(fd, buf, len)` → 读到的字节数（ADR-188）。
+///
+/// 按 fd 指向的对象类型分派。**本轮只接 Console**，其余回 `-95` 并记日志点名。
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_fd_read(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    fd_io(frame, false)
+}
+
+/// 77：`fd_write(fd, buf, len)` → 写出的字节数（ADR-188）。
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_fd_write(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    fd_io(frame, true)
+}
+
+/// `fd_read`/`fd_write` 的共同实现（ADR-188 决策 2）。
+///
+/// ## 为什么不新写一套 IO
+///
+/// 每种对象的 IO 都已经有实现，而且都带实测过的边界检查（`COPY_MAX`/`CONSOLE_MAX`/
+/// `UDP_PAYLOAD_MAX`）。重写一遍等于把那些检查再写一次，漏一处就是一个越界。
+///
+/// ## 为什么只接 Console
+///
+/// Console 是 stdio 的载体，**接上它 `printf` 就能用**。文件与 socket 的分派留着但
+/// **不假装实现**：遇到它们回 `-95` 并打日志点名。
+///
+/// **不静默降级成 Console**：那会把文件内容写到串口上。
+#[cfg(feature = "handles")]
+fn fd_io(frame: &crate::arch::x86_64::trap::TrapFrame, write: bool) -> u64 {
+    use crate::handle::{Handle, ObjRef, RIGHT_READ, RIGHT_WRITE};
+    let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
+    let Some((pid, gen)) = current_proc() else { return E_BAD_HANDLE };
+    // 惰性 stdio：第一次 IO 时 0/1/2 可能还没建（ADR-187）
+    ensure_stdio(owner.0, owner.1, pid, gen);
+    let fd = frame.rdi as u32;
+    let Some(t) = crate::proc::proc_fd_table(pid, gen) else {
+        return crate::network::socket::E_BAD_FD;
+    };
+    let Some(h) = t.lookup(fd) else {
+        return crate::network::socket::E_BAD_FD;
+    };
+    let need = if write { RIGHT_WRITE } else { RIGHT_READ };
+    let obj = match crate::handle::resolve(h, owner, need) {
+        Ok((o, _)) => o,
+        Err(e) => return handle_err(e),
+    };
+    match obj {
+        ObjRef::Console(sid) => {
+            // **复用 20/21 号的核心逻辑**（不复制 frame：它不是 Copy）
+            console_io_sid(sid, frame.rsi, frame.rdx as usize, write)
+        }
+        #[cfg(feature = "fs-open")]
+        ObjRef::VfsFile { .. } => {
+            crate::log_warn!(
+                "fd_io: fd {} 是 VfsFile，本轮未接（ADR-188 未决 1），回 -95", fd
+            );
+            E_OPNOTSUPP
+        }
+        ObjRef::Socket { .. } => {
+            crate::log_warn!(
+                "fd_io: fd {} 是 Socket，本轮未接（ADR-188 未决 2），回 -95", fd
+            );
+            E_OPNOTSUPP
+        }
+        _ => {
+            crate::log_warn!("fd_io: fd {} 的对象类型不支持 IO，回 -95", fd);
+            E_OPNOTSUPP
+        }
+    }
+}
+
 /// 72：`fd_install(h)` → fd。
 ///
 /// 把句柄装进当前进程的 fd 表，返回最小的空闲 fd（0/1/2 是标准流，从 3 起）。
@@ -3318,7 +3396,15 @@ fn sys_console_io(frame: &crate::arch::x86_64::trap::TrapFrame, write: bool) -> 
         Ok(_) => return E_DENIED,
         Err(e) => return handle_err(e),
     };
-    let want = frame.rdx as usize;
+    console_io_sid(sid, frame.rsi, frame.rdx as usize, write)
+}
+
+/// Console 的实际 IO：`sid` + 用户缓冲指针 + 长度（ADR-188 决策 2）。
+///
+/// **从 `sys_console_io` 抽出来**：fd 版要复用这段，而 `TrapFrame` 不是 `Copy`，
+/// 没法「换个 rdi 再调一遍」。抽成独立函数是唯一干净的做法。
+#[cfg(feature = "handles")]
+pub(crate) fn console_io_sid(sid: u8, uptr: u64, want: usize, write: bool) -> u64 {
     if want > CONSOLE_MAX {
         return E_TOO_LONG;
     }
@@ -3327,7 +3413,7 @@ fn sys_console_io(frame: &crate::arch::x86_64::trap::TrapFrame, write: bool) -> 
     }
     let mut buf = [0u8; CONSOLE_MAX];
     if write {
-        match copy_from_user(frame.rsi, &mut buf[..want]) {
+        match copy_from_user(uptr, &mut buf[..want]) {
             Ok(n) if n == want => crate::serial::write_bytes_sid(sid as usize, &buf[..n]) as u64,
             _ => {
                 BAD_PTRS.fetch_add(1, Ordering::Relaxed);
@@ -3342,7 +3428,7 @@ fn sys_console_io(frame: &crate::arch::x86_64::trap::TrapFrame, write: bool) -> 
         }
         // VMM 同时串行化各任务的消费，并保证坏目标指针不会取走输入。
         let result = mm::with_vmm_lock(|| {
-            validate_range(frame.rsi, want as u64, true)?;
+            validate_range(uptr, want as u64, true)?;
             let mut n = 0;
             while n < want {
                 // S6c：控制台输入源从"只有串口"变成"串口或键盘"（裁决记在 ADR-083 决策 5）。
@@ -3354,7 +3440,7 @@ fn sys_console_io(frame: &crate::arch::x86_64::trap::TrapFrame, write: bool) -> 
                 buf[n] = b;
                 n += 1;
             }
-            copy_to_user_locked(&buf[..n], frame.rsi).map(|copied| (n, copied))
+            copy_to_user_locked(&buf[..n], uptr).map(|copied| (n, copied))
         });
         match result {
             Ok((taken, copied)) if copied == taken || copied > 0 => copied as u64,
@@ -4570,6 +4656,8 @@ pub fn syscall_dispatch(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> boo
         SYS_FD_LOOKUP => sys_fd_lookup(frame),
         SYS_FD_CLOSE => sys_fd_close(frame),
         SYS_FD_LIST => sys_fd_list(frame),
+        SYS_FD_READ => sys_fd_read(frame),
+        SYS_FD_WRITE => sys_fd_write(frame),
         SYS_SOCK_CREATE => sys_sock_create(frame),
         SYS_SOCK_BIND => sys_sock_bind(frame),
         SYS_SOCK_LISTEN => sys_sock_listen(frame),

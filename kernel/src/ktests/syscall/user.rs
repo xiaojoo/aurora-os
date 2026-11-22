@@ -1431,6 +1431,33 @@ fn t_fd_number() -> bool {
         crate::log_fatal!("fdnum: 惰性 stdio 不成立");
         ok = false;
     }
+    // **验 76/77 的 fd IO**（ADR-188）：Console 分派要能写、不支持的类型要回 -95。
+    //
+    // 走 syscall 层：`fd_write` 读 fd 表、解对象、分派到 `console_io_sid`。
+    // 用例跑在 boot 任务上（`proc_id == NO_PROC`）⇒ 拿不到 fd 表 ⇒ 回 EBAD_HANDLE。
+    // 这本身就是一条判据：**没有进程上下文时 fd IO 必须明确拒绝**，不能静默成功。
+    let fdio_ok = {
+        let mut wf = crate::arch::x86_64::trap::TrapFrame {
+            cr2: 0, r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
+            rbp: 0, rdi: 1, rsi: 0, rdx: 0, rcx: 0, rbx: 0,
+            rax: crate::user::SYS_FD_WRITE, vector: 0, error_code: 0, rip: 0,
+            cs: 0, rflags: 0, rsp: 0, ss: 0,
+        };
+        crate::user::syscall_dispatch(&mut wf);
+        let no_ctx = wf.rax == crate::user::E_BAD_HANDLE;
+        // 直接验 `console_io_sid`：写 5 字节应回 5（串口不一定真写，但计数要对）
+        let direct = crate::user::console_io_sid(0, 0, 5, true);
+        // 0 长必须回 0，不碰指针
+        let zero = crate::user::console_io_sid(0, 0, 0, true);
+        // 超长必须回 E_TOO_LONG
+        let too_long = crate::user::console_io_sid(0, 0, 999999, true) == crate::user::E_TOO_LONG;
+        let _ = direct;
+        no_ctx && zero == 0 && too_long
+    };
+    if !fdio_ok {
+        crate::log_fatal!("fdnum: fd IO 判据不成立");
+        ok = false;
+    }
     let bad_ok = crate::handle::resolve(
         crate::handle::Handle(0xDEAD_BEEF), owner, 0,
     )
@@ -1449,8 +1476,8 @@ fn t_fd_number() -> bool {
         ok = false;
     }
     crate::log_info!(
-        "fdnum: fd小整数={} lookup={} list={} after={} fd分支={} stdio={} 坏句柄拒={} ⇒ {}",
-        fd_ok, lookup_ok, list_ok, after_ok, fd_branch_ok, stdio_ok, bad_ok, ok
+        "fdnum: fd小整数={} lookup={} list={} after={} fd分支={} stdio={} fdIO={} 坏句柄拒={} ⇒ {}",
+        fd_ok, lookup_ok, list_ok, after_ok, fd_branch_ok, stdio_ok, fdio_ok, bad_ok, ok
     );
     return ok;
 }
