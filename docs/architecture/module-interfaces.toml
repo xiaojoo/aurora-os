@@ -696,6 +696,9 @@ public_api = [
   "xhci::plan_init", "xhci::InitError", "xhci::OpWrite", "xhci::TrbType",
   "xhci::parse_trb", "xhci::build_trb", "xhci::RingCursor", "xhci::TRB_BYTES",
   "xhci::TRB_RING_SIZE",
+  "xhci::setup_event_ring", "xhci::EventRingReading", "xhci::EventRingError",
+  "xhci::build_erst_entry", "xhci::parse_erst_entry", "xhci::ERST_ENTRY_BYTES",
+  "xhci::run_device", "xhci::RunReading", "xhci::RunError",
 ]
 allowed_callers = ["diagnostics", "integration", "sched", "storage", "network"]
 dependencies = [
@@ -1195,8 +1198,8 @@ known_scc = [
 "driver->arch" = 55
 "driver->boot" = 1
 "driver->irq" = 19
-"driver->memory" = 26
-"driver->pci" = 30
+"driver->memory" = 31
+"driver->pci" = 31
 "driver->time" = 15
 "irq->arch" = 29
 "irq->memory" = 1

@@ -23662,3 +23662,60 @@ USB 与前面几片都不同：它有真正的**硬件状态机**，判据要证
 3. **事件环**（Interrupter 0 的 ERST + 中断）
 4. **Scratchpad Buffer 分配**
 5. **DMA 泄漏** —— `forget` 是故意的，但**没有卸载路径**；控制器若需重置，这两块永远回不来
+---
+
+## 531. ADR-212 落地：xHCI 事件环配置（切片 H 第五层）（2026-11-23）
+
+### 一个必须说清的坑：Interrupter 不在 OP 段
+
+第一版把 Interrupter 寄存器当成 `OP + 0x20 + n*0x20`，于是 `ERSTBA(0)` 落在 `OP+0x30`
+—— **与 `DCBAAP` 同址**。那不是巧合，是理解错了。
+
+权威依据（FreeBSD `xhci.c`）：`XWRITE4(sc, runt, XHCI_ERSTBA_LO(0), ...)` —— 第二个参数是 **runt**。
+**Interrupter 在 `RTSoFF` 那段里**（从 CAP+0x18 读），与 OP 是两个基址。
+
+实测验证：`rt=0x1040`（OP 0x40 + RTSOFF 0x1000），与 `op=0x40` 明显不同。
+
+### 交付
+
+    build_erst_entry / parse_erst_entry / setup_event_ring
+    RT_IMAN 0x00 / RT_IMOD 0x04 / RT_ERSTSZ 0x08 / RT_ERSTBA 0x10 / RT_ERDP 0x18
+
+配置流程：读 RTSOFF → 分配事件环段（一页=256 TRB）+ ERST 表 → 都清零 →
+写 ERST 表项 → 写 ERSTSZ=1 / ERSTBA / ERDP（含 EHB）→ 写 IMAN.IE。
+
+### 决策 1：`seg_size` 是 TRB 个数，不是字节数
+
+这是最容易写错的一格。写 4096（字节）会让硬件读越界 256 倍。判据第 2 格专门证它。
+
+### 决策 2：`ERDP` 必须带 `EHB`
+
+`EHB`（bit 3）是「事件处理者已就绪」。不置它，控制器不会开始写事件 ——
+而症状是「事件永远不来」，极难归因。
+
+### 决策 3：不开 MSI/MSI-X，用轮询 IP 位
+
+`IMAN.IE=1` 只让控制器置 `IP` 位，真正中断投递要 PCI 中断配置。
+今天用轮询代替 —— 与 AHCI 的 `t_irq_ahci` 并存：轮询是判据能证的最小形态，中断是产品路径。
+
+### 判据八格
+
+    xhci-er: 往返=true 未对齐拒=true 零拒=true 配置=true erstsz=1 iman=0x2 ie=true
+             对齐=true 分开=true seg=256 ｜ rt=0x1040 ring=0x3d000 erst=0x3e000 ⇒ true
+
+负样本（ERSTSZ 写 0）⇒「配置不对 erstsz=0」。
+
+### 读数
+
+| 项 | 结果 |
+|---|---|
+| `check` | **21/21** |
+| `handles,xhci` 档 | **`PASS(33)`**，`t_xhci_event_ring` 八格全绿 |
+
+### 未做
+
+1. **命令环消费者**（投递 TRB + 等 Command Completion Event）—— 本层只配了事件环，没发命令
+2. **MSI/MSI-X** 中断投递
+3. **事件环的回收**（读 ERDP、清 EHB、前移 dequeue）
+4. **端口枚举**（Enable Slot → Address Device → Configure Endpoint）
+5. **ERST 只用 1 段**

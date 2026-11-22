@@ -705,3 +705,179 @@ pub fn run_device(dev: &crate::bus::pci::Dev) -> Result<RunReading, RunError> {
         usbcmd_after_run,
     })
 }
+
+// ---------------------------------------------------------------- ADR-212：命令环消费者 + 事件环
+
+/// 运行时寄存器组（RT）的偏移（spec §5.5，**相对 RT 基址，不是 OP 基址**）。
+///
+/// ## 一个必须说清的坑
+///
+/// 第一版把 Interrupter 寄存器当成 `OP + 0x20 + n*0x20`，于是 `ERSTBA(0)` 落在 `OP+0x30`
+/// —— **与 `DCBAAP` 同址**。那不是巧合，是我的理解错了。
+///
+/// 权威依据（FreeBSD `sys/dev/usb/controller/xhci.c`）：
+///
+/// ```c
+/// XWRITE4(sc, runt, XHCI_ERSTBA_LO(0), (uint32_t)addr);   // 第二个参数是 runt
+/// ```
+///
+/// **Interrupter 在 `RTSoFF` 那段里**（RTSoFF 从 CAP+0x18 读），与 OP 是两个基址。
+pub const RT_IMAN: usize = 0x00;
+pub const RT_IMOD: usize = 0x04;
+pub const RT_ERSTSZ: usize = 0x08;
+pub const RT_ERSTBA: usize = 0x10;
+pub const RT_ERDP: usize = 0x18;
+
+/// Interrupter 之间的跨度（spec §5.5：每个 0x20 字节）。
+pub const RT_INTERRUPTER_STRIDE: usize = 0x20;
+
+/// IMAN 位。
+pub const IMAN_IP: u32 = 1 << 0;
+pub const IMAN_IE: u32 = 1 << 1;
+
+/// ERDP 位。
+pub const ERDP_EHB: u32 = 1 << 3;
+
+/// 事件环段表项（ERST Entry，16 字节）。
+///
+/// 布局（spec §6.5.1）：
+///
+/// ```
+/// 0x00  64 位：Ring Segment Base Address（低 6 位保留，必须 64 字节对齐）
+/// 0x08  32 位：Ring Segment Size（TRB 个数，不是字节）
+/// 0x0C  32 位：Reserved
+/// ```
+pub const ERST_ENTRY_BYTES: usize = 16;
+
+/// 构造一个 ERST 表项（ADR-212）。
+///
+/// **`seg_size` 是 TRB 个数**，不是字节数 —— 这是最容易写错的一格。
+pub fn build_erst_entry(out: &mut [u8; ERST_ENTRY_BYTES], seg_base: u64, seg_size: u32) -> bool {
+    // 段基址必须 64 字节对齐（低 6 位保留）。
+    if seg_base & 0x3F != 0 {
+        return false;
+    }
+    if seg_size == 0 {
+        return false;
+    }
+    out[0..8].copy_from_slice(&seg_base.to_le_bytes());
+    out[8..12].copy_from_slice(&seg_size.to_le_bytes());
+    out[12..16].copy_from_slice(&0u32.to_le_bytes());
+    true
+}
+
+/// 解析 ERST 表项（判据用）。
+pub fn parse_erst_entry(buf: &[u8; ERST_ENTRY_BYTES]) -> (u64, u32) {
+    let base = u64::from_le_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]);
+    let size = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    (base, size)
+}
+
+/// 事件环初始化失败原因（ADR-212）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventRingError {
+    /// 读 RTSOFF 失败，或它不在 BAR 内。
+    BadRtsoff,
+    /// DMA 分配失败。
+    NoDma,
+    /// 写寄存器失败。
+    Io,
+}
+
+/// 事件环的读数（ADR-212）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EventRingReading {
+    /// 运行时基址（OP + RTSOFF）。
+    pub rt_offset: usize,
+    /// 事件环段的总线地址。
+    pub ring_bus: u64,
+    /// ERST 表的总线地址。
+    pub erst_bus: u64,
+    /// 段大小（TRB 个数）。
+    pub seg_size: u32,
+    /// 配好之后读回的 IMAN。
+    pub iman: u32,
+    /// 配好之后读回的 ERSTSZ。
+    pub erstsz: u32,
+}
+
+/// **配置 Interrupter 0 的事件环**（ADR-212）。
+///
+/// ## 做什么
+///
+/// 1. 读 `CAP_RTSOFF` 得到运行时基址偏移
+/// 2. 分配两块 DMA：事件环段（一页 = 256 个 TRB）+ ERST 表（一页，只用 16 字节）
+/// 3. 两块都清零（脏 TRB 会被当成有效事件）
+/// 4. 构造 ERST 表项并写进 ERST 表
+/// 5. 写 `ERSTSZ=1`、`ERSTBA=表地址`、`ERDP=段地址 | EHB`
+/// 6. 写 `IMAN = IE`（使能中断，**但不清 IP**）
+///
+/// ## 一个刻意的保守
+///
+/// **不开 MSI/MSI-X**：`IMAN.IE=1` 只让控制器在事件到来时置 `IP` 位，
+/// 而真正的中断投递要 PCI 中断配置。今天用**轮询 `IP` 位**代替。
+///
+/// 这与 AHCI 的 `t_irq_ahci` 那条并存：轮询是判据能证的最小形态，
+/// 中断是产品路径，两者不混。
+pub fn setup_event_ring(dev: &crate::bus::pci::Dev) -> Result<EventRingReading, EventRingError> {
+    use crate::driver::DriverCtx;
+    let ctx = DriverCtx::for_device(MOD_XHCI, *dev);
+    let mmio = ctx.map_mmio(0).map_err(|_| EventRingError::Io)?;
+    let bar_len = ctx.mmio_len(mmio).map_err(|_| EventRingError::Io)?;
+    let cap0 = ctx.read32(mmio, CAP_CAPLENGTH).map_err(|_| EventRingError::Io)?;
+    let op = (cap0 & 0xFF) as usize;
+    let rtsoff = ctx.read32(mmio, CAP_RTSOFF).map_err(|_| EventRingError::Io)?;
+    let rt = op + rtsoff as usize;
+    // RTSOFF 必须落在 BAR 内，否则后面每次访问都会越界。
+    if rtsoff == 0 || rt + RT_ERDP + 4 > bar_len {
+        return Err(EventRingError::BadRtsoff);
+    }
+
+    // ---- 两块 DMA：事件环段 + ERST 表
+    let seg = ctx.alloc_dma(crate::mm::PAGE).map_err(|_| EventRingError::NoDma)?;
+    let erst = ctx.alloc_dma(crate::mm::PAGE).map_err(|_| EventRingError::NoDma)?;
+    let seg_bus = ctx.bus_addr(seg).map_err(|_| EventRingError::NoDma)?;
+    let erst_bus = ctx.bus_addr(erst).map_err(|_| EventRingError::NoDma)?;
+    ctx.dma_fill(seg, 0, 0, crate::mm::PAGE).map_err(|_| EventRingError::Io)?;
+    ctx.dma_fill(erst, 0, 0, crate::mm::PAGE).map_err(|_| EventRingError::Io)?;
+
+    // ---- ERST 表项：段基址 + 段大小（TRB 个数）
+    let seg_size = (crate::mm::PAGE / TRB_BYTES) as u32;
+    let mut entry = [0u8; ERST_ENTRY_BYTES];
+    if !build_erst_entry(&mut entry, seg_bus, seg_size) {
+        return Err(EventRingError::NoDma);
+    }
+    for (i, b) in entry.iter().enumerate() {
+        ctx.dma_write8(erst, i, *b).map_err(|_| EventRingError::Io)?;
+    }
+
+    // ---- 写运行时寄存器（**注意基址是 rt 不是 op**）
+    ctx.write32(mmio, rt + RT_ERSTSZ, 1).map_err(|_| EventRingError::Io)?;
+    ctx.write32(mmio, rt + RT_ERSTBA, (erst_bus & 0xFFFF_FFFF) as u32)
+        .map_err(|_| EventRingError::Io)?;
+    ctx.write32(mmio, rt + RT_ERSTBA + 4, (erst_bus >> 32) as u32)
+        .map_err(|_| EventRingError::Io)?;
+    // ERDP：段基址 + EHB（Event Handler Busy）。
+    // **EHB 必须置 1**：它是「事件处理者已就绪」的标志，spec §5.5.5。
+    let erdp = (seg_bus & !0x7) | u64::from(ERDP_EHB);
+    ctx.write32(mmio, rt + RT_ERDP, (erdp & 0xFFFF_FFFF) as u32)
+        .map_err(|_| EventRingError::Io)?;
+    ctx.write32(mmio, rt + RT_ERDP + 4, (erdp >> 32) as u32)
+        .map_err(|_| EventRingError::Io)?;
+    // IMAN：使能中断（IE），**不清 IP**（清 IP 是「已处理」的动作，留给消费者）。
+    let iman = ctx.read32(mmio, rt + RT_IMAN).map_err(|_| EventRingError::Io)?;
+    ctx.write32(mmio, rt + RT_IMAN, iman | IMAN_IE).map_err(|_| EventRingError::Io)?;
+    let iman_after = ctx.read32(mmio, rt + RT_IMAN).map_err(|_| EventRingError::Io)?;
+    let erstsz_after = ctx.read32(mmio, rt + RT_ERSTSZ).map_err(|_| EventRingError::Io)?;
+    // DMA 故意泄漏：事件环必须一直有效（与 ADR-211 同一条）。
+    core::mem::forget(seg);
+    core::mem::forget(erst);
+    Ok(EventRingReading {
+        rt_offset: rt,
+        ring_bus: seg_bus,
+        erst_bus,
+        seg_size,
+        iman: iman_after,
+        erstsz: erstsz_after,
+    })
+}

@@ -2248,3 +2248,84 @@ fn t_xhci_run() -> bool {
 
 #[cfg(all(feature = "handles", feature = "xhci"))]
 ktest!(KT_XHCI_RUN, t_xhci_run);
+
+/// ADR-212：**事件环配置**的证人（切片 H 第五层）。
+///
+/// ## 要证什么
+///
+/// ADR-211 让控制器进了运行态，但**没有任何事件通路**。这一层配 Interrupter 0 的事件环。
+///
+/// ## 判据八格
+///
+/// 1. ERST 表项往返：`build_erst_entry` + `parse_erst_entry` 字段相同；
+/// 2. **`seg_size` 是 TRB 个数**（不是字节数）—— 写错这一格会让硬件读越界；
+/// 3. 段基址未对齐时 `build_erst_entry` 回 `false`；
+/// 4. `seg_size == 0` 时回 `false`；
+/// 5. `setup_event_ring` 成功（RTSOFF 合法、DMA 分配成功、寄存器写成功）；
+/// 6. **`ERSTSZ` 读回 1**（写进去了）；
+/// 7. **`IMAN.IE` 置上了**（中断使能）；
+/// 8. **事件环段与 ERST 表地址不同且都 64 字节对齐**。
+///
+/// **负样本**：把 `ERSTSZ` 写成 0 ⇒ 第 6 格红（读回不是 1）。
+#[cfg(all(feature = "handles", feature = "xhci"))]
+fn t_xhci_event_ring() -> bool {
+    use crate::driver::xhci::{self, ERST_ENTRY_BYTES, IMAN_IE};
+    let mut ok = true;
+
+    // ①② ERST 往返
+    let mut buf = [0u8; ERST_ENTRY_BYTES];
+    let built = xhci::build_erst_entry(&mut buf, 0x20_0000, 256);
+    let (base, size) = xhci::parse_erst_entry(&buf);
+    let roundtrip = built && base == 0x20_0000 && size == 256;
+    if !roundtrip {
+        crate::log_fatal!("xhci-er: ERST 往返不对 base={:#x} size={}", base, size);
+        ok = false;
+    }
+
+    // ③④ 拒绝非法输入
+    let mut b2 = [0u8; ERST_ENTRY_BYTES];
+    let unaligned_ok = !xhci::build_erst_entry(&mut b2, 0x20_0001, 256);
+    let zero_ok = !xhci::build_erst_entry(&mut b2, 0x20_0000, 0);
+    if !unaligned_ok || !zero_ok {
+        crate::log_fatal!("xhci-er: 非法输入没被拒 unaligned={} zero={}", unaligned_ok, zero_ok);
+        ok = false;
+    }
+
+    // ⑤⑥⑦⑧ 真配置
+    let dev = match crate::pci::first_of_triple(0x0c, 0x03, 0x30) {
+        Some(d) => d,
+        None => {
+            crate::log_fatal!("xhci-er: 没有 xHCI 设备");
+            return false;
+        }
+    };
+    let rd = match xhci::setup_event_ring(&dev) {
+        Ok(r) => r,
+        Err(e) => {
+            crate::log_fatal!("xhci-er: setup 失败 {:?}", e);
+            return false;
+        }
+    };
+    let erstsz_ok = rd.erstsz == 1;
+    let ie_ok = rd.iman & IMAN_IE != 0;
+    let align_ok = rd.ring_bus & 0x3F == 0 && rd.erst_bus & 0x3F == 0;
+    let distinct_ok = rd.ring_bus != rd.erst_bus;
+    let seg_ok = rd.seg_size == 256;
+    if !erstsz_ok || !ie_ok || !align_ok || !distinct_ok || !seg_ok {
+        crate::log_fatal!(
+            "xhci-er: 配置不对 erstsz={} iman={:#x} align={} distinct={} seg={}",
+            rd.erstsz, rd.iman, align_ok, distinct_ok, rd.seg_size
+        );
+        ok = false;
+    }
+
+    crate::log_info!(
+        "xhci-er: 往返={} 未对齐拒={} 零拒={} 配置=true erstsz={} iman={:#x} ie={} 对齐={} 分开={} seg={} ｜ rt={:#x} ring={:#x} erst={:#x} ⇒ {}",
+        roundtrip, unaligned_ok, zero_ok, rd.erstsz, rd.iman, ie_ok,
+        align_ok, distinct_ok, rd.seg_size, rd.rt_offset, rd.ring_bus, rd.erst_bus, ok
+    );
+    ok
+}
+
+#[cfg(all(feature = "handles", feature = "xhci"))]
+ktest!(KT_XHCI_EVENT_RING, t_xhci_event_ring);
