@@ -5,7 +5,7 @@
 >
 > **2026-11-20（ADR-175 跨 AS 读走物理地址）**：`sched/user` U2 9 → 10（`copy_from_user_in` 里 HHDM 别名的单字节读）。**总数 +1**（530 → 531）。
 
-总计 595 处。U1 85 · U2 161 · U3 13 · U4 168 · U5 128 · U6 40
+总计 603 处。U1 85 · U2 161 · U3 13 · U4 176 · U5 128 · U6 40
 
 | 类别 | 含义 | 处数 |
 |---|---|---|
@@ -631,6 +631,23 @@ ADR-199：`Socket` 存 `ConnState` 需要一个可变入口，而 `Socket` 本�
 |---|---|---|
 | U6 | 61 | `let tests = unsafe { core::slice::from_raw_parts(start as *const KTest, bytes / size) };  let mut passed = 0us` |
 
+
+### time/timer
+
+| 类别 | 行 | 形状 |
+|---|---|---|
+| U4 | 96 | `unsafe impl Sync for TableCell {}` （定时器表的静态包装）|
+| U4 | 101 | `unsafe { &mut *TABLE.0.get() }` （`add`，持 TABLE_LOCK）|
+| U4 | 128 | `unsafe { &mut *TABLE.0.get() }` （`cancel`）|
+| U4 | 147 | `unsafe { &mut *TABLE.0.get() }` （`advance`）|
+| U4 | 168 | `unsafe { &mut *TABLE.0.get() }` （`expire`）|
+| U4 | 190 | `unsafe { &*TABLE.0.get() }` （`pending`）|
+| U4 | 198 | `unsafe { &*TABLE.0.get() }` （`stats`）|
+| U4 | 209 | `unsafe { &mut *TABLE.0.get() }` （`clear`）|
+
+ADR-201：定时器的 128 条 `Slot` 进 `.bss`，八处指针都指向 `TABLE` 这个静态量，
+生命周期整个内核，访问都在 `TABLE_LOCK`（`RANK_TIMER=6`，`new_isr_taken`）内。
+载荷全为 `Copy` 数值，无别名逃逸。
 ### time/tsc
 
 | 类别 | 行 | 形状 |

@@ -6,3 +6,6 @@
 
 pub(crate) mod clock;
 pub(crate) mod tsc;
+
+/// 定时器子系统（ADR-201）：纯数据结构 + 独立推进。
+pub mod timer;
