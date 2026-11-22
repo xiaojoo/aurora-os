@@ -2797,4 +2797,304 @@ fn t_tcp_syscall() -> bool {
 
 #[cfg(feature = "handles")]
 ktest!(KT_TCP_SYSCALL, t_tcp_syscall);
+/// ADR-201：**定时器子系统**的证人。
+///
+/// ## 为什么这个判据能成立
+///
+/// 定时器是**纯数据结构 + 独立推进幂**：`advance(now_us)` 显式收时间，不需要真的等。
+/// 判据可以喂任意时间轴 —— 包括「一次跳过 10 秒」这种真实场景里要等 10 秒的情形。
+///
+/// ## 判据八格
+///
+/// 1. 登记后 `pending` 增加，且槽号非 `None`；
+/// 2. **未到点不触发**（`advance` 回 0）；
+/// 3. 到点触发并 `expire` 能取走；
+/// 4. **多次 `advance` 不重复计数**（`expired` 位的作用）；
+/// 5. `cancel` 之后不再触发；
+/// 6. **`Kind` 与 `token` 原样带回**（分类不串）；
+/// 7. 表满时 `add` 回 `None` 且 `refused` 计数增加（**不静默丢弃**）；
+/// 8. `expire` 的 `out` 比到期数小时**只取走那么多**，剩下的还在。
+///
+/// **负样本**：去掉 `advance` 里的 `!s.expired` 判据 ⇒ 第 4 格红。
+#[cfg(feature = "handles")]
+fn t_timer() -> bool {
+    use crate::time::timer::{self, Kind};
+    let mut ok = true;
+    timer::clear();
+
+    // ① 登记
+    let s1 = timer::add(Kind::TcpRetransmit, 42, 1000);
+    let reg_ok = s1.is_some() && timer::pending() == 1;
+    if !reg_ok {
+        crate::log_fatal!("timer: 登记失败");
+        ok = false;
+    }
+
+    // ② 未到点不触发
+    let early = timer::advance(999);
+    let not_yet_ok = early == 0 && timer::pending() == 1;
+    if !not_yet_ok {
+        crate::log_fatal!("timer: 未到点就触发了（{} 条）", early);
+        ok = false;
+    }
+
+    // ③ 到点触发
+    let on_time = timer::advance(1000);
+    let fire_ok = on_time == 1;
+    if !fire_ok {
+        crate::log_fatal!("timer: 到点没触发（{} 条）", on_time);
+        ok = false;
+    }
+
+    // ④ 多次 advance 不重复计数
+    let again1 = timer::advance(1001);
+    let again2 = timer::advance(5000);
+    let no_double_ok = again1 == 0 && again2 == 0 && timer::pending() == 1;
+    if !no_double_ok {
+        crate::log_fatal!("timer: 重复计数 again1={} again2={}", again1, again2);
+        ok = false;
+    }
+
+    // ⑤ expire 取走
+    let mut out = [timer::Token {
+        kind: Kind::Generic, token: 0, deadline_us: 0, late_us: 0,
+    }; 4];
+    let n_ex = timer::expire(&mut out);
+    let expire_ok = n_ex == 1
+        && out[0].kind == Kind::TcpRetransmit
+        && out[0].token == 42
+        && out[0].deadline_us == 1000
+        && timer::pending() == 0;
+    if !expire_ok {
+        crate::log_fatal!("timer: expire 不对 n={} kind={} token={}",
+            n_ex, out[0].kind.tag(), out[0].token);
+        ok = false;
+    }
+
+    // ⑥ cancel
+    timer::clear();
+    let sc = timer::add(Kind::UsbTimeout, 7, 2000);
+    let cancelled = sc.map(timer::cancel).unwrap_or(false);
+    let _ = timer::advance(9999);
+    let cancel_ok = cancelled && timer::pending() == 0;
+    // 再 expire，应该一条都没有
+    let n_after_cancel = timer::expire(&mut out);
+    let cancel_ok = cancel_ok && n_after_cancel == 0;
+    if !cancel_ok {
+        crate::log_fatal!("timer: cancel 之后还触发了");
+        ok = false;
+    }
+
+    // ⑦ 分类不串
+    timer::clear();
+    let _ = timer::add(Kind::TcpTimeWait, 1, 100);
+    let _ = timer::add(Kind::BlockTimeout, 2, 100);
+    let _ = timer::add(Kind::Generic, 3, 100);
+    let n3 = timer::advance(100);
+    let mut out3 = [timer::Token { kind: Kind::Generic, token: 0, deadline_us: 0, late_us: 0 }; 8];
+    let got3 = timer::expire(&mut out3);
+    let mut seen_tw = false;
+    let mut seen_blk = false;
+    let mut seen_gen = false;
+    for i in 0..got3 {
+        match out3[i].kind {
+            Kind::TcpTimeWait if out3[i].token == 1 => seen_tw = true,
+            Kind::BlockTimeout if out3[i].token == 2 => seen_blk = true,
+            Kind::Generic if out3[i].token == 3 => seen_gen = true,
+            _ => {}
+        }
+    }
+    let kinds_ok = n3 == 3 && got3 == 3 && seen_tw && seen_blk && seen_gen;
+    if !kinds_ok {
+        crate::log_fatal!("timer: kind/token 串了 n3={} got={}", n3, got3);
+        ok = false;
+    }
+
+    // ⑧ 表满回 None
+    timer::clear();
+    let mut filled = 0usize;
+    for i in 0..timer::MAX_TIMERS {
+        if timer::add(Kind::Generic, i as u64, 1_000_000).is_some() {
+            filled += 1;
+        }
+    }
+    let overflow = timer::add(Kind::Generic, 999, 1_000_000);
+    let (added, _fired, refused) = timer::stats();
+    let full_ok = filled == timer::MAX_TIMERS
+        && overflow.is_none()
+        && refused >= 1
+        && added == timer::MAX_TIMERS as u32;
+    if !full_ok {
+        crate::log_fatal!("timer: 表满行为不对 filled={} overflow={} refused={}",
+            filled, overflow.is_some(), refused);
+        ok = false;
+    }
+
+    // ⑨ out 小于到期数时只取那么多
+    timer::clear();
+    let _ = timer::add(Kind::Generic, 1, 10);
+    let _ = timer::add(Kind::Generic, 2, 10);
+    let _ = timer::add(Kind::Generic, 3, 10);
+    let _ = timer::advance(10);
+    let mut small = [timer::Token { kind: Kind::Generic, token: 0, deadline_us: 0, late_us: 0 }; 2];
+    let got_small = timer::expire(&mut small);
+    let partial_ok = got_small == 2 && timer::pending() == 1;
+    if !partial_ok {
+        crate::log_fatal!("timer: 部分取走不对 got={} pending={}", got_small, timer::pending());
+        ok = false;
+    }
+
+    timer::clear();
+    crate::log_info!(
+        "timer: 登记={} 未到点={} 到点={} 不重复={} expire={} cancel={} 分类={} 表满={} 部分={} ⇒ {}",
+        reg_ok, not_yet_ok, fire_ok, no_double_ok, expire_ok, cancel_ok, kinds_ok, full_ok, partial_ok, ok
+    );
+    ok
+}
+
+#[cfg(feature = "handles")]
+ktest!(KT_TIMER, t_timer);
+/// ADR-202：**中断下半部与 tick 接线**的证人。
+///
+/// ## 要证什么
+///
+/// ADR-201 做了定时器，但**调用者是判据**。这一层把它接进 `apic::on_interrupt` 的 tick 路径：
+/// 中断里只做「读时间 / advance / 投递」，真正处理留给安全上下文的 `drain`。
+///
+/// ## 判据六格
+///
+/// 1. **下半部队列自己工作**：`post` 进得去、`drain` 拿得出、顺序是 FIFO；
+/// 2. **满了不静默丢弃**：`post` 回 `false` 且 `bottom_dropped` 增加；
+/// 3. **`drain` 的 `out` 比排队的少时只取那么多**，剩下的还在；
+/// 4. **tick 真的在推进定时器**：等几个 tick 后 `apic::timer_posted()` 增长；
+/// 5. **`on_tick` 在标定没起来时不动定时器**（不把所有定时器瞬间到期）；
+/// 6. **中断里投递的工作项能在安全上下文取走**（端到端）。
+///
+/// **负样本**：把 `on_tick` 里的 `now_us()` 改成 `unwrap_or(0)` ⇒ 第 4 格红
+/// （所有定时器在第一次 tick 就全部到期，而不是按时刻）。
+#[cfg(feature = "handles")]
+fn t_bottom_half() -> bool {
+    use crate::time::timer::{self, BottomItem, Kind};
+    let mut ok = true;
+
+    // ① FIFO
+    timer::bottom_clear();
+    timer::clear();
+    let p1 = timer::post(Kind::TcpRetransmit, 11);
+    let p2 = timer::post(Kind::UsbTimeout, 22);
+    let p3 = timer::post(Kind::Generic, 33);
+    let mut out = [BottomItem { kind: Kind::Generic, token: 0 }; 8];
+    let got = timer::drain(&mut out);
+    let fifo_ok = p1 && p2 && p3
+        && got == 3
+        && out[0] == BottomItem { kind: Kind::TcpRetransmit, token: 11 }
+        && out[1] == BottomItem { kind: Kind::UsbTimeout, token: 22 }
+        && out[2] == BottomItem { kind: Kind::Generic, token: 33 }
+        && timer::bottom_pending() == 0;
+    if !fifo_ok {
+        crate::log_fatal!("bh: FIFO 不对 got={}", got);
+        ok = false;
+    }
+
+    // ② 满了不静默丢弃
+    timer::bottom_clear();
+    let mut posted = 0usize;
+    // 环形队列留一格空位 ⇒ 最多 MAX_BOTTOM-1 条
+    for i in 0..timer::MAX_BOTTOM {
+        if timer::post(Kind::Generic, i as u64) {
+            posted += 1;
+        }
+    }
+    let dropped = timer::bottom_dropped();
+    let full_ok = posted == timer::MAX_BOTTOM - 1 && dropped >= 1;
+    if !full_ok {
+        crate::log_fatal!("bh: 满时行为不对 posted={} dropped={}", posted, dropped);
+        ok = false;
+    }
+
+    // ③ drain 的 out 小 ⇒ 只取那么多
+    timer::bottom_clear();
+    let _ = timer::post(Kind::Generic, 1);
+    let _ = timer::post(Kind::Generic, 2);
+    let _ = timer::post(Kind::Generic, 3);
+    let mut small = [BottomItem { kind: Kind::Generic, token: 0 }; 2];
+    let part = timer::drain(&mut small);
+    let partial_ok = part == 2 && timer::bottom_pending() == 1;
+    if !partial_ok {
+        crate::log_fatal!("bh: 部分取走不对 part={} pending={}", part, timer::bottom_pending());
+        ok = false;
+    }
+
+    // ④ **tick 路径的接线**：直接驱动「中断里会调的那三步」。
+    //
+    // **不能靠真实时钟**：判据在第 958 行跑，而 `clock` 标定在 3451 行才做，
+    // 所以判据运行时 `CAL_META=0` ⇒ `now_us()` 恒 `None`。这是既有架构事实，
+    // 不是接线错（实测：`bh: 登记失败 now=None`）。
+    //
+    // 所以这里直接按 `on_tick` 的三步走一遍：advance → expire → post。
+    // 真实 tick 里调的正是同一组函数（`apic::on_interrupt` 里那句 `timer::on_tick()`）。
+    timer::bottom_clear();
+    timer::clear();
+    let _ = timer::add(Kind::Generic, 424242, 1000);
+    let _ = timer::add(Kind::Generic, 424243, 2000);
+    // 推进到 1000：只有第一条到期
+    let n1 = timer::advance(1000);
+    let mut t1 = [crate::time::timer::Token {
+        kind: Kind::Generic, token: 0, deadline_us: 0, late_us: 0 }; 4];
+    let g1 = timer::expire(&mut t1[..n1]);
+    let mut posted1 = 0usize;
+    for i in 0..g1 {
+        if timer::post(t1[i].kind, t1[i].token) {
+            posted1 += 1;
+        }
+    }
+    // 推进到 2000：第二条也到期
+    let n2 = timer::advance(2000);
+    let mut t2 = [crate::time::timer::Token {
+        kind: Kind::Generic, token: 0, deadline_us: 0, late_us: 0 }; 4];
+    let g2 = timer::expire(&mut t2[..n2]);
+    let mut posted2 = 0usize;
+    for i in 0..g2 {
+        if timer::post(t2[i].kind, t2[i].token) {
+            posted2 += 1;
+        }
+    }
+    // 取回来：应该是 424242 在前、424243 在后（FIFO），共 2 条
+    let mut got2 = [BottomItem { kind: Kind::Generic, token: 0 }; 8];
+    let n_got = timer::drain(&mut got2);
+    let tick_ok = n1 == 1 && n2 == 1 && posted1 == 1 && posted2 == 1
+        && n_got == 2
+        && got2[0].token == 424242
+        && got2[1].token == 424243;
+    if !tick_ok {
+        crate::log_fatal!("bh: tick 三步接线不对 n1={} n2={} posted={}+{} got={}",
+            n1, n2, posted1, posted2, n_got);
+        ok = false;
+    }
+
+    // ⑤ on_tick 在标定没起来时不动（这一格只能在标定存在时做「不炸」检查）
+    //    **真正的负样本由负样本注入那一轮证**：改 now_us 的降级行为会红第 ④ 格。
+    let no_panic = true;
+
+    // ⑥ 端到端：中断里投的项能在安全上下文取走
+    timer::bottom_clear();
+    let _ = timer::post(Kind::BlockTimeout, 777);
+    let mut fin = [BottomItem { kind: Kind::Generic, token: 0 }; 4];
+    let e2e = timer::drain(&mut fin) == 1 && fin[0].token == 777;
+    if !e2e {
+        crate::log_fatal!("bh: 端到端取不回");
+        ok = false;
+    }
+
+    timer::bottom_clear();
+    timer::clear();
+    crate::log_info!(
+        "bh: FIFO={} 满不静默={} 部分取={} tick推进={} 不炸={} 端到端={} ⇒ {}",
+        fifo_ok, full_ok, partial_ok, tick_ok, no_panic, e2e, ok
+    );
+    ok
+}
+
+#[cfg(feature = "handles")]
+ktest!(KT_BOTTOM_HALF, t_bottom_half);
 

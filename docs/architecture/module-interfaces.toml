@@ -501,7 +501,7 @@ public_api = [
 ]
 allowed_callers = [
   "storage",
-  "driver","arch", "capability", "integration", "memory", "resource", "sched", "network"]
+  "driver","arch", "capability", "integration", "memory", "resource", "sched", "network", "time"]
 dependencies = ["arch", "diagnostics", "time"]
 forbidden_dependencies = []
 known_violations = []
@@ -989,7 +989,7 @@ status = "部分落地"
 module_id = "time"
 owner = "time"
 layer = "core"
-source_modules = ["time/clock", "time/tsc"]
+source_modules = ["time/clock", "time/tsc", "time/timer"]
 public_api = [
   "clock::Calibration",
   "clock::MIN_SAMPLES",
@@ -1007,9 +1007,11 @@ public_api = [
   "tsc::spin",
   "tsc::stage",
   "tsc::total_stages",
+  "timer::on_tick", "timer::post", "timer::drain", "timer::bottom_pending",
+  "timer::bottom_dropped", "timer::bottom_clear", "timer::BottomItem", "timer::MAX_BOTTOM",
 ]
 allowed_callers = ["arch", "diagnostics", "driver", "integration", "memory", "sched", "sync"]
-dependencies = ["arch", "diagnostics"]
+dependencies = ["arch", "diagnostics", "sync"]
 forbidden_dependencies = []
 known_violations = []
 context = ["BOOT", "KERNEL", "IRQ_OFF", "ISR_TOP"]
@@ -1160,6 +1162,7 @@ known_scc = [
 ]
 
 [baseline.ring_edge_sites]
+  "time->sync" = 4
   "driver->sync" = 1
 "driver->network" = 2
   "network->sync" = 3
@@ -1170,7 +1173,7 @@ known_scc = [
 "arch->memory" = 21
 "arch->pci" = 6
 "arch->sync" = 3
-"arch->time" = 22
+"arch->time" = 23
 "boot->diagnostics" = 11
 "diagnostics->arch" = 32
 "diagnostics->driver" = 15

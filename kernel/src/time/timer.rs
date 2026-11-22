@@ -257,3 +257,150 @@ pub fn add_after_ms(kind: Kind, token: u64, delta_ms: u64) -> Option<u16> {
     let now = now_us()?;
     add(kind, token, now.saturating_add(delta_ms.saturating_mul(1000)))
 }
+
+// ---------------------------------------------------------------- ADR-202：中断下半部（最小形态）
+
+/// 下半部队列容量（ADR-202）。
+///
+/// ## 为什么是 32
+///
+/// 一条 `BottomItem` 约 24 字节 ⇒ 32 条 = **768 B**，可忽略。
+///
+/// **溢出时不能静默丢弃**：那会让 TCP 重传悄悄消失。所以满了计数，`drain` 时能看见。
+pub const MAX_BOTTOM: usize = 32;
+
+/// 一条下半部工作项（ADR-202）。
+///
+/// 与 `Token` 的区别：`Token` 是「定时器到期了」这个事实，`BottomItem` 是
+/// 「**请你在安全上下文里处理它**」这个请求。两者的生命周期不同：
+/// `Token` 从 `expire` 取走就没了，`BottomItem` 要等 `drain`。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BottomItem {
+    pub kind: Kind,
+    pub token: u64,
+}
+
+struct Bottom {
+    items: [BottomItem; MAX_BOTTOM],
+    head: usize,
+    tail: usize,
+    /// 本轮**丢弃**了几条（满了）。
+    dropped: u32,
+}
+
+struct BottomCell(core::cell::UnsafeCell<Bottom>);
+// SAFETY: 读写全在 `BOTTOM_LOCK` 内；载荷全为 Copy。
+unsafe impl Sync for BottomCell {}
+
+static BOTTOM: BottomCell = BottomCell(core::cell::UnsafeCell::new(Bottom {
+    items: [BottomItem { kind: Kind::Generic, token: 0 }; MAX_BOTTOM],
+    head: 0,
+    tail: 0,
+    dropped: 0,
+}));
+
+/// 下半部队列的锁。**叶子锁**，`new_isr_taken`（ISR 里会调 `post`）。
+static BOTTOM_LOCK: crate::sync::IrqSpinLock<()> =
+    crate::sync::IrqSpinLock::new_isr_taken(crate::sync::RANK_TIMER, ());
+
+/// **在中断上下文里投递一个工作项**（ADR-202）。
+///
+/// 这是「中断里只做最少的事」那个原则的落点：中断里只把「要做什么」记下来，
+/// 真正的处理留给安全上下文。
+///
+/// **必须能在 ISR 里调**：不分配、不打印、不取除 `BOTTOM_LOCK` 以外的锁。
+/// 返回是否成功入队（满了回 `false` 并计数）。
+pub fn post(kind: Kind, token: u64) -> bool {
+    let _g = BOTTOM_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let b = unsafe { &mut *BOTTOM.0.get() };
+    let next = (b.tail + 1) % MAX_BOTTOM;
+    if next == b.head {
+        // 满
+        b.dropped += 1;
+        return false;
+    }
+    b.items[b.tail] = BottomItem { kind, token };
+    b.tail = next;
+    true
+}
+
+/// **在安全上下文里取走全部工作项**（ADR-202）。
+///
+/// 返回取走几条。`dropped` 由 `bottom_dropped()` 单独查 —— **不合并进返回值**，
+/// 因为「取走了 3 条」和「另外还漏了 2 条」是两件不同的事。
+pub fn drain(out: &mut [BottomItem]) -> usize {
+    let _g = BOTTOM_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let b = unsafe { &mut *BOTTOM.0.get() };
+    let mut n = 0usize;
+    while b.head != b.tail && n < out.len() {
+        out[n] = b.items[b.head];
+        b.head = (b.head + 1) % MAX_BOTTOM;
+        n += 1;
+    }
+    n
+}
+
+/// 下半部还排着几条（判据用）。
+pub fn bottom_pending() -> usize {
+    let _g = BOTTOM_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let b = unsafe { &*BOTTOM.0.get() };
+    (b.tail + MAX_BOTTOM - b.head) % MAX_BOTTOM
+}
+
+/// 累计丢弃了几条（ADR-202：**必须可查**，不能静默）。
+pub fn bottom_dropped() -> u32 {
+    let _g = BOTTOM_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let b = unsafe { &*BOTTOM.0.get() };
+    b.dropped
+}
+
+/// 清空下半部（判据用）。
+pub fn bottom_clear() {
+    let _g = BOTTOM_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let b = unsafe { &mut *BOTTOM.0.get() };
+    b.head = 0;
+    b.tail = 0;
+    b.dropped = 0;
+}
+
+/// **中断里的「定时器到点」处理**（ADR-202）—— 这是 `advance` 的真实调用者。
+///
+/// ## 做什么、不做什么
+///
+/// 做：读 `now_us`、`advance`、把到期项搬进下半部队列。
+///
+/// **不做**：真正处理（TCP 重传要发包、USB 超时要动设备、块层超时要回完成）——
+/// 那些都留给 `drain` 的调用方在安全上下文里做。
+///
+/// ## 为什么这里可以直接调 `advance`
+///
+/// `advance` 只取 `TABLE_LOCK`（`RANK_TIMER`，`new_isr_taken`），不分配、不打印。
+/// **这依赖那条 rank 声明是对的** —— 而 `check-fat32-ports` 就在查这件事。
+///
+/// 返回本次投递了几条（不含丢弃的）。
+pub fn on_tick() -> usize {
+    let Some(now) = now_us() else {
+        // 标定没起来：**不动定时器**，也不把它当成「所有都到期」。
+        return 0;
+    };
+    let n = advance(now);
+    if n == 0 {
+        return 0;
+    }
+    // 取走并投递（一次最多 `MAX_TIMERS` 条）
+    let mut out = [Token { kind: Kind::Generic, token: 0, deadline_us: 0, late_us: 0 }; MAX_TIMERS];
+    let got = expire(&mut out[..n]);
+    let mut posted = 0usize;
+    for i in 0..got {
+        if post(out[i].kind, out[i].token) {
+            posted += 1;
+        }
+        // 满了：`post` 已经记了 `dropped`，这里不重复计
+    }
+    posted
+}

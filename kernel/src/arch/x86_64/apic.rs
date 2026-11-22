@@ -110,6 +110,11 @@ static IOAPIC_VA: AtomicU64 = AtomicU64::new(0);
 
 /// 中断计数：按 IRQ 下标（0..16）分开，`TICKS` 是定时器那一路的别名计数。
 static IRQ_COUNTS: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
+
+/// 中断里投递到下半部的累计条数（ADR-202 的判据用）。
+///
+/// **只加不读**，读走 `timer_posted()`。这样中断路径里没有读-改-写之外的操作。
+static TIMER_POSTED: AtomicU64 = AtomicU64::new(0);
 static UNEXPECTED: AtomicUsize = AtomicUsize::new(0);
 static SPURIOUS: AtomicUsize = AtomicUsize::new(0);
 /// 主动让出/重调度（向量 0xF0，软件中断）。单独一格：它既不是 IRQ 也不是 tick，
@@ -188,6 +193,11 @@ pub fn is_lapic_mapped() -> bool {
 pub fn ticks() -> usize {
     IRQ_COUNTS[TIMER_ISA_IRQ as usize].load(Ordering::Relaxed)
 }
+/// 中断里投递到下半部的累计条数（ADR-202）。
+pub fn timer_posted() -> u64 {
+    TIMER_POSTED.load(Ordering::Relaxed)
+}
+
 
 /// 有界自轮询等 PIT tick 的一组读数。
 #[derive(Debug, Clone, Copy)]
@@ -594,6 +604,19 @@ pub fn on_interrupt(vector: usize) {
                 TICK_TSC_MAX_DELTA.fetch_max(now - prev, Ordering::Relaxed);
                 TICK_TSC_SUM.fetch_add(now - prev, Ordering::Relaxed);
                 TICK_TSC_N.fetch_add(1, Ordering::Relaxed);
+            }
+            // **定时器推进 + 投递下半部**（ADR-202）。
+            //
+            // 这里只做「读时间 / advance / 投递」三件：
+            // - `now_us` 只做原子读 + 读 TSC；
+            // - `advance` 只取 `TABLE_LOCK`（`RANK_TIMER`，`new_isr_taken`）；
+            // - `post` 只取 `BOTTOM_LOCK`（同 rank）。
+            //
+            // **真正处理（发包/动设备/回完成）不在这里**：那些留给安全上下文的 `drain`。
+            let tick_posted = crate::time::timer::on_tick();
+            if tick_posted > 0 {
+                // 只累加计数：中断里不打印
+                TIMER_POSTED.fetch_add(tick_posted as u64, Ordering::Relaxed);
             }
         }
         // 负样本：在中断上下文里真的走一次全局分配器。检测器必须抓到，
