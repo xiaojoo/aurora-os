@@ -927,7 +927,13 @@ fn t_ahci_write() -> bool {
         );
         return false;
     };
-    const TARGET_LBA: u64 = 4096;
+    // **必须与 `t_ahci_high_lba` 的区间错开**（ADR-190 实测）：那个用例也读写 LBA 4096，
+    // 而两个用例的先后由链接器决定 ⇒ 谁先跑谁就把图案改了 ⇒ 另一个的「第二段没盖住
+    // 第一段」判据红。实测失败率 25.23%（108/428），且相邻两跑一红一绿、用例顺序不同。
+    //
+    // 取 8192：那块盘 4 MiB = 8192 扇区，8192 已到边界 ⇒ 改 6144（仍在盘内，
+    // 且与 4096 相隔 2048 扇区，8 扇区的写不可能越界碰到）。
+    const TARGET_LBA: u64 = 6144;
     const SECS: u16 = 8;
     let before = match ahci::read_lba(sc, TARGET_LBA, SECS) {
         Ok(r) => r.hash,
