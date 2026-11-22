@@ -24215,3 +24215,89 @@ ADR-194 只做了合并，队列一直没做。这一层补上：提交 → 排�
 3. **没有预读**
 4. **`vol` 由调用方给** —— 给错了就会串（没有从 `ReadCursor` 自动推导）
 5. **24 槽可能不够** —— 大文件顺序读会持续淘汰
+---
+
+## 540. ADR-220 落地：VFS 三层联动（2026-11-23）
+
+### 把三个各自独立的层串成一套
+
+| 层 | 它知道 | 它不知道 |
+|---|---|---|
+| dentry 缓存 | 名字 → `Entry` | 这个 Entry 的 inode 是谁 |
+| inode 表 | `(vol, cluster)` → 元数据 | 这个 inode 属于哪个挂载 |
+| superblock | 卷 → 几何/只读/引用 | 卷里有哪些文件 |
+
+**没有任何东西保证它们说的是同一个文件。**
+
+### 交付
+
+    VfsNode { sb_slot, inode_slot, vol, cluster, size, attr }
+    NodeError { NotMounted, NoInode, Vfs(VfsError) }
+    open_node / close_node / node_consistent / sb_slot_of / volume_fingerprint_pub
+
+### 决策 1：顺序是「superblock → 路径 → inode」
+
+**先查 superblock**：没挂载的卷不该被解析。反过来会让「未挂载卷的 dentry 命中」泄漏结果 ——
+与 ADR-195 那条「坏卷结果泄漏给好卷」是同一类错误。
+
+### 决策 2：未挂载时自动挂载（幂等）
+
+「打开一个卷上的文件」本身就隐含「这个卷被挂载了」。`sb_mount` 是幂等的，所以重复调用安全。
+
+### 决策 3：close_node 不卸载 superblock
+
+挂载是**卷级**状态，节点关闭不该影响它。与 POSIX 的 `iput` 不触发 `umount` 同一条思路。
+
+### 判据九格
+
+    3l: 句柄=true sb=true inode=true vol=true 独立对账=true
+        同路径同槽=true close=true 自动挂载=true 不同路径=true ⇒ true
+
+### 本 ADR 最有价值的一课：**自证抓不到自己的错**
+
+第一版只有八格，而且**负样本咬不动**。
+把 `open_node` 里的 `vol` 改成 `volume_fingerprint(...) ^ 0xDEAD`（故意算错），八格**全绿**。
+
+原因：`node_consistent` 用「句柄里自己带的 vol」比对「superblock 里存的 vol」——
+而 superblock 里那个也是**同一个错误函数**算出来的。**两边都错，于是「一致」。**
+
+这就是**自证**：用被测物自己的输出验证被测物。
+
+修法：加第 9 格，用**独立来源**对账（`volume_fingerprint_pub` 独立算一遍）。
+同一负样本再跑：
+
+    3l: 卷指纹与独立来源不符 句柄=0x1d87c2001bc77eda 独立=0x1d87c2001bc7a077
+    3l: ... 独立对账=false ⇒ false
+
+**抓住了。**
+
+### 这条应当推广
+
+AGENTS.md 已写「涉及硬件、存储、网络、签名的结论，要有宿主机侧的第二台仪器对账」。
+本 ADR 把它推广到**任何判据**：
+
+> **如果一个判据的所有输入都来自被测物自己，它证明不了任何东西。**
+> 至少要有一格，其输入来自一条**独立于被测路径**的计算。
+
+本会话已出现三次同源问题：
+
+| 位置 | 自证形态 | 独立对账 |
+|---|---|---|
+| ADR-195 dentry | 缓存键不带卷 | 判据喂两个卷 |
+| ADR-219 页缓存 | 「命中」只看返回值 | `memdisk_read_calls()` 计数 |
+| ADR-220 三层 | 句柄的 vol vs superblock 的 vol | `volume_fingerprint_pub` 独立算 |
+
+### 读数
+
+| 项 | 结果 |
+|---|---|
+| `check` | **21/21** |
+| `handles,fs-ro` 档 | **`PASS(33)`**，`t_three_layers` 九格全绿 |
+
+### 未做
+
+1. **`open_node` 没有接进产品路径** —— `handle.rs` 仍走 `lookup` + 自己的句柄表
+2. **没有 `i_op` / `f_op` 间接层**
+3. **dentry 不存 inode 号** —— 每次 `open_node` 仍要重算 `(vol, cluster)`
+4. **没有 `VfsNode` 的生命周期管理** —— 泄漏一个就少一个 inode 引用
+5. **单根挂载**

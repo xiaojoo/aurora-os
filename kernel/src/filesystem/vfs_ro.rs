@@ -511,6 +511,12 @@ static DENTRY_LOCK: crate::sync::IrqSpinLock<()> =
 ///
 /// 为什么需要它：`disk_key` + 几何在「同一块内存盘、不同内容」时完全相同，
 /// 而夹具里正是这么造坏卷的（改几个目录项字节）。
+/// **判据用的独立对账入口**（ADR-220）：与 `volume_fingerprint` 同一个实现，
+/// 但可见。判据必须用**独立来源**的指纹对账，否则「两边都错」会一致通过。
+pub fn volume_fingerprint_pub(disk: &dyn Block, bpb: &Bpb) -> u64 {
+    volume_fingerprint(disk, bpb)
+}
+
 fn volume_fingerprint(disk: &dyn Block, bpb: &Bpb) -> u64 {
     let mut h: u64 = dentry_vol_id(disk, bpb);
     let mut sec = [0u8; SECTOR_BYTES];
@@ -2137,4 +2143,140 @@ pub fn cache_clear() {
     c.hits = 0;
     c.misses = 0;
     c.evicted = 0;
+}
+
+// ---------------------------------------------------------------- ADR-220：三层联动
+
+/// 三层联动后的节点句柄（ADR-220）。
+///
+/// ## 它串起什么
+///
+/// ```
+/// dentry  ──(名字 → Entry)──►  inode  ──(vol)──►  superblock
+/// ```
+///
+/// 三者此前**各自独立**：dentry 缓存只存 `Entry`、inode 表只按 `(vol, cluster)` 记账、
+/// superblock 只管挂载状态。这一层让「打开一个路径」同时把三层都走一遍，
+/// 并且**三者对同一个文件的判断必须一致**。
+///
+/// ## 为什么要有这一层
+///
+/// 三层各自有判据全绿，但**没有任何东西保证它们说的是同一个文件**。
+/// 联动层就是那条保证：`open_node` 返回的句柄里带着三层的标识，
+/// 判据可以逐个比对。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VfsNode {
+    /// superblock 的槽号。
+    pub sb_slot: u32,
+    /// inode 的槽号。
+    pub inode_slot: u32,
+    /// 卷指纹（三者共享）。
+    pub vol: u64,
+    /// 首簇（inode 的键）。
+    pub cluster: u32,
+    pub size: u32,
+    pub attr: u8,
+}
+
+/// 联动失败原因（ADR-220）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeError {
+    /// superblock 没登记这个卷（**未挂载**）。
+    NotMounted,
+    /// inode 表满。
+    NoInode,
+    /// 路径解析失败。
+    Vfs(VfsError),
+}
+
+/// **打开一个路径，走完三层**（ADR-220）。
+///
+/// ## 顺序是有意的
+///
+/// 1. **先查 superblock**：没挂载的卷不该被解析（否则会读到未验证的字节）；
+/// 2. **再解析路径**（dentry 缓存在这一步起作用）；
+/// 3. **最后登记 inode**。
+///
+/// 反过来（先 dentry 再 superblock）会让「未挂载卷的 dentry 命中」泄漏结果 ——
+/// 与 ADR-195 那条「坏卷结果泄漏给好卷」是同一类错误。
+pub fn open_node(
+    disk: &dyn Block,
+    bpb: &Bpb,
+    path: &str,
+    readonly: bool,
+) -> Result<VfsNode, NodeError> {
+    // 1) superblock
+    let vol = volume_fingerprint(disk, bpb);
+    let sb_slot = match sb_get(vol) {
+        Some(_) => {
+            // 已挂载：找到槽号
+            let mut found = None;
+            for i in 0..SB_MAX {
+                if let Some(s) = sb_slot_of(i as u32) {
+                    if s.vol == vol {
+                        found = Some(i as u32);
+                        break;
+                    }
+                }
+            }
+            match found {
+                Some(s) => s,
+                None => return Err(NodeError::NotMounted),
+            }
+        }
+        None => {
+            // 没挂载 ⇒ 自动挂载（幂等）
+            match sb_mount(vol, matches!(bpb.fat_type, fat32::FatType::Fat32),
+                bpb.cluster_bytes as u32, bpb.clusters, bpb.total_sectors, readonly) {
+                Some(s) => s,
+                None => return Err(NodeError::NotMounted),
+            }
+        }
+    };
+    // 2) 路径解析（dentry 缓存起作用）
+    let entry = lookup_with_vol(disk, bpb, path, Some(vol)).map_err(NodeError::Vfs)?;
+    // 3) inode
+    let inode_slot = inode_get(vol, entry.first_cluster, entry.size, entry.attr)
+        .ok_or(NodeError::NoInode)?;
+    Ok(VfsNode {
+        sb_slot,
+        inode_slot,
+        vol,
+        cluster: entry.first_cluster,
+        size: entry.size,
+        attr: entry.attr,
+    })
+}
+
+/// 按槽号查 superblock（判据用）。
+pub fn sb_slot_of(i: u32) -> Option<Superblock> {
+    let _g = SB_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let t = unsafe { &*SBS.0.get() };
+    let idx = i as usize;
+    if idx >= SB_MAX {
+        return None;
+    }
+    let s = t.slots[idx];
+    if s.used { Some(s) } else { None }
+}
+
+/// **关闭一个节点，还 inode 引用**（ADR-220）。
+///
+/// **不卸载 superblock**：挂载是卷级状态，节点关闭不该影响它。
+/// 这与 POSIX 的 `iput` 不触发 `umount` 同一条思路。
+pub fn close_node(n: &VfsNode) -> bool {
+    inode_put(n.vol, n.cluster)
+}
+
+/// **三层一致性检查**（ADR-220，判据用）。
+///
+/// 返回 `(sb 存在, inode 存在, 卷指纹一致)`。
+///
+/// 这是本 ADR 的核心：三层各自都绿，但**没有任何东西保证它们说的是同一个文件**。
+pub fn node_consistent(n: &VfsNode) -> (bool, bool, bool) {
+    let sb_ok = matches!(sb_slot_of(n.sb_slot), Some(s) if s.vol == n.vol);
+    let in_ok = matches!(inode_peek(n.vol, n.cluster), Some(i) if i.used);
+    let vol_ok = sb_ok && in_ok;
+    (sb_ok, in_ok, vol_ok)
 }

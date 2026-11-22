@@ -2161,3 +2161,133 @@ fn t_read_cached_equiv() -> bool {
 
 #[cfg(feature = "handles")]
 ktest!(KT_READ_CACHED_EQUIV, t_read_cached_equiv);
+
+/// ADR-220：**三层联动**的证人。
+///
+/// ## 要证什么
+///
+/// dentry / inode / superblock 三层各自判据全绿，但**没有任何东西保证它们说的是同一个文件**。
+/// 这一层就是那条保证。
+///
+/// ## 判据八格
+///
+/// 1. `open_node` 成功，返回句柄里三层标识齐全；
+/// 2. **superblock 真的登记了**（`node_consistent` 第 1 项）；
+/// 3. **inode 真的登记了**（第 2 项）；
+/// 4. **三层卷指纹一致**（第 3 项）；
+/// 5. **同一路径两次 `open_node` 拿到同一个 inode 槽**（幂等 + 引用计数）；
+/// 6. **`close_node` 减引用**（inode 还在，`refs` 减一）；
+/// 7. **未挂载的卷也能自动挂载**（`open_node` 内部 `sb_mount`）；
+/// 8. **不同路径拿到不同 inode**（不是所有路径都返回同一项）。
+///
+/// **负样本**：把 `open_node` 的 superblock 检查去掉（直接 `sb_mount` 一个假 vol）⇒ 第 4 格红。
+#[cfg(feature = "handles")]
+fn t_three_layers() -> bool {
+    use crate::filesystem::vfs_ro;
+    let mut ok = true;
+    vfs_ro::inode_clear();
+    vfs_ro::sb_clear();
+    vfs_ro::dentry_clear();
+
+    // 造 FAT32 真卷
+    let mut img = [0u8; F32_VOL_BYTES];
+    make_image32(&mut img);
+    let disk = MemDisk { img: &img };
+    let fs = match vfs_ro::ReadOnlyFs::mount(&disk) {
+        Ok(f) => f,
+        Err(e) => {
+            crate::log_fatal!("3l: 挂载失败 {}", e.tag());
+            return false;
+        }
+    };
+    let bpb = fs.bpb();
+
+    // ① open_node
+    let n = match vfs_ro::open_node(&disk, &bpb, "/SUB/INNER.TXT", true) {
+        Ok(n) => n,
+        Err(e) => {
+            crate::log_fatal!("3l: open_node 失败 {:?}", e);
+            return false;
+        }
+    };
+    let handle_ok = n.size > 0 && n.cluster > 0 && n.vol != 0;
+    if !handle_ok {
+        crate::log_fatal!("3l: 句柄字段不对 {:?}", n);
+        ok = false;
+    }
+
+    // ②③④ 一致性
+    let (sb_ok, in_ok, vol_ok) = vfs_ro::node_consistent(&n);
+    if !sb_ok || !in_ok || !vol_ok {
+        crate::log_fatal!("3l: 三层不一致 sb={} inode={} vol={}", sb_ok, in_ok, vol_ok);
+        ok = false;
+    }
+
+    // ⑨ **独立来源对账**（ADR-220 补记）：
+    //
+    // 前四格都用「句柄里自己带的 vol」对账 —— 那是**自证**：
+    // 如果 `open_node` 把 vol 算错，`node_consistent` 两边都错，仍然一致通过。
+    //
+    // 实测：负样本「vol ^ 0xDEAD」下前八格**全绿**，因为自证抓不到。
+    // 所以必须用一个**独立算出**的指纹对账。
+    let indep_vol = vfs_ro::volume_fingerprint_pub(&disk, &bpb);
+    let indep_ok = n.vol == indep_vol;
+    if !indep_ok {
+        crate::log_fatal!("3l: 卷指纹与独立来源不符 句柄={:#x} 独立={:#x}", n.vol, indep_vol);
+        ok = false;
+    }
+
+    // ⑤ 同一路径两次拿到同一 inode 槽
+    let n2 = match vfs_ro::open_node(&disk, &bpb, "/SUB/INNER.TXT", true) {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    let same_ok = n2.inode_slot == n.inode_slot
+        && n2.sb_slot == n.sb_slot
+        && matches!(vfs_ro::inode_peek(n.vol, n.cluster), Some(i) if i.refs == 2);
+    if !same_ok {
+        crate::log_fatal!("3l: 两次 open 不一致 slot {} vs {} refs={:?}",
+            n.inode_slot, n2.inode_slot, vfs_ro::inode_peek(n.vol, n.cluster).map(|i| i.refs));
+        ok = false;
+    }
+
+    // ⑥ close_node 减引用（inode 仍在）
+    let c1 = vfs_ro::close_node(&n);
+    let after = vfs_ro::inode_peek(n.vol, n.cluster);
+    let close_ok = c1 && matches!(after, Some(i) if i.refs == 1 && i.used);
+    if !close_ok {
+        crate::log_fatal!("3l: close_node 不对 ret={} peek={:?}", c1, after);
+        ok = false;
+    }
+
+    // ⑦ 未挂载卷自动挂载：清 sb 后再 open
+    vfs_ro::sb_clear();
+    let n3 = vfs_ro::open_node(&disk, &bpb, "/SUB/INNER.TXT", true);
+    let auto_ok = n3.is_ok() && vfs_ro::sb_count() >= 1;
+    if !auto_ok {
+        crate::log_fatal!("3l: 自动挂载不对 {:?} count={}", n3.is_ok(), vfs_ro::sb_count());
+        ok = false;
+    }
+
+    // ⑧ 不同路径不同 inode
+    let root_n = vfs_ro::open_node(&disk, &bpb, "/", true);
+    let sub_n = vfs_ro::open_node(&disk, &bpb, "/SUB", true);
+    let distinct_ok = matches!((root_n, sub_n),
+        (Ok(a), Ok(b)) if a.cluster != b.cluster || a.inode_slot != b.inode_slot);
+    if !distinct_ok {
+        crate::log_fatal!("3l: 不同路径拿到同一 inode");
+        ok = false;
+    }
+
+    vfs_ro::inode_clear();
+    vfs_ro::sb_clear();
+    vfs_ro::dentry_clear();
+    crate::log_info!(
+        "3l: 句柄={} sb={} inode={} vol={} 独立对账={} 同路径同槽={} close={} 自动挂载={} 不同路径={} ⇒ {}",
+        handle_ok, sb_ok, in_ok, vol_ok, indep_ok, same_ok, close_ok, auto_ok, distinct_ok, ok
+    );
+    ok
+}
+
+#[cfg(feature = "handles")]
+ktest!(KT_THREE_LAYERS, t_three_layers);

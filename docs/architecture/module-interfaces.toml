@@ -796,7 +796,10 @@ public_api = [
   "gpt::Table", "gpt::crc32", "gpt::find_by_type", "gpt::find_esp", "gpt::parse_header",
   "gpt::protective_mbr", "gpt::scan", "gpt::ESP_TYPE_GUID", "gpt::MAX_ARRAY_BYTES",
   "gpt::MAX_ENTRIES", "gpt::MAX_ENTRY_BYTES", "vfs::AhciDisk", "vfs::SECTOR_BYTES",
-  "fat32::FileCursor", "fat32::FsError", "fat32::MAX_CLUSTERS_WALKED",
+  "fat32::FileCursor", "fat32::FsError", "fat32::FatType", "fat32::MAX_CLUSTERS_WALKED",
+  "vfs_ro::open_node", "vfs_ro::close_node", "vfs_ro::node_consistent", "vfs_ro::VfsNode",
+  "vfs_ro::NodeError", "vfs_ro::volume_fingerprint_pub", "vfs_ro::sb_slot_of",
+
   "fat32::FAT16_ENTRY_BYTES", "fs_open::DIRENT_RECORD_LEN", "fs_open::Opened", "fs_open::PORT",
   "fs_open::port", "fs_open::set_port", "fs_open::OPEN_READ_ONLY", "fs_open::OPEN_WRITE",
   "fs_rw::PORT", "filesystem::fs_rw", "fs_open::STAT_KIND_FILE", "fs_open::STAT_RECORD_LEN",
