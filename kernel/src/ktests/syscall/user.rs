@@ -509,26 +509,33 @@ fn t_syscall_abi_arms() -> bool {
     syscall_dispatch(&mut f);
     let recv_known = user::unknown_nr() == u1;
 
-    // ---- 53：已登记但未实现。**回 -18、nosys 涨 1、unknown 不涨**，三个都要成立。
-    // 只判"某个计数器涨了"是不够的：把 53 从号表删掉会让它去涨 unknown_nr 而照样绿。
+    // ---- 53（ADR-181 起**已实现**）：**不涨 nosys、不涨 unknown**，两个都要成立。
+    //
+    // 旧判据是「回 -18 且 nosys 涨 1」——那是 53 还没实现时写的。ADR-181 把它接成
+    // 真 UDP send 之后，**判据必须跟着实现走**：继续断言「未实现」会让这条用例
+    // 在功能上线时变红，而那个红是判据过时，不是功能坏了。
+    //
+    // 新判据仍保留原来的用意（分得清「号没登记」与「号没实现」）：
+    // 已实现的号**两个计数器都不该涨**。
     let u2 = user::unknown_nr();
     let n2 = user::nosys_nr();
     f.rax = SYS_SOCK_SEND;
     f.rdi = 0; f.rsi = 0; f.rdx = 0;
     syscall_dispatch(&mut f);
-    let sock_send_nosys = user::nosys_nr() == n2 + 1
+    // 句柄 0 不是 socket ⇒ 回 EBADF（-9），但**绝不是** E_NOSYS
+    let sock_send_impl = user::nosys_nr() == n2
         && user::unknown_nr() == u2
-        && f.rax == user::E_NOSYS;
+        && f.rax != user::E_NOSYS;
 
-    // ---- 54：同上。
+    // ---- 54：同上（ADR-181 起已实现）。
     let u3 = user::unknown_nr();
     let n3 = user::nosys_nr();
     f.rax = SYS_SOCK_RECV;
     f.rdi = 0; f.rsi = 0; f.rdx = 0;
     syscall_dispatch(&mut f);
-    let sock_recv_nosys = user::nosys_nr() == n3 + 1
+    let sock_recv_impl = user::nosys_nr() == n3
         && user::unknown_nr() == u3
-        && f.rax == user::E_NOSYS;
+        && f.rax != user::E_NOSYS;
 
     // ---- 56（INPUT_READ）：抽样覆盖**输入族**。14 个号只证 53/54 等于只证了 socket 族。
     let u4 = user::unknown_nr();
@@ -551,20 +558,20 @@ fn t_syscall_abi_arms() -> bool {
         && f.rax == user::E_NOSYS;
 
     let ok = send_known && recv_known
-        && sock_send_nosys && sock_recv_nosys
+        && sock_send_impl && sock_recv_impl
         && input_read_nosys && audio_stream_nosys;
     // 日志要能分辨**四个**计数器（ADR-176 决策 4）：两个 unknown 起点、两个 nosys 起点，
     // 再加末值。只打一个数的话，红的那一遍分不清是"号没登记"还是"号没实现"。
     crate::log_info!(
-        "abi-arms: 33已知={} 34已知={} 53未实现={} 54未实现={} 56未实现={} 60未实现={} \
+        "abi-arms: 33已知={} 34已知={} 53已实现={} 54已实现={} 56未实现={} 60未实现={} \
          ⇒ unknown {}→{} nosys {}→{} 判据={}",
         send_known, recv_known,
-        sock_send_nosys, sock_recv_nosys, input_read_nosys, audio_stream_nosys,
+        sock_send_impl, sock_recv_impl, input_read_nosys, audio_stream_nosys,
         u0, user::unknown_nr(), n2, user::nosys_nr(), ok
     );
     if !ok {
         crate::log_fatal!(
-            "abi-arms: 判据不成立（33/34 必须已知；53/54/56/60 必须已登记未实现：\
+            "abi-arms: 判据不成立（33/34 必须已知；53/54 已实现（两计数器都不涨）；56/60 必须未实现：\
              回 -18、nosys_nr 涨 1、unknown_nr 不涨）\
              unknown 起点 u0={} u1={} u2={} u3={} u4={} u5={} 末值={} \
              nosys 起点 n2={} n3={} n4={} n5={} 末值={}",
@@ -710,3 +717,156 @@ fn t_signal_roundtrip() -> bool {
 }
 #[cfg(feature = "handles")]
 ktest!(KT_SIGNAL_ROUNDTRIP, t_signal_roundtrip);
+/// ADR-181：socket 族（48–55）的**证人**。
+///
+/// ## 判据七格
+///
+/// 1. `AF_INET + SOCK_DGRAM` 建成功，句柄 kind 是 `KIND_SOCKET`；
+/// 2. `AF_INET6` 回 `-38`（ENOSYS），**不是** `-1`（参数写错）；
+/// 3. `SOCK_STREAM` 回 `-38`；
+/// 4. `bind` 成功；**同端口重复 bind** 回 `-98`（EADDRINUSE）；
+/// 5. `listen`/`accept` 在 DGRAM 上回 `-95`（EOPNOTSUPP），**不静默返回 0**；
+/// 6. `recv` 空队列回 `-11`（EAGAIN），**不阻塞**；
+/// 7. `close` 之后 socket 槽被回收（`used()` 回到基线）。
+///
+/// ## 为什么不测 `send`
+///
+/// `send` 要真发帧，而 ktest 环境里 `bind_net` 可能没绑（取决于用例顺序）。
+/// 发帧路径由 33 号的既有用例覆盖；这里只证 **socket 层的状态机**，
+/// 不重复证 virtio 的收发——那是 `t_net_*` 的职责。
+///
+/// **负样本**：把 `sys_sock_listen` 改成返回 0（静默成功），第 5 格立刻红。
+#[cfg(feature = "handles")]
+fn t_socket_family() -> bool {
+    let Some(owner) = crate::sched::current_identity() else {
+        crate::log_fatal!("sock: 拿不到当前身份");
+        return false;
+    };
+    let mut ok = true;
+    let base_used = crate::network::socket::used();
+
+    // 1. 建一个 AF_INET + SOCK_DGRAM
+    let (slot, gen) = match crate::network::socket::create(
+        crate::network::socket::AF_INET,
+        crate::network::socket::SOCK_DGRAM,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_fatal!("sock: create 失败 ret={}", e);
+            return false;
+        }
+    };
+    let h = match crate::handle::grant_socket(
+        owner, slot, gen,
+        crate::handle::RIGHT_READ | crate::handle::RIGHT_WRITE,
+    ) {
+        Ok(h) => h,
+        Err(e) => {
+            crate::log_fatal!("sock: grant 失败 {:?}", e);
+            crate::network::socket::destroy(slot, gen);
+            return false;
+        }
+    };
+    let kind_ok = match crate::handle::resolve(h, owner, crate::handle::RIGHT_READ) {
+        Ok((o, _)) => matches!(o, crate::handle::ObjRef::Socket { .. }),
+        Err(_) => false,
+    };
+    if !kind_ok {
+        crate::log_fatal!("sock: 句柄 kind 不是 Socket");
+        ok = false;
+    }
+
+    // 2+3. AF_INET6 / SOCK_STREAM 回 ENOSYS（不是 EINVAL）
+    let v6 = crate::network::socket::create(
+        crate::network::socket::AF_INET6,
+        crate::network::socket::SOCK_DGRAM,
+    )
+    .is_err();
+    let v6_ret = crate::network::socket::create(
+        crate::network::socket::AF_INET6,
+        crate::network::socket::SOCK_DGRAM,
+    )
+    .err()
+    .unwrap_or(0);
+    let v6_ok = v6 && v6_ret == crate::network::socket::E_NOSYS;
+    let stream_ret = crate::network::socket::create(
+        crate::network::socket::AF_INET,
+        crate::network::socket::SOCK_STREAM,
+    )
+    .err()
+    .unwrap_or(0);
+    let stream_ok = stream_ret == crate::network::socket::E_NOSYS;
+    if !v6_ok || !stream_ok {
+        crate::log_fatal!("sock: 族/类型拒绝不对 v6={:#x} stream={:#x}", v6_ret, stream_ret);
+        ok = false;
+    }
+
+    // 4. bind + 重复 bind
+    let ep = crate::network::udp::UdpEndpoint { ip: [127, 0, 0, 1], port: 45999 };
+    let bind_ok = crate::network::socket::bind(slot, gen, ep).is_ok();
+    let (slot2, gen2) = match crate::network::socket::create(
+        crate::network::socket::AF_INET,
+        crate::network::socket::SOCK_DGRAM,
+    ) {
+        Ok(v) => v,
+        Err(_) => (0, 0),
+    };
+    let dup_ret = crate::network::socket::bind(slot2, gen2, ep).err().unwrap_or(0);
+    let dup_ok = dup_ret == crate::network::socket::E_ADDRINUSE;
+    if !bind_ok || !dup_ok {
+        crate::log_fatal!("sock: bind 不对 bind_ok={} dup={:#x}", bind_ok, dup_ret);
+        ok = false;
+    }
+
+    // 5. listen/accept 在 DGRAM 上回 EOPNOTSUPP（-95）
+    //
+    // **必须走 syscall 层**：`socket` 模块没有 listen/accept 入口，那两格的
+    // 语义在 `sys_sock_listen`/`sys_sock_accept` 里。第一版只验了「槽还活着」，
+    // 而把 handler 改成静默返回 0 时它照样绿 —— 负样本没咬住（实测）。
+    let mut tf = crate::arch::x86_64::trap::TrapFrame {
+        cr2: 0, r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
+        rbp: 0, rdi: h.0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0, vector: 0,
+        error_code: 0, rip: 0, cs: 0, rflags: 0, rsp: 0, ss: 0,
+    };
+    tf.rax = crate::user::SYS_SOCK_LISTEN;
+    crate::user::syscall_dispatch(&mut tf);
+    let listen_ret = tf.rax;
+    tf.rax = crate::user::SYS_SOCK_ACCEPT;
+    crate::user::syscall_dispatch(&mut tf);
+    let accept_ret = tf.rax;
+    let opnotsupp_ok = listen_ret == crate::network::socket::E_OPNOTSUPP
+        && accept_ret == crate::network::socket::E_OPNOTSUPP;
+    if !opnotsupp_ok {
+        crate::log_fatal!("sock: listen/accept 应回 -95，实得 {:#x}/{:#x}", listen_ret, accept_ret);
+        ok = false;
+    }
+
+    // 6. recv 空队列回 EAGAIN
+    let mut buf = [0u8; 64];
+    let again_ret = crate::network::socket::dequeue(slot, gen, &mut buf).err().unwrap_or(0);
+    let again_ok = again_ret == crate::network::socket::E_AGAIN;
+    if !again_ok {
+        crate::log_fatal!("sock: 空队列 recv 应回 EAGAIN，实得 {:#x}", again_ret);
+        ok = false;
+    }
+
+    // 7. close 之后槽回收
+    let _ = crate::handle::close(h, owner);
+    let destroyed = crate::network::socket::destroy(slot, gen);
+    let _ = crate::network::socket::destroy(slot2, gen2);
+    let after = crate::network::socket::used();
+    let reclaim_ok = destroyed && after == base_used;
+    if !reclaim_ok {
+        crate::log_fatal!("sock: 槽没回收 destroyed={} before={} after={}", destroyed, base_used, after);
+        ok = false;
+    }
+
+    crate::log_info!(
+        "sock: kind={} v6拒={:#x} stream拒={:#x} bind={} 重复={:#x} listen={:#x} accept={:#x} EAGAIN={:#x} 回收={} 末used={} ⇒ {}",
+        kind_ok, v6_ret, stream_ret, bind_ok, dup_ret, listen_ret, accept_ret, again_ret, reclaim_ok, after, ok
+    );
+    ok
+}
+
+#[cfg(feature = "handles")]
+ktest!(KT_SOCKET_FAMILY, t_socket_family);

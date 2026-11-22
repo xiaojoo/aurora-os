@@ -54,6 +54,17 @@ pub const RANK_PMM: LockRank = LockRank(30);
 /// 用户句柄表（P7）。只读文件对象**不持有页框** ⇒ 表锁内只许调台账(40)、不许调 mm(20)；
 /// 盘 I/O 也不在锁内（AHCI 在关中断下只能走轮询宽限窗）。见 `docs/architecture/lock-order.md`。
 pub const RANK_HANDLE: LockRank = LockRank(35);
+
+/// 等级 36：socket 表（`network::socket::TABLE`，ADR-181）。
+///
+/// **为什么紧贴 35 之后**：socket 表只被 `handle` 层的 socket 句柄操作调用，
+/// 那些路径已经持 `RANK_HANDLE(35)` ⇒ 本锁必须**比 35 深**才满足严格递增。
+/// 而它内部不取任何锁（队列操作全在本表锁内完成），所以 36 是安全的下界。
+///
+/// **它不在中断上下文取**：收包路径（`socket::enqueue`）今天只从
+/// 用户态 syscall 侧调，不从中断里调 —— 若将来接到真收包中断，
+/// 这一行要改成 `true` 并重跑 ADR-081 决策 2 的判据。
+pub const RANK_NET: LockRank = LockRank(36);
 pub const RANK_LEDGER: LockRank = LockRank(40);
 pub const RANK_ACPI: LockRank = LockRank(50);
 /// 跨核竞争用例专用（`smp::CONTENTION_LOCK`）。排在最内层是因为它**不嵌套任何东西**：

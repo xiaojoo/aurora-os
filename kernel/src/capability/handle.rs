@@ -173,6 +173,10 @@ pub enum ObjRef {
     Proc { slot: u16, gen: u32 },
     ASpace { slot: u16, gen: u32 },
     Thread { gidx: usize, id: u32 },
+    /// socket（ADR-181 决策 5）。本体住在 `network::socket` 的槽表，
+    /// 这里只存带世代号的引用——与 `Proc`/`Job`/`ASpace` 同律：
+    /// close 撤的是**名字**，销毁本体走 `socket::destroy`。
+    Socket { slot: u16, gen: u32 },
 }
 
 #[derive(Clone, Copy)]
@@ -1176,6 +1180,18 @@ pub fn grant_aspace(owner: (usize, u32), slot: u16, rights: u32) -> Result<Handl
 /// 棘轮要一次性登记 `sched` 的十来条环内边（实测报红就是这件事）。
 /// 线程槽位的活性判据留在 `sched` 自己的入口（那里本来就要判 `state`），
 /// 所以句柄层少这一判**不损失安全性**；用例 C4 把这条分工变成可判的读数。
+/// 授一个 socket 句柄（ADR-181 决策 5）。
+///
+/// `gen` 是 `network::socket::create` 返回的世代号：槽号会复用，
+/// 只比槽号会让新 socket 继承旧句柄（与 `Proc`/`Job` 同一条坑）。
+pub fn grant_socket(owner: (usize, u32), slot: u16, gen: u32, rights: u32) -> Result<Handle, HErr> {
+    if !crate::network::socket::live(slot, gen) {
+        return Err(note(HErr::NoSuch));
+    }
+    let mut g = TABLE.lock();
+    insert(g.get(), owner, rights, ObjRef::Socket { slot, gen })
+}
+
 pub fn grant_thread(owner: (usize, u32), gidx: usize, id: u32, rights: u32) -> Result<Handle, HErr> {
     if id == 0 {
         return Err(note(HErr::NoSuch));

@@ -23,6 +23,8 @@ pub mod eth;
 pub mod icmp;
 pub mod ipv4;
 pub mod proto;
+pub mod socket;
+pub mod udp;
 
 
 

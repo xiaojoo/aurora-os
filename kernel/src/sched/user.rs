@@ -299,6 +299,8 @@ pub const KIND_THREAD: u32 = 6;
 pub const KIND_CONSOLE: u32 = 7;
 /// FS-03：目录句柄（只供 readdir）。文件仍复用 KIND_FILE，legacy FileObj 与 VfsFile 对用户同类。
 pub const KIND_DIR: u32 = 8;
+/// ADR-181：socket 句柄的种类号。
+pub const KIND_SOCKET: u32 = 9;
 
 /// `(major << 32) | (minor << 16) | features`。位一律**读回真实状态**，不读"我打算开"。
 pub fn abi_word() -> u64 {
@@ -1132,6 +1134,7 @@ fn kind_of(o: &crate::handle::ObjRef) -> u32 {
         crate::handle::ObjRef::Proc { .. } => KIND_PROC,
         crate::handle::ObjRef::ASpace { .. } => KIND_ASPACE,
         crate::handle::ObjRef::Thread { .. } => KIND_THREAD,
+        crate::handle::ObjRef::Socket { .. } => KIND_SOCKET,
     }
 }
 
@@ -2459,6 +2462,281 @@ fn sys_sysinfo(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
         Ok(_) => E_FAULT,
         Err(_) => E_FAULT,
     }
+}
+
+// ---------------------------------------------------------------- ADR-181：socket 族（48–55）
+
+/// 从用户内存读一个 `sockaddr_in`（16 字节，ADR-181 决策 4）。
+///
+/// 布局与 Linux **字节级一致**：
+///
+///     struct sockaddr_in {
+///         u16 sin_family;   // 偏移 0
+///         u16 sin_port;     // 偏移 2，网络序
+///         u32 sin_addr;     // 偏移 4，网络序
+///         u8  sin_zero[8];  // 偏移 8
+///     };
+///
+/// **端口和地址都是网络序（大端）**，所以 `u16::from_be_bytes` 直接读。
+#[cfg(feature = "handles")]
+fn read_sockaddr_in(ptr: u64) -> Result<crate::network::udp::UdpEndpoint, u64> {
+    let mut b = [0u8; 16];
+    match copy_from_user(ptr, &mut b) {
+        Ok(16) => {}
+        _ => return Err(E_FAULT),
+    }
+    let family = u16::from_ne_bytes([b[0], b[1]]);
+    if family != crate::network::socket::AF_INET {
+        // AF_INET6 也走这里：今天回 ENOSYS（族没实现），不是 EINVAL（参数写错）
+        if family == crate::network::socket::AF_INET6 {
+            return Err(crate::network::socket::E_NOSYS);
+        }
+        return Err(E_INVALID);
+    }
+    Ok(crate::network::udp::UdpEndpoint {
+        port: u16::from_be_bytes([b[2], b[3]]),
+        ip: [b[4], b[5], b[6], b[7]],
+    })
+}
+
+/// 48：`socket(domain, type, protocol)` → 句柄。
+///
+/// ## 为什么回句柄而不是 fd
+///
+/// ADR-181 决策 3 说「返回 fd」，但**fd 号段还没分配**（那是未决 1 的后半）。
+/// 今天先回**句柄**，与 8/9/22/24/25/26 那批一致——这样：
+///
+/// - 用户态拿到的东西与别的对象同形（可以 `dup`、可以传、可以 `close`）；
+/// - 等 fd 号段定了，只需在句柄外面包一层 fd 表，**不用改 socket 层**。
+///
+/// 返回 `-38` 的情形（`AF_INET6` / `SOCK_STREAM`）是「这个族/类型还没实现」，
+/// 不是「参数写错」（那是 `-1`）——ADR-181 决策 2 要求调用方能分辨这两件事。
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_sock_create(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
+    let domain = frame.rdi as u16;
+    let ty = frame.rsi as u16;
+    let proto = frame.rdx;
+    // protocol 只收 0（"由内核选"）；UDP 显式传 17 也接受
+    if proto != 0 && proto != 17 {
+        return E_INVALID;
+    }
+    let (slot, gen) = match crate::network::socket::create(domain, ty) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    match crate::handle::grant_socket(owner, slot, gen, crate::handle::RIGHT_READ | crate::handle::RIGHT_WRITE) {
+        Ok(h) => h.0,
+        Err(e) => {
+            // 授句柄失败要把 socket 槽还回去，否则每次失败漏一格
+            crate::network::socket::destroy(slot, gen);
+            handle_err(e)
+        }
+    }
+}
+
+/// 49：`bind(h, addr_ptr, addr_len)`。
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_sock_bind(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
+    if frame.rdx != 16 {
+        return E_INVALID;
+    }
+    let (slot, gen) = match socket_slot_of(frame.rdi, owner) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let ep = match read_sockaddr_in(frame.rsi) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    match crate::network::socket::bind(slot, gen, ep) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+/// 50：`listen` —— 对 `SOCK_DGRAM` 无意义，回 `-95` 并记日志点名。
+///
+/// **不静默返回 0**：那样调用方会以为监听成功了，然后 `accept` 永远等不到连接，
+/// 排查时完全看不出是哪一步错了。
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_sock_listen(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
+    match socket_slot_of(frame.rdi, owner) {
+        Ok((slot, _)) => {
+            crate::log_warn!("sock: listen 在 DGRAM socket 上无意义（槽 {}），回 -95", slot);
+            crate::network::socket::E_OPNOTSUPP
+        }
+        Err(e) => e,
+    }
+}
+
+/// 51：`connect(h, addr_ptr, addr_len)` —— UDP 的 connect 只是记住默认对端。
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_sock_connect(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
+    if frame.rdx != 16 {
+        return E_INVALID;
+    }
+    let (slot, gen) = match socket_slot_of(frame.rdi, owner) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let ep = match read_sockaddr_in(frame.rsi) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    match crate::network::socket::connect(slot, gen, ep) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+/// 52：`accept` —— 对 `SOCK_DGRAM` 无意义，回 `-95` 并记日志点名。
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_sock_accept(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
+    match socket_slot_of(frame.rdi, owner) {
+        Ok((slot, _)) => {
+            crate::log_warn!("sock: accept 在 DGRAM socket 上无意义（槽 {}），回 -95", slot);
+            crate::network::socket::E_OPNOTSUPP
+        }
+        Err(e) => e,
+    }
+}
+
+/// 53：`send(h, buf, len, flags)` → 发出的字节数。
+///
+/// 需要先 `connect`（UDP 的 send 没有对端参数；`sendto` 是未决 3）。
+/// 本地端口未 `bind` 时**自动分配一个临时端口**（Linux 的行为）。
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_sock_send(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
+    let len = frame.rdx as usize;
+    if len == 0 || len > crate::network::udp::UDP_PAYLOAD_MAX {
+        return E_INVALID;
+    }
+    let (slot, gen) = match socket_slot_of(frame.rdi, owner) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let (mut local, peer) = match crate::network::socket::endpoints(slot, gen) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if peer.port == 0 {
+        // 没 connect 就 send：Linux 回 EDESTADDRREQ（-89）。
+        return u64::MAX - 88;
+    }
+    if local.port == 0 {
+        // 临时端口：从 49152 起按槽号错开（IANA 动态端口段）
+        local.port = 49152 + slot;
+        if let Err(e) = crate::network::socket::bind(slot, gen, local) {
+            return e;
+        }
+    }
+    let mut payload = [0u8; crate::network::udp::UDP_PAYLOAD_MAX];
+    match copy_from_user(frame.rsi, &mut payload[..len]) {
+        Ok(n) if n == len => {}
+        _ => return E_FAULT,
+    }
+    // 惰性 bind 网卡（与 33 号同一条：shell 会话里没人先调 bind_net）
+    if crate::virtio::bind_net().is_err() {
+        return E_IO;
+    }
+    let (dst_mac, src_mac) = match net_macs_for(peer.ip) {
+        Some(v) => v,
+        None => return E_IO,
+    };
+    let mut f = [0u8; 1536];
+    let Some(flen) = crate::network::udp::build_frame(
+        &mut f, &dst_mac, &src_mac, local, peer, &payload[..len],
+    ) else {
+        return E_INVALID;
+    };
+    if crate::virtio::send_raw(&f[..flen]).is_err() {
+        return E_IO;
+    }
+    len as u64
+}
+
+/// 54：`recv(h, buf, len, flags)` → 收到的字节数。
+///
+/// **非阻塞**：队列空回 `-11`（EAGAIN）。阻塞版要等 `RANK_WAITQ` 接入，是未决。
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_sock_recv(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
+    let cap = frame.rdx as usize;
+    if cap == 0 {
+        return E_INVALID;
+    }
+    let (slot, gen) = match socket_slot_of(frame.rdi, owner) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let mut buf = [0u8; crate::network::udp::UDP_PAYLOAD_MAX];
+    let want = cap.min(crate::network::udp::UDP_PAYLOAD_MAX);
+    let (_src, n) = match crate::network::socket::dequeue(slot, gen, &mut buf[..want]) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    match copy_to_user(&buf[..n], frame.rsi) {
+        Ok(n2) if n2 == n => n as u64,
+        _ => E_FAULT,
+    }
+}
+
+/// 55：`close(h)` —— 撤 socket 名字并销毁槽。
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_sock_close(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
+    let h = crate::handle::Handle(frame.rdi);
+    let (slot, gen) = match socket_slot_of(frame.rdi, owner) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    // 先撤名字（close 的语义），再销毁本体
+    if let Err(e) = crate::handle::close(h, owner) {
+        return handle_err(e);
+    }
+    crate::network::socket::destroy(slot, gen);
+    0
+}
+
+/// 从句柄解出 `(slot, gen)`。**只接受 `ObjRef::Socket`**。
+#[cfg(feature = "handles")]
+fn socket_slot_of(h: u64, owner: (usize, u32)) -> Result<(u16, u32), u64> {
+    let (obj, _) = match crate::handle::resolve(
+        crate::handle::Handle(h), owner, crate::handle::RIGHT_READ,
+    ) {
+        Ok(v) => v,
+        Err(e) => return Err(handle_err(e)),
+    };
+    match obj {
+        crate::handle::ObjRef::Socket { slot, gen } => Ok((slot, gen)),
+        _ => Err(E_BAD_HANDLE),
+    }
+}
+
+/// 取发往 `dst_ip` 的目标 MAC 与本机 MAC。
+///
+/// 先查 ARP 表；查不到就发广播帧（`FF:FF:FF:FF:FF:FF`）——
+/// 这在同一广播域里能到，跨网段要靠网关（由 `connect` 的地址决定）。
+#[cfg(feature = "handles")]
+fn net_macs_for(dst_ip: [u8; 4]) -> Option<([u8; 6], [u8; 6])> {
+    let our_mac = crate::virtio::net_info().map(|i| i.mac).unwrap_or([0u8; 6]);
+    // ARP 表里没有就发广播：同一广播域能到，跨网段要靠网关（由 connect 的地址决定）。
+    let dst_mac = crate::virtio::arp_lookup(&dst_ip).unwrap_or([0xFF; 6]);
+    Some((dst_mac, our_mac))
 }
 
 /// 47（ADR-158）：DNS 解析。
@@ -3818,14 +4096,14 @@ pub fn syscall_dispatch(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> boo
         // 落地的分片：socket 族等 ADR-166 的 network 模块、输入族等 ADR-162 的 USB HID、
         // 音频族等 ADR-163 的 HDA。实现落地时把对应那一行换成真 handler，
         // 并按 ADR-176「验收」重写 `t_syscall_abi_arms` 里那一格（**不许直接删**）。
-        SYS_SOCK_CREATE => nosys(),
-        SYS_SOCK_BIND => nosys(),
-        SYS_SOCK_LISTEN => nosys(),
-        SYS_SOCK_CONNECT => nosys(),
-        SYS_SOCK_ACCEPT => nosys(),
-        SYS_SOCK_SEND => nosys(),
-        SYS_SOCK_RECV => nosys(),
-        SYS_SOCK_CLOSE => nosys(),
+        SYS_SOCK_CREATE => sys_sock_create(frame),
+        SYS_SOCK_BIND => sys_sock_bind(frame),
+        SYS_SOCK_LISTEN => sys_sock_listen(frame),
+        SYS_SOCK_CONNECT => sys_sock_connect(frame),
+        SYS_SOCK_ACCEPT => sys_sock_accept(frame),
+        SYS_SOCK_SEND => sys_sock_send(frame),
+        SYS_SOCK_RECV => sys_sock_recv(frame),
+        SYS_SOCK_CLOSE => sys_sock_close(frame),
         SYS_INPUT_READ => nosys(),
         SYS_INPUT_POLL => nosys(),
         SYS_INPUT_GRAB => nosys(),

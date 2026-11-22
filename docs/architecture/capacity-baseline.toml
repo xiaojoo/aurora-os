@@ -424,3 +424,12 @@ linux_source = "Linux revoke 走 files_struct 遍历，无栈数组"
 reason = "revoke_task/reset_for_test 在栈上收集 VMO 槽号的上界。**不能写 MAX_HANDLES**：那会让栈数组随容量增长（实测 131072 => 128 KiB 栈数组 => Double Fault）。取 64，超出的分批判。"
 is_tradeoff = true
 cost = "64 字节栈数组"
+
+[[const]]
+kernel_const = "MAX_SOCKETS"
+value = 256
+section = "network"
+linux_source = "Linux 的 socket 总数受 RLIMIT_NOFILE 与内存约束，无对应常量；somaxconn 是 listen 队列长度不是 socket 总数"
+reason = "全系统 socket 槽数。256 x ~48 B = 12 KiB，放 .bss 不推高布局（ADR-179 的阈值是「容量 x 元素 > 几十 KiB」）。这是本轮接缝，不是硬件依据。"
+is_tradeoff = true
+cost = "Socket x 256（含每槽 8 个数据报队列，约 12 KiB 数据）"

@@ -460,7 +460,7 @@ public_api = [
 allowed_callers = ["integration"]
 dependencies = [
   "arch", "boot", "capability", "diagnostics", "display", "driver", "input", "memory", "pci",
-  "security", "storage", "sync", "time"
+  "security", "storage", "sync", "time", "network",
 ]
 forbidden_dependencies = []
 known_violations = []
@@ -495,7 +495,7 @@ public_api = [
   "sync::IrqGuard",
   "sync::RANK_HANDLE",
 ]
-allowed_callers = ["arch", "capability", "integration", "memory", "resource", "sched"]
+allowed_callers = ["arch", "capability", "integration", "memory", "resource", "sched", "network"]
 dependencies = ["arch", "diagnostics", "time"]
 forbidden_dependencies = []
 known_violations = []
@@ -572,7 +572,7 @@ owner = "network"
 layer = "service"
 source_modules = [
   "network", "network/arp", "network/arp_table", "network/dhcp", "network/dns", "network/eth",
-  "network/icmp", "network/ipv4", "network/proto"
+  "network/icmp", "network/ipv4", "network/proto", "network/socket", "network/udp"
 ]
 # 今天只有边界声明与 `NetError`：协议实现仍在 `driver/virtio.rs` 里，**待搬迁**
 # （ADR-166 未决 1）。先登记"这个域存在、依赖谁、谁能调"，搬迁时往这里加成员。
@@ -597,17 +597,28 @@ public_api = [
   "arp_table::ArpStats", "arp_table::arp_lookup", "arp_table::arp_learn",
   "arp_table::arp_stats", "arp_table::arp_read_from", "arp_table::arp_len",
   "ipv4::NET_SUBNET_MASK", "ipv4::is_local_subnet", "ipv4::next_hop",
-  "ipv4::arp_learn_from_frame", "ipv4::ip_cksum"
+  "ipv4::arp_learn_from_frame", "ipv4::ip_cksum",
+  "socket::AF_INET",
+  "socket::AF_INET6",
+  "socket::SOCK_DGRAM",
+  "socket::SOCK_STREAM",
+  "socket::create", "socket::destroy", "socket::live", "socket::bind",
+  "socket::connect", "socket::endpoints", "socket::dequeue", "socket::E_NOSYS",
+  "socket::E_OPNOTSUPP", "socket::E_AGAIN", "socket::E_BAD_FD", "socket::E_ADDRINUSE",
+  "socket::E_EXHAUSTED", "socket::MAX_SOCKETS", "socket::SOCK_RX_QUEUE",
+  "socket::used", "socket::enqueue",
+  "udp::UdpEndpoint", "udp::UDP_PAYLOAD_MAX", "udp::UDP_HDR", "udp::IP_HDR",
+  "udp::ETH_HDR", "udp::build_frame", "udp::parse_frame", "udp::udp_checksum",
 ]
 # 今天**无人调用**（协议还在 driver 里）；按实测填空，搬迁后再长出来。
-allowed_callers = ["driver"]
+allowed_callers = ["driver", "capability", "sched"]
 # 依赖方向是 **network → driver（单向）**：协议通过驱动的收发原语工作。
 # 反向依赖会让驱动不得不认识协议，那正是 ADR-166 要拆掉的东西。
 # 今天**无源码依赖**：`network/mod.rs` 只 use 了 core。
 # 登记表写的是「现在是什么」，不是「打算变成什么」——计划属 ADR，事实属这里。
 # ADR-171：协议拆成 7 个文件后 `network` **不再依赖 driver**
 # （`fnv1a64` 换成自带的 `eth::frame_hash`）⇒ 出环。
-dependencies = []
+dependencies = ["sync"]
 forbidden_dependencies = ["storage", "display", "input"]
 known_violations = []
 test_targets = []
@@ -1010,11 +1021,13 @@ public_api = [
   "handle::init",
   # ADR-180：per-process fd 表。
   "handle::FdTable",
+  # ADR-181：socket 句柄与族常量。
+  "handle::grant_socket",
   "handle::FD_TABLE_INIT",
   "handle::FD_TABLE_MAX",
 ]
 allowed_callers = ["integration", "sched"]
-dependencies = ["memory", "storage", "sync"]
+dependencies = ["memory", "storage", "sync", "network"]
 forbidden_dependencies = []
 known_violations = []
 context = ["KERNEL", "USER_ENTRY"]
@@ -1093,10 +1106,12 @@ status = "部分落地"
 [baseline]
 # 当前产品代码的强连通分量（Task B 冻结基线）：新增环成员或改环 ⇒ check 红。
 known_scc = [
-  ["arch", "boot", "diagnostics", "driver", "irq", "memory", "pci", "resource", "sync", "time"],
+  ["arch", "boot", "diagnostics", "driver", "irq", "memory", "network", "pci", "resource", "sync", "time"],
 ]
 
 [baseline.ring_edge_sites]
+"driver->network" = 2
+"network->sync" = 1
 "arch->boot" = 2
 "arch->diagnostics" = 19
 "arch->irq" = 2

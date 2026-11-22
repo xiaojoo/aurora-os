@@ -21152,3 +21152,94 @@ ADR-180 落地时 `ProcEntry.fd_table` 是**空壳**（字段存在但没人写�
 ### 未决 3 已关闭
 
 剩下的未决：1（fd 号段）、2（`dup2`）、5（用户态 fd API）。
+---
+
+## 496. ADR-181 落地：socket 族 48–55（2026-11-22）
+
+### 为什么做这个
+
+48–55 这 8 个号**早就声明并占位了，但全是 `nosys()` 空壳**。
+`check-syscall-abi-arms` 判据 3 只对账「有没有臂」，所以空壳照样绿——那是设计意图。
+
+**这才是「后面」**：socket 是 IPv6 的真正入口（`socket(domain, type, proto)` 的第一个参数）。
+
+### 交付
+
+| 号 | 本轮 | 说明 |
+|---|---|---|
+| 48 `socket` | **实现** | `AF_INET` + `SOCK_DGRAM` 可用 |
+| 49 `bind` | **实现** | |
+| 50 `listen` | 回 **-95** | DGRAM 无意义，**不静默返回 0** |
+| 51 `connect` | **实现** | UDP 的 connect = 设默认对端 |
+| 52 `accept` | 回 **-95** | 同上 |
+| 53 `send` | **实现** | |
+| 54 `recv` | **实现** | 非阻塞，空队列回 -11 |
+| 55 `close` | **实现** | |
+
+**新增模块**：`network/udp.rs`（打包/解包/校验和）、`network/socket.rs`（槽表 256 格）。
+
+### 三个设计决定
+
+**① 先做 UDP，不做 TCP**：UDP 无状态机，TCP 要握手/重传/拥塞控制。
+`SOCK_STREAM` 显式回 -38 并记日志，**不静默降级成 DGRAM**。
+
+**② `domain` 今天就收 `AF_INET` 与 `AF_INET6`**：IPv6 还没实现，但**参数形状现在就要对**。
+`AF_INET6` 回 `-38`（族没实现），**不是** `-1`（参数写错）——调用方要能分辨这两件事。
+
+**③ socket 走句柄层，不走 fd 表**：`close` 语义、权限位、跨进程传递都已在句柄层做好。
+等 fd 号段定了（未决 1 后半），只需在句柄外**包一层** fd 表，不用改 socket 层。
+
+### 一条新锁：`RANK_NET = 36`
+
+紧贴 `RANK_HANDLE(35)` 之后：socket 表只被 `handle` 层的 socket 句柄操作调用，
+那些路径已持 35 ⇒ 本锁必须比 35 深。它内部不取任何锁，36 是安全下界。
+
+**已同步**：`sync/mod.rs`、`lock-order.md` 表格、`check-fat32-ports` 的锁序检查。
+
+### 判据七格（`t_socket_family`）
+
+     sock: kind=true v6拒=-38 stream拒=-38 bind=true 重复=-98 listen=-95 accept=-95 EAGAIN=-11 回收=true 末used=0 ⇒ true
+
+### 负样本：第一次没咬住（如实记）
+
+第一版第 5 格验的是「socket 层槽还活着」——把 `sys_sock_listen` 改成静默返回 0，
+**它照样绿**（实测 PASS(33)）。**判据没覆盖它声称覆盖的东西。**
+
+改成走 syscall 层真调 48/50/52 之后，负样本精准咬住：
+
+    sock: listen/accept 应回 -95，实得 0x0/0xffffffffffffffa1
+    t_socket_family -> failed
+
+### 一条过时判据必须跟着实现走
+
+`t_syscall_abi_arms` 原本硬编码「53/54 必须未实现，回 -18 且 nosys 涨 1」。
+我实现了它们 ⇒ 这条用例变红。
+
+**那个红是判据过时，不是功能坏了。** 改成「已实现的号两个计数器都不涨」：
+
+    abi-arms: 33已知=true 34已知=true 53已实现=true 54已实现=true 56未实现=true 60未实现=true ⇒ 判据=true
+
+原来的用意（分得清「号没登记」与「号没实现」）完整保留。
+
+### 读数
+
+| 项 | 结果 |
+|---|---|
+| `check` | **20/20** |
+| `handles` 档 | 104 条 ktest，**8 次跑里 5 次 104/104 全绿** |
+
+失败 3 次全是既有偶发：`t_sdkdemo` ×2（历史 8%）、`t_ap_released_and_ticking` ×1。
+
+### 一次误判的教训
+
+中途连续 6 次全 FAIL，我一度以为是 socket 引入的回归。查历史才确认
+`t_q2_workload_slots` 是 **2.8% 的既有偶发**（263/9252，最早 11-11 17:14），
+那次是**概率簇**。加诊断后 8 次跑里它一次没红。
+
+### 未做
+
+1. **TCP**（`SOCK_STREAM`）—— 需要状态机，单独 ADR
+2. **IPv6**（`AF_INET6`）—— 地址类型、NDP、SLAAC、AAAA，单独 ADR
+3. **`sendto`/`recvfrom`**（无 connect 时给对端）
+4. **fd 号段**（socket 现在回句柄，不是 fd）
+5. **收包路径接中断**（今天 `socket::enqueue` 只从 syscall 侧调）

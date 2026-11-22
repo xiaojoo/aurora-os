@@ -2247,6 +2247,12 @@ fn t_q2_workload_slots() -> bool {
     // ④ 被拒的那几次 spawn 各已经发过一段 VA 窗口和 4 个页框：它们必须原样回来。
     //    这一格本来只是读数，实测 `va23->23 / free 不变` ⇒ 升成判据（去回滚它就红）。
     let rollback_ok = f1 == f0 && va1 == va0;
+    if !rollback_ok {
+        crate::log_fatal!(
+            "q2: 回滚不成立 f{}->{}(差 {}) va{}->{}(差 {}) 收尸={} 回滚={}",
+            f0, f1, f1 as i64 - f0 as i64, va0, va1, va1 as i64 - va0 as i64, reaped, rolled_back
+        );
+    }
     // ⑤ 收尾：进程/Job 清零、回收发生、**本 Job 的线程一条都不剩**（§383：底噪会自己走，
     //    所以不拿全局 `active1 == act0` 当判据，只把它打进日志）。
     let baseline_ok = drained && jd.is_ok() && pc1 == 0 && jc1 == 0 && ours_end == 0;
