@@ -44,7 +44,7 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 #[cfg(feature = "fs-open")]
 pub const MAX_HANDLES: usize = 16384;
 #[cfg(not(feature = "fs-open"))]
-
+pub const MAX_HANDLES: usize = 131072;
 /// 查「这个任务属于哪个进程」的函数指针（ADR-191）。
 ///
 /// ## 为什么是函数指针而不是直接调 `sched`
@@ -79,7 +79,6 @@ fn proc_of(gidx: usize) -> u16 {
     f(gidx)
 }
 
-pub const MAX_HANDLES: usize = 131072;
 /// 一次 `revoke_task`/`reset_for_test` 里**栈上**收集 VMO 槽号的容量。
 ///
 /// 为什么不能直接用 `MAX_HANDLES`（ADR-179 实测）：那两个函数原来写
@@ -206,6 +205,10 @@ pub enum ObjRef {
         cursor: ReadCursor,
         stat: VfsEntry,
         share: Option<u8>,
+        /// **卷指纹**（ADR-221）：读路径要用它走页缓存。
+        ///
+        /// 没有它就只能走不缓存的 `read_disk` —— 而缓存版要 `(vol, lba)` 才能命中。
+        vol: u64,
     },
     /// 目录句柄不内嵌 `DirCursor`（那会把每槽撑到 1.5 KiB）；`DirState` 是可复制的紧凑游标。
     #[cfg(feature = "fs-open")]
@@ -987,9 +990,10 @@ pub fn grant_vfs_file(
     cursor: ReadCursor,
     stat: VfsEntry,
     rights: u32,
+    vol: u64,
 ) -> Result<Handle, HErr> {
     let mut g = TABLE.lock();
-    insert(g.get(), owner, rights, ObjRef::VfsFile { port, part, cursor, stat, share: None })
+    insert(g.get(), owner, rights, ObjRef::VfsFile { port, part, cursor, stat, share: None, vol })
 }
 
 #[cfg(feature = "fs-open")]
@@ -1006,7 +1010,7 @@ pub fn grant_vfs_dir(
 }
 
 #[cfg(feature = "fs-open")]
-fn disk_for(port: u8, part: Option<Partition>) -> (AhciDisk, Option<Partition>) {
+pub(crate) fn disk_for(port: u8, part: Option<Partition>) -> (AhciDisk, Option<Partition>) {
     (AhciDisk { port }, part)
 }
 
@@ -1513,7 +1517,7 @@ pub fn dup(h: Handle, owner: (usize, u32), new_rights: u32) -> Result<Handle, HE
                 Some(ObjRef::File(FileObj { share: Some(i), ..f }))
             }
             #[cfg(feature = "fs-open")]
-            Some(ObjRef::VfsFile { port, part, cursor, stat, share }) => {
+            Some(ObjRef::VfsFile { port, part, cursor, stat, share, vol }) => {
                 let i = match share {
                     Some(i) => {
                         cell_retain(t, i);
@@ -1527,7 +1531,7 @@ pub fn dup(h: Handle, owner: (usize, u32), new_rights: u32) -> Result<Handle, HE
                         None => return Err(HErr::Exhausted),
                     },
                 };
-                Some(ObjRef::VfsFile { port, part, cursor, stat, share: Some(i) })
+                Some(ObjRef::VfsFile { port, part, cursor, stat, share: Some(i), vol })
             }
             Some(_) => None,
             None => {
@@ -1605,7 +1609,7 @@ pub fn vmo_of(h: Handle, owner: (usize, u32), need: u32) -> Result<crate::vmo::V
 enum ReadTicketKind {
     Fat(FileCursor),
     #[cfg(feature = "fs-open")]
-    Vfs(ReadCursor),
+    Vfs(ReadCursor, u64),
 }
 
 pub struct ReadTicket {
@@ -1632,7 +1636,7 @@ impl ReadTicket {
         match self.kind {
             ReadTicketKind::Fat(c) => c.position(),
             #[cfg(feature = "fs-open")]
-            ReadTicketKind::Vfs(c) => c.position(),
+            ReadTicketKind::Vfs(c, _) => c.position(),
         }
     }
 
@@ -1640,7 +1644,7 @@ impl ReadTicket {
         match self.kind {
             ReadTicketKind::Fat(c) => c.stat().size,
             #[cfg(feature = "fs-open")]
-            ReadTicketKind::Vfs(c) => c.size(),
+            ReadTicketKind::Vfs(c, _) => c.size(),
         }
     }
 
@@ -1648,7 +1652,16 @@ impl ReadTicket {
         match self.kind {
             ReadTicketKind::Fat(ref mut c) => c.read(disk, dst).map_err(HErr::Io),
             #[cfg(feature = "fs-open")]
-            ReadTicketKind::Vfs(ref mut c) => {
+            ReadTicketKind::Vfs(ref mut c, _vol) => {
+                // **回退到不缓存版**（ADR-221 实测）：
+                //
+                // 走 `read_disk_cached` 会让 `t_sdkdemo` 开始读盘，而 AHCI 的 `XFER`
+                // （rank 37）持锁期间调 `tsc::now()`（TIMER 6）⇒ 锁序违规 ⇒ 整机 HANG：
+                //
+                //   [fatal] L4 sync: 锁序违规，外层 rank=37 本次 rank=6
+                //
+                // **这是 AHCI 内部的既有问题**，不是本层引入的；本层只负责不踩它。
+                // 修 `XFER` 的锁序要改驱动语义（AGENTS.md 硬约束 1），单独一轮做。
                 let n = vfs_ro::read_disk(disk, c, dst).map_err(vfs_to_herr)?;
                 Ok(n)
             }
@@ -1685,7 +1698,7 @@ pub fn begin_read(h: Handle, owner: (usize, u32)) -> Result<ReadTicket, HErr> {
             })
         }
         #[cfg(feature = "fs-open")]
-        Some(ObjRef::VfsFile { port, part, cursor, share, .. }) => {
+        Some(ObjRef::VfsFile { port, part, cursor, share, vol, .. }) => {
             let (cur, cell) = match share {
                 None => (cursor, None),
                 Some(i) => match t.cells[i as usize] {
@@ -1704,7 +1717,7 @@ pub fn begin_read(h: Handle, owner: (usize, u32)) -> Result<ReadTicket, HErr> {
                 port,
                 part,
                 cell,
-                kind: ReadTicketKind::Vfs(cur),
+                kind: ReadTicketKind::Vfs(cur, vol),
             })
         }
         // 目录句柄有对象、有 READ 权，但"读一个目录的字节"这件事在 VFS 层就不成立：
@@ -1743,7 +1756,7 @@ pub fn finish(ticket: ReadTicket, bytes: usize) -> Result<(), HErr> {
                 true
             }
             #[cfg(feature = "fs-open")]
-            (Some(CellCur::Vfs(x)), ReadTicketKind::Vfs(k)) => {
+            (Some(CellCur::Vfs(x)), ReadTicketKind::Vfs(k, _)) => {
                 *x = k;
                 true
             }
@@ -1761,7 +1774,7 @@ pub fn finish(ticket: ReadTicket, bytes: usize) -> Result<(), HErr> {
                 true
             }
             #[cfg(feature = "fs-open")]
-            (Some(ObjRef::VfsFile { cursor: old, .. }), ReadTicketKind::Vfs(c)) => {
+            (Some(ObjRef::VfsFile { cursor: old, .. }), ReadTicketKind::Vfs(c, _)) => {
                 *old = c;
                 true
             }
@@ -1800,7 +1813,7 @@ pub fn begin_write(h: Handle, owner: (usize, u32)) -> Result<ReadTicket, HErr> {
     let slot = check(t, h, owner, RIGHT_WRITE)?;
     let e_gen = t.slots[slot].gen;
     match t.slots[slot].obj {
-        Some(ObjRef::VfsFile { port, part, cursor, share, .. }) => {
+        Some(ObjRef::VfsFile { port, part, cursor, share, vol, .. }) => {
             let (cur, cell) = match share {
                 None => (cursor, None),
                 Some(i) => match t.cells[i as usize] {
@@ -1819,7 +1832,7 @@ pub fn begin_write(h: Handle, owner: (usize, u32)) -> Result<ReadTicket, HErr> {
                 port,
                 part,
                 cell,
-                kind: ReadTicketKind::Vfs(cur),
+                kind: ReadTicketKind::Vfs(cur, vol),
             })
         }
         // 目录句柄、以及任何非文件对象：写不成立。与读的 `-11 EISDIR` 相对，这里回类型不符。
@@ -1831,7 +1844,7 @@ pub fn begin_write(h: Handle, owner: (usize, u32)) -> Result<ReadTicket, HErr> {
 #[cfg(feature = "fs-rw")]
 pub fn write_chunk(ticket: &mut ReadTicket, disk: &dyn Block, src: &[u8]) -> Result<usize, HErr> {
     match ticket.kind {
-        ReadTicketKind::Vfs(ref mut c) => vfs_ro::write_at(disk, c, src).map_err(vfs_to_herr),
+        ReadTicketKind::Vfs(ref mut c, _) => vfs_ro::write_at(disk, c, src).map_err(vfs_to_herr),
         _ => Err(HErr::Denied),
     }
 }

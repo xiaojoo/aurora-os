@@ -3976,7 +3976,13 @@ fn sys_file_open(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     };
     let granted = match opened {
         Opened::File { port, cursor, stat } => {
-            crate::handle::grant_vfs_file(owner, port, None, cursor, stat, rights)
+            // **卷指纹必须真算**（ADR-221）：传 0 会让所有卷共用缓存槽，
+            // 不同盘的同 LBA 直接串（实测 `t_sdkdemo` 信箱魔数读到 0）。
+            let vol = {
+                let (d, _) = crate::handle::disk_for(port, None);
+                crate::filesystem::vfs_ro::volume_fingerprint_pub(&d, &cursor.bpb())
+            };
+            crate::handle::grant_vfs_file(owner, port, None, cursor, stat, rights, vol)
         }
         Opened::Dir { port, state, stat } => {
             crate::handle::grant_vfs_dir(owner, port, None, stat, state, rights)

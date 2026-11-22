@@ -296,7 +296,9 @@ fn syscall_cells(fs: &ReadOnlyFs<'_>, small: &vfs_ro::Entry, direct: &[u8; 100])
     };
     let mut filled = true;
     for _ in 0..MAX_HANDLES - 1 {
-        if handle::grant_vfs_file(ident, fs_open::PORT, None, fill_cursor, *small, RIGHT_READ).is_err() {
+        // 容量测试不关心卷身份，用固定值（这条路径不读数据）
+        let fvol = 0u64;
+        if handle::grant_vfs_file(ident, fs_open::PORT, None, fill_cursor, *small, RIGHT_READ, fvol).is_err() {
             filled = false;
             break;
         }
@@ -996,6 +998,7 @@ fn t_fs_open_dup_shared() -> bool {
         cur,
         st,
         handle::RIGHT_READ | handle::RIGHT_DUP,
+        0u64, // vol：容量测试不关心卷身份
     ) {
         Ok(h) => h,
         Err(_) => return false,

@@ -24301,3 +24301,74 @@ AGENTS.md 已写「涉及硬件、存储、网络、签名的结论，要有宿�
 3. **dentry 不存 inode 号** —— 每次 `open_node` 仍要重算 `(vol, cluster)`
 4. **没有 `VfsNode` 的生命周期管理** —— 泄漏一个就少一个 inode 引用
 5. **单根挂载**
+---
+
+## 541. ADR-221：产品路径带上卷指纹（**并发现 fs-open 档的既有 HANG**）（2026-11-23）
+
+### 目标与结果
+
+目标：让产品路径（`file_open` → `read`）带上卷指纹，从而能用页缓存。
+**结果：卷指纹加上了，但读路径接缓存必须回退 —— 因为它触发了一个既有缺陷。**
+
+### 已落地
+
+    // vfs_ro
+    ReadCursor::bpb() -> Bpb
+    volume_fingerprint_pub(disk, bpb) -> u64
+    // 且 volume_fingerprint 改为**不读盘**
+
+    // handle
+    VfsFile { ..., vol: u64 }
+    pub(crate) disk_for(...)
+    grant_vfs_file(..., vol: u64)
+    ReadTicketKind::Vfs(ReadCursor, u64)
+
+### 发现 1：volume_fingerprint 读盘会导致锁序违规
+
+第一版读 LBA 0 与 LBA 1 做哈希 —— 那是**真实块 I/O**。而它被 `file_open` 调用，于是：
+
+    [fatal] L4 sync: 锁序违规，外层 rank=37 本次 rank=6
+
+改成**纯从 bpb 几何字段派生**。指纹只需要「区分不同卷」，不需要「完整识别卷内容」。
+
+### 发现 2：**fs-open 档在 HEAD 就 HANG**（既有缺陷，不是本轮引入）
+
+把本轮全部改动 `git stash` 掉、跑 HEAD（`dab30fe`）的 `fs-open` 档：
+
+    FATAL [fatal] L4 sync: 锁序违规，外层 rank=37 本次 rank=6
+    判定=HANG qemu_rc=-1 用时=120.0s
+
+**所以这不是本轮引入的。** `fs-open` 档此前从未被单独验证过。
+
+### 发现 3：rank 37 与 TIMER(6) 的冲突点在 AHCI 侧
+
+| 位置 | 锁 | 是否在持锁时读时钟 |
+|---|---|---|
+| `driver/ahci.rs:362` | `XFER`（`OpenSpinLock`）| **是**（`write_bytes` 路径有 `tsc::now()`）|
+| `filesystem/block_io.rs:317` | `QUEUE_LOCK` | 否 |
+| `filesystem/block_io.rs:510` | `CB_LOCK` | 否 |
+
+`XFER` 是 `OpenSpinLock`（不动 IF），而 `tsc::now()` 要取 `RANK_TIMER(6)`。**37 → 6 是倒序。**
+
+修它要改 AHCI 的锁语义（AGENTS.md 硬约束 1：不改已实测的驱动语义），单独一轮做。
+
+### 为什么读路径接缓存回退了
+
+`read_chunk` 走 `read_disk_cached` 会让 `t_sdkdemo` 开始读盘 ⇒ 撞上上面那条。
+**本层只负责不踩它**，而不是顺手改驱动。所以回退到 `read_disk`，`_vol` 保留（将来一行切换）。
+
+### 读数
+
+| 档 | 结果 |
+|---|---|
+| `check` | **21/21** |
+| `handles` | **`PASS(33)`** |
+| `handles,fs-ro` | **`PASS(33)`** |
+| `handles,fs-open` | **HANG**（既有缺陷，HEAD 同样）|
+
+### 未做
+
+1. **`XFER` 的锁序**（本 ADR 发现的核心缺陷）—— 要改 AHCI，需单独 ADR
+2. **`read_chunk` 仍用不缓存版** —— 等 1 修好
+3. **`fs-open` 档从未被验证过** —— 这次是第一次跑，暴露了上面那条
+4. **`volume_fingerprint` 不再读盘** ⇒ 对「同几何、不同内容」的卷区分度下降

@@ -262,6 +262,15 @@ pub struct ReadCursor {
 }
 
 impl ReadCursor {
+    /// **判据与产品路径用的 `Bpb` 访问器**（ADR-221）。
+    ///
+    /// 读路径要算卷指纹（`volume_fingerprint_pub(&disk, &bpb)`），
+    /// 而 `ReadCursor` 把 `bpb` 藏在私有字段里 —— 没有这个访问器就只能传 0，
+    /// 那会让所有卷共用缓存槽（实测 `t_sdkdemo` 信箱魔数读到 0）。
+    pub fn bpb(&self) -> Bpb {
+        self.bpb
+    }
+
     pub fn position(&self) -> u32 {
         self.position
     }
@@ -518,24 +527,25 @@ pub fn volume_fingerprint_pub(disk: &dyn Block, bpb: &Bpb) -> u64 {
 }
 
 fn volume_fingerprint(disk: &dyn Block, bpb: &Bpb) -> u64 {
+    // **不读盘**（ADR-221 实测撞过）：
+    //
+    // 第一版读 LBA 0 与 LBA 1 做哈希 —— 那让 `volume_fingerprint` 变成一次真实块 I/O，
+    // 而它被 `file_open` 的路径调用 ⇒ 与 AHCI 的 `XFER`（rank 37）锁序冲突：
+    //
+    //   [fatal] L4 sync: 锁序违规，外层 rank=37 本次 rank=6
+    //
+    // 整机 HANG（`t_sdkdemo` 连续两次复现）。
+    //
+    // **指纹只需要「区分不同卷」，不需要「完整识别卷内容」**：
+    // `dentry_vol_id` 已经包含 `disk_key`（哪个口/哪种设备），
+    // 再叠上 BPB 的几何字段就足以区分夹具与真机的几个卷。
     let mut h: u64 = dentry_vol_id(disk, bpb);
-    let mut sec = [0u8; SECTOR_BYTES];
-    // 引导扇区（LBA 0）：含 BPB、卷标、跳转指令
-    if disk.read_sectors(0, &mut sec).is_ok() {
-        for (i, b) in sec.iter().enumerate() {
-            if i % 8 == 0 {
-                h = h.wrapping_mul(0x0100_0000_01b3).wrapping_add(*b as u64);
-            }
-        }
-    }
-    // FAT32 的 FSInfo（LBA 1）：坏卷测试也动它
-    if bpb.clusters > 65525 && disk.read_sectors(1, &mut sec).is_ok() {
-        for (i, b) in sec.iter().enumerate() {
-            if i % 8 == 0 {
-                h = h.wrapping_mul(0x0100_0000_01b3).wrapping_add(*b as u64);
-            }
-        }
-    }
+    h = h.wrapping_mul(0x0100_0000_01b3).wrapping_add(bpb.total_sectors);
+    h = h.wrapping_mul(0x0100_0000_01b3).wrapping_add(bpb.clusters);
+    h = h.wrapping_mul(0x0100_0000_01b3).wrapping_add(bpb.cluster_bytes as u64);
+    h = h.wrapping_mul(0x0100_0000_01b3).wrapping_add(u64::from(bpb.root_cluster));
+    h = h.wrapping_mul(0x0100_0000_01b3).wrapping_add(u64::from(bpb.sectors_per_fat));
+    h = h.wrapping_mul(0x0100_0000_01b3).wrapping_add(u64::from(bpb.reserved_sectors));
     h
 }
 
@@ -2051,7 +2061,7 @@ static PAGES: PageCacheCell = PageCacheCell(core::cell::UnsafeCell::new(PageCach
 }));
 
 static CACHE_LOCK: crate::sync::IrqSpinLock<()> =
-    crate::sync::IrqSpinLock::new(crate::sync::RANK_BLOCK, ());
+    crate::sync::IrqSpinLock::new(crate::sync::RANK_GROW, ());
 
 /// **读一个扇区，经页缓存**（ADR-218）。
 ///

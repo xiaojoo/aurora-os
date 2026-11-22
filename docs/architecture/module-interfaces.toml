@@ -1077,7 +1077,7 @@ public_api = [
   "handle::has",
   "handle::transfer",
   "handle::transfer_rollback",
-  "handle::grant_vfs_file",
+  "handle::disk_for", "handle::grant_vfs_file",
   "handle::grant_vfs_dir",
   "handle::seek",
   "handle::stat",
