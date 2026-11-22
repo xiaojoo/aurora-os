@@ -1892,3 +1892,151 @@ pub fn sb_clear() {
     t.mounted = 0;
     t.unmounted = 0;
 }
+
+// ---------------------------------------------------------------- ADR-218：页缓存
+
+/// 页缓存的槽数（ADR-218）。
+///
+/// 每个槽存一个 512 字节扇区 + 元数据 ⇒ 24 × 528 ≈ **12.4 KiB**，进 `.bss` 可接受。
+///
+/// 需求侧：一次 FAT 链遍历会重复读 FAT 扇区（同一扇区被多个簇共享），
+/// 目录扫描会重复读目录扇区。24 槽覆盖「一条路径解析 + 一次文件读」的热集。
+pub const PAGE_CACHE_MAX: usize = 24;
+
+/// 一个缓存槽（ADR-218）。
+#[derive(Clone, Copy)]
+pub struct CachePage {
+    /// 卷指纹。
+    pub vol: u64,
+    /// 扇区号。
+    pub lba: u64,
+    /// 最近使用序号（越大越新）。
+    pub used_at: u32,
+    pub valid: bool,
+    /// 扇区内容。
+    pub data: [u8; SECTOR_BYTES],
+}
+
+const CACHE_EMPTY: CachePage = CachePage {
+    vol: 0,
+    lba: 0,
+    used_at: 0,
+    valid: false,
+    data: [0u8; SECTOR_BYTES],
+};
+
+struct PageCache {
+    slots: [CachePage; PAGE_CACHE_MAX],
+    /// 单调递增的使用序号（LRU 判据）。
+    clock: u32,
+    hits: u32,
+    misses: u32,
+    evicted: u32,
+}
+
+struct PageCacheCell(core::cell::UnsafeCell<PageCache>);
+// SAFETY: 读写全在 `CACHE_LOCK` 内；载荷全为 Copy。
+unsafe impl Sync for PageCacheCell {}
+
+static PAGES: PageCacheCell = PageCacheCell(core::cell::UnsafeCell::new(PageCache {
+    slots: [CACHE_EMPTY; PAGE_CACHE_MAX],
+    clock: 0,
+    hits: 0,
+    misses: 0,
+    evicted: 0,
+}));
+
+static CACHE_LOCK: crate::sync::IrqSpinLock<()> =
+    crate::sync::IrqSpinLock::new(crate::sync::RANK_BLOCK, ());
+
+/// **读一个扇区，经页缓存**（ADR-218）。
+///
+/// ## 为什么缓存「扇区」而不是「页」
+///
+/// 这一层的上游（`read_disk`）逐扇区读，而 FAT 表与目录项都是 32 字节粒度、
+/// 扇区是 512 字节 —— **扇区就是这一层真正的访问单位**。
+/// 缓存更大的页只会浪费空间（目录扇区很少连续用到）。
+///
+/// ## 命中判据是 `(vol, lba)`
+///
+/// 与 dentry / inode / superblock 同一条教训：**不带卷指纹就会串**。
+pub fn cached_read(disk: &dyn Block, vol: u64, lba: u64, out: &mut [u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+    // 先查缓存（锁内只查表，不碰设备）
+    {
+        let _g = CACHE_LOCK.lock();
+        // SAFETY: 持锁期间独占。
+        let c = unsafe { &mut *PAGES.0.get() };
+        c.clock = c.clock.wrapping_add(1);
+        let now = c.clock;
+        for s in c.slots.iter_mut() {
+            if s.valid && s.vol == vol && s.lba == lba {
+                *out = s.data;
+                s.used_at = now;
+                c.hits += 1;
+                return Ok(());
+            }
+        }
+        c.misses += 1;
+    }
+    // 未命中：读盘（锁外）
+    let mut buf = [0u8; SECTOR_BYTES];
+    block_io::read_checked(disk, lba, &mut buf, &block_io::Budget::UNBOUNDED)?;
+    *out = buf;
+    // 写回缓存
+    {
+        let _g = CACHE_LOCK.lock();
+        // SAFETY: 持锁期间独占。
+        let c = unsafe { &mut *PAGES.0.get() };
+        c.clock = c.clock.wrapping_add(1);
+        let now = c.clock;
+        // 先找空位
+        for s in c.slots.iter_mut() {
+            if !s.valid {
+                *s = CachePage { vol, lba, used_at: now, valid: true, data: buf };
+                return Ok(());
+            }
+        }
+        // 满了：淘汰 `used_at` 最小的（LRU）
+        let mut victim = 0usize;
+        let mut oldest = u32::MAX;
+        for (i, s) in c.slots.iter().enumerate() {
+            if s.used_at < oldest {
+                oldest = s.used_at;
+                victim = i;
+            }
+        }
+        c.slots[victim] = CachePage { vol, lba, used_at: now, valid: true, data: buf };
+        c.evicted += 1;
+    }
+    Ok(())
+}
+
+/// `(命中, 未命中, 淘汰)` 累计（判据用）。
+pub fn cache_stats() -> (u32, u32, u32) {
+    let _g = CACHE_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let c = unsafe { &*PAGES.0.get() };
+    (c.hits, c.misses, c.evicted)
+}
+
+/// 已用槽数（判据用）。
+pub fn cache_used() -> usize {
+    let _g = CACHE_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let c = unsafe { &*PAGES.0.get() };
+    c.slots.iter().filter(|s| s.valid).count()
+}
+
+/// 清空页缓存（判据用）。
+pub fn cache_clear() {
+    let _g = CACHE_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let c = unsafe { &mut *PAGES.0.get() };
+    for s in c.slots.iter_mut() {
+        *s = CACHE_EMPTY;
+    }
+    c.clock = 0;
+    c.hits = 0;
+    c.misses = 0;
+    c.evicted = 0;
+}

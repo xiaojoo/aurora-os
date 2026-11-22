@@ -1915,3 +1915,123 @@ fn t_superblock() -> bool {
 
 #[cfg(feature = "handles")]
 ktest!(KT_SUPERBLOCK, t_superblock);
+
+/// ADR-218：**页缓存**的证人。
+///
+/// ## 要证什么
+///
+/// `read_disk` 逐扇区读，每次都要块 I/O。页缓存让「重复读同一扇区」不再碰盘。
+///
+/// ## 判据八格
+///
+/// 1. 首次读是**未命中**（`misses` 增长）；
+/// 2. **再读同一扇区是命中**（`hits` 增长，`misses` 不变）；
+/// 3. **内容正确**（缓存返回的字节与源一致）；
+/// 4. **不同卷的同 LBA 不串**（`(vol, lba)` 复合键）；
+/// 5. **表满时淘汰 LRU**（`evicted` 增长，且淘汰的是最久未用的）；
+/// 6. **命中时不碰设备**（用 `MemDisk` 的读取计数证明）；
+/// 7. `cache_used()` 与 `(未命中 - 淘汰)` 一致；
+/// 8. `cache_clear` 之后回零。
+///
+/// **负样本**：把命中判据里的 `vol` 比对去掉 ⇒ 第 4 格红。
+#[cfg(feature = "handles")]
+fn t_page_cache() -> bool {
+    use crate::filesystem::vfs_ro;
+    use crate::filesystem::vfs::SECTOR_BYTES;
+    let mut ok = true;
+    vfs_ro::cache_clear();
+
+    static mut IMG: [u8; 64 * 512] = [0u8; 64 * 512];
+    // SAFETY: 单核判据路径。
+    let img: &mut [u8] = unsafe { &mut *core::ptr::addr_of_mut!(IMG) };
+    for (i, b) in img.iter_mut().enumerate() {
+        *b = ((i / 512) as u8) ^ ((i % 512) as u8);
+    }
+    let disk = crate::filesystem::vfs::MemDisk { img };
+
+    // ① 首次未命中
+    let mut buf = [0u8; SECTOR_BYTES];
+    let r1 = vfs_ro::cached_read(&disk, 0xAA, 3, &mut buf);
+    let (h1, m1, _) = vfs_ro::cache_stats();
+    let miss_ok = r1.is_ok() && h1 == 0 && m1 == 1;
+    if !miss_ok {
+        crate::log_fatal!("cache: 首次未命中不对 h={} m={}", h1, m1);
+        ok = false;
+    }
+
+    // ③ 内容正确（与源比对）
+    let content_ok = buf.iter().enumerate().all(|(i, b)| *b == img[3 * 512 + i]);
+    if !content_ok {
+        crate::log_fatal!("cache: 内容不对");
+        ok = false;
+    }
+
+    // ⑥ 命中时不碰设备（用读取计数证明）
+    let calls_before = crate::filesystem::vfs::memdisk_read_calls();
+    let r2 = vfs_ro::cached_read(&disk, 0xAA, 3, &mut buf);
+    let calls_after = crate::filesystem::vfs::memdisk_read_calls();
+    let (h2, m2, _) = vfs_ro::cache_stats();
+    let hit_ok = r2.is_ok() && h2 == 1 && m2 == 1 && calls_after == calls_before;
+    if !hit_ok {
+        crate::log_fatal!("cache: 命中不对 h={} m={} calls {}->{}",
+            h2, m2, calls_before, calls_after);
+        ok = false;
+    }
+
+    // ④ 不同卷的同 LBA 不串
+    let mut buf2 = [0u8; SECTOR_BYTES];
+    let r3 = vfs_ro::cached_read(&disk, 0xBB, 3, &mut buf2);
+    let (_, m3, _) = vfs_ro::cache_stats();
+    let distinct_ok = r3.is_ok() && m3 == 2 && vfs_ro::cache_used() == 2;
+    if !distinct_ok {
+        crate::log_fatal!("cache: 不同卷串了 m={} used={}", m3, vfs_ro::cache_used());
+        ok = false;
+    }
+
+    // ⑤ 表满淘汰 LRU
+    vfs_ro::cache_clear();
+    let mut b = [0u8; SECTOR_BYTES];
+    // 填满
+    for i in 0..vfs_ro::PAGE_CACHE_MAX {
+        let _ = vfs_ro::cached_read(&disk, 1, i as u64, &mut b);
+    }
+    let full = vfs_ro::cache_used() == vfs_ro::PAGE_CACHE_MAX;
+    // 再读一个新扇区 ⇒ 淘汰 LBA 0（最久未用）
+    let _ = vfs_ro::cached_read(&disk, 1, 30, &mut b); // 盘内合法（64 扇区）
+    let (_, _, ev) = vfs_ro::cache_stats();
+    // 读回 LBA 0：应当未命中（被淘汰了）
+    let (_, m_before, _) = vfs_ro::cache_stats();
+    let _ = vfs_ro::cached_read(&disk, 1, 0, &mut b);
+    let (_, m_after, _) = vfs_ro::cache_stats();
+    let lru_ok = full && ev == 1 && m_after == m_before + 1;
+    if !lru_ok {
+        crate::log_fatal!("cache: LRU 不对 full={} ev={} m {}->{}", full, ev, m_before, m_after);
+        ok = false;
+    }
+
+    // ⑦ used 与 (未命中 - 淘汰) 一致
+    let (_, mm, ee) = vfs_ro::cache_stats();
+    let used_ok = vfs_ro::cache_used() == (mm - ee) as usize;
+    if !used_ok {
+        crate::log_fatal!("cache: used 不对 used={} m={} e={}", vfs_ro::cache_used(), mm, ee);
+        ok = false;
+    }
+
+    // ⑧ clear
+    vfs_ro::cache_clear();
+    let (hc, mc, ec) = vfs_ro::cache_stats();
+    let clear_ok = vfs_ro::cache_used() == 0 && hc == 0 && mc == 0 && ec == 0;
+    if !clear_ok {
+        crate::log_fatal!("cache: clear 之后有残留 used={}", vfs_ro::cache_used());
+        ok = false;
+    }
+
+    crate::log_info!(
+        "cache: 首未中={} 内容={} 命中={} 不串={} LRU={} used一致={} clear={} ⇒ {}",
+        miss_ok, content_ok, hit_ok, distinct_ok, lru_ok, used_ok, clear_ok, ok
+    );
+    ok
+}
+
+#[cfg(feature = "handles")]
+ktest!(KT_PAGE_CACHE, t_page_cache);
