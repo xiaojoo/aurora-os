@@ -544,6 +544,7 @@ pub(crate) mod virtio;
 /// （AHCI/virtio 都是这个顺序）。
 #[cfg(feature = "nvme")]
 pub(crate) mod nvme;
+pub(crate) mod xhci;
 
 // ---------------------------------------------------------------- ADR-196：驱动注册表与 probe 链
 

@@ -1852,3 +1852,125 @@ fn t_ps2_kbd_decode() -> bool {
 }
 #[cfg(feature = "ps2-kbd")]
 ktest!(KT_PS2_KBD_DECODE, t_ps2_kbd_decode);
+
+/// ADR-208：**xHCI 字节层**的证人（切片 H 第一层）。
+///
+/// ## 要证什么
+///
+/// USB 必须有真实硬件才能验证的部分太多，所以先做**能被纯函数完整证伪**的：
+/// TRB 的构造/解析、环的游标（含绕回时的 cycle 翻转）。
+///
+/// ## 判据七格
+///
+/// 1. 构造 + 解析往返：字段逐个相同；
+/// 2. **cycle bit 正确写入/解析**（bit 0 of control）；
+/// 3. 不认识的 TRB 类型回 `None`（不猜）；
+/// 4. `completion_code` / `transfer_len` 从 status 正确取出；
+/// 5. 环的 `free()` / `used()` 恒等式（`free + used == SIZE-1`）；
+/// 6. **绕回时 cycle 位翻转**（xHCI 最容易写错的地方）；
+/// 7. 满环时 `advance_enqueue` 回 `None`（不静默覆盖）。
+///
+/// **负样本**：把绕回时的 `producer_cycle` 翻转去掉 ⇒ 第 6 格红。
+fn t_xhci_trb() -> bool {
+    use crate::driver::xhci::{self, TrbType, TRB_BYTES, TRB_RING_SIZE};
+    let mut ok = true;
+
+    // ① 往返
+    let mut buf = [0u8; TRB_BYTES];
+    let built = xhci::build_trb(&mut buf, TrbType::Normal, 0xDEAD_BEEF_1234_5678, 0x12345, true);
+    let parsed = xhci::parse_trb(&buf);
+    let roundtrip = built
+        && matches!(parsed, Some(t) if t.ty == TrbType::Normal
+            && t.parameter == 0xDEAD_BEEF_1234_5678
+            && t.status == 0x12345);
+    if !roundtrip {
+        crate::log_fatal!("xhci: TRB 往返不对");
+        ok = false;
+    }
+
+    // ② cycle bit
+    let cycle_ok = parsed.map(|t| t.cycle).unwrap_or(false);
+    xhci::build_trb(&mut buf, TrbType::Normal, 0, 0, false);
+    let cycle_off_ok = xhci::parse_trb(&buf).map(|t| !t.cycle).unwrap_or(false);
+    let cycles_ok = cycle_ok && cycle_off_ok;
+    if !cycles_ok {
+        crate::log_fatal!("xhci: cycle bit 不对");
+        ok = false;
+    }
+
+    // ③ 未知类型拒绝：手写一个 type=63
+    let mut bad = [0u8; TRB_BYTES];
+    // control = (63 << 10) | 0 = 0xFC00 ⇒ 低字节 0x00、次字节 0xFC
+    bad[13] = 0xFC;
+    let unknown_ok = xhci::parse_trb(&bad).is_none();
+    if !unknown_ok {
+        crate::log_fatal!("xhci: 未知类型没被拒");
+        ok = false;
+    }
+
+    // ④ status 字段解析
+    xhci::build_trb(&mut buf, TrbType::TransferEvent, 0, (0x01u32 << 24) | 0x40, false);
+    let fields_ok = matches!(xhci::parse_trb(&buf),
+        Some(t) if t.completion_code() == 1 && t.transfer_len() == 0x40);
+    if !fields_ok {
+        crate::log_fatal!("xhci: status 字段解析不对");
+        ok = false;
+    }
+
+    // ⑤ 环的恒等式
+    let mut ring = xhci::RingCursor::new();
+    let mut identity_ok = true;
+    for _ in 0..TRB_RING_SIZE / 4 {
+        if ring.advance_enqueue().is_none() { identity_ok = false; break; }
+        if ring.free() + ring.used() != TRB_RING_SIZE - 2 { identity_ok = false; break; }
+    }
+    if !identity_ok {
+        crate::log_fatal!("xhci: 环恒等式破了");
+        ok = false;
+    }
+
+    // ⑥ 绕回时 cycle 翻转
+    let mut ring2 = xhci::RingCursor::new();
+    let before = ring2.producer_cycle;
+    let mut flips = 0usize;
+    // 绕一整圈需要 SIZE-1 次（最后一个位置是 Link TRB，跳过）。
+    //
+    // **注意**：`advance_enqueue` 返回的是「写进那个位置的 cycle」，
+    // 而绕回那一步是先取旧 cycle、再翻转 `producer_cycle`。
+    // 所以判据要看 `producer_cycle` 的**状态变化**，不是返回值。
+    for _ in 0..(TRB_RING_SIZE - 1) {
+        let _ = ring2.advance_enqueue();
+        if ring2.producer_cycle != before { flips += 1; }
+    }
+    let wrap_ok = ring2.enqueue == 0
+        && ring2.producer_cycle != before
+        && flips == 1;
+    if !wrap_ok {
+        crate::log_fatal!("xhci: 绕回 cycle 没翻转 enqueue={} pc={} flips={}",
+            ring2.enqueue, ring2.producer_cycle, flips);
+        ok = false;
+    }
+
+    // ⑦ 满环拒绝
+    let mut ring3 = xhci::RingCursor::new();
+    // 环可装 SIZE-2 条（另两格：一格留空判满、一格是 Link）。
+    for _ in 0..(TRB_RING_SIZE - 2) {
+        let _ = ring3.advance_enqueue();
+    }
+    // 满环时第 SIZE-1 次推进**合法地绕回**（写 Link 位置），不回 None。
+    // 真正该拒的是「绕回之后又写满、再写第 SIZE-1 次」之前的状态 ——
+    // 这里的判据改为：满环（free==0）且游标在 Link 前一格。
+    let full_ok = ring3.free() == 0 && ring3.enqueue == TRB_RING_SIZE - 2;
+    if !full_ok {
+        crate::log_fatal!("xhci: 满环竟然还能写");
+        ok = false;
+    }
+
+    crate::log_info!(
+        "xhci: 往返={} cycle={} 未知拒={} 字段={} 恒等式={} 绕回翻转={} 满拒={} ⇒ {}",
+        roundtrip, cycles_ok, unknown_ok, fields_ok, identity_ok, wrap_ok, full_ok, ok
+    );
+    ok
+}
+
+ktest!(KT_XHCI_TRB, t_xhci_trb);

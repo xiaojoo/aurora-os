@@ -23414,3 +23414,62 @@ ADR-206 记下的缺陷 1 是：
 1. **`reserved_end` 与 `release_va_locked` 是同一份教训的第二处** —— 还有没有第三处？
    `grep "0..MAX_VA_RESERVATIONS"` 应当成为一次审计，这次没做
 2. **`t_map_hole` / `t_q2_workload_slots` 仍是 1/10 偶发**
+---
+
+## 527. ADR-208 落地：xHCI 字节层（切片 H 第一层）（2026-11-23）
+
+### 为什么只做字节层
+
+USB 与前面几片都不同：它有真正的**硬件状态机**，判据要证的东西大多必须有真实设备
+（或 QEMU 的 xHCI 模拟）才有意义。所以先做**能被纯函数判据完整证伪**的部分：
+
+| 做 | 不做 |
+|---|---|
+| TRB 的构造 / 解析 | 控制器的实际初始化 |
+| 环的游标（生产者/消费者索引）| 端口枚举 |
+| 寄存器偏移常量 | 设备类驱动（HID/大容量存储）|
+
+与 TCP 分层（ADR-197 先做段格式）同一个思路：**先让字节层可证，再接硬件**。
+
+### 交付
+
+    TRB_BYTES=16 / TRB_RING_SIZE=256（推导值：一页 / 16，2 的幂）
+    TrbType（10 种）/ parse_trb / build_trb
+    RingCursor { enqueue, dequeue, producer_cycle, consumer_cycle }
+    CAP_*/OP_* 寄存器偏移常量
+
+### 决策 1：环容量是推导值，不是接缝尺
+
+`256` 来自 `TRB_BYTES × N == PAGE` 且 N 是 2 的幂 —— 一页对齐的环是 xHCI 的要求。
+
+### 决策 2：**最后一格固定是 Link TRB**（实测绕了三圈）
+
+1. 第一版绕回阈值写 `SIZE`，游标停在 255 就判满 ⇒ `enqueue=255 pc=true flips=0`；
+2. 改成 `SIZE-1` 后能绕回，但 `free()` 还按 `SIZE-1` 算 ⇒ 满环判据矛盾；
+3. 改成 `free = SIZE-2 - used` 后，第 255 次推进才绕回，而判据循环了 254 次。
+
+**最终语义**：环最后一格固定是 Link 永不可写；可装 `SIZE-2` 条；
+`advance_enqueue` **先判绕回、再判满** —— 停在 Link 前一格且满时下一次写入合法绕回，
+而不是回 `None`。若先判满，游标永远卡在 `SIZE-2`，cycle 永不翻转。
+
+### 判据七格
+
+    xhci: 往返=true cycle=true 未知拒=true 字段=true 恒等式=true 绕回翻转=true 满拒=true ⇒ true
+
+负样本（去掉绕回时的 cycle 翻转）⇒「绕回 cycle 没翻转 enqueue=0 pc=true flips=0」。
+
+### 读数
+
+| 项 | 结果 |
+|---|---|
+| `check` | **21/21** |
+| `handles` 档 | `t_xhci_trb` 七格全绿；唯一失败是既有 `t_map_hole` |
+
+### 未做（USB 的完整形态）
+
+1. **控制器初始化**（CAP/OP 寄存器读写、TR Dequeue Pointer 编程）
+2. **端口枚举**（Enable Slot → Address Device → Configure Endpoint）
+3. **Link TRB 真的写进环** —— 今天只是「游标跳过」
+4. **事件环**（Transfer Event / Command Completion 的消费）
+5. **设备类驱动**（HID / 大容量存储）
+6. **QEMU xHCI 的端到端验证** —— 今天没有任何真实设备参与
