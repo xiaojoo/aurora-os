@@ -818,6 +818,16 @@ fn t_fat32_exec() -> bool {
     // P7 ⑤：装载器给**这个容器**授予 READ|DUP 句柄，指向它自己那份镜像。
     // 身份按 spawn 返回的 gidx 查两格（gidx + Task::id）——不是启动上下文自己的身份；
     // 把句柄写进容器的 `.slots`，与 `flag` 一起在它被换上来之前写好（定时器还没开）。
+    // **先把它停住再写槽**（ADR-190 实测）：`spawn_user` 建完就是 `Runnable`，
+    // 不是 `Blocked`。若此刻定时器在跑，它**立刻就能被换上来读 flag**，
+    // 而我们下面还要 `grant_file`（磁盘 IO，几十行代码）才写 `FLAG_HANDLE`。
+    //
+    // 实测症状：`h_magic=Some(0) h_done=Some(0) 表清空=false`（句柄段整个没跑），
+    // 而基础序列全对 —— 因为基础序列不依赖 flag，只有句柄段依赖。
+    // 失败率 81%（943/1158），正是「谁先跑到」的概率。
+    let tid = crate::sched::id_of(t);
+    let token = crate::sync::WaitToken { queue: 15, seq: ((t as u64) << 32) | u64::from(tid) };
+    let _ = crate::sched::block_task(t, token);
     let ring3_h = match crate::sched::identity_of(t) {
         Some(ident) => {
             let hc = match vol.open_cursor("HELLO.ELF") {
@@ -859,6 +869,8 @@ fn t_fat32_exec() -> bool {
     };
     // §199：收尾按原样放回（与 t_handle_reap 同一律）。本用例需要表走，所以照样开；
     // 旧写法无条件 stop，把表停给了后面所有用例（第二终端的前置条件，BACKLOG §198/§199）。
+    // **放行**：槽已经写好了，现在才让它跑（ADR-190）
+    crate::sched::wake_task(t, token);
     let tick_in = apic::ticks();
     crate::ktests::syscall::elf::fmark(31);
     let timer_was_running =

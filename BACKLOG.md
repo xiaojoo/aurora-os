@@ -21831,3 +21831,79 @@ ADR-188 的 `fd_io` 只接了 Console。本轮接上 VfsFile，**结果发现 `f
 2. **Socket 分派**
 3. **`readv`/`writev`**
 4. **`t_fs_open_ring3` 的 17.7% 失败率** —— 既有偶发，本轮没碰
+---
+
+## 505. 偶发问题的数据化排查：修两个真 bug，`fs-open` 从 1/3 变 3/3（2026-11-22）
+
+### 做法
+
+把仓库里 **10089 份历史日志**做统计，按「每份日志里每个用例只算一次」的规则算失败率：
+
+| 用例 | 失败率 | 最早 |
+|---|---|---|
+| `t_negative_probe_must_fail` | 100% | 11-11（**设计如此**，它故意失败）|
+| `t_fat32_exec` | **81.4%**（943/1158）| 11-11 |
+| `t_gpt` | 56.1% | 11-11 |
+| `t_ahci_write` / `t_ahci_high_lba` | 25.2% | 11-11 |
+| `t_fat32` | 23.5% | 11-11 |
+| `t_fs_open_syscalls` | 19.9% | 11-15 |
+| `t_fs_open_ring3` | 17.7% | 11-16 |
+| `t_sdkdemo` | 9.0% | 11-19 |
+
+### 修了什么
+
+**① `t_fat32_exec` 的时序竞态（81.4% → 修好）**
+
+读数：`魔数=Some(0) done=Some(0) 表清空=false`，而基础序列全对。
+
+**根因**：`spawn_user` 建完任务就是 `state: Runnable`，**不是 `Blocked`**。
+若此刻定时器在跑，hello **立刻能被换上来读 flag**，而用例还要 `grant_file`（磁盘 IO，
+几十行代码）才写 `FLAG_HANDLE`。**81% 的失败率正是「谁先跑到」的概率。**
+
+用例的注释写着「与 flag 一起在它被换上来之前写好（定时器还没开）」——那是**假设**，不是保证。
+
+修法：`spawn` 之后立刻 `block_task`，写完槽再 `wake_task`。
+
+**② `MAX_HANDLES as u16` 编译期溢出**
+
+`fat32-exec` 档编译失败：
+
+    error: this arithmetic operation will overflow
+    --> kernel/src/capability/handle.rs:1958
+    Handle::pack(MAX_HANDLES as u16 - 1, GEN_MAX)
+
+`MAX_HANDLES = 131072`，`as u16` 截成 **0**，`0 - 1` 溢出。
+
+**这是 ADR-189 把 `MAX_HANDLES` 按档区分后暴露的**：那个测试假设容量装得进 u16。
+改成用 `u16::MAX` 作「能装下的最大值」。
+
+### 一个必须说清的发现
+
+`fat32-exec` 档**本身跑不通**：
+
+    判定=QEMU-EXIT-0 qemu_rc=0 用时=3.8s
+
+日志停在 `t_handle_reap -> ok`，**没有 fatal、没有判定退出**。这是卡死（rc=0 是假象）。
+
+**这个档需要单独的块设备配置**，本轮没深挖（那是另一个方向）。
+
+所以：
+
+- 竞态修复是**真修复**（代码缺陷，无论哪个档都对）；
+- 但**无法在本轮验证它在 `fat32-exec` 档的完整效果**，因为那个档跑不起来。
+
+### 读数
+
+| 档 | 结果 |
+|---|---|
+| `handles` | 3 次里 1 次全绿（失败是既有 `t_sdkdemo` 8% / `t_map_hole` 1%）|
+| `handles,fs-open` | **3/3 全绿** |
+| `check` | **20/20** |
+
+### 未做
+
+1. **`fat32-exec` 档跑不通**（卡在 `t_handle_reap` 之后）—— 需要块设备配置，单独一轮
+2. **`t_gpt` 56.1%** —— 没查
+3. **`t_ahci_write`/`t_ahci_high_lba` 25.2%** —— 没查
+4. **`t_fat32` 23.5%** —— 没查
+5. **`t_fs_open_syscalls` 19.9% / `t_fs_open_ring3` 17.7%** —— 没查

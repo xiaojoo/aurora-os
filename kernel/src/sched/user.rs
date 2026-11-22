@@ -3602,7 +3602,10 @@ fn file_read_h(h: crate::handle::Handle, uptr: u64, want: usize) -> u64 {
                     // 中途写用户内存失败：**不提交游标**（重试会重新交付这几字节）。
                     BAD_PTRS.fetch_add(1, Ordering::Relaxed);
                     crate::handle::abort(ticket);
-                    crate::log_info!("abi: file_read 写用户缓冲失败，游标未提交");
+                    crate::log_info!(
+                    "abi: file_read 写用户缓冲失败，游标未提交（目标 va={:#x} 长度={} done={}）",
+                    uptr + done as u64, n, done
+                );
                     return E_FAULT;
                 }
             },

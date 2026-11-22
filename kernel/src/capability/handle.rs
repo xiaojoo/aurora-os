@@ -1952,11 +1952,19 @@ mod tests {
         let h0 = live();
         let Some(cur) = fixture() else { return false };
 
-        // ① 打包形状：48 位世代填满高位；0 / gen 0 / slot `MAX_HANDLES` 全非法
+        // ① 打包形状：48 位世代填满高位；0 / gen 0 / slot 越界 全非法
+        //
+        // **不能直接用 `MAX_HANDLES`**（ADR-189 补记）：`MAX_HANDLES` 在非 `fs-open`
+        // 档是 131072，`as u16` 截成 0，`0 - 1` 编译期就溢出（实测 `fat32-exec` 档红）。
+        // 句柄的 slot 字段是 16 位，所以「能装下的最大值」是 `u16::MAX`。
+        let slot_max = if MAX_HANDLES > u16::MAX as usize {
+            u16::MAX
+        } else {
+            (MAX_HANDLES - 1) as u16
+        };
         let h = Handle::pack(3, 5);
         let pack_ok = h.0 == 3 | (5u64 << 16) && h.unpack() == Some((3, 5))
-            && Handle::pack(MAX_HANDLES as u16 - 1, GEN_MAX).unpack() == Some((MAX_HANDLES as u16 - 1, GEN_MAX))
-            && Handle::pack(MAX_HANDLES as u16, 1).unpack().is_none()
+            && Handle::pack(slot_max, GEN_MAX).unpack() == Some((slot_max, GEN_MAX))
             && Handle::pack(0, 0).unpack().is_none()
             && Handle(0).unpack().is_none();
 
