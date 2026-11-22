@@ -423,6 +423,8 @@ pub struct OpenSpinLock<T> {
 /// `OpenSpinLock` 的 guard：**不还原中断标志**（因为从来没关过）。
 pub struct OpenGuard<'a, T: Send> {
     lock: &'a OpenSpinLock<T>,
+    /// 取锁前的 `INNERMOST`，Drop 时**还原成它**（不是无条件清 0）。
+    prev_rank: u8,
 }
 
 impl<T: Send> OpenSpinLock<T> {
@@ -439,26 +441,29 @@ impl<T: Send> OpenSpinLock<T> {
     pub fn lock(&self) -> OpenGuard<'_, T> {
         ACQUIRES.fetch_add(1, Ordering::Relaxed);
         let slot = crate::arch::x86_64::cpu::self_slot();
-        let token = cpu_token();
-        let t0 = crate::tsc::now();
-        let outer = INNERMOST[slot].swap(self.rank.0, Ordering::Relaxed);
-        if outer >= self.rank.0 {
-            crate::log_fatal!("L4 sync: 锁序违规，外层 rank={} 本次 rank={}", outer, self.rank.0);
-            crate::exit::finish(crate::exit::Code::ExceptionFatal);
-        }
+        let _ = cpu_token();
         let mut spins = 0u64;
         loop {
             if self.locked.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
                 break;
             }
-            let _ = (spins, t0, token);
             spins += 1;
             // **不做超时判**（如实记）：`IrqSpinLock` 有那套（等锁超时升 L4），
             // 这里省掉是因为块传输的自旋由设备保证有界（PxCI 一定落定或超时返回）。
             // 若将来发现某块盘会永久不落定，这里要补回来。
             core::hint::spin_loop();
         }
-        OpenGuard { lock: self }
+        // **INNERMOST 记账必须在 CAS 成功之后**（实测）：
+        // 第一版在 CAS 之前 swap，竞争失败时不会还原 ⇒ 下一次取同一把锁看到
+        // `外层 rank=37 本次 rank=37` ⇒ L4 崩溃（实测 EXCEPTION(39)）。
+        // 另外 `prev_rank != 0` 那一格：0 表示「没有外层锁」，不是违规。
+        let prev_rank = INNERMOST[slot].swap(self.rank.0, Ordering::Relaxed);
+        if self.rank.0 <= prev_rank && prev_rank != 0 {
+            ORDER_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
+            crate::log_fatal!("L4 sync: 锁序违规，外层 rank={} 本次 rank={}", prev_rank, self.rank.0);
+            crate::exit::finish(crate::exit::Code::ExceptionFatal);
+        }
+        OpenGuard { lock: self, prev_rank }
     }
 }
 
@@ -472,13 +477,17 @@ impl<T: Send> OpenGuard<'_, T> {
 impl<T: Send> Drop for OpenGuard<'_, T> {
     fn drop(&mut self) {
         let slot = crate::arch::x86_64::cpu::self_slot();
-        INNERMOST[slot].store(self.lock.rank.0, Ordering::Relaxed);
+        INNERMOST[slot].store(self.prev_rank, Ordering::Relaxed);
         self.lock.locked.store(0, Ordering::Release);
     }
 }
 // SAFETY: `data` 只能在持有 `locked` 时访问，因此 T: Send 即可跨线程共享。
 // 注意这只覆盖"互斥"，不覆盖 M3b 的多核 TLB/内存序问题（那需要 §6.6 的 shootdown）。
 unsafe impl<T: Send> Sync for IrqSpinLock<T> {}
+/// SAFETY: 与 `IrqSpinLock` 同一理由 —— `locked` 是原子量；`data` 只在 `OpenGuard`
+/// 存活期间通过 `get(&mut self)` 可变访问，而同一时刻只有一个 guard（互斥由 `locked` 保证）。
+unsafe impl<T: Send> Sync for OpenSpinLock<T> {}
+
 
 #[must_use = "丢弃守卫会立即释放锁，等于什么都没锁（§7.1 R16）"]
 pub struct IrqGuard<'a, T: Send> {

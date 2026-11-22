@@ -137,6 +137,20 @@ pub struct Socket {
     used: AtomicU32,
     /// 世代号：槽复用后旧句柄必须失配（与 `Proc`/`Job` 同律）。
     gen: AtomicU32,
+    /// **名字引用数**（ADR-192）：`dup` 加一、`close` 减一，**减到 0 才销毁本体**。
+    ///
+    /// ## 为什么必须有
+    ///
+    /// 第一版 `sys_sock_close` 无条件 `destroy`，于是：
+    ///
+    /// ```
+    /// fd1 = socket(); fd2 = dup(fd1);
+    /// close(fd2);       // ← 本体被销毁
+    /// send(fd1, ...);   // ← 这条还活着的名字悬空
+    /// ```
+    ///
+    /// POSIX 语义是「`close` 减引用，最后一条关上才销毁」。
+    refs: AtomicU32,
     domain: u16,
     ty: u16,
     /// 本地端点（`bind` 之后有效）。
@@ -153,6 +167,7 @@ pub struct Socket {
 const SOCK_EMPTY: Socket = Socket {
     used: AtomicU32::new(0),
     gen: AtomicU32::new(0),
+    refs: AtomicU32::new(0),
     domain: 0,
     ty: 0,
     local: SockAddr::V4 { ip: [0; 4], port: 0 },
@@ -207,8 +222,62 @@ pub fn create(domain: u16, ty: u16) -> Result<(u16, u32), u64> {
     s.rx_head.store(0, Ordering::Relaxed);
     s.rx_tail.store(0, Ordering::Relaxed);
     s.rx_count.store(0, Ordering::Relaxed);
+    // **出生时一条名字**（ADR-192）：`dup` 加、`close` 减，减到 0 才销毁。
+    s.refs.store(1, Ordering::Release);
     s.used.store(1, Ordering::Release);
     Ok((slot as u16, s.gen.load(Ordering::Acquire)))
+}
+
+/// 给 socket **加一条名字引用**（`dup` 时调，ADR-192）。
+///
+/// `gen` 不符（槽已复用）⇒ `false`，调用方必须把它当成「对象不在了」。
+pub fn sock_ref(slot: u16, gen: u32) -> bool {
+    let mut g = TABLE.lock();
+    let t = g.get();
+    let Some(s) = t.slots.get_mut(slot as usize) else { return false };
+    if s.used.load(Ordering::Acquire) == 0 || s.gen.load(Ordering::Acquire) != gen {
+        return false;
+    }
+    s.refs.fetch_add(1, Ordering::AcqRel);
+    true
+}
+
+/// 给 socket **减一条名字引用**；**减到 0 才真的销毁本体**（ADR-192）。
+///
+/// 返回 `true` = 本体已销毁；`false` = 还有别的名字活着，或 `gen` 不符。
+///
+/// **这就是 POSIX 的 `close` 语义**：第一版无条件 `destroy`，`dup` 之后关一条就把
+/// 本体撤了，另一条名字悬空（实测 `sockref` 用例抓到）。
+pub fn sock_unref(slot: u16, gen: u32) -> bool {
+    let mut g = TABLE.lock();
+    let t = g.get();
+    let Some(s) = t.slots.get_mut(slot as usize) else { return false };
+    if s.used.load(Ordering::Acquire) == 0 || s.gen.load(Ordering::Acquire) != gen {
+        return false;
+    }
+    let prev = s.refs.fetch_sub(1, Ordering::AcqRel);
+    if prev > 1 {
+        return false; // 还有别的名字活着
+    }
+    // 最后一条：真的销毁
+    s.refs.store(0, Ordering::Release);
+    s.used.store(0, Ordering::Release);
+    s.rx_head.store(0, Ordering::Relaxed);
+    s.rx_tail.store(0, Ordering::Relaxed);
+    s.rx_count.store(0, Ordering::Relaxed);
+    true
+}
+
+/// 当前名字引用数（判据用）。
+pub fn sock_refs(slot: u16, gen: u32) -> u32 {
+    let mut g = TABLE.lock();
+    let t = g.get();
+    match t.slots.get(slot as usize) {
+        Some(s) if s.used.load(Ordering::Acquire) != 0 && s.gen.load(Ordering::Acquire) == gen => {
+            s.refs.load(Ordering::Acquire)
+        }
+        _ => 0,
+    }
 }
 
 /// 销毁一个 socket。`gen` 不符 ⇒ `false`（槽已被复用，不是当初那个）。

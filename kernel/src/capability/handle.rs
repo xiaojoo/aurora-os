@@ -1553,8 +1553,18 @@ pub fn dup(h: Handle, owner: (usize, u32), new_rights: u32) -> Result<Handle, HE
             }
         }
     };
+    // **VMO 与 Socket 都要加对象级引用**（ADR-192）：它们的本体住在旁表里，
+    // 句柄只是名字。`dup` 之后两条名字共享一个本体，`close` 减到 0 才销毁。
+    //
+    // 加引用必须在**锁外**（`sock_ref` 要取 `RANK_NET(36)`，在 HANDLE(35) 里取就是
+    // 正向嵌套但会让持锁时间变长；更重要的是提交失败要能退回）。
     if let ObjRef::Vmo { slot } = obj {
         if crate::vmo::vmo_ref(crate::vmo::VmoId::from_slot(slot)).is_err() {
+            return Err(HErr::NoSuch);
+        }
+    }
+    if let ObjRef::Socket { slot, gen } = obj {
+        if !crate::network::socket::sock_ref(slot, gen) {
             return Err(HErr::NoSuch);
         }
     }
@@ -1565,6 +1575,9 @@ pub fn dup(h: Handle, owner: (usize, u32), new_rights: u32) -> Result<Handle, HE
     if r.is_err() {
         if let ObjRef::Vmo { slot } = obj {
             crate::vmo::vmo_unref(crate::vmo::VmoId::from_slot(slot));
+        }
+        if let ObjRef::Socket { slot, gen } = obj {
+            let _ = crate::network::socket::sock_unref(slot, gen);
         }
     }
     r

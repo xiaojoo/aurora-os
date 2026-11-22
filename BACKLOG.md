@@ -22199,3 +22199,76 @@ Linux 对比里排第 3 的「句柄/文件表语义」，拆成三小片：本�
 3. **`revoke_task` 按进程清**（现在仍按任务清）
 4. **`t_irq_ahci` 的时序问题**（ADR-190 锁粒度遗留）
 5. **切片 C/D/E**：VMA 归属、块层队列、VFS 三层
+---
+
+## 510. ADR-192 落地：对象引用计数（socket 的 close 减引用）（2026-11-22）
+
+### 五样对象化，第二片（B）
+
+**第一步不是动手，是先测量现状** —— 引用计数在仓库里**不统一**：
+
+| 对象 | 有引用计数吗 | 谁管 |
+|---|---|---|
+| VMO | **有**（`refs: u16`）| `vmo_ref`/`vmo_unref` |
+| File / VfsFile | **有**（共享游标格子）| `cell_retain`/`cell_release` |
+| **Socket** | **没有** | `sys_sock_close` 无条件 `destroy` |
+| Console | 不需要（内核静态对象）| — |
+
+### Socket 缺为什么致命
+
+    fd1 = socket()
+    fd2 = dup(fd1)
+    close(fd2)       // ← 本体被销毁
+    send(fd1, ...)   // ← 这条还活着的名字悬空
+
+`sys_sock_close` 里那句 `destroy(slot, gen)` **无条件**执行。
+
+### 交付
+
+`Socket` 加 `refs: AtomicU32`；`sock_ref`/`sock_unref`/`sock_refs`；
+`dup` 里 Socket 与 VMO 同一位置加引用（都是「本体住旁表、句柄只是名字」）。
+
+### 判据七格
+
+    sockref: 基线=0 dup两条=true 关二后一可用=true 本体在=true
+             关二没销毁=true refs=1 关一后本体没了=true 收场=0 ⇒ true
+
+**`refs=1` 是关键读数**：关掉第二条后引用数从 2 减到 1，本体仍在。
+
+### 负样本（变异证红）
+
+把 `if prev > 1` 改成 `if false && prev > 1`：
+
+    sockref: 关第二条就把本体销毁了（引用计数没生效）
+    sockref: 关第二条之后第一条失效 closed2=true h1可用=true 本体在=false
+
+**FAIL(35)。**
+
+### 三个实测撞出来的坑
+
+**① 测试只调 `handle::close`，永远测不到引用计数**
+
+`sys_sock_close` 是「`handle::close` + `sock_unref`」两步。第一版只调第一步 ⇒
+`本体没了=false` —— 那是**测试的错**，不是实现的错。
+
+**② `OpenSpinLock` 的 `INNERMOST` 记账在 CAS 之前**
+
+竞争失败时不还原 ⇒ 下次取同一把锁看到 `外层 rank=37 本次 rank=37` ⇒ **EXCEPTION(39)**。
+修法：记账移到 CAS **成功之后**，判据排除 `prev_rank == 0`；`OpenGuard` 记住 `prev_rank`
+并在 Drop 时**还原成它**（不是无条件清 0）。
+
+**③ `OpenSpinLock` 缺 `Sync`** —— 照 `IrqSpinLock` 补 `unsafe impl Sync` + SAFETY 注释。
+
+### 读数
+
+| 项 | 结果 |
+|---|---|
+| `check` | **20/20** |
+| `handles` 档 | 4 次跑 **3 次全绿（111/111）**，唯一失败是既有 `t_sdkdemo`（8.9%）|
+
+### 未做
+
+1. **`File`/`VfsFile` 的 `cell_*` 管的是共享游标，不是对象本身** —— 语义要单独审
+2. **`revoke_task` 不调 `sock_unref`** —— 任务被杀时它装的 socket 名字不减引用
+3. **`close_on_exec`** 仍未做
+4. **切片 C/D/E**：VMA 归属、块层队列、VFS 三层

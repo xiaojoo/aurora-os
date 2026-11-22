@@ -1715,3 +1715,216 @@ fn t_handle_proc_owner() -> bool {
 // NEGATIVE SAMPLE: 暂时不收集，看 t_irq_ahci 是否恢复
 #[cfg(feature = "handles")]
 ktest!(KT_HANDLE_PROC_OWNER, t_handle_proc_owner);
+
+/// ADR-192：**对象引用计数**的证人（切片 B）。
+///
+/// ## 要证什么
+///
+/// `close` 的 POSIX 语义是「**减少一个引用**」，最后一个引用消失时才销毁对象。
+/// 今天的实现里：
+///
+/// - File/VfsFile：`cell_release` 管的是**共享游标**，不是对象本身；
+/// - VMO：`vmo_unref` 管的是**帧引用**，那个有计数；
+/// - Console / Socket / 其它：**没有对象级计数**。
+///
+/// 本用例先**测量现状**：dup 出两个名字、关掉一个，另一个还能不能用。
+///
+/// ## 判据
+///
+/// 1. `dup` 之后两条名字都可用；
+/// 2. 关掉第一条之后，第二条**仍可用**（这是 POSIX 语义）；
+/// 3. 关掉第二条之后，对象真的失效；
+/// 4. `live()` 回到进来时的基线（不多不少）。
+///
+/// 若第 2 格红 ⇒ 说明「关一条名字就把对象撤了」，那就是本轮要修的。
+#[cfg(feature = "handles")]
+fn t_handle_refcount() -> bool {
+    use crate::handle::{self, RIGHT_READ, RIGHT_DUP};
+    let mut ok = true;
+    let Some(me) = crate::sched::current_identity() else {
+        crate::log_fatal!("refcnt: 拿不到身份");
+        return false;
+    };
+    let h0 = handle::live();
+
+    // 建一个 Console 句柄（带 DUP 权限，才能 dup）
+    let h1 = match handle::grant_console(me, RIGHT_READ | RIGHT_DUP, 0) {
+        Ok(h) => h,
+        Err(_) => {
+            crate::log_fatal!("refcnt: grant_console 失败");
+            return false;
+        }
+    };
+    let after_grant = handle::live();
+
+    // ① dup 出第二条名字
+    let h2 = match handle::dup(h1, me, RIGHT_READ) {
+        Ok(h) => h,
+        Err(e) => {
+            crate::log_fatal!("refcnt: dup 失败 {:?}", e);
+            return false;
+        }
+    };
+    let both_ok = handle::resolve(h1, me, RIGHT_READ).is_ok()
+        && handle::resolve(h2, me, RIGHT_READ).is_ok();
+    if !both_ok {
+        crate::log_fatal!("refcnt: dup 之后不是两条都能用");
+        ok = false;
+    }
+
+    // ② **关掉第一条，第二条必须仍可用**（POSIX 语义）
+    let closed1 = handle::close(h1, me).is_ok();
+    let h2_still = handle::resolve(h2, me, RIGHT_READ).is_ok();
+    if !closed1 || !h2_still {
+        crate::log_fatal!(
+            "refcnt: 关第一条之后第二条失效了 closed1={} h2可用={}",
+            closed1, h2_still
+        );
+        ok = false;
+    }
+
+    // ③ 关掉第二条，两条都该失效
+    let closed2 = handle::close(h2, me).is_ok();
+    let both_dead = handle::resolve(h1, me, RIGHT_READ).is_err()
+        && handle::resolve(h2, me, RIGHT_READ).is_err();
+    if !closed2 || !both_dead {
+        crate::log_fatal!("refcnt: 关第二条之后还有活的 closed2={} 都失效={}", closed2, both_dead);
+        ok = false;
+    }
+
+    // ④ 收场回基线
+    let base_ok = handle::live() == h0;
+    if !base_ok {
+        crate::log_fatal!("refcnt: 收场没回基线 live={} 基线={}", handle::live(), h0);
+        ok = false;
+    }
+    crate::log_info!(
+        "refcnt: 授予后={} dup两条都可用={} 关一条后第二条={} 关两条后都失效={} live={}->{} ⇒ {}",
+        after_grant, both_ok, h2_still, both_dead, h0, handle::live(), ok
+    );
+    ok
+}
+
+#[cfg(feature = "handles")]
+ktest!(KT_HANDLE_REFCOUNT, t_handle_refcount);
+
+/// ADR-192：**Socket 的 dup/close 引用计数**（切片 B 的核心）。
+///
+/// ## 要证什么
+///
+/// `socket()` 返回 fd，`dup` 能出第二条名字。今天的 `sys_sock_close` 会**直接**
+/// `socket::destroy`，于是：
+///
+/// ```
+/// fd1 = socket()
+/// fd2 = dup(fd1)
+/// close(fd2)      // ← 这里就把 socket 本体销毁了
+/// send(fd1, ...)  // ← 于是这条还活着的名字失效了
+/// ```
+///
+/// POSIX 语义：`close` 只减引用，最后一条关上才销毁。
+///
+/// ## 判据四格
+///
+/// 1. `dup` 之后两条名字都指向同一个 socket 槽；
+/// 2. 关掉第二条之后，**第一条仍能操作**（这是本轮要修的）；
+/// 3. 关掉第一条之后，socket 槽真的被销毁；
+/// 4. 收场干净（socket 计数回基线）。
+#[cfg(feature = "handles")]
+fn t_socket_refcount() -> bool {
+    use crate::network::socket;
+    let mut ok = true;
+    let Some(me) = crate::sched::current_identity() else {
+        crate::log_fatal!("sockref: 拿不到身份");
+        return false;
+    };
+    let base = socket::used();
+
+    // 建一个 socket + 一条句柄
+    let (slot, gen) = match socket::create(socket::AF_INET, socket::SOCK_DGRAM) {
+        Ok(v) => v,
+        Err(_) => {
+            crate::log_fatal!("sockref: create 失败");
+            return false;
+        }
+    };
+    let h1 = match crate::handle::grant_socket(
+        me,
+        slot,
+        gen,
+        crate::handle::RIGHT_READ | crate::handle::RIGHT_WRITE | crate::handle::RIGHT_DUP,
+    ) {
+        Ok(h) => h,
+        Err(_) => {
+            crate::log_fatal!("sockref: grant 失败");
+            let _ = socket::destroy(slot, gen);
+            return false;
+        }
+    };
+
+    // ① dup 出第二条
+    let h2 = match crate::handle::dup(h1, me, crate::handle::RIGHT_READ) {
+        Ok(h) => h,
+        Err(e) => {
+            crate::log_fatal!("sockref: dup 失败 {:?}", e);
+            let _ = crate::handle::close(h1, me);
+            let _ = socket::destroy(slot, gen);
+            return false;
+        }
+    };
+    let both = crate::handle::resolve(h1, me, 0).is_ok()
+        && crate::handle::resolve(h2, me, 0).is_ok();
+    if !both {
+        crate::log_fatal!("sockref: dup 之后不是两条都可用");
+        ok = false;
+    }
+
+    // ② **关掉第二条，第一条必须仍能操作 socket**
+    let closed2 = crate::handle::close(h2, me).is_ok();
+    // 第二条名字：减引用但**不销毁**（还有 h1 活着）
+    let destroyed2 = socket::sock_unref(slot, gen);
+    let refs_after2 = socket::sock_refs(slot, gen);
+    let h1_still = crate::handle::resolve(h1, me, crate::handle::RIGHT_WRITE).is_ok();
+    // 关键：socket 本体必须还在（不是只看句柄在）
+    let body_alive = socket::live(slot, gen);
+    // **第二条关上不该销毁本体**（`destroyed2` 必须是 false）
+    if destroyed2 {
+        crate::log_fatal!("sockref: 关第二条就把本体销毁了（引用计数没生效）");
+        ok = false;
+    }
+    if !closed2 || !h1_still || !body_alive {
+        crate::log_fatal!(
+            "sockref: 关第二条之后第一条失效 closed2={} h1可用={} 本体在={}",
+            closed2, h1_still, body_alive
+        );
+        ok = false;
+    }
+
+    // ③ 关掉第一条：**减引用到 0，本体才该销毁**
+    //
+    // 这里显式调 `sock_unref`，因为 `sys_sock_close` 做的就是「handle::close +
+    // sock_unref」两步。第一版测试只调了 `handle::close`，于是永远测不到引用计数
+    // （`本体没了=false` 是**测试的错**，不是实现的错）。
+    let closed1 = crate::handle::close(h1, me).is_ok();
+    let destroyed = socket::sock_unref(slot, gen);
+    let body_gone = destroyed && !socket::live(slot, gen);
+    if !closed1 || !body_gone {
+        crate::log_fatal!("sockref: 关第一条之后本体还在 closed1={} 本体没了={}", closed1, body_gone);
+        ok = false;
+    }
+
+    // ④ 收场
+    let base_ok = socket::used() == base;
+    if !base_ok {
+        crate::log_fatal!("sockref: 收场 socket 计数没回基线 {} vs {}", socket::used(), base);
+        ok = false;
+    }
+    crate::log_info!(
+        "sockref: 基线={} dup两条={} 关二后一可用={} 本体在={} 关二没销毁={} refs={} 关一后本体没了={} 收场={} ⇒ {}",
+        base, both, h1_still, body_alive, !destroyed2, refs_after2, body_gone, socket::used(), ok
+    );
+    ok
+}
+
+#[cfg(feature = "handles")]
+ktest!(KT_SOCKET_REFCOUNT, t_socket_refcount);

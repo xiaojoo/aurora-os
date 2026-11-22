@@ -3215,11 +3215,14 @@ fn sys_sock_close(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
         Ok(v) => v,
         Err(e) => return e,
     };
-    // 先撤名字（close 的语义），再销毁本体
+    // 先撤名字（close 的语义），再**减引用**
     if let Err(e) = crate::handle::close(h, owner) {
         return handle_err(e);
     }
-    crate::network::socket::destroy(slot, gen);
+    // **减引用，不是无条件销毁**（ADR-192）：`dup` 出两条名字时，关一条不该
+    // 把本体撤掉 —— 那样另一条名字就悬空了（实测 `sockref` 用例抓到）。
+    // 减到 0 才真的销毁，这是 POSIX 的 `close` 语义。
+    let _destroyed = crate::network::socket::sock_unref(slot, gen);
     // 若是 fd 传进来的，fd 那一格也要清掉（否则留着指向已销毁的 socket）
     if frame.rdi < 0x1_0000 {
         if let Some((pid, pgen)) = current_proc() {
