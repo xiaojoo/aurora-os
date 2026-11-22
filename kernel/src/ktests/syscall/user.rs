@@ -1403,6 +1403,34 @@ fn t_fd_number() -> bool {
         crate::log_fatal!("fdnum: socket_arg 的 fd 分支不成立");
         ok = false;
     }
+    // **验惰性 stdio**（ADR-187）：调一次 `fd_list` 之后 0/1/2 应该在。
+    //
+    // 第一版没验这一格，`ensure_stdio` 从没被触发过——判据绿但功能没跑（实测）。
+    // **直接验 `preset_std` 在真进程上能填 0/1/2**（ADR-187）：
+    //
+    // 不能走 `fd_list` syscall：那条路要 `current_proc()`，而这条用例跑在
+    // boot 任务上（`proc_id == NO_PROC`）。第一版就是这么写的，
+    // 实测 `stdio=false` —— 判据验的是「syscall 有没有进程上下文」，不是 stdio。
+    let stdio_ok = {
+        let Ok(h2) = crate::handle::grant_console(
+            owner, crate::handle::RIGHT_READ | crate::handle::RIGHT_WRITE, 0,
+        ) else {
+            crate::log_fatal!("fdnum: grant_console 失败");
+            return false;
+        };
+        let mut t2 = crate::handle::FdTable::new();
+        let r = t2.preset_std(h2, h2, h2).is_ok()
+            && t2.lookup(0) == Some(h2)
+            && t2.lookup(1) == Some(h2)
+            && t2.lookup(2) == Some(h2)
+            && t2.used() == 3;
+        let _ = crate::handle::close(h2, owner);
+        r
+    };
+    if !stdio_ok {
+        crate::log_fatal!("fdnum: 惰性 stdio 不成立");
+        ok = false;
+    }
     let bad_ok = crate::handle::resolve(
         crate::handle::Handle(0xDEAD_BEEF), owner, 0,
     )
@@ -1421,8 +1449,8 @@ fn t_fd_number() -> bool {
         ok = false;
     }
     crate::log_info!(
-        "fdnum: fd小整数={} lookup={} list={} after={} fd分支={} 坏句柄拒={} ⇒ {}",
-        fd_ok, lookup_ok, list_ok, after_ok, fd_branch_ok, bad_ok, ok
+        "fdnum: fd小整数={} lookup={} list={} after={} fd分支={} stdio={} 坏句柄拒={} ⇒ {}",
+        fd_ok, lookup_ok, list_ok, after_ok, fd_branch_ok, stdio_ok, bad_ok, ok
     );
     return ok;
 }

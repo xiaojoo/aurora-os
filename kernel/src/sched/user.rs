@@ -1121,6 +1121,82 @@ fn sys_aspace_map(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     }
 }
 
+/// 给一个**刚绑定的**进程预置 0/1/2 三个标准流（ADR-187）。
+///
+/// ## 为什么在 `process_start` 而不在 `proc_create`
+///
+/// 句柄的 owner 是 `(任务全局下标, 任务 id)`，而 `proc_create` 时**还没有线程**——
+/// 没有 owner 就无法建句柄。
+///
+/// POSIX 的语义也是这样：`fork` 出来的子进程继承父进程的 fd 表，而「这个进程真的能跑」
+/// 是 `exec` 之后的事。我们的 `process_start` 正好是那个时刻。
+///
+/// ## 三个 fd 都指向同一个 Console 句柄
+///
+/// 今天没有「输入流」与「输出流」的区分——Console 对象同时支持读写。
+/// 所以 0/1/2 指向**同一个**句柄是正确的最小实现。
+///
+/// 将来要做「stderr 单独重定向」时，需要三个独立句柄（`dup` 出三份），那是未决 1。
+///
+/// ## 失败不阻断启动
+///
+/// 预置失败（内存不足）只记日志，**不阻止进程启动**——
+/// 一个没有 stdio 但能跑的程序，比一个起不来的程序有用。
+#[cfg(feature = "handles")]
+/// stdio 是否已经预置过（每进程一个标记，避免重复建句柄）。
+static STDIO_DONE: [core::sync::atomic::AtomicBool; 64] = [const { core::sync::atomic::AtomicBool::new(false) }; 64];
+
+/// 惰性预置 stdio（ADR-187 决策 3）。
+///
+/// ## 为什么惰性
+///
+/// 建 Console 句柄会让 `handle::live()` 涨 1，而 `psys` 的收场判据是 `live == h0`。
+/// 那个判据是对的——**启动一个进程不该凭空多占句柄名额**。
+///
+/// 所以只在「真的要用 fd 0/1/2」时才建。
+fn ensure_stdio(gidx: usize, tid: u32, pid: u16, pgen: u32) {
+    if pid as usize >= STDIO_DONE.len() {
+        return;
+    }
+    if STDIO_DONE[pid as usize].load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    preset_std_for(gidx, tid, pid, pgen);
+    STDIO_DONE[pid as usize].store(true, core::sync::atomic::Ordering::Release);
+}
+
+fn preset_std_for(gidx: usize, tid: u32, pid: u16, pgen: u32) {
+    let owner = (gidx, tid);
+    // **只建一个 Console 句柄，三个 fd 都指向它**（ADR-187 决策 2）。
+    //
+    // 第一版建了三个（`dup` 出三份），结果 `handle::live()` 涨了 3 ⇒
+    // `psys` 的 `live == h0` 收场判据红，而且 `start_ok` 的 `nhandles == 4`
+    // 也跟着红。**判据没错**：stdio 不该凭空多占句柄名额。
+    //
+    // POSIX 里 0/1/2 是三个**独立的**打开文件描述，但我们的 Console 对象
+    // 同时支持读写，所以一个句柄服务三个 fd 是正确的最小实现。
+    let rights = crate::handle::RIGHT_READ | crate::handle::RIGHT_WRITE;
+    let Ok(h) = crate::handle::grant_console(owner, rights, 0) else {
+        crate::log_warn!("stdio: 预置 0/1/2 失败（进程 {} 起来但没有 stdio）", pid);
+        return;
+    };
+    let (h_in, h_out, h_err) = (h, h, h);
+    let Some(mut t) = crate::proc::proc_fd_table(pid, pgen) else {
+        crate::log_warn!("stdio: 取不到 fd 表（进程 {}）", pid);
+        return;
+    };
+    if t.preset_std(h_in, h_out, h_err).is_err() {
+        crate::log_warn!("stdio: preset_std 失败（进程 {}）", pid);
+        return;
+    }
+    // 扩容之后容量可能变了，写回主人（ADR-180 补记二）
+    let _ = crate::proc::proc_set_fd_table(pid, pgen, t.base(), t.cap());
+    crate::log_info!(
+        "stdio: 进程 {} 预置 0/1/2 完成 used={} cap={}",
+        pid, t.used(), t.cap()
+    );
+}
+
 /// 16 号停线程用的 token：**不注册任何等待队列项**（它不等事件，只等 16 号），
 /// 所以 `terminate_task` 里那两句摘链天然是无效操作。seq 由 `(gidx, id)` 确定性推出，
 /// 15 号与 16 号各自算一遍就必然相同，不需要把 token 存在任何表里。
@@ -1263,6 +1339,15 @@ fn sys_thread_create(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
         let _ = crate::proc::proc_detach_thread(pid);
         return E_EXHAUSTED;
     }
+    // **stdio 不在启动路径上无条件建**（ADR-187 实测教训）：
+    //
+    // 建一个 Console 句柄会让 `handle::live()` 涨 1，而 `psys` 的收场判据是
+    // `live == h0`（「比基线，不比 0」）。那个判据是对的：**启动一个进程不该
+    // 凭空多占句柄名额**。
+    //
+    // 所以 stdio 走**惰性**：进程第一次真的要用 fd 0/1/2 时，由 `fd_lookup` 触发。
+    // 见 `ensure_stdio`。
+    let _ = (pid, pgen);
     if !crate::sched::block_task(g, start_token(g, id)) {
         let _ = crate::sched::terminate_task(g);
         let _ = crate::proc::proc_detach_thread(pid);
@@ -2524,6 +2609,11 @@ fn sys_fd_install(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
 #[inline(never)]
 fn sys_fd_lookup(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let Some((pid, gen)) = current_proc() else { return E_BAD_HANDLE };
+    // **惰性预置 stdio**（ADR-187）：第一次查 fd 时才建 Console 句柄。
+    // 这样「启动一个进程」不占句柄名额，而「真的要用 stdio」时它就在。
+    if let Some(owner) = crate::sched::current_identity() {
+        ensure_stdio(owner.0, owner.1, pid, gen);
+    }
     let Some(t) = crate::proc::proc_fd_table(pid, gen) else {
         return crate::network::socket::E_BAD_FD;
     };
@@ -2564,6 +2654,7 @@ fn sys_fd_close(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
 fn sys_fd_list(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
     let Some((pid, gen)) = current_proc() else { return E_BAD_HANDLE };
+    ensure_stdio(owner.0, owner.1, pid, gen);
     let cap = frame.rsi as usize;
     let want = cap / 8;
     if want == 0 {
