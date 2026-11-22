@@ -22705,3 +22705,77 @@ UDP 的「帧」是一个完整的语义单位（一问一答）。TCP 的段不
 4. **TIME_WAIT 重发最后 ACK**（真实语义缺失）
 5. **`socket::create(SOCK_STREAM)` 仍回 `E_NOSYS`**（状态机还没接进 socket 层）
 6. **拥塞控制**（明确不做）
+---
+
+## 517. ADR-199 落地：TCP 接进 socket 层（切片 G 第三层）（2026-11-22）
+
+### 补的是「用户态还用不了」
+
+ADR-197/198 做出了段格式与状态机，但 `socket(SOCK_STREAM)` 仍回 `E_NOSYS`。
+
+### 交付
+
+`Socket` 槽加 `SocketTcp`（`UnsafeCell<Option<ConnState>>`）；
+`tcp_info`/`tcp_listen`/`tcp_start_connect`/`tcp_on_segment`/`tcp_close`；
+`create(AF_INET, SOCK_STREAM)` **成功**，初始 `Listen` 态。
+
+### 决策 1：`ConnState` 放进 socket 槽，不做独立连接表
+
+连接的**身份**就是 socket 槽（`(slot, gen)` 已是稳定身份）。再建一张表就要维护两份同步，
+而那份同步没有额外的语义价值。
+
+### 决策 2：TCP 的数据**复用 UDP 的接收队列**
+
+本 ADR 最关键的一个接线决定。接收队列的语义（环形、有界、按端口投递）与传输层无关，
+用户态 `recv` 走同一个出口 —— 不必为 TCP 再写一条读取路径。
+
+**一个实测撞出来的坑**：`enqueue` 按**本地端口**投递，端口 0 的 socket 收不到。
+所以必须先 `bind`。判据第一版没 `bind`，`数据入队=false` —— 那是**测试的错**。
+
+### 判据七格
+
+    tcpsock: create=true dgram无tcp=true listen=true 连接=true
+             握手=true 数据入队=true 关闭=true ⇒ true
+
+### 一个必须跟着改的旧判据
+
+`t_socket_family` 里有「`SOCK_STREAM` 必须回 `-38`」—— 那是状态机还不存在时写的。
+`create` 放行后它立刻变红。
+
+> **这与 AF_INET6 那条是同一个教训：实现之后判据必须跟着实现走。**
+
+改成「能建且初始是 `Listen`」后恢复。
+
+### 负样本
+
+把 `create` 的类型检查改回只收 `SOCK_DGRAM`：
+
+    tcpsock: create(STREAM) 失败 0xffffffffffffffff
+
+**`t_tcp_socket` 与 `t_socket_family` 同时红** —— 两条判据都在看同一件事，这是对的。
+
+### 读数
+
+| 项 | 结果 |
+|---|---|
+| `check` | **20/20** |
+| `handles` 档 | 3 次跑**全部跑满 116 条**，`tcpsock` 三跑全绿，`PASS(33)` 1 次 |
+
+那两次失败是既有 `t_q2_workload_slots`（2.8%）与 `t_sdkdemo`（8.9%）。
+
+### TCP 现在的真实能力
+
+| 能做 | 不能做 |
+|---|---|
+| `socket(SOCK_STREAM)` | 重传（丢一个段就永久卡住）|
+| `listen` / 主动连接 | 滑动窗口（会淹没接收方）|
+| 段级握手与挥手 | 乱序重组 |
+| 数据收发（经 UDP 队列）| TIME_WAIT 重发 ACK |
+| 对错 ACK、乱序的拒绝 | 拥塞控制 |
+
+### 一个仍开着的关键缺口
+
+**`sys_sock_send`/`recv` 的 TCP 分支还没接**：它们仍按 `UDP_PAYLOAD_MAX` 限长，
+且 `send` 走 `udp::build_frame`。`accept` 也还没实现。
+
+所以：**socket 层能建 TCP、能收段，但用户态还不能真的发 TCP 数据。**

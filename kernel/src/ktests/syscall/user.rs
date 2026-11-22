@@ -723,7 +723,7 @@ ktest!(KT_SIGNAL_ROUNDTRIP, t_signal_roundtrip);
 ///
 /// 1. `AF_INET + SOCK_DGRAM` 建成功，句柄 kind 是 `KIND_SOCKET`；
 /// 2. `AF_INET6` 回 `-38`（ENOSYS），**不是** `-1`（参数写错）；
-/// 3. `SOCK_STREAM` 回 `-38`；
+/// 3. `SOCK_STREAM` **能建**且初始是 `Listen` 态（ADR-199）；
 /// 4. `bind` 成功；**同端口重复 bind** 回 `-98`（EADDRINUSE）；
 /// 5. `listen`/`accept` 在 DGRAM 上回 `-95`（EOPNOTSUPP），**不静默返回 0**；
 /// 6. `recv` 空队列回 `-11`（EAGAIN），**不阻塞**；
@@ -776,7 +776,7 @@ fn t_socket_family() -> bool {
         ok = false;
     }
 
-    // 2. AF_INET6 **现在能建**（ADR-182 决策 5 落地）；SOCK_STREAM 仍回 ENOSYS
+    // 2. AF_INET6 与 SOCK_STREAM **现在都能建**（ADR-182 决策 5、ADR-199）
     //
     // 旧判据是「AF_INET6 必须回 -38」——那是 IPv6 还没实现时写的。
     // 实现之后**判据必须跟着实现走**，否则功能上线时这条用例反而变红。
@@ -796,13 +796,27 @@ fn t_socket_family() -> bool {
     if v6_slot != u16::MAX {
         let _ = crate::network::socket::destroy(v6_slot, v6_gen);
     }
-    let stream_ret = crate::network::socket::create(
+    // **`SOCK_STREAM` 现在能建了**（ADR-199 接进 socket 层）。
+    //
+    // 旧判据是「必须回 -38」——那是 TCP 状态机还不存在时写的。
+    // 与上面 AF_INET6 那条同一个教训：**实现之后判据必须跟着走**。
+    let stream_res = crate::network::socket::create(
         crate::network::socket::AF_INET,
         crate::network::socket::SOCK_STREAM,
-    )
-    .err()
-    .unwrap_or(0);
-    let stream_ok = stream_ret == crate::network::socket::E_NOSYS;
+    );
+    let stream_ret = stream_res.err().unwrap_or(0);
+    // 建成了 ⇒ 必须是 Listen 态，然后**销毁**（不然 `回收` 那格会红）
+    let stream_ok = match stream_res {
+        Ok((ss, sg)) => {
+            let is_listen = matches!(
+                crate::network::socket::tcp_info(ss, sg),
+                Some(i) if i.state == crate::network::tcp_conn::State::Listen
+            );
+            let _ = crate::network::socket::destroy(ss, sg);
+            is_listen
+        }
+        Err(_) => false,
+    };
     if !v6_ok || !stream_ok {
         crate::log_fatal!("sock: 族/类型拒绝不对 v6={:#x} stream={:#x}", v6_ret, stream_ret);
         ok = false;
@@ -2472,4 +2486,149 @@ fn t_tcp_conn() -> bool {
 
 #[cfg(feature = "handles")]
 ktest!(KT_TCP_CONN, t_tcp_conn);
+/// ADR-199：**TCP 接进 socket 层**的证人（切片 G 第三层）。
+///
+/// ## 要证什么
+///
+/// ADR-197/198 做了段格式与状态机，但 `socket(SOCK_STREAM)` 仍回 `E_NOSYS` ——
+/// **用户态还用不了**。这一层把它接进 socket 槽。
+///
+/// ## 判据七格
+///
+/// 1. `create(AF_INET, SOCK_STREAM)` **成功**（不再回 `E_NOSYS`），且 `tcp_info` 是 `Listen`；
+/// 2. `create(AF_INET, SOCK_DGRAM)` 的 `tcp_info` 是 `None`（dgram 没有 TCP 状态）；
+/// 3. `tcp_listen` 在 stream socket 上成功、在 dgram 上回 `E_OPNOTSUPP`；
+/// 4. `tcp_start_connect` 把状态推到 `SynSent` 并返回 SYN 段（`snd_nxt` 前进一格）；
+/// 5. **喂一个 SYN-ACK 进 `tcp_on_segment`** ⇒ 状态变 `Established` 并要回 ACK；
+/// 6. **喂数据段** ⇒ 载荷进了接收队列（`dequeue` 能读出来）；
+/// 7. `tcp_close` 在 `Established` 上返回 FIN 段，状态变 `FinWait1`。
+///
+/// **负样本**：把 `create` 里的 `SOCK_STREAM` 分支改回 `E_NOSYS` ⇒ 第 1 格红。
+#[cfg(feature = "handles")]
+fn t_tcp_socket() -> bool {
+    use crate::network::{socket, tcp, tcp_conn};
+    let mut ok = true;
+
+    // ① create(SOCK_STREAM) 成功
+    let (slot, gen) = match socket::create(socket::AF_INET, socket::SOCK_STREAM) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_fatal!("tcpsock: create(STREAM) 失败 {:#x}", e);
+            return false;
+        }
+    };
+    let info0 = socket::tcp_info(slot, gen);
+    let create_ok = matches!(info0, Some(i) if i.state == tcp_conn::State::Listen);
+    if !create_ok {
+        crate::log_fatal!("tcpsock: create 之后不是 Listen");
+        ok = false;
+    }
+
+    // ② dgram 没有 tcp 状态
+    let (dslot, dgen) = match socket::create(socket::AF_INET, socket::SOCK_DGRAM) {
+        Ok(v) => v,
+        Err(_) => {
+            crate::log_fatal!("tcpsock: create(DGRAM) 失败");
+            return false;
+        }
+    };
+    let dgram_ok = socket::tcp_info(dslot, dgen).is_none();
+    if !dgram_ok {
+        crate::log_fatal!("tcpsock: dgram socket 竟然有 tcp 状态");
+        ok = false;
+    }
+
+    // ③ tcp_listen：stream 成功、dgram 拒
+    let listen_ok = socket::tcp_listen(slot, gen).is_ok();
+    let listen_dgram = socket::tcp_listen(dslot, dgen) == Err(socket::E_OPNOTSUPP);
+    if !listen_ok || !listen_dgram {
+        crate::log_fatal!("tcpsock: listen 不对 stream={} dgram拒={}", listen_ok, listen_dgram);
+        ok = false;
+    }
+
+    // ④ tcp_start_connect ⇒ SynSent + SYN 段
+    let syn = match socket::tcp_start_connect(slot, gen) {
+        Ok(r) => r,
+        Err(e) => {
+            crate::log_fatal!("tcpsock: start_connect 失败 {:#x}", e);
+            return false;
+        }
+    };
+    let info1 = socket::tcp_info(slot, gen);
+    let connect_ok = matches!(info1, Some(i) if i.state == tcp_conn::State::SynSent)
+        && syn.flags == tcp::SYN
+        && matches!(info1, Some(i) if i.snd_nxt == syn.seq.wrapping_add(1));
+    if !connect_ok {
+        crate::log_fatal!("tcpsock: start_connect 之后状态/序号不对");
+        ok = false;
+    }
+
+    // ⑤ 喂 SYN-ACK ⇒ Established
+    let iss = syn.seq;
+    let synack = tcp::Segment {
+        src_port: 80, dst_port: 0,
+        seq: 7000, ack: iss.wrapping_add(1),
+        flags: tcp::SYN | tcp::ACK, window: 4096, data_off: 5, payload: &[],
+    };
+    let reply = socket::tcp_on_segment(slot, gen, &synack, socket::SockAddr::V4 { ip: [10, 0, 2, 2], port: 80 });
+    let handshake_ok = matches!(reply, Ok(Some(r)) if r.flags == tcp::ACK && r.ack == 7001)
+        && matches!(socket::tcp_info(slot, gen), Some(i) if i.state == tcp_conn::State::Established);
+    if !handshake_ok {
+        crate::log_fatal!("tcpsock: 喂 SYN-ACK 之后没进 Established");
+        ok = false;
+    }
+
+    // ⑥ 喂数据段 ⇒ 载荷进接收队列
+    //    **先把本地端口绑上**：`enqueue` 按端口投递，端口 0 投不进来。
+    // **bind 要真正成功**：`enqueue` 按本地端口投递，端口 0 收不到。
+    let _ = crate::network::ifaddr::addr_add(
+        crate::network::ipv6::IpAddr::V4(crate::network::dhcp::DHCP_GUEST_IP), 24, 0);
+    let bind_res = socket::bind(
+        slot, gen,
+        socket::SockAddr::V4 { ip: crate::network::dhcp::DHCP_GUEST_IP, port: 45990 },
+    );
+    if bind_res.is_err() {
+        crate::log_fatal!("tcpsock: bind 失败 {:#x}", bind_res.unwrap_err());
+        ok = false;
+    }
+    let bound_port = socket::endpoints(slot, gen).map(|(l, _)| l.port()).unwrap_or(0);
+    if bound_port != 45990 {
+        crate::log_fatal!("tcpsock: bind 之后端口是 {}", bound_port);
+        ok = false;
+    }
+    let data = tcp::Segment {
+        src_port: 80, dst_port: 45990,
+        seq: 7001, ack: 0,
+        flags: tcp::ACK | tcp::PSH, window: 4096, data_off: 5, payload: b"hi",
+    };
+    let _ = socket::tcp_on_segment(slot, gen, &data, socket::SockAddr::V4 { ip: [10, 0, 2, 2], port: 80 });
+    let mut out = [0u8; 64];
+    let got = socket::dequeue(slot, gen, &mut out);
+    let data_ok = matches!(got, Ok((_, n)) if n == 2 && &out[..2] == b"hi");
+    if !data_ok {
+        crate::log_fatal!("tcpsock: 数据没进接收队列");
+        ok = false;
+    }
+
+    // ⑦ tcp_close ⇒ FIN 段 + FinWait1
+    let fin = socket::tcp_close(slot, gen);
+    let close_ok = matches!(fin, Ok(Some(r)) if r.flags == (tcp::FIN | tcp::ACK))
+        && matches!(socket::tcp_info(slot, gen), Some(i) if i.state == tcp_conn::State::FinWait1);
+    if !close_ok {
+        crate::log_fatal!("tcpsock: close 不对");
+        ok = false;
+    }
+
+    // 收场
+    let _ = socket::destroy(dslot, dgen);
+    let _ = socket::destroy(slot, gen);
+    crate::log_info!(
+        "tcpsock: create={} dgram无tcp={} listen={} 连接={} 握手={} 数据入队={} 关闭={} ⇒ {}",
+        create_ok, dgram_ok, listen_ok && listen_dgram, connect_ok, handshake_ok, data_ok, close_ok, ok
+    );
+    ok
+}
+
+#[cfg(feature = "handles")]
+ktest!(KT_TCP_SOCKET, t_tcp_socket);
 

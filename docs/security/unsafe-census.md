@@ -5,7 +5,7 @@
 >
 > **2026-11-20（ADR-175 跨 AS 读走物理地址）**：`sched/user` U2 9 → 10（`copy_from_user_in` 里 HHDM 别名的单字节读）。**总数 +1**（530 → 531）。
 
-总计 592 处。U1 85 · U2 161 · U3 13 · U4 165 · U5 128 · U6 40
+总计 595 处。U1 85 · U2 161 · U3 13 · U4 168 · U5 128 · U6 40
 
 | 类别 | 含义 | 处数 |
 |---|---|---|
@@ -500,6 +500,19 @@ ADR-194：`t_block_merge` 的两个 `static mut`。**故意进 `.bss` 而不进�
 | U2 | 160 | `unsafe { core::ptr::write_bytes((pa + hhdm) as *mut u8, 0, PAGE) }; frames[got] = pa / PAGE as u64; got += 1;` |
 | U2 | 273 | `unsafe { core::ptr::copy(src.as_ptr().add(done), (pa + hhdm) as *mut u8, k) }; done += k; }` |
 | U2 | 306 | `unsafe { core::ptr::copy((pa + hhdm) as *const u8, dst.as_mut_ptr().add(done), k) }; done += k; }` |
+
+
+### network/socket
+
+| 类别 | 行 | 形状 |
+|---|---|---|
+| U4 | 145 | `unsafe impl Sync for SocketTcp {}` （TCP 状态的静态包装）|
+| U4 | 152 | `unsafe { *self.0.get() }` （`SocketTcp::get`，表锁内）|
+| U4 | 158 | `unsafe { f(&mut *self.0.get()) }` （`SocketTcp::with`，表锁内）|
+
+ADR-199：`Socket` 存 `ConnState` 需要一个可变入口，而 `Socket` 本身在
+`IrqSpinLock<SocketTable>` 里。三处指针都指向 `SocketTcp` 自己的 `UnsafeCell`，
+读写全在 `TABLE`（`RANK_NET=36`）内，`ConnState` 是纯 `Copy` 数值，无别名逃逸。
 
 ### network/arp_table
 

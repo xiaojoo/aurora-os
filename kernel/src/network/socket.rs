@@ -132,6 +132,31 @@ const DG_EMPTY: Datagram = Datagram {
     data: [0; UDP_PAYLOAD_MAX],
 };
 
+/// socket 的 TCP 状态（ADR-199）。
+///
+/// `None` = 不是 stream socket；`Some` = 有一个连接状态。
+pub struct SocketTcp(core::cell::UnsafeCell<Option<crate::network::tcp_conn::ConnState>>);
+
+// SAFETY: 所有读写都在 `TABLE`（`RANK_NET=36`）内，锁提供互斥；
+// `ConnState` 是纯 `Copy` 数值，无别名逃逸。
+unsafe impl Sync for SocketTcp {}
+
+impl SocketTcp {
+    const fn new() -> Self {
+        Self(core::cell::UnsafeCell::new(None))
+    }
+    /// 读快照（表锁内调）。
+    fn get(&self) -> Option<crate::network::tcp_conn::ConnState> {
+        // SAFETY: 调用方持 `TABLE` 锁。
+        unsafe { *self.0.get() }
+    }
+    /// 可变访问（表锁内调）。
+    fn with<R>(&self, f: impl FnOnce(&mut Option<crate::network::tcp_conn::ConnState>) -> R) -> R {
+        // SAFETY: 调用方持 `TABLE` 锁。
+        unsafe { f(&mut *self.0.get()) }
+    }
+}
+
 /// 一个 socket 槽。
 pub struct Socket {
     used: AtomicU32,
@@ -157,6 +182,15 @@ pub struct Socket {
     local: SockAddr,
     /// 默认对端（`connect` 之后有效）。UDP 的 connect 只是记住对端。
     peer: SockAddr,
+    /// **TCP 连接状态**（ADR-199）：`Some` = 这是一个 stream socket。
+    ///
+    /// ## 为什么用 `UnsafeCell` 包一层
+    ///
+    /// `Socket` 存在 `IrqSpinLock<SocketTable>` 里，而 `ConnState` 要**可变**
+    /// （`on_segment` 收 `&mut`）。表锁已经保证互斥，所以这里只需要绕过 `&self`。
+    ///
+    /// **锁序**：`ConnState` 的读写全在 `TABLE`（`RANK_NET=36`）内，不取别的锁。
+    tcp: SocketTcp,
     /// 接收队列头/尾与计数（环形）。
     rx_head: AtomicU32,
     rx_tail: AtomicU32,
@@ -172,6 +206,7 @@ const SOCK_EMPTY: Socket = Socket {
     ty: 0,
     local: SockAddr::V4 { ip: [0; 4], port: 0 },
     peer: SockAddr::V4 { ip: [0; 4], port: 0 },
+    tcp: SocketTcp::new(),
     rx_head: AtomicU32::new(0),
     rx_tail: AtomicU32::new(0),
     rx_count: AtomicU32::new(0),
@@ -193,10 +228,11 @@ pub fn create(domain: u16, ty: u16) -> Result<(u16, u32), u64> {
     if domain != AF_INET && domain != AF_INET6 {
         return Err(E_INVAL);
     }
-    if ty == SOCK_STREAM {
-        return Err(E_NOSYS);
-    }
-    if ty != SOCK_DGRAM {
+    // **`SOCK_STREAM` 现在支持了**（ADR-199）：走 TCP 状态机。
+    //
+    // ADR-181 决策 1 当时回 `E_NOSYS`，理由是「TCP 状态机不存在」。
+    // ADR-198 把状态机做出来了（纯函数），这一轮把它接进 socket 槽。
+    if ty != SOCK_DGRAM && ty != SOCK_STREAM {
         return Err(E_INVAL);
     }
     let mut g = TABLE.lock();
@@ -224,6 +260,14 @@ pub fn create(domain: u16, ty: u16) -> Result<(u16, u32), u64> {
     s.rx_count.store(0, Ordering::Relaxed);
     // **出生时一条名字**（ADR-192）：`dup` 加、`close` 减，减到 0 才销毁。
     s.refs.store(1, Ordering::Release);
+    // stream socket 出生在 `Listen` 态（`bind`+`listen` 之后才真的收 SYN）；
+    // dgram 的 `tcp` 保持 `None`。
+    if ty == SOCK_STREAM {
+        // ISS 用组合数：槽号 + 世代，够避免同一槽复用时序号撞车
+        let iss = 0x1000_0000u32.wrapping_add((slot as u32) << 8).wrapping_add(s.gen.load(Ordering::Acquire));
+        let st = crate::network::tcp_conn::ConnState::listen(iss);
+        s.tcp.with(|o| *o = Some(st));
+    }
     s.used.store(1, Ordering::Release);
     Ok((slot as u16, s.gen.load(Ordering::Acquire)))
 }
@@ -579,4 +623,177 @@ pub fn bootstrap_addrs() {
         let _ = addr_add(IpAddr::V6(link_local_from_mac(&mac)), 64, 0);
     }
 
+}
+
+// ---------------------------------------------------------------- ADR-199：TCP 接进 socket 层
+
+/// TCP 连接在 socket 槽上的快照（判据用）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TcpInfo {
+    pub state: crate::network::tcp_conn::State,
+    pub snd_nxt: u32,
+    pub rcv_nxt: u32,
+}
+
+/// 取一个 stream socket 的 TCP 状态快照。**dgram socket 回 `None`**。
+pub fn tcp_info(slot: u16, gen: u32) -> Option<TcpInfo> {
+    let mut g = TABLE.lock();
+    let t = g.get();
+    let s = t.slots.get(slot as usize)?;
+    if s.used.load(Ordering::Acquire) == 0 || s.gen.load(Ordering::Acquire) != gen {
+        return None;
+    }
+    let st = s.tcp.get()?;
+    Some(TcpInfo { state: st.state, snd_nxt: st.snd_nxt, rcv_nxt: st.rcv_nxt })
+}
+
+/// `listen`：把 stream socket 从 `Listen` 状态保持住（幂等），并记下本地端口。
+///
+/// **dgram socket 回 `E_OPNOTSUPP`**：UDP 没有 listen。
+pub fn tcp_listen(slot: u16, gen: u32) -> Result<(), u64> {
+    let mut g = TABLE.lock();
+    let t = g.get();
+    let s = t.slots.get_mut(slot as usize).ok_or(E_BAD_FD)?;
+    if s.used.load(Ordering::Acquire) == 0 || s.gen.load(Ordering::Acquire) != gen {
+        return Err(E_BAD_FD);
+    }
+    if s.ty != SOCK_STREAM {
+        return Err(E_OPNOTSUPP);
+    }
+    s.tcp.with(|o| match o {
+        Some(st) => {
+            // 只有 `Listen`（或已退回 `Listen`）能 listen
+            if st.state == crate::network::tcp_conn::State::Listen {
+                Ok(())
+            } else {
+                Err(E_INVAL)
+            }
+        }
+        None => Err(E_INVAL),
+    })
+}
+
+/// **主动连接**：把本端推进到 `SynSent`，返回要发出的 SYN 段。
+///
+/// ## 为什么返回段而不是自己发
+///
+/// socket 层**不碰设备**（与 `udp` 同一纪律）。调用方（syscall 层）拿到段去发。
+/// 这样判据可以只测状态机与段构造，不需要网卡。
+pub fn tcp_start_connect(slot: u16, gen: u32) -> Result<crate::network::tcp_conn::Reply, u64> {
+    let mut g = TABLE.lock();
+    let t = g.get();
+    let s = t.slots.get_mut(slot as usize).ok_or(E_BAD_FD)?;
+    if s.used.load(Ordering::Acquire) == 0 || s.gen.load(Ordering::Acquire) != gen {
+        return Err(E_BAD_FD);
+    }
+    if s.ty != SOCK_STREAM {
+        return Err(E_OPNOTSUPP);
+    }
+    s.tcp.with(|o| match o {
+        Some(st) => {
+            if st.state != crate::network::tcp_conn::State::Listen {
+                return Err(E_INVAL);
+            }
+            // Listen ⇒ SynSent
+            let iss = st.iss;
+            *st = crate::network::tcp_conn::ConnState::connect(iss);
+            let r = st.syn_segment();
+            // SYN 占一格
+            st.snd_nxt = st.snd_nxt.wrapping_add(1);
+            Ok(r)
+        }
+        None => Err(E_INVAL),
+    })
+}
+
+/// **收一个段**：把段喂给状态机，返回要回的段（`None` = 不用回）。
+///
+/// ## 载荷去哪了
+///
+/// 段里的数据被**复制进接收队列**（`enqueue` 那条路），所以调用方之后能用
+/// `dequeue` 读出来 —— 与 UDP 的 `recv` 走同一个出口。
+///
+/// **这是本 ADR 最关键的一个接线决定**：TCP 的数据不走新路径，复用了 UDP 的接收队列。
+/// 理由：接收队列的语义（环形、有界、按端口投递）与传输层无关。
+pub fn tcp_on_segment(
+    slot: u16,
+    gen: u32,
+    seg: &crate::network::tcp::Segment<'_>,
+    src: SockAddr,
+) -> Result<Option<crate::network::tcp_conn::Reply>, u64> {
+    use crate::network::tcp_conn::{self, Reaction};
+    let mut g = TABLE.lock();
+    let t = g.get();
+    let s = t.slots.get_mut(slot as usize).ok_or(E_BAD_FD)?;
+    if s.used.load(Ordering::Acquire) == 0 || s.gen.load(Ordering::Acquire) != gen {
+        return Err(E_BAD_FD);
+    }
+    if s.ty != SOCK_STREAM {
+        return Err(E_OPNOTSUPP);
+    }
+    // 先把载荷复制出来（`enqueue` 要再取一次表锁 —— 那是同等级重入，所以必须**先放锁**）。
+    //
+    // 这里用一个小缓冲把载荷搬出锁外，长度受 `TCP_PAYLOAD_MAX` 约束。
+    let payload_len = seg.payload.len().min(crate::network::tcp::TCP_PAYLOAD_MAX);
+    let mut payload = [0u8; crate::network::tcp::TCP_PAYLOAD_MAX];
+    payload[..payload_len].copy_from_slice(&seg.payload[..payload_len]);
+
+    let (reaction, accepted) = s.tcp.with(|o| match o {
+        Some(st) => {
+            let before = st.rcv_nxt;
+            let r = tcp_conn::on_segment(st, seg);
+            // 只有真的前进了才算「这段数据被接受」
+            let acc = st.rcv_nxt != before && payload_len > 0;
+            (r, acc)
+        }
+        None => (Reaction::Ignore, false),
+    });
+    // 放表锁（`g` 在这里 drop）
+    drop(g);
+
+    if accepted {
+        let _ = enqueue(slot_port(slot), src, &payload[..payload_len]);
+    }
+
+    match reaction {
+        Reaction::Reply(r) => Ok(Some(r)),
+        Reaction::Silent | Reaction::Ignore => Ok(None),
+    }
+}
+
+/// 取一个 socket 的本地端口（`enqueue` 按端口投递时用）。
+fn slot_port(slot: u16) -> u16 {
+    let mut g = TABLE.lock();
+    let t = g.get();
+    match t.slots.get(slot as usize) {
+        Some(s) if s.used.load(Ordering::Acquire) != 0 => s.local.port(),
+        _ => 0,
+    }
+}
+
+/// 本端主动关：返回要发的 FIN 段（`None` = 状态不允许）。
+pub fn tcp_close(slot: u16, gen: u32) -> Result<Option<crate::network::tcp_conn::Reply>, u64> {
+    use crate::network::tcp_conn;
+    let mut g = TABLE.lock();
+    let t = g.get();
+    let s = t.slots.get_mut(slot as usize).ok_or(E_BAD_FD)?;
+    if s.used.load(Ordering::Acquire) == 0 || s.gen.load(Ordering::Acquire) != gen {
+        return Err(E_BAD_FD);
+    }
+    if s.ty != SOCK_STREAM {
+        return Ok(None);
+    }
+    s.tcp.with(|o| match o {
+        Some(st) => {
+            // 先试 `ESTABLISHED`，再试 `CLOSE_WAIT`
+            if let Some(r) = tcp_conn::close_send_fin(st) {
+                return Ok(Some(r));
+            }
+            if let Some(r) = tcp_conn::close_send_fin_from_close_wait(st) {
+                return Ok(Some(r));
+            }
+            Ok(None)
+        }
+        None => Ok(None),
+    })
 }
