@@ -30,6 +30,40 @@ use core::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LockRank(pub u8);
 
+impl LockRank {
+    /// **锁名（只用于诊断）**（ADR-222）。
+    ///
+    /// 锁序违规的日志原来只说 `外层 rank=37 本次 rank=6` ——
+    /// **37 是哪把锁、6 是哪把锁，得靠人肉去数**。
+    /// 实测为此浪费了一整轮（先是怀疑 `QUEUE_LOCK`、再怀疑 `CB_LOCK`、
+    /// 最后才发现是 AHCI 的 `XFER`）。
+    ///
+    /// 这个函数只读常量、不进临界区、不分配，可以安全地在崩溃路径调用。
+    pub const fn name(self) -> &'static str {
+        match self.0 {
+            1 => "BOOT",
+            2 => "STACK",
+            3 => "TEST_MOD",
+            4 => "GROW",
+            5 => "WAITQ",
+            6 => "TIMER",
+            8 => "RUNQ",
+            10 => "HEAP",
+            20 => "VMM",
+            30 => "PMM",
+            35 => "HANDLE",
+            36 => "NET",
+            37 => "BLOCK",
+            38 => "DENTRY",
+            40 => "LEDGER",
+            50 => "ACPI",
+            60 => "TEST",
+            _ => "?",
+        }
+    }
+}
+
+
 /// 等级就是"从外到内的获取顺序"，数值小的先拿、嵌套时必须严格递增。
 /// 今天真实的嵌套链只有一条，所以这张表的次序不是排版而是调用关系：
 /// `堆(10) -> VMM(20) -> PMM(30) -> 台账(40)`；ACPI(50) 目前只在启动期单独用。
@@ -466,7 +500,10 @@ impl<T: Send> OpenSpinLock<T> {
         let prev_rank = INNERMOST[slot].swap(self.rank.0, Ordering::Relaxed);
         if self.rank.0 <= prev_rank && prev_rank != 0 {
             ORDER_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
-            crate::log_fatal!("L4 sync: 锁序违规，外层 rank={} 本次 rank={}", prev_rank, self.rank.0);
+            crate::log_fatal!(
+                "L4 sync: 锁序违规，外层 rank={}({}) 本次 rank={}({})",
+                prev_rank, LockRank(prev_rank).name(), self.rank.0, self.rank.name()
+            );
             crate::exit::finish(crate::exit::Code::ExceptionFatal);
         }
         OpenGuard { lock: self, prev_rank }
@@ -731,7 +768,10 @@ impl<T: Send> IrqSpinLock<T> {
         let prev_rank = INNERMOST[slot].swap(self.rank.0, Ordering::Relaxed);
         if self.rank.0 <= prev_rank && prev_rank != 0 {
             ORDER_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
-            crate::log_fatal!("L4 sync: 锁序违规，外层 rank={} 本次 rank={}", prev_rank, self.rank.0);
+            crate::log_fatal!(
+                "L4 sync: 锁序违规，外层 rank={}({}) 本次 rank={}({})",
+                prev_rank, LockRank(prev_rank).name(), self.rank.0, self.rank.name()
+            );
             crate::exit::finish(crate::exit::Code::ExceptionFatal);
         }
         self.held_by.store(token, Ordering::Relaxed);

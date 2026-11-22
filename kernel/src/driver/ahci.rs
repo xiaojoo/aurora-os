@@ -359,7 +359,19 @@ static PORT_STATE: [AtomicU8; 32] = [const { AtomicU8::new(0) }; 32];
 //
 // `OpenSpinLock` 只做互斥、不动 IF：正好是「传输互斥 + 等完成中断」需要的形状。
 // 安全性见 `sync::OpenSpinLock` 的类型文档（它不在 ISR 里取、临界区不分配）。
-static XFER: crate::sync::OpenSpinLock<()> = crate::sync::OpenSpinLock::new(crate::sync::RANK_BLOCK, ());
+// **rank 必须是 GROW(4) 而不是 BLOCK(37)**（ADR-222 实测）：
+//
+// 上面那段注释原来写「传输内部不取任何别的锁（纯 MMIO + 轮询）=> 37 是安全下界」——
+// **那个假设是错的**。`wait_settled` / `wait_ms` 等的是**完成中断**，
+// 而中断处理里取 `RANK_TIMER(6)`：
+//
+//   [fatal] L4 sync: 锁序违规，外层 rank=37(BLOCK) 本次 rank=6(TIMER)
+//
+// `OpenSpinLock` 不动 IF（这正是它存在的理由，见上），所以持锁期间中断照进 => 37 -> 6 倒序。
+// 后果是整机 HANG，而 `fs-open` 档因此从未跑通过（ADR-221 发现）。
+//
+// 取 `GROW(4)`：与 `CACHE_LOCK` / `STATE_LOCK` 同一档，都是「持锁期间会走到更深的锁」。
+static XFER: crate::sync::OpenSpinLock<()> = crate::sync::OpenSpinLock::new(crate::sync::RANK_GROW, ());
 static PORT_RESETS: [AtomicU32; 32] = [const { AtomicU32::new(0) }; 32];
 /// 每个端口因"发射被吞"而重置的次数，与 §8.2 的故障预算分开数（见 `recover_for_issue`）
 static PORT_ISSUE_RESETS: [AtomicU32; 32] = [const { AtomicU32::new(0) }; 32];

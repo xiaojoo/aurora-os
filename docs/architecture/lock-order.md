@@ -17,7 +17,8 @@
 | `RANK_PMM` | 30 | 物理帧位图与 `free_frames` 计数 | 台账(40) | `phys_alloc`/`phys_free` 结束时记账 | 否 |
 | `RANK_HANDLE` | 35 | 用户句柄表（`kernel/src/handle.rs`，`handles` 特性） | 台账(40) | ADR-007 裁决 E（2026-11-07 批准，同日落地）：第一版对象是只读文件、**不持有页框** ⇒ 表锁内只许调台账、不许调 mm；盘 I/O 在锁外（取票/提交两段）。**P5c-1 起再加一条**：对象**活性判定**也在锁外（`resolve` 取完引用放锁，再判 `mm::aspace_live` ⇒ 那一步要取 VMM(20)）。负样本 M19：把判定留在 35 之内 ⇒ `L4 sync: 锁序违规，外层 rank=35 本次 rank=20` ⇒ EXCEPTION(39) | 否 |
 | `RANK_NET` | 36 | socket 表（`network/socket.rs` 的 `TABLE`，ADR-181） | （叶子：队列操作全在本锁内完成） | **ADR-181（2026-11-22）**：socket 表只被 `handle` 层的 socket 句柄操作调用，那些路径已持 `RANK_HANDLE(35)` ⇒ 本锁必须比 35 深。它内部不取任何锁，所以 36 是安全下界。**收包路径今天只从用户态 syscall 侧调**，不从中断里调；若将来接到真收包中断，这一格要改成「是」并重跑 ADR-081 决策 2 的判据 | 否 |
-| `RANK_BLOCK` | 37 | 块设备传输（`driver/ahci.rs` 的 `XFER`，ADR-190）| （叶子：纯 MMIO + 轮询）| **ADR-190（2026-11-22）**：`OFF_DATA` 是**全局单块** 232 KiB DMA 缓冲，所有端口共用，而传输流程「填缓冲→发命令→等完成→读缓冲」之间原本**没有任何互斥** ⇒ 两个调用方交错就互相覆盖。实测 `t_fat32` 两卷读同一个 `HELLO.ELF`、字节数/簇数/尾字节全同而**哈希不同**（22% 失败）。**比 `RANK_HANDLE(35)` 深**：句柄层在锁外做磁盘 IO，调传输时不持 HANDLE。**不能复用 `RANK_NET(36)`**：那是 socket 表，合用会让「socket 里读盘」变成同等级重入。全部调用点都在任务上下文（实测无 ISR 调用）⇒ `IrqSpinLock` 默认语义正确 | 否 |
+| `RANK_GROW` | 4 | **块设备传输（`driver/ahci.rs` 的 `XFER`）** | 会等完成中断 => 中断里取 TIMER(6) => 必须低于 6（ADR-222）|
+| `RANK_BLOCK` | 37 | 块层请求队列 / 完成回调（`block_io.rs` 的 `QUEUE_LOCK`/`CB_LOCK`）| （叶子：只读写静态表）|
 | `RANK_DENTRY` | 38 | dentry 缓存（`filesystem/vfs_ro.rs` 的 `DENTRY_LOCK`，ADR-195）| （叶子：只读写缓存表）| **ADR-195（2026-11-22）**：路径解析的 `(卷指纹, 父簇, 名字)` → `Entry` 缓存。**叶子锁**：临界区里只读写那 64 条 `DentrySlot`，不取任何别的锁。比 `RANK_BLOCK(37)` 深：缓存命中时**不碰盘**。**每次 `ReadOnlyFs::mount` 都清缓存** —— 夹具造坏卷的方式是改同一块 img 的目录项，引导扇区指纹不变 ⇒ 不清就会把好卷的结果返回给坏卷（实测两个用例红）。| 否 |
 | `RANK_LEDGER` | 40 | `resource::Ledger` 的每模块计数 | （叶子） | 不再获取别的锁 | 否 |
 | `RANK_ACPI` | 50 | ACPI 解析结果静态量 | （叶子，目前只在启动期单独使用） | 解析路径不分配物理帧 | 否 |
