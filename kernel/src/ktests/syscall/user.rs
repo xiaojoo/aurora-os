@@ -3097,4 +3097,182 @@ fn t_bottom_half() -> bool {
 
 #[cfg(feature = "handles")]
 ktest!(KT_BOTTOM_HALF, t_bottom_half);
+/// ADR-203：**TCP 重传**的证人 —— 定时器、下半部、TCP 三层第一次串起来。
+///
+/// ## 要证什么
+///
+/// 「TCP 丢一个段就永久卡住」是前面几片一直记着的最硬天花板。这一层把它拆掉。
+///
+/// ## 判据九格
+///
+/// 1. 发送后登记：`arm_retx` 让 `armed = true` 且带上正确的 seq/len/flags；
+/// 2. **收到的 ACK 覆盖该段 ⇒ 取消**（`ack_retx` 回 `true`，`armed = false`）；
+/// 3. **ACK 不覆盖 ⇒ 不取消**（`ack_retx` 回 `false`）；
+/// 4. **重传不推进 `snd_nxt`**（这是重传与正常发送最关键的差别）；
+/// 5. **指数退避**：每次重传后 `backoff_us` 翻倍，到 `RETX_MAX_BACKOFF_US` 封顶；
+/// 6. **超过 `RETX_MAX_TRIES` 放弃**（回 `None`）；
+/// 7. `tcp_handle_timer` 走 `Kind::TcpRetransmit` 拿到要重发的段；
+/// 8. `tcp_handle_timer` 对不认识的 `Kind` 回 `None`（不误伤）；
+/// 9. **端到端**：socket 层发一段 → 定时器到期 → 分派 → 拿到同样的段。
+///
+/// **负样本**：让 `on_retx_timeout` 里推进 `snd_nxt` ⇒ 第 4 格红。
+#[cfg(feature = "handles")]
+fn t_tcp_retx() -> bool {
+    use crate::network::{socket, tcp, tcp_conn};
+    use crate::time::timer;
+    let mut ok = true;
+
+    // ① arm_retx
+    let mut st = tcp_conn::ConnState::connect(1000);
+    st.state = tcp_conn::State::Established;
+    st.snd_nxt = 5000;
+    st.rcv_nxt = 7000;
+    st.arm_retx(5000, 100, tcp::ACK | tcp::PSH);
+    let arm_ok = st.retx.armed
+        && st.retx.seq == 5000
+        && st.retx.len == 100
+        && st.retx.flags == (tcp::ACK | tcp::PSH)
+        && st.retx.tries == 0
+        && st.retx.backoff_us == tcp_conn::RETX_BASE_US;
+    if !arm_ok {
+        crate::log_fatal!("retx: arm 不对 armed={} seq={} len={}",
+            st.retx.armed, st.retx.seq, st.retx.len);
+        ok = false;
+    }
+
+    // ② ACK 覆盖 ⇒ 取消
+    let mut st2 = st;
+    let ack_ok = st2.ack_retx(5100) && !st2.retx.armed;
+    if !ack_ok {
+        crate::log_fatal!("retx: 覆盖的 ACK 没取消");
+        ok = false;
+    }
+
+    // ③ ACK 不覆盖 ⇒ 不取消
+    let mut st3 = st;
+    let noack_ok = !st3.ack_retx(5050) && st3.retx.armed;
+    if !noack_ok {
+        crate::log_fatal!("retx: 部分 ACK 竟然取消了");
+        ok = false;
+    }
+
+    // ④ 重传不推进 snd_nxt
+    let mut st4 = st;
+    let snd_before = st4.snd_nxt;
+    let r1 = st4.on_retx_timeout();
+    let no_advance_ok = r1.is_some() && st4.snd_nxt == snd_before
+        && matches!(r1, Some(r) if r.seq == 5000 && r.payload_len == 100);
+    if !no_advance_ok {
+        crate::log_fatal!("retx: 重传推进了 snd_nxt {}->{}", snd_before, st4.snd_nxt);
+        ok = false;
+    }
+
+    // ⑤ 指数退避
+    let mut st5 = st;
+    let b0 = st5.retx.backoff_us;
+    let _ = st5.on_retx_timeout();
+    let b1 = st5.retx.backoff_us;
+    let _ = st5.on_retx_timeout();
+    let b2 = st5.retx.backoff_us;
+    // 一直翻倍到封顶。
+    //
+    // **不能循环 10 次**：`tries` 到 `RETX_MAX_TRIES`(6) 就放弃，`armed` 被清、
+    // `backoff` 归零（实测 max=0）。正好 4 次就到 200ms<<4 = 3.2s 封顶。
+    for _ in 0..4 {
+        let _ = st5.on_retx_timeout();
+    }
+    let bmax = st5.retx.backoff_us;
+    let backoff_ok = b0 == tcp_conn::RETX_BASE_US
+        && b1 == b0 * 2
+        && b2 == b0 * 4
+        && bmax == tcp_conn::RETX_MAX_BACKOFF_US;
+    if !backoff_ok {
+        crate::log_fatal!("retx: 退避不对 {} {} {} max={}", b0, b1, b2, bmax);
+        ok = false;
+    }
+
+    // ⑥ 超过上限放弃
+    let mut st6 = st;
+    let mut got_none = false;
+    for _ in 0..(tcp_conn::RETX_MAX_TRIES as usize + 2) {
+        if st6.on_retx_timeout().is_none() {
+            got_none = true;
+            break;
+        }
+    }
+    let giveup_ok = got_none && !st6.retx.armed;
+    if !giveup_ok {
+        crate::log_fatal!("retx: 超过上限没放弃 tries={}", st6.retx.tries);
+        ok = false;
+    }
+
+    // ⑦⑧ tcp_handle_timer
+    let (slot, gen) = match socket::create(socket::AF_INET, socket::SOCK_STREAM) {
+        Ok(v) => v,
+        Err(_) => {
+            crate::log_fatal!("retx: create 失败");
+            return false;
+        }
+    };
+    let _ = crate::network::ifaddr::addr_add(
+        crate::network::ipv6::IpAddr::V4(crate::network::dhcp::DHCP_GUEST_IP), 24, 0);
+    let _ = socket::bind(slot, gen, socket::SockAddr::V4 {
+        ip: crate::network::dhcp::DHCP_GUEST_IP, port: 46020 });
+    // 握手到 Established
+    let syn = tcp::Segment { src_port: 7777, dst_port: 46020, seq: 100, ack: 0,
+        flags: tcp::SYN, window: 4096, data_off: 5, payload: &[] };
+    let _ = socket::tcp_on_segment(slot, gen, &syn,
+        socket::SockAddr::V4 { ip: [10, 0, 2, 2], port: 7777 });
+    let iss = socket::tcp_info(slot, gen).map(|i| i.snd_nxt - 1).unwrap_or(0);
+    let ack3 = tcp::Segment { src_port: 7777, dst_port: 46020, seq: 101, ack: iss.wrapping_add(1),
+        flags: tcp::ACK, window: 4096, data_off: 5, payload: &[] };
+    let _ = socket::tcp_on_segment(slot, gen, &ack3,
+        socket::SockAddr::V4 { ip: [10, 0, 2, 2], port: 7777 });
+    let _ = socket::connect(slot, gen, socket::SockAddr::V4 { ip: [10, 0, 2, 2], port: 7777 });
+
+    // 发一段 ⇒ arm
+    let sent = socket::tcp_send_payload(slot, gen, 8);
+    let sent_ok = sent.is_ok();
+    let sent_seq = sent.as_ref().map(|r| r.seq).unwrap_or(0);
+    // 直接分派重传（绕过真实定时器：判据运行时时钟未标定）
+    let dispatched = socket::tcp_handle_timer(timer::Kind::TcpRetransmit, slot as u64);
+    let dispatch_ok = matches!(dispatched, Some((s, _, r)) if s == slot && r.seq == sent_seq && r.payload_len == 8);
+    if !sent_ok || !dispatch_ok {
+        crate::log_fatal!("retx: 分派不对 sent={} dispatch={}", sent_ok, dispatch_ok);
+        ok = false;
+    }
+
+    // ⑧ 不认识的 Kind 回 None
+    let unknown_ok = socket::tcp_handle_timer(timer::Kind::UsbTimeout, slot as u64).is_none();
+    if !unknown_ok {
+        crate::log_fatal!("retx: 不认识的 Kind 竟然处理了");
+        ok = false;
+    }
+
+    // ⑨ 端到端：重传段发出去之后，收到 ACK 能取消
+    let e2e_arm = socket::tcp_info(slot, gen).is_some();
+    let ack_seg = tcp::Segment { src_port: 7777, dst_port: 46020,
+        seq: 101, ack: sent_seq.wrapping_add(8),
+        flags: tcp::ACK, window: 4096, data_off: 5, payload: &[] };
+    let _ = socket::tcp_on_segment(slot, gen, &ack_seg,
+        socket::SockAddr::V4 { ip: [10, 0, 2, 2], port: 7777 });
+    // 取消之后再分派重传，应该回 None（armed 已清）
+    let after_ack = socket::tcp_handle_timer(timer::Kind::TcpRetransmit, slot as u64);
+    let e2e_ok = e2e_arm && after_ack.is_none();
+    if !e2e_ok {
+        crate::log_fatal!("retx: 端到端取消不对 arm={} after_ack={}", e2e_arm, after_ack.is_some());
+        ok = false;
+    }
+
+    let _ = socket::destroy(slot, gen);
+    timer::clear();
+    crate::log_info!(
+        "retx: arm={} ACK取消={} 部分ACK不取消={} 不推进={} 退避={} 放弃={} 分派={} 不误伤={} 端到端={} ⇒ {}",
+        arm_ok, ack_ok, noack_ok, no_advance_ok, backoff_ok, giveup_ok, dispatch_ok, unknown_ok, e2e_ok, ok
+    );
+    ok
+}
+
+#[cfg(feature = "handles")]
+ktest!(KT_TCP_RETX, t_tcp_retx);
 

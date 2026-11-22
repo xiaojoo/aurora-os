@@ -73,6 +73,47 @@ impl State {
     }
 }
 
+/// 未确认段的记录（ADR-203）。
+///
+/// `armed = false` 表示「没有待重传的段」。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetxState {
+    /// 这一段起始序号。
+    pub seq: u32,
+    /// 这一段载荷长度（重传时原样再发）。
+    pub len: u16,
+    /// 标志位（重传时原样带）。
+    pub flags: u8,
+    /// 已经重传了几次（第一次发送时是 0）。
+    pub tries: u8,
+    /// 当前退避间隔（µs）。每次重传翻倍，上限 `RETX_MAX_BACKOFF_US`。
+    pub backoff_us: u32,
+    /// 有没有待重传的段。
+    pub armed: bool,
+}
+
+impl RetxState {
+    /// 空的（没有待重传）。
+    pub const EMPTY: Self = Self {
+        seq: 0, len: 0, flags: 0, tries: 0, backoff_us: 0, armed: false,
+    };
+}
+
+/// 首次重传间隔（ADR-203）：**200 ms**。
+///
+/// 真实 TCP 用 RTT 估计算 RTO。今天没有 RTT 测量 ⇒ 用固定值，
+/// 而固定值在网络抖动时会误判 —— 这是本 ADR 明确记下的取舍。
+pub const RETX_BASE_US: u32 = 200_000;
+
+/// 退避上限（ADR-203）：**3.2 s**（`200ms << 4`）。
+pub const RETX_MAX_BACKOFF_US: u32 = 3_200_000;
+
+/// 最多重传几次（ADR-203）：**6 次**。
+///
+/// 6 次 × 指数退避累计约 9.4 s 就放弃。Linux 的 `tcp_retries2` 默认 15（分钟级），
+/// 而本仓库的判据不能等那么久。
+pub const RETX_MAX_TRIES: u8 = 6;
+
 /// 连接的状态（**纯数据**，不含锁、不含槽号）。
 #[derive(Clone, Copy, Debug)]
 pub struct ConnState {
@@ -85,6 +126,11 @@ pub struct ConnState {
     pub iss: u32,
     /// 本端通告的窗口（**今天恒为固定值**，不做窗口缩放）。
     pub rcv_wnd: u16,
+    /// **重传状态**（ADR-203）。
+    ///
+    /// 今天只有一条：记「最近发出、尚未被确认的那一段」。真实 TCP 有队列，
+    /// 连续发两段时第一段的记录会被第二段覆盖 —— **这是真实的能力缺失**，已记进未决 1。
+    pub retx: RetxState,
 }
 
 /// 状态机对收到的一个段的**反应**。
@@ -115,12 +161,12 @@ pub struct Reply {
 impl ConnState {
     /// 新建一个**监听**连接。
     pub fn listen(iss: u32) -> Self {
-        Self { state: State::Listen, snd_nxt: iss, rcv_nxt: 0, iss, rcv_wnd: 8192 }
+        Self { state: State::Listen, snd_nxt: iss, rcv_nxt: 0, iss, rcv_wnd: 8192, retx: RetxState::EMPTY }
     }
 
     /// 新建一个**主动连接**（SYN_SENT）。
     pub fn connect(iss: u32) -> Self {
-        Self { state: State::SynSent, snd_nxt: iss, rcv_nxt: 0, iss, rcv_wnd: 8192 }
+        Self { state: State::SynSent, snd_nxt: iss, rcv_nxt: 0, iss, rcv_wnd: 8192, retx: RetxState::EMPTY }
     }
 
     /// 本端要发 SYN 时的段（主动连接用）。
@@ -372,4 +418,90 @@ pub fn close_send_fin_from_close_wait(st: &mut ConnState) -> Option<Reply> {
     };
     st.snd_nxt = st.snd_nxt.wrapping_add(1);
     Some(r)
+}
+
+// ---------------------------------------------------------------- ADR-203：重传
+
+impl ConnState {
+    /// **发出一个数据段之后登记重传**（ADR-203）。
+    ///
+    /// 由 `tcp_send_payload` 在推进 `snd_nxt` 之后调用。
+    ///
+    /// ## 为什么在这里记「段内容」
+    ///
+    /// 重传要**原样再发一次**（同样的 seq、同样的载荷、同样的标志）。
+    /// 所以必须记住长度与标志 —— 只记序号不够，因为重发时不知道该发多少字节。
+    pub fn arm_retx(&mut self, seq: u32, len: u16, flags: u8) {
+        self.retx = RetxState {
+            seq,
+            len,
+            flags,
+            tries: 0,
+            backoff_us: RETX_BASE_US,
+            armed: true,
+        };
+    }
+
+    /// **收到对该段的确认 ⇒ 取消重传**（ADR-203）。
+    ///
+    /// 判据：`ack >= seq + len`（对端确认了这一段的所有字节）。
+    /// 返回**是否真的取消了一条**（`false` = 本来就没有 / ack 还不够）。
+    ///
+    /// ## 为什么用 `>=` 而不是 `==`
+    ///
+    /// 真实 TCP 的 ACK 可以累积确认（一个 ACK 确认多个段）。今天只发一段，
+    /// 所以 `==` 也对；但用 `>=` 是**更安全的写法** —— 它不会因为对端回了个
+    /// 更大的 ack（比如重复确认）而漏掉取消。
+    pub fn ack_retx(&mut self, ack: u32) -> bool {
+        if !self.retx.armed {
+            return false;
+        }
+        let end = self.retx.seq.wrapping_add(self.retx.len as u32);
+        // 序号回绕安全的「ack >= end」判断
+        if ack.wrapping_sub(end) < 0x8000_0000 {
+            self.retx = RetxState::EMPTY;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// **该重传了**：检查次数上限，翻倍退避，返回要重发的段（ADR-203）。
+    ///
+    /// 返回 `None` = **放弃**（超过 `RETX_MAX_TRIES`），调用方应当判连接死亡。
+    ///
+    /// ## 这里不动 `snd_nxt`
+    ///
+    /// 重传**不推进**序号 —— 发的是同一段数据。
+    /// 这是重传与正常发送最关键的差别，也是最容易写错的地方。
+    pub fn on_retx_timeout(&mut self) -> Option<Reply> {
+        if !self.retx.armed {
+            return None;
+        }
+        if self.retx.tries >= RETX_MAX_TRIES {
+            // 放弃：连接判死
+            self.retx = RetxState::EMPTY;
+            return None;
+        }
+        self.retx.tries += 1;
+        // 指数退避，封顶
+        let next = self.retx.backoff_us.saturating_mul(2).min(RETX_MAX_BACKOFF_US);
+        self.retx.backoff_us = next;
+        Some(Reply {
+            seq: self.retx.seq,
+            ack: self.rcv_nxt,
+            flags: self.retx.flags,
+            window: self.rcv_wnd,
+            payload_len: self.retx.len,
+        })
+    }
+
+    /// 当前应当等多长时间（µs）再重传。`0` = 没有待重传。
+    pub fn retx_backoff_us(&self) -> u32 {
+        if self.retx.armed {
+            self.retx.backoff_us
+        } else {
+            0
+        }
+    }
 }

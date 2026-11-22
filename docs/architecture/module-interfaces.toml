@@ -661,7 +661,7 @@ allowed_callers = ["driver", "capability", "sched"]
 # 登记表写的是「现在是什么」，不是「打算变成什么」——计划属 ADR，事实属这里。
 # ADR-171：协议拆成 7 个文件后 `network` **不再依赖 driver**
 # （`fnv1a64` 换成自带的 `eth::frame_hash`）⇒ 出环。
-dependencies = ["sync", "driver"]
+dependencies = ["sync", "driver", "time"]
 forbidden_dependencies = ["storage", "display", "input"]
 known_violations = []
 test_targets = []
@@ -1007,10 +1007,12 @@ public_api = [
   "tsc::spin",
   "tsc::stage",
   "tsc::total_stages",
+  "timer::Kind", "timer::add_after_ms", "timer::Token", "timer::now_us",
   "timer::on_tick", "timer::post", "timer::drain", "timer::bottom_pending",
   "timer::bottom_dropped", "timer::bottom_clear", "timer::BottomItem", "timer::MAX_BOTTOM",
 ]
-allowed_callers = ["arch", "diagnostics", "driver", "integration", "memory", "sched", "sync"]
+allowed_callers = ["arch", "diagnostics", "driver", "integration", "memory", "sched", "sync", "network"]
+
 dependencies = ["arch", "diagnostics", "sync"]
 forbidden_dependencies = []
 known_violations = []
@@ -1174,6 +1176,7 @@ known_scc = [
 "arch->pci" = 6
 "arch->sync" = 3
 "arch->time" = 23
+  "network->time" = 4
 "boot->diagnostics" = 11
 "diagnostics->arch" = 32
 "diagnostics->driver" = 15

@@ -23010,3 +23010,85 @@ tick 接线（`apic::on_interrupt` 的 `TIMER_ISA_IRQ` 支）：`timer::on_tick(
 
 **所以：下半部这个「零件」也立住了，但同样还没接进真实业务。**
 下一步应该是 TCP 重传 —— 那是第一个真正消费定时器的业务。
+---
+
+## 521. ADR-203 落地：TCP 重传（定时器/下半部/TCP 三层首次串起来）（2026-11-22）
+
+### 拆掉的天花板
+
+前面几片一直记着一条：**「TCP 丢一个段就永久卡住」**。这一层把它拆掉。
+
+### 交付
+
+    pub struct RetxState { seq, len, flags, tries, backoff_us, armed }
+    RETX_BASE_US = 200_000 / RETX_MAX_BACKOFF_US = 3_200_000 / RETX_MAX_TRIES = 6
+
+    ConnState::arm_retx / ack_retx / on_retx_timeout
+    socket::tcp_handle_timer / tcp_arm_retx_timer
+
+### 决策 1：重传**不推进 `snd_nxt`**
+
+**这是重传与正常发送最关键的差别，也是最容易写错的地方。**
+
+重传发的是同一段数据。推进序号会让对端看到「跳过一个段」，而那个缺口永远补不上。
+负样本让它推进一次 —— 实测 `5000->5100` 当场红。
+
+### 决策 2：ACK 判据用 `ack >= seq + len`，不是 `==`
+
+真实 TCP 的 ACK 可以累积确认。`>=` 不会因为对端回了更大的 ack 而漏掉取消。
+序号回绕用 `ack.wrapping_sub(end) < 0x8000_0000` 判。
+
+### 决策 3：固定 200 ms 起步，指数退避到 3.2 s
+
+**真实 TCP 用 RTT 估计算 RTO。今天没有 RTT 测量 ⇒ 用固定值。**
+而固定值在网络抖动时会误判 —— 这是**明确记下的取舍，不是疏忽**。
+
+### 决策 4：只记**一段**，不是队列
+
+**这是真实的能力缺失**：连续发两段时，第一段的重传记录会被第二段覆盖。
+今天可接受是因为 `tcp_send_payload` 是「发一段等一段」的语义。已写进未决 1。
+
+### 判据九格
+
+    retx: arm=true ACK取消=true 部分ACK不取消=true 不推进=true 退避=true
+          放弃=true 分派=true 不误伤=true 端到端=true ⇒ true
+
+### 负样本
+
+让 `on_retx_timeout` 推进 `snd_nxt` ⇒「重传推进了 snd_nxt 5000->5100」红。
+
+### 一个判据自己写错的地方
+
+第 5 格（退避）第一版循环 10 次想「翻倍到封顶」，实测 `max=0`。
+
+**不是退避错** —— `tries` 到 6 就放弃，`armed` 被清、`backoff` 归零。
+改成正好 4 次（200→400→800→1600→3200 封顶）就对。
+
+### 三层第一次串起来的形状
+
+    定时器到期（ADR-201 的 advance/expire）
+      ↓
+    下半部投递（ADR-202 的 post → drain）
+      ↓
+    tcp_handle_timer(kind, token)   ← **这一层新加的接缝**
+      ↓
+    ConnState::on_retx_timeout()     → 拿到要重发的段
+
+### 读数
+
+| 项 | 结果 |
+|---|---|
+| `check` | **20/20** |
+| `handles` 3 连跑 | `t_tcp_retx` 三跑全绿，`PASS(33)` 2 次 |
+
+### 未做
+
+1. **重传队列**（现在只记一段）
+2. **RTT 测量与自适应 RTO**（现在固定 200 ms）
+3. **快速重传**（三个重复 ACK 立即重传）
+4. **`drain` 之后真的要发出去** —— 判据走的是 `tcp_handle_timer` 直接调用，
+   真实路径需要「有一个线程在 `drain` 并把段发出去」，那还没做
+5. **没有定时器时怎么办** —— `tcp_arm_retx_timer` 在时钟未标定时回 `None`，
+   调用方应当知道「这条连接没有重传保护」
+
+**所以：重传的「决策与状态」立住了，但「真的发出去」那一步还没接。**

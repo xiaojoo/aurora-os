@@ -738,15 +738,19 @@ pub fn tcp_on_segment(
     let mut payload = [0u8; crate::network::tcp::TCP_PAYLOAD_MAX];
     payload[..payload_len].copy_from_slice(&seg.payload[..payload_len]);
 
-    let (reaction, accepted) = s.tcp.with(|o| match o {
+    let (reaction, accepted, acked) = s.tcp.with(|o| match o {
         Some(st) => {
             let before = st.rcv_nxt;
             let r = tcp_conn::on_segment(st, seg);
-            // 只有真的前进了才算「这段数据被接受」
             let acc = st.rcv_nxt != before && payload_len > 0;
-            (r, acc)
+            // **收到 ACK ⇒ 取消重传**（ADR-203）。
+            //
+            // 这一步必须在 `on_segment` **之后**：状态机可能刚刚接受了这段数据，
+            // 而 ACK 号里带着对端对我们那一段的确认。
+            let acked = if seg.is_ack() { st.ack_retx(seg.ack) } else { false };
+            (r, acc, acked)
         }
-        None => (Reaction::Ignore, false),
+        None => (Reaction::Ignore, false, false),
     });
     // 放表锁（`g` 在这里 drop）
     drop(g);
@@ -755,6 +759,7 @@ pub fn tcp_on_segment(
         let _ = enqueue(slot_port(slot), src, &payload[..payload_len]);
     }
 
+    let _ = acked;
     match reaction {
         Reaction::Reply(r) => Ok(Some(r)),
         Reaction::Silent | Reaction::Ignore => Ok(None),
@@ -839,6 +844,9 @@ pub fn tcp_send_payload(
                 window: st.rcv_wnd,
                 payload_len: payload_len as u16,
             };
+            // **登记重传**（ADR-203）：记下这一段的序号/长度/标志，
+            // 没收到的 ACK 之前要能原样再发一次。
+            st.arm_retx(r.seq, r.payload_len, r.flags);
             st.snd_nxt = st.snd_nxt.wrapping_add(payload_len as u32);
             Ok(r)
         }
@@ -914,4 +922,65 @@ pub fn tcp_accept(listen_slot: u16, listen_gen: u32) -> Result<(u16, u32), u64> 
         s.peer = SockAddr::V4 { ip: [0; 4], port: 0 };
     }
     Ok((new_slot as u16, t.slots[new_slot].gen.load(Ordering::Acquire)))
+}
+
+/// **下半部分派**：处理一个到期项（ADR-203）。
+///
+/// ## 这是三层第一次真正串起来
+///
+/// 定时器（ADR-201）到点 → 下半部（ADR-202）投递 → **这里**分派到 TCP 重传。
+/// 前两层在此之前都只是「零件」，这是它们的第一个真实消费者。
+///
+/// ## 返回值
+///
+/// 返回 `Some(Reply)` 表示「要重发一个段」，调用方拿到后去装帧发出。
+/// 返回 `None` 表示「不用发 / 已放弃」。
+///
+/// **放弃时连接会被标记**（`retx.armed = false` 且 `tries` 到顶），
+/// 调用方可以从 `tcp_info` 看到状态没变但重传没了 —— 那是「连接死了」的信号。
+pub fn tcp_handle_timer(kind: crate::time::timer::Kind, token: u64) -> Option<(u16, u32, crate::network::tcp_conn::Reply)> {
+    use crate::time::timer::Kind;
+    match kind {
+        Kind::TcpRetransmit => {
+            let slot = token as u16;
+            let mut g = TABLE.lock();
+            let t = g.get();
+            let s = t.slots.get_mut(slot as usize)?;
+            if s.used.load(Ordering::Acquire) == 0 {
+                return None;
+            }
+            let gen = s.gen.load(Ordering::Acquire);
+            let r = s.tcp.with(|o| match o {
+                Some(st) => st.on_retx_timeout(),
+                None => None,
+            })?;
+            Some((slot, gen, r))
+        }
+        // 其它类别今天不处理（USB / 块层还没消费定时器）
+        _ => None,
+    }
+}
+
+/// **为一条连接的重传登记定时器**（ADR-203）。
+///
+/// 由 `tcp_send_payload` 的调用方在**发出段之后**调（发之前登记会让「发送失败」
+/// 也留下一个假的重传）。
+///
+/// 返回定时器槽号；登记失败（表满 / 时钟未标定）回 `None` —— **调用方要知道**，
+/// 因为没有定时器就没有重传。
+pub fn tcp_arm_retx_timer(slot: u16) -> Option<u16> {
+    let backoff = {
+        let mut g = TABLE.lock();
+        let t = g.get();
+        let s = t.slots.get(slot as usize)?;
+        s.tcp.get().map(|st| st.retx_backoff_us()).unwrap_or(0)
+    };
+    if backoff == 0 {
+        return None;
+    }
+    crate::time::timer::add_after_ms(
+        crate::time::timer::Kind::TcpRetransmit,
+        slot as u64,
+        (backoff / 1000) as u64,
+    )
 }
