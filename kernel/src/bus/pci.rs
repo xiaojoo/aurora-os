@@ -236,6 +236,10 @@ pub struct BarSize {
 /// 小端 ⇒ class 在**高字节**。这不再是解读：`KT_PCI` 拿"已知设备 ⇒ 已知类别"钉它
 /// （四台不同族的设备同时成立才算钉住，错一个字节序就会当场崩在某一台上）。
 impl Dev {
+    /// class 与 subclass 一起取（ADR-196 的匹配规则用）。
+    pub fn class_subclass(&self) -> (u8, u8) {
+        (((self.cfg08 >> 24) & 0xFF) as u8, ((self.cfg08 >> 16) & 0xFF) as u8)
+    }
     pub fn revision(&self) -> u8 {
         (self.cfg08 & 0xFF) as u8
     }

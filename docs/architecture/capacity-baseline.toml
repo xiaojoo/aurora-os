@@ -433,3 +433,12 @@ linux_source = "Linux 的 socket 总数受 RLIMIT_NOFILE 与内存约束，无�
 reason = "全系统 socket 槽数。256 x ~48 B = 12 KiB，放 .bss 不推高布局（ADR-179 的阈值是「容量 x 元素 > 几十 KiB」）。这是本轮接缝，不是硬件依据。"
 is_tradeoff = true
 cost = "Socket x 256（含每槽 8 个数据报队列，约 12 KiB 数据）"
+
+[[const]]
+kernel_const = "MAX_DRIVERS"
+value = 8
+section = "driver"
+linux_source = "Linux 无「驱动数量上限」常量：驱动通过 `module_init`/`pci_register_driver` 动态注册，表是链表（`drivers_kset`）。这里设上限是因为内核不用堆做长生命周期表"
+reason = "驱动注册表槽数。8 x ~40 B = 320 B，可忽略。今天 4 个驱动（ahci/virtio-blk/virtio-net/nvme），留一倍余量。**这是接缝尺，不是硬件依据**——超过 8 个驱动时应改成链表而不是改大这个数。"
+is_tradeoff = true
+cost = "DriverEntry x 8（每条 40 字节：名字指针 + 规则 3 字节 + 函数指针）"

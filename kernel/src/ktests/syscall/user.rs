@@ -2034,4 +2034,142 @@ fn t_lazy_as_owner() -> bool {
 #[cfg(feature = "handles")]
 ktest!(KT_LAZY_AS_OWNER, t_lazy_as_owner);
 
+/// ADR-196：**驱动注册表与 probe 链**的证人（切片 F）。
+///
+/// ## 要证什么
+///
+/// 今天驱动是 `main.rs` 里硬编码调用的。这一片加了「设备 → 驱动」的匹配与 probe 链。
+///
+/// ## 判据六格
+///
+/// 1. `register_builtin` 注册了**全部内置驱动**（≥ 3，nvme 门控下是 4）；
+/// 2. 规则按 class/subclass 匹配：`(0x01,0x06)` 只命中 AHCI，不命中 virtio-blk；
+/// 3. `class_only` 规则忽略 subclass；
+/// 4. **probe 链「第一个 Claimed 就返回」**：造两个驱动都匹配，只有第一个被调；
+/// 5. **`NotMine` 会让链继续**：第一个回 NotMine，第二个被调到；
+/// 6. **`Failed` 会让链立即停**：第一个回 Failed，第二个**不该**被调（否则掩盖错误）。
+///
+/// **负样本**：把 `Failed` 那支改成 `continue` ⇒ 第 6 格红。
+#[cfg(feature = "handles")]
+fn t_driver_match() -> bool {
+    use crate::driver::{self, DriverEntry, MatchRule, ProbeOutcome};
+    use core::sync::atomic::{AtomicU32, Ordering};
+    let mut ok = true;
+
+    // ---- ① 内置驱动注册
+    driver::registry_clear();
+    let n = driver::register_builtin();
+    let min = if cfg!(feature = "nvme") { 4 } else { 3 };
+    let reg_ok = n >= min && driver::registered() == n;
+    if !reg_ok {
+        crate::log_fatal!("drv: 内置驱动只注册了 {} 个（至少 {}）", n, min);
+        ok = false;
+    }
+
+    // ---- ② 规则按 class/subclass 匹配
+    let ahci_dev = crate::bus::pci::Dev {
+        bdf: 0, vendor: 0x8086, device: 0x2922,
+        // class=0x01 subclass=0x06：cfg08 的高字节是 class、次高是 subclass
+        cfg08: 0x0106_0000, hdr: 0, bar0: 0,
+    };
+    let blk_dev = crate::bus::pci::Dev { cfg08: 0x0100_0000, ..ahci_dev };
+    let net_dev = crate::bus::pci::Dev { cfg08: 0x0200_0000, ..ahci_dev };
+    let ahci_rule = MatchRule::new(0x01, 0x06);
+    let blk_rule = MatchRule::new(0x01, 0x00);
+    let net_rule = MatchRule::new(0x02, 0x00);
+    let match_ok = ahci_rule.matches(&ahci_dev)
+        && !ahci_rule.matches(&blk_dev)
+        && blk_rule.matches(&blk_dev)
+        && !blk_rule.matches(&ahci_dev)
+        && net_rule.matches(&net_dev)
+        && !net_rule.matches(&blk_dev);
+    if !match_ok {
+        crate::log_fatal!("drv: class/subclass 匹配不对");
+        ok = false;
+    }
+
+    // ---- ③ class_only 忽略 subclass
+    let any01 = MatchRule::class_only(0x01);
+    let class_only_ok = any01.matches(&ahci_dev) && any01.matches(&blk_dev) && !any01.matches(&net_dev);
+    if !class_only_ok {
+        crate::log_fatal!("drv: class_only 规则不对");
+        ok = false;
+    }
+
+    // ---- ④⑤⑥ probe 链语义（用计数探针）
+    static CALLED_A: AtomicU32 = AtomicU32::new(0);
+    static CALLED_B: AtomicU32 = AtomicU32::new(0);
+    fn probe_claim(_d: &crate::bus::pci::Dev) -> ProbeOutcome {
+        CALLED_A.fetch_add(1, Ordering::Relaxed);
+        ProbeOutcome::Claimed
+    }
+    fn probe_notmine(_d: &crate::bus::pci::Dev) -> ProbeOutcome {
+        CALLED_A.fetch_add(1, Ordering::Relaxed);
+        ProbeOutcome::NotMine
+    }
+    fn probe_fail(_d: &crate::bus::pci::Dev) -> ProbeOutcome {
+        CALLED_A.fetch_add(1, Ordering::Relaxed);
+        ProbeOutcome::Failed(driver::DriverError::NoDevice)
+    }
+    fn probe_second(_d: &crate::bus::pci::Dev) -> ProbeOutcome {
+        CALLED_B.fetch_add(1, Ordering::Relaxed);
+        ProbeOutcome::Claimed
+    }
+
+    // ④ 第一个 Claimed 就返回
+    driver::registry_clear();
+    CALLED_A.store(0, Ordering::Relaxed);
+    CALLED_B.store(0, Ordering::Relaxed);
+    driver::register(DriverEntry { name: "a", rule: ahci_rule, probe: probe_claim });
+    driver::register(DriverEntry { name: "b", rule: ahci_rule, probe: probe_second });
+    let r4 = driver::probe_device(&ahci_dev);
+    let claim_ok = matches!(r4, Some(("a", ProbeOutcome::Claimed)))
+        && CALLED_A.load(Ordering::Relaxed) == 1
+        && CALLED_B.load(Ordering::Relaxed) == 0;
+    if !claim_ok {
+        crate::log_fatal!("drv: Claimed 之后链没停");
+        ok = false;
+    }
+
+    // ⑤ NotMine 继续
+    driver::registry_clear();
+    CALLED_A.store(0, Ordering::Relaxed);
+    CALLED_B.store(0, Ordering::Relaxed);
+    driver::register(DriverEntry { name: "a", rule: ahci_rule, probe: probe_notmine });
+    driver::register(DriverEntry { name: "b", rule: ahci_rule, probe: probe_second });
+    let r5 = driver::probe_device(&ahci_dev);
+    let notmine_ok = matches!(r5, Some(("b", ProbeOutcome::Claimed)))
+        && CALLED_A.load(Ordering::Relaxed) == 1
+        && CALLED_B.load(Ordering::Relaxed) == 1;
+    if !notmine_ok {
+        crate::log_fatal!("drv: NotMine 之后链没继续");
+        ok = false;
+    }
+
+    // ⑥ Failed 立即停（不掩盖错误）
+    driver::registry_clear();
+    CALLED_A.store(0, Ordering::Relaxed);
+    CALLED_B.store(0, Ordering::Relaxed);
+    driver::register(DriverEntry { name: "a", rule: ahci_rule, probe: probe_fail });
+    driver::register(DriverEntry { name: "b", rule: ahci_rule, probe: probe_second });
+    let r6 = driver::probe_device(&ahci_dev);
+    let fail_ok = matches!(r6, Some(("a", ProbeOutcome::Failed(_))))
+        && CALLED_B.load(Ordering::Relaxed) == 0;
+    if !fail_ok {
+        crate::log_fatal!("drv: Failed 之后链没停（会掩盖错误）");
+        ok = false;
+    }
+
+    // 收场：恢复内置注册（后面的用例可能要看）
+    driver::registry_clear();
+    let _ = driver::register_builtin();
+    crate::log_info!(
+        "drv: 内置={} 匹配={} class_only={} Claimed停={} NotMine续={} Failed停={} ⇒ {}",
+        n, match_ok, class_only_ok, claim_ok, notmine_ok, fail_ok, ok
+    );
+    ok
+}
+
+#[cfg(feature = "handles")]
+ktest!(KT_DRIVER_MATCH, t_driver_match);
 

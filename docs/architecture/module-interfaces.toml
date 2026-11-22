@@ -668,7 +668,10 @@ public_api = [
   "virtio::VirtioError", "virtio::read_block", "virtio::write_block", "virtio::read_block_at",
   "virtio::write_block_at", "virtio::bind_net", "virtio::send_raw", "virtio::receive",
   "virtio::net_info", "ahci::State", "ahci::info", "ahci::state", "nvme::NvmeError",
-  "nvme::read_lba", "nvme::write_lba"
+  "nvme::read_lba", "nvme::write_lba",
+  "nvme::init", "virtio::probe", "driver::MatchRule", "driver::ProbeOutcome",
+  "driver::DriverEntry", "driver::MAX_DRIVERS", "driver::register", "driver::registered", "driver::driver_name",
+  "driver::registry_clear", "driver::probe_device", "driver::register_builtin", "driver::matching_rules",
 ]
 allowed_callers = ["diagnostics", "integration", "sched", "storage", "network"]
 dependencies = [
@@ -1163,7 +1166,7 @@ known_scc = [
 "driver->boot" = 1
 "driver->irq" = 19
 "driver->memory" = 21
-"driver->pci" = 21
+"driver->pci" = 27
 "driver->time" = 13
 "irq->arch" = 29
 "irq->memory" = 1

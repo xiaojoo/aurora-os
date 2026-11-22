@@ -662,6 +662,15 @@ fn stage_acpi_and_pci() {
                     d.hdr,
                     d.bar0
                 );
+                // **只记录「哪条规则会匹配它」，不真的 probe**（ADR-196）。
+                //
+                // 为什么不在这里 probe：驱动的 `init()` 会真去动设备，而启动路径
+                // 今天的顺序是「AHCI 在 `stage_storage_guard_crash` 里认领」。
+                // 在这里再 probe 一次会重复初始化（虽然幂等，但日志会乱）。
+                //
+                // probe 链本身的正确性由 `t_driver_match` 单独证。
+                let (c, sc) = d.class_subclass();
+                crate::log_info!("pci:   类别={:#04x}/{:#04x} 匹配={}", c, sc, crate::driver::matching_rules(c, sc));
             }
         }
     }
@@ -704,6 +713,13 @@ fn stage_fault_injections() {
 
 /// 存储认领、启动循环保护与上一次崩溃的读回。
 fn stage_storage_guard_crash() {
+    // **先注册驱动，再让 probe 链去认领设备**（ADR-196）。
+    //
+    // 注册是纯内存操作（4 条表项），放在这里是为了让下面的 `probe_device` 有东西可匹配。
+    // **顺序有意义**：AHCI 先于 virtio-blk 注册，所以同一台 class=0x01 的设备
+    // 会先被 AHCI 试（它的规则更具体：subclass=0x06 vs 0x00）。
+    let n_reg = crate::driver::register_builtin();
+    crate::log_info!("boot: 驱动注册 {} 个（上限 {}）", n_reg, crate::driver::MAX_DRIVERS);
     // ---- §9.4 的启动循环保护：必须先有存储，才谈得上"跨重启的那个计数"。
     // 认领提到启动路径里不是顺手多调一次（`ahci::init` 本来就幂等）：`decide()` 要在
     // 任何可能崩的路径**之前**把 `n+1` 写回盘，而驱动与用例都在后面。

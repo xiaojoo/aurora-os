@@ -544,3 +544,245 @@ pub(crate) mod virtio;
 /// （AHCI/virtio 都是这个顺序）。
 #[cfg(feature = "nvme")]
 pub(crate) mod nvme;
+
+// ---------------------------------------------------------------- ADR-196：驱动注册表与 probe 链
+
+/// 一个驱动的**匹配规则**（ADR-196）。
+///
+/// ## 为什么需要它
+///
+/// 今天驱动是 `main.rs` 里**硬编码调用**的：
+///
+/// ```rust
+/// match ahci::init() { ... }
+/// ```
+///
+/// 加一块新设备就要改一次 `main.rs`。这不是「少了某个功能」，而是**设备模型不存在**。
+///
+/// ## 规则怎么表达
+///
+/// 只按 **PCI class/subclass** 匹配（今天够用）：
+///
+/// - `class = 0x01, subclass = 0x06` ⇒ AHCI（SATA 控制器）
+/// - `class = 0x01, subclass = 0x08` ⇒ NVMe
+/// - `class = 0x02, subclass = 0x00` ⇒ 以太网（virtio-net）
+/// - `class = 0x01, subclass = 0x00` ⇒ SCSI/其它块设备（virtio-blk）
+///
+/// **不按 vendor/device 匹配**：那会把规则变成一张永远填不完的表，而 class 是设备自己声明的能力。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MatchRule {
+    /// PCI class。
+    pub class: u8,
+    /// PCI subclass。
+    pub subclass: u8,
+    /// 允许 subclass 为任意值。
+    pub any_subclass: bool,
+}
+
+impl MatchRule {
+    pub const fn new(class: u8, subclass: u8) -> Self {
+        Self { class, subclass, any_subclass: false }
+    }
+
+    pub const fn class_only(class: u8) -> Self {
+        Self { class, subclass: 0, any_subclass: true }
+    }
+
+    /// 这个规则是否匹配一台设备。
+    pub fn matches(&self, dev: &crate::bus::pci::Dev) -> bool {
+        let (c, s) = dev.class_subclass();
+        c == self.class && (self.any_subclass || s == self.subclass)
+    }
+}
+
+/// probe 的结果（ADR-196）。
+///
+/// **不用 `Result<(), E>`**：`Claimed` 与 `NotMine` 是两种完全不同的结果，
+/// 而「probe 失败」又要和「不是我的设备」分开 —— 前者是错误，后者是正常。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    /// 认领成功。
+    Claimed,
+    /// 不是我的设备（规则匹配了但驱动自己判断不是）。**不是错误。**
+    NotMine,
+    /// 是我的，但初始化失败。**是错误。**
+    Failed(DriverError),
+}
+
+/// 一个驱动：匹配规则 + probe 函数 + 名字（ADR-196）。
+#[derive(Clone, Copy)]
+pub struct DriverEntry {
+    /// 驱动名（日志与判据用，**不参与匹配**）。
+    pub name: &'static str,
+    /// 匹配规则。
+    pub rule: MatchRule,
+    /// probe 入口。
+    pub probe: fn(&crate::bus::pci::Dev) -> ProbeOutcome,
+}
+
+/// 驱动注册表容量（ADR-196）。
+///
+/// **8 是接缝尺，不是推导值**：今天 4 个驱动，留一倍余量。超了 `register` 回 `false`。
+pub const MAX_DRIVERS: usize = 8;
+
+struct Registry {
+    entries: [Option<DriverEntry>; MAX_DRIVERS],
+    n: usize,
+}
+
+struct RegistryCell(core::cell::UnsafeCell<Registry>);
+// SAFETY: 注册只在启动期单核做；probe 链也只跑一次。载荷全为 Copy。
+unsafe impl Sync for RegistryCell {}
+
+static REGISTRY: RegistryCell = RegistryCell(core::cell::UnsafeCell::new(Registry {
+    entries: [None; MAX_DRIVERS],
+    n: 0,
+}));
+
+/// 注册一个驱动。**启动期调用**；表满回 `false`（不静默丢弃）。
+pub fn register(e: DriverEntry) -> bool {
+    // SAFETY: 启动期单核，没有并发访问者。
+    let r = unsafe { &mut *REGISTRY.0.get() };
+    if r.n >= MAX_DRIVERS {
+        return false;
+    }
+    r.entries[r.n] = Some(e);
+    r.n += 1;
+    true
+}
+
+/// 已注册的驱动数（判据用）。
+pub fn registered() -> usize {
+    // SAFETY: 只读快照。
+    unsafe { (*REGISTRY.0.get()).n }
+}
+
+/// 已注册的驱动名（判据用；越界回 `None`）。
+pub fn driver_name(i: usize) -> Option<&'static str> {
+    // SAFETY: 只读快照。
+    let r = unsafe { &*REGISTRY.0.get() };
+    r.entries.get(i).and_then(|e| e.as_ref()).map(|e| e.name)
+}
+
+/// 清空注册表（判据用）。
+pub fn registry_clear() {
+    // SAFETY: 启动期单核。
+    let r = unsafe { &mut *REGISTRY.0.get() };
+    for e in r.entries.iter_mut() {
+        *e = None;
+    }
+    r.n = 0;
+}
+
+/// 对一台设备跑 probe 链，返回**第一个**认领它的驱动名（ADR-196）。
+///
+/// ## 语义
+///
+/// - 规则不匹配 ⇒ 跳过（不算失败）；
+/// - 规则匹配但驱动回 `NotMine` ⇒ 继续试下一个；
+/// - 回 `Claimed` ⇒ **立即返回**（一台设备只归一个驱动）；
+/// - 回 `Failed` ⇒ **也立即返回**（是我的但坏了，不该让下一个驱动再试 —— 那会掩盖错误）。
+pub fn probe_device(dev: &crate::bus::pci::Dev) -> Option<(&'static str, ProbeOutcome)> {
+    // SAFETY: 只读快照。
+    let r = unsafe { &*REGISTRY.0.get() };
+    for e in r.entries.iter().flatten() {
+        if !e.rule.matches(dev) {
+            continue;
+        }
+        match (e.probe)(dev) {
+            ProbeOutcome::Claimed => return Some((e.name, ProbeOutcome::Claimed)),
+            ProbeOutcome::Failed(err) => return Some((e.name, ProbeOutcome::Failed(err))),
+            ProbeOutcome::NotMine => continue,
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------- ADR-196：四个驱动的 probe 适配器
+
+/// AHCI 的 probe 适配器：`class=0x01, subclass=0x06`（SATA 控制器）。
+///
+/// **不检查 vendor/device**：AHCI 是一个接口规范，任何厂商的 SATA 控制器都该走它。
+fn probe_ahci(_dev: &crate::bus::pci::Dev) -> ProbeOutcome {
+    match crate::ahci::init() {
+        Ok(_) => ProbeOutcome::Claimed,
+        // `init` 的失败分两类，这里**不细分**（那是 `ahci.rs` 的事）：
+        // 一律当 `Failed` 报出去，由调用方决定是否降级。
+        Err(_) => ProbeOutcome::Failed(DriverError::NoDevice),
+    }
+}
+
+/// virtio 的 probe 适配器：`class=0x01, subclass=0x00`（块）与 `class=0x02, subclass=0x00`（网）。
+///
+/// **同一个 `virtio::probe()` 服务两种设备**：它自己按 PCI capability 找 virtio 结构，
+/// 内部区分 blk/net。所以两个规则都指向它。
+fn probe_virtio(_dev: &crate::bus::pci::Dev) -> ProbeOutcome {
+    match crate::virtio::probe() {
+        Ok(_) => ProbeOutcome::Claimed,
+        Err(_) => ProbeOutcome::NotMine,
+    }
+}
+
+/// NVMe 的 probe 适配器：`class=0x01, subclass=0x08`。
+///
+/// **门控在 `nvme` 特性下**：那个模块本身是 `#[cfg(feature = "nvme")]` 的。
+#[cfg(feature = "nvme")]
+fn probe_nvme(_dev: &crate::bus::pci::Dev) -> ProbeOutcome {
+    match crate::driver::nvme::init() {
+        Ok(_) => ProbeOutcome::Claimed,
+        Err(_) => ProbeOutcome::NotMine,
+    }
+}
+
+/// 注册全部内置驱动（ADR-196）。**启动期调一次**。
+///
+/// 返回注册成功的个数；表满或重复注册由调用方看返回值（不静默）。
+pub fn register_builtin() -> usize {
+    let mut n = 0;
+    if register(DriverEntry {
+        name: "ahci",
+        rule: MatchRule::new(0x01, 0x06),
+        probe: probe_ahci,
+    }) {
+        n += 1;
+    }
+    // virtio-blk：class 0x01 subclass 0x00（SCSI/其它块设备）
+    if register(DriverEntry {
+        name: "virtio-blk",
+        rule: MatchRule::new(0x01, 0x00),
+        probe: probe_virtio,
+    }) {
+        n += 1;
+    }
+    // virtio-net：class 0x02 subclass 0x00（以太网）
+    if register(DriverEntry {
+        name: "virtio-net",
+        rule: MatchRule::new(0x02, 0x00),
+        probe: probe_virtio,
+    }) {
+        n += 1;
+    }
+    // NVMe：class 0x01 subclass 0x08（门控在 `nvme` 特性下）
+    #[cfg(feature = "nvme")]
+    if register(DriverEntry {
+        name: "nvme",
+        rule: MatchRule::new(0x01, 0x08),
+        probe: probe_nvme,
+    }) {
+        n += 1;
+    }
+    n
+}
+
+/// 有多少条规则会匹配 `(class, subclass)`（ADR-196 的启动期记录用）。
+///
+/// **不 probe**：只数规则。启动路径不该为了打一行日志去动设备。
+pub fn matching_rules(class: u8, subclass: u8) -> usize {
+    // SAFETY: 只读快照。
+    let r = unsafe { &*REGISTRY.0.get() };
+    r.entries
+        .iter()
+        .flatten()
+        .filter(|e| e.rule.class == class && (e.rule.any_subclass || e.rule.subclass == subclass))
+        .count()
+}
