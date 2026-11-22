@@ -42,6 +42,16 @@ impl<'a> Budget<'a> {
         clock: no_clock,
         cancel: &NEVER_CANCEL,
     };
+
+    /// 有没有可能被取消（ADR-194）。
+    ///
+    /// 合并窗口用它决定段长：有取消位时段要短，否则取消要等一整个大段读完。
+    /// 判据是「指针不是那个永假静态量」——**不是**读它的值（值随时可能被置位，
+    /// 而「会不会被取消」是构造时决定的）。
+    #[inline]
+    pub fn has_cancel(&self) -> bool {
+        !core::ptr::eq(self.cancel, &NEVER_CANCEL)
+    }
 }
 
 /// 一次请求的结果。`error == None` 当且仅当 `sectors_done == 请求的扇区数`。
@@ -148,25 +158,41 @@ pub fn read_at(disk: &dyn Block, lba: u64, dst: &mut [u8], budget: &Budget<'_>) 
     }
     let n = (dst.len() / SECTOR_BYTES) as u32;
     let bounded = budget.deadline != u64::MAX;
-    for i in 0..n {
+    // **合并传输**（ADR-194）：连续扇区合成一次 `read_sectors`。
+    //
+    // 第一版逐扇区调（每次 512 字节）⇒ 读 64 KiB 要发 128 条命令，每条约 20 µs，
+    // 多花 2.5 ms；而 AHCI 单次能吃 928 扇区。
+    //
+    // 段长：无界 128 扇区（64 KiB），有死线/取消时 8 扇区（粒度细）。
+    // **内联而不抽函数**：抽成 `impl Iterator` 会让 `.text` 布局变化，
+    // 实测那个变化触发了收尾路径的 `unexpected vector=13`（本轮踩过）。
+    let cap: u32 = if budget.deadline == u64::MAX && !budget.has_cancel() { 128 } else { 8 };
+    let mut done = 0u32;
+    while done < n {
+        let mut take = (n - done).min(cap);
+        while take > 0 && lba.checked_add(u64::from(done) + u64::from(take)).is_none() {
+            take -= 1;
+        }
+        if take == 0 {
+            break;
+        }
+        let at = lba + u64::from(done);
         if budget.cancel.load(Ordering::Relaxed) {
             b.cancels.fetch_add(1, Ordering::Relaxed);
-            return Outcome { sectors_done: i, error: Some(BlockError::Refused) };
+            return Outcome { sectors_done: done, error: Some(BlockError::Refused) };
         }
         if bounded && (budget.clock)() >= budget.deadline {
             b.timeouts.fetch_add(1, Ordering::Relaxed);
-            return Outcome { sectors_done: i, error: Some(BlockError::NotSettled) };
+            return Outcome { sectors_done: done, error: Some(BlockError::NotSettled) };
         }
-        let Some(cur) = lba.checked_add(u64::from(i)) else {
-            b.refused.fetch_add(1, Ordering::Relaxed);
-            return Outcome { sectors_done: 0, error: Some(BlockError::Refused) };
-        };
-        let off = i as usize * SECTOR_BYTES;
-        match disk.read_sectors(cur, &mut dst[off..off + SECTOR_BYTES]) {
+        let off = done as usize * SECTOR_BYTES;
+        let end = off + take as usize * SECTOR_BYTES;
+        match disk.read_sectors(at, &mut dst[off..end]) {
             Ok(()) => {
-                b.sectors_ok.fetch_add(1, Ordering::Relaxed);
+                b.sectors_ok.fetch_add(take as u64, Ordering::Relaxed);
+                done += take;
             }
-            Err(e) => return Outcome { sectors_done: i, error: Some(e) },
+            Err(e) => return Outcome { sectors_done: done, error: Some(e) },
         }
     }
     Outcome { sectors_done: n, error: None }

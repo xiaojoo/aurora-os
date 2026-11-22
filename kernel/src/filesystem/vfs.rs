@@ -333,7 +333,22 @@ fn nvme_block_err(e: crate::nvme::NvmeError) -> BlockError {
 #[derive(Debug, Clone, Copy)]
 pub struct MemDisk<'a> {
     pub img: &'a [u8],
+}/// MemDisk 的 `read_sectors` 调用计数（ADR-194 的判据用）。
+///
+/// **只给判据用**：合并读的效果只能靠「发了几条命令」证明，不能靠耗时（那是量具噪声）。
+static MEMDISK_READS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// 读计数器当前值。
+pub fn memdisk_read_calls() -> u32 {
+    MEMDISK_READS.load(core::sync::atomic::Ordering::Acquire)
 }
+
+/// 把计数器清零（每个判据格开始前调）。
+pub fn memdisk_reset_calls() {
+    MEMDISK_READS.store(0, core::sync::atomic::Ordering::Release);
+}
+
+
 
 impl Block for MemDisk<'_> {
     fn read_sectors(&self, lba: u64, dst: &mut [u8]) -> Result<(), BlockError> {
@@ -347,6 +362,7 @@ impl Block for MemDisk<'_> {
         if end > self.img.len() {
             return Err(BlockError::Refused);
         }
+        MEMDISK_READS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         dst.copy_from_slice(&self.img[start..end]);
         Ok(())
     }
