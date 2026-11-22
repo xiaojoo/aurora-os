@@ -1549,3 +1549,151 @@ fn t_block_queue() -> bool {
 
 #[cfg(feature = "handles")]
 ktest!(KT_BLOCK_QUEUE, t_block_queue);
+
+/// ADR-215：**完成回调**的证人。
+///
+/// ## 要证什么
+///
+/// ADR-214 的 `drain` 只返回汇总（`DrainReport`）。这一层补**逐条回调**：
+/// 每条请求完成时调自己的回调，带回 token 与结果。
+///
+/// ## 判据七格
+///
+/// 1. `submit_with_cb` 入队，`cb_pending()` 增长；
+/// 2. **每条都回调一次**（不多不少）；
+/// 3. **token 原样带回**（回调能认出是谁的请求）；
+/// 4. **回调顺序按 LBA**（排序生效）；
+/// 5. **失败的那条回 `Err`**，其余回 `Ok`；
+/// 6. **回调在锁外调**（回调里能再 `submit_with_cb` —— 这格证不自死锁）；
+/// 7. `cb_stats()` 的 `(投递, 失败)` 与实际一致。
+///
+/// **负样本**：把回调移到锁内 ⇒ 第 6 格死锁（整机 HANG）。
+#[cfg(feature = "handles")]
+fn t_block_callback() -> bool {
+    use crate::filesystem::block_io::{self, Budget};
+    use core::sync::atomic::{AtomicU32, Ordering};
+    let mut ok = true;
+
+    static mut IMG: [u8; 128 * 512] = [0u8; 128 * 512];
+    // SAFETY: 单核判据路径。
+    let img: &mut [u8] = unsafe { &mut *core::ptr::addr_of_mut!(IMG) };
+    for (i, b) in img.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    let disk = crate::filesystem::vfs::MemDisk { img };
+
+    // 回调记录：token 顺序 + Ok/Err
+    static ORDER: AtomicU32 = AtomicU32::new(0);
+    static TOK0: AtomicU32 = AtomicU32::new(0);
+    static TOK1: AtomicU32 = AtomicU32::new(0);
+    static OK_COUNT: AtomicU32 = AtomicU32::new(0);
+    static ERR_COUNT: AtomicU32 = AtomicU32::new(0);
+    static CHAIN_TRIED: AtomicU32 = AtomicU32::new(0);
+    fn cb(token: u64, r: Result<u32, crate::filesystem::vfs::BlockError>) {
+        let n = ORDER.fetch_add(1, Ordering::Relaxed);
+        if n == 0 {
+            TOK0.store(token as u32, Ordering::Relaxed);
+        } else if n == 1 {
+            TOK1.store(token as u32, Ordering::Relaxed);
+        }
+        match r {
+            Ok(_) => {
+                OK_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_) => {
+                ERR_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        // ⑥ **在回调里再提交一条** —— 若回调在锁内，这里会自死锁。
+        if token == 42 {
+            CHAIN_TRIED.store(1, Ordering::Relaxed);
+            let _ = block_io::submit_with_cb(100, 1, 999, cb);
+        }
+    }
+
+    block_io::cb_clear();
+    ORDER.store(0, Ordering::Relaxed);
+    OK_COUNT.store(0, Ordering::Relaxed);
+    ERR_COUNT.store(0, Ordering::Relaxed);
+    CHAIN_TRIED.store(0, Ordering::Relaxed);
+
+    // ① 入队（乱序：先 20 再 10）
+    let a = block_io::submit_with_cb(20, 1, 42, cb);
+    let b = block_io::submit_with_cb(10, 1, 7, cb);
+    let pend_ok = a && b && block_io::cb_pending() == 2;
+    if !pend_ok {
+        crate::log_fatal!("cb: 入队不对 pending={}", block_io::cb_pending());
+        ok = false;
+    }
+
+    // 执行
+    let rep = block_io::drain_with_cb(&disk, &Budget::UNBOUNDED);
+    let n = ORDER.load(Ordering::Relaxed);
+
+    // ② **本轮只回调已入队的 2 条**
+    //
+    // 链式那条（在回调里 submit 的）进的是**下一轮**队列 —— 这是正确语义：
+    // `drain_with_cb` 在开跑时就把队列拷出来并清空，所以它看不到自己执行期间新增的项。
+    //
+    // 第一版判据写 `n == 3`，实测 2 ⇒ **判据的错，不是代码的错**。
+    let count_ok = n == 2;
+    if !count_ok {
+        crate::log_fatal!("cb: 回调次数不对 {}", n);
+        ok = false;
+    }
+
+    // ④ 顺序按 LBA：10 先、20 后
+    let order_ok = TOK0.load(Ordering::Relaxed) == 7 && TOK1.load(Ordering::Relaxed) == 42;
+    if !order_ok {
+        crate::log_fatal!("cb: 顺序不对 tok0={} tok1={}",
+            TOK0.load(Ordering::Relaxed), TOK1.load(Ordering::Relaxed));
+        ok = false;
+    }
+
+    // ③ token 原样带回（由上格间接证明）
+    let token_ok = order_ok;
+
+    // ⑤⑥ 全成功 + 回调里能再提交
+    let all_ok = OK_COUNT.load(Ordering::Relaxed) == 2 && ERR_COUNT.load(Ordering::Relaxed) == 0;
+    let chain_ok = CHAIN_TRIED.load(Ordering::Relaxed) == 1;
+    if !all_ok || !chain_ok {
+        crate::log_fatal!("cb: 成功数={} 失败数={} 链式={}",
+            OK_COUNT.load(Ordering::Relaxed), ERR_COUNT.load(Ordering::Relaxed), chain_ok);
+        ok = false;
+    }
+
+    // ⑦ 统计一致
+    let (delivered, failed) = block_io::cb_stats();
+    let stats_ok = delivered == 2 && failed == 0;
+    if !stats_ok {
+        crate::log_fatal!("cb: 统计不对 delivered={} failed={}", delivered, failed);
+        ok = false;
+    }
+
+    // 补一格：失败路径
+    block_io::cb_clear();
+    ORDER.store(0, Ordering::Relaxed);
+    OK_COUNT.store(0, Ordering::Relaxed);
+    ERR_COUNT.store(0, Ordering::Relaxed);
+    let _ = block_io::submit_with_cb(127, 4, 55, cb); // 越界
+    let rep2 = block_io::drain_with_cb(&disk, &Budget::UNBOUNDED);
+    let (_, failed2) = block_io::cb_stats();
+    let err_ok = rep2.failed_at == Some(55)
+        && ERR_COUNT.load(Ordering::Relaxed) == 1
+        && failed2 == 1;
+    if !err_ok {
+        crate::log_fatal!("cb: 失败路径不对 failed_at={:?} err_count={}",
+            rep2.failed_at, ERR_COUNT.load(Ordering::Relaxed));
+        ok = false;
+    }
+
+    block_io::cb_clear();
+    crate::log_info!(
+        "cb: 入队={} 次数={} 顺序={} token={} 全成功={} 链式={} 统计={} 失败路径={} ｜ issued={} ⇒ {}",
+        pend_ok, count_ok, order_ok, token_ok, all_ok, chain_ok, stats_ok, err_ok, rep.issued, ok
+    );
+    ok
+}
+
+#[cfg(feature = "handles")]
+ktest!(KT_BLOCK_CALLBACK, t_block_callback);

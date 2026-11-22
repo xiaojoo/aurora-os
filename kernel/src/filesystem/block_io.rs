@@ -465,3 +465,190 @@ pub fn drain(disk: &dyn Block, budget: &Budget<'_>) -> DrainReport {
         failed_at,
     }
 }
+
+// ---------------------------------------------------------------- ADR-215：完成回调
+
+/// 完成回调的签名（ADR-215）。
+///
+/// 收「原始提交者的 token」与「结果」。**不回传数据** —— 数据在调用方自己的缓冲里，
+/// 回调只负责「好了/错了」。
+pub type OnComplete = fn(token: u64, result: Result<u32, BlockError>);
+
+/// 带回调的请求（ADR-215）。
+#[derive(Clone, Copy)]
+pub struct Pending {
+    pub req: Request,
+    pub cb: Option<OnComplete>,
+}
+
+struct CbQueue {
+    items: [Pending; QUEUE_MAX],
+    len: usize,
+    seq: u32,
+    /// 回调投递计数（判据用）。
+    delivered: u32,
+    /// 回调失败计数。
+    failed: u32,
+}
+
+struct CbQueueCell(core::cell::UnsafeCell<CbQueue>);
+// SAFETY: 读写全在 `CB_LOCK` 内；载荷全为 Copy。
+unsafe impl Sync for CbQueueCell {}
+
+static CB_QUEUE: CbQueueCell = CbQueueCell(core::cell::UnsafeCell::new(CbQueue {
+    items: [Pending {
+        req: Request { lba: 0, sectors: 0, token: 0, seq: 0 },
+        cb: None,
+    }; QUEUE_MAX],
+    len: 0,
+    seq: 0,
+    delivered: 0,
+    failed: 0,
+}));
+
+static CB_LOCK: crate::sync::IrqSpinLock<()> =
+    crate::sync::IrqSpinLock::new(crate::sync::RANK_BLOCK, ());
+
+/// **提交一条带回调的请求**（ADR-215）。
+///
+/// ## 与 `submit` 的区别
+///
+/// `submit` 的完成是 `drain` 的返回值（汇总）；这里的完成是**逐条回调**。
+///
+/// 两个队列分开，是因为它们的语义不同：
+///
+/// - `QUEUE` 是「批量提交、一次执行、一个汇总」；
+/// - `CB_QUEUE` 是「逐条提交、逐条回调」。
+///
+/// **混在一起会让「谁的回调该被调」变得含糊。**
+pub fn submit_with_cb(lba: u64, sectors: u32, token: u64, cb: OnComplete) -> bool {
+    if sectors == 0 {
+        return false;
+    }
+    let _g = CB_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let q = unsafe { &mut *CB_QUEUE.0.get() };
+    if q.len >= QUEUE_MAX {
+        return false;
+    }
+    q.seq = q.seq.wrapping_add(1);
+    q.items[q.len] = Pending {
+        req: Request { lba, sectors, token, seq: q.seq },
+        cb: Some(cb),
+    };
+    q.len += 1;
+    true
+}
+
+/// 带回调的队列里排着几条。
+pub fn cb_pending() -> usize {
+    let _g = CB_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    unsafe { (*CB_QUEUE.0.get()).len }
+}
+
+/// `(投递, 失败)` 累计（判据用）。
+pub fn cb_stats() -> (u32, u32) {
+    let _g = CB_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let q = unsafe { &*CB_QUEUE.0.get() };
+    (q.delivered, q.failed)
+}
+
+/// 清空带回调的队列（判据用）。
+pub fn cb_clear() {
+    let _g = CB_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let q = unsafe { &mut *CB_QUEUE.0.get() };
+    q.len = 0;
+    q.seq = 0;
+    q.delivered = 0;
+    q.failed = 0;
+}
+
+/// **执行带回调的队列**（ADR-215）：逐条执行、逐条回调。
+///
+/// ## 回调在锁外调
+///
+/// **这是本 ADR 最关键的一条**：回调可能再调 `submit_with_cb`（链式请求），
+/// 如果在持锁时调，就会自死锁（同 rank 重入）。
+///
+/// 所以先把队列拷出来、放锁、再逐条执行并回调。
+pub fn drain_with_cb(disk: &dyn Block, budget: &Budget<'_>) -> DrainReport {
+    let mut items = [Pending {
+        req: Request { lba: 0, sectors: 0, token: 0, seq: 0 },
+        cb: None,
+    }; QUEUE_MAX];
+    let len = {
+        let _g = CB_LOCK.lock();
+        // SAFETY: 持锁期间独占。
+        let q = unsafe { &mut *CB_QUEUE.0.get() };
+        let n = q.len;
+        items[..n].copy_from_slice(&q.items[..n]);
+        q.len = 0;
+        n
+    };
+    if len == 0 {
+        return DrainReport { issued: 0, merged: 0, sectors_ok: 0, failed_at: None };
+    }
+    // 排序（与 `drain` 同一套：按 LBA，稳定）
+    let mut reqs = [Request { lba: 0, sectors: 0, token: 0, seq: 0 }; QUEUE_MAX];
+    for i in 0..len {
+        reqs[i] = items[i].req;
+    }
+    // 手工插入排序（保持 items 与 reqs 同步）
+    for i in 1..len {
+        let key = items[i];
+        let mut j = i;
+        while j > 0 {
+            let prev = items[j - 1];
+            if !(prev.req.lba > key.req.lba || (prev.req.lba == key.req.lba && prev.req.seq > key.req.seq)) {
+                break;
+            }
+            items[j] = items[j - 1];
+            j -= 1;
+        }
+        items[j] = key;
+    }
+    let mut sectors_ok = 0u64;
+    let mut failed_at = None;
+    let mut buf = [0u8; 512];
+    for i in 0..len {
+        let it = items[i];
+        let mut done = 0u32;
+        let mut err = None;
+        while done < it.req.sectors {
+            let out = read_at(disk, it.req.lba + u64::from(done), &mut buf, budget);
+            if let Some(e) = out.error {
+                err = Some(e);
+                break;
+            }
+            done += 1;
+        }
+        // **回调在锁外**（见文档注释）
+        if let Some(cb) = it.cb {
+            match err {
+                None => {
+                    cb(it.req.token, Ok(it.req.sectors));
+                    let _g = CB_LOCK.lock();
+                    // SAFETY: 持锁期间独占。
+                    unsafe { (*CB_QUEUE.0.get()).delivered += 1; }
+                }
+                Some(e) => {
+                    cb(it.req.token, Err(e));
+                    let _g = CB_LOCK.lock();
+                    // SAFETY: 持锁期间独占。
+                    unsafe { (*CB_QUEUE.0.get()).failed += 1; }
+                    if failed_at.is_none() {
+                        failed_at = Some(it.req.token);
+                    }
+                }
+            }
+        }
+        if err.is_none() {
+            sectors_ok += u64::from(it.req.sectors);
+        }
+    }
+    let _ = reqs;
+    DrainReport { issued: len as u32, merged: 0, sectors_ok, failed_at }
+}

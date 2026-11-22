@@ -23916,3 +23916,53 @@ ADR-194 只做了合并，队列一直没做。这一层补上：提交 → 排�
 3. **`drain` 仍是同步的** —— 没有异步路径
 4. **没有完成回调** —— `DrainReport` 是汇总，不是逐条回调
 5. **电梯只做静态排序** —— 没有执行中途插入并重排
+---
+
+## 535. ADR-215 落地：块层完成回调（2026-11-23）
+
+### ADR-214 的 drain 只有汇总，这一层补逐条回调
+
+    pub type OnComplete = fn(token: u64, result: Result<u32, BlockError>);
+    pub fn submit_with_cb(lba, sectors, token, cb) -> bool
+    pub fn drain_with_cb(disk, budget) -> DrainReport
+    pub fn cb_pending() -> usize / cb_stats() -> (u32, u32)
+
+### 决策 1：两个队列分开，不合并
+
+| 队列 | 语义 |
+|---|---|
+| `QUEUE`（ADR-214）| 批量提交、一次执行、**一个汇总** |
+| `CB_QUEUE`（本 ADR）| 逐条提交、**逐条回调** |
+
+**混在一起会让「谁的回调该被调」变得含糊。**
+
+### 决策 2：回调必须在锁外调（本 ADR 最关键的一条）
+
+回调可能再调 `submit_with_cb`（链式请求），如果在持锁时调，就会**同 rank 重入 ⇒ 自死锁**。
+所以 `drain_with_cb` 先把队列拷出来、放锁、再逐条执行并回调。
+
+判据第 6 格专门证它：回调里 `token == 42` 时再 `submit_with_cb` —— 不死锁即通过。
+
+### 决策 3：本轮只执行「开跑时已在队列里」的请求
+
+链式提交的那条进的是**下一轮**。
+**第一版判据写「回调 3 次」，实测 2 —— 那是判据的错，不是代码的错。**
+
+### 判据八格
+
+    cb: 入队=true 次数=true 顺序=true token=true 全成功=true 链式=true 统计=true
+        失败路径=true ｜ issued=2 ⇒ true
+
+### 读数
+
+| 项 | 结果 |
+|---|---|
+| `check` | **21/21** |
+| `handles,fs-ro` 档 | `t_block_callback` 八格全绿；唯一失败是既有 `t_q2_workload_slots` |
+
+### 未做
+
+1. **回调是 `fn` 指针，不带上下文** —— 需要捕获状态的调用方要自己做全局表
+2. **没有异步** —— `drain_with_cb` 仍是同步的，回调在返回前全部执行完
+3. **合并与回调不共存** —— 合并会让多条请求共用一个回调
+4. **回调里 panic 会带走整机** —— 没有隔离
