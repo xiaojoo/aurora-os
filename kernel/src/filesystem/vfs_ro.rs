@@ -941,6 +941,78 @@ pub fn read_disk(disk: &dyn Block, cur: &mut ReadCursor, dst: &mut [u8]) -> Resu
     Ok(done)
 }
 
+/// **`read_disk` 的缓存版本**（ADR-219）：多收一个 `vol`，其余语义完全一致。
+///
+/// ## 为什么加一个变体而不是改 `read_disk`
+///
+/// `read_disk` 的契约（逐扇区、错误归因、链走到底）已被 `t_vfs_ro_*` 一族判据钉住，
+/// 而它**不知道自己在哪个卷上**（`ReadCursor` 里没有 `vol`）。
+///
+/// 加 `vol` 参数会动那条契约；加一个变体不动 —— 调用方按需要选。
+///
+/// ## 缓存粒度
+///
+/// 只缓存「扇区读取」那一步（第 907 行的 `read_checked`）。
+/// FAT 链遍历与错误判定**一字不改** —— 缓存不该改变语义。
+pub fn read_disk_cached(
+    disk: &dyn Block,
+    vol: u64,
+    cur: &mut ReadCursor,
+    dst: &mut [u8],
+) -> Result<usize, VfsError> {
+    if cur.position >= cur.stat.size || dst.is_empty() {
+        return Ok(0);
+    }
+    let v = cur.bpb;
+    let want = core::cmp::min(dst.len(), (cur.stat.size - cur.position) as usize);
+    let mut pending = *cur;
+    let mut done = 0usize;
+    let mut sector = [0u8; SECTOR_BYTES];
+    while done < want {
+        if pending.clusters >= fat32::MAX_CLUSTERS_WALKED {
+            return Err(VfsError::Fs(FsError::ChainTooLong));
+        }
+        let cluster_off = pending.position as usize % v.cluster_bytes;
+        let lba = data_lba(&v, pending.cluster)? + (cluster_off / SECTOR_BYTES) as u64;
+        // **唯一与 `read_disk` 不同的地方**：经页缓存
+        cached_read(disk, vol, lba, &mut sector).map_err(|e| VfsError::Fs(FsError::Io(e)))?;
+        let sector_off = cluster_off % SECTOR_BYTES;
+        let take = core::cmp::min(want - done, SECTOR_BYTES - sector_off);
+        dst[done..done + take].copy_from_slice(&sector[sector_off..sector_off + take]);
+        pending.position += take as u32;
+        done += take;
+        if cluster_off + take == v.cluster_bytes || pending.position == pending.stat.size {
+            let next = fat_next_disk_cached(disk, vol, &v, pending.cluster).map_err(VfsError::Fs)?;
+            let at_end = pending.position == pending.stat.size;
+            if next >= v.eoc_marker {
+                if !at_end {
+                    return Err(VfsError::Fs(FsError::ChainEndsEarly {
+                        bytes: pending.position as usize,
+                        size: pending.stat.size,
+                        cluster: pending.cluster,
+                        next,
+                    }));
+                }
+            } else {
+                if at_end {
+                    return Err(VfsError::Fs(FsError::ChainEndsLate {
+                        bytes: pending.position as usize,
+                        size: pending.stat.size,
+                        cluster: pending.cluster,
+                        next,
+                    }));
+                }
+                pending.cluster = next;
+                pending.clusters += 1;
+            }
+        }
+    }
+    cur.position = pending.position;
+    cur.cluster = pending.cluster;
+    cur.clusters = pending.clusters;
+    Ok(done)
+}
+
 /// seek 从首簇重建簇号；只允许 `0..=size`，FS-03 不承诺稀疏 seek。
 pub fn seek_disk(disk: &dyn Block, cur: &mut ReadCursor, newpos: u32) -> Result<u32, VfsError> {
     if newpos > cur.stat.size {
@@ -1306,6 +1378,32 @@ fn fat_next_disk(disk: &dyn Block, v: &Bpb, cluster: u32) -> Result<u32, FsError
     let lba = v.reserved_sectors as u64 + (byte_off / SECTOR_BYTES) as u64;
     let mut sec = [0u8; SECTOR_BYTES];
     block_io::read_checked(disk, lba, &mut sec, &block_io::Budget::UNBOUNDED).map_err(FsError::Io)?;
+    let in_sec = byte_off % SECTOR_BYTES;
+    if in_sec + v.fat_entry_bytes > SECTOR_BYTES {
+        return Err(FsError::BadCluster(cluster));
+    }
+    Ok(if v.fat_entry_bytes == fat32::FAT16_ENTRY_BYTES {
+        u32::from(u16_at(&sec, in_sec)) & v.cluster_mask
+    } else {
+        u32_at(&sec, in_sec) & v.cluster_mask
+    })
+}
+/// **`fat_next_disk` 的缓存版本**（ADR-219）：多收一个 `vol`，其余语义一致。
+///
+/// ## 为什么需要它
+///
+/// 第一版只把**数据扇区**接进缓存，而 FAT 链遍历仍走 `read_checked` ——
+/// 实测第二次读仍有 1 次设备 I/O（`calls 56->57`）。
+///
+/// **FAT 扇区才是重复读取最频繁的**：一个簇一个 FAT 项，同一条 FAT 扇区被几十个簇共享。
+fn fat_next_disk_cached(disk: &dyn Block, vol: u64, v: &Bpb, cluster: u32) -> Result<u32, FsError> {
+    if cluster < MIN_CLUSTER {
+        return Err(FsError::BadCluster(cluster));
+    }
+    let byte_off = cluster as usize * v.fat_entry_bytes;
+    let lba = v.reserved_sectors as u64 + (byte_off / SECTOR_BYTES) as u64;
+    let mut sec = [0u8; SECTOR_BYTES];
+    cached_read(disk, vol, lba, &mut sec).map_err(FsError::Io)?;
     let in_sec = byte_off % SECTOR_BYTES;
     if in_sec + v.fat_entry_bytes > SECTOR_BYTES {
         return Err(FsError::BadCluster(cluster));

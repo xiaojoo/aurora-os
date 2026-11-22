@@ -24156,3 +24156,62 @@ ADR-194 只做了合并，队列一直没做。这一层补上：提交 → 排�
 3. **没有预读**
 4. **没有回写**
 5. **24 槽是接缝尺** —— 没有容量基线登记
+---
+
+## 539. ADR-219 落地：把页缓存接进读路径（2026-11-23）
+
+### ADR-218 的未决 1：「页缓存还没接进 read_disk」。本 ADR 补上。
+
+     pub fn read_disk_cached(disk, vol, cur, dst) -> Result<usize, VfsError>
+     fn fat_next_disk_cached(disk, vol, v, cluster) -> Result<u32, FsError>
+
+### 决策 1：加变体，不改 read_disk 的契约
+
+`read_disk` 的契约已被 `t_vfs_ro_*` 一族判据钉住，而它**不知道自己在哪个卷上**
+（`ReadCursor` 里没有 `vol`）。加 `vol` 参数会动那条契约；加一个变体不动。
+
+### 决策 2：FAT 扇区也必须进缓存（实测买来的）
+
+第一版只把**数据扇区**接进缓存，FAT 链遍历仍走 `read_checked`：
+
+    rce: 缓存没省 I/O calls 56->57
+
+第二次读仍有 1 次设备 I/O —— 因为跨簇时要读 FAT。
+**FAT 扇区才是重复读取最频繁的**：一个簇一个 FAT 项，同一条 FAT 扇区被几十个簇共享。
+
+补了 `fat_next_disk_cached` 之后：
+
+    rce: 等价=true 省I/O=true 对照涨=true ｜ 首次plain=54 缓存后=0
+
+**`缓存后=0`** —— 第二次读完全零设备 I/O。
+
+### 判据六格
+
+1. 造 FAT32 真卷（`make_image32`）
+2. `read_disk` 读出前 N 字节
+3. `read_disk_cached` 读出同样的 N 字节
+4. **两者逐字节相同**（语义等价）
+5. 第二次 `read_disk_cached` **零设备 I/O**
+6. **对照组**：第二次 `read_disk` 的计数会涨（证明量具本身有效）
+
+第 6 格是最有价值的一格：**它证明「零 I/O」不是因为计数坏了**。
+
+### 负样本（cached_read 换回 read_checked）
+
+    rce: 等价=true 省I/O=false 对照涨=true ｜ 首次plain=54 缓存后=1 ⇒ false
+
+### 读数
+
+| 项 | 结果 |
+|---|---|
+| `check` | **21/21** |
+| `handles,fs-ro` 档 | `t_read_cached_equiv` 六格全绿 |
+| 第二次读的设备 I/O | **54 → 0**（首次 plain 读 54 次）|
+
+### 未做
+
+1. **`read_disk` 与 `read_disk_cached` 并存** —— 前者仍被 `handle.rs` 等调用，没有统一
+2. **三层仍未联动**
+3. **没有预读**
+4. **`vol` 由调用方给** —— 给错了就会串（没有从 `ReadCursor` 自动推导）
+5. **24 槽可能不够** —— 大文件顺序读会持续淘汰

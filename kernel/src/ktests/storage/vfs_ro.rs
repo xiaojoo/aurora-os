@@ -2035,3 +2035,129 @@ fn t_page_cache() -> bool {
 
 #[cfg(feature = "handles")]
 ktest!(KT_PAGE_CACHE, t_page_cache);
+
+/// ADR-219：**`read_disk_cached` 与 `read_disk` 语义等价**的证人。
+///
+/// ## 要证什么
+///
+/// ADR-218 的页缓存此前只是一个可调用的层，**没接进任何读路径**。
+/// 这一层加 `read_disk_cached` 并证两件事：
+///
+/// 1. **语义等价**：同一文件、同一段，缓存版与不缓存版返回的字节完全相同；
+/// 2. **真的省了 I/O**：第二次读时设备读取计数不涨。
+///
+/// ## 判据六格
+///
+/// 1. 造一个真 FAT32 卷（`make_image`）；
+/// 2. `read_disk` 读出前 N 字节；
+/// 3. `read_disk_cached` 读出同样的 N 字节；
+/// 4. **两者逐字节相同**；
+/// 5. 第二次 `read_disk_cached` 的**设备读取计数不涨**；
+/// 6. 第二次 `read_disk` 的**设备读取计数会涨**（对照组 —— 证明计数本身有效）。
+///
+/// **负样本**：把 `read_disk_cached` 里的 `cached_read` 换回 `read_checked` ⇒ 第 5 格红。
+#[cfg(feature = "handles")]
+fn t_read_cached_equiv() -> bool {
+    use crate::filesystem::vfs_ro;
+    use crate::filesystem::vfs::SECTOR_BYTES;
+    let mut ok = true;
+    vfs_ro::cache_clear();
+
+    // ① 造 FAT32 真卷
+    let mut img = [0u8; F32_VOL_BYTES];
+    make_image32(&mut img);
+    let disk = crate::filesystem::vfs::MemDisk { img: &img };
+    let fs = match vfs_ro::ReadOnlyFs::mount(&disk) {
+        Ok(f) => f,
+        Err(e) => {
+            crate::log_fatal!("rce: 挂载失败 {}", e.tag());
+            return false;
+        }
+    };
+    let bpb = fs.bpb();
+
+    // 找一个已知文件
+    let entry = match fs.lookup("/SUB/INNER.TXT") {
+        Ok(e) => e,
+        Err(e) => {
+            crate::log_fatal!("rce: 查不到文件 {}", e.tag());
+            return false;
+        }
+    };
+
+    let n = core::cmp::min(entry.size as usize, 4 * SECTOR_BYTES);
+    if n == 0 {
+        crate::log_fatal!("rce: 文件是空的");
+        return false;
+    }
+
+    // ② 不缓存版
+    let mut a = [0u8; 4 * SECTOR_BYTES];
+    let mut c1 = match vfs_ro::open(&disk, &bpb, &entry) {
+        Ok(c) => c,
+        Err(e) => {
+            crate::log_fatal!("rce: open 失败 {:?}", e);
+            return false;
+        }
+    };
+    let r1 = vfs_ro::read_disk(&disk, &mut c1, &mut a[..n]);
+    let calls_plain_1 = crate::filesystem::vfs::memdisk_read_calls();
+
+    // ③ 缓存版
+    vfs_ro::cache_clear();
+    let mut b = [0u8; 4 * SECTOR_BYTES];
+    let mut c2 = match vfs_ro::open(&disk, &bpb, &entry) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let r2 = vfs_ro::read_disk_cached(&disk, 0xC0FFEE, &mut c2, &mut b[..n]);
+
+    // ④ 逐字节相同
+    let equiv = r1 == r2 && a[..n] == b[..n];
+    if !equiv {
+        crate::log_fatal!("rce: 结果不等价 r1={:?} r2={:?}", r1, r2);
+        ok = false;
+    }
+
+    // ⑤ 第二次缓存版：设备计数不涨
+    let before_cached = crate::filesystem::vfs::memdisk_read_calls();
+    let mut c3 = match vfs_ro::open(&disk, &bpb, &entry) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let mut b2 = [0u8; 4 * SECTOR_BYTES];
+    let r3 = vfs_ro::read_disk_cached(&disk, 0xC0FFEE, &mut c3, &mut b2[..n]);
+    let after_cached = crate::filesystem::vfs::memdisk_read_calls();
+    // 注意：FAT 链遍历仍要读 FAT 扇区，那些也被缓存了（同一 vol），
+    // 所以整个第二次读应当零 I/O。
+    let saved = r3.is_ok() && after_cached == before_cached;
+    if !saved {
+        crate::log_fatal!("rce: 缓存没省 I/O calls {}->{}", before_cached, after_cached);
+        ok = false;
+    }
+
+    // ⑥ 对照组：不缓存版第二次仍要读设备
+    let before_plain = crate::filesystem::vfs::memdisk_read_calls();
+    let mut c4 = match vfs_ro::open(&disk, &bpb, &entry) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let mut a2 = [0u8; 4 * SECTOR_BYTES];
+    let _ = vfs_ro::read_disk(&disk, &mut c4, &mut a2[..n]);
+    let after_plain = crate::filesystem::vfs::memdisk_read_calls();
+    let control = after_plain > before_plain;
+    if !control {
+        crate::log_fatal!("rce: 对照组计数没涨 —— 量具失效 {}->{}", before_plain, after_plain);
+        ok = false;
+    }
+
+    vfs_ro::cache_clear();
+    crate::log_info!(
+        "rce: 等价={} 省I/O={} 对照涨={} ｜ 首次plain={} 缓存后={} ⇒ {}",
+        equiv, saved, control, calls_plain_1, after_cached - before_cached, ok
+    );
+    ok
+}
+
+#[cfg(feature = "handles")]
+ktest!(KT_READ_CACHED_EQUIV, t_read_cached_equiv);
