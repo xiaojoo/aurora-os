@@ -30,6 +30,20 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 /// S9g（用户裁决 2026-11-15）：全局句柄表 16→64。16 格时每个活 shell 占 ~6-7 格，
 /// 同时只能开 2 个，`+` 撞容量墙。槽号仍走 SLOT_BITS=16 位编码，64 远未越界。
 /// 这是容量裁决（ADR-007 的 16 被用户放宽），si 描述表 MAX_STARTUP_HANDLES 仍 16（ABI 不动）。
+/// 句柄表容量。
+///
+/// **`fs-open` 档要小 8 倍**（ADR-189 补记）：那个档的 `Entry` 内嵌 `VfsFile`
+/// 的 `ReadCursor` + `VfsEntry`，单条 760 字节（其它档约 64 字节）。
+///
+/// 131072 x 760 B = **95 MiB**，在 512 MiB 机器上找不到连续块 ⇒
+/// `handle::init 引导失败 OutOfMemory` ⇒ BOOT-INVALID（实测）。
+///
+/// 16384 x 760 B = 12 MiB，安全。**这不是「容量够用」，是「大 Entry 档的合理上限」**：
+/// 真正的解法是把 `VfsFile` 的大字段挪进旁表（像 `cells` 那样），
+/// 那要改十几处读写点，单独一轮做（ADR-189 未决 1）。
+#[cfg(feature = "fs-open")]
+pub const MAX_HANDLES: usize = 16384;
+#[cfg(not(feature = "fs-open"))]
 pub const MAX_HANDLES: usize = 131072;
 /// 一次 `revoke_task`/`reset_for_test` 里**栈上**收集 VMO 槽号的容量。
 ///
@@ -306,10 +320,21 @@ impl SlotArray {
         //
         // 取 `max_phys / 2` 作起点：那是高半区，bootloader 从不往那里放东西，
         // 且按 2^order 对齐后仍有足够空间（512 MiB 机器 ⇒ 起点 256 MiB）。
-        let min_phys = crate::mm::max_phys() / 2;
+        // **起点是镜像末尾，不是 max_phys/2**（ADR-179 补记四）：
+        //
+        // `max_phys/2` 在 512 MiB 机器上是 256 MiB，而 `fs-open` 档的镜像
+        // `phys_base` 已经到 353 MiB —— **镜像本身跨过了那条线**，于是向上找
+        // 连续块时撞上镜像 ⇒ `handle::init 引导失败 OutOfMemory`（实测）。
+        //
+        // 镜像末尾一定在镜像之后，也一定在 bootloader 区之上（那个区在镜像之前）。
+        let min_phys = crate::mm::image_phys_end()
+            .unwrap_or_else(|| crate::mm::max_phys() / 2);
         // **分配走 mm 侧的入口**（ADR-180 的环修正，与 `FdTable` 同一修法）：
         // `capability -> memory` 的新边让强连通分量涨大，`check-module-interfaces` 会红。
-        let va = crate::mm::alloc_handle_slots(order, min_phys)?;
+        // **传实际页数，不传 order**（ADR-179 补记四）：order 会把 5632 页
+        // 取整到 16384 页（64 MiB），在 512 MiB 机器上找不到连续块。
+        let _ = order;
+        let va = crate::mm::alloc_handle_slots(pages, min_phys)?;
         // 清零：`EMPTY` 是全 0 语义（used=false, gen=0, obj=None），
         // 但**不能假设刚分到的物理页是干净的**（bootloader 可能留了内容）。
         // SAFETY: va 指向刚分配的 2^order 个连续帧（>= MAX_HANDLES 个 Entry），
@@ -368,6 +393,14 @@ impl SlotArray {
     #[inline]
     pub fn iter(&self) -> core::slice::Iter<'_, Entry> {
         self.as_slice().iter()
+    }
+
+    /// 可变迭代（ADR-179 补记三）：`fs-open` 档的 `reset_for_test` 要用。
+    ///
+    /// **这个方法是 `fs-open` 档编译失败暴露出来的**：ADR-179 只加了 `iter`，
+    /// 而 `handles` 档从不编译走 `iter_mut` 的那两处，所以缺了半年没人发现。
+    pub fn iter_mut(&mut self) -> core::slice::IterMut<'_, Entry> {
+        self.as_mut_slice().iter_mut()
     }
 }
 
@@ -523,7 +556,15 @@ impl FdTable {
         let pages = bytes.div_ceil(crate::mm::PAGE);
         let order = (usize::BITS - 1 - pages.leading_zeros()) as u8;
         // 与句柄表同一修法：从 max_phys/2 之上分配，避开 bootloader 占用的低端区。
-        let min_phys = crate::mm::max_phys() / 2;
+        // **起点是镜像末尾，不是 max_phys/2**（ADR-179 补记四）：
+        //
+        // `max_phys/2` 在 512 MiB 机器上是 256 MiB，而 `fs-open` 档的镜像
+        // `phys_base` 已经到 353 MiB —— **镜像本身跨过了那条线**，于是向上找
+        // 连续块时撞上镜像 ⇒ `handle::init 引导失败 OutOfMemory`（实测）。
+        //
+        // 镜像末尾一定在镜像之后，也一定在 bootloader 区之上（那个区在镜像之前）。
+        let min_phys = crate::mm::image_phys_end()
+            .unwrap_or_else(|| crate::mm::max_phys() / 2);
         // **分配在 mm 侧完成**（ADR-180 的环修正）：
         //
         // `capability -> memory` 会让依赖图出现新环（`check-module-interfaces` 抓到：
@@ -621,7 +662,15 @@ impl FdTable {
         let bytes = new_cap * core::mem::size_of::<u64>();
         let pages = bytes.div_ceil(crate::mm::PAGE);
         let order = (usize::BITS - 1 - pages.leading_zeros()) as u8;
-        let min_phys = crate::mm::max_phys() / 2;
+        // **起点是镜像末尾，不是 max_phys/2**（ADR-179 补记四）：
+        //
+        // `max_phys/2` 在 512 MiB 机器上是 256 MiB，而 `fs-open` 档的镜像
+        // `phys_base` 已经到 353 MiB —— **镜像本身跨过了那条线**，于是向上找
+        // 连续块时撞上镜像 ⇒ `handle::init 引导失败 OutOfMemory`（实测）。
+        //
+        // 镜像末尾一定在镜像之后，也一定在 bootloader 区之上（那个区在镜像之前）。
+        let min_phys = crate::mm::image_phys_end()
+            .unwrap_or_else(|| crate::mm::max_phys() / 2);
         let new_va = crate::mm::alloc_fd_table_pages(order, min_phys)
             .map_err(|_| HErr::Exhausted)?;
         // SAFETY: new_va 指向刚分配的连续帧（>= new_cap 个 u64）；

@@ -411,6 +411,37 @@ fn idx(va: u64, level: u8) -> usize {
     ((va >> (12 + 9 * level as u64)) & 0x1ff) as usize
 }
 
+/// 内核镜像在物理内存里的**末尾**（ADR-179 补记四）。
+///
+/// ## 为什么需要它
+///
+/// ADR-179 用 `max_phys / 2` 作「避开 bootloader 低端区」的起点。那在 512 MiB 机器上
+/// 是 256 MiB —— 而 `fs-open` 档的镜像 `phys_base` 已经到 353 MiB，**镜像本身就跨过了
+/// 那条线**。于是 `phys_alloc_above(256 MiB)` 向上找 8 MiB 连续块时撞上镜像 ⇒
+/// `handle::init 引导失败 OutOfMemory`（实测 `handles,fs-open` 档 BOOT-INVALID）。
+///
+/// 正确的起点是**镜像末尾**：它一定在镜像之后，也一定在 bootloader 区之上
+/// （bootloader 区在镜像之前）。
+///
+/// 返回 `None` = 镜像边界还没定（`init_allocator` 之前）。
+pub fn image_phys_end() -> Option<u64> {
+    let st = s();
+    if st.img_phys_lo == 0 || st.img_va_lo == 0 {
+        return None;
+    }
+    // 镜像的 VA 末尾 = 链接器给的 `__bss_end`（`.bss` 之后就是镜像末尾）。
+    // `kernel/linker.ld` 里有 `PROVIDE(__bss_end = .)`，实测那个符号存在。
+    extern "C" {
+        static __bss_end: u8;
+    }
+    // SAFETY: `__bss_end` 是链接器符号，取它的**地址**不是读它的内容。
+    let end_va = unsafe { &__bss_end as *const u8 as u64 };
+    if end_va < st.img_va_lo {
+        return None;
+    }
+    Some(st.img_phys_lo + (end_va - st.img_va_lo))
+}
+
 pub fn hhdm() -> u64 {
     s().hhdm
 }
@@ -640,7 +671,8 @@ pub fn bootstrap_va_res() -> Result<(), MmError> {
     }
     let order = (usize::BITS - 1 - pages.leading_zeros()) as u8;
     // 与句柄表同一修法：从 max_phys/2 之上分配，避开 bootloader 占用的低端区。
-    let min_phys = max_phys() / 2;
+    // 同 `handle::init`：起点是镜像末尾（ADR-179 补记四）
+    let min_phys = image_phys_end().unwrap_or_else(|| max_phys() / 2);
     let frames = phys_alloc_above(order, MOD_BOOT, min_phys)?;
     let base = frames.base().0;
     core::mem::forget(frames);
@@ -3329,6 +3361,10 @@ pub fn phys_alloc_above(order: u8, owner: ModuleId, min_phys: u64) -> Result<Own
         }
         f += n as u64;
     }
+    crate::log_fatal!(
+        "phys_alloc_above: 找不到 order={} 连续块（min_phys={:#x} limit_pages={} free={}）",
+        order, min_phys, limit, st.free_frames.load(Ordering::Relaxed)
+    );
     Err(MmError::OutOfMemory)
 }
 
@@ -3433,17 +3469,93 @@ pub fn frame_sealed(frame: u64) -> bool {
     unsafe { (*arr.add(frame as usize)).flags & FI_SEALED != 0 }
 }
 
-/// 分配句柄槽数组占的连续页，返回 HHDM 虚地址（ADR-179/180）。
+/// 分配**恰好 `pages` 个连续页**（不向上取整到 2 的幂）。
 ///
-/// 与 `alloc_fd_table_pages` 同一理由：`capability -> memory` 的**分配动作**
-/// 会让依赖图出现新环，所以分配在 `mm` 侧，`capability` 只拿地址。
-pub fn alloc_handle_slots(order: u8, min_phys: u64) -> Result<u64, MmError> {
-    let frames = phys_alloc_above(order, MOD_BOOT, min_phys)?;
+/// ## 为什么需要它
+///
+/// `phys_alloc(order)` 只收 order，所以 5632 页会被取整到 `2^14 = 16384` 页（64 MiB）。
+/// 那在 512 MiB 机器上找不到连续块（实测 `handle::init` OutOfMemory）。
+///
+/// 本函数按页数线性扫描，**不浪费 3 倍内存**。
+///
+/// ## 与 `phys_alloc_above` 的关系
+///
+/// 两者都从 `min_phys` 之上找，区别只是「块大小」：
+/// `phys_alloc_above` 要 2 的幂（给 `OwnedFrames` 的 `order` 字段），
+/// 本函数要任意页数（只给 HHDM 地址，不用 `OwnedFrames`）。
+pub fn phys_alloc_contig(pages: usize, owner: ModuleId, min_phys: u64) -> Result<OwnedFrames, MmError> {
+    if pages == 0 {
+        return Err(MmError::InvalidAddress);
+    }
+    let _g = pmm();
+    let st = s();
+    if !st.ready.load(Ordering::Relaxed) {
+        return Err(MmError::NotInit);
+    }
+    let n = pages as u64;
+    let limit = st.max_phys / PAGE as u64;
+    let active = frame_info_active();
+    // 起点：min_phys 向上取整到页
+    let floor_pages = (min_phys / PAGE as u64).max(1);
+    let mut f = floor_pages;
+    while f + n <= limit {
+        let mut ok = true;
+        let mut k = 0u64;
+        while k < n {
+            let used = if active { fi_refcnt(f + k) >= 1 } else { bit_get(f + k) };
+            if used {
+                ok = false;
+                break;
+            }
+            k += 1;
+        }
+        if ok {
+            let mut k = 0u64;
+            while k < n {
+                if active {
+                    fi_set_used(f + k, true, owner);
+                } else {
+                    bit_set(f + k, true);
+                }
+                k += 1;
+            }
+            let st = s();
+            st.free_frames.fetch_sub(pages, Ordering::Relaxed);
+            ledger_alloc(owner, pages);
+            // `OwnedFrames` 的 `order` 字段是 u8，装不下 14 以上的页数；
+            // 这里填 0 表示「不是 2 的幂块」——调用方用 `forget` 之后不依赖它。
+            return Ok(OwnedFrames { base: PhysAddr(f * PAGE as u64), order: 0, owner });
+        }
+        f += 1;
+    }
+    crate::log_fatal!(
+        "phys_alloc_contig: 找不到 {} 连续页（min_phys={:#x} limit={} free={}）",
+        pages, min_phys, limit, st.free_frames.load(Ordering::Relaxed)
+    );
+    Err(MmError::OutOfMemory)
+}
+
+/// 分配句柄槽数组占的**连续页**，返回 HHDM 虚地址（ADR-179/180）。
+///
+/// ## 为什么收 `pages` 而不是 `order`
+///
+/// 第一版收 `order`，于是 `pages = 5632` 被向上取整到 `2^14 = 16384` 页（**64 MiB**），
+/// 而实际只需要 22 MiB。多要的 3 倍内存在 512 MiB 机器上找不到连续块 ⇒
+/// `handle::init 引导失败 OutOfMemory`（实测 `handles,fs-open` 档 BOOT-INVALID，
+/// 诊断读数 `找不到 order=14 连续块 min_phys=0x17ceab78`）。
+///
+/// 所以这里按**实际页数**找连续块，不做 2 的幂取整。
+///
+/// 与 `alloc_fd_table_pages` 同一理由（那个只有 1 页，取整无害，但保持同一条纪律）。
+pub fn alloc_handle_slots(pages: usize, min_phys: u64) -> Result<u64, MmError> {
+    if pages == 0 {
+        return Err(MmError::InvalidAddress);
+    }
+    let frames = phys_alloc_contig(pages, MOD_BOOT, min_phys)?;
     let base = frames.base().0;
     core::mem::forget(frames);
     Ok(hhdm() + base)
 }
-
 /// 分配一张 fd 表占的连续页，返回它的 **HHDM 虚地址**（ADR-180）。
 ///
 /// ## 为什么这个函数在 `mm` 而不在 `capability`

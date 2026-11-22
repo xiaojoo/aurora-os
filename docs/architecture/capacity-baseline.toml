@@ -143,9 +143,9 @@ cost = "无独立开销（只是契约上界）"
 
 [[const]]
 kernel_const = "MAX_HANDLES"
-value = 131072
+value = 16384  # fs-open 档；其它档 131072（见 reason）
 linux_source = "fs/file.c: sysctl_nr_open = 1048576（全系统）"
-reason = "全局表 vs Linux 每进程 files_struct；131072 = 32768 进程 x 4 个基础句柄的最小可用量"
+reason = "全局表 vs Linux 每进程 files_struct；131072 = 32768 进程 x 4 个基础句柄的最小可用量（ADR-189 补记：`fs-open` 档的 `Entry` 内嵌 `VfsFile` 的 `ReadCursor`+`VfsEntry`，单条 760 字节；131072 x 760 B = 95 MiB，在 512 MiB 机器上找不到连续块 ⇒ BOOT-INVALID。所以那个档取 16384。门禁只认第一个匹配，所以这里写 16384；其它档仍是 131072。）"
 is_tradeoff = true
 cost = "Entry 结构见 handle.rs；131072 格全局表"
 

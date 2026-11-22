@@ -287,6 +287,8 @@ public_api = [
   "mm::bootstrap_va_res",
   # ADR-179/180：分配动作放 mm 侧，避免 capability -> memory 成环。
   "mm::alloc_handle_slots",
+  "mm::image_phys_end",
+  "mm::phys_alloc_contig",
   "mm::alloc_fd_table_pages",
   "mm::release_fd_table",
   "mm::reclaim_bootloader_regions",

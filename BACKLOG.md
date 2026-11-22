@@ -21762,3 +21762,72 @@ ADR-186/187 之后，一个 POSIX 程序的 `printf` 要走两步：
 2. **Socket 分派**（复用 53/54，但 socket 的 `send` 要 `connect` 过）
 3. **`readv`/`writev`**
 4. **`lseek` 的 fd 版**
+---
+
+## 504. ADR-189 落地：`fd_io` 的 VfsFile 分派 + `fs-open` 档容量修正（2026-11-22）
+
+### 接 VfsFile 分派，撞出一个更严重的问题
+
+ADR-188 的 `fd_io` 只接了 Console。本轮接上 VfsFile，**结果发现 `fs-open` 档已经 BOOT-INVALID 了**。
+
+### 交付
+
+**① 抽出 `file_read_h` / `file_write_h`**：`TrapFrame` 不是 `Copy`，没法「换个 rdi 再调一遍」。
+
+**锁序**：`begin_read` 取 `RANK_HANDLE(35)`，返票后全程锁外做磁盘 IO。
+`fd_io` 只持 `RANK_NET(36)` 到「解出对象」为止，然后才调这里。反过来就是反向嵌套 ⇒ L4。
+
+**② `SlotArray::iter_mut`** —— `fs-open` 档编译失败报缺这个方法。
+
+**这是 ADR-179 留下的**：它只加了 `iter`，而 `handles` 档从不编译走 `iter_mut` 的那两处，
+所以缺了没人发现。
+
+### 核心发现：`MAX_HANDLES` 必须按档区分
+
+**根因**：`fs-open` 档的 `Entry` 内嵌 `VfsFile` 的 `ReadCursor` + `VfsEntry`，单条 **760 字节**
+（其它档约 64 字节）。
+
+    131072 × 760 B = 95 MiB
+
+在 512 MiB 机器上找不到连续块 ⇒ `handle::init 引导失败 OutOfMemory` ⇒ BOOT-INVALID。
+
+**历史证据**：`fs-open` 档历史 **PASS 过 762 次、BOOT-INVALID 0 次** ——
+这是 ADR-179 把 `MAX_HANDLES` 从 4096 提到 131072 之后才出现的**回归**。
+
+修法：那个档取 **16384**（12 MiB）。
+
+**这不是「容量够用」，是「大 Entry 档的合理上限」。** 真正的解法是把 `VfsFile` 的大字段
+挪进旁表（像 `cells` 那样），那要改十几处读写点。
+
+### 三个实测撞出来的坑
+
+**① 2 的幂取整浪费 3 倍内存**：
+
+    phys_alloc_above: 找不到 order=14 连续块（min_phys=0x17ceab78 limit_pages=130780）
+
+`5632` 页被取整到 `2^14 = 16384` 页（64 MiB）。加 `phys_alloc_contig` 按实际页数分配。
+
+**② `min_phys = max_phys/2` 在大镜像下失效**：`fs-open` 档镜像 `phys_base` 已到 353 MiB，
+而 `max_phys/2` 是 256 MiB —— **镜像本身跨过了那条线**。加 `image_phys_end()`。
+
+**③ 链接器符号是 `__bss_end` 不是 `__kernel_end`** —— 第一版写错，链接失败。
+
+### 读数
+
+| 档 | 结果 |
+|---|---|
+| `handles` | **PASS(33)**，108/108，连跑 3 次全绿 |
+| `handles,fs-open` | **从 BOOT-INVALID 恢复到能跑**，117 条用例 |
+| `check` | **20/20** |
+
+`fs-open` 档：`handle: slots 引导 base=... len=16384 pages=3040 清零后used=0`
+
+那个档的失败是 `t_sdkdemo`（8%）与 `t_fs_open_ring3`（**17.7%**，210/1187，最早 11-16）——
+都是既有偶发。
+
+### 未做
+
+1. **`VfsFile` 大字段挪进旁表** —— `Entry` 不该被最大的变体撑大
+2. **Socket 分派**
+3. **`readv`/`writev`**
+4. **`t_fs_open_ring3` 的 17.7% 失败率** —— 既有偶发，本轮没碰

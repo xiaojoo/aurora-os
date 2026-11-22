@@ -2634,10 +2634,32 @@ fn fd_io(frame: &crate::arch::x86_64::trap::TrapFrame, write: bool) -> u64 {
         }
         #[cfg(feature = "fs-open")]
         ObjRef::VfsFile { .. } => {
-            crate::log_warn!(
-                "fd_io: fd {} 是 VfsFile，本轮未接（ADR-188 未决 1），回 -95", fd
-            );
-            E_OPNOTSUPP
+            // **复用 10/23 号的核心逻辑**（ADR-189）：`file_read_h`/`file_write_h`
+            // 走 `begin_read`/`begin_write`，取票之后全程锁外做磁盘 IO。
+            //
+            // **锁序**：`fd_io` 自己只持 `RANK_NET(36)` 到「解出对象」为止，
+            // 解完就放锁（`resolve` 内部取放），然后才调这里。
+            // 反过来（先 begin_read 35 再取 NET 36）就是反向嵌套 ⇒ L4。
+            let want = frame.rdx as usize;
+            if want == 0 {
+                return E_INVALID;
+            }
+            if want > COPY_MAX {
+                return E_TOO_LONG;
+            }
+            if write {
+                #[cfg(feature = "fs-rw")]
+                {
+                    return file_write_h(h, frame.rsi, want);
+                }
+                #[cfg(not(feature = "fs-rw"))]
+                {
+                    crate::log_warn!("fd_io: 本档没开 fs-rw，fd {} 写不了", fd);
+                    return E_OPNOTSUPP;
+                }
+            } else {
+                file_read_h(h, frame.rsi, want)
+            }
         }
         ObjRef::Socket { .. } => {
             crate::log_warn!(
@@ -3470,10 +3492,22 @@ fn sys_file_write(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     if want > COPY_MAX {
         return E_TOO_LONG;
     }
+    file_write_h(crate::handle::Handle(frame.rdi), frame.rsi, want)
+}
+
+/// 文件写的核心：句柄 + 用户缓冲 + 长度（ADR-189）。
+///
+/// 与 [`file_read_h`] 同一条锁序纪律：`begin_write` 取 `RANK_HANDLE(35)`，
+/// 返回票之后全程锁外做磁盘 IO。
+///
+/// **`fs-rw` 门控**：`begin_write`/`write_chunk` 只在开了写方向的档里存在。
+/// 没开的档里 `sys_file_write` 也不该被调到（分派表同样门控）。
+#[cfg(all(feature = "handles", feature = "fs-rw"))]
+fn file_write_h(h: crate::handle::Handle, uptr: u64, want: usize) -> u64 {
     let Some(owner) = crate::sched::current_identity() else {
         return E_BAD_HANDLE;
     };
-    let mut ticket = match crate::handle::begin_write(crate::handle::Handle(frame.rdi), owner) {
+    let mut ticket = match crate::handle::begin_write(h, owner) {
         Ok(t) => t,
         Err(e) => return handle_err(e),
     };
@@ -3484,7 +3518,7 @@ fn sys_file_write(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let mut done = 0usize;
     while done < want {
         let ask = core::cmp::min(buf.len(), want - done);
-        match copy_from_user(frame.rsi + done as u64, &mut buf[..ask]) {
+        match copy_from_user(uptr + done as u64, &mut buf[..ask]) {
             Ok(n) if n == ask => {}
             _ => {
                 // 用户缓冲读不回来：票作废，游标一格不动（与读路径同一条纪律）。
@@ -3515,7 +3549,6 @@ fn sys_file_write(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
         Err(e) => handle_err(e),
     }
 }
-
 #[cfg(feature = "handles")]
 fn sys_file_read(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let want = frame.rdx as usize;
@@ -3525,10 +3558,27 @@ fn sys_file_read(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     if want > COPY_MAX {
         return E_TOO_LONG;
     }
+    file_read_h(crate::handle::Handle(frame.rdi), frame.rsi, want)
+}
+
+/// 文件读的核心：句柄 + 用户缓冲 + 长度（ADR-189）。
+///
+/// **从 `sys_file_read` 抽出来**：76 号（`fd_read`）要复用这段，而 `TrapFrame` 不是 `Copy`，
+/// 没法「换个 rdi 再调一遍」。
+///
+/// ## 锁序
+///
+/// `begin_read` 取 `RANK_HANDLE(35)`，返回票之后**全程在锁外做磁盘 IO**。
+/// 这与 `fd_io` 的形状兼容（`fd_io` 自己持 `RANK_NET(36)` 只到「解出对象」为止，
+/// 解完就放锁，然后才调这里）。
+///
+/// **若顺序反过来**（先 begin_read 再取 NET），就是 35 → 36 的反向嵌套 ⇒ L4。
+#[cfg(feature = "handles")]
+fn file_read_h(h: crate::handle::Handle, uptr: u64, want: usize) -> u64 {
     let Some(owner) = crate::sched::current_identity() else {
         return E_BAD_HANDLE;
     };
-    let mut ticket = match crate::handle::begin_read(crate::handle::Handle(frame.rdi), owner) {
+    let mut ticket = match crate::handle::begin_read(h, owner) {
         Ok(t) => t,
         Err(e) => return handle_err(e),
     };
@@ -3546,7 +3596,7 @@ fn sys_file_read(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
         };
         match got {
             Ok(0) => break, // EOF
-            Ok(n) => match copy_to_user(&chunk[..n], frame.rsi + done as u64) {
+            Ok(n) => match copy_to_user(&chunk[..n], uptr + done as u64) {
                 Ok(m) if m == n => done += n,
                 _ => {
                     // 中途写用户内存失败：**不提交游标**（重试会重新交付这几字节）。
@@ -3568,7 +3618,6 @@ fn sys_file_read(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
         Err(e) => handle_err(e),
     }
 }
-
 #[cfg(feature = "fs-open")]
 fn vfs_err_ret(e: crate::filesystem::vfs_ro::VfsError) -> u64 {
     use crate::filesystem::fat32::FsError;
