@@ -1038,6 +1038,82 @@ static RETX_FIRED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64
 static RETX_SENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static RETX_FAILED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+// ---------------------------------------------------------------- ADR-205：重传载荷缓冲
+
+/// **待重传段的载荷缓冲**（ADR-205）。
+///
+/// ## 为什么全局一份而不是每连接一份
+///
+/// 每连接一份是 `MAX_SOCKETS × 1460 = 374 KiB` —— **不可接受**。
+///
+/// 全局一份是 **1460 字节**，而它能工作的前提是：本仓库的 TCP 是「**发一段等一段**」
+/// 的语义（`tcp_send_payload` 一次一段，`RetxState` 也只记一段）。
+///
+/// ## 一个真实的限制
+///
+/// **两条连接同时有待重传的段时，后发的会覆盖先发的。**
+/// 这与 `RetxState` 只记一段是**同一个限制**，不是新引入的 —— 见 ADR-205 未决 1。
+struct RetxBuf(core::cell::UnsafeCell<[u8; crate::network::tcp::TCP_PAYLOAD_MAX]>);
+// SAFETY: 读写全在 `RETX_BUF_LOCK` 内；缓冲是纯字节，无别名逃逸。
+unsafe impl Sync for RetxBuf {}
+
+static RETX_BUF: RetxBuf = RetxBuf(core::cell::UnsafeCell::new([0u8; crate::network::tcp::TCP_PAYLOAD_MAX]));
+static RETX_BUF_LEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static RETX_BUF_LOCK: crate::sync::IrqSpinLock<()> =
+    // **用 `new` 而不是 `new_isr_taken`**：`RANK_NET` 按 lock-order 表不在中断里取。
+    // 这条也是 `check-fat32-ports` 抓出来的（ADR-081 决策 2 的**反方向**）。
+    crate::sync::IrqSpinLock::new(crate::sync::RANK_NET, ());
+
+/// **保存一段载荷以便重传**（ADR-205）。
+///
+/// 由 `tcp_send` 在**发出成功后**调（发之前保存会让「发送失败」也留下一个假的待重传）。
+pub fn retx_buf_store(payload: &[u8]) {
+    let n = payload.len().min(crate::network::tcp::TCP_PAYLOAD_MAX);
+    let _g = RETX_BUF_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let b = unsafe { &mut *RETX_BUF.0.get() };
+    b[..n].copy_from_slice(&payload[..n]);
+    RETX_BUF_LEN.store(n as u32, Ordering::Release);
+}
+
+
+/// **取回待重传的载荷**（ADR-205）：拷进 `out`，返回长度（`0` = 没有）。
+///
+/// ## 为什么先比长度
+///
+/// 缓冲里存的是「**最后一次发出的段**」。而要求重传的那一段可能是更早的
+/// （如果中间又发了别段）。长度不符 ⇒ **不能拿这份数据**，回 0 让调用方知道。
+///
+/// **返回 0 比返回错数据好得多**：错数据是静默损坏，0 是可见的失败。
+fn retx_buf_load(want_len: u16, out: &mut [u8]) -> usize {
+    let stored = RETX_BUF_LEN.load(Ordering::Acquire) as usize;
+    if stored == 0 || stored != want_len as usize || out.len() < stored {
+        return 0;
+    }
+    let _g = RETX_BUF_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let b = unsafe { &*RETX_BUF.0.get() };
+    out[..stored].copy_from_slice(&b[..stored]);
+    stored
+}
+
+/// 判据用：从缓冲取回载荷（`retx_buf_load` 的 `pub` 包装）。
+pub fn retx_buf_load_pub(want_len: u16, out: &mut [u8]) -> usize {
+    retx_buf_load(want_len, out)
+}
+
+/// 判据用：清掉缓冲。
+#[cfg(feature = "handles")]
+pub fn retx_buf_clear() {
+    RETX_BUF_LEN.store(0, Ordering::Release);
+}
+
+/// 判据用：缓冲里存了几字节。
+pub fn retx_buf_len() -> u16 {
+    RETX_BUF_LEN.load(Ordering::Acquire) as u16
+}
+
+
 /// **MAC 解析的注入点**（ADR-204）。
 ///
 /// 为什么注入而不是直接调：`mac_of` 在 `sched/user.rs` 里（它要查 ARP 表 + 可能发 NS），
@@ -1108,7 +1184,16 @@ fn tcp_retransmit_send(slot: u16, gen: u32, reply: &crate::network::tcp_conn::Re
     ip[16..20].copy_from_slice(&p.ip);
     let ipck = crate::network::ipv4::ip_cksum(ip);
     ip[10..12].copy_from_slice(&ipck.to_be_bytes());
-    // **零载荷**（见文档注释里的诚实说明）
+    // **从缓冲取回载荷**（ADR-205）。
+    //
+    // 取不到（长度不符 / 缓冲空）就**不发** —— 发一个空载荷段是对端眼里
+    // 「序号对了但数据没了」，那是最坏的一种故障。
+    let mut payload = [0u8; tcp::TCP_PAYLOAD_MAX];
+    let got = retx_buf_load(reply.payload_len, &mut payload);
+    if got == 0 && reply.payload_len != 0 {
+        // 有长度但取不到数据 ⇒ 明确失败，不静默发空
+        return false;
+    }
     let n = match tcp::build_segment(
         &mut f[34..],
         &l.ip,
@@ -1119,7 +1204,7 @@ fn tcp_retransmit_send(slot: u16, gen: u32, reply: &crate::network::tcp_conn::Re
         reply.ack,
         reply.flags,
         reply.window,
-        &[],
+        &payload[..got],
     ) {
         Some(n) => n,
         None => return false,

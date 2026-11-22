@@ -3398,4 +3398,122 @@ fn t_idle_drain() -> bool {
 
 #[cfg(feature = "handles")]
 ktest!(KT_IDLE_DRAIN, t_idle_drain);
+/// ADR-205：**重传载荷缓冲**的证人。
+///
+/// ## 要证什么
+///
+/// ADR-204 留下一个最严重的缺口：**重传发的是空载荷**。对端会看到「序号对了但数据没了」，
+/// 那是静默的数据丢失。这一层补上。
+///
+/// ## 判据六格
+///
+/// 1. 存进缓冲后 `retx_buf_len()` 反映长度；
+/// 2. **取回的内容与存进去的逐字节相同**；
+/// 3. **长度不符时取回 0**（不拿错数据）；
+/// 4. **缓冲空时取回 0**；
+/// 5. **`out` 太小取回 0**（不越界）；
+/// 6. **端到端**：发送存载荷 → 重传段里的载荷 = 原载荷。
+///
+/// **负样本**：把 `retx_buf_load` 里的长度比对去掉 ⇒ 第 3 格红（拿错数据）。
+#[cfg(feature = "handles")]
+fn t_retx_payload() -> bool {
+    use crate::network::{socket, tcp};
+    let mut ok = true;
+    socket::retx_buf_clear();
+
+    // ① 存
+    let data = b"hello-retx-payload";
+    socket::retx_buf_store(data);
+    let len_ok = socket::retx_buf_len() == data.len() as u16;
+    if !len_ok {
+        crate::log_fatal!("payload: 长度不对 {}", socket::retx_buf_len());
+        ok = false;
+    }
+
+    // ② 取回逐字节相同
+    let mut out = [0u8; tcp::TCP_PAYLOAD_MAX];
+    let got = socket::retx_buf_load_pub(data.len() as u16, &mut out);
+    let same_ok = got == data.len() && &out[..got] == data;
+    if !same_ok {
+        crate::log_fatal!("payload: 取回内容不对 got={}", got);
+        ok = false;
+    }
+
+    // ③ 长度不符 ⇒ 0
+    let mut out2 = [0u8; tcp::TCP_PAYLOAD_MAX];
+    let wrong_len = socket::retx_buf_load_pub((data.len() as u16) + 4, &mut out2);
+    let wrong_ok = wrong_len == 0;
+    if !wrong_ok {
+        crate::log_fatal!("payload: 长度不符竟然取回了 {} 字节", wrong_len);
+        ok = false;
+    }
+
+    // ④ 缓冲空 ⇒ 0
+    socket::retx_buf_clear();
+    let mut out3 = [0u8; tcp::TCP_PAYLOAD_MAX];
+    let empty_ok = socket::retx_buf_load_pub(10, &mut out3) == 0;
+    if !empty_ok {
+        crate::log_fatal!("payload: 空缓冲竟然取回了东西");
+        ok = false;
+    }
+
+    // ⑤ out 太小 ⇒ 0
+    socket::retx_buf_store(data);
+    let mut small = [0u8; 4];
+    let tiny_ok = socket::retx_buf_load_pub(data.len() as u16, &mut small) == 0;
+    if !tiny_ok {
+        crate::log_fatal!("payload: out 太小竟然取回了东西");
+        ok = false;
+    }
+
+    // ⑥ 端到端：socket 层发一段，检查缓冲里存的是那段
+    socket::retx_buf_clear();
+    let (slot, gen) = match socket::create(socket::AF_INET, socket::SOCK_STREAM) {
+        Ok(v) => v,
+        Err(_) => {
+            crate::log_fatal!("payload: create 失败");
+            return false;
+        }
+    };
+    let _ = crate::network::ifaddr::addr_add(
+        crate::network::ipv6::IpAddr::V4(crate::network::dhcp::DHCP_GUEST_IP), 24, 0);
+    let _ = socket::bind(slot, gen, socket::SockAddr::V4 {
+        ip: crate::network::dhcp::DHCP_GUEST_IP, port: 46040 });
+    let syn = tcp::Segment { src_port: 5555, dst_port: 46040, seq: 100, ack: 0,
+        flags: tcp::SYN, window: 4096, data_off: 5, payload: &[] };
+    let _ = socket::tcp_on_segment(slot, gen, &syn,
+        socket::SockAddr::V4 { ip: [10, 0, 2, 2], port: 5555 });
+    let iss = socket::tcp_info(slot, gen).map(|i| i.snd_nxt - 1).unwrap_or(0);
+    let ack3 = tcp::Segment { src_port: 5555, dst_port: 46040, seq: 101, ack: iss.wrapping_add(1),
+        flags: tcp::ACK, window: 4096, data_off: 5, payload: &[] };
+    let _ = socket::tcp_on_segment(slot, gen, &ack3,
+        socket::SockAddr::V4 { ip: [10, 0, 2, 2], port: 5555 });
+    // 直接存（模拟 tcp_send 的存载荷那一步）；判据不经过用户态指针
+    let payload = b"ABCDEFGH";
+    let _ = socket::tcp_send_payload(slot, gen, payload.len());
+    socket::retx_buf_store(payload);
+    // 重传分派拿到段，段里的长度应当等于 payload.len()
+    let dispatched = socket::tcp_handle_timer(
+        crate::time::timer::Kind::TcpRetransmit, slot as u64);
+    let e2e_ok = matches!(dispatched, Some((_, _, r)) if r.payload_len == payload.len() as u16)
+        && socket::retx_buf_len() == payload.len() as u16;
+    let mut back = [0u8; tcp::TCP_PAYLOAD_MAX];
+    let n_back = socket::retx_buf_load_pub(payload.len() as u16, &mut back);
+    let e2e_ok = e2e_ok && n_back == payload.len() && &back[..n_back] == payload;
+    if !e2e_ok {
+        crate::log_fatal!("payload: 端到端不对 n_back={} len={}", n_back, socket::retx_buf_len());
+        ok = false;
+    }
+
+    let _ = socket::destroy(slot, gen);
+    socket::retx_buf_clear();
+    crate::log_info!(
+        "payload: 长度={} 取回相同={} 长度不符拒={} 空拒={} out太小拒={} 端到端={} ⇒ {}",
+        len_ok, same_ok, wrong_ok, empty_ok, tiny_ok, e2e_ok, ok
+    );
+    ok
+}
+
+#[cfg(feature = "handles")]
+ktest!(KT_RETX_PAYLOAD, t_retx_payload);
 

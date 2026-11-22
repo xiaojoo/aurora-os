@@ -644,7 +644,8 @@ public_api = [
   "tcp_conn::ConnState", "tcp_conn::State", "tcp_conn::Reaction",
   "tcp_conn::Reply", "tcp_conn::on_segment", "tcp_conn::close_send_fin",
   "tcp_conn::close_send_fin_from_close_wait",
-  "socket::dispatch_timer", "socket::install_mac_of", "socket::mac_of_installed",
+  "socket::retx_buf_store", "socket::retx_buf_load_pub", "socket::retx_buf_len",
+  "socket::retx_buf_clear", "socket::tcp_arm_retx_timer", "socket::dispatch_timer", "socket::install_mac_of", "socket::mac_of_installed",
   "socket::retx_stats", "socket::tcp_info",
   "socket::tcp_accept",
   "socket::tcp_send_payload",
@@ -1170,7 +1171,7 @@ known_scc = [
   "time->sync" = 4
   "driver->sync" = 1
 "driver->network" = 2
-  "network->sync" = 3
+  "network->sync" = 5
   "network->driver" = 9
 "arch->boot" = 2
 "arch->diagnostics" = 19

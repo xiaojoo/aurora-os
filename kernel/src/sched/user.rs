@@ -3125,6 +3125,11 @@ fn tcp_send(slot: u16, gen: u32, uptr: u64, len: usize) -> u64 {
     if crate::virtio::send_raw(&f[..34 + n]).is_err() {
         return E_IO;
     }
+    // **发出成功才存载荷**（ADR-205）：发之前存会让「发送失败」也留下
+    // 一个假的待重传段，而那个段永远发不出去、也永远不会被 ACK 取消。
+    socket::retx_buf_store(&payload[..len]);
+    // 登记重传定时器（时钟未标定时回 None —— 那条连接没有重传保护）
+    let _ = socket::tcp_arm_retx_timer(slot);
     len as u64
 }
 
