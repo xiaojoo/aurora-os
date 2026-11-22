@@ -1734,3 +1734,161 @@ pub fn inode_clear() {
     t.misses = 0;
     t.evicted = 0;
 }
+
+// ---------------------------------------------------------------- ADR-217：superblock
+
+/// superblock 表的槽数（ADR-217）。
+///
+/// 每条约 56 字节 ⇒ 8 条 = 448 字节。需求侧：QEMU 里最多挂几块盘（AHCI 多口 + NVMe + virtio），
+/// 8 覆盖「一块盘一个卷」的常见配置。
+pub const SB_MAX: usize = 8;
+
+/// 一个已挂载卷的超级块（ADR-217）。
+///
+/// ## 它记什么、不记什么
+///
+/// | 记 | 不记 |
+/// |---|---|
+/// | 卷指纹（与 dentry/inode 同一套）| 目录内容（那是 dentry 的活）|
+/// | 几何（簇大小、簇数、FAT 类型）| 具体文件的元数据（那是 inode 的活）|
+/// | **只读标志**（本仓库的卷都是只读的）| 页缓存 |
+/// | 挂载计数与引用 | 挂载点路径（单根挂载，固定 `/`）|
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Superblock {
+    pub vol: u64,
+    /// FAT 类型（0 = FAT16、1 = FAT32）。
+    pub fat32: bool,
+    pub cluster_bytes: u32,
+    pub clusters: u64,
+    pub total_sectors: u64,
+    /// **只读标志**：本仓库所有卷都是只读的（`fs-rw` 档除外）。
+    pub readonly: bool,
+    /// 挂载引用数：`sb_get` 加一、`sb_put` 减一。
+    pub refs: u32,
+    pub used: bool,
+}
+
+const SB_EMPTY: Superblock = Superblock {
+    vol: 0,
+    fat32: false,
+    cluster_bytes: 0,
+    clusters: 0,
+    total_sectors: 0,
+    readonly: true,
+    refs: 0,
+    used: false,
+};
+
+struct SbTable {
+    slots: [Superblock; SB_MAX],
+    mounted: u32,
+    unmounted: u32,
+}
+
+struct SbCell(core::cell::UnsafeCell<SbTable>);
+// SAFETY: 读写全在 `SB_LOCK` 内；载荷全为 Copy。
+unsafe impl Sync for SbCell {}
+
+static SBS: SbCell = SbCell(core::cell::UnsafeCell::new(SbTable {
+    slots: [SB_EMPTY; SB_MAX],
+    mounted: 0,
+    unmounted: 0,
+}));
+
+static SB_LOCK: crate::sync::IrqSpinLock<()> =
+    crate::sync::IrqSpinLock::new(crate::sync::RANK_DENTRY, ());
+
+/// **登记一个挂载的卷**（ADR-217）。
+///
+/// 幂等：同一个 `vol` 再登记会把 `refs` 加一并返回原槽。
+/// 返回 `None` = 表满（**不静默丢弃**）。
+pub fn sb_mount(vol: u64, fat32: bool, cluster_bytes: u32, clusters: u64, total_sectors: u64, readonly: bool) -> Option<u32> {
+    let _g = SB_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let t = unsafe { &mut *SBS.0.get() };
+    // 已挂载 ⇒ 加引用
+    for (i, s) in t.slots.iter_mut().enumerate() {
+        if s.used && s.vol == vol {
+            s.refs = s.refs.saturating_add(1);
+            return Some(i as u32);
+        }
+    }
+    // 新挂载
+    for (i, s) in t.slots.iter_mut().enumerate() {
+        if !s.used {
+            *s = Superblock {
+                vol, fat32, cluster_bytes, clusters, total_sectors, readonly,
+                refs: 1, used: true,
+            };
+            t.mounted += 1;
+            return Some(i as u32);
+        }
+    }
+    None
+}
+
+/// **卸载一个卷**（ADR-217）：`refs` 减一，减到 0 才真正释放槽。
+///
+/// 返回 `false` = 那个卷本来就没挂载。
+pub fn sb_umount(vol: u64) -> bool {
+    let _g = SB_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let t = unsafe { &mut *SBS.0.get() };
+    for s in t.slots.iter_mut() {
+        if s.used && s.vol == vol {
+            s.refs = s.refs.saturating_sub(1);
+            if s.refs == 0 {
+                *s = SB_EMPTY;
+                t.unmounted += 1;
+            }
+            return true;
+        }
+    }
+    false
+}
+
+/// 查一个卷的超级块（ADR-217）。
+pub fn sb_get(vol: u64) -> Option<Superblock> {
+    let _g = SB_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let t = unsafe { &*SBS.0.get() };
+    t.slots.iter().find(|s| s.used && s.vol == vol).copied()
+}
+
+/// 这个卷能不能写（ADR-217）。
+///
+/// **未挂载的卷一律回 `false`**：不知道它是否只读时，保守拒绝。
+pub fn sb_writable(vol: u64) -> bool {
+    match sb_get(vol) {
+        Some(s) => s.used && !s.readonly,
+        None => false,
+    }
+}
+
+/// 已挂载的卷数（判据用）。
+pub fn sb_count() -> usize {
+    let _g = SB_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let t = unsafe { &*SBS.0.get() };
+    t.slots.iter().filter(|s| s.used).count()
+}
+
+/// `(挂载次数, 卸载次数)` 累计（判据用）。
+pub fn sb_stats() -> (u32, u32) {
+    let _g = SB_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let t = unsafe { &*SBS.0.get() };
+    (t.mounted, t.unmounted)
+}
+
+/// 清空 superblock 表（判据用）。
+pub fn sb_clear() {
+    let _g = SB_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let t = unsafe { &mut *SBS.0.get() };
+    for s in t.slots.iter_mut() {
+        *s = SB_EMPTY;
+    }
+    t.mounted = 0;
+    t.unmounted = 0;
+}

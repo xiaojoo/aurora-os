@@ -1809,3 +1809,109 @@ fn t_inode() -> bool {
 
 #[cfg(feature = "handles")]
 ktest!(KT_INODE, t_inode);
+
+/// ADR-217：**superblock** 的证人。
+///
+/// ## 要证什么
+///
+/// 这一层给 VFS 加「卷级元数据 + 挂载状态 + 只读标志」。
+///
+/// ## 判据七格
+///
+/// 1. `sb_mount` 登记新卷，`sb_count()` 增长；
+/// 2. **同一个 `vol` 再挂载是幂等的**（`refs` 加一，不占新槽）；
+/// 3. `sb_umount` 减引用，**减到 0 才释放槽**；
+/// 4. **`sb_writable` 对只读卷回 `false`**、对可写卷回 `true`；
+/// 5. **未挂载的卷 `sb_writable` 回 `false`**（保守拒绝，不是「默认可写」）；
+/// 6. **表满时 `sb_mount` 回 `None`**（不静默丢弃）；
+/// 7. `sb_stats` 的 `(挂载, 卸载)` 与实际一致。
+///
+/// **负样本**：把 `sb_writable` 的未挂载分支改成 `true` ⇒ 第 5 格红。
+#[cfg(feature = "handles")]
+fn t_superblock() -> bool {
+    use crate::filesystem::vfs_ro;
+    let mut ok = true;
+    vfs_ro::sb_clear();
+
+    // ① 挂载
+    let a = vfs_ro::sb_mount(0xAA, true, 512, 1000, 2048, true);
+    let mount_ok = a.is_some() && vfs_ro::sb_count() == 1;
+    if !mount_ok {
+        crate::log_fatal!("sb: 挂载不对 {:?} count={}", a, vfs_ro::sb_count());
+        ok = false;
+    }
+
+    // ② 幂等：再挂同一个卷
+    let b = vfs_ro::sb_mount(0xAA, true, 512, 1000, 2048, true);
+    let idem_ok = a == b
+        && vfs_ro::sb_count() == 1
+        && matches!(vfs_ro::sb_get(0xAA), Some(s) if s.refs == 2);
+    if !idem_ok {
+        crate::log_fatal!("sb: 幂等不对 a={:?} b={:?} count={}", a, b, vfs_ro::sb_count());
+        ok = false;
+    }
+
+    // ③ 卸载减引用，减到 0 才释放
+    let u1 = vfs_ro::sb_umount(0xAA);
+    let still = vfs_ro::sb_count() == 1;
+    let u2 = vfs_ro::sb_umount(0xAA);
+    let gone = vfs_ro::sb_count() == 0;
+    let umount_ok = u1 && u2 && still && gone;
+    if !umount_ok {
+        crate::log_fatal!("sb: 卸载不对 u1={} u2={} still={} gone={}", u1, u2, still, gone);
+        ok = false;
+    }
+    // **统计必须在 ③ 之后、④ 的 `sb_clear()` 之前记录**（第三次修正）：
+    // ④ 会清表，而 `unmounted` 只有 ③ 的 `sb_umount` 会产生。
+    let (m_early, u_early) = vfs_ro::sb_stats();
+
+    // ④ 只读 / 可写
+    vfs_ro::sb_clear();
+    let _ = vfs_ro::sb_mount(0xAA, true, 512, 1000, 2048, true);
+    let _ = vfs_ro::sb_mount(0xBB, true, 512, 1000, 2048, false);
+    let ro_ok = !vfs_ro::sb_writable(0xAA) && vfs_ro::sb_writable(0xBB);
+    if !ro_ok {
+        crate::log_fatal!("sb: 只读判定不对 ro={} rw={}",
+            vfs_ro::sb_writable(0xAA), vfs_ro::sb_writable(0xBB));
+        ok = false;
+    }
+
+    // ⑤ 未挂载 ⇒ 不可写（保守）
+    let unmounted_ok = !vfs_ro::sb_writable(0xCC);
+    if !unmounted_ok {
+        crate::log_fatal!("sb: 未挂载的卷竟然可写");
+        ok = false;
+    }
+
+    // ⑥ 表满
+    vfs_ro::sb_clear();
+    let mut filled = 0usize;
+    for i in 0..vfs_ro::SB_MAX {
+        if vfs_ro::sb_mount(1 + i as u64, true, 512, 100, 200, true).is_some() {
+            filled += 1;
+        }
+    }
+    let overflow = vfs_ro::sb_mount(9999, true, 512, 100, 200, true);
+    let full_ok = filled == vfs_ro::SB_MAX && overflow.is_none();
+    if !full_ok {
+        crate::log_fatal!("sb: 表满行为不对 filled={} overflow={}", filled, overflow.is_some());
+        ok = false;
+    }
+
+    // ⑦ 统计
+    let stats_ok = m_early >= 1 && u_early >= 1;
+    if !stats_ok {
+        crate::log_fatal!("sb: 统计不对 mounted={} unmounted={}", m_early, u_early);
+        ok = false;
+    }
+
+    vfs_ro::sb_clear();
+    crate::log_info!(
+        "sb: 挂载={} 幂等={} 卸载={} 只读={} 未挂载拒写={} 表满={} 统计={} ⇒ {}",
+        mount_ok, idem_ok, umount_ok, ro_ok, unmounted_ok, full_ok, stats_ok, ok
+    );
+    ok
+}
+
+#[cfg(feature = "handles")]
+ktest!(KT_SUPERBLOCK, t_superblock);

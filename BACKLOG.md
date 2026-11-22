@@ -24027,3 +24027,65 @@ ADR-194 只做了合并，队列一直没做。这一层补上：提交 → 排�
 3. **inode 与 dentry 未联动** —— dentry 存的是 `Entry`，没有指向 inode 号
 4. **没有 `i_op` / `f_op` 间接层**
 5. **淘汰是「第一个 refs==0」而不是 LRU**
+---
+
+## 537. ADR-217 落地：superblock（2026-11-23）
+
+### VFS 三层的第三层。页缓存还没做。
+
+| 记 | 不记 |
+|---|---|
+| 卷指纹（与 dentry/inode 同一套）| 目录内容（dentry 的活）|
+| 几何（簇大小、簇数、FAT 类型）| 文件元数据（inode 的活）|
+| **只读标志** | 页缓存 |
+| 挂载引用计数 | 挂载点路径（单根挂载）|
+
+### 交付
+
+    SB_MAX = 8
+    Superblock { vol, fat32, cluster_bytes, clusters, total_sectors, readonly, refs, used }
+    sb_mount / sb_umount / sb_get / sb_writable / sb_stats / sb_count / sb_clear
+
+### 决策 1：挂载是幂等的（refs 加一）
+
+同一个卷被挂两次不该占两个槽 —— 与 inode 的 iget 同一条思路。
+
+### 决策 2：sb_writable 对未挂载的卷回 false
+
+**不知道它是否只读时，保守拒绝。**
+「默认可写」是那种「看起来方便、实际会静默写坏东西」的默认值。
+
+### 判据七格
+
+    sb: 挂载=true 幂等=true 卸载=true 只读=true 未挂载拒写=true 表满=true 统计=true ⇒ true
+
+负样本（未挂载分支改 true）⇒「未挂载的卷竟然可写」。
+
+### 一个我踩了三次的坑（必须记下来）
+
+`t_inode` 与 `t_superblock` 都出现过「统计不对」，成因完全相同：
+**判据中途调了 `clear()`，而统计是在最后才查的。**
+
+| 次 | 用例 | 错误 |
+|---|---|---|
+| 1 | `t_inode` | 最后才查，中途 `inode_clear()` 清零 |
+| 2 | `t_superblock` | 移到 ⑥ 之前 —— 但 ④ 还有一次 `sb_clear()` |
+| 3 | `t_superblock` | 移到 ③ 之后、④ 之前 —— 这次对 |
+
+**教训：判据里凡有「累计计数」，必须在第一个可能清零它的调用之前取快照。**
+这条应当写进写判据的检查清单。
+
+### 读数
+
+| 项 | 结果 |
+|---|---|
+| `check` | **21/21** |
+| `handles,fs-ro` 档 | **`PASS(33)`**，`t_superblock` 七格全绿 |
+
+### 未做
+
+1. **页缓存** —— 每次 `open` 仍要 3 次块 I/O
+2. **三层未联动** —— dentry / inode / superblock 各自独立
+3. **没有 `i_op` / `f_op` 间接层**
+4. **没有挂载点路径**（单根挂载）
+5. **没有脏标记与回写**
