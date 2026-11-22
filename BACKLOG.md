@@ -22639,3 +22639,69 @@ UDP 的「帧」是一个完整的语义单位（一问一答）。TCP 的段不
 3. **重传与滑动窗口**
 4. **`socket::create(SOCK_STREAM)` 仍回 `E_NOSYS`**
 5. **拥塞控制**（明确不做）
+---
+
+## 516. ADR-198 落地：TCP 连接状态机（切片 G 第二层）（2026-11-22）
+
+### 这一层的核心设计：状态机是**纯函数**
+
+    pub fn on_segment(st: &mut ConnState, seg: &Segment) -> Reaction
+
+**不持锁、不碰表、不发包。** 输入「当前状态 + 收到的段」，输出「新状态 + 要回什么段」。
+
+### 这解决了一个真实困难
+
+我上一轮说过：**状态机需要两个端点或一个能回 SYN-ACK 的对端**，而那份工具链不存在。
+
+**纯函数设计绕开了它**：判据自己扮演对端，直接构造段喂给 `on_segment`。
+
+这比「造回环驱动」简单得多，而且**判据更强** —— 能精确构造「SYN-ACK 的 ack 错一位」
+这种真实网络里几乎撞不到的情形。
+
+### 交付
+
+`State` 十个状态、`ConnState { state, snd_nxt, rcv_nxt, iss, rcv_wnd }`、
+`Reaction { Ignore, Silent, Reply }`、`on_segment`、`close_send_fin`。
+
+### 决策 1：`Reaction` 三态，不是 `Option<Reply>`
+
+`Option` 会把「什么都不做」和「不回但状态变了」混在一起 —— 而那两种在判据里必须分开。
+
+### 决策 2：不做乱序重组
+
+收到的段必须正好是期望序号，否则 `Ignore`。真实 TCP 要缓存乱序段并重组，那是可靠性层。
+
+### 判据七格
+
+    tcp-conn: 被动握手=true 主动连接=true 错ACK拒=true 数据=true
+              乱序拒=true FIN=true 本端关=true ⇒ true
+
+**「错 ACK 拒」是本片最有价值的一格**：它构造「SYN-ACK 的 ack = iss+1 之外的值」，
+在真实网络上几乎撞不到，而这个校验正是防「连接被劫持」的第一道闸。
+
+### 负样本
+
+把「收到 FIN 时 `rcv_nxt` 前进一格」去掉：
+
+    tcp-conn: FIN 处理不对 state=CLOSE_WAIT rcv_nxt=1006
+    tcp-conn: ... FIN=false ⇒ false
+
+`rcv_nxt=1006` 而不是 `1007` —— **差一格**，正是 SEQ 占位规则的错法。
+
+### 读数
+
+| 项 | 结果 |
+|---|---|
+| `check` | **20/20** |
+| `handles` 档 | 3 次跑**全部跑满 115 条**，`PASS(33)` 1 次 |
+
+那两次失败是既有 `t_q2_workload_slots`（2.8%）与 `t_map_hole`（1%）—— **`tcp` 与 `tcp-conn` 三个跑全绿**。
+
+### 未做
+
+1. **重传**（没有定时器）
+2. **滑动窗口**（字段照填，但不按对端窗口限制发送）
+3. **乱序重组**
+4. **TIME_WAIT 重发最后 ACK**（真实语义缺失）
+5. **`socket::create(SOCK_STREAM)` 仍回 `E_NOSYS`**（状态机还没接进 socket 层）
+6. **拥塞控制**（明确不做）

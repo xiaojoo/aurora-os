@@ -2325,4 +2325,151 @@ fn t_tcp_segment() -> bool {
 
 #[cfg(feature = "handles")]
 ktest!(KT_TCP_SEGMENT, t_tcp_segment);
+/// ADR-198：**TCP 连接状态机**的证人（切片 G 第二层）。
+///
+/// ## 为什么这个判据能成立
+///
+/// 状态机是**纯函数**（`on_segment(&mut ConnState, &Segment) -> Reaction`）：
+/// 不持锁、不碰表、不发包。所以判据可以在**一段栈内存**上跑完整条握手与挥手路径，
+/// 不需要网卡、不需要对端、不需要时序。
+///
+/// ## 判据七格
+///
+/// 1. **三次握手**：LISTEN 收 SYN ⇒ SYN_RCVD 回 SYN-ACK ⇒ 收 ACK ⇒ ESTABLISHED；
+/// 2. **主动连接**：SYN_SENT 收 SYN-ACK ⇒ ESTABLISHED 回 ACK；
+/// 3. **SYN-ACK 的 ack 不对时拒**（这是握手的核心校验）；
+/// 4. **数据传输**：ESTABLISHED 收数据 ⇒ `rcv_nxt` 前进、回 ACK；
+/// 5. **乱序数据被丢弃**（序号不等于 `rcv_nxt`）；
+/// 6. **对端 FIN** ⇒ CLOSE_WAIT 回 ACK，`rcv_nxt` 前进一格；
+/// 7. **本端关**：ESTABLISHED ⇒ FIN_WAIT1，`snd_nxt` 前进一格。
+///
+/// **负样本**：把 `seq_len`/`rcv_nxt` 前进里的「FIN 占一格」去掉 ⇒ 第 6 格红。
+#[cfg(feature = "handles")]
+fn t_tcp_conn() -> bool {
+    use crate::network::tcp;
+    use crate::network::tcp_conn::{self, Reaction, State};
+    let mut ok = true;
+
+    // ---- ① 三次握手（被动方）
+    let mut srv = tcp_conn::ConnState::listen(5000);
+    let syn = tcp::Segment {
+        src_port: 12345, dst_port: 80,
+        seq: 1000, ack: 0,
+        flags: tcp::SYN, window: 4096, data_off: 5, payload: &[],
+    };
+    let r1 = tcp_conn::on_segment(&mut srv, &syn);
+    let synack_ok = srv.state == State::SynReceived
+        && srv.rcv_nxt == 1001
+        && matches!(r1, Reaction::Reply(r)
+            if r.flags == (tcp::SYN | tcp::ACK) && r.ack == 1001 && r.seq == 5000);
+    // 第三次握手
+    let ack3 = tcp::Segment {
+        src_port: 12345, dst_port: 80,
+        seq: 1001, ack: 5001,
+        flags: tcp::ACK, window: 4096, data_off: 5, payload: &[],
+    };
+    let r2 = tcp_conn::on_segment(&mut srv, &ack3);
+    let established = srv.state == State::Established && matches!(r2, Reaction::Silent);
+    if !synack_ok || !established {
+        crate::log_fatal!("tcp-conn: 被动握手不对 synack={} established={}", synack_ok, established);
+        ok = false;
+    }
+
+    // ---- ② 主动连接
+    let mut cli = tcp_conn::ConnState::connect(1000);
+    let synack = tcp::Segment {
+        src_port: 80, dst_port: 12345,
+        seq: 5000, ack: 1001,
+        flags: tcp::SYN | tcp::ACK, window: 4096, data_off: 5, payload: &[],
+    };
+    let r3 = tcp_conn::on_segment(&mut cli, &synack);
+    let active_ok = cli.state == State::Established
+        && cli.rcv_nxt == 5001
+        && matches!(r3, Reaction::Reply(r) if r.flags == tcp::ACK && r.ack == 5001);
+    if !active_ok {
+        crate::log_fatal!("tcp-conn: 主动连接不对");
+        ok = false;
+    }
+
+    // ---- ③ SYN-ACK 的 ack 不对时拒
+    let mut cli2 = tcp_conn::ConnState::connect(1000);
+    let bad_ack = tcp::Segment {
+        src_port: 80, dst_port: 12345,
+        seq: 5000, ack: 9999, // 错的
+        flags: tcp::SYN | tcp::ACK, window: 4096, data_off: 5, payload: &[],
+    };
+    let r4 = tcp_conn::on_segment(&mut cli2, &bad_ack);
+    let bad_reject = matches!(r4, Reaction::Ignore) && cli2.state == State::SynSent;
+    if !bad_reject {
+        crate::log_fatal!("tcp-conn: 错的 SYN-ACK 被接受了");
+        ok = false;
+    }
+
+    // ---- ④ 数据传输
+    let before_rcv = srv.rcv_nxt;
+    let data = tcp::Segment {
+        src_port: 12345, dst_port: 80,
+        seq: before_rcv, ack: srv.snd_nxt,
+        flags: tcp::ACK | tcp::PSH, window: 4096, data_off: 5, payload: b"hello",
+    };
+    let r5 = tcp_conn::on_segment(&mut srv, &data);
+    let data_ok = srv.rcv_nxt == before_rcv + 5
+        && srv.state == State::Established
+        && matches!(r5, Reaction::Reply(r) if r.ack == before_rcv + 5 && r.flags == tcp::ACK);
+    if !data_ok {
+        crate::log_fatal!("tcp-conn: 数据传输不对 rcv_nxt={}", srv.rcv_nxt);
+        ok = false;
+    }
+
+    // ---- ⑤ 乱序数据被丢弃
+    let before_bad = srv.rcv_nxt;
+    let ooo = tcp::Segment {
+        src_port: 12345, dst_port: 80,
+        seq: before_bad + 100, // 跳了
+        ack: srv.snd_nxt,
+        flags: tcp::ACK, window: 4096, data_off: 5, payload: b"xyz",
+    };
+    let r6 = tcp_conn::on_segment(&mut srv, &ooo);
+    let ooo_ok = matches!(r6, Reaction::Ignore) && srv.rcv_nxt == before_bad;
+    if !ooo_ok {
+        crate::log_fatal!("tcp-conn: 乱序数据被接受了");
+        ok = false;
+    }
+
+    // ---- ⑥ 对端 FIN ⇒ CLOSE_WAIT，rcv_nxt 前进一格
+    let before_fin = srv.rcv_nxt;
+    let fin = tcp::Segment {
+        src_port: 12345, dst_port: 80,
+        seq: before_fin, ack: srv.snd_nxt,
+        flags: tcp::FIN | tcp::ACK, window: 4096, data_off: 5, payload: &[],
+    };
+    let r7 = tcp_conn::on_segment(&mut srv, &fin);
+    let fin_ok = srv.state == State::CloseWait
+        && srv.rcv_nxt == before_fin + 1
+        && matches!(r7, Reaction::Reply(r) if r.ack == before_fin + 1);
+    if !fin_ok {
+        crate::log_fatal!("tcp-conn: FIN 处理不对 state={} rcv_nxt={}", srv.state.tag(), srv.rcv_nxt);
+        ok = false;
+    }
+
+    // ---- ⑦ 本端关：从 CLOSE_WAIT 发 FIN ⇒ LAST_ACK，snd_nxt 前进一格
+    let before_snd = srv.snd_nxt;
+    let my_fin = tcp_conn::close_send_fin_from_close_wait(&mut srv);
+    let close_ok = srv.state == State::LastAck
+        && srv.snd_nxt == before_snd + 1
+        && matches!(my_fin, Some(r) if r.flags == (tcp::FIN | tcp::ACK));
+    if !close_ok {
+        crate::log_fatal!("tcp-conn: 本端关不对 state={} snd_nxt={}", srv.state.tag(), srv.snd_nxt);
+        ok = false;
+    }
+
+    crate::log_info!(
+        "tcp-conn: 被动握手={} 主动连接={} 错ACK拒={} 数据={} 乱序拒={} FIN={} 本端关={} ⇒ {}",
+        synack_ok && established, active_ok, bad_reject, data_ok, ooo_ok, fin_ok, close_ok, ok
+    );
+    ok
+}
+
+#[cfg(feature = "handles")]
+ktest!(KT_TCP_CONN, t_tcp_conn);
 

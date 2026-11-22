@@ -579,7 +579,7 @@ layer = "service"
 source_modules = [
   "network", "network/arp", "network/arp_table", "network/dhcp", "network/dns", "network/eth",
   "network/icmp", "network/ifaddr", "network/ipv4", "network/ipv6", "network/ndp",
-  "network/proto", "network/tcp", "network/socket", "network/udp"
+  "network/proto", "network/tcp", "network/tcp_conn", "network/socket", "network/udp"
 ]
 # 今天只有边界声明与 `NetError`：协议实现仍在 `driver/virtio.rs` 里，**待搬迁**
 # （ADR-166 未决 1）。先登记"这个域存在、依赖谁、谁能调"，搬迁时往这里加成员。
@@ -640,6 +640,9 @@ public_api = [
   "tcp::tcp_checksum", "tcp::TCP_PAYLOAD_MAX", "tcp::TCP_HDR_MIN",
   "tcp::TCP_HDR_MAX", "tcp::FIN", "tcp::SYN", "tcp::RST", "tcp::PSH",
   "tcp::ACK", "tcp::URG",
+  "tcp_conn::ConnState", "tcp_conn::State", "tcp_conn::Reaction",
+  "tcp_conn::Reply", "tcp_conn::on_segment", "tcp_conn::close_send_fin",
+  "tcp_conn::close_send_fin_from_close_wait",
 ]
 # 今天**无人调用**（协议还在 driver 里）；按实测填空，搬迁后再长出来。
 allowed_callers = ["driver", "capability", "sched"]
