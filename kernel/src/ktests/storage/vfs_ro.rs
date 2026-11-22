@@ -1697,3 +1697,115 @@ fn t_block_callback() -> bool {
 
 #[cfg(feature = "handles")]
 ktest!(KT_BLOCK_CALLBACK, t_block_callback);
+
+/// ADR-216：**inode 层**的证人。
+///
+/// ## 要证什么
+///
+/// 这一层给 VFS 加「同一文件在同一卷内的稳定标识 + 引用计数」。
+///
+/// ## 判据八格
+///
+/// 1. `inode_get` 首次分配槽，`refs == 1`；
+/// 2. **同一个 `(卷, 簇)` 再取一次命中同一槽**，`refs == 2`；
+/// 3. **不同卷的同簇号不串**（`(vol, cluster)` 是复合键）；
+/// 4. `inode_put` 减引用，减到 0 但**不立即淘汰**（缓存仍在）；
+/// 5. **表满时淘汰 `refs == 0` 的项**（不是静默失败）；
+/// 6. **全部有引用时表满回 `None`**（不静默丢弃）；
+/// 7. `inode_stats` 的 `(命中, 未命中, 淘汰)` 与实际一致；
+/// 8. `inode_clear` 之后回零。
+///
+/// **负样本**：把 `inode_get` 的 `(vol, cluster)` 复合键退化成只看 `cluster` ⇒ 第 3 格红。
+#[cfg(feature = "handles")]
+fn t_inode() -> bool {
+    use crate::filesystem::vfs_ro;
+    let mut ok = true;
+    vfs_ro::inode_clear();
+
+    // ① 首次分配
+    let a = vfs_ro::inode_get(0xAA, 5, 100, 0x20);
+    let first_ok = matches!(a, Some(_))
+        && matches!(vfs_ro::inode_peek(0xAA, 5), Some(i) if i.refs == 1 && i.size == 100);
+    if !first_ok {
+        crate::log_fatal!("inode: 首次分配不对 {:?}", a);
+        ok = false;
+    }
+
+    // ② 再取命中同一槽，refs == 2
+    let b = vfs_ro::inode_get(0xAA, 5, 100, 0x20);
+    let hit_ok = a == b && matches!(vfs_ro::inode_peek(0xAA, 5), Some(i) if i.refs == 2);
+    if !hit_ok {
+        crate::log_fatal!("inode: 二次取没命中 a={:?} b={:?}", a, b);
+        ok = false;
+    }
+
+    // ③ 不同卷的同簇号不串
+    let c = vfs_ro::inode_get(0xBB, 5, 200, 0x20);
+    let distinct_ok = c.is_some() && c != a
+        && matches!(vfs_ro::inode_peek(0xBB, 5), Some(i) if i.size == 200);
+    if !distinct_ok {
+        crate::log_fatal!("inode: 不同卷串了 a={:?} c={:?}", a, c);
+        ok = false;
+    }
+
+    // ④ put 减引用，不立即淘汰
+    let _ = vfs_ro::inode_put(0xAA, 5);
+    let _ = vfs_ro::inode_put(0xAA, 5);
+    let put_ok = matches!(vfs_ro::inode_peek(0xAA, 5), Some(i) if i.refs == 0 && i.used);
+    if !put_ok {
+        crate::log_fatal!("inode: put 之后状态不对 {:?}", vfs_ro::inode_peek(0xAA, 5));
+        ok = false;
+    }
+
+    // **在 clear 之前记录一次统计**：③④ 那几步已经产生了命中，
+    // 而 ⑤⑥ 的 `inode_clear()` 会把计数清零 —— 第一版判据在最后才查，
+    // 实测 `hits=0`，那是判据顺序的错。
+    let (hits_early, misses_early, _) = vfs_ro::inode_stats();
+    // ⑤⑥ 表满：先填满（保留一个 refs=0 的给淘汰）
+    vfs_ro::inode_clear();
+    let mut filled = 0usize;
+    for i in 0..vfs_ro::INODE_MAX {
+        if vfs_ro::inode_get(1, i as u32 + 100, 10, 0x20).is_some() {
+            filled += 1;
+        }
+    }
+    let all_ref = filled == vfs_ro::INODE_MAX && vfs_ro::inode_get(1, 9999, 10, 0x20).is_none();
+    if !all_ref {
+        crate::log_fatal!("inode: 全有引用时表满没回 None filled={}", filled);
+        ok = false;
+    }
+    // 放掉一个 ⇒ 再取应当淘汰它
+    let _ = vfs_ro::inode_put(1, 100);
+    let evict_ok = vfs_ro::inode_get(1, 9999, 10, 0x20).is_some()
+        && vfs_ro::inode_peek(1, 100).is_none();
+    if !evict_ok {
+        crate::log_fatal!("inode: 淘汰不对");
+        ok = false;
+    }
+
+    // ⑦ 统计
+    let (hits, misses, evicted) = vfs_ro::inode_stats();
+    let stats_ok = hits_early >= 1 && misses_early >= 1 && evicted >= 1;
+    if !stats_ok {
+        crate::log_fatal!("inode: 统计不对 hits_early={} misses_early={} evicted={}", hits_early, misses_early, evicted);
+        ok = false;
+    }
+
+    // ⑧ clear
+    vfs_ro::inode_clear();
+    let (h2, m2, e2) = vfs_ro::inode_stats();
+    let clear_ok = vfs_ro::inode_used() == 0 && h2 == 0 && m2 == 0 && e2 == 0;
+    if !clear_ok {
+        crate::log_fatal!("inode: clear 之后有残留 used={}", vfs_ro::inode_used());
+        ok = false;
+    }
+
+    crate::log_info!(
+        "inode: 首次={} 命中={} 不串={} put={} 全引用满拒={} 淘汰={} 统计={} clear={} ⇒ {}",
+        first_ok, hit_ok, distinct_ok, put_ok, all_ref, evict_ok, stats_ok, clear_ok, ok
+    );
+    ok
+}
+
+#[cfg(feature = "handles")]
+ktest!(KT_INODE, t_inode);

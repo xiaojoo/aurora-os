@@ -1571,3 +1571,166 @@ fn entry_matches(e: &Entry, want: &[u8]) -> bool {
         None => false,
     }
 }
+
+// ---------------------------------------------------------------- ADR-216：inode 层
+
+/// inode 表的槽数（ADR-216）。
+///
+/// ## 为什么是 64
+///
+/// 一条 `Inode` 约 32 字节 ⇒ 64 条 = **2 KiB**，进 `.bss` 可忽略。
+/// 需求侧：一条路径解析会触及「根 + 各级目录 + 目标」几项，64 覆盖常见深度。
+/// 满了 `inode_get` 回 `None`（不静默丢弃）。
+pub const INODE_MAX: usize = 64;
+
+/// 一个 inode（ADR-216）。
+///
+/// ## inode 号从哪来
+///
+/// **用 FAT 的首簇号**（根目录是 0）。这是天然稳定的：
+///
+/// - 同一个文件在不同路径下首簇相同 ⇒ inode 号相同；
+/// - 跨卷复用同一个首簇号时会撞，所以键是 **`(卷指纹, 首簇)`**（与 dentry 缓存同一条教训）。
+///
+/// **不是 POSIX 的 `ino_t`**（那是文件系统自己的编号空间），但语义等价：
+/// 「同一文件在同一卷内的稳定标识」。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Inode {
+    /// 卷指纹（与 dentry 缓存同一套）。
+    pub vol: u64,
+    /// 首簇号（根目录 = 0）。
+    pub cluster: u32,
+    /// 文件大小（字节）。目录为 0。
+    pub size: u32,
+    /// 属性字节（FAT 的 attr）。
+    pub attr: u8,
+    /// 引用计数：`inode_get` 加一、`inode_put` 减一，**减到 0 才可被淘汰**。
+    pub refs: u32,
+    /// 已被淘汰的槽（`used = false`）。
+    pub used: bool,
+}
+
+const INODE_EMPTY: Inode = Inode {
+    vol: 0,
+    cluster: 0,
+    size: 0,
+    attr: 0,
+    refs: 0,
+    used: false,
+};
+
+struct InodeTable {
+    slots: [Inode; INODE_MAX],
+    /// 累计统计（判据用）。
+    hits: u32,
+    misses: u32,
+    evicted: u32,
+}
+
+struct InodeCell(core::cell::UnsafeCell<InodeTable>);
+// SAFETY: 读写全在 `INODE_LOCK` 内；载荷全为 Copy。
+unsafe impl Sync for InodeCell {}
+
+static INODES: InodeCell = InodeCell(core::cell::UnsafeCell::new(InodeTable {
+    slots: [INODE_EMPTY; INODE_MAX],
+    hits: 0,
+    misses: 0,
+    evicted: 0,
+}));
+
+static INODE_LOCK: crate::sync::IrqSpinLock<()> =
+    crate::sync::IrqSpinLock::new(crate::sync::RANK_DENTRY, ());
+
+/// **取一个 inode**（ADR-216）：命中则 `refs += 1`，未命中则新建。
+///
+/// 返回 `None` = 表满（**不静默丢弃**）。
+///
+/// ## 为什么 refs 在「取」的时候加
+///
+/// 这是 POSIX 的语义：`iget` 拿到引用，用完 `iput` 还。
+/// 没有引用计数的 inode 表无法安全淘汰（会拔掉别人正在用的项）。
+pub fn inode_get(vol: u64, cluster: u32, size: u32, attr: u8) -> Option<u32> {
+    let _g = INODE_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let t = unsafe { &mut *INODES.0.get() };
+    // 先找命中的
+    for (i, s) in t.slots.iter_mut().enumerate() {
+        if s.used && s.vol == vol && s.cluster == cluster {
+            s.refs = s.refs.saturating_add(1);
+            t.hits += 1;
+            return Some(i as u32);
+        }
+    }
+    // 再找空位
+    for (i, s) in t.slots.iter_mut().enumerate() {
+        if !s.used {
+            *s = Inode { vol, cluster, size, attr, refs: 1, used: true };
+            t.misses += 1;
+            return Some(i as u32);
+        }
+    }
+    // 满了：找一个 refs == 0 的淘汰
+    for (i, s) in t.slots.iter_mut().enumerate() {
+        if s.refs == 0 {
+            *s = Inode { vol, cluster, size, attr, refs: 1, used: true };
+            t.evicted += 1;
+            t.misses += 1;
+            return Some(i as u32);
+        }
+    }
+    None
+}
+
+/// **还一个 inode 引用**（ADR-216）。返回 `false` = 那个槽本来就不是这个 inode。
+///
+/// **`refs` 减到 0 不立即淘汰**：淘汰是 `inode_get` 在表满时做的。
+/// 这样「用完就还」不会让缓存失效（与 dentry 缓存同一条思路）。
+pub fn inode_put(vol: u64, cluster: u32) -> bool {
+    let _g = INODE_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let t = unsafe { &mut *INODES.0.get() };
+    for s in t.slots.iter_mut() {
+        if s.used && s.vol == vol && s.cluster == cluster {
+            s.refs = s.refs.saturating_sub(1);
+            return true;
+        }
+    }
+    false
+}
+
+/// 查一个 inode 的当前状态（判据用）。
+pub fn inode_peek(vol: u64, cluster: u32) -> Option<Inode> {
+    let _g = INODE_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let t = unsafe { &*INODES.0.get() };
+    t.slots.iter().find(|s| s.used && s.vol == vol && s.cluster == cluster).copied()
+}
+
+/// `(命中, 未命中, 淘汰)` 累计（判据用）。
+pub fn inode_stats() -> (u32, u32, u32) {
+    let _g = INODE_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let t = unsafe { &*INODES.0.get() };
+    (t.hits, t.misses, t.evicted)
+}
+
+/// 已用槽数（判据用）。
+pub fn inode_used() -> usize {
+    let _g = INODE_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let t = unsafe { &*INODES.0.get() };
+    t.slots.iter().filter(|s| s.used).count()
+}
+
+/// 清空 inode 表（判据用）。
+pub fn inode_clear() {
+    let _g = INODE_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let t = unsafe { &mut *INODES.0.get() };
+    for s in t.slots.iter_mut() {
+        *s = INODE_EMPTY;
+    }
+    t.hits = 0;
+    t.misses = 0;
+    t.evicted = 0;
+}
