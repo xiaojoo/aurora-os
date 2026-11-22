@@ -448,9 +448,21 @@ pub enum NdAction {
     /// 需要回一个 NA 给 `dst_ip`（目标 MAC 用 `dst_mac`）。
     ReplyNa { dst_ip: [u8; 16], dst_mac: [u8; 6], target: [u8; 16] },
 }
+/// 只看这一帧的 NS target，**不持任何锁**（ADR-185）。
+///
+/// 给调用方「先查地址表判属，再把结果传进 `handle_frame`」用。
+pub fn peek_ns_target(f: &[u8]) -> Option<[u8; 16]> {
+    let msg = parse_nd(f)?;
+    if msg.kind == ICMPV6_NS { Some(msg.target) } else { None }
+}
+
+
 
 /// 解析并处理一帧。**不持锁调用发包**：返回动作由调用方执行。
-pub fn handle_frame(f: &[u8], our_mac: &[u8; 6]) -> NdAction {
+/// `is_ours` = 这个 NS 的 target 是不是本机地址（**由调用方查地址表后传入**）。
+///
+/// **为什么不在这里查**：见 `ICMPV6_NS` 分支里的注释——同等级重入会 L4。
+pub fn handle_frame(f: &[u8], our_mac: &[u8; 6], is_ours: bool) -> NdAction {
     let Some(msg) = parse_nd(f) else {
         return NdAction::None;
     };
@@ -463,12 +475,22 @@ pub fn handle_frame(f: &[u8], our_mac: &[u8; 6]) -> NdAction {
             NdAction::None
         }
         ICMPV6_NS => {
-            // 对端问的是不是我们？`target` 是它要解析的地址。
-            // 我们无法从这一帧判断 target 是不是自己的（需要本机地址表，
-            // 而本轮地址是静态配置的，没有那张表），所以**总是回**。
-            // 代价：链路上每台机器都会回 NA，而真正的目标会回得更快。
-            // 这是「没有本机地址表」时的正确妥协（ADR-184 未决 1）。
+            // **精确判属**（ADR-185 决策 4）：target 在地址表里才回 NA。
+            //
+            // ADR-184 那一版是「总是回」，代价是链路上每台机器都回 NA，
+            // 真正的目标只是回得更快。地址表落地后这条可以精确了。
             let _ = our_mac;
+            // **地址表查询不能在这里做**（ADR-185 实测）：
+            //
+            // `handle_frame` 的调用方（`deliver_frame`）可能已持 `RANK_NET`，
+            // 而 `addr_is_local` 也要 `RANK_NET` ⇒ 同等级重入 ⇒ L4（实测
+            // `锁序违规，外层 rank=36 本次 rank=36`）。
+            //
+            // 所以把判属**提到调用方**：`handle_frame` 只解析，判属由 `deliver_frame`
+            // 在拿锁之前做完，通过 `is_ours` 传进来。
+            if !is_ours {
+                return NdAction::None;
+            }
             NdAction::ReplyNa {
                 dst_ip: msg.src_ip,
                 dst_mac: msg.lladdr.unwrap_or([0xFF; 6]),

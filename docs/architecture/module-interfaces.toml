@@ -572,7 +572,8 @@ owner = "network"
 layer = "service"
 source_modules = [
   "network", "network/arp", "network/arp_table", "network/dhcp", "network/dns", "network/eth",
-  "network/icmp", "network/ipv4", "network/ipv6", "network/ndp", "network/proto", "network/socket", "network/udp"
+  "network/icmp", "network/ifaddr", "network/ipv4", "network/ipv6", "network/ndp",
+  "network/proto", "network/socket", "network/udp"
 ]
 # 今天只有边界声明与 `NetError`：协议实现仍在 `driver/virtio.rs` 里，**待搬迁**
 # （ADR-166 未决 1）。先登记"这个域存在、依赖谁、谁能调"，搬迁时往这里加成员。
@@ -614,12 +615,21 @@ public_api = [
   "ipv6::IP6_MIN_MTU", "ipv6::eui64_from_mac", "ipv6::link_local_from_mac",
   "ipv6::parse_udp6_frame", "ipv6::is_ipv4_frame", "ipv6::is_ipv6_frame",
   "ipv6::IP6_ALL_NODES_LL", "ipv6::IP6_UNSPECIFIED",
-  "socket::SockAddr",  "ndp::build_ns", "ndp::build_na", "ndp::NEXT_HEADER_ICMPV6",
+  "socket::SockAddr",  "ndp::build_ns", "ndp::build_na", "ndp::peek_ns_target", "ndp::NEXT_HEADER_ICMPV6",
+  "ifaddr::IfAddr", "ifaddr::IF_ADDR_MAX", "ifaddr::addr_add", "ifaddr::addr_remove",
+  "ifaddr::addr_is_local", "ifaddr::addr_count", "ifaddr::addr_list", "ifaddr::addr_clear",
+  "ifaddr::is_wildcard", "ifaddr::is_link_local", "ifaddr::primary_v4",
+  "ifaddr::primary_v6_link_local", "ifaddr::set_gateway", "ifaddr::gateway",
+  "socket::bootstrap_addrs",
   "ndp::NdAction", "ndp::handle_frame",
   "ndp::nd_lookup", "ndp::nd_learn", "ndp::nd_mark_incomplete", "ndp::nd_stats",
   "ndp::nd_clear", "ndp::NdState", "ndp::NdStats", "ndp::NDP_TABLE_MAX",
   "socket::poll_once", "socket::deliver_frame",
-]
+  "ifaddr::IfAddr", "ifaddr::IF_ADDR_MAX", "ifaddr::addr_add", "ifaddr::addr_remove",
+  "ifaddr::addr_is_local", "ifaddr::addr_count", "ifaddr::addr_list", "ifaddr::addr_clear",
+  "ifaddr::is_wildcard", "ifaddr::is_link_local", "ifaddr::primary_v4",
+  "ifaddr::primary_v6_link_local", "ifaddr::set_gateway", "ifaddr::gateway",
+  "socket::bootstrap_addrs",]
 # 今天**无人调用**（协议还在 driver 里）；按实测填空，搬迁后再长出来。
 allowed_callers = ["driver", "capability", "sched"]
 # 依赖方向是 **network → driver（单向）**：协议通过驱动的收发原语工作。
@@ -1121,8 +1131,8 @@ known_scc = [
 
 [baseline.ring_edge_sites]
 "driver->network" = 2
-  "network->sync" = 2
-  "network->driver" = 5
+  "network->sync" = 3
+  "network->driver" = 6
 "arch->boot" = 2
 "arch->diagnostics" = 19
 "arch->irq" = 2

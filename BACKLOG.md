@@ -21469,3 +21469,79 @@ pub enum SockAddr { V4 { ip: [u8; 4], port: u16 }, V6 { ip: [u8; 16], port: u16 
 2. **中断收包**（把 `poll_once` 换成 ISR 驱动，要改 `RANK_NET` 的 ISR 属性）。
 3. **STALE/DELAY/PROBE** 三态。
 4. **`sin6_scope_id`**。
+---
+
+## 500. ADR-185 落地：本机地址表（2026-11-22）
+
+### 为什么做这个
+
+三个具体后果逼出来的：
+
+| # | 后果 |
+|---|---|
+| 1 | **NDP 应答泛滥** —— 收到 NS 时无法判断 target 是不是自己的，只能总是回 NA |
+| 2 | **`bind` 语义错** —— `bind(192.168.1.1)` 在 Linux 上是 `EADDRNOTAVAIL`，我们之前接受 |
+| 3 | **DHCP 白做** —— 解析出 `yiaddr` 却不生效，等于没有 DHCP |
+
+### 交付
+
+| 项 | 内容 |
+|---|---|
+| `network/ifaddr.rs` | `IfAddr` 类型 + 地址表（8 项，`RANK_NET`）|
+| `dhcp_apply` | 把 `yiaddr`/掩码/网关写回表（前缀从掩码推）|
+| NDP 精确判属 | `handle_frame(.., is_ours)`，判属由调用方在**拿锁之前**做 |
+| `bind` 校验 | 非通配地址必须在表里，否则 `-99` |
+
+### 三个实测撞出来的坑
+
+**① 锁序重入**（`L4 sync: 锁序违规，外层 rank=36 本次 rank=36`）：
+
+`bind` 里先拿 `RANK_NET`（socket 表），锁内又调 `addr_is_local`（地址表，也是 `RANK_NET`）。
+**同等级重入。** 修法：判属移到**拿锁之前**。
+
+**② `handle_frame` 里查地址表同样重入**：
+
+`deliver_frame` 可能已持 `RANK_NET`。修法：加 `peek_ns_target`（不持锁，纯解析），
+由调用方查完判属、把 `is_ours` 传进 `handle_frame`。
+
+**③ `bootstrap_addrs` 的守卫用错了判据**：
+
+第一版用 `AtomicBool` 记「跑过没有」。但 `t_ifaddr` 会 `addr_clear()`，之后守卫挡住不再填 ⇒
+**后续 `bind` 全部 EADDRNOTAVAIL**。改成「看表是否非空」。
+
+### 判据七格（`t_ifaddr`）
+
+    ifaddr: 加查=true 幂等=true 删=true 通配=true bind拒=true bind通配=true ndp判属=true ⇒ true
+
+### 负样本（变异证红）
+
+去掉 `bind` 的归属校验：
+
+    ifaddr: bind 应拒非本机地址，实得 0x0
+    ifaddr: ... bind拒=false ... ⇒ false，FAIL(35)
+
+**只有第 5 格红。**
+
+### 一个连带修的用例缺陷
+
+`t_socket_family` 与 `t_ndp_cache` 原本绑 `127.0.0.1` 与一个自造地址——
+**地址表落地后 `bind` 会拒它们**。改成**显式把地址加进表**（不靠 `bootstrap_addrs`，
+因为别的用例会清表）。
+
+这不是「测试挡路」，而是**新语义的正确后果**：`bind` 现在真的校验归属了。
+
+### 读数
+
+| 项 | 结果 |
+|---|---|
+| `check` | **20/20** |
+| `handles` 档 | **107/107**，连跑 5 次 **2 次全绿** |
+
+失败 3 次**全是既有 `t_sdkdemo`**（历史 8%）。本轮三个判据（`ifaddr`/`ndp`/`sock`）稳定全 true。
+
+### 未做
+
+1. **租期到期与续租**（DHCP lease time + 定时器）
+2. **多网卡**（`iface` 字段已留，查询函数要按接口过滤）
+3. **IPv6 全局地址**（SLAAC 或静态配置；本轮只有链路本地）
+4. **`addr_list` 的用户态出口**（今天只有内核侧查询，没有 syscall）

@@ -43,6 +43,7 @@ pub const E_INVAL: u64 = u64::MAX;           // -1  EINVAL
 pub const E_NOSYS: u64 = u64::MAX - 37;      // -38 ENOSYS
 pub const E_OPNOTSUPP: u64 = u64::MAX - 94;  // -95 EOPNOTSUPP
 pub const E_ADDRINUSE: u64 = u64::MAX - 97;  // -98 EADDRINUSE
+pub const E_ADDRNOTAVAIL: u64 = u64::MAX - 98; // -99 EADDRNOTAVAIL（地址不属于本机）
 pub const E_EXHAUSTED: u64 = u64::MAX - 5;   // -6  ENOMEM
 
 /// 一个 socket 端点：两个族并列（ADR-182 决策 5 / ADR-183）。
@@ -236,6 +237,24 @@ pub fn live(slot: u16, gen: u32) -> bool {
 
 /// `bind`：记住本地端点。
 pub fn bind(slot: u16, gen: u32, local: SockAddr) -> Result<(), u64> {
+    // **地址归属校验必须在拿锁之前做**（ADR-185 实测）：
+    //
+    // `bootstrap_addrs` 与 `addr_is_local` 都要 `RANK_NET(36)`，而本函数下面
+    // 也要 `RANK_NET`（socket 表与地址表共用一把）。在锁内查就是同等级重入 ⇒ L4
+    // （实测 `锁序违规，外层 rank=36 本次 rank=36`）。
+    //
+    // `bind(192.168.1.1)` 在 Linux 上是 `EADDRNOTAVAIL`，我们之前接受。
+    // **通配地址必须放行**：`bind(0.0.0.0:80)` 是「监听所有接口」的标准写法。
+    bootstrap_addrs();
+    let check_ip = match local {
+        SockAddr::V4 { ip, .. } => crate::network::ipv6::IpAddr::V4(ip),
+        SockAddr::V6 { ip, .. } => crate::network::ipv6::IpAddr::V6(ip),
+    };
+    if !crate::network::ifaddr::is_wildcard(&check_ip)
+        && !crate::network::ifaddr::addr_is_local(&check_ip)
+    {
+        return Err(E_ADDRNOTAVAIL);
+    }
     let mut g = TABLE.lock();
     let t = g.get();
     let Some(s) = t.slots.get_mut(usize::from(slot)) else {
@@ -366,7 +385,15 @@ pub fn deliver_frame(f: &[u8]) -> u8 {
         // 不能走下面的 UDP 解析。
         if f.len() > 14 + 6 && f[14 + 6] == crate::network::ndp::NEXT_HEADER_ICMPV6 {
             let our_mac = crate::virtio::net_info().map(|i| i.mac).unwrap_or([0u8; 6]);
-            match crate::network::ndp::handle_frame(f, &our_mac) {
+            // 判属在**拿锁之前**做（`handle_frame` 内部不能查地址表，会同等级重入）
+            let is_ours = crate::network::ndp::peek_ns_target(f)
+                .map(|t| {
+                    crate::network::ifaddr::addr_is_local(
+                        &crate::network::ipv6::IpAddr::V6(t),
+                    )
+                })
+                .unwrap_or(false);
+            match crate::network::ndp::handle_frame(f, &our_mac, is_ours) {
                 crate::network::ndp::NdAction::ReplyNa { dst_ip, dst_mac, target } => {
                     // **回 NA 必须在锁外**（`handle_frame` 已放锁）
                     let our_ip = crate::network::ipv6::link_local_from_mac(&our_mac);
@@ -412,6 +439,7 @@ pub fn deliver_frame(f: &[u8]) -> u8 {
 /// 那是另一件事——本轮先把「收了能进队列」打通。
 #[cfg(feature = "handles")]
 pub fn poll_once(wait_ms: u64) -> usize {
+    bootstrap_addrs();
     if crate::virtio::bind_net().is_err() {
         return 0;
     }
@@ -437,4 +465,49 @@ pub fn poll_once(wait_ms: u64) -> usize {
         }
     }
     delivered
+}
+
+// ---------------------------------------------------------------- ADR-185：地址表的惰性引导
+
+/// 地址表是否已经引导过（避免每次 `bind` 都重复加）。
+static ADDR_BOOTSTRAPPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// 惰性引导地址表：把网卡 MAC 对应的链路本地 IPv6 地址与 DHCP 夹具的 IPv4 地址加进去。
+///
+/// ## 为什么在 socket 层而不在 `bind_net`
+///
+/// `bind_net` 在 `driver/virtio.rs`，而 `driver` 不该依赖 `network`（ADR-166 的方向是
+/// `network → driver` 单向）。所以引导放在**用到地址的第一处**（`bind` 与 `poll_once`）。
+///
+/// ## 为什么 IPv4 用 `DHCP_GUEST_IP`
+///
+/// 那是 QEMU slirp 的固定地址（`dhcpstart=10.0.2.15`），也是 DHCP 夹具的期望值。
+/// 真正的 DHCP 回填走 `dhcp_apply`——但那个要真的发一次 DHCP 请求，
+/// 而今天没有任何路径自动做（ADR-185 未决 1）。
+///
+/// **所以这里是「静态引导 + DHCP 可覆盖」的混合**：先加夹具地址让 socket 能用，
+/// 真跑到 DHCP 时 `dhcp_apply` 会再加一条（`addr_add` 幂等）。
+pub fn bootstrap_addrs() {
+    use crate::network::ifaddr::{addr_add, addr_count};
+    use crate::network::ipv6::{link_local_from_mac, IpAddr};
+    // **守卫看「表是否非空」，不看「跑过没有」**（ADR-185 实测）：
+    //
+    // 第一版用一个 `AtomicBool` 记住「跑过」，但 `t_ifaddr` 会 `addr_clear()`，
+    // 之后 `bootstrap_addrs` 被守卫挡住不再填 ⇒ 后续 `bind` 全部 EADDRNOTAVAIL。
+    // 表非空才是「已经有地址」的正确判据。
+    if crate::network::ifaddr::addr_count() != 0 {
+        return;
+    }
+    let mac = crate::virtio::net_info().map(|i| i.mac).unwrap_or([0u8; 6]);
+    if mac == [0u8; 6] {
+        // 网卡还没绑：不加（下次再试）
+        return;
+    }
+    if addr_count() == 0 {
+        // IPv4：QEMU slirp 的固定地址（`dhcpstart`）
+        let _ = addr_add(IpAddr::V4(crate::network::dhcp::DHCP_GUEST_IP), 24, 0);
+        // IPv6：链路本地（由 MAC 按 EUI-64 推出）
+        let _ = addr_add(IpAddr::V6(link_local_from_mac(&mac)), 64, 0);
+    }
+
 }

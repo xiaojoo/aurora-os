@@ -183,3 +183,50 @@ pub fn parse_reply(buf: &[u8], used_idx: u16, used_len: u32, used_id: u32) -> Re
         used_id,
     })
 }
+
+/// 把 DHCP 应答写进地址表（ADR-185 决策 3）。
+///
+/// ## 三件事
+///
+/// 1. `yiaddr` + `subnet_mask` 推前缀，加进地址表；
+/// 2. `router` 记成默认网关（**不进地址表**——它不是本机地址）；
+/// 3. 幂等：同一地址重复 apply 不重复加。
+///
+/// ## 为什么前缀从掩码推
+///
+/// DHCP 给的是 `subnet_mask`（如 `255.255.255.0`），而地址表存的是 `prefix`（如 24）。
+/// 数掩码里前导 1 的个数即可。
+///
+/// **掩码全零或全 1 时退回 24**：`0.0.0.0` 与 `255.255.255.255` 都不是合法的单播掩码，
+/// 服务器给这种值说明配置有问题，用默认值比算出一个荒谬的前缀安全。
+#[cfg(feature = "virtio-net")]
+pub fn dhcp_apply(reply: &DhcpReply) -> bool {
+    use crate::network::ifaddr::{addr_add, set_gateway};
+    use crate::network::ipv6::IpAddr;
+    let ip = reply.yiaddr;
+    if ip == [0, 0, 0, 0] {
+        return false;
+    }
+    // 数前导 1 的个数（合法掩码是连续的 1 后跟连续的 0）
+    let mut prefix = 0u8;
+    let mut done = false;
+    for b in reply.subnet_mask {
+        let mut bit = 0x80u8;
+        while bit != 0 {
+            if done || (b & bit) == 0 {
+                done = true;
+            } else {
+                prefix += 1;
+            }
+            bit >>= 1;
+        }
+    }
+    if prefix == 0 || prefix == 32 {
+        prefix = 24;
+    }
+    let added = addr_add(IpAddr::V4(ip), prefix, 0);
+    if reply.router != [0, 0, 0, 0] {
+        set_gateway(IpAddr::V4(reply.router));
+    }
+    added
+}

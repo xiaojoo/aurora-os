@@ -21,6 +21,7 @@ pub mod dhcp;
 pub mod dns;
 pub mod eth;
 pub mod icmp;
+pub mod ifaddr;
 pub mod ipv4;
 pub mod ipv6;
 pub mod ndp;

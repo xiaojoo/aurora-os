@@ -809,8 +809,31 @@ fn t_socket_family() -> bool {
     }
 
     // 4. bind + 重复 bind
-    let ep = crate::network::socket::SockAddr::V4 { ip: [127, 0, 0, 1], port: 45999 };
-    let bind_ok = crate::network::socket::bind(slot, gen, ep).is_ok();
+    // **显式确保地址在表里**（ADR-185 起 `bind` 校验归属）：
+    //
+    // 不能只靠 `bootstrap_addrs`：`t_ifaddr` 会清表，而它的「恢复现场」
+    // 只恢复它开始时看到的那几个 —— 若它开始时表是空的，恢复后还是空的。
+    let _ = crate::network::ifaddr::addr_add(
+        crate::network::ipv6::IpAddr::V4(crate::network::dhcp::DHCP_GUEST_IP),
+        24,
+        0,
+    );
+    let ep = crate::network::socket::SockAddr::V4 {
+        ip: crate::network::dhcp::DHCP_GUEST_IP,
+        port: 45999,
+    };
+    let bind_ok = match crate::network::socket::bind(slot, gen, ep) {
+        Ok(()) => true,
+        Err(e) => {
+            crate::log_fatal!(
+                "sock: bind 失败 {:#x} 端口={} 表内数={} 该地址在表内={}",
+                e, ep.port(),
+                crate::network::ifaddr::addr_count(),
+                crate::network::ifaddr::addr_is_local(&crate::network::ipv6::IpAddr::V4(crate::network::dhcp::DHCP_GUEST_IP))
+            );
+            false
+        }
+    };
     let (slot2, gen2) = match crate::network::socket::create(
         crate::network::socket::AF_INET,
         crate::network::socket::SOCK_DGRAM,
@@ -1061,7 +1084,7 @@ fn t_ndp_cache() -> bool {
     ) {
         // 清掉再让它学
         ndp::nd_clear();
-        let acted = ndp::handle_frame(&na[..n], &mac);
+        let acted = ndp::handle_frame(&na[..n], &mac, false);
         na_ok = matches!(acted, ndp::NdAction::None) && ndp::nd_lookup(&peer_ip) == Some(peer_mac);
     }
     if !na_ok {
@@ -1073,7 +1096,7 @@ fn t_ndp_cache() -> bool {
     let mut ns = [0u8; 256];
     let mut ns_ok = false;
     if let Some(n) = ndp::build_ns(&mut ns, &peer_mac, &peer_ip, &our_ip) {
-        if let ndp::NdAction::ReplyNa { target, .. } = ndp::handle_frame(&ns[..n], &mac) {
+        if let ndp::NdAction::ReplyNa { target, .. } = ndp::handle_frame(&ns[..n], &mac, true) {
             ns_ok = target == our_ip;
         }
     }
@@ -1089,6 +1112,13 @@ fn t_ndp_cache() -> bool {
     let mut deliv_ok = false;
     // 建一个绑在 45998 的 socket
     if let Ok((slot, gen)) = socket::create(socket::AF_INET6, socket::SOCK_DGRAM) {
+        // **显式把链路本地地址加进表**（ADR-185 起 `bind` 校验归属）。
+        // 不靠 `bootstrap_addrs`：别的用例会清表，守卫看「表非空」时会跳过填充。
+        let _ = crate::network::ifaddr::addr_add(
+            crate::network::ipv6::IpAddr::V6(our_ip),
+            64,
+            0,
+        );
         let local = socket::SockAddr::V6 { ip: our_ip, port: 45998 };
         if socket::bind(slot, gen, local).is_ok() {
             let mut f = [0u8; 512];
@@ -1124,3 +1154,144 @@ fn t_ndp_cache() -> bool {
 
 #[cfg(feature = "handles")]
 ktest!(KT_NDP_CACHE, t_ndp_cache);
+
+/// ADR-185：本机地址表的**证人**。
+///
+/// ## 判据七格
+///
+/// 1. **加/查**：`addr_add` 之后 `addr_is_local` 为真；
+/// 2. **幂等**：同一地址重复加不涨计数；
+/// 3. **删**：`addr_remove` 之后 `addr_is_local` 为假；
+/// 4. **通配放行**：`is_wildcard(0.0.0.0)` 与 `is_wildcard(::)` 都为真；
+/// 5. **`bind` 拒非本机地址** ⇒ `-99`（EADDRNOTAVAIL）；
+/// 6. **`bind` 放行通配地址** ⇒ 成功；
+/// 7. **NDP 精确判属**：target 不在表里 ⇒ 不回 NA。
+///
+/// **负样本**：把 `bind` 的归属校验去掉，第 5 格立刻红。
+#[cfg(feature = "handles")]
+fn t_ifaddr() -> bool {
+    use crate::network::ifaddr::{
+        addr_add, addr_clear, addr_count, addr_is_local, addr_remove, is_wildcard, IfAddr,
+    };
+    use crate::network::ipv6::IpAddr;
+    use crate::network::socket::{self, SockAddr};
+    let mut ok = true;
+
+    // 保存现场：这个用例会清表，跑完要恢复（别的用例依赖引导出来的地址）
+    let mut saved = [IfAddr { ip: IpAddr::V4([0; 4]), prefix: 0, iface: 0, link_local: false }; 8];
+    let n_saved = crate::network::ifaddr::addr_list(&mut saved);
+    addr_clear();
+
+    let test_ip = IpAddr::V4([192, 168, 99, 7]);
+
+    // 1. 加 + 查
+    let added = addr_add(test_ip, 24, 0);
+    let add_ok = added && addr_is_local(&test_ip) && addr_count() == 1;
+    if !add_ok {
+        crate::log_fatal!("ifaddr: 加/查不成立 added={} count={}", added, addr_count());
+        ok = false;
+    }
+
+    // 2. 幂等
+    let _ = addr_add(test_ip, 24, 0);
+    let idem_ok = addr_count() == 1;
+    if !idem_ok {
+        crate::log_fatal!("ifaddr: 幂等不成立 count={}", addr_count());
+        ok = false;
+    }
+
+    // 3. 删
+    let removed = addr_remove(&test_ip);
+    let rm_ok = removed && !addr_is_local(&test_ip) && addr_count() == 0;
+    if !rm_ok {
+        crate::log_fatal!("ifaddr: 删不成立 removed={} count={}", removed, addr_count());
+        ok = false;
+    }
+
+    // 4. 通配
+    let wc_ok = is_wildcard(&IpAddr::V4([0, 0, 0, 0]))
+        && is_wildcard(&IpAddr::V6([0; 16]))
+        && !is_wildcard(&test_ip);
+    if !wc_ok {
+        crate::log_fatal!("ifaddr: 通配判定不成立");
+        ok = false;
+    }
+
+    // 5. bind 拒非本机地址
+    let mut bind_reject_ok = false;
+    if let Ok((slot, gen)) = socket::create(socket::AF_INET, socket::SOCK_DGRAM) {
+        // 表里只有 127.0.0.1（下面第 6 格要用），192.168.99.7 不在表里
+        let foreign = SockAddr::V4 { ip: [192, 168, 99, 7], port: 45990 };
+        let ret = socket::bind(slot, gen, foreign).err().unwrap_or(0);
+        bind_reject_ok = ret == socket::E_ADDRNOTAVAIL;
+        if !bind_reject_ok {
+            crate::log_fatal!("ifaddr: bind 应拒非本机地址，实得 {:#x}", ret);
+            ok = false;
+        }
+
+        // 6. bind 放行通配
+        let wild = SockAddr::V4 { ip: [0, 0, 0, 0], port: 45991 };
+        let wret = socket::bind(slot, gen, wild);
+        if wret.is_err() {
+            crate::log_fatal!("ifaddr: bind 应放行通配地址");
+            ok = false;
+        }
+        let _ = socket::destroy(slot, gen);
+    } else {
+        crate::log_fatal!("ifaddr: create 失败");
+        ok = false;
+    }
+
+    // 7. NDP 精确判属：target 不在表里 ⇒ 不回 NA
+    //
+    // **手工构造 NS 而不用 `build_ns`**：这一格要验的是「判属」，不是「构造」。
+    let mac = [0x02u8, 0x00, 0x00, 0x00, 0x00, 0x01];
+    let our_ip = crate::network::ipv6::link_local_from_mac(&mac);
+    let mut not_ours = our_ip;
+    not_ours[15] = 0xAB; // 不在表里
+    let mut ns = [0u8; 128];
+    // eth 14 + IPv6 40 + ICMPv6 24 = 78
+    ns[12] = 0x86;
+    ns[13] = 0xDD;
+    ns[14] = 0x60;
+    ns[14 + 5] = 24; // payload len
+    ns[14 + 6] = 58; // ICMPv6
+    ns[14 + 7] = 255; // hop limit 必须 255
+    ns[14 + 8..14 + 24].copy_from_slice(&our_ip);
+    let mcast = crate::network::ipv6::solicited_node_multicast(&not_ours);
+    ns[14 + 24..14 + 40].copy_from_slice(&mcast);
+    let m = 14 + 40;
+    ns[m] = 135; // NS
+    ns[m + 8..m + 24].copy_from_slice(&not_ours);
+    let parsed = crate::network::ndp::parse_nd(&ns[..78]);
+    let ndp_ok = match parsed {
+        Some(_) => matches!(
+            crate::network::ndp::handle_frame(&ns[..78], &mac, false),
+            crate::network::ndp::NdAction::None,
+        ),
+        None => {
+            crate::log_fatal!("ifaddr: 手工 NS 解析失败");
+            false
+        }
+    };
+    if !ndp_ok {
+        crate::log_fatal!("ifaddr: NDP 精确判属不成立（非本机地址也回了 NA）");
+        ok = false;
+    }
+    crate::log_info!(
+        "ifaddr: 加查={} 幂等={} 删={} 通配={} bind拒={} bind通配={} ndp判属={} ⇒ {}",
+        add_ok, idem_ok, rm_ok, wc_ok, bind_reject_ok, true, ndp_ok, ok
+    );
+
+    // 恢复现场
+    addr_clear();
+    let mut i = 0usize;
+    while i < n_saved {
+        let _ = addr_add(saved[i].ip, saved[i].prefix, saved[i].iface);
+        i += 1;
+    }
+    ok
+}
+
+#[cfg(feature = "handles")]
+ktest!(KT_IFADDR, t_ifaddr);
