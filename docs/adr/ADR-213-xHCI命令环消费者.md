@@ -105,3 +105,48 @@ TRB 类型/cycle、CRCR 地址对齐（0x91000 是 64 字节对齐）、事件�
 3. **MSI/MSI-X**
 4. **Link TRB 真的写进环尾** —— 今天只是游标跳过（ADR-208 未决 3）
 5. **Scratchpad Buffer 分配**
+## 第二轮排查（2026-11-23）
+
+### 已排除：Bus Master
+
+`driver/mod.rs:198` 的 `map_mmio` 里已置 `enable_command(0b110)`
+（bit1=Memory Space、bit2=Bus Master）。**不是这个原因。**
+
+### 新发现：CRCR 只能在 RS=0 时写
+
+把 CRCR 移到 RS=1 之后，读回 **`crcr=0x0`**（写入被硬件拒绝）。
+移回 RS=1 之前，读回 `crcr=0x84001`（地址 + RCS=1 都在）。
+
+**结论：CRCR 只能在控制器停止时写。** 这一条已确认并写进代码注释。
+
+### 仍未解决：CRR 不置位
+
+```
+xhci: 终值 usbcmd=0x5 usbsts=0x0 config=0x40 dcbaap=0x86000
+      crcr=0x84001 erdp=0x85000 erstba=0x94000 cmd0=0x0
+```
+
+寄存器终值全部正确：
+
+| 寄存器 | 值 | 判断 |
+|---|---|---|
+| USBCMD | `0x5` | RS=1 + INTE=1 ✓ |
+| USBSTS | `0x0` | HCH=0，控制器在跑 ✓ |
+| CONFIG | `0x40` | MaxSlotsEn=64 ✓ |
+| DCBAAP | `0x86000` | 页对齐 ✓ |
+| CRCR | `0x84001` | 地址 + RCS=1 ✓ |
+| ERDP | `0x85000` | 段地址 ✓ |
+| ERSTBA | `0x94000` | 表地址 ✓ |
+| **CRR (bit3)** | **0** | **不置位** |
+
+### 一个待验证的假设
+
+**CRR 可能只在「命令环上有待处理命令」时置位** —— 若是这样，CRR=0 在空环时是正常的，
+而真正的问题是 Doorbell 没让控制器看到命令。
+
+这需要读 QEMU 的 `hcd-xhci.c` 源码确认（本轮网络取不到）。
+
+### 本轮停止的理由
+
+按项目纪律「**先记录问题，不要死磕**」：已经排除 Bus Master、CRCR 时序两个方向，
+剩下的必须靠读 QEMU 源码或逻辑分析仪，那不是本轮能完成的。

@@ -674,6 +674,12 @@ pub fn run_device(dev: &crate::bus::pci::Dev) -> Result<RunReading, RunError> {
 
     // CONFIG：MaxSlotsEn
     ctx.write32(mmio, op + OP_CONFIG, u32::from(cap.max_slots())).map_err(|_| RunError::Io)?;
+    // **CRCR 必须在 RS=0 时写**（ADR-213 实测第二轮）：
+    //
+    // 第一版放在 RS=1 之前 ⇒ 读回 `crcr_lo=0x91001`（写入成功，但 CRR=0）；
+    // 第二版放到 RS=1 之后 ⇒ 读回 **`crcr=0x0`**（写入被硬件拒绝）。
+    //
+    // 结论：CRCR 只能在控制器停止时写；RS=1 之后由控制器自己置 CRR。
 
     // ---- 5) 运行：RS=1 + INTE=1，等 HCH=0
     ctx.write32(mmio, cmd_off, USBCMD_RUN | USBCMD_INTE).map_err(|_| RunError::Io)?;
@@ -691,15 +697,6 @@ pub fn run_device(dev: &crate::bus::pci::Dev) -> Result<RunReading, RunError> {
     }
     let usbsts_after_run = ctx.read32(mmio, sts_off).map_err(|_| RunError::Io)?;
     let usbcmd_after_run = ctx.read32(mmio, cmd_off).map_err(|_| RunError::Io)?;
-    // **CRCR 必须在 RS=1 之后写**（ADR-213 实测）：
-    //
-    // 第一版在 RS=1 之前写 CRCR，读回 `crcr_lo=0x91001`（RCS=1 但 **CRR=0**）——
-    // 说明控制器认为命令环没在运行 ⇒ 敲 Doorbell 无效 ⇒ Enable Slot 永远超时。
-    //
-    // 顺序：HCRST → DCBAAP → CONFIG → RS=1（等 HCH=0）→ **CRCR**。
-    let crcr = op + OP_CRCR;
-    ctx.write32(mmio, crcr, ((ring_bus & !0x3F) | 1) as u32).map_err(|_| RunError::Io)?;
-    ctx.write32(mmio, crcr + 4, (ring_bus >> 32) as u32).map_err(|_| RunError::Io)?;
     // DMA 句柄**故意泄漏**（不 release）：控制器在跑，环必须一直有效。
     // 这与 NVMe 同一条：设备活着，缓冲就得活着。
     core::mem::forget(ring);
@@ -1079,6 +1076,15 @@ pub fn bring_up(dev: &crate::bus::pci::Dev) -> Result<RunReading, RunError> {
     ctx.write32(mmio, dcbaap + 4, (dcbaa_bus >> 32) as u32).map_err(|_| RunError::Io)?;
     // CONFIG
     ctx.write32(mmio, op + OP_CONFIG, u32::from(cap.max_slots())).map_err(|_| RunError::Io)?;
+    // **CRCR 必须在 RS=0 时写**（ADR-213 实测第二轮）：
+    //
+    // 第一版放在 RS=1 之前 ⇒ 读回 `crcr_lo=0x91001`（写入成功，但 CRR=0）；
+    // 第二版放到 RS=1 之后 ⇒ 读回 **`crcr=0x0`**（写入被硬件拒绝）。
+    //
+    // 结论：CRCR 只能在控制器停止时写；RS=1 之后由控制器自己置 CRR。
+    let crcr = op + OP_CRCR;
+    ctx.write32(mmio, crcr, ((cmd_bus & !0x3F) | 1) as u32).map_err(|_| RunError::Io)?;
+    ctx.write32(mmio, crcr + 4, (cmd_bus >> 32) as u32).map_err(|_| RunError::Io)?;
     // 事件环（RT 段）
     ctx.write32(mmio, rt + RT_ERSTSZ, 1).map_err(|_| RunError::Io)?;
     ctx.write32(mmio, rt + RT_ERSTBA, (erst_bus & 0xFFFF_FFFF) as u32).map_err(|_| RunError::Io)?;
@@ -1122,7 +1128,21 @@ pub fn bring_up(dev: &crate::bus::pci::Dev) -> Result<RunReading, RunError> {
         event_cycle: true,
         seg_trbs,
     });
-    let _ = erst; // ERST 句柄故意不存：控制器已读走表项，后续不再改
+    let _ = erst;
+    // **初始化后打印全部关键寄存器终值**：
+    // 「CRR 不置位」的成因只能在寄存器终值里找，不能靠猜。
+    let dbg_cmd = ctx.read32(mmio, cmd_off).unwrap_or(0);
+    let dbg_sts = ctx.read32(mmio, sts_off).unwrap_or(0);
+    let dbg_cfg = ctx.read32(mmio, op + OP_CONFIG).unwrap_or(0);
+    let dbg_dcbaap_lo = ctx.read32(mmio, op + OP_DCBAAP).unwrap_or(0);
+    let dbg_crcr_lo = ctx.read32(mmio, op + OP_CRCR).unwrap_or(0);
+    let dbg_erdp_lo = ctx.read32(mmio, rt + RT_ERDP).unwrap_or(0);
+    let dbg_erstba_lo = ctx.read32(mmio, rt + RT_ERSTBA).unwrap_or(0);
+    let dbg_cmd0 = ctx.dma_read32(cmd, 0).unwrap_or(0);
+    crate::log_info!(
+        "xhci: 终值 usbcmd={:#x} usbsts={:#x} config={:#x} dcbaap={:#x} crcr={:#x} erdp={:#x} erstba={:#x} cmd0={:#x}",
+        dbg_cmd, dbg_sts, dbg_cfg, dbg_dcbaap_lo, dbg_crcr_lo, dbg_erdp_lo, dbg_erstba_lo, dbg_cmd0
+    );
     Ok(RunReading {
         cap: Reading {
             cap_length: cap.cap_length,
