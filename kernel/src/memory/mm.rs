@@ -1046,6 +1046,64 @@ pub fn mark_switched() {
     AURORA_KERNEL_CR3.store(p, Ordering::Release);
     crate::log_info!("mm: page tables switched ok (running on our own stack)");
 }
+/// 查「当前任务登记的 AS 槽」的函数指针（ADR-193）。
+///
+/// ## 为什么是函数指针而不是直接调 `sched`
+///
+/// `memory` 直接调 `sched::current_as_slot` 会形成**双向依赖**：`sched` 已经依赖
+/// `memory`（`alloc_va_range`、`map`、`aspace_*`），再加反向边就是新的强连通分量
+/// （`check-module-interfaces` 当场红，实测）。
+///
+/// 与 `handle::install_proc_of`、`sync::install_wait_ops` 同一模式。
+static AS_OF_TASK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// 启动期安装一次（由 `sched` 调）。
+pub fn install_as_of_task(f: fn() -> Option<u16>) {
+    AS_OF_TASK.store(f as usize as u64, core::sync::atomic::Ordering::Release);
+}
+
+/// 查当前任务登记的 AS；没装时回 `None`（**不 panic、不猜**）。
+#[inline]
+fn current_as_slot() -> Option<u16> {
+    let v = AS_OF_TASK.load(core::sync::atomic::Ordering::Acquire);
+    if v == 0 {
+        return None;
+    }
+    // SAFETY: 只可能是 `install_as_of_task` 装进来的 `fn() -> Option<u16>`，
+    // 签名一一对应；指针启动期装一次、之后只读。
+    let f: fn() -> Option<u16> = unsafe { core::mem::transmute(v as usize) };
+    f()
+}
+
+
+
+/// 按 CR3 值反查 AS 槽号（ADR-193）。
+///
+/// ## 为什么需要它
+///
+/// 惰性区间表（`LazyRegion`）原来**没有地址空间标识**：`lazy_find(va)` 只按 VA 匹配。
+/// 于是两个进程各自 `mmap` 到相同 VA（不同 AS）时，表里会命中**对方的区间**；
+/// `munmap(va)` 可能释放别人的映射。
+///
+/// #PF 修复路径（`demand_zero_try`）拿到的只有 `cr2`，而 `cr3` 是**故障那个 AS 的**
+/// （硬件在进 #PF 时已经切到故障 AS 的地址空间）。所以「按 CR3 反查槽」是唯一正确的归属判据。
+///
+/// 返回 `None` = 这个 CR3 不属于任何活 AS（内核 AS 或已销毁）。
+pub fn as_slot_of_cr3(cr3: u64) -> Option<u16> {
+    if !is_ready() {
+        return None;
+    }
+    let root = cr3 & !(PAGE as u64 - 1);
+    // AS 表是独立静态量（`ASPACES`），不在 `State` 里。
+    // SAFETY: 只读快照；调用方要么在 VMM(20) 内（#PF 路径），要么在启动期单核。
+    let t = unsafe { &*ASPACES.0.get() };
+    for (i, e) in t.items.iter().enumerate() {
+        if e.used && e.pml4 != 0 && (e.pml4 & !(PAGE as u64 - 1)) == root {
+            return Some(i as u16);
+        }
+    }
+    None
+}
 
 /// 内核自己的 PML4 物理地址（0 = 还没切换）。释放 AP 前必须确认它非 0。
 pub fn our_cr3() -> u64 {
@@ -2579,12 +2637,21 @@ struct LazyRegion {
     /// 已填充位图：占用唯一真相（ADR-065 同律）。
     filled: u16,
     owner: ModuleId,
+    /// **这条区间属于哪个地址空间**（ADR-193）。
+    ///
+    /// ## 为什么必须有
+    ///
+    /// 原来没有这一格，`lazy_find(va)` 只按 VA 匹配 ⇒ 两个进程各自 `mmap` 到
+    /// 相同 VA 时会命中**对方的区间**，`munmap` 可能释放别人的映射。
+    ///
+    /// `NO_ASPACE` = 内核 AS（或还没绑定）。
+    as_slot: u16,
     /// 已填充页的物理基（帧 0 永不可分配 ⇒ 0 可作"无帧"哨兵）。
     frames: [u64; MAX_LAZY_PAGES],
 }
 
 const LAZY_EMPTY: LazyRegion =
-    LazyRegion { used: false, base: 0, pages: 0, filled: 0, owner: ModuleId(0), frames: [0; MAX_LAZY_PAGES] };
+    LazyRegion { used: false, base: 0, pages: 0, filled: 0, owner: ModuleId(0), as_slot: u16::MAX /* = NO_ASPACE，断言在 sched 侧 */, frames: [0; MAX_LAZY_PAGES] };
 
 #[derive(Clone, Copy)]
 struct LazyTable {
@@ -2630,6 +2697,32 @@ pub struct LazyHandle {
 }
 
 impl LazyHandle {
+    /// **测试专用：把归属改成给定 AS**（ADR-193 的判据需要造「别人的区间」）。
+    ///
+    /// 生产路径不用它。存在的理由：boot 任务没有真 AS，靠切 AS 造不出「同名 VA
+    /// 分属两个 AS」的局面，而那条正是本切片要证的。
+    #[cfg(feature = "handles")]
+    pub fn force_as_slot(&self, as_slot: u16) {
+        let _g = vmm();
+        let r = &mut lazy_items().items[usize::from(self.slot)];
+        if r.used {
+            r.as_slot = as_slot;
+        }
+    }
+
+    /// **这条区间记下的地址空间归属**（ADR-193 的判据用）。
+    ///
+    /// 返回 `None` = 槽已释放。`u16::MAX` = 无 AS（内核 AS 或未绑定）。
+    pub fn as_slot_of_region(&self) -> Option<u16> {
+        let _g = vmm();
+        let r = lazy_items().items[usize::from(self.slot)];
+        if r.used {
+            Some(r.as_slot)
+        } else {
+            None
+        }
+    }
+
     /// 区间起始 VA（用例装桩代码与竞争格需要；表读在 VMM 内）。
     pub fn base(&self) -> Option<u64> {
         let _g = vmm();
@@ -2657,7 +2750,17 @@ pub fn lazy_new(pages: usize, owner: ModuleId) -> Option<LazyHandle> {
     for i in 0..MAX_LAZY_REGIONS {
         let r = &mut lazy_items().items[i];
         if !r.used {
-            *r = LazyRegion { used: true, base: va.0, pages: pages as u16, filled: 0, owner, frames: [0; MAX_LAZY_PAGES] };
+            // **记下归属的 AS**（ADR-193）。
+            //
+            // **不能取 `our_cr3()`**（实测回归）：mmap syscall 在**内核上下文**里跑，
+            // 那时的 CR3 可能还是内核表（boot 任务的），而 #PF 发生在**用户 AS** 里 ⇒
+            // 记下的归属与故障 AS 不符 ⇒ `demand_zero_try` 找不到 ⇒
+            // `unexpected #PF rip=0x100103000 cr2=0x100103000 err=0x15` ⇒ 任务被杀。
+            //
+            // 正确做法：取**调用方任务登记的 AS**（`set_aspace` 那一格），
+            // 它才是这段 VA 将来真正会被访问时所在的地址空间。
+            let as_slot = current_as_slot().unwrap_or(u16::MAX);
+            *r = LazyRegion { used: true, base: va.0, pages: pages as u16, filled: 0, owner, as_slot, frames: [0; MAX_LAZY_PAGES] };
             return Some(LazyHandle { slot: i as u16 });
         }
     }
@@ -2747,11 +2850,21 @@ pub fn demand_zero_try(cr2: u64) -> bool {
         return false;
     }
     let va = cr2 & !(PAGE as u64 - 1);
+    // **必须按故障 AS 过滤**（ADR-193）：`cr2` 是故障 VA，`cr3` 是故障 AS 的根。
+    //
+    // 原来只按 VA 匹配 ⇒ 两个进程各自 `mmap` 到相同 VA 时会命中对方的区间，
+    // 于是 A 的 #PF 修好了 B 的页（越界映射）。
+    let fault_as = as_slot_of_cr3(our_cr3()).unwrap_or(u16::MAX);
     let hit = {
         let _g = vmm();
         let mut found = None;
         for (i, r) in lazy_items().items.iter().enumerate() {
             if !r.used || cr2 < r.base || cr2 >= r.base + r.pages as u64 * PAGE as u64 {
+                continue;
+            }
+            // 归属不符 ⇒ 不是我们的区间，继续找（**不是**直接返回 false：
+            // 同一个 VA 在不同 AS 里可能各有一条区间）。
+            if r.as_slot != fault_as {
                 continue;
             }
             let idx = (va - r.base) as usize / PAGE;
@@ -2817,8 +2930,10 @@ pub fn lazy_find(va: u64) -> Option<(u16, u64, usize)> {
         return None;
     }
     let _g = vmm();
+    // **按当前 AS 过滤**（ADR-193）：否则同名 VA 会命中别人的区间。
+    let cur_as = as_slot_of_cr3(our_cr3()).unwrap_or(u16::MAX);
     for (i, r) in lazy_items().items.iter().enumerate() {
-        if r.used && va >= r.base && va < r.base + r.pages as u64 * PAGE as u64 {
+        if r.used && r.as_slot == cur_as && va >= r.base && va < r.base + r.pages as u64 * PAGE as u64 {
             return Some((i as u16, r.base, r.pages as usize));
         }
     }

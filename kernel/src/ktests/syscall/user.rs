@@ -1928,3 +1928,108 @@ fn t_socket_refcount() -> bool {
 
 #[cfg(feature = "handles")]
 ktest!(KT_SOCKET_REFCOUNT, t_socket_refcount);
+
+/// ADR-193：**惰性区间按地址空间归属**的证人（切片 C）。
+///
+/// ## 为什么要 `force_as_slot`
+///
+/// 第一版判据在 boot 任务上跑（`当前AS=0xffff`），而 `as_slot == cur_as` 在那种情况下
+/// 恒成立 ⇒ **负样本（去掉过滤）也不会红**（实测）。判据绿但关键路径没验。
+///
+/// 这一版造**两条区间**：一条归当前 AS，另一条用 `force_as_slot` 强行改成别的 AS。
+/// 后者必须**找不到** —— 这才真的验到了归属过滤。
+///
+/// ## 判据五格
+///
+/// 1. 归当前 AS 的那条：`lazy_find` 找得到；
+/// 2. **归别的 AS 的那条：找不到**（本轮要修的）；
+/// 3. 把它改回当前 AS：又找得到（证明过滤是唯一原因）；
+/// 4. 释放之后都找不到；
+/// 5. 收场干净。
+#[cfg(feature = "handles")]
+fn t_lazy_as_owner() -> bool {
+    use crate::mm;
+    let mut ok = true;
+    crate::sched::init_boot_task();
+    crate::sched::start_workers();
+
+    let cur_slot = mm::as_slot_of_cr3(mm::our_cr3()).unwrap_or(u16::MAX);
+    // 造一个**肯定不等于当前**的 AS 号
+    let other_slot = if cur_slot == 0 { 1u16 } else { 0u16 };
+
+    // ① 归当前 AS 的区间
+    let mine = match mm::lazy_new(2, mm::MOD_TEST) {
+        Some(h) => h,
+        None => {
+            crate::log_fatal!("lazyas: lazy_new(mine) 失败");
+            return false;
+        }
+    };
+    let mine_base = match mine.base() {
+        Some(b) => b,
+        None => {
+            crate::log_fatal!("lazyas: mine.base() 回 None");
+            return false;
+        }
+    };
+    let mine_found = mm::lazy_find(mine_base).is_some();
+    if !mine_found {
+        crate::log_fatal!("lazyas: 自己那条找不到");
+        ok = false;
+    }
+
+    // ② 造「别人的区间」
+    let theirs = match mm::lazy_new(2, mm::MOD_TEST) {
+        Some(h) => h,
+        None => {
+            crate::log_fatal!("lazyas: lazy_new(theirs) 失败");
+            drop(mine);
+            return false;
+        }
+    };
+    let theirs_base = match theirs.base() {
+        Some(b) => b,
+        None => {
+            crate::log_fatal!("lazyas: theirs.base() 回 None");
+            drop(mine);
+            return false;
+        }
+    };
+    let before_force = mm::lazy_find(theirs_base).is_some();
+    theirs.force_as_slot(other_slot);
+    // ③ **改成别的 AS 之后必须找不到**（核心判据）
+    let after_force = mm::lazy_find(theirs_base).is_none();
+    if !before_force || !after_force {
+        crate::log_fatal!(
+            "lazyas: AS 过滤没生效 改之前找得到={} 改之后找不到={}",
+            before_force, after_force
+        );
+        ok = false;
+    }
+
+    // ④ 改回当前 AS：又找得到
+    theirs.force_as_slot(cur_slot);
+    let back = mm::lazy_find(theirs_base).is_some();
+    if !back {
+        crate::log_fatal!("lazyas: 改回当前 AS 之后还是找不到");
+        ok = false;
+    }
+
+    // ⑤ 释放之后都找不到
+    drop(mine);
+    drop(theirs);
+    let gone = mm::lazy_find(mine_base).is_none() && mm::lazy_find(theirs_base).is_none();
+    if !gone {
+        crate::log_fatal!("lazyas: 释放之后还能找到");
+        ok = false;
+    }
+
+    crate::log_info!(
+        "lazyas: 当前AS={:#x} 别人的AS={:#x} 自己找得到={} 改归属前={} 改后找不到={} 改回找得到={} 释放后没了={} ⇒ {}",
+        cur_slot, other_slot, mine_found, before_force, after_force, back, gone, ok
+    );
+    ok
+}
+
+#[cfg(feature = "handles")]
+ktest!(KT_LAZY_AS_OWNER, t_lazy_as_owner);

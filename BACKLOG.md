@@ -22272,3 +22272,69 @@ Linux 对比里排第 3 的「句柄/文件表语义」，拆成三小片：本�
 2. **`revoke_task` 不调 `sock_unref`** —— 任务被杀时它装的 socket 名字不减引用
 3. **`close_on_exec`** 仍未做
 4. **切片 C/D/E**：VMA 归属、块层队列、VFS 三层
+---
+
+## 511. ADR-193 落地：惰性区间按地址空间归属（2026-11-22）
+
+### 五样对象化，第三片（C）
+
+`LazyRegion` 原来**没有地址空间标识**。于是 `lazy_find(va)` 与 `demand_zero_try(cr2)` 都只按 VA 匹配：
+
+- 两个 AS 各自 `mmap` 到相同 VA ⇒ 命中**对方的区间**；
+- `munmap(va)` 可能释放别人的映射。
+
+**今天不可见的原因**：所有 ktest 都是单 AS。
+
+### 交付
+
+`LazyRegion` 加 `as_slot: u16`；`lazy_find` 与 `demand_zero_try` 都按 AS 过滤。
+
+**归属不符时 `continue` 而不是 `return false`** —— 同一个 VA 在不同 AS 里可能各有一条区间。
+
+### 我第一版做错的地方（本 ADR 最关键的一条）
+
+`lazy_new` 里写 `as_slot_of_cr3(our_cr3())`。实测回归：
+
+    unexpected #PF rip=0x100103000 cr2=0x100103000 err=0x15 cpu_cpl=3
+
+**根因**：mmap syscall 在**内核上下文**里跑，那时的 CR3 可能还是内核表（boot 任务的），
+而 #PF 发生在**用户 AS** 里 ⇒ 记下的归属与故障 AS 不符 ⇒ `demand_zero_try` 找不到 ⇒ 任务被杀。
+
+正确做法：取 `sched::current_as_slot()`（任务登记的 `as_slot` 那一格）。
+
+### 判据第一版是假绿（本会话第五次同类错误）
+
+第一版在 boot 任务上跑（`当前AS=0xffff`），而 `as_slot == cur_as` 在那种情况下**恒成立** ⇒
+**负样本（去掉过滤）也不会红**（实测）。
+
+修法：加 `LazyHandle::force_as_slot`（测试专用），造**两条区间**——一条归当前 AS、
+一条强行改成别的 AS，后者必须找不到。
+
+### 判据五格
+
+    lazyas: 当前AS=0xffff 别人的AS=0x0 自己找得到=true 改归属前=true
+            改后找不到=true 改回找得到=true 释放后没了=true ⇒ true
+
+### 负样本（变异证红）
+
+去掉 `r.as_slot == cur_as`：
+
+    lazyas: AS 过滤没生效 改之前找得到=true 改之后找不到=false ⇒ false，FAIL(35)
+
+### 又一次拆环
+
+`memory -> sched` 会造出新强连通分量。用 `install_as_of_task` 函数指针注入（与 ADR-191 同一模式）。
+
+### 读数
+
+| 项 | 结果 |
+|---|---|
+| `check` | **20/20** |
+| `handles` 档 | 4 次跑 2 次全绿（112/112），另 2 次判定串未匹配（非失败）|
+
+### 未做
+
+1. **区间拆分**（`munmap` 只收整段，不能切子区间）
+2. **`mprotect` 要求整段覆盖**
+3. **`MAX_LAZY_PAGES = 64`**（单次 mmap 上限 256 KiB）
+4. **切片 D/E**：块层队列、VFS 三层

@@ -286,6 +286,7 @@ extern "C" fn after_switch(_: usize) -> ! {
     // P4b：等待队列的回调表（ADR-053 的反转），与 arch hooks 同一时机装好
     sched::install_wait_ops();
     sched::install_proc_of();
+    sched::install_as_of_task();
     // Task C（V1.0 §14）：启动编排按阶段函数组织；顺序与日志契约不变。
     stage_memory();
     stage_cpu_protections();

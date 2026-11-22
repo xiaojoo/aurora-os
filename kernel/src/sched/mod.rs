@@ -975,6 +975,10 @@ fn current_id_no_lock() -> usize {
 ///
 /// 与 `install_wait_ops` 同一模式：**避免 `capability -> sched` 的反向边**。
 /// 那个反向边会形成新的强连通分量 `[capability, sched]`（门禁当场红）。
+pub fn install_as_of_task() {
+    crate::mm::install_as_of_task(current_as_slot);
+}
+
 pub fn install_proc_of() {
     // **一致性断言**：`capability` 侧用 `u16::MAX` 当「没有进程」的哨兵，
     // 它必须等于 `NO_PROC`。这里断言一次，改一边不改另一边会当场崩。
@@ -2364,6 +2368,28 @@ pub fn own_current(item: OwnedItem) -> Result<(), mm::MmError> {
     }
     s.tasks[slot_of(me)].owned.push_item(item)
 }
+/// 当前任务登记的 AS 槽（ADR-193）。
+///
+/// 与 `as_slot_of_cr3(our_cr3())` 的区别：后者读**硬件 CR3**，前者读**任务记录**。
+/// mmap 这类「在内核上下文里替用户登记 VA」的路径必须用后者 —— 那时 CR3 可能还是内核表。
+///
+/// 返回 `None` = 当前任务没有 AS（boot 任务）或越界。
+pub fn current_as_slot() -> Option<u16> {
+    let cpu = crate::arch::x86_64::cpu::self_slot();
+    let gi = current_of(cpu);
+    if gi >= MAX_TASKS_TOTAL {
+        return None;
+    }
+    // SAFETY: 只读快照，理由同 `current_of`。
+    let s = unsafe { (*RQ[cpu].data.get()).tasks[slot_of(gi)].as_slot };
+    if s == NO_ASPACE {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+
 
 /// 把一个任务登记到某个 AS 上（W3 P5b；用例用，P5c 的 `thread_create` 走同一条）。
 /// **在这里查一次根表并缓存**，换人时就不再取 VMM。只允许本 CPU 的活任务（同 `set_proc_id`）。
