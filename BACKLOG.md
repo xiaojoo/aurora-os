@@ -21387,3 +21387,85 @@ pub enum SockAddr { V4 { ip: [u8; 4], port: u16 }, V6 { ip: [u8; 16], port: u16 
 2. **`recv` 返回源地址**（今天只回字节数；`recvfrom` 是另一件事）
 3. **双栈 `AF_INET6` 收 `::ffff:a.b.c.d`**
 4. **`sin6_scope_id`**（链路本地地址需要 scope 才能唯一定位接口，本轮忽略）
+---
+
+## 499. ADR-184 落地：NDP 邻居缓存 + 收包投递（2026-11-22）
+
+### 补的是两个真实缺口（都是前几轮自己标出来的）
+
+| # | 缺口 | 出处 |
+|---|---|---|
+| 1 | **`socket::enqueue` 没有任何调用者** —— 收了包不进队列，`recv` 永远回 EAGAIN | ADR-181 |
+| 2 | **IPv6 目标 MAC 用组播兜底**，没有 NDP 邻居缓存 | ADR-183 决策 4 |
+
+**第 1 条最严重**：整个 socket 的接收方向是断的。ADR-181 建了队列，但没有任何代码往里放东西。
+
+而 `t_socket_family` 只验了「空队列回 EAGAIN」——**那恰好掩盖了这个缺口**
+（空队列永远回 EAGAIN，所以判据绿）。这是一条「判据通过但功能是断的」的实例。
+
+### 交付
+
+| 项 | 内容 |
+|---|---|
+| `socket::deliver_frame` | 按协议分发，**NDP 优先于 UDP** |
+| `socket::poll_once` | 轮询网卡，一次最多 8 帧（队列深度就是 8）|
+| `ndp` 缓存 | `nd_lookup` / `nd_learn` / `nd_mark_incomplete` / `nd_stats` / `nd_clear` |
+| `ndp::handle_frame` | NS → 回 NA，NA → 学进缓存 |
+| `send` 三级回退 | 命中单播 / 未命中同时发 NS + 组播 / 下一帧命中 |
+| `recv` 的 `recvfrom` | `r10` = 源地址输出，`r8` = 超时 |
+
+### 五个设计点
+
+**① NDP 必须先于 UDP 判**：它是 ICMPv6，不走 UDP 解析。混在一起会让 NDP 帧被当坏 UDP 丢掉，
+然后邻居永远学不到 MAC。
+
+**② NDP 缓存与 socket 表共用 `RANK_NET(36)`**：两者都是网络层小表，从不互相嵌套。
+
+**③ 缓存只做 `Incomplete`/`Reachable` 两态**：RFC 4861 的 STALE/DELAY/PROBE 是为了
+「邻居悄悄换 MAC」的检测，需要定时器——本轮没有。**`Incomplete` 不算命中。**
+
+**④ `send` 未命中时既发 NS 又发数据**：严格按 RFC 应该等 NA 回来再发，但那要阻塞几十毫秒，
+而 `send` 是非阻塞语义。折中是同时发——第一帧多绕一圈，第二帧起单播。
+
+**⑤ `recvfrom` 用 `r10`/`r8` 而不是 `rcx`/`r9`**：SYSCALL 会覆盖 rcx（返回地址），
+而 Linux 的 syscall ABI 本来就把第 4 参放 r10。
+
+### 判据六格（`t_ndp_cache`）
+
+    ndp: 未命中=true 命中=true Incomplete=true NA处理=true NS回NA=true 投递=true stats(h2 m2 l2 e0) ⇒ true
+
+### 负样本（变异证红）
+
+把 `nd_lookup` 里 `state == Reachable` 的判断去掉（`Incomplete` 也返回 MAC）：
+
+    ndp: Incomplete 不该命中
+    ndp: ... Incomplete=false ... ⇒ false，判定 FAIL(35)
+
+**只有第 3 格红**，其余五格仍绿。
+
+### 读数
+
+| 项 | 结果 |
+|---|---|
+| `check` | **20/20** |
+| `handles` 档 | **106/106**，连跑 5 次 **4 次全绿** |
+
+那次失败是既有 `t_sdkdemo` 偶发（`读用户页被拒 va=0x100002000`，§487 同族），
+它级联出 66 个失败——**与本轮改动无关**。
+
+### 一个新增的依赖边（门禁抓到）
+
+`network -> driver` 是新边（socket 里调 `virtio::send_raw`），站点 5。
+已登记棘轮，`driver.allowed_callers += network`。
+
+**这条边是设计上的让步**：`network` 本不该依赖 `driver`（ADR-166 的方向是 `network → driver` 单向），
+而今天确实如此——只是它让 `driver` 也进了同一个 SCC。真正的解法是把收发原语抽象成
+`DriverCtx` 之外的一层，那是 ADR-166 未决 1 的范围。
+
+### 未做
+
+1. **本机地址表**：`handle_frame` 收到 NS 时**总是回 NA**（无法判断 target 是不是自己的），
+   代价是链路上每台机器都回。
+2. **中断收包**（把 `poll_once` 换成 ISR 驱动，要改 `RANK_NET` 的 ISR 属性）。
+3. **STALE/DELAY/PROBE** 三态。
+4. **`sin6_scope_id`**。

@@ -11,6 +11,8 @@
 //! 第二条是 NDP 比 ARP 好的地方：只有真正关心那个地址的节点会收到，
 //! 而不是整个广播域。
 
+use crate::sync::{IrqSpinLock, RANK_NET};
+
 use crate::network::ipv6::{
     solicited_node_multicast, IP6_ADDR_LEN, IP6_HDR, NET_TYPE_IPV6,
 };
@@ -258,4 +260,221 @@ pub fn is_all_nodes(addr: &[u8; 16]) -> bool {
         i += 1;
     }
     true
+}
+
+// ---------------------------------------------------------------- ADR-184：NDP 邻居缓存
+
+/// NDP 邻居缓存的槽数。
+///
+/// 与 ARP 表的 8 项同量级：链路本地的邻居个数是个位数。
+/// 256 位地址 + 48 位 MAC + 状态 = 约 32 B/项 ⇒ 8 项 256 B，放 `.bss` 无压力。
+pub const NDP_TABLE_MAX: usize = 8;
+
+/// 邻居缓存状态（RFC 4861 §7.3.2 的简化版）。
+///
+/// **本轮只做 REACHABLE 与 INCOMPLETE 两态**：
+/// STALE/DELAY/PROBE 是为了「邻居悄悄换了 MAC」的检测，
+/// 那需要定时器与再确认逻辑——本轮没有，所以学到的就当真。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum NdState {
+    /// 还没学到 MAC（发过 NS，没等到 NA）。
+    Incomplete,
+    /// 学到了，可以直接用。
+    Reachable,
+}
+
+#[derive(Clone, Copy)]
+struct NdEntry {
+    ip: [u8; 16],
+    mac: [u8; 6],
+    state: NdState,
+    /// 空槽标记（`ip` 全零且 state=Incomplete 时也算空——见 `is_empty`）。
+    used: bool,
+}
+
+const ND_EMPTY: NdEntry = NdEntry {
+    ip: [0u8; 16],
+    mac: [0u8; 6],
+    state: NdState::Incomplete,
+    used: false,
+};
+
+struct NdTable {
+    entries: [NdEntry; NDP_TABLE_MAX],
+    hits: u32,
+    misses: u32,
+    learns: u32,
+    evicts: u32,
+}
+
+/// 缓存表的锁等级：与 socket 表同用 `RANK_NET(36)`。
+///
+/// **为什么可以共用一把锁**：两者都是「网络层的小表」，且从不互相嵌套获取。
+/// 共用的好处是「查表 → 发包」这一串只有一个锁等级要维护。
+static NDP_TABLE: IrqSpinLock<NdTable> = IrqSpinLock::new(
+    RANK_NET,
+    NdTable {
+        entries: [ND_EMPTY; NDP_TABLE_MAX],
+        hits: 0,
+        misses: 0,
+        learns: 0,
+        evicts: 0,
+    },
+);
+
+/// 邻居缓存的读数（判据用）。
+pub struct NdStats {
+    pub hits: u32,
+    pub misses: u32,
+    pub learns: u32,
+    pub evicts: u32,
+}
+
+/// 查邻居缓存。`Reachable` 才返回 MAC；`Incomplete` 与 miss 都回 `None`。
+///
+/// **`Incomplete` 也回 `None`**：那个槽只是「我们正在问」，还没有答案。
+pub fn nd_lookup(ip: &[u8; 16]) -> Option<[u8; 6]> {
+    let mut g = NDP_TABLE.lock();
+    let t = g.get();
+    let mut i = 0usize;
+    while i < NDP_TABLE_MAX {
+        if t.entries[i].used && t.entries[i].ip == *ip {
+            if t.entries[i].state == NdState::Reachable {
+                t.hits += 1;
+                return Some(t.entries[i].mac);
+            }
+            // 找到槽但还没学到 ⇒ 也算 miss（调用方要发 NS）
+            t.misses += 1;
+            return None;
+        }
+        i += 1;
+    }
+    t.misses += 1;
+    None
+}
+
+/// 学一条邻居（NA 里的 target + 目标链路层地址选项）。
+///
+/// 已有则覆盖（与 ARP 的 RFC 826 merge 同律）；满则挤第一条（FIFO，最简且测得出）。
+pub fn nd_learn(ip: &[u8; 16], mac: &[u8; 6]) {
+    let mut g = NDP_TABLE.lock();
+    let t = g.get();
+    t.learns += 1;
+    // 先找已有槽
+    let mut i = 0usize;
+    while i < NDP_TABLE_MAX {
+        if t.entries[i].used && t.entries[i].ip == *ip {
+            t.entries[i].mac = *mac;
+            t.entries[i].state = NdState::Reachable;
+            return;
+        }
+        i += 1;
+    }
+    // 找空槽
+    let mut i = 0usize;
+    while i < NDP_TABLE_MAX {
+        if !t.entries[i].used {
+            t.entries[i].ip = *ip;
+            t.entries[i].mac = *mac;
+            t.entries[i].state = NdState::Reachable;
+            t.entries[i].used = true;
+            return;
+        }
+        i += 1;
+    }
+    // 满了：挤第 0 条
+    t.evicts += 1;
+    t.entries[0].ip = *ip;
+    t.entries[0].mac = *mac;
+    t.entries[0].state = NdState::Reachable;
+    t.entries[0].used = true;
+}
+
+/// 记一条「正在问」的邻居（发 NS 之前调）。已 `Reachable` 的不降级。
+pub fn nd_mark_incomplete(ip: &[u8; 16]) {
+    let mut g = NDP_TABLE.lock();
+    let t = g.get();
+    let mut i = 0usize;
+    while i < NDP_TABLE_MAX {
+        if t.entries[i].used && t.entries[i].ip == *ip {
+            return; // 已有槽，状态不动
+        }
+        i += 1;
+    }
+    let mut i = 0usize;
+    while i < NDP_TABLE_MAX {
+        if !t.entries[i].used {
+            t.entries[i].ip = *ip;
+            t.entries[i].state = NdState::Incomplete;
+            t.entries[i].used = true;
+            return;
+        }
+        i += 1;
+    }
+}
+
+/// 读数。
+pub fn nd_stats() -> NdStats {
+    let mut g = NDP_TABLE.lock();
+    let t = g.get();
+    NdStats { hits: t.hits, misses: t.misses, learns: t.learns, evicts: t.evicts }
+}
+
+/// 清表（用例收尾用）。
+pub fn nd_clear() {
+    let mut g = NDP_TABLE.lock();
+    let t = g.get();
+    let mut i = 0usize;
+    while i < NDP_TABLE_MAX {
+        t.entries[i] = ND_EMPTY;
+        i += 1;
+    }
+}
+
+/// 处理一帧 NDP（NS 或 NA），返回是否被消费。
+///
+/// ## NS 的处理
+///
+/// 收到 NS 时**我们必须回 NA**，否则对端学不到我们的 MAC。
+/// 但回 NA 要发包，而本函数在 `RANK_NET` 锁内——**不能在这里发**。
+/// 所以返回一个「待发 NA」的指示，由调用方在锁外发。
+///
+/// ## NA 的处理
+///
+/// 直接把 `target + lladdr` 学进缓存。
+pub enum NdAction {
+    /// 消费了，不需要回包。
+    None,
+    /// 需要回一个 NA 给 `dst_ip`（目标 MAC 用 `dst_mac`）。
+    ReplyNa { dst_ip: [u8; 16], dst_mac: [u8; 6], target: [u8; 16] },
+}
+
+/// 解析并处理一帧。**不持锁调用发包**：返回动作由调用方执行。
+pub fn handle_frame(f: &[u8], our_mac: &[u8; 6]) -> NdAction {
+    let Some(msg) = parse_nd(f) else {
+        return NdAction::None;
+    };
+    match msg.kind {
+        ICMPV6_NA => {
+            // 只学「有目标链路层地址选项」的 NA——没有选项的 NA 是「不在此处」
+            if let Some(mac) = msg.lladdr {
+                nd_learn(&msg.target, &mac);
+            }
+            NdAction::None
+        }
+        ICMPV6_NS => {
+            // 对端问的是不是我们？`target` 是它要解析的地址。
+            // 我们无法从这一帧判断 target 是不是自己的（需要本机地址表，
+            // 而本轮地址是静态配置的，没有那张表），所以**总是回**。
+            // 代价：链路上每台机器都会回 NA，而真正的目标会回得更快。
+            // 这是「没有本机地址表」时的正确妥协（ADR-184 未决 1）。
+            let _ = our_mac;
+            NdAction::ReplyNa {
+                dst_ip: msg.src_ip,
+                dst_mac: msg.lladdr.unwrap_or([0xFF; 6]),
+                target: msg.target,
+            }
+        }
+        _ => NdAction::None,
+    }
 }

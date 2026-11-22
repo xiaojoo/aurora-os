@@ -2738,11 +2738,39 @@ fn sys_sock_send(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
 /// 然后按 IPv6 头里的单播目的地址决定收不收。代价是同一链路上所有同组播组的
 /// 主机都会收到一份——比真正的 NDP 缓存低效，但正确。
 #[cfg(feature = "handles")]
+/// 取发往某个 IPv6 地址的目标 MAC（ADR-184：查 NDP 邻居缓存）。
+///
+/// ## 三级回退
+///
+/// 1. **缓存命中**（`Reachable`）⇒ 用学到的 MAC（单播，最高效）；
+/// 2. **缓存未命中** ⇒ 发一个 NS（主动去问），同时用被请求节点组播的组播 MAC 把这一帧发出去；
+/// 3. 下一帧就能命中缓存了。
+///
+/// ## 第 2 步为什么既发 NS 又发数据
+///
+/// 严格按 RFC 4861 应该「等 NA 回来再发数据」。但那要阻塞（等几十毫秒），
+/// 而 `send` 是非阻塞语义。折中是：**同时发**——NS 让对端回 NA 把缓存填上，
+/// 数据帧走组播仍然能到（目标主机一定在自己的组播组里）。
+///
+/// 这样第一帧多绕一圈，第二帧起就是单播。
+#[cfg(feature = "handles")]
 fn ndp_mac_for(dst_ip: &[u8; 16]) -> [u8; 6] {
+    use crate::network::ndp;
+    if let Some(mac) = ndp::nd_lookup(dst_ip) {
+        return mac;
+    }
+    // 未命中：发 NS 去问（尽力而为，失败不影响本帧）
+    let our_mac = crate::virtio::net_info().map(|i| i.mac).unwrap_or([0u8; 6]);
+    let our_ip = crate::network::ipv6::link_local_from_mac(&our_mac);
+    let mut ns = [0u8; 256];
+    if let Some(n) = ndp::build_ns(&mut ns, &our_mac, &our_ip, dst_ip) {
+        let _ = crate::virtio::send_raw(&ns[..n]);
+        ndp::nd_mark_incomplete(dst_ip);
+    }
+    // 本帧走组播：目标主机一定在自己的被请求节点组播组里
     let mcast = crate::network::ipv6::solicited_node_multicast(dst_ip);
     [0x33, 0x33, mcast[12], mcast[13], mcast[14], mcast[15]]
-}
-/// 54：`recv(h, buf, len, flags)` → 收到的字节数。
+}/// 54：`recv(h, buf, len, flags)` → 收到的字节数。
 ///
 /// **非阻塞**：队列空回 `-11`（EAGAIN）。阻塞版要等 `RANK_WAITQ` 接入，是未决。
 #[cfg(feature = "handles")]
@@ -2753,22 +2781,74 @@ fn sys_sock_recv(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     if cap == 0 {
         return E_INVALID;
     }
+    // r10 = 源地址输出指针（0 = 不要），r8 = 超时 ms（0 = 非阻塞）。
+    // 这两个参数用 r10/r8 而不是 rcx/r9：SYSCALL 会覆盖 rcx（返回地址），
+    // 而 Linux 的 syscall ABI 本来就把第 4 参放 r10。
+    let src_out = frame.r10;
+    let wait_ms = frame.r8;
     let (slot, gen) = match socket_slot_of(frame.rdi, owner) {
         Ok(v) => v,
         Err(e) => return e,
     };
     let mut buf = [0u8; crate::network::udp::UDP_PAYLOAD_MAX];
     let want = cap.min(crate::network::udp::UDP_PAYLOAD_MAX);
-    let (_src, n) = match crate::network::socket::dequeue(slot, gen, &mut buf[..want]) {
+    // 先试队列；空了就轮询一次网卡再试。
+    //
+    // **为什么先试队列**：轮询要碰设备寄存器（贵），而队列里可能已经有包。
+    let mut got = crate::network::socket::dequeue(slot, gen, &mut buf[..want]);
+    if got.is_err() && wait_ms > 0 {
+        // 有超时 ⇒ 轮询一次（非阻塞），再试
+        let _ = crate::network::socket::poll_once(0);
+        got = crate::network::socket::dequeue(slot, gen, &mut buf[..want]);
+    }
+    let (src, n) = match got {
         Ok(v) => v,
         Err(e) => return e,
     };
+    // 源地址回填（recvfrom 语义）。`src_out == 0` 表示调用方不要。
+    if src_out != 0 {
+        if let Err(e) = write_sockaddr(src_out, src) {
+            return e;
+        }
+    }
     match copy_to_user(&buf[..n], frame.rsi) {
         Ok(n2) if n2 == n => n as u64,
         _ => E_FAULT,
     }
 }
 
+/// 把源地址写回用户内存（`recvfrom` 的输出参数，ADR-184）。
+///
+/// 布局与 `read_sockaddr` 严格对称：IPv4 写 16 字节（地址在偏移 4），
+/// IPv6 写 28 字节（地址在偏移 8）。
+#[cfg(feature = "handles")]
+fn write_sockaddr(ptr: u64, addr: crate::network::socket::SockAddr) -> Result<(), u64> {
+    use crate::network::socket::{SockAddr, AF_INET, AF_INET6};
+    match addr {
+        SockAddr::V4 { ip, port } => {
+            let mut b = [0u8; 16];
+            b[0..2].copy_from_slice(&AF_INET.to_ne_bytes());
+            b[2..4].copy_from_slice(&port.to_be_bytes());
+            b[4..8].copy_from_slice(&ip);
+            match copy_to_user(&b, ptr) {
+                Ok(16) => Ok(()),
+                _ => Err(E_FAULT),
+            }
+        }
+        SockAddr::V6 { ip, port } => {
+            let mut b = [0u8; 28];
+            b[0..2].copy_from_slice(&AF_INET6.to_ne_bytes());
+            b[2..4].copy_from_slice(&port.to_be_bytes());
+            // b[4..8] = flowinfo（0）
+            b[8..24].copy_from_slice(&ip);
+            // b[24..28] = scope_id（本轮忽略，ADR-183 未决 4）
+            match copy_to_user(&b, ptr) {
+                Ok(28) => Ok(()),
+                _ => Err(E_FAULT),
+            }
+        }
+    }
+}
 /// 55：`close(h)` —— 撤 socket 名字并销毁槽。
 #[cfg(feature = "handles")]
 #[inline(never)]

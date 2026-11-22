@@ -338,3 +338,103 @@ pub fn used() -> usize {
     let t = g.get();
     t.slots.iter().filter(|s| s.used.load(Ordering::Acquire) != 0).count()
 }
+
+// ---------------------------------------------------------------- ADR-184：收包投递到 socket 队列
+
+/// 把一帧收到的以太网帧**按协议分发**：UDP 进 socket 队列，其余忽略。
+///
+/// ## 为什么需要这个函数
+///
+/// ADR-181 建了 socket 队列（`socket::enqueue`），但**没有任何调用者** ——
+/// 收了包不会进队列，`recv` 永远回 EAGAIN。这是那一轮留下的真实缺口。
+///
+/// ## 为什么不在中断里做
+///
+/// `socket::enqueue` 要取 `RANK_NET(36)` 锁。中断上下文里取它会与
+/// `sys_sock_send`（持 36 的路径）形成跨上下文互等。
+/// 所以本函数**只在 syscall 上下文**（`sys_sock_recv` 轮询时）调。
+///
+/// ## 返回值
+///
+/// 投递成功的**协议族**（4 或 6），`0` = 这帧不是我们能处理的 UDP。
+#[cfg(feature = "handles")]
+pub fn deliver_frame(f: &[u8]) -> u8 {
+    use crate::network::socket::{enqueue, SockAddr};
+    // IPv6 优先判：`0x86DD` 与 `0x0800` 首字节不同，不会误判
+    if crate::network::ipv6::is_ipv6_frame(f) {
+        // **先看是不是 NDP**（ICMPv6 58），是就处理并返回——NDP 不是 UDP，
+        // 不能走下面的 UDP 解析。
+        if f.len() > 14 + 6 && f[14 + 6] == crate::network::ndp::NEXT_HEADER_ICMPV6 {
+            let our_mac = crate::virtio::net_info().map(|i| i.mac).unwrap_or([0u8; 6]);
+            match crate::network::ndp::handle_frame(f, &our_mac) {
+                crate::network::ndp::NdAction::ReplyNa { dst_ip, dst_mac, target } => {
+                    // **回 NA 必须在锁外**（`handle_frame` 已放锁）
+                    let our_ip = crate::network::ipv6::link_local_from_mac(&our_mac);
+                    let mut nf = [0u8; 256];
+                    if let Some(n) = crate::network::ndp::build_na(
+                        &mut nf, &our_mac, &our_ip, &dst_ip, &dst_mac, &target, true,
+                    ) {
+                        let _ = crate::virtio::send_raw(&nf[..n]);
+                    }
+                }
+                crate::network::ndp::NdAction::None => {}
+            }
+            return 6;
+        }
+        if let Some((src, _dst, sp, dp, payload)) = crate::network::ipv6::parse_udp6_frame(f) {
+            let ep = SockAddr::V6 { ip: src, port: sp };
+            if enqueue(dp, ep, payload) {
+                return 6;
+            }
+        }
+        return 0;
+    }
+    if crate::network::ipv6::is_ipv4_frame(f) {
+        if let Some((src, _dst, payload)) = crate::network::udp::parse_frame(f) {
+            let ep = SockAddr::from_v4(src);
+            if enqueue(_dst.port, ep, payload) {
+                return 4;
+            }
+        }
+        return 0;
+    }
+    0
+}
+
+/// 轮询一次网卡，把收到的 UDP 投递到 socket 队列。
+///
+/// 返回投递成功的帧数。`wait_ms = 0` 表示**不等待**（非阻塞轮询）。
+///
+/// ## 为什么用轮询而不是中断
+///
+/// virtio 的接收路径今天就是轮询式的（`receive(wait_ms)`）。
+/// 改成中断要动 `RANK_NET` 的「是否在 ISR 取」那一格（`lock-order.md` 写明是「否」），
+/// 那是另一件事——本轮先把「收了能进队列」打通。
+#[cfg(feature = "handles")]
+pub fn poll_once(wait_ms: u64) -> usize {
+    if crate::virtio::bind_net().is_err() {
+        return 0;
+    }
+    let mut delivered = 0usize;
+    // 一次轮询最多处理 8 帧：队列深度是 8，超过没意义，而且拖长 syscall
+    for _ in 0..8 {
+        match crate::virtio::receive(wait_ms) {
+            Ok((data, n, _uidx, _ulen, _uid)) => {
+                if n == 0 {
+                    break;
+                }
+                // 被动学 ARP（与 34 号同一条：原帧是 ARP 就按 sender 学）
+                let _ = crate::virtio::arp_learn_from_frame(&data[..n]);
+                if deliver_frame(&data[..n]) != 0 {
+                    delivered += 1;
+                }
+            }
+            Err(_) => break,
+        }
+        if wait_ms == 0 {
+            // 非阻塞模式下不循环等：一次 receive 已经取了当前可取的帧
+            break;
+        }
+    }
+    delivered
+}

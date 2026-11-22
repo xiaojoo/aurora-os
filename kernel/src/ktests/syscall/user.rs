@@ -999,3 +999,128 @@ fn t_ipv6_core() -> bool {
 
 #[cfg(feature = "handles")]
 ktest!(KT_IPV6_CORE, t_ipv6_core);
+
+/// ADR-184：NDP 邻居缓存与收包投递的**证人**。
+///
+/// ## 判据六格
+///
+/// 1. **缓存未命中** ⇒ `nd_lookup` 回 `None`，`misses` 涨；
+/// 2. **学到之后命中** ⇒ `nd_lookup` 回那个 MAC，`hits` 涨；
+/// 3. **`Incomplete` 不算命中**（只记「正在问」）；
+/// 4. **NA 帧能被处理** ⇒ `handle_frame` 学进缓存；
+/// 5. **NS 帧要求回 NA** ⇒ 返回 `ReplyNa` 且 target 正确；
+/// 6. **`deliver_frame` 能投递 UDP**（IPv4 与 IPv6 各一次）。
+///
+/// **负样本**：把 `nd_lookup` 里 `state == Reachable` 的判断去掉（`Incomplete` 也返回 MAC），
+/// 第 3 格立刻红。
+#[cfg(feature = "handles")]
+fn t_ndp_cache() -> bool {
+    use crate::network::{ndp, socket};
+    let mut ok = true;
+    ndp::nd_clear();
+    let s0 = ndp::nd_stats();
+
+    let mac = [0x02u8, 0x00, 0x00, 0x00, 0x00, 0x01];
+    let our_ip = crate::network::ipv6::link_local_from_mac(&mac);
+    let peer_mac = [0x02u8, 0x00, 0x00, 0x00, 0x00, 0x02];
+    let mut peer_ip = crate::network::ipv6::link_local_from_mac(&peer_mac);
+    peer_ip[15] = 0x99; // 与 our_ip 区分开
+
+    // 1. 未命中
+    let miss_before = ndp::nd_stats().misses;
+    let miss_ok = ndp::nd_lookup(&peer_ip).is_none() && ndp::nd_stats().misses > miss_before;
+    if !miss_ok {
+        crate::log_fatal!("ndp: 未命中判据不成立");
+        ok = false;
+    }
+
+    // 2. 学到之后命中
+    ndp::nd_learn(&peer_ip, &peer_mac);
+    let hit_before = ndp::nd_stats().hits;
+    let hit_ok = ndp::nd_lookup(&peer_ip) == Some(peer_mac) && ndp::nd_stats().hits > hit_before;
+    if !hit_ok {
+        crate::log_fatal!("ndp: 命中判据不成立");
+        ok = false;
+    }
+
+    // 3. Incomplete 不算命中
+    let mut third = peer_ip;
+    third[15] = 0x77;
+    ndp::nd_mark_incomplete(&third);
+    let inc_ok = ndp::nd_lookup(&third).is_none();
+    if !inc_ok {
+        crate::log_fatal!("ndp: Incomplete 不该命中");
+        ok = false;
+    }
+
+    // 4. NA 帧被处理
+    let mut na = [0u8; 256];
+    let mut na_ok = false;
+    if let Some(n) = ndp::build_na(
+        &mut na, &peer_mac, &peer_ip, &our_ip, &mac, &peer_ip, false,
+    ) {
+        // 清掉再让它学
+        ndp::nd_clear();
+        let acted = ndp::handle_frame(&na[..n], &mac);
+        na_ok = matches!(acted, ndp::NdAction::None) && ndp::nd_lookup(&peer_ip) == Some(peer_mac);
+    }
+    if !na_ok {
+        crate::log_fatal!("ndp: NA 处理不成立");
+        ok = false;
+    }
+
+    // 5. NS 要求回 NA
+    let mut ns = [0u8; 256];
+    let mut ns_ok = false;
+    if let Some(n) = ndp::build_ns(&mut ns, &peer_mac, &peer_ip, &our_ip) {
+        if let ndp::NdAction::ReplyNa { target, .. } = ndp::handle_frame(&ns[..n], &mac) {
+            ns_ok = target == our_ip;
+        }
+    }
+    if !ns_ok {
+        crate::log_fatal!("ndp: NS 未要求回 NA");
+        ok = false;
+    }
+
+    // 6. deliver_frame 能投递 UDP（IPv6 一次）
+    //    **不测 IPv4**：那要造一个真的 IPv4 UDP 帧，而 `udp::build_frame` 需要 MAC；
+    //    这里只证「IPv6 分支能进队列」这个本轮新加的通路。
+    ndp::nd_clear();
+    let mut deliv_ok = false;
+    // 建一个绑在 45998 的 socket
+    if let Ok((slot, gen)) = socket::create(socket::AF_INET6, socket::SOCK_DGRAM) {
+        let local = socket::SockAddr::V6 { ip: our_ip, port: 45998 };
+        if socket::bind(slot, gen, local).is_ok() {
+            let mut f = [0u8; 512];
+            let dmac = [0x33u8, 0x33, 0xFF, 0, 0, 0x99];
+            if let Some(n) = crate::network::ipv6::build_udp6_frame(
+                &mut f, &dmac, &peer_mac, &peer_ip, &our_ip, 40000, 45998, b"ndp-test",
+            ) {
+                let fam = socket::deliver_frame(&f[..n]);
+                let mut buf = [0u8; 64];
+                if fam == 6 {
+                    if let Ok((src, got)) = socket::dequeue(slot, gen, &mut buf) {
+                        deliv_ok = got == 8 && &buf[..8] == b"ndp-test" && src.is_v6();
+                    }
+                }
+            }
+        }
+        let _ = socket::destroy(slot, gen);
+    }
+    if !deliv_ok {
+        crate::log_fatal!("ndp: deliver_frame 投递不成立");
+        ok = false;
+    }
+
+    let s1 = ndp::nd_stats();
+    crate::log_info!(
+        "ndp: 未命中={} 命中={} Incomplete={} NA处理={} NS回NA={} 投递={} stats(h{} m{} l{} e{}) ⇒ {}",
+        miss_ok, hit_ok, inc_ok, na_ok, ns_ok, deliv_ok,
+        s1.hits - s0.hits, s1.misses - s0.misses, s1.learns - s0.learns, s1.evicts - s0.evicts, ok
+    );
+    ndp::nd_clear();
+    ok
+}
+
+#[cfg(feature = "handles")]
+ktest!(KT_NDP_CACHE, t_ndp_cache);

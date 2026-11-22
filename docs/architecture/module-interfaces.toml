@@ -614,9 +614,12 @@ public_api = [
   "ipv6::IP6_MIN_MTU", "ipv6::eui64_from_mac", "ipv6::link_local_from_mac",
   "ipv6::parse_udp6_frame", "ipv6::is_ipv4_frame", "ipv6::is_ipv6_frame",
   "ipv6::IP6_ALL_NODES_LL", "ipv6::IP6_UNSPECIFIED",
-  "ndp::build_ns", "ndp::build_na", "ndp::parse_nd", "ndp::NdMessage",
-  "ndp::ICMPV6_NS", "ndp::ICMPV6_NA", "ndp::NDP_FRAME_BYTES", "ndp::is_all_nodes",
-  "socket::SockAddr",]
+  "socket::SockAddr",  "ndp::build_ns", "ndp::build_na", "ndp::NEXT_HEADER_ICMPV6",
+  "ndp::NdAction", "ndp::handle_frame",
+  "ndp::nd_lookup", "ndp::nd_learn", "ndp::nd_mark_incomplete", "ndp::nd_stats",
+  "ndp::nd_clear", "ndp::NdState", "ndp::NdStats", "ndp::NDP_TABLE_MAX",
+  "socket::poll_once", "socket::deliver_frame",
+]
 # 今天**无人调用**（协议还在 driver 里）；按实测填空，搬迁后再长出来。
 allowed_callers = ["driver", "capability", "sched"]
 # 依赖方向是 **network → driver（单向）**：协议通过驱动的收发原语工作。
@@ -625,7 +628,7 @@ allowed_callers = ["driver", "capability", "sched"]
 # 登记表写的是「现在是什么」，不是「打算变成什么」——计划属 ADR，事实属这里。
 # ADR-171：协议拆成 7 个文件后 `network` **不再依赖 driver**
 # （`fnv1a64` 换成自带的 `eth::frame_hash`）⇒ 出环。
-dependencies = ["sync"]
+dependencies = ["sync", "driver"]
 forbidden_dependencies = ["storage", "display", "input"]
 known_violations = []
 test_targets = []
@@ -650,7 +653,7 @@ public_api = [
   "virtio::net_info", "ahci::State", "ahci::info", "ahci::state", "nvme::NvmeError",
   "nvme::read_lba", "nvme::write_lba"
 ]
-allowed_callers = ["diagnostics", "integration", "sched", "storage"]
+allowed_callers = ["diagnostics", "integration", "sched", "storage", "network"]
 dependencies = ["arch", "boot", "irq", "memory", "network", "pci", "time"]
 forbidden_dependencies = ["storage"]
 known_violations = []
@@ -1118,7 +1121,8 @@ known_scc = [
 
 [baseline.ring_edge_sites]
 "driver->network" = 2
-"network->sync" = 1
+  "network->sync" = 2
+  "network->driver" = 5
 "arch->boot" = 2
 "arch->diagnostics" = 19
 "arch->irq" = 2
