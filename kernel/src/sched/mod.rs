@@ -564,12 +564,25 @@ pub fn reap(cpu: usize) -> usize {
         // 一轮里这一格只取放一次队列锁（原来是 3~4 次：state、has_bag、id 各一次）。
         // 这不是微优化——A/B 之后必须把抢占点上的锁流量降下来（ADR-048 未决 1）。
         // `continue` 从这个块里离开时句柄先析构，不会带着锁跳出循环体。
-        let (st, has_bag, _id) = {
+        // **ADR-234：`has_c` 在同一个临界区里算**。
+        //
+        // ADR-233 为了读 `owned` 又取了一次 `rq(cpu)`，结果偶发消失（0/20）。
+        // ADR-232 已证明「无锁 fetch_add 不干扰」—— 差别就在「有没有取锁」。
+        // 所以这里把 `owned` 的遍历并进**本来就要取的那次锁**，不多取一次。
+        let (st, has_bag, _id, has_c) = {
             let s = rq(cpu);
             let st = s.tasks[slot].state;
+            let n0 = s.tasks[slot].owned.n;
+            let mut has_c = false;
+            for k in 0..n0.min(MAX_OWNED) {
+                if let Some(OwnedItem::Map(m)) = s.tasks[slot].owned.items[k].as_ref() {
+                    let v = m.virt();
+                    if v.0 >= 0x1000_c0000 && v.0 < 0x1000_d0000 { has_c = true; }
+                }
+            }
             // Done 的判定带 `|| st == Done` 是因为"被杀但映射为空"也要归化成 Free，
             // 否则槽位永远停在 Done —— 那正是 M4-1 撞过的"队列被占满"的形状。
-            (st, s.tasks[slot].owned.n > 0 || st == TaskState::Done, s.tasks[slot].id)
+            (st, s.tasks[slot].owned.n > 0 || st == TaskState::Done, s.tasks[slot].id, has_c)
         };
         if st != TaskState::Free && st != TaskState::Done {
             continue;
@@ -591,22 +604,9 @@ pub fn reap(cpu: usize) -> usize {
         if st == TaskState::Done {
             REAP_RETIRED_DONE.fetch_add(1, Ordering::Relaxed);
         }
-        // **ADR-233 观测**：记录被回收的 gi 与它的 owned 里有没有容器段。
-        // 判据拿它和「探针的 gi」对比，就能确认「收的是不是探针」。
+        // **ADR-234 观测**：只 store，不再取锁。
         REAP_LAST_GI.store(gi as u32, Ordering::Relaxed);
-        {
-            let s2 = rq(cpu);
-            let n2 = s2.tasks[slot].owned.n;
-            let mut has_c = false;
-            for k in 0..n2.min(MAX_OWNED) {
-                if let Some(OwnedItem::Map(m)) = s2.tasks[slot].owned.items[k].as_ref() {
-                    let v = m.virt();
-                    if v.0 >= 0x1000_c0000 && v.0 < 0x1000_d0000 { has_c = true; }
-                }
-            }
-            drop(s2);
-            if has_c { REAP_LAST_HAD_CONTAINER.store(1, Ordering::Relaxed); }
-        }
+        if has_c { REAP_LAST_HAD_CONTAINER.store(1, Ordering::Relaxed); }
         // 任务退出撤销：句柄表里 owner 两格都对的表项在这里清掉。**这是唯一安全的时刻**——
         // 它的内核栈与用户页都已经不会再被踩（设计 §7）。只读文件对象不持有页框，账只记在手柄表里。
         #[cfg(feature = "handles")]
