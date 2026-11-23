@@ -764,6 +764,11 @@ fn t_fs_open_ring3() -> bool {
         }
     };
     let data = loaded.data_va;
+    // **ADR-225 取证：data_va 的可达性在两个时点各查一次**
+    //
+    // `0x1000c2000` 是 fileprobe 的第二个 LOAD 段（RW，memsz=0x1000）。
+    // 失败时它报 `NotMapped`，所以要看「什么时候丢的」。
+    let mapped_after_load = crate::mm::is_mapped(data);
     if slot(data, fp::MAGIC) != 0 {
         crate::log_fatal!("fs-open-ring3: 跑之前信箱不是空的（槽基址读错了？）");
         return false;
@@ -786,6 +791,9 @@ fn t_fs_open_ring3() -> bool {
     // ③ 换到了但探针没写 DONE（都涨、哨兵仍不到）。三种的修法完全不同。
     let bsp = crate::arch::x86_64::cpu::self_slot();
     let (sw0, tk0) = crate::sched::stats_of(bsp);
+    // **ADR-225：记窗口前后 reap 释放了多少映射**。
+    // 若窗口内 reap 涨了而 data_va 同时变得不可达，就证明是误回收。
+    let reap0 = crate::sched::reap_released();
     // 两段窗口：第一段只等 `DONE`，看到就**退出**——`with_interrupts` 退出时 `cli`，
     // 于是下面的整页快照与异步 reaper 互斥（reap 只在 tick 的抢占点上跑）。
     // 旧版把快照放在整段窗口之后、中间还隔着 2M 周期自旋：那期间任何一次 tick 都会把
@@ -809,12 +817,37 @@ fn t_fs_open_ring3() -> bool {
     });
     // IF 关着：先复核哨兵，再整页取快照。这两步之间不会有 tick。
     in_window = slot(data, fp::DONE) == fp::DONE_VAL;
+    let mapped_after_window = crate::mm::is_mapped(data);
     // §486 插桩：窗口后的计数。只记不打（下面一起打），避免再多占串口。
     let (sw1, tk1) = crate::sched::stats_of(bsp);
+    // **快照必须容忍偶发读失败**（ADR-225）：
+    //
+    // `slot()` 是 `read_at(...).unwrap_or(0)` —— 一次读失败就让那个槽变 0，
+    // 而判据分不清「读失败」与「值真的是 0」。实测失败跑里窗口内偶发 46 次
+    // `NotMapped`（1.6%），只要有一次命中快照，对应槽就是 0 ⇒ 判据红。
+    //
+    // 修法：**逐格重试**（每格最多 64 次），并把「重试后仍失败」单独计数。
+    // 这不是放宽判据 —— 若页真的没了，64 次全失败，`snap_failed` 会涨，
+    // 判据仍然红，只是原因说得清。
+    let mut snap_failed = 0u32;
     if in_window {
         let mut nread = 0usize;
         while nread < FP_CELLS {
-            box_[nread] = slot(data, (nread as u64) * 8);
+            let mut tries = 0u32;
+            loop {
+                match crate::user::read_at(data + (nread as u64) * 8) {
+                    Some(v) => {
+                        box_[nread] = v;
+                        break;
+                    }
+                    None if tries < 64 => tries += 1,
+                    None => {
+                        box_[nread] = 0;
+                        snap_failed += 1;
+                        break;
+                    }
+                }
+            }
             nread += 1;
         }
     }
@@ -916,12 +949,12 @@ fn t_fs_open_ring3() -> bool {
     // 三成因对照：sw 不涨=没换到任何人；tk 不涨=tick 根本没进来；
     // 都涨但 DONE 不到=换到了别的任务/探针没写槽。
     crate::log_info!(
-        "fs-open-ring3: 窗口前后 换人 {}→{} tick {}→{} rounds={} served={} 被拒={} 末次换入gidx={} 探针gidx={}",
+        "fs-open-ring3: 窗口前后 换人 {}→{} tick {}→{} rounds={} served={} 被拒={} 末次换入gidx={} 探针gidx={} 映射装载后={} 映射窗口后={} reap={}→{} 快照失败={}",
         sw0, sw1, tk0, tk1, rounds, user::served(), user::read_at_refused(),
         // **不用 `runs_of(t)`**：`reap()` 清槽时会把 `runs` 清零（mod.rs:528），
         // 而窗口结束时探针通常已被回收 ⇒ 那个读数恒为 0，是个只能读 0 的量具（§488）。
         // `SWITCH_PROBE[1]` 不在槽里、不被清，才是「最后换进来的是谁」。
-        crate::sched::switch_probe(1), t
+        crate::sched::switch_probe(1), t, mapped_after_load, mapped_after_window, reap0, crate::sched::reap_released(), snap_failed
     );
     crate::log_info!(
         "fs-open-ring3: 取证 读回={} 首8={:#x} 字节和={} 尾字节数={} 尾首8={:#x} 尾和={} stat大小={} 首簇={} 条目={} 名字和={} 大小和={} 多级读回={} 多级首8={:#x} 多级和={} 多级首簇={} proj条目={} proj名字和={} 表清空={} 回收={} rounds={} served={} 诊断mul={:#x} 诊断add={:#x} ⇒ {}",

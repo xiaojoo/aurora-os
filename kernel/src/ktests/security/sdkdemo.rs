@@ -65,11 +65,22 @@ fn t_sdkdemo() -> bool {
     // 槽布局见 `user/sdkdemo/src/main.rs` 的 `SLOTS`：
     //   [0]=魔数 0x53444B31 · [1]=uid · [2]=gid · [3]=caps · [4]=dev · [5]=自洽
     let base = loaded.data_va;
-    let magic = crate::user::read_at(base).unwrap_or(0);
+    // **读失败与值不对必须分开报**（ADR-225）：
+    //
+    // 原来这里是 `read_at(base).unwrap_or(0)` —— 那正是下面 76-81 行注释批评的写法。
+    // 读不到用户页时它变成 `magic=0`，日志只说「魔数不对」，
+    // 而真正的原因是「读用户页被拒」在另一行 —— 两者处置方向完全不同。
+    let magic_read = crate::user::read_at(base);
+    let magic = magic_read.unwrap_or(0);
     if magic != 0x5344_4B31 {
+        let (nu, nm, ns, nw, tl) = crate::user::read_at_refused_by_kind();
         crate::log_fatal!(
-            "sdkdemo: 信箱魔数不对 读到={:#x} 期望=0x53444b31（data_va={:#x}）",
-            magic, base
+            "sdkdemo: 信箱魔数不对 读到={:#x} 读成功={} 期望=0x53444b31（data_va={:#x}）",
+            magic, magic_read.is_some(), base
+        );
+        crate::log_fatal!(
+            "sdkdemo: 被拒分类 不在用户区={} 没映射={} 不共享={} 不可写={} 太长={} 映射在={}",
+            nu, nm, ns, nw, tl, crate::mm::is_mapped(base)
         );
         return false;
     }
