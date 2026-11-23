@@ -279,6 +279,17 @@ impl OwnedSet {
     }
 }
 
+/// **`spawn` 因为「槽是 Free 但袋还满着」而跳过的次数**（ADR-244 观测）。
+///
+/// 非零就说明这条路径真的发生过：那个槽还没被 `reap` 收，它的映射（内核栈 4 页 +
+/// 1 条 VA 保留）还挂在袋里。**跳过是对的**——`reap` 会在下一次抢占点收它；
+/// 覆盖才是错的（见 `spawn_inner` 的选槽注释）。纯原子自增，不写串口（ADR-227）。
+static SPAWN_SKIPPED_STALE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn spawn_skipped_stale() -> u64 {
+    SPAWN_SKIPPED_STALE.load(Ordering::Relaxed)
+}
+
 /// 每个 CPU 一格：**还有几个槽的资源在等"CPU 挪开它"**。为 0 就等于没有待回收，
 /// 所以 `preempt_point` 可以先读这一格再决定要不要扫队列（见 `reap` 的计数语义）。
 /// 为什么需要它：`preempt_point` 在**每次**出中断时都会路过回收检查，
@@ -435,8 +446,11 @@ pub fn terminate_task(task: usize) -> bool {
         // 放在放掉 RUNQ 之后：revoke_task 取 HANDLE(35)、其 VMO 归还在锁外取 VMM(20)。
         #[cfg(feature = "handles")]
         crate::handle::revoke_task(task, dead_id);
+        // ADR-244：带 `dead_id` 进去。这个槽在我们放锁之后可能已被 `reap`
+        // 收掉并**复用**给新任务；那时收它就是把新住户的袋子抢走。
+        // 校验放在 `release_owned` 取 RUNQ 的那个临界区里，与取袋同一个原子步骤。
         if has_bag {
-            release_owned(cpu, slot);
+            release_owned_checked(cpu, slot, Some(dead_id));
         }
     }
     true
@@ -470,7 +484,49 @@ pub fn container_owned_stats() -> (u32, u32) {
         CONTAINER_OWNED_LAST.load(Ordering::Relaxed),
     )
 }
+/// `release_owned` 被调了几次、一共放出几条项（ADR-244 观测）。纯原子，不写串口。
+/// 「因为槽已被复用而拒绝回收」的次数（ADR-244）。
+static RELEASE_STALE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn release_stale() -> u64 {
+    RELEASE_STALE.load(Ordering::Relaxed)
+}
+
+static RELEASE_OWNED_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static RELEASE_OWNED_ITEMS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+
+pub fn release_owned_stats() -> (u64, u64) {
+    (
+        RELEASE_OWNED_CALLS.load(Ordering::Relaxed),
+        RELEASE_OWNED_ITEMS.load(Ordering::Relaxed),
+    )
+}
+
 fn release_owned(cpu: usize, slot: usize) {
+    release_owned_checked(cpu, slot, None);
+}
+
+/// 同上，但**带一个 id 校验**（ADR-244）：只有槽的当前住户仍是 `want_id` 才收。
+///
+/// ## 为什么需要它（这是本轮定位到的真根因）
+///
+/// `terminate_task` 在持 RUNQ 时读一次 `has_bag`（= `owned.n > 0`），放锁之后才调
+/// `release_owned`。这个窗口里**同一个槽可以被别的路径收掉**（`reap` 的抢占点扫的是
+/// 「Free 且 has_bag」的格，两条路径都能命中同一格）。于是第二次进来时袋已经空了。
+///
+/// 实测（`t_q2_workload_slots`，加了按 slot 的调用序日志）：
+///   #36 slot=6 放出=1
+///   #37 slot=7 放出=0    ← 这一格：`has_bag` 为真，进来时袋已空
+///   #38 slot=8 放出=1
+/// 那一跑正是红的：`回滚不成立 f97419->97415(差 -4) va21->22(差 1)`。
+/// **袋子没人搬走过**（同一跑 `va: 拒绝放手的保留 12→12`，零拒绝），
+/// 所以漏的不是「放手被拒」，而是「**根本没人放手**」——那条内核对映射在
+/// 第一次 `release_owned` 之外的地方消失了。
+///
+/// 带 id 校验之后：槽被复用时旧调用**直接拒绝**，不会去动新住户的袋子，
+/// 而且多一条可数的证据（`RELEASE_STALE`）告诉下一个人这件事真的发生过。
+fn release_owned_checked(cpu: usize, slot: usize, want_id: Option<u32>) {
     // **ADR-229：按 slot 分桶记录「哪个任务释放了容器段映射」**。
     //
     // ADR-228 已证明「窗口内某被 reap 任务的 owned 含容器段」，但不知道是哪个。
@@ -501,7 +557,15 @@ fn release_owned(cpu: usize, slot: usize) {
     let mut released = 0usize;
     {
         let mut s = rq(cpu);
+        // ADR-244：槽被复用了就什么都不做 —— 这个槽现在住的是别人。
+        if let Some(want) = want_id {
+            if s.tasks[slot].id != want {
+                RELEASE_STALE.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
         let n = core::mem::take(&mut s.tasks[slot].owned.n);
+
         for i in 0..n.min(MAX_OWNED) {
             if let Some(m) = s.tasks[slot].owned.items[i].take() {
                 bag.items[i] = Some(m);
@@ -526,6 +590,9 @@ fn release_owned(cpu: usize, slot: usize) {
     if released > 0 {
         REAP_RELEASED.fetch_add(released as u64, Ordering::Relaxed);
     }
+    RELEASE_OWNED_CALLS.fetch_add(1, Ordering::Relaxed);
+    RELEASE_OWNED_ITEMS.fetch_add(released as u64, Ordering::Relaxed);
+
     let mut s = rq(cpu);
     s.tasks[slot].kstack_lo = 0;
     s.tasks[slot].kstack_hi = 0;
@@ -1603,7 +1670,10 @@ pub fn init_idle() -> bool {
     let (lo, hi) = (base, base + IDLE_STACK_BYTES as u64);
     let mut s = rq(cpu);
     // 不用 slot 0：那是启动/空闲上下文的位置，`init_boot_task`/`init_idle_task` 会重写它。
-    let Some(slot) = (1..MAX_TASKS).find(|&i| s.tasks[i].state == TaskState::Free) else {
+    // **ADR-244：同一条判据**（Free 且袋已空）。空闲上下文的 `Task` 字面量同样整体覆盖槽位。
+    let Some(slot) = (1..MAX_TASKS)
+        .find(|&i| s.tasks[i].state == TaskState::Free && s.tasks[i].owned.n == 0)
+    else {
         return false;
     };
     let f = (hi - trap::TRAP_FRAME_BYTES as u64) as usize;
@@ -1701,7 +1771,41 @@ fn spawn_inner(entry: fn() -> !, resident: bool) -> Result<usize, mm::MmError> {
     strace("spawn: S4 前 rq");
     let mut s = rq(cpu);
     strace("spawn: S4 后");
-    let slot = (0..MAX_TASKS).find(|&i| s.tasks[i].state == TaskState::Free).ok_or(mm::MmError::Unsupported)?;
+    // **ADR-244：选槽要求「Free **且** 袋已空」。**
+    //
+    // 原来只看 `state == Free`，而 `terminate_task` 是在**持 RUNQ 时**就标 Free 的
+    // （`release_owned` 要等放锁之后，见 ADR-047 决策 2）。于是存在一个窗口：
+    // **槽是 Free、袋里还挂着映射**。这时覆盖 `s.tasks[slot] = Task {...}` 会把旧袋
+    // 连同里面的 `OwnedItem` 一起遗弃 —— `OwnedSet` 没有 `Drop`，所以
+    // `Mapping::drop` 根本不跑：**内核栈 4 页 + 1 条 VA 保留永久漏掉**。
+    //
+    // 实测（`t_q2_workload_slots`，3 跑取中位）：
+    //   spawn后 f97392 va28 → spawn 的 7 条全部结束后 f97420 va21（正确，+28/-7）
+    //   同一份代码另两跑：                          → f97417 va22（只 +24/-6，差一条栈）
+    // 而且**再等 3e9 cycles 也不变**（`q2-再等` 那行前后读数完全相同）⇒ 不是"回来得晚"，
+    // 是永久漏。逐条诊断 7 条线程全是 `Free owned=0 kstack_lo=0`，正是因为**漏的那条
+    // 槽已被这个新任务复用并覆盖**，新任务自己正常走完了生命周期。
+    //
+    // 不这里就地释放旧袋：那要在持 RUNQ 时 drop `Mapping`（取 VMM、等 shootdown），
+    // 正是 ADR-047 决策 2 禁止的反向嵌套。**跳过**让 `reap` 在抢占点收它才是对的路径。
+    let mut skipped = 0u64;
+    let slot = (0..MAX_TASKS)
+        .find(|&i| {
+            let st = &s.tasks[i];
+            if st.state != TaskState::Free {
+                return false;
+            }
+            // 袋不空 ⇒ 还没被回收，不能用（用了就是覆盖 = 漏掉它的映射）
+            if st.owned.n > 0 {
+                skipped += 1;
+                return false;
+            }
+            true
+        })
+        .ok_or(mm::MmError::Unsupported)?;
+    if skipped > 0 {
+        SPAWN_SKIPPED_STALE.fetch_add(skipped, Ordering::Relaxed);
+    }
     // 合成首次运行的异常帧：放在栈顶往下，字段顺序必须与 trap::TrapFrame 逐格一致。
     let f = (stack_hi - trap::TRAP_FRAME_BYTES as u64) as usize;
     let mut frame = [0u64; 23];
@@ -1772,7 +1876,11 @@ pub fn spawn_user(entry_rip: u64, user_stack_top: u64, arg: u64, mut res: OwnedS
     let kstack_hi = win.0 + (USER_STACK_VA_PAGES as u64) * mm::PAGE as u64;
 
     let mut s = rq(cpu);
-    let slot = (0..MAX_TASKS).find(|&i| s.tasks[i].state == TaskState::Free).ok_or(mm::MmError::Unsupported)?;
+    // **ADR-244：与 `spawn_inner` 同一条判据**（Free **且** 袋已空）。
+    // 用户任务也一样：覆盖一个「Free 但袋还满」的槽，会遗弃它名下的容器段映射与整条内核栈。
+    let slot = (0..MAX_TASKS)
+        .find(|&i| s.tasks[i].state == TaskState::Free && s.tasks[i].owned.n == 0)
+        .ok_or(mm::MmError::Unsupported)?;
     let f = (kstack_hi - trap::TRAP_FRAME_BYTES as u64) as usize;
     let mut frame = [0u64; 23];
     frame[16] = 0; // vector
