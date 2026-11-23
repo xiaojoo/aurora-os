@@ -2589,8 +2589,13 @@ fn t_object_wait() -> bool {
     let _ = sched::terminate_task(g);
     // P6c：回收变确定之后，工人可能在窗口里就已经被收掉了 ⇒ 这里再等"释放数涨"会等不到。
     // 判据的意图是"它的资源已经交回去了"，所以**槽已 Free** 同样算数（不是放宽，是换成等价证据）。
+    //
+    // **ADR-243 更正**：Free 只有在**袋也空了**时才是"资源已交回"的证据。`terminate_task`
+    // 在拿队列锁时就标 Free，而 `release_owned` 在放锁之后 ⇒ 存在"Free 但袋里还有映射"的窗口。
+    // 那时短路会让 `drain_reap` 不跑，而没有 tick 就没有抢占点，`REAP_PENDING` 永不消费，
+    // 袋里的映射就漏了（同一形状在 `t_q2_workload_slots` 上 14/14 复现）。
     let drained = sched::reap_released() > rel0 || drain_reap()
-        || sched::state_of(g) == sched::TaskState::Free;
+        || (sched::state_of(g) == sched::TaskState::Free && sched::owned_of(g) == 0);
     if !was_running { apic::timer_stop().ok(); }
     let r: [u64; 16] = core::array::from_fn(|i| WAIT_SYS[i].load(core::sync::atomic::Ordering::Acquire));
     if r[15] != 0 {

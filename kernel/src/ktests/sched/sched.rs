@@ -2023,7 +2023,7 @@ fn q2_sample(rounds: usize, pids: &[u16; 4]) {
 }
 
 fn t_q2_workload_slots() -> bool {
-    use crate::ktests::common::drain_reap;
+    use crate::ktests::common::{drain_reap, drain_reap_for};
     use crate::proc;
     // 用例自足（与 `t_demand_zero` 同一套）：登记启动上下文与 `RUN` 位必须在**任何 spawn/yield 之前**，
     // 理由与症状见 `t_proc_job_wait` 开头那条同型注释（ahci-scratch 与 fault-resched-ipi 两档实测）。
@@ -2231,8 +2231,20 @@ fn t_q2_workload_slots() -> bool {
     // 先看增量再决定要不要烧窗口，理由同 `t_proc_job_wait` 那条（`-d int` 行的墙钟预算）。
     // P6c：回收变确定之后释放可能早于窗口，所以"全部槽已 Free"也是等价证据
     // （`reap` 先释放资源再标 Free）。逐个看比只看计数稳：计数可能已被别的用例的回收涨过。
-    let all_free = (0..ok_n).all(|i| sched::state_of(gids[i]) == sched::TaskState::Free);
-    let drained = sched::reap_released() > rel0 || all_free || drain_reap();
+    //
+    // **ADR-243 更正**："先释放再标 Free"只对 `reap` 成立，对 `terminate_task` **不成立**——
+    // 它在拿队列锁时就标 Free，而 `release_owned` 在放锁之后。于是"全部 Free"可能在
+    // **袋还牵着映射**时就成立，本格短路 ⇒ 不进 `drain_reap` ⇒ 没有 tick ⇒ 没有抢占点
+    // ⇒ `REAP_PENDING` 永远不消费 ⇒ 那 4 页内核栈与 1 条 VA 保留**再也没人放手**。
+    // 实测 14/14 红：`回滚不成立 ...(差 -4) va17->18(差 1)`。
+    // 判据收紧成"Free **且** 袋已空"：袋子空才是释放已发生的直接证据。
+    let all_free = (0..ok_n).all(|i| {
+        sched::state_of(gids[i]) == sched::TaskState::Free && sched::owned_of(gids[i]) == 0
+    });
+    // **ADR-243**：`reap_released() > rel0` 是**全局**计数——别的 CPU 上任何一次回收都会让它涨，
+    // 与本任务无关。实测加袋子检查后仍 1/5 红（`drained=true` 而本任务那 4 页还挂着）。
+    // 所以这里等的是**本 Job 自己**的袋子：逐条 `drain_reap_for`，谁没空就烧窗口等它。
+    let drained = all_free || (0..ok_n).all(|i| drain_reap_for(gids[i]));
     let jd = proc::job_destroy(job);
     let (pc1, _) = proc::proc_residual();
     let (jc1, _) = proc::job_residual();

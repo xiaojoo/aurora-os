@@ -52,12 +52,82 @@ pub(crate) const P7_CALLS: u64 = 32;
 /// 而那一刻的唯一来源是中断出口路过 `preempt_point` ⇒ 想回收就得开一次窗口让 tick 进来。
 /// "它的资源已经交回去了"的判据（P6c）。**回收时刻确定之后**，释放可能发生在观测窗口之前，
 /// 所以只要求"释放数在窗口内涨"会假红（实测 `released=1→1` 而槽早已 Free）。
-/// 三个等价证据按代价从低到高排：增量已在 → 槽已归化成 Free → 才烧 `drain_reap` 那个窗口。
-/// 槽已 Free 是充分证据：`reap` 是**先释放资源、再标 Free** 的，所以 Free 蕴含释放已发生。
+///
+/// **2026-11-23 更正（ADR-243）**：这里的第二条曾经写的是「槽已 Free 是充分证据」，
+/// 理由是「`reap` 先释放资源、再标 Free」。**那条前提只对 `reap` 成立，对 `terminate_task` 不成立**：
+/// `terminate_task` 在拿队列锁时就把槽标成 `Free`，而 `release_owned` 要等到**放锁之后**
+/// （持 RUNQ 去 drop `Mapping` 会反向嵌套，见 ADR-047 决策 2）。所以存在一个窗口：
+/// **槽是 Free、而袋里还牵着映射**。`mod.rs` 的 `owned_of` 注释早就记过这句话——
+/// 「槽位是 Free 不等于资源回去了」——只是这里没跟着改。
+///
+/// 后果不是「等得久一点」，而是**漏掉释放**：本函数一返回 true，调用方就不再进 `drain_reap`
+/// 那个窗口，而没有 tick 就没有抢占点，`REAP_PENDING` 就永远不消费 ⇒ 袋里的映射
+/// （内核栈 4 页 + 一条 VA 保留）**再也没人放手**。实测 `t_q2_workload_slots`
+/// 14 次跑 14 次红：`回滚不成立 f97212->97208(差 -4) va17->18(差 1)`。
+///
+/// 修法：`Free` 只在**袋也空了**时才算证据。袋子还在就说明释放还没发生，
+/// 必须烧那个窗口让抢占点真的跑一次。
+/// **没有放宽**：袋子空是释放已发生的直接证据（`release_owned` 把袋搬空之后才 drop），
+/// 比原来的 `Free` 更强。
 pub(crate) fn drained_or_free(rel0: u64, g: usize) -> bool {
     crate::sched::reap_released() > rel0
-        || crate::sched::state_of(g) == crate::sched::TaskState::Free
-        || drain_reap()
+        || (crate::sched::state_of(g) == crate::sched::TaskState::Free
+            && crate::sched::owned_of(g) == 0)
+        || drain_reap_for(g)
+}
+
+/// **等这一个任务**的袋子真的空了（ADR-243）。
+///
+/// 为什么不能用 `drain_reap`：那个等的是**全局** `reap_released` 涨——
+/// 别的 CPU 上任何一个任务被回收都会让它涨，于是「窗口里涨了」可以与本任务的释放
+/// **完全无关**。实测 `t_q2_workload_slots` 在加了袋子检查之后仍有 1/5 红：
+/// `回滚不成立 f97427->97423(差 -4) va21->22(差 1)`，而同一跑 `drained=true` ——
+/// 判据以为收完了，实际本任务那 4 页内核栈还挂在袋里。
+///
+/// ## 判据是 `owned_of(g) == 0`（**已知不完美**）
+///
+/// 它由 `release_owned` 在搬出袋子时变 0（`core::mem::take(&mut ...owned.n)`），
+/// 所以它是**本任务自己的**计数 —— 别的 CPU 的回收动不了它，不会像全局
+/// `reap_released` 那样被噪声顶成真。
+///
+/// **但它不等于 `drop(bag)` 已跑完**（真正的解映射/还帧在那之后）。我试过改用
+/// `kstack_lo == 0`（那一格确实是 `drop(bag)` 之后才清的），实测**更差**
+/// （8 跑 5 红），已回退 —— 原因未查清，记在这里免得下一个人重走。
+///
+/// ## 已知残留（ADR-243 未决 1）
+///
+/// `t_q2_workload_slots` 仍有约 1/3 的跑报 `回滚不成立 ...(差 -4) va..->..(差 1)`。
+/// **本轮实测：未改的 HEAD 同样 2/6 红**，所以这不是本修法引入的。
+/// 逐条诊断显示 q2 的 7 条线程全是 `state=Free owned=0`，
+/// 所以漏的是一条**没人持有的 3 页 VA 保留**（`0x100002000`），根因未定位。
+pub(crate) fn drain_reap_for(g: usize) -> bool {
+    let done = || crate::sched::owned_of(g) == 0;
+    if done() {
+        return true;
+    }
+    let ticks_before = sched::ticks_of(0);
+    let mut hit = false;
+    apic::with_interrupts(|| {
+        let t0 = tsc::now();
+        while tsc::now().wrapping_sub(t0) < 1_000_000_000 {
+            if done() {
+                hit = true;
+                break;
+            }
+            tsc::spin(20_000);
+        }
+    });
+    if !hit {
+        crate::log_warn!(
+            "reap: 窗口内这个任务的资源没交回 g={} state={:?} owned={} 窗口内 tick {}→{}",
+            g,
+            crate::sched::state_of(g),
+            crate::sched::owned_of(g),
+            ticks_before,
+            sched::ticks_of(0)
+        );
+    }
+    hit
 }
 
 pub(crate) fn drain_reap() -> bool {
