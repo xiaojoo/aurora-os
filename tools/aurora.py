@@ -6125,6 +6125,57 @@ def check_syscall_abi_arms() -> list[str]:
             "（ADR-176）"
         )
 
+    # ---- 规则 4（2026-11-23，§562）：臂引用的 handler 若有 `#[cfg]`，臂自己必须也有 `#[cfg]`。
+    #
+    # **这条是补一个真实漏网的洞**：2026-11-22 的 `96c04ac` 把 14 条臂写成直接调
+    # `sys_fd_*` / `sys_sock_*`，而那些 handler 全都 `#[cfg(feature = "handles")]`。
+    # `handles` 关掉时 handler 不存在，臂却还在 ⇒ **默认档 E0425 ×14，整链两天跑不了**。
+    #
+    # 规则 1/3 都是**文本对账**：它们只问「名字在不在」，看不见 cfg，所以对这个问题
+    # 完全失明（实测：坏树上规则 1/3 全绿，`consts=77 arms=74 missing=[]`）。
+    # 规则 4 补的是「条件性」：handler 有条件，臂就必须有条件 —— 否则那个组合下编译不过。
+    #
+    # **它不规定该用哪种修法**：`#[cfg(feature="handles")] SYS_X => handler` 与
+    # `#[cfg(feature="handles")] SYS_X => handler` + `#[cfg(not(...))] SYS_X => nosys()`
+    # 两种都合法（后者更贴 ADR-176「号在、功能不在」）。它只咬「臂无条件、handler 有条件」。
+    lines = kern.split("\n")
+    gated_fns: set[str] = set()
+    for i, l in enumerate(lines):
+        m = re.match(r"\s*(?:pub(?:\(crate\))?\s+)?fn\s+([a-z_0-9]+)", l)
+        if not m:
+            continue
+        for j in range(i - 1, max(-1, i - 6), -1):
+            s = lines[j].strip()
+            if s.startswith("#[cfg"):
+                gated_fns.add(m.group(1))
+                break
+            if s and not s.startswith("//") and not s.startswith("#["):
+                break
+    if len(gated_fns) < 20:
+        # 量具自证：解析出的门控函数太少 = 正则或路径变了，**这道判据在空转**。
+        return [f"只解析出 {len(gated_fns)} 个带 cfg 的函数（< 20）⇒ 规则 4 在空转"]
+    for i, l in enumerate(lines):
+        m = re.match(r"^\s{8}(SYS_[A-Z_0-9]+)\s*=>\s*([a-z_0-9]+)\(", l)
+        if not m:
+            continue
+        name, callee = m.group(1), m.group(2)
+        if callee not in gated_fns:
+            continue
+        arm_gated = False
+        for j in range(i - 1, max(-1, i - 4), -1):
+            s = lines[j].strip()
+            if s.startswith("#[cfg"):
+                arm_gated = True
+                break
+            if s and not s.startswith("//"):
+                break
+        if not arm_gated:
+            bad.append(
+                f"{name} 的臂无条件，但它调的 {callee} 带 #[cfg] ⇒ 关掉那个特性时"
+                "这条臂会引用不存在的函数（2026-11-23 §562：默认档 E0425 ×14，整链两天跑不了）。"
+                "给臂补同一条 #[cfg]，或用 #[cfg(not(..))] 落 nosys()"
+            )
+
     return bad
 
 def check_ktest_anchors() -> list[str]:
@@ -7523,8 +7574,11 @@ SPLIT_P4_RE = re.compile(
     r"split\(P4\): 等价=(?P<eq>true|false) 金丝雀=(?P<can>true|false) 跨别名=(?P<cross>true|false) "
     r"幂等=(?P<idem>true|false) map成功=(?P<map>true|false) 永久PT=(?P<pt>\d+) requests增量=(?P<req>\d+)")
 MAP_HOLE_P4_RE = re.compile(
+    # **格式修正**（ADR-242 补记）：ADR-179 在往返后加了一段括号字段，
+    # 正则没跟着改 ⇒ 整条见证行被读成「用例没跑到」，
+    # 而内核那一跑其实全线（实测 run-10729: 87/87 PASS）。所以括号那段是可选的。
     r"map_hole\(P4\): 单属性=(?P<single>true|false) 拒覆盖=(?P<cov>true|false) 拒usable=(?P<us>true|false) "
-    r"往返=(?P<rt>true|false) leaf=(?P<leaf>0x[0-9a-f]+)")
+    r"往返=(?P<rt>true|false)(?: \([^)]*\))? leaf=(?P<leaf>0x[0-9a-f]+)")
 SPLIT_OOM_P4_RE = re.compile(
     r"split OOM\(P4\): err=(?P<err>\w+) 原样=(?P<intact>true|false) 回基线=(?P<back>true|false)")
 

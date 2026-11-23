@@ -285,10 +285,12 @@ extern "C" fn after_switch(_: usize) -> ! {
     sched::install_arch_hooks();
     // P4b：等待队列的回调表（ADR-053 的反转），与 arch hooks 同一时机装好
     sched::install_wait_ops();
+    #[cfg(feature = "handles")]
     sched::install_proc_of();
     sched::install_as_of_task();
     // **MAC 解析的注入点**（ADR-204）：`network` 不能依赖 `sched`，
     // 但重传发段要查 ARP 表。与上面三条同一个模式 —— 这是第四次用它。
+    #[cfg(feature = "handles")]
     crate::network::socket::install_mac_of(crate::sched::user::mac_for_retx);
     // Task C（V1.0 §14）：启动编排按阶段函数组织；顺序与日志契约不变。
     stage_memory();

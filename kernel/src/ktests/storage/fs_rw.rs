@@ -170,15 +170,21 @@ fn t_fs_rw_syscall23() -> bool {
         }
     };
 
+    // **卷指纹必须真算**（ADR-221）：与产品路径 `file_open` 同一条路。
+    // 传 0 会让所有卷共用缓存槽，不同盘的同 LBA 直接串。
+    let vol = {
+        let (d, _) = handle::disk_for(fs_rw::PORT, None);
+        vfs_ro::volume_fingerprint_pub(&d, &log_cur.bpb())
+    };
     // 两格：LOG 拿读写权；DATA 只拿读权，专门用来证"只读句柄写 ⇒ -4"。
-    let hw = match handle::grant_vfs_file(ident, fs_rw::PORT, None, log_cur, log, RIGHT_READ | RIGHT_WRITE) {
+    let hw = match handle::grant_vfs_file(ident, fs_rw::PORT, None, log_cur, log, RIGHT_READ | RIGHT_WRITE, vol) {
         Ok(h) => h,
         Err(e) => {
             crate::log_fatal!("fs-rw-23: 授写句柄被拒 {}", e.tag());
             return false;
         }
     };
-    let hr = match handle::grant_vfs_file(ident, fs_rw::PORT, None, data_cur, data, RIGHT_READ) {
+    let hr = match handle::grant_vfs_file(ident, fs_rw::PORT, None, data_cur, data, RIGHT_READ, vol) {
         Ok(h) => h,
         Err(e) => {
             let _ = handle::close(hw, ident);
@@ -204,6 +210,7 @@ fn t_fs_rw_syscall23() -> bool {
         ghost_cur,
         log,
         RIGHT_READ,
+        vol,
     ) {
         Ok(h) => h,
         Err(e) => {

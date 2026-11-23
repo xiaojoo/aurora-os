@@ -1496,6 +1496,7 @@ fn t_fd_number() -> bool {
     return ok;
 }
 
+#[cfg(feature = "handles")]
 ktest!(KT_FD_NUMBER, t_fd_number);
 
 

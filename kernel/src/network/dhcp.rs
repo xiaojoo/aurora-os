@@ -200,7 +200,7 @@ pub fn parse_reply(buf: &[u8], used_idx: u16, used_len: u32, used_id: u32) -> Re
 /// **掩码全零或全 1 时退回 24**：`0.0.0.0` 与 `255.255.255.255` 都不是合法的单播掩码，
 /// 服务器给这种值说明配置有问题，用默认值比算出一个荒谬的前缀安全。
 #[cfg(feature = "virtio-net")]
-pub fn dhcp_apply(reply: &DhcpReply) -> bool {
+pub fn dhcp_apply(reply: &Reply) -> bool {
     use crate::network::ifaddr::{addr_add, set_gateway};
     use crate::network::ipv6::IpAddr;
     let ip = reply.yiaddr;

@@ -1159,6 +1159,7 @@ static STDIO_DONE: [core::sync::atomic::AtomicBool; 64] = [const { core::sync::a
 /// 那个判据是对的——**启动一个进程不该凭空多占句柄名额**。
 ///
 /// 所以只在「真的要用 fd 0/1/2」时才建。
+#[cfg(feature = "handles")]
 fn ensure_stdio(gidx: usize, tid: u32, pid: u16, pgen: u32) {
     if pid as usize >= STDIO_DONE.len() {
         return;
@@ -1170,6 +1171,7 @@ fn ensure_stdio(gidx: usize, tid: u32, pid: u16, pgen: u32) {
     STDIO_DONE[pid as usize].store(true, core::sync::atomic::Ordering::Release);
 }
 
+#[cfg(feature = "handles")]
 fn preset_std_for(gidx: usize, tid: u32, pid: u16, pgen: u32) {
     let owner = (gidx, tid);
     // **只建一个 Console 句柄，三个 fd 都指向它**（ADR-187 决策 2）。
@@ -4871,20 +4873,62 @@ pub fn syscall_dispatch(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> boo
         // 落地的分片：socket 族等 ADR-166 的 network 模块、输入族等 ADR-162 的 USB HID、
         // 音频族等 ADR-163 的 HDA。实现落地时把对应那一行换成真 handler，
         // 并按 ADR-176「验收」重写 `t_syscall_abi_arms` 里那一格（**不许直接删**）。
+        #[cfg(feature = "handles")]
         SYS_FD_INSTALL => sys_fd_install(frame),
+        #[cfg(not(feature = "handles"))]
+        SYS_FD_INSTALL => nosys(),
+        #[cfg(feature = "handles")]
         SYS_FD_LOOKUP => sys_fd_lookup(frame),
+        #[cfg(not(feature = "handles"))]
+        SYS_FD_LOOKUP => nosys(),
+        #[cfg(feature = "handles")]
         SYS_FD_CLOSE => sys_fd_close(frame),
+        #[cfg(not(feature = "handles"))]
+        SYS_FD_CLOSE => nosys(),
+        #[cfg(feature = "handles")]
         SYS_FD_LIST => sys_fd_list(frame),
+        #[cfg(not(feature = "handles"))]
+        SYS_FD_LIST => nosys(),
+        #[cfg(feature = "handles")]
         SYS_FD_READ => sys_fd_read(frame),
+        #[cfg(not(feature = "handles"))]
+        SYS_FD_READ => nosys(),
+        #[cfg(feature = "handles")]
         SYS_FD_WRITE => sys_fd_write(frame),
+        #[cfg(not(feature = "handles"))]
+        SYS_FD_WRITE => nosys(),
+        #[cfg(feature = "handles")]
         SYS_SOCK_CREATE => sys_sock_create(frame),
+        #[cfg(not(feature = "handles"))]
+        SYS_SOCK_CREATE => nosys(),
+        #[cfg(feature = "handles")]
         SYS_SOCK_BIND => sys_sock_bind(frame),
+        #[cfg(not(feature = "handles"))]
+        SYS_SOCK_BIND => nosys(),
+        #[cfg(feature = "handles")]
         SYS_SOCK_LISTEN => sys_sock_listen(frame),
+        #[cfg(not(feature = "handles"))]
+        SYS_SOCK_LISTEN => nosys(),
+        #[cfg(feature = "handles")]
         SYS_SOCK_CONNECT => sys_sock_connect(frame),
+        #[cfg(not(feature = "handles"))]
+        SYS_SOCK_CONNECT => nosys(),
+        #[cfg(feature = "handles")]
         SYS_SOCK_ACCEPT => sys_sock_accept(frame),
+        #[cfg(not(feature = "handles"))]
+        SYS_SOCK_ACCEPT => nosys(),
+        #[cfg(feature = "handles")]
         SYS_SOCK_SEND => sys_sock_send(frame),
+        #[cfg(not(feature = "handles"))]
+        SYS_SOCK_SEND => nosys(),
+        #[cfg(feature = "handles")]
         SYS_SOCK_RECV => sys_sock_recv(frame),
+        #[cfg(not(feature = "handles"))]
+        SYS_SOCK_RECV => nosys(),
+        #[cfg(feature = "handles")]
         SYS_SOCK_CLOSE => sys_sock_close(frame),
+        #[cfg(not(feature = "handles"))]
+        SYS_SOCK_CLOSE => nosys(),
         SYS_INPUT_READ => nosys(),
         SYS_INPUT_POLL => nosys(),
         SYS_INPUT_GRAB => nosys(),

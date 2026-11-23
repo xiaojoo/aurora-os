@@ -1087,6 +1087,7 @@ pub fn install_as_of_task() {
     crate::mm::install_as_of_task(current_as_slot);
 }
 
+#[cfg(feature = "handles")]
 pub fn install_proc_of() {
     // **一致性断言**：`capability` 侧用 `u16::MAX` 当「没有进程」的哨兵，
     // 它必须等于 `NO_PROC`。这里断言一次，改一边不改另一边会当场崩。

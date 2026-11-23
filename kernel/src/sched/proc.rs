@@ -455,6 +455,7 @@ pub fn proc_aspace(proc_id: u16, gen: u32) -> Option<(u16, u32)> {
 /// 放进 `handle` 会让 `capability` 反过来依赖 `sched`，而今天 `sched → capability`
 /// 已经存在，反向再加一条会成环。所以表住在 `proc`，`handle` 只提供「fd → 句柄」
 /// 的语义层（后续切片）。
+#[cfg(feature = "handles")]
 pub fn proc_fd_table(proc_id: u16, gen: u32) -> Option<crate::handle::FdTable> {
     // 快路径：已经分配过就按它记的容量重建视图。
     let existing = mm::with_vmm_lock(|| {
@@ -505,6 +506,7 @@ pub fn proc_fd_table(proc_id: u16, gen: u32) -> Option<crate::handle::FdTable> {
 /// 读到的是旧表之后的内存（脏的）。
 ///
 /// 返回 `false` = 进程不存在或世代不符。
+#[cfg(feature = "handles")]
 pub fn proc_set_fd_table(proc_id: u16, gen: u32, base: u64, cap: usize) -> bool {
     mm::with_vmm_lock(|| {
         let s = st();
