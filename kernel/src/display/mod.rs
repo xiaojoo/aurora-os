@@ -12,3 +12,7 @@
 pub(crate) mod fbcon;
 #[cfg(feature = "framebuffer")]
 pub(crate) mod frame;
+/// ADR-239：图形设备层（能力探测与格式推导）。
+///
+/// **不依赖 `framebuffer` 特性**：它是纯字节层，判据在默认档也能跑。
+pub(crate) mod gpu;

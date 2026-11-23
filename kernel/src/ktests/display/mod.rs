@@ -130,3 +130,6 @@ fn t_kbd_inject() -> bool {
 ktest!(KT_FB_PATTERN, t_fb_pattern);
 #[cfg(feature = "ps2-kbd")]
 ktest!(KT_KBD_INJECT, t_kbd_inject);
+
+/// ADR-239：图形设备层字节部分的判据。
+mod gpu;
