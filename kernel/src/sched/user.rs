@@ -5730,6 +5730,13 @@ pub fn read_at_in(aslot: u16, va: u64) -> Option<u64> {
 /// 上限取 8：一次失败调用链里前 8 格足够说明成因，之后计数、不再打。
 const READ_AT_LOG_MAX: u64 = 8;
 static READ_AT_REFUSED: AtomicU64 = AtomicU64::new(0);
+// ADR-224：`READ_AT_REFUSED` 的**分类**。五个分开数，因为处置方向完全不同。
+static REFUSED_NOT_USER: AtomicU64 = AtomicU64::new(0);
+static REFUSED_NOT_MAPPED: AtomicU64 = AtomicU64::new(0);
+static REFUSED_NOT_SHARED: AtomicU64 = AtomicU64::new(0);
+static REFUSED_NOT_WRITABLE: AtomicU64 = AtomicU64::new(0);
+static REFUSED_TOO_LONG: AtomicU64 = AtomicU64::new(0);
+
 
 pub fn read_at(va: u64) -> Option<u64> {
     match peek_u64(va) {
@@ -5737,6 +5744,17 @@ pub fn read_at(va: u64) -> Option<u64> {
         Err(e) => {
             // 先计数再判要不要打：**计数器永远准确**，日志有上界。
             // 两者分开是刻意的——判据要的是计数，读的人要的是成因。
+            //
+            // **分类计数**（ADR-224）：只知道「被拒 41613 次」不够 ——
+            // 五种成因的处置方向完全不同（见 `PtrError`）。
+            // 判据可以直接读分类，不必靠日志前 8 行去猜。
+            match e {
+                PtrError::NotUserRange => REFUSED_NOT_USER.fetch_add(1, Ordering::Relaxed),
+                PtrError::NotMapped => REFUSED_NOT_MAPPED.fetch_add(1, Ordering::Relaxed),
+                PtrError::NotSharedWithUser => REFUSED_NOT_SHARED.fetch_add(1, Ordering::Relaxed),
+                PtrError::NotWritable => REFUSED_NOT_WRITABLE.fetch_add(1, Ordering::Relaxed),
+                PtrError::TooLong => REFUSED_TOO_LONG.fetch_add(1, Ordering::Relaxed),
+            };
             let n = READ_AT_REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
             if n <= READ_AT_LOG_MAX {
                 crate::log_info!("abi: 读用户页被拒 va={va:#x} —— {}", PtrError::describe(e));
@@ -5755,6 +5773,20 @@ pub fn read_at(va: u64) -> Option<u64> {
 pub fn read_at_refused() -> u64 {
     READ_AT_REFUSED.load(Ordering::Relaxed)
 }
+
+/// `(不在用户区, 没映射, 不共享, 不可写, 太长)` 分类计数（ADR-224）。
+///
+/// 判据用它把「读不到」拆成五种，而不是只知道一个总数。
+pub fn read_at_refused_by_kind() -> (u64, u64, u64, u64, u64) {
+    (
+        REFUSED_NOT_USER.load(Ordering::Relaxed),
+        REFUSED_NOT_MAPPED.load(Ordering::Relaxed),
+        REFUSED_NOT_SHARED.load(Ordering::Relaxed),
+        REFUSED_NOT_WRITABLE.load(Ordering::Relaxed),
+        REFUSED_TOO_LONG.load(Ordering::Relaxed),
+    )
+}
+
 
 /// 容器加载那条路径的判据要能自己说明失败原因，这里给一份人话（同 `elf::describe`）。
 pub fn describe_load(e: LoadError) -> &'static str {
