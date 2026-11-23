@@ -538,6 +538,19 @@ pub fn reap_observations() -> (u32, u32, u32) {
         REAP_RETIRED_DONE.load(Ordering::Relaxed),
     )
 }
+
+/// **最近一次被回收槽的 gi**（ADR-233 观测）。
+static REAP_LAST_GI: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+/// **最近一次回收时，那个槽的 owned 里有没有容器段**（1 = 有）。
+static REAP_LAST_HAD_CONTAINER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// 读「最近被回收的 gi」与「它是否含容器段」（ADR-233）。
+pub fn reap_last() -> (u32, bool) {
+    (
+        REAP_LAST_GI.load(Ordering::Relaxed),
+        REAP_LAST_HAD_CONTAINER.load(Ordering::Relaxed) != 0,
+    )
+}
 pub fn reap(cpu: usize) -> usize {
     if cpu >= crate::arch::x86_64::cpu::MAX_CPUS || REAP_PENDING[cpu].load(Ordering::Acquire) == 0 {
         return 0;
@@ -577,6 +590,22 @@ pub fn reap(cpu: usize) -> usize {
         REAP_RETIRED.fetch_add(1, Ordering::Relaxed);
         if st == TaskState::Done {
             REAP_RETIRED_DONE.fetch_add(1, Ordering::Relaxed);
+        }
+        // **ADR-233 观测**：记录被回收的 gi 与它的 owned 里有没有容器段。
+        // 判据拿它和「探针的 gi」对比，就能确认「收的是不是探针」。
+        REAP_LAST_GI.store(gi as u32, Ordering::Relaxed);
+        {
+            let s2 = rq(cpu);
+            let n2 = s2.tasks[slot].owned.n;
+            let mut has_c = false;
+            for k in 0..n2.min(MAX_OWNED) {
+                if let Some(OwnedItem::Map(m)) = s2.tasks[slot].owned.items[k].as_ref() {
+                    let v = m.virt();
+                    if v.0 >= 0x1000_c0000 && v.0 < 0x1000_d0000 { has_c = true; }
+                }
+            }
+            drop(s2);
+            if has_c { REAP_LAST_HAD_CONTAINER.store(1, Ordering::Relaxed); }
         }
         // 任务退出撤销：句柄表里 owner 两格都对的表项在这里清掉。**这是唯一安全的时刻**——
         // 它的内核栈与用户页都已经不会再被踩（设计 §7）。只读文件对象不持有页框，账只记在手柄表里。
