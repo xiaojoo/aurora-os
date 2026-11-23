@@ -1652,16 +1652,19 @@ impl ReadTicket {
         match self.kind {
             ReadTicketKind::Fat(ref mut c) => c.read(disk, dst).map_err(HErr::Io),
             #[cfg(feature = "fs-open")]
-            ReadTicketKind::Vfs(ref mut c, _vol) => {
-                // **回退到不缓存版**（ADR-221 实测）：
+            ReadTicketKind::Vfs(ref mut c, vol) => {
+                // **保持不缓存版**（ADR-238 实测）：
                 //
-                // 走 `read_disk_cached` 会让 `t_sdkdemo` 开始读盘，而 AHCI 的 `XFER`
-                // （rank 37）持锁期间调 `tsc::now()`（TIMER 6）⇒ 锁序违规 ⇒ 整机 HANG：
+                // 锁序前提已满足（ADR-222 把 `XFER` 改成 `GROW(4)`），
+                // 但**实测启用缓存让失败率从 4/20 涨到 7/20**：
                 //
-                //   [fatal] L4 sync: 锁序违规，外层 rank=37 本次 rank=6
+                //   `handles,fs-open` 无缓存：4/20
+                //   `handles,fs-open` 有缓存：**7/20**
                 //
-                // **这是 AHCI 内部的既有问题**，不是本层引入的；本层只负责不踩它。
-                // 修 `XFER` 的锁序要改驱动语义（AGENTS.md 硬约束 1），单独一轮做。
+                // 缓存改变了读路径的时序，加剧了那条既有竞态（ADR-228~237：
+                // 探针自己的页在被回收后仍被读）。
+                //
+                // **缓存不能以稳定性为代价** —— 等那条竞态修好再启用。
                 let n = vfs_ro::read_disk(disk, c, dst).map_err(vfs_to_herr)?;
                 Ok(n)
             }
