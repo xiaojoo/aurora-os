@@ -439,7 +439,44 @@ fn refund_asmap(it: &OwnedItem) {
     }
 }
 
+
+/// **「某个被回收任务的 owned 里含容器段」的次数**（ADR-229）。
+static CONTAINER_OWNED_SLOTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// 最近一次命中时的 slot 号。
+static CONTAINER_OWNED_LAST: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// 读「被回收任务里含容器段的次数」与「最近命中的 slot」（ADR-229）。
+pub fn container_owned_stats() -> (u32, u32) {
+    (
+        CONTAINER_OWNED_SLOTS.load(Ordering::Relaxed),
+        CONTAINER_OWNED_LAST.load(Ordering::Relaxed),
+    )
+}
 fn release_owned(cpu: usize, slot: usize) {
+    // **ADR-229：按 slot 分桶记录「哪个任务释放了容器段映射」**。
+    //
+    // ADR-228 已证明「窗口内某被 reap 任务的 owned 含容器段」，但不知道是哪个。
+    // 这里在**搬出映射之前**读一遍 VA，把 slot 记进位图 —— 纯原子操作，
+    // 不写串口（ADR-227 的教训：写串口会改变时序让偶发消失）。
+    #[cfg(feature = "unmap-trace")]
+    {
+        let s0 = rq(cpu);
+        let n0 = s0.tasks[slot].owned.n;
+        let mut hit = false;
+        for i in 0..n0.min(MAX_OWNED) {
+            if let Some(OwnedItem::Map(m)) = s0.tasks[slot].owned.items[i].as_ref() {
+                let v = m.virt();
+                if v.0 >= 0x1000_c0000 && v.0 < 0x1000_d0000 {
+                    hit = true;
+                }
+            }
+        }
+        drop(s0);
+        if hit {
+            CONTAINER_OWNED_SLOTS.fetch_add(1, Ordering::Relaxed);
+            CONTAINER_OWNED_LAST.store(slot as u32, Ordering::Relaxed);
+        }
+    }
     // 一次持锁把"取走计数 + 把映射搬出槽位"做完（原来分两次，每次都要重取队列锁）。
     // `drop(bag)` 仍旧留在锁外——那才是真正可能阻塞的一步，合并取锁不能把它带进来。
     let mut bag = OwnedSet::new();
