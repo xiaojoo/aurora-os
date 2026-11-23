@@ -261,6 +261,23 @@ impl Mapping {
     }
 }
 
+
+/// **容器段被解映射的次数**（ADR-228，只用于偶发取证）。
+///
+/// 为什么是原子量而不是日志：ADR-227 实测 `log_info!` 会让 `t_fs_open_ring3`
+/// 的偶发消失（heisenbug）。原子自增不写串口、不取锁、不分配，
+/// 对时序的影响小到可忽略，而判据能直接读它。
+///
+/// **只在 `unmap-trace` 特性下有值**，默认档恒为 0。
+static CONTAINER_UNMAPS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// 读「容器段被解映射的次数」（ADR-228）。
+///
+/// 判据用法：窗口开始时读一次、结束时再读一次，差值为 0 说明
+/// 窗口内没有任何 `Mapping` 落在容器段被 drop。
+pub fn container_unmaps() -> u32 {
+    CONTAINER_UNMAPS.load(core::sync::atomic::Ordering::Relaxed)
+}
 impl Drop for Mapping {
     fn drop(&mut self) {
         let Some(frames) = self.frames.take() else { return };
@@ -269,20 +286,16 @@ impl Drop for Mapping {
         // “解映射后仍已映射”才暴露。
         {
             let _g = vmm();
-            // **ADR-227：容器段的解映射取证**。
+            // **ADR-228：容器段的解映射计数（不写串口）**。
             //
-            // ADR-225/226 已把 `t_fs_open_ring3` 的偶发收窄到「窗口内某个
-            // `Mapping` 被 drop」，而这是唯一的解映射路径。
+            // ADR-227 证明：`log_info!` 那一行会让偶发消失（heisenbug）。
+            // 所以这里改成**纯原子自增** —— 不写串口、不取锁、不分配，
+            // 时序影响降到最小，判据在窗口结束时读这个计数。
             //
-            // 只在 `unmap-trace` 特性下、且只覆盖 fileprobe 的两个 LOAD 段
-            // （`0x1000c0000..0x1000d0000`）—— 范围窄到不会淹没串口，
-            // 又不改任何分支（只有 `log_info`，判据不看它）。
+            // 只在 `unmap-trace` 特性下、且只覆盖 fileprobe 的两个 LOAD 段。
             #[cfg(feature = "unmap-trace")]
             if self.virt.0 >= 0x1000_c0000 && self.virt.0 < 0x1000_d0000 {
-                crate::log_info!(
-                    "unmap-trace: 撤容器段 va={:#x} pages={} AS={:?}",
-                    self.virt.0, frames.count(), crate::mm::current_as_slot()
-                );
+                CONTAINER_UNMAPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
             unmap_pages(self.virt, frames.count());
             // **VA 保留跟着映射一起放手**（M4-2 的任务退出需要它）。不放手的话，
