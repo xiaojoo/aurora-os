@@ -39,6 +39,12 @@ pub struct SchedHooks {
     /// 顺序反了会让被换出的任务按旧 rip 恢复，信号等于没投递且不会有任何东西变红。
     pub deliver_signal: fn(&mut crate::arch::x86_64::trap::TrapFrame),
     pub exit_current: fn(usize),
+    /// **`SYS_EXIT` 的「不返回用户态」收尾**（ADR-236）。
+    ///
+    /// 与 `exit_current` 的差别：它把 `frame.rip` 指向内核落脚页，
+    /// 让任务不再回到用户态。`Action::Exit` 必须用它，否则
+    /// 任务标了结束却还在跑（ADR-228~235 的根因）。
+    pub exit_park: fn(&mut crate::arch::x86_64::trap::TrapFrame),
     /// 安全契片由 sched 安装；调用点必须在异常出口。
     pub preempt_point: fn(u64, usize),
 }
@@ -74,6 +80,8 @@ fn no_cow(_: u64) -> bool {
 
 /// 默认实现：不投递。未装 `sched` 时信号族不存在，行为与装之前逐字相同。
 fn no_signal(_: &mut crate::arch::x86_64::trap::TrapFrame) {}
+fn no_exit_park(_f: &mut crate::arch::x86_64::trap::TrapFrame) {}
+
 fn no_exit(_: usize) {}
 fn no_preempt(_: u64, _: usize) {}
 
@@ -92,6 +100,7 @@ static HOOKS: HooksCell = HooksCell(UnsafeCell::new(SchedHooks {
     cow: no_cow,
     deliver_signal: no_signal,
     exit_current: no_exit,
+    exit_park: no_exit_park,
     preempt_point: no_preempt,
 }));
 

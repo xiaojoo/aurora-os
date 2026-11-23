@@ -1129,7 +1129,15 @@ pub unsafe extern "C" fn aurora_trap_entry(frame: &mut TrapFrame) {
         // **不停机**——这条分支存在的全部意义就是"一个用户程序的错不变成整台机器的错"。
         Action::Kill => (crate::hooks::sched().park_current)(frame),
         // `SYS_EXIT`：只把"结束"这个动作登记下来，**不在这个上下文里释放任何东西**
-        Action::Exit => (crate::hooks::sched().exit_current)(cpu),
+        // **ADR-236：`Action::Exit` 不再返回用户态**。
+        //
+        // 原来只调 `exit_current`（标结束 + 立牌）然后返回，`iretq` 把用户态
+        // 恢复回去，任务继续跑；而槽已标 `Free`/`Done` ⇒ 下一个抢占点换人后
+        // `reap` 回收它，撤掉它还在用的页（ADR-228~234 的根因）。
+        //
+        // 改用 `exit_park`：把 `frame.rip` 指向内核落脚页，任务不再回到用户态，
+        // 只等下一次抢占被换下 —— 与 `park_current` 同形。
+        Action::Exit => (crate::hooks::sched().exit_park)(frame),
         Action::Resume => {}
     }
     // ADR-177 信号族：**投递点**。位置有三个约束，每一个都是必须的：

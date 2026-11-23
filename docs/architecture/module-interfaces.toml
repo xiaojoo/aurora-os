@@ -456,7 +456,7 @@ public_api = [
   "user::SYS_PROCESS_KILL",
   "user::WAIT_TERMINATED",
   "user::WAIT_MAX_MS",
-  "user::park_current",
+  "user::exit_park", "user::park_current",
   "user::syscall_dispatch",
   "sched::current_cred",
   "sched::set_cred",

@@ -4968,6 +4968,49 @@ pub fn park_current(frame: &mut crate::arch::x86_64::trap::TrapFrame) {
     };
 }
 
+
+/// **`SYS_EXIT` 的「不返回用户态」收尾**（ADR-236）。
+///
+/// ## 为什么需要它
+///
+/// `Action::Exit` 原来只调 `exit_current(cpu)`，那是「标结束 + 立牌」，
+/// **然后返回**。`iretq` 把用户态恢复回去，探针继续 `loop { SYS_EXIT }`。
+///
+/// 而槽已经被标成 `Free`/`Done` ⇒ 下一个抢占点换人后，`reap` 看到
+/// 「`Free` 且 `gi != cur`」就回收它 —— **撤掉它还在用的页**。
+/// 实测（ADR-228~234）：`t_fs_open_ring3` 约 1/7 失败，`reap` 回收的 `gi`
+/// 与探针的 `gi` 完全相同。
+///
+/// ## 做法
+///
+/// 与 `park_current` 同形：把 `frame.rip` 指向内核落脚页（`jmp .`），
+/// 让这个任务**不再回到用户态**，只等下一次抢占被换下。
+///
+/// **与 `park_current` 的两点差别**：
+///
+/// 1. 不调 `kill_current`（它会把退出码写成 1），退出码已由 `SYS_EXIT` 自记；
+/// 2. 不增 `KILLS`（那不是「被杀」）。
+pub fn exit_park(frame: &mut crate::arch::x86_64::trap::TrapFrame) {
+    crate::sched::exit_current(crate::arch::x86_64::cpu::self_slot());
+    let tramp = match TRAMP.load(Ordering::Acquire) {
+        0 => {
+            // 与 `park_current` 同一条理由：没有落脚页就是内核不变量破了。
+            crate::log_fatal!("user: exit 没有落脚页（trampoline 没建起来）rip={:#x}", frame.rip);
+            crate::exit::finish(crate::exit::Code::ExceptionFatal);
+            #[allow(unreachable_code)]
+            return;
+        }
+        t => t,
+    };
+    frame.rip = tramp;
+    // IF 按 `CPU_IF` 写对（同 `park_current`：这条出口不经过 `if_patch`）。
+    frame.rflags = if crate::arch::x86_64::apic::interrupts_enabled(crate::arch::x86_64::cpu::self_slot()) {
+        0x2 | RFLAGS_IF
+    } else {
+        0x2
+    };
+}
+
 // ------------------------------------------------------------ M4-2：按容器加载
 //
 /// 一次加载的产物：入口、可写段的起点（结果槽就在那一页的开头）、装了多少页与用户栈顶。
