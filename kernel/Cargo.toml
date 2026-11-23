@@ -21,6 +21,9 @@ xhci = []
 # ADR-213：命令环闭环（Enable Slot）。**默认关** —— 见 ADR-213 未决 1：
 # CRCR 的 CRR 位在 QEMU xHCI 上读回 0，命令不被消费。开了只会红。
 xhci-slot = []
+
+# ADR-227：容器段解映射取证。**默认关** —— 只给偶发定位用。
+unmap-trace = []
 default = []
 # 负样本：让 ktest 里的一条断言故意不成立，用于证明判定契约的尺子能分辨
 # （手册 §12.3 R19）。正常运行时不得带这个 feature 合入。

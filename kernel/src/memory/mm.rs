@@ -269,6 +269,21 @@ impl Drop for Mapping {
         // “解映射后仍已映射”才暴露。
         {
             let _g = vmm();
+            // **ADR-227：容器段的解映射取证**。
+            //
+            // ADR-225/226 已把 `t_fs_open_ring3` 的偶发收窄到「窗口内某个
+            // `Mapping` 被 drop」，而这是唯一的解映射路径。
+            //
+            // 只在 `unmap-trace` 特性下、且只覆盖 fileprobe 的两个 LOAD 段
+            // （`0x1000c0000..0x1000d0000`）—— 范围窄到不会淹没串口，
+            // 又不改任何分支（只有 `log_info`，判据不看它）。
+            #[cfg(feature = "unmap-trace")]
+            if self.virt.0 >= 0x1000_c0000 && self.virt.0 < 0x1000_d0000 {
+                crate::log_info!(
+                    "unmap-trace: 撤容器段 va={:#x} pages={} AS={:?}",
+                    self.virt.0, frames.count(), crate::mm::current_as_slot()
+                );
+            }
             unmap_pages(self.virt, frames.count());
             // **VA 保留跟着映射一起放手**（M4-2 的任务退出需要它）。不放手的话，
             // 反复 exec/exit 会把 `MAX_VA_RESERVATIONS` 吃光，表现是
