@@ -24803,3 +24803,145 @@ heisenbug 不能靠加日志抓。可用手段只剩：
 1. **根因仍未定位** —— 插桩让问题消失
 2. **下一步应改用「不写串口的原子计数」**
 3. **`unmap-trace` 默认关** —— 不能进默认档（会让偶发消失，掩盖问题）
+## 548. ADR-228：原子计数不写串口，偶发仍现（1/15）且抓到「窗口内容器段被撤 2 次」（2026-11-23）
+
+ADR-227 的「加日志就消失」换成**不写串口、不取锁、不分配**的原子计数（`Mapping::drop` 里
+`CONTAINER_UNMAPS.fetch_add`，仅 `unmap-trace` 特性、仅容器段 VA 范围）。
+
+**15 跑 1 失败（约 1/15，与插桩前 1/8 同量级 ⇒ 原子计数没像日志那样干扰时序）。** 失败跑读数：
+
+    换人 338→342  tick 323→373  rounds=60894  served=34  被拒=58424
+    映射装载后=true  映射窗口后=false  reap=134→138  快照失败=0  容器段撤映射=0→2
+
+结论：窗口内确有任务被 reap，其 `owned` 含容器段映射 ⇒ 探针数据页被撤。ADR-225 假设 3 证实；
+ADR-227「插桩后假设 3 不成立」是错的（插桩改变了行为）。`check` 21/21。
+
+## 549. ADR-229：按 slot 分桶，被回收的就是探针自己（slot=2）（2026-11-23）
+
+`release_owned` 里按 slot 分桶原子计数。**4/20 失败全部命中 slot=2**，而 `探针gidx=2`。
+根因链：探针跑完 → 自己 exit → 下一抢占点 reap 它 → `release_owned` 取出含容器段的 owned →
+`Mapping::drop` 撤数据页 → 内核窗口读全 0。
+
+**本 ADR 的定性是「这不是 bug，是测试的时序假设错了」**：测试已用「看到 DONE 就退出窗口」规避，
+但探针退出与内核读 DONE 之间仍有缝。`t_sdkdemo` 那次 `容器段owned=0→0`，是另一条路。`check` 21/21。
+
+## 550. ADR-230：根因链闭合（代码事实）—— terminate_task 置 Free 让 reap 收仍在跑的任务（2026-11-23）
+
+读完 `exit_current → terminate_task → reap` 全链：`terminate_task` 置 **Free**（非 Done），
+`exit_current` 只 `mark_need` 不立即换人 ⇒ `iretq` 回用户态探针继续 loop ⇒ 下一抢占点 `gi != cur`
+⇒ reap 收它。需五条件同时成立（故约 1/8）。提出修法 A/B/C，**本轮未实施**（硬约束 1：改调度语义要单独一轮 + 负样本）。
+读数 `handles,fs-open,unmap-trace` 16/20（只读代码）。`check` 21/21。
+
+## 551. ADR-231：修法 A（置 Done）无效，4/20→4/20，已回退（2026-11-23）
+
+`exit_current` 里置回 Done + 登记待回收。**零改善**：`reap` 判据本就 `|| st == Done`，
+且 `has_bag` 的 `|| st == Done` 让 Done 即使 owned 为空也算有袋 ⇒ **更容易被收**。
+教训：「读到那行注释」≠「理解含义」；修法必须先证明能改变读数再实施。回退后 `git diff` 空（同 `bd7c495`）。`check` 21/21。
+
+## 552. ADR-232：只观测不改逻辑 —— 闸门生效，但收的不是 Done（2026-11-23）
+
+纯原子自增（`REAP_BLOCKED_BY_CUR`/`REAP_RETIRED`/`REAP_RETIRED_DONE`）。4/20：
+四次失败 `reap挡住` 全 25→26（**闸门生效**）；`Done` 全不变（16→16/15→15）⇒ **收的是 Free**。
+分两类：**A**（回收+1 且容器段撤映射 0→2，`t_fs_open_ring3`）；**B**（回收+0，`t_sdkdemo`，与 reap 无关）。
+观测不干扰（16/20 同加观测前）。`check` 21/21。
+
+## 553. ADR-233：gi 观测又取一次 RUNQ 锁 ⇒ 偶发消失 0/20（第二次 heisenbug）（2026-11-23）
+
+比 ADR-232 多了「再取一次 `rq(cpu)` 锁 + 遍历 owned 循环」⇒ **0/20**。
+**分界线是「有没有取锁」，不是「有没有原子操作」**：取锁引入自旋等待，长度取决于别的 CPU，足以改变竞态胜者。
+该批观测在 `unmap-trace` 档下读数不可信（自己干扰了）。`check` 21/21。
+
+## 554. ADR-234：把遍历并进已有 RUNQ 临界区 ⇒ 3/20 不干扰，gi 三次全 = 探针（2026-11-23）
+
+`has_c` 在本来就要取的那次锁里算，临界区外只做两次 store。**3/20（与 4/20 同量级 ⇒ 不干扰）**，
+`末次回收gi=2=探针gi` 3/3。类 A 确认（收探针、含容器段）；类 B（收探针但不含容器段，撤的是别的资源）。
+方向：reap 需要「在 CPU 上」判据（候选 `on_cpu_now` 标志）。`check` 21/21。
+
+## 555. ADR-235：修法 B（on_cpu_now 时置 Done）也无效，3/20，已回退（2026-11-23）
+
+`terminate_task` 按 `s.current == task` 置 Done/Free。**3/20 与修复前同**。观测证实改动生效（Done 计数跟涨），
+但「挡住」与「回收」是**两次不同的 reap**，回收那次 `cur` 已不是探针。**`current_of` 只反映「此刻在不在跑」，
+不是「还会不会再跑」**。真正方向：`SYS_EXIT` 不应返回用户态。回退后 `git diff` 空（同 `50c861d`）。`check` 21/21。
+
+## 556. ADR-236：修法 C exit_park（Action::Exit 不回用户态）—— 首跑判「修好」，暴露第二种失败（2026-11-23）
+
+`exit_park` 把 `frame.rip` 指向内核落脚页（与 `park_current` 同形），不再 `iretq` 回用户态。
+首跑 `容器段撤映射 0→2 ⇒ 0→0`，据此判「原缺陷修好」。但失败样本变新形态：`tick 6→56 被拒=51067 rounds=54364`
+（ADR-223 描述过的饥饿形态）。失败率 4/20（修复前 3/20，样本量不足以区分）。`handles` 回归 FAIL=0。`check` 21/21。
+
+## 557. ADR-237：续跑 20 次，0→2 复现 —— exit_park 没根治，首验是抽样错误（2026-11-23）
+
+20 跑 4 失败，其中 3 次 `容器段撤映射 0→2` 仍现；`AsMap撤=0→0`（AsMap 假设被否）。
+原因：`exit_park` 第一步仍调 `exit_current → terminate_task` 置 Free，落脚页任务被换下后照常被收。
+**「一次跑出好读数不等于修好了」**（首验只跑 1 次，违反 ADR-225 纪律）。真正修法要 exit_park 不调 exit_current +
+reap 加「在落脚页」判据 ⇒ 回到 ADR-235 的死路。`handles,fs-open` 16/20。`check` 21/21。
+
+## 558. ADR-238：重新启用页缓存，失败率 4/20→7/20，已回退（2026-11-23）
+
+ADR-222 修好 XFER 锁序后重试缓存。锁序完全合法（`handles` FAIL=0），但 `handles,fs-open` 不缓存 4/20、
+缓存 **7/20**。缓存改变读路径时序，撞上既有竞态的「最坏时序点」。**三种扰动三个失败率**：
+加日志 0/20、多取锁 0/20、加缓存 7/20。缓存是性能优化不是正确性修复，回退。收益未测量。`check` 21/21。
+
+## 559. ADR-239：图形设备层第一层（字节层，切片 I）—— t_gpu_mode 八格全绿（2026-11-23）
+
+`ModeInfo/validate/GpuKind::from_ids/bochs_mode`，不写寄存器不做模式设置。`t_gpu_mode` 八格全 true，`PASS(33)`。
+**最有价值的教训**：`validate` 结尾 `row_bytes().ok_or(ZeroBpp)` 兜底掩盖了被删的 `bpp==0` 检查 ⇒ 负样本咬不动；
+改成 `expect` 不变量后负样本咬住（删检查 ⇒ panic ⇒ HANG）。**兜底该写成不变量，不是伪装成正常错误分支。**
+
+## 560. ADR-240：GPU 真设备探测（切片 I 第二层）—— t_gpu_probe 七格全绿（2026-11-23）
+
+`probe_device/probe_first` 真读 QEMU 显卡：`0x1234:0x1111` Bochs，BAR0=16 MiB。七格全 true。
+**外部负样本最有价值**：`-vga none` ⇒ PCI 无显示设备 ⇒ 红（证明判据真在读设备）。
+未决：没映射 MMIO、没读 Bochs 寄存器、没模式设置、`Frame` 仍从 Limine 取帧缓冲、只探第一台、probe 失败没计数。
+读数注：本 HEAD 复跑 handles 曾见 `t_gpu_probe` 红（该跑 QEMU PCI 无 bochs，01.0 是网卡），属宿主机设备形状差异，待同 ELF 复跑归类。
+
+## 561. ADR-241 落地（裁决 B：信箱归属活过探针）—— t_fs_open_ring3 竞态 4/20 → 0/20（2026-11-23）
+
+### 先对账两条「既有红」的来路（任务①）
+
+- **`t_reap_premise` 不是 `exit_park` 引入的新回归**：它走内核工人 `terminate_task`，不经 `SYS_EXIT`。
+  run-10625 红 / run-10626 绿，失败签名 `状态=Free 名下=1 released 93→93`（工人已终止但映射没被收）——
+  是 reap 竞态同族的「没收到」侧，属既有偶发。ADR-240 标它「既有」是对的。
+- **`t_gpu_probe` 在 run-10626 红是宿主机设备形状**：该跑 QEMU PCI 无 bochs（01.0 是网卡 `8086:10d3`），
+  run-10625 的 01.0 才是 `1234:1111`。PCI 拓扑本身不同，非内核缺陷。本轮 20 跑均 ok，记「环境形状，不归因」。
+
+### 根因（reconcile ADR-229 与 ADR-230）
+
+探针 `put(DONE)` 后才 `SYS_EXIT`（fileprobe:362），DONE 一定先写。竞态是：第一段窗口开中断轮询 DONE、
+每读一次自旋 20_000 周期，tick 挤进两次读之间 ⇒ 探针被换下 ⇒ reap（`gi != cur`）撤信箱页 ⇒
+内核下次读 `NotMapped→0`，永远等不到 DONE。**「给 reap 加判据」修不了**（ADR-231/235/237 三次改状态字段全失败）：
+探针合法换下后收它本就正确，错的是「内核还没消费信箱，页就被收了」。
+
+### 裁决 B 落地（使用者裁决，先于代码记入 ADR-241）
+
+关键结构事实：ktest 探针 `as_slot=NO_ASPACE`（spawn_user:1789），跑内核 AS，owned 袋只管「何时 drop」。
+fileprobe 数据段 memsz=0x1000 恰一页一 Mapping。故：
+
+1. `OwnedSet::take_map_at(va)`（sched/mod.rs，swap-remove，只搬出不改其余项释放语义）；
+2. `t_fs_open_ring3` spawn 前取出信箱 Mapping 归测试持有，快照后显式 drop；
+3. 新增两守卫格：reap 后 `is_mapped(data)==true`（信箱活过探针）、drop 后 `==false`（资源真还）。
+
+**不动 load/spawn_user/reap/terminate_task/exit_park 任何已实测语义**（硬约束 1 合规），与 exit_park 正交互补。
+
+### 读数（同一 ELF b67ed2856972）
+
+| 项 | 结果 |
+|---|---|
+| `handles,fs-open` 20 跑（run-10627~10646）| `t_fs_open_ring3` **20/20 ok**（对照修复前 4/20）|
+| 守卫格 `信箱活过探针 / 显式回收` | **20/20 true/true** |
+| 首跑 run-10627 | total=144 passed=144 failed=0；被拒=0 映射窗口后=true 快照失败=0 容器段撤映射=0→0 |
+| **负样本**（run-10647，ELF 4d7c45698da2，去掉 take_map_at）| `信箱活过探针=false`、`t_fs_open_ring3 -> failed`（144 仅 1 红）**确定性证红** |
+| 还原后 run-10648 | ELF sha 复原 b67ed2856972，144/144 复绿 |
+| `handles` 回归（run-10649，ELF 5d61715d484d）| **126/126 PASS**（take_map_at 非 fs-open 档编译通过）|
+| `check` | **21/21** |
+
+### 行尾纪律（本轮踩到并修掉）
+
+`fs_open.rs` 混合行尾（1064 CRLF + 4 LF：299/300/1039/1040），`sched/mod.rs` 全 LF。Edit 工具写文件把混合行尾归一成 CRLF 引入 churn，`text=auto` 过滤器掩盖成小 numstat。**`grep -c $'\r'` 在 Git Bash 返回假 0 不可靠**，用 Python 字节级判定才揪出。修法：`git cat-file blob` 还原精确字节，再 Python 字节级替换施编辑（编辑区 CRLF、保留那 4 行 LF）。终态 `fs_open.rs` 24/3、`sched/mod.rs` 18/0 行尾零贡献；两档 ELF sha 与验证态逐字一致（b67ed2856972 / 5d61715d484d，终态复跑 run-10651/10652）。
+
+### 未做 / 未决
+
+1. `t_sdkdemo` 类 B 失败（ADR-232/234 与容器段无关的另一条路）——未查。
+2. `t_reap_premise` 既有偶发（reap「没收到」侧）——本轮 20 跑均 ok，但样本不足以言稳定，未声称修它。
+3. 页缓存（ADR-238）仍回退态——竞态既修，**下一轮可重试启用并测收益**（本 ADR 不连带启用）。
+4. AGENTS.md 进度快照仍过期（153 ADR/20 门禁/恒红 2 条等），本轮只补 BACKLOG，未改 AGENTS。

@@ -756,14 +756,22 @@ fn t_fs_open_ring3() -> bool {
     user::clear_counters();
 
     let rel0 = sched::reap_released();
-    let t = match sched::spawn_user(loaded.entry, loaded.stack_top, 0, loaded.owned) {
+    let data = loaded.data_va;
+    // ADR-241（裁决 B）：信箱 Mapping 取出探针袋、归测试持有——它必须活过探针。
+    // 留在袋里的话，探针一退出就被 reap 撤映射，内核窗口读不到 DONE（ADR-228~238 的竞态）。
+    let mut owned = loaded.owned;
+    let mailbox = owned.take_map_at(data);
+    if mailbox.is_none() {
+        crate::log_fatal!("fs-open-ring3: 信箱映射不在袋里 data_va={:#x}", data);
+        return false;
+    }
+    let t = match sched::spawn_user(loaded.entry, loaded.stack_top, 0, owned) {
         Ok(t) => t,
         Err(e) => {
             crate::log_fatal!("fs-open-ring3: spawn_user 失败 {:?}", e);
             return false;
         }
     };
-    let data = loaded.data_va;
     // **ADR-225 取证：data_va 的可达性在两个时点各查一次**
     //
     // `0x1000c2000` 是 fileprobe 的第二个 LOAD 段（RW，memsz=0x1000）。
@@ -870,6 +878,18 @@ fn t_fs_open_ring3() -> bool {
     // 快照已在上面（第一段窗口退出、IF 关着时）取走：容器一被 reap，它名下的页就还给分配器，
     // 之后再 `read_at` 读到的就是"页表链没走完"（§366）。
     let reaped = drained_or_free(rel0, t);
+    // ADR-241 守卫格：信箱活过探针——探针被 reap 之后、显式 drop 之前，信箱页必须仍在。
+    // 负样本：把 take_map_at 去掉（信箱放回探针袋）⇒ 探针 reap 即撤信箱 ⇒ 本格红。
+    let mailbox_survives = crate::mm::is_mapped(data);
+    if !mailbox_survives {
+        crate::log_fatal!("fs-open-ring3: 不成立 信箱活过探针（reap 后信箱页没了）");
+    }
+    // 显式收信箱：解映射 + 还帧 + 放手 VA 保留（Mapping::drop 既有语义）。资源账仍平衡。
+    drop(mailbox);
+    let mailbox_released = !crate::mm::is_mapped(data);
+    if !mailbox_released {
+        crate::log_fatal!("fs-open-ring3: 不成立 信箱显式回收（drop 后仍映射）");
+    }
     // **比基线，不比 0**（§463）。
     let table_clean = handle::live() == h_before;
 
@@ -882,7 +902,8 @@ fn t_fs_open_ring3() -> bool {
     if !table_clean {
         crate::log_fatal!("fs-open-ring3: 不成立 表清空（live={}）", handle::live());
     }
-    let mut ok = in_window && reaped && table_clean;
+    crate::log_info!("fs-open-ring3: ADR-241 信箱活过探针={} 显式回收={}", mailbox_survives, mailbox_released);
+    let mut ok = in_window && reaped && table_clean && mailbox_survives && mailbox_released;
     ok &= cell_eq(box_[(fp::MAGIC / 8) as usize], fp::MAGIC_VAL, "magic");
     ok &= cell_eq(box_[(fp::DONE / 8) as usize], fp::DONE_VAL, "done");
     ok &= cell_eq(box_[(fp::READ_TOTAL / 8) as usize], 100, "读回总字节");

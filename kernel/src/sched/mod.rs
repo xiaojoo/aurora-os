@@ -259,6 +259,24 @@ impl OwnedSet {
         }
         Ok(n)
     }
+
+    /// ADR-241（裁决 B）：按 VA 取出一条 `Map` 交给调用方持有，袋里不再有它。
+    ///
+    /// 用途：信箱（容器数据页）要**活过探针任务**——它在探针袋里的话，探针一退出就被
+    /// `reap` 撤映射，内核窗口读不到 DONE（ADR-228~238 的竞态）。取出归测试持有、快照后
+    /// 显式 drop，竞态按构造消失。**只搬出，不改其余项的释放语义**：swap-remove 把末项
+    /// 补进空位，`release_owned` 逐项 drop、不依赖顺序。找不到回 `None`（调用方据此红）。
+    pub fn take_map_at(&mut self, va: u64) -> Option<mm::Mapping> {
+        let idx = (0..self.n)
+            .find(|&i| matches!(&self.items[i], Some(OwnedItem::Map(m)) if m.virt().0 == va))?;
+        let it = self.items[idx].take()?;
+        self.n -= 1;
+        self.items[idx] = self.items[self.n].take();
+        match it {
+            OwnedItem::Map(m) => Some(m),
+            _ => None,
+        }
+    }
 }
 
 /// 每个 CPU 一格：**还有几个槽的资源在等"CPU 挪开它"**。为 0 就等于没有待回收，
