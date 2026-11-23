@@ -178,3 +178,92 @@ pub fn bochs_mode(xres: u32, yres: u32, bpp: u16) -> ModeInfo {
     let pitch = raw.saturating_add(3) & !3;
     ModeInfo { width: xres, height: yres, pitch, bpp, memory_model: 1 }
 }
+
+
+/// 一次真设备探测的读数（ADR-240）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GpuReading {
+    pub kind: GpuKind,
+    pub vendor: u16,
+    pub device: u16,
+    pub class: u8,
+    pub subclass: u8,
+    pub progif: u8,
+    /// BAR0 的物理基址（内存型）。
+    pub bar0: u64,
+    /// BAR0 长度（字节）。
+    pub bar0_len: u64,
+    /// BAR0 是不是 64 位。
+    pub bar0_64: bool,
+}
+
+/// 探测失败原因（ADR-240）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpuProbeError {
+    /// 不是显示类设备（class != 0x03）。
+    NotDisplay,
+    /// 型号认不出（`GpuKind::from_ids` 回 None）。
+    UnknownVendor,
+    /// BAR0 不是内存型（I/O 型或不存在）。
+    NoMmio,
+    /// BAR 尺寸不成形状（0 或非 2 的幂）。
+    BadBar,
+}
+
+/// **对一个 PCI 设备做真探测**（ADR-240）：读 ID、识别型号、读 BAR0。
+///
+/// ## 与 `GpuKind::from_ids` 的分工
+///
+/// `from_ids` 是纯函数（喂 ID 回型号），本函数**从设备取 ID** 再喂给它。
+/// 这样「识别逻辑」与「取 ID」分开，前者能被纯函数判据完整证伪。
+///
+/// ## 今天不做什么
+///
+/// **不映射 MMIO、不读寄存器、不设模式。** 只回答「这块卡是什么、BAR 在哪、多大」。
+pub fn probe_device(dev: &crate::bus::pci::Dev) -> Result<GpuReading, GpuProbeError> {
+    // cfg32(0) = vendor(16) | device(16)
+    let id = dev.cfg32(0);
+    let vendor = (id & 0xFFFF) as u16;
+    let device = (id >> 16) as u16;
+    let (class, subclass) = dev.class_subclass();
+    let progif = dev.progif();
+    let kind = GpuKind::from_ids(vendor, device, class).ok_or(GpuProbeError::NotDisplay)?;
+    if kind == GpuKind::UnknownDisplay {
+        // **不算失败**：这是「认得出是显卡但不认识型号」，要能被计数。
+        // 但 BAR 还是要读 —— 后面的层可能靠它。
+    }
+    // BAR0：显示设备的主显存窗口
+    let (bar0, bar0_64) = dev.mem_bar(0).ok_or(GpuProbeError::NoMmio)?;
+    let sz = dev.size_mem_bar(0);
+    if sz.size == 0 || !sz.size.is_power_of_two() {
+        return Err(GpuProbeError::BadBar);
+    }
+    Ok(GpuReading {
+        kind,
+        vendor,
+        device,
+        class,
+        subclass,
+        progif,
+        bar0,
+        bar0_len: sz.size,
+        bar0_64,
+    })
+}
+
+/// **在所有显示类设备里找第一个**（ADR-240）。
+///
+/// 返回 `(读数, 设备)` —— 设备要留给后续的 `DriverCtx`。
+pub fn probe_first() -> Option<(GpuReading, crate::bus::pci::Dev)> {
+    let n = crate::pci::info()?.n;
+    for i in 0..n {
+        let Some(dev) = crate::pci::dev(i) else { continue };
+        if dev.class() != 0x03 {
+            continue;
+        }
+        if let Ok(r) = probe_device(&dev) {
+            return Some((r, dev));
+        }
+    }
+    None
+}
