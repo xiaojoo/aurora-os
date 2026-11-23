@@ -522,6 +522,22 @@ fn release_owned(cpu: usize, slot: usize) {
 /// `skip = current` 这一条是全部的要点：当前任务正站在自己的内核栈上，
 /// 它的映射（如果有）在这一刻**不能**解映射。所以退出时先标 Free、把资源留在槽里，
 /// 等这个 CPU 换别人上来之后再收。
+
+/// **`reap` 被 `gi == cur` 挡住的次数**（ADR-232 观测）。
+static REAP_BLOCKED_BY_CUR: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// **`reap` 真的回收了一个槽的次数**。
+static REAP_RETIRED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// 其中「回收时状态是 `Done`」的次数（= 可能是还没跑完的）。
+static REAP_RETIRED_DONE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// 读 `reap` 的三个观测计数（ADR-232）：(被 cur 挡住, 回收总数, 其中 Done)。
+pub fn reap_observations() -> (u32, u32, u32) {
+    (
+        REAP_BLOCKED_BY_CUR.load(Ordering::Relaxed),
+        REAP_RETIRED.load(Ordering::Relaxed),
+        REAP_RETIRED_DONE.load(Ordering::Relaxed),
+    )
+}
 pub fn reap(cpu: usize) -> usize {
     if cpu >= crate::arch::x86_64::cpu::MAX_CPUS || REAP_PENDING[cpu].load(Ordering::Acquire) == 0 {
         return 0;
@@ -551,8 +567,16 @@ pub fn reap(cpu: usize) -> usize {
         if gi == cur {
             // **不能收**：它的内核栈就是现在这条栈（或者它正站在里面的用户页上）。
             // 留着这一格计数，下一轮抢占点再来试；不能因为"这一轮放了别人"就把账抹平。
+            //
+            // **ADR-232 观测**：这道闸命中几次。纯原子自增，不写串口。
+            REAP_BLOCKED_BY_CUR.fetch_add(1, Ordering::Relaxed);
             waiting += 1;
             continue;
+        }
+        // **ADR-232 观测**：真的要收了。看「收的是不是还没跑完的任务」。
+        REAP_RETIRED.fetch_add(1, Ordering::Relaxed);
+        if st == TaskState::Done {
+            REAP_RETIRED_DONE.fetch_add(1, Ordering::Relaxed);
         }
         // 任务退出撤销：句柄表里 owner 两格都对的表项在这里清掉。**这是唯一安全的时刻**——
         // 它的内核栈与用户页都已经不会再被踩（设计 §7）。只读文件对象不持有页框，账只记在手柄表里。
