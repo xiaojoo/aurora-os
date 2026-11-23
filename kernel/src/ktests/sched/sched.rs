@@ -2052,7 +2052,9 @@ fn t_q2_workload_slots() -> bool {
     crate::log_info!("q2: 步骤 3 Job残留={}", jc0);
     let f0 = mm::free_frames();
     let va0 = mm::reservation_count();
-    crate::log_info!("q2: 步骤 4 空闲页={} 保留={}", f0, va0);
+    // ADR-245 取证：按**模块记账**读内核栈帧，这个数不受别的模块分配干扰。
+    let st0 = crate::resource::live_of(sched::MOD_STACK_TASK);
+    crate::log_info!("q2: 步骤 4 空闲页={} 保留={} 栈帧={}", f0, va0, st0);
     let rel0 = sched::reap_released();
     crate::log_info!("q2: 步骤 5 回收={}", rel0);
     // active 的基线里含跑用例的 boot 上下文自己（它也是 Running），所以拿读数对读数
@@ -2258,6 +2260,8 @@ fn t_q2_workload_slots() -> bool {
     }
     // ④ 被拒的那几次 spawn 各已经发过一段 VA 窗口和 4 个页框：它们必须原样回来。
     //    这一格本来只是读数，实测 `va23->23 / free 不变` ⇒ 升成判据（去回滚它就红）。
+    let st1 = crate::resource::live_of(sched::MOD_STACK_TASK);
+    crate::log_info!("q2-栈: 模块栈帧 {}->{} (差 {})", st0, st1, st1 as i64 - st0 as i64);
     let rollback_ok = f1 == f0 && va1 == va0;
     if !rollback_ok {
         crate::log_fatal!(
