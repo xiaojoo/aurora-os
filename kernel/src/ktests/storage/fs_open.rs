@@ -799,6 +799,7 @@ fn t_fs_open_ring3() -> bool {
     let (cos0, col0) = crate::sched::container_owned_stats();
     let (rb0, rr0, rd0) = crate::sched::reap_observations();
     let (rlg0, rhc0) = crate::sched::reap_last();
+    let am0 = crate::mm::container_asmap_drops();
     // 两段窗口：第一段只等 `DONE`，看到就**退出**——`with_interrupts` 退出时 `cli`，
     // 于是下面的整页快照与异步 reaper 互斥（reap 只在 tick 的抢占点上跑）。
     // 旧版把快照放在整段窗口之后、中间还隔着 2M 周期自旋：那期间任何一次 tick 都会把
@@ -954,12 +955,12 @@ fn t_fs_open_ring3() -> bool {
     // 三成因对照：sw 不涨=没换到任何人；tk 不涨=tick 根本没进来；
     // 都涨但 DONE 不到=换到了别的任务/探针没写槽。
     crate::log_info!(
-        "fs-open-ring3: 窗口前后 换人 {}→{} tick {}→{} rounds={} served={} 被拒={} 末次换入gidx={} 探针gidx={} 映射装载后={} 映射窗口后={} reap={}→{} 快照失败={} 容器段撤映射={}→{} 容器段owned={}→{}(slot={}→{}) reap挡住={}→{} 回收={}→{}(Done={}→{}) 末次回收gi={}→{}(含容器={}→{}) 探针gi={}",
+        "fs-open-ring3: 窗口前后 换人 {}→{} tick {}→{} rounds={} served={} 被拒={} 末次换入gidx={} 探针gidx={} 映射装载后={} 映射窗口后={} reap={}→{} 快照失败={} 容器段撤映射={}→{} 容器段owned={}→{}(slot={}→{}) reap挡住={}→{} 回收={}→{}(Done={}→{}) 末次回收gi={}→{}(含容器={}→{}) 探针gi={} AsMap撤={}→{}",
         sw0, sw1, tk0, tk1, rounds, user::served(), user::read_at_refused(),
         // **不用 `runs_of(t)`**：`reap()` 清槽时会把 `runs` 清零（mod.rs:528），
         // 而窗口结束时探针通常已被回收 ⇒ 那个读数恒为 0，是个只能读 0 的量具（§488）。
         // `SWITCH_PROBE[1]` 不在槽里、不被清，才是「最后换进来的是谁」。
-        crate::sched::switch_probe(1), t, mapped_after_load, mapped_after_window, reap0, crate::sched::reap_released(), snap_failed, cum0, crate::mm::container_unmaps(), cos0, crate::sched::container_owned_stats().0, col0, crate::sched::container_owned_stats().1, rb0, crate::sched::reap_observations().0, rr0, crate::sched::reap_observations().1, rd0, crate::sched::reap_observations().2, rlg0, crate::sched::reap_last().0, rhc0, crate::sched::reap_last().1, t
+        crate::sched::switch_probe(1), t, mapped_after_load, mapped_after_window, reap0, crate::sched::reap_released(), snap_failed, cum0, crate::mm::container_unmaps(), cos0, crate::sched::container_owned_stats().0, col0, crate::sched::container_owned_stats().1, rb0, crate::sched::reap_observations().0, rr0, crate::sched::reap_observations().1, rd0, crate::sched::reap_observations().2, rlg0, crate::sched::reap_last().0, rhc0, crate::sched::reap_last().1, t, am0, crate::mm::container_asmap_drops()
     );
     crate::log_info!(
         "fs-open-ring3: 取证 读回={} 首8={:#x} 字节和={} 尾字节数={} 尾首8={:#x} 尾和={} stat大小={} 首簇={} 条目={} 名字和={} 大小和={} 多级读回={} 多级首8={:#x} 多级和={} 多级首簇={} proj条目={} proj名字和={} 表清空={} 回收={} rounds={} served={} 诊断mul={:#x} 诊断add={:#x} ⇒ {}",

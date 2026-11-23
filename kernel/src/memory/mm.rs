@@ -2399,8 +2399,25 @@ impl AspaceMapping {
     }
 }
 
+
+/// **容器段被 `AsMap` 撤掉的次数**（ADR-237 观测）。
+static CONTAINER_ASMAP_DROPS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// 读「容器段被 `AsMap` 撤掉的次数」（ADR-237）。
+pub fn container_asmap_drops() -> u32 {
+    CONTAINER_ASMAP_DROPS.load(core::sync::atomic::Ordering::Relaxed)
+}
 impl Drop for AspaceMapping {
     fn drop(&mut self) {
+        // **ADR-237：`AsMap` 也覆盖容器段**（此前观测只看了 `Map`）。
+        //
+        // ADR-236 之后 `容器段撤映射=0→0` 但 `末次回收gi=2(含容器=true)` 仍出现 ——
+        // 因为那条 `owned` 里的是 `OwnedItem::AsMap`，它走 `walk_leaf_in` 手动清叶子，
+        // **不经过 `unmap_pages`**，所以那个计数器不涨。
+        #[cfg(feature = "unmap-trace")]
+        if self.va.0 >= 0x1000_c0000 && self.va.0 < 0x1000_d0000 {
+            CONTAINER_ASMAP_DROPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
         let n = self.pages.min(MAX_AS_MAP_PAGES);
         let mut out = [0u64; MAX_AS_MAP_PAGES];
         out[..n].copy_from_slice(&self.frames[..n]);
