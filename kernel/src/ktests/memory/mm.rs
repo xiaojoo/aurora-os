@@ -244,6 +244,63 @@ fn t_map_write_unmap() -> bool {
 }
 ktest!(KT_MAP_UNMAP, t_map_write_unmap);
 
+/// 一段 VA 保留拆成 2+1 两条映射：第一条 drop 只应推迟放手，第二条必须归还保留与三帧。
+fn t_va_reservation_split_drop() -> bool {
+    let va = match mm::alloc_va_range(3) {
+        Some(v) => v,
+        None => {
+            crate::log_fatal!("va-split: 三段 VA 分不出来");
+            return false;
+        }
+    };
+    let f2 = match mm::phys_alloc(1, mm::MOD_TEST) {
+        Ok(f) => f,
+        Err(e) => {
+            crate::log_fatal!("va-split: 两帧块分不出来 {:?}", e);
+            return false;
+        }
+    };
+    let m2 = match mm::map(va, f2, mm::PageFlags::RW) {
+        Ok(m) => m,
+        Err(e) => {
+            crate::log_fatal!("va-split: 前两页映不上 {:?}", e);
+            return false;
+        }
+    };
+    let f1 = match mm::phys_alloc(0, mm::MOD_TEST) {
+        Ok(f) => f,
+        Err(e) => {
+            crate::log_fatal!("va-split: 第三帧分不出来 {:?}", e);
+            return false;
+        }
+    };
+    let tail = mm::VirtAddr(va.0 + 2 * mm::PAGE as u64);
+    let m1 = match mm::map(tail, f1, mm::PageFlags::RW) {
+        Ok(m) => m,
+        Err(e) => {
+            crate::log_fatal!("va-split: 第三页映不上 {:?}", e);
+            return false;
+        }
+    };
+    let after_alloc = mm::free_frames();
+    let reserved_before = mm::is_reserved(va.0);
+    drop(m2);
+    let deferred = mm::is_reserved(va.0) && mm::is_mapped(tail.0);
+    drop(m1);
+    let released = !mm::is_reserved(va.0)
+        && !mm::is_mapped(va.0)
+        && !mm::is_mapped(va.0 + mm::PAGE as u64)
+        && !mm::is_mapped(tail.0);
+    let frames_back = mm::free_frames() == after_alloc + 3;
+    let ok = reserved_before && deferred && released && frames_back;
+    crate::log_info!(
+        "va-split: 初始保留={} 首drop推迟={} 次drop归还={} 三帧归还={} ⇒ {}",
+        reserved_before, deferred, released, frames_back, ok
+    );
+    ok
+}
+ktest!(KT_VA_RESERVATION_SPLIT_DROP, t_va_reservation_split_drop);
+
 /// guard page：只映射第二页，第一页必须仍未映射且访问它要能取到异常。
 /// 这是 M1 时我在 §5.2 注释里承认“还没有 guard page”的那一项。
 fn t_guard_page_blocks_access() -> bool {

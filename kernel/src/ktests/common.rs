@@ -94,12 +94,12 @@ pub(crate) fn drained_or_free(rel0: u64, g: usize) -> bool {
 /// `kstack_lo == 0`（那一格确实是 `drop(bag)` 之后才清的），实测**更差**
 /// （8 跑 5 红），已回退 —— 原因未查清，记在这里免得下一个人重走。
 ///
-/// ## 已知残留（ADR-243 未决 1）
+/// ## 2026-11-25 更正（BACKLOG §575）
 ///
-/// `t_q2_workload_slots` 仍有约 1/3 的跑报 `回滚不成立 ...(差 -4) va..->..(差 1)`。
-/// **本轮实测：未改的 HEAD 同样 2/6 红**，所以这不是本修法引入的。
-/// 逐条诊断显示 q2 的 7 条线程全是 `state=Free owned=0`，
-/// 所以漏的是一条**没人持有的 3 页 VA 保留**（`0x100002000`），根因未定位。
+/// `0x100002000` 的“第 2 页仍映射”不是长期泄漏：3 页保留拆成 2+1 两条 Mapping，
+/// 第一条 drop 时第三条仍在，`release_va_locked` 正确推迟；第二条 drop 后保留与
+/// 三帧全部归还。`t_va_reservation_split_drop` 已直查，`forget(m1)` 负样本精确红；
+/// handles 40/40 PASS、完整矩阵 82/82。
 pub(crate) fn drain_reap_for(g: usize) -> bool {
     let done = || crate::sched::owned_of(g) == 0;
     if done() {
