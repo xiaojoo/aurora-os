@@ -477,6 +477,16 @@ impl<T: Send> OpenSpinLock<T> {
         self.rank
     }
 
+    /// 外层 rank 合法时才等待获取；非法嵌套在 CAS 前拒绝，不污染锁状态。
+    pub fn lock_checked(&self) -> Option<OpenGuard<'_, T>> {
+        let slot = cpu_slot();
+        let outer = INNERMOST[slot].load(Ordering::Relaxed);
+        if outer != 0 && self.rank.0 <= outer {
+            return None;
+        }
+        Some(self.lock())
+    }
+
     /// 取锁。**不动 IF**。
     pub fn lock(&self) -> OpenGuard<'_, T> {
         ACQUIRES.fetch_add(1, Ordering::Relaxed);
@@ -519,7 +529,7 @@ impl<T: Send> OpenGuard<'_, T> {
 
 impl<T: Send> Drop for OpenGuard<'_, T> {
     fn drop(&mut self) {
-        let slot = crate::arch::x86_64::cpu::self_slot();
+        let slot = cpu_slot();
         INNERMOST[slot].store(self.prev_rank, Ordering::Relaxed);
         self.lock.locked.store(0, Ordering::Release);
     }
@@ -621,6 +631,11 @@ fn cpu_token() -> u64 {
 }
 
 // ----------------------------------------------------------------- lockdep
+
+/// 当前 CPU 槽位；非法嵌套检查与 guard 生命周期共用同一入口。
+fn cpu_slot() -> usize {
+    crate::arch::x86_64::cpu::self_slot()
+}
 
 /// 每个 CPU 各自的"当前最深锁等级"。
 ///

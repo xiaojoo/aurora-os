@@ -31,6 +31,8 @@ mod boot;
 mod bus;
 mod capability;
 mod diag;
+#[cfg(feature = "kdump")]
+mod capture;
 mod display;
 mod driver;
 mod filesystem;
@@ -169,6 +171,24 @@ fn on_panic(info: &PanicInfo) -> ! {
 
 /// 异常里判定为致命的出口：打印现场后给独立退出码（ExceptionFatal=39）。
 pub fn exit_fatal_from_exception(frame: &trap::TrapFrame) -> ! {
+    #[cfg(feature = "kdump")]
+    {
+        let site = crash::Site {
+            vector: frame.vector as u32,
+            error_code: frame.error_code as u32,
+            cr2: frame.cr2,
+            rip: frame.rip,
+            rsp: frame.rsp,
+            rbp: frame.rbp,
+        };
+        let cpu = cpu::self_slot();
+        trap::p3_record_fatal(cpu, tsc::now().wrapping_sub(trap::entry_tsc_of(cpu)));
+        serial::unlock_for_halt();
+        // SAFETY: 异常帧来自当前 ISR，capture 栈与快照已初始化；入口不再返回普通 ISR。
+        unsafe { capture::enter_capture(&site, frame) };
+    }
+    #[cfg(not(feature = "kdump"))]
+    {
     // 无锁现场记录的第一格：**在任何串口写、任何块设备写之前**。抓到的那次挂死 RIP
     // 落在 `dump_site` 里而串口上没有 `[fatal]`——那一行有没有出去从此不再是唯一证据。
     crash::mark_fatal(
@@ -204,6 +224,7 @@ pub fn exit_fatal_from_exception(frame: &trap::TrapFrame) -> ! {
     )
     .ok();
     exit::finish(exit::Code::ExceptionFatal)
+    }
 }
 
 /// 内核入口。Limine 在完成长模式、分页、higher-half 映射后直接跳到这里，
@@ -509,6 +530,13 @@ fn stage_memory() {
         crate::log_fatal!("mm::bootstrap_va_res 失败 {:?}", e);
         exit::boot_invalid("va res bootstrap failed");
     }
+    #[cfg(feature = "kdump")]
+    if let Err(e) = crate::capture::init() {
+        crate::log_fatal!("kdump: capture 预留失败 {:?}", e);
+        exit::boot_invalid("kdump capture init failed");
+    }
+    #[cfg(feature = "kdump")]
+    exit::install_capture_enter(crate::capture::enter_capture as usize);
     #[cfg(feature = "handles")]
     if let Err(e) = crate::handle::init() {
         crate::log_fatal!("handle::init 引导失败 {:?}（句柄槽数组分不出）", e);
@@ -730,7 +758,14 @@ fn stage_storage_guard_crash() {
     // 任何可能崩的路径**之前**把 `n+1` 写回盘，而驱动与用例都在后面。
     // 存储没起来 ⇒ 状态区读不到 ⇒ 按最坏情况进安全模式（这正是"读不到"该有的处置）。
     match ahci::init() {
-        Ok(i) => crate::log_info!("boot: 存储已认领 abar={:#x} 端口={}", i.abar, i.ports),
+        Ok(i) => {
+            crate::log_info!("boot: 存储已认领 abar={:#x} 端口={}", i.abar, i.ports);
+            #[cfg(feature = "kdump")]
+            if let Err(error) = crate::capture::init_io() {
+                crate::log_fatal!("kdump: capture AHCI 初始化失败 {:?}", error);
+                exit::boot_invalid("kdump capture AHCI init failed");
+            }
+        }
         Err(e) => {
             crate::log_warn!("boot: 存储没认领上 {:?}，状态区读不到 ⇒ 按最坏情况处理", e)
         }

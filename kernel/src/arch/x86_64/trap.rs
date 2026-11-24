@@ -210,6 +210,8 @@ struct Tables {
     /// #DF 独立栈（早期版本；MM 就绪后由 `install_exception_stack` 换成带 guard page 的栈）。
     /// bss 里的静态数组**无法**把它下面一页标成不可访问，所以这一段只是"分离的异常栈"。
     df_stack: [u8; PAGE],
+    #[cfg(feature = "kdump")]
+    nmi_stack: [u8; PAGE],
 }
 
 #[repr(C, align(64))]
@@ -226,6 +228,8 @@ static TABLES: [TablesSlot; crate::arch::x86_64::cpu::MAX_CPUS] = [const {
         idt: [[0; 2]; IDT_ENTRIES],
         tss: Tss::new(),
         df_stack: [0u8; PAGE],
+        #[cfg(feature = "kdump")]
+        nmi_stack: [0u8; PAGE],
     }))
 }; crate::arch::x86_64::cpu::MAX_CPUS];
 
@@ -264,6 +268,8 @@ extern "C" {
     static isr_table: [u64; IDT_ENTRIES];
     /// TLB shootdown 桩的地址
     static isr_shootdown_gate: [u64; 1];
+    #[cfg(feature = "kdump")]
+    static isr_nmi_gate: [u64; 1];
     fn flush_segments(code_sel: u64, data_sel: u16);
 }
 
@@ -325,6 +331,12 @@ pub fn init_cpu_tables(slot: usize) {
     };
     // SAFETY: 写自己那一槽的 TSS；偏移 36 才是架构规定的 IST1（`tss_offsets` 负责核对）
     unsafe { core::ptr::write_unaligned(core::ptr::addr_of_mut!(t.tss.ist[0]), ist1) };
+    #[cfg(feature = "kdump")]
+    {
+        let nmi_top = ((t.nmi_stack.as_ptr() as u64) + PAGE as u64) & !0xf;
+        // SAFETY: IST2 位于 packed TSS 的 ist[1]，本 CPU 启动期独占写入。
+        unsafe { core::ptr::write_unaligned(core::ptr::addr_of_mut!(t.tss.ist[1]), nmi_top) };
+    }
 
     let has_err = vectors_with_error_code();
     for v in 0..IDT_ENTRIES {
@@ -335,17 +347,32 @@ pub fn init_cpu_tables(slot: usize) {
         // "不该出现的向量"共用桩，它会压 48 当向量号，把真正的 242 弄丢。
         // 本地定时器 241 已经有自己的 `isr_stub_241` 并在那张表里占好了位置（M3b-2b），
         // 所以不再需要特例——特例少一处，"哪个向量的现场是真的"这件事就少一处要记的规矩。
+        #[cfg(feature = "kdump")]
+        let handler = if v == VEC_SHOOTDOWN {
+            unsafe { isr_shootdown_gate[0] }
+        } else if v == 2 {
+            unsafe { isr_nmi_gate[0] }
+        } else {
+            unsafe { isr_table[v] }
+        };
+        #[cfg(not(feature = "kdump"))]
         let handler = if v == VEC_SHOOTDOWN {
             unsafe { isr_shootdown_gate[0] }
         } else {
             unsafe { isr_table[v] }
         };
+        let ist = if v == 8 { 1 } else { 0 };
+        #[cfg(feature = "kdump")]
+        let ist = if v == 2 { 2 } else { ist };
+        let present = v == 2;
+        #[cfg(feature = "kdump")]
+        let present = false;
         t.idt[v] = idt_gate(
             true,
-            if v == 8 { 1 } else { 0 },
+            ist,
             SEL_CODE as u16,
             handler,
-            v == 2,
+            present,
             // 唯一的 DPL3 门：ring3 用它发起系统调用（M4-1 走 `int 0x80`，理由见 ADR-025）
             v == VEC_SYSCALL,
         );
@@ -1747,6 +1774,26 @@ syscall_entry:
     // 不变量破了：内核栈还没装就收到快路径调用。继续往下会写到地址 0（ring0 的 #PF，
     // 归因成"退出路径自己写坏了"），所以在这里留一条最响的信号。
     ud2
+"#
+);
+
+#[cfg(feature = "kdump")]
+core::arch::global_asm!(
+    r#"
+    .global isr_stub_nmi_capture
+isr_stub_nmi_capture:
+    FAST_PROLOG
+    mov rdi, rbp
+    call aurora_capture_nmi
+1:
+    cli
+    hlt
+    jmp 1b
+
+    .align 8
+    .global isr_nmi_gate
+isr_nmi_gate:
+    .quad isr_stub_nmi_capture
 "#
 );
 

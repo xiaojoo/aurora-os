@@ -700,6 +700,132 @@ fn t_reap_premise() -> bool {
 }
 ktest!(KT_REAP_PREMISE, t_reap_premise);
 
+fn t_reap_late_registration() -> bool {
+    let signal = sched::ReapSignal::new();
+    signal.mark();
+    let first = signal.scan(|| {
+        signal.mark();
+        7usize
+    });
+    let late = signal.scan(|| 9usize);
+    let empty = signal.scan(|| 0usize);
+    let ok = first == Some(7) && late == Some(9) && empty.is_none();
+    if !ok {
+        crate::log_fatal!(
+            "reap 迟到登记: first={:?} late={:?} empty={:?}",
+            first, late, empty
+        );
+    }
+    ok
+}
+ktest!(KT_REAP_LATE_REGISTRATION, t_reap_late_registration);
+
+fn t_reap_host_guard() -> bool {
+    use sched::TaskState::{Done, Free, Runnable, Running};
+    let ok = !sched::reap_host_safe(Done)
+        && !sched::reap_host_safe(Free)
+        && sched::reap_host_safe(Runnable)
+        && sched::reap_host_safe(Running);
+    if !ok {
+        crate::log_fatal!("reap 落袋闸: Done/Free 必须拒绝，Runnable/Running 必须放行");
+    }
+    ok
+}
+ktest!(KT_REAP_HOST_GUARD, t_reap_host_guard);
+
+static HOST_RACE_VICTIM: AtomicUsize = AtomicUsize::new(usize::MAX);
+static HOST_RACE_ENTERED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static HOST_RACE_RESUMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn host_race_victim() -> ! {
+    loop {
+        sched::yield_now();
+        tsc::spin(1_000);
+    }
+}
+
+fn host_race_host() -> ! {
+    let victim = HOST_RACE_VICTIM.load(Ordering::Acquire);
+    HOST_RACE_ENTERED.store(true, Ordering::Release);
+    let _ = sched::terminate_task(victim);
+    HOST_RACE_RESUMED.store(true, Ordering::Release);
+    sched::yield_now();
+    loop {
+        tsc::spin(1_000);
+    }
+}
+
+fn t_release_host_lifetime() -> bool {
+    if sched::state_of(0) == sched::TaskState::Free {
+        sched::init_boot_task();
+    }
+    sched::start_workers();
+    if clock::current().is_none() {
+        crate::calibrate_clock_once();
+    }
+    let tick_in = apic::ticks();
+    let probe = apic::wait_ticks(tick_in, 2, clock::window_cycles(2));
+    let was_running = probe.ticks >= 2;
+    if !was_running {
+        apic::timer_start().ok();
+    }
+    sched::REAP_YIELD_PROBE.store(false, Ordering::Release);
+    HOST_RACE_ENTERED.store(false, Ordering::Release);
+    HOST_RACE_RESUMED.store(false, Ordering::Release);
+    let f0 = mm::free_frames();
+    let va0 = mm::reservation_count();
+    let st0 = crate::resource::live_of(sched::MOD_STACK_TASK);
+    let victim = match sched::spawn(host_race_victim) {
+        Ok(g) => g,
+        Err(e) => { crate::log_fatal!("host-race: victim spawn {:?}", e); return false; }
+    };
+    let host = match sched::spawn(host_race_host) {
+        Ok(g) => g,
+        Err(e) => { crate::log_fatal!("host-race: host spawn {:?}", e); return false; }
+    };
+    HOST_RACE_VICTIM.store(victim, Ordering::Release);
+    sched::REAP_YIELD_PROBE.store(true, Ordering::Release);
+    let entered = apic::with_interrupts(|| {
+        let t0 = tsc::now();
+        while !HOST_RACE_ENTERED.load(Ordering::Acquire)
+            && tsc::now().wrapping_sub(t0) < 1_000_000_000
+        {
+            tsc::spin(10_000);
+        }
+        HOST_RACE_ENTERED.load(Ordering::Acquire)
+    });
+    let host_terminated = entered && sched::terminate_task(host);
+    let resumed = apic::with_interrupts(|| {
+        let t0 = tsc::now();
+        while !HOST_RACE_RESUMED.load(Ordering::Acquire)
+            && tsc::now().wrapping_sub(t0) < 1_000_000_000
+        {
+            tsc::spin(10_000);
+        }
+        HOST_RACE_RESUMED.load(Ordering::Acquire)
+    });
+    sched::REAP_YIELD_PROBE.store(false, Ordering::Release);
+    let _ = sched::terminate_task(host);
+    let _ = sched::terminate_task(victim);
+    let drained = crate::ktests::common::drain_reap_for(host);
+    if !was_running {
+        apic::timer_stop().ok();
+    }
+    let f1 = mm::free_frames();
+    let va1 = mm::reservation_count();
+    let st1 = crate::resource::live_of(sched::MOD_STACK_TASK);
+    let ok = entered && resumed && !host_terminated && drained && f1 == f0 && va1 == va0 && st1 == st0;
+    crate::log_info!(
+        "host-race: entered={} host_terminated={} resumed={} drained={} free{}->{} va{}->{} stack{}->{}",
+        entered, host_terminated, resumed, drained, f0, f1, va0, va1, st0, st1
+    );
+    if !ok {
+        crate::log_fatal!("host-race: 持袋宿主被终止或未恢复，判定不成立");
+    }
+    ok
+}
+ktest!(KT_RELEASE_HOST_LIFETIME, t_release_host_lifetime);
+
 /// P3b-2 的搭档：让出一次就收工，用来证明"有真任务时 idle 不许被选中"。
 fn idle_probe_partner() -> ! {
     sched::yield_now();
@@ -2052,7 +2178,7 @@ fn t_q2_workload_slots() -> bool {
     crate::log_info!("q2: 步骤 3 Job残留={}", jc0);
     let f0 = mm::free_frames();
     let va0 = mm::reservation_count();
-    // ADR-245 取证：按**模块记账**读内核栈帧，这个数不受别的模块分配干扰。
+    // ADR-244 补记二取证：按**模块记账**读内核栈帧，这个数不受别的模块分配干扰。
     let st0 = crate::resource::live_of(sched::MOD_STACK_TASK);
     crate::log_info!("q2: 步骤 4 空闲页={} 保留={} 栈帧={}", f0, va0, st0);
     let rel0 = sched::reap_released();
@@ -2237,7 +2363,7 @@ fn t_q2_workload_slots() -> bool {
     // **ADR-243 更正**："先释放再标 Free"只对 `reap` 成立，对 `terminate_task` **不成立**——
     // 它在拿队列锁时就标 Free，而 `release_owned` 在放锁之后。于是"全部 Free"可能在
     // **袋还牵着映射**时就成立，本格短路 ⇒ 不进 `drain_reap` ⇒ 没有 tick ⇒ 没有抢占点
-    // ⇒ `REAP_PENDING` 永远不消费 ⇒ 那 4 页内核栈与 1 条 VA 保留**再也没人放手**。
+    // ⇒ 回收脏位永远不被消费 ⇒ 那 4 页内核栈与 1 条 VA 保留**再也没人放手**。
     // 实测 14/14 红：`回滚不成立 ...(差 -4) va17->18(差 1)`。
     // 判据收紧成"Free **且** 袋已空"：袋子空才是释放已发生的直接证据。
     let all_free = (0..ok_n).all(|i| {

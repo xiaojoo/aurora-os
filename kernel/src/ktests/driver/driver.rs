@@ -547,6 +547,10 @@ fn t_ahci_claim() -> bool {
     };
     let handshakes = e.ports[..e.n].iter().all(|p| p.fr && p.cr);
     let tables_ok = e.ports[..e.n].iter().all(|p| {
+        #[cfg(feature = "kdump")]
+        if ahci::is_capture_port(p.num) {
+            return true;
+        }
         p.clb == i.ring_pa as u32
             && p.fb == (i.ring_pa + ahci::OFF_RXFIS + ahci::RX_BYTES * u64::from(p.num)) as u32
     });
@@ -1778,6 +1782,66 @@ fn t_driver_ctx() -> bool {
     ok
 }
 ktest!(KT_DRIVER_CTX, t_driver_ctx);
+
+fn t_ahci_lock_rank_guard() -> bool {
+    if ahci::init().is_err() {
+        crate::log_fatal!("ahci-rank: AHCI 认领失败");
+        return false;
+    }
+    let port = match ahci::boot_port() {
+        Ok(port) => port,
+        Err(error) => {
+            crate::log_fatal!("ahci-rank: 找不到引导口 {:?}", error);
+            return false;
+        }
+    };
+    let before = crate::sync::stats();
+    let mut buf = [0u8; 512];
+    let (rejected, after_outer) = {
+        let _outer = smp::CONTENTION_LOCK.lock();
+        let rejected = matches!(
+            ahci::read_bytes(port, 0, &mut buf),
+            Err(ahci::AhciError::Denied(_))
+        );
+        (rejected, crate::sync::stats())
+    };
+    let acquire_delta = after_outer.acquires - before.acquires;
+    let normal_ok = ahci::read_bytes(port, 0, &mut buf).is_ok();
+    let no_violation = after_outer.order_violations == before.order_violations
+        && after_outer.reentrant_hits == before.reentrant_hits;
+    let ok = rejected && normal_ok && no_violation;
+    crate::log_info!(
+        "ahci-rank: 外层rank={} 拒绝={} 全内核取锁增量={} 无新增违规={} 放锁后正常读={} ⇒ {}",
+        smp::CONTENTION_LOCK.rank().0, rejected, acquire_delta, no_violation, normal_ok, ok
+    );
+    ok
+}
+ktest!(KT_AHCI_LOCK_RANK_GUARD, t_ahci_lock_rank_guard);
+
+#[cfg(feature = "kdump")]
+fn t_ahci_capture_quarantine() -> bool {
+    let mut buf = [0u8; 512];
+    let read = matches!(
+        ahci::read_bytes(1, 0, &mut buf),
+        Err(ahci::AhciError::Quarantined)
+    );
+    let write = matches!(
+        ahci::write_bytes(1, 0, &[0u8; 512]),
+        Err(ahci::AhciError::Quarantined)
+    );
+    let write_lba = matches!(
+        ahci::write_lba(1, 0, 1),
+        Err(ahci::AhciError::Quarantined)
+    );
+    let ok = read && write && write_lba;
+    crate::log_info!(
+        "ahci-capture: 读拒={} 任意写拒={} 图案写拒={} ⇒ {}",
+        read, write, write_lba, ok
+    );
+    ok
+}
+#[cfg(feature = "kdump")]
+ktest!(KT_AHCI_CAPTURE_QUARANTINE, t_ahci_capture_quarantine);
 /// S6c：`kbd::step` 的纯解码判据。六条各对一个负样本靶子，**不碰端口也不碰中断**，
 /// 所以它不需要 QMP 注入配合就能独立变红。
 /// set-1 事实：'h'=0x23（break 0xA3）、'g'=0x22、'i'=0x17、回车=0x1C、右 Ctrl=E0 14

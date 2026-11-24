@@ -470,6 +470,36 @@ pub fn image_phys_end() -> Option<u64> {
     Some(st.img_phys_lo + (end_va - st.img_va_lo))
 }
 
+#[cfg(feature = "kdump")]
+pub fn image_phys_base() -> Option<u64> {
+    let st = s();
+    (st.img_phys_lo != 0 && st.img_va_lo != 0).then_some(st.img_phys_lo)
+}
+
+#[cfg(feature = "kdump")]
+pub fn map_capture(va: u64, phys: u64, pages: usize) -> Result<(), MmError> {
+    if !is_ready() || pages == 0 {
+        return Err(MmError::NotInit);
+    }
+    let bytes = (pages as u64).checked_mul(PAGE as u64).ok_or(MmError::InvalidAddress)?;
+    let end_va = va.checked_add(bytes).ok_or(MmError::InvalidAddress)?;
+    let end_pa = phys.checked_add(bytes).ok_or(MmError::InvalidAddress)?;
+    if VirtAddr::new(end_va - 1).is_none() || end_pa > s().max_phys {
+        return Err(MmError::InvalidAddress);
+    }
+    let _g = vmm();
+    for k in 0..pages {
+        let flags = if k * PAGE < aurora_capture::CAPTURE_TEXT_BYTES {
+            PageFlags::RX
+        } else {
+            PageFlags::RW
+        };
+        set_leaf(va + k as u64 * PAGE as u64, phys + k as u64 * PAGE as u64 | flags.bits(), false, false)?;
+    }
+    MAPPED_PAGES.fetch_add(pages, Ordering::Relaxed);
+    Ok(())
+}
+
 pub fn hhdm() -> u64 {
     s().hhdm
 }

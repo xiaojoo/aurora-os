@@ -955,6 +955,26 @@ pub fn send_ipi_to(dest_lapic_id: u32, vector: u32) -> Result<(), ApicError> {
     Ok(())
 }
 
+#[cfg(feature = "kdump")]
+pub fn send_nmi_to(dest_lapic_id: u32) -> Result<(), ApicError> {
+    let lapic = LAPIC_VA.load(Ordering::Relaxed);
+    if lapic == 0 {
+        return Err(ApicError::NoLapic);
+    }
+    mmio_write32(lapic, LAPIC_ICR_HI, dest_lapic_id << 24);
+    // NMI 投递模式 100，Assert，Physical；NMI 没有向量号，也不走普通 IPI 的 EOI 路径。
+    mmio_write32(lapic, LAPIC_ICR_LO, (4 << 8) | (1 << 14));
+    let mut spins = 0u32;
+    while mmio_read32(lapic, LAPIC_ICR_LO) & ICR_DELIVERY_PENDING != 0 {
+        core::hint::spin_loop();
+        spins += 1;
+        if spins >= ICR_POLL_LIMIT {
+            return Err(ApicError::MapFailed);
+        }
+    }
+    Ok(())
+}
+
 /// 快路径桩用的 EOI（不经过 `on_interrupt`，所以那里没有本 CPU 的 EOI 计数）。
 pub fn eoi_self() {
     let lapic = LAPIC_VA.load(Ordering::Relaxed);

@@ -3,8 +3,15 @@
 version = 4
 
 [[package]]
+name = "aurora-capture"
+version = "0.0.0"
+
+[[package]]
 name = "aurora-kernel"
 version = "0.0.0"
+dependencies = [
+ "aurora-capture",
+]
 
 [[package]]
 name = "aurora-user-execprobe"

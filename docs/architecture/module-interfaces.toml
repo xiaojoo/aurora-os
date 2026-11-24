@@ -75,6 +75,7 @@ public_api = [
   "apic::reset_tick_stats",
   "apic::self_id",
   "apic::send_ipi_to",
+  "apic::send_nmi_to",
   "apic::state",
   "apic::tick_delta_max_cycles",
   "apic::tick_delta_sum",
@@ -241,6 +242,9 @@ public_api = [
   "mm::MOD_AS_PT",
   "mm::split_huge",
   "mm::map_hole",
+  "mm::map_capture",
+  "mm::image_phys_base",
+  "mm::region",
   "mm::unmap",
   "mm::phys_of",
   "mm::phys_of_in",
@@ -684,7 +688,8 @@ source_modules = ["driver", "driver/ahci", "driver/virtio", "driver/nvme", "driv
 public_api = [
   "driver::DriverCtx", "driver::DmaHandle", "driver::DriverError", "driver::IrqHandle",
   "driver::MmioHandle", "ahci::REG_CAP", "ahci::REG_GHC", "ahci::SECTOR", "ahci::boot_port",
-  "ahci::fnv1a64", "ahci::init", "ahci::read_bytes", "ahci::write_bytes", "ahci::AhciError",
+  "ahci::fnv1a64", "ahci::init", "ahci::prepare_capture", "ahci::CaptureIo",
+  "ahci::is_capture_port", "ahci::read_bytes", "ahci::write_bytes", "ahci::AhciError",
   "virtio::VirtioError", "virtio::read_block", "virtio::write_block", "virtio::read_block_at",
   "virtio::write_block_at", "virtio::bind_net", "virtio::send_raw", "virtio::receive",
   "virtio::net_info", "ahci::State", "ahci::info", "ahci::state", "nvme::NvmeError",
@@ -707,10 +712,10 @@ forbidden_dependencies = ["storage"]
 known_violations = []
 context = ["KERNEL"]
 error_classes = ["A", "B", "C"]
-resource_ownership = "驱动模块身份、MMIO/DMA 能力句柄表、槽位与 generation、授权与撤销状态、驱动资源统计。"
+resource_ownership = "驱动模块身份、MMIO/DMA 能力句柄表、槽位与 generation、授权与撤销状态、驱动资源统计；kdump 专用 AHCI 口与常驻 DMA 环由 capture 编排独占。"
 error_policy = "Denied/WrongContext/ResourceExhausted/MappingError；越权/世代不匹配 → 拒绝并记事件。"
 unsafe_scope = ["driver/mod:U3,U4", "driver/ahci:U4", "driver/virtio:U4"]
-test_targets = ["t_driver_ctx"]
+test_targets = ["t_driver_ctx", "t_ahci_lock_rank_guard"]
 status = "部分落地"
 
 [modules."pci"]
@@ -849,6 +854,7 @@ public_api = [
   "exit::Code",
   "exit::boot_invalid",
   "exit::finish",
+  "exit::install_capture_enter",
   "serial::bytes_out",
   "serial::session_limit",
   "serial::set_session_limit",
@@ -898,7 +904,7 @@ context = ["BOOT", "KERNEL", "IRQ_OFF", "ISR_TOP", "PANIC"]
 error_classes = ["B", "D"]
 resource_ownership = "日志环、崩溃摘要、持久状态记录、启动健康状态、看门狗状态、最终停机出口。"
 error_policy = "故障路径不分配、不等可能损坏的锁；持久状态写失败不得再触发不可恢复故障。"
-unsafe_scope = ["diag/serial:U1", "diag/crash:U6"]
+unsafe_scope = ["diag/serial:U1", "diag/crash:U6", "diag/exit:U1,U2"]
 test_targets = ["t_state_store", "t_crash", "t_crash_oops", "t_watchdog", "t_serial_atomic", "t_serial_rx"]
 status = "部分落地"
 
@@ -1152,8 +1158,11 @@ status = "已落地"
 module_id = "integration"
 owner = "integration"
 layer = "integration"
-source_modules = ["main"]
+source_modules = ["main", "capture"]
 public_api = [
+  "capture::enter_capture",
+  "capture::init",
+  "capture::init_io",
   "main::calibrate_clock_once",
   "main::exit_fatal_from_exception",
   "main::kmain",
@@ -1165,9 +1174,9 @@ forbidden_dependencies = []
 known_violations = []
 context = ["BOOT", "KERNEL"]
 error_classes = ["A", "D"]
-resource_ownership = "内核入口、启动编排、阶段日志、最终判定与退出码。"
-error_policy = "必需项失败 → BootInvalid(37)；异常 → L4(39)；用例失败 → FAIL(35)。"
-unsafe_scope = ["main:U4"]
+resource_ownership = "内核入口、启动编排、阶段日志、最终判定与退出码；capture 预留区、停机交接与第二内核入口编排。"
+error_policy = "必需项失败 → BootInvalid(37)；异常 → L4(39)；用例失败 → FAIL(35)；kdump capture 资源未就绪 → BootInvalid(37)。"
+unsafe_scope = ["main:U2,U4", "capture:U1,U2,U4"]
 test_targets = []
 status = "部分落地"
 

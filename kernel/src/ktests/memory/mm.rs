@@ -513,8 +513,6 @@ fn t_map_hole() -> bool {
         crate::log_fatal!("map_hole: 前提失效，pa 已被 HHDM 覆盖");
         return false;
     }
-    let res0 = mm::reservation_count();
-    let f0 = mm::free_frames();
     let mh = match mm::map_hole(pa, 2) {
         Ok(m) => m,
         Err(e) => {
@@ -527,17 +525,14 @@ fn t_map_hole() -> bool {
     let single = !mm::is_mapped(mm::hhdm() + pa)
         && eff.map_or(false, |f| !f.user && f.writable && !f.executable && f.levels == 4);
     let leaf = mm::leaf_value(va.0).unwrap_or(0);
-    let res1 = mm::reservation_count();
+    let reserved = mm::is_reserved(va.0);
     drop(mh);
-    // 往返格拆成四个子条件：合成一个 bool 时，红了不知道是哪一项。
-    // 2026-11-21 §479 排查 t_map_hole 偶发（8668 绿 / 2 红）时加的；保留它是因为
-    // 它把「哪一项不成立」变成可读的，而代价是四次读数——都是原子量，不取锁。
-    // **打印实际计数**（ADR-179 排查）：只打 true/false 时，
-    // 「保留没涨」与「别的上下文也涨了」看起来一样。
-    let rt_a = res1 == res0 + 1;
-
-    let rt_b = mm::reservation_count() == res0;
-    let rt_c = mm::free_frames() == f0;
+    // 只核对这次映射的所有权；全局 reservation/free_frames 会被 AP 工人的并发分配打噪声。
+    let reserved_after = mm::is_reserved(va.0);
+    let leaf_after = mm::leaf_value(va.0);
+    let rt_a = reserved;
+    let rt_b = !reserved_after;
+    let rt_c = leaf_after.is_none();
     let rt_d = !mm::is_mapped(va.0);
     let roundtrip = rt_a && rt_b && rt_c && rt_d;
     // 拒绝格：扫内存映射找 usable 基址与"覆盖内非 usable"基址，不写死本机布局
@@ -561,7 +556,7 @@ fn t_map_hole() -> bool {
     let rej_zero = mm::map_hole(pa, 0).err() == Some(mm::MmError::InvalidAddress);
     // 四个子条件分开打（ADR-178）：只打合成值，红了还是不知道是哪一项。
     crate::log_info!(
-        "map_hole(P4): 单属性={} 拒覆盖={} 拒usable={} 往返={} (a保留+1={} b回基线={} c帧回={} d已解映={}) leaf={:#x}",
+        "map_hole(P4): 单属性={} 拒覆盖={} 拒usable={} 往返={} (a已登记={} b已放手={} c叶已清={} d未映射={}) leaf={:#x}",
         single, rej_cov, rej_usable, roundtrip, rt_a, rt_b, rt_c, rt_d, leaf);
     single && rej_cov && rej_usable && roundtrip && rej_zero && leaf != 0
 }
@@ -2592,7 +2587,7 @@ fn t_object_wait() -> bool {
     //
     // **ADR-243 更正**：Free 只有在**袋也空了**时才是"资源已交回"的证据。`terminate_task`
     // 在拿队列锁时就标 Free，而 `release_owned` 在放锁之后 ⇒ 存在"Free 但袋里还有映射"的窗口。
-    // 那时短路会让 `drain_reap` 不跑，而没有 tick 就没有抢占点，`REAP_PENDING` 永不消费，
+    // 那时短路会让 `drain_reap` 不跑，而没有 tick 就没有抢占点，回收脏位永不被消费，
     // 袋里的映射就漏了（同一形状在 `t_q2_workload_slots` 上 14/14 复现）。
     let drained = sched::reap_released() > rel0 || drain_reap()
         || (sched::state_of(g) == sched::TaskState::Free && sched::owned_of(g) == 0);

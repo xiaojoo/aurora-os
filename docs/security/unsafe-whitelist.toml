@@ -19,6 +19,12 @@ scope = "arch/x86_64/trap.rs(asm+描述符+CR2) · serial.rs(端口) · limine.r
 scope_actual = "asm 全局符号与异常桩(trap/sched/cpu) · 描述符表与 CR4/CR3(trap/cpu/mm) · 端口与 MMIO(serial/apic) · 页表遍历(mm) · per-CPU 静态区的裸指针读写(sched/sync/resource/smp/user/cpu) · 内联 asm 的取指/STAC-CLAC(user) · ktest 里的现场读回(main 与 ktests/*) · arch↔sched 回调表(hooks) · 句柄表里那一段连续物理内存的 volatile 字节/双字访问与 `UnsafeCell` 表(driver) · 驱动静态区取句柄(ahci，只剩 5 处，全部是拿句柄不是拿指针) · **ADR-179 新增 4 处 U2**：`capability/handle` 的句柄槽数组从 .bss 改为运行时分配（`SlotArray::allocate` 的 `phys_alloc_above` + 清零循环 + `as_slice`/`as_mut_slice` 的 `from_raw_parts{,_mut}`），指针来源是 MOD_BOOT 的连续帧、长度 MAX_HANDLES、生命周期整个内核、访问都在 RANK_HANDLE(35) 锁内 · 崩溃现场的有界栈走(crash：两处 read_volatile，每处都先过「8 字节对齐 + 内核半区 + 已映射」三关，读回来的值只进记录、不解引用、不参与控制流)"
 expires = "M2：按 §2.5 拆出 aurora-arch / aurora-hw / aurora-mm-core 后，本条改为逐 crate 登记"
 
+# ADR-247：独立 capture 内核。所有指针都来自固定 ABI、HHDM 或自家 static；只允许 leader 在 AP 停车后访问。
+[crate.aurora-capture]
+reason = "kdump 第二内核需要独立页表、固定镜像/HHDM 转换、UC MMIO/DMA、端口 I/O 与无分配 vmcore 缓冲"
+scope_actual = "paging：capture .bss 内 4 KiB 对齐 TABLES，VA/PA 差由 8 MiB CaptureBootInfo 固定，切 CR3 前单 leader 写、切后只读；ahci：首 4 GiB HHDM 别名与 256 KiB DMA 保留区，范围/对齐先验，AP 已停车，UC volatile；serial：16550/isa-debug-exit 端口 I/O；main/lib：主内核传入的 CaptureBootInfo 只读复制、固定 capture VA 载荷与自家 VMCORE static"
+expires = "M7 真机矩阵后按机型复核；若 capture 改为多核并行或引入分配/锁，本条必须重新裁决"
+
 # M4-2：第一个用户程序（测试夹具）。它的 unsafe 只有两类，都写在源码注释里。
 [crate.aurora-user-probe]
 reason = "第二个用户产物（W3 P5a）：unsafe 需求是 int 0x80 的四参入口、两处 RIP 相对 lea 取自己段的基址、两个自跳转，以及往自己 .slots 写结果与从 14 号返回的用户 VA 读回 8 字节；不碰任何内核对象"
@@ -120,11 +126,11 @@ U2 = 10
 # `mm` 的 U2 不变：`phys_of_in` 是**从 `phys_of` 提出来的**，遍历体原样搬走，
 # 两个函数各一处 `unsafe {`，总数仍 55。`aspace_root` 自身没有 unsafe 块。
 # 对账：530+1=531、U2 119+1=120。
-total = 654
-U1 = 85
-U2 = 162
+total = 705
+U1 = 104
+U2 = 183
 U3 = 13
-U4 = 223
+U4 = 234
 U5 = 128
 U6 = 43
 
@@ -144,7 +150,7 @@ U1 = 5
 U4 = 12
 
 [modules."arch/x86_64/trap"]
-U1 = 13
+U1 = 17
 U4 = 9
 
 [modules."boot/limine"]
@@ -177,7 +183,7 @@ U4 = 9
 
 [modules."driver/mod"]
 U3 = 9
-U4 = 16
+U4 = 17
 
 [modules."driver/virtio"]
 U4 = 8
@@ -229,7 +235,29 @@ U4 = 2
 U6 = 1
 
 [modules."main"]
+U2 = 1
 U4 = 5
+
+# ADR-247：每 CPU 独占 capture 栈与快照；旧栈现场只在跳转前复制，NMI 只写自身槽。
+[modules."capture"]
+U1 = 9
+U2 = 11
+U4 = 10
+
+[modules."capture/ahci"]
+U2 = 5
+
+[modules."capture/paging"]
+U1 = 2
+U2 = 2
+
+[modules."capture/serial"]
+U1 = 3
+
+# ADR-247：软件 L4 经启动期安装的 extern "C" 函数指针进入 capture； transmute 只在 boot 安装后使用。
+[modules."diag/exit"]
+U1 = 1
+U2 = 2
 
 [modules."memory/heap"]
 U2 = 7

@@ -6,8 +6,12 @@
 //! 内核会往不存在的端口写，测试既不失败也不通过，只能等到超时。
 
 use crate::serial;
+#[cfg(feature = "kdump")]
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 const DEBUGEXIT_PORT: u16 = 0xf4;
+#[cfg(feature = "kdump")]
+static CAPTURE_ENTER: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -29,16 +33,32 @@ impl Code {
     }
 }
 
+#[cfg(feature = "kdump")]
+pub fn install_capture_enter(entry: usize) {
+    CAPTURE_ENTER.store(entry, Ordering::Release);
+}
+
 /// 写判定码并停住。若 QEMU 没带 debugexit 设备，这里会挂住，由外层超时判“挂死”，
 /// 而不是误判成“通过”。
 pub fn finish(code: Code) -> ! {
     if code == Code::ExceptionFatal {
-        // 行锁在这里放开并转入"不再排队"：崩溃那几行是这段话里最不能丢的，而此刻也没有
-        // 别人该来抢这通道（别的 CPU 要么已经停机，要么正一起停机）。
         serial::unlock_for_halt();
-        // §9.7：L4 是终点，所以崩溃摘要必须在停机之前尽力落盘。收口放在这里而不是每个
-        // 调用点，是因为调用点会长（`mm::free_violation`、`heap` 的两处……）——漏掉一处的
-        // 表现是"盘上安静地没有记录"，那种故障不会有别的尺子报出来。
+        #[cfg(feature = "kdump")]
+        {
+            let entry = CAPTURE_ENTER.load(Ordering::Acquire);
+            if entry == 0 {
+                serial::line("fatal", format_args!("kdump: capture 入口未安装"));
+                loop {
+                    core::hint::spin_loop();
+                }
+            }
+            // SAFETY: 入口由 stage_memory 在 capture 初始化成功后安装；两个指针参数的 C ABI 表示相同。
+            let enter: unsafe extern "C" fn(*const (), *const ()) -> ! =
+                unsafe { core::mem::transmute(entry) };
+            // SAFETY: 软件 L4 出口处于 ring0，capture 栈与快照已由启动期初始化。
+            unsafe { enter(core::ptr::null(), core::ptr::null()) };
+        }
+        #[cfg(not(feature = "kdump"))]
         crate::crash::ensure_dumped();
     }
     // 停机的最后一格也记一笔（同样在串口写之前）：看到这一格却没有 `qemu-exit=` 行，

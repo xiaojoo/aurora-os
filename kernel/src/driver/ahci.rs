@@ -61,7 +61,9 @@ const CAP_S64A: u32 = 1 << 31;
 pub const PORTS_BASE: usize = 0x100;
 pub const PORT_STRIDE: usize = 0x80;
 const P_CLB: usize = 0x00; // 命令列表基址（低 32 位，要求 1024 字节对齐）
+const P_CLBU: usize = 0x04;
 const P_FB: usize = 0x08; // 接收 FIS 区基址（要求 256 字节对齐）
+const P_FBU: usize = 0x0c;
 const P_IS: usize = 0x10; // 中断状态（W1C）。M5-g② 起 `PxIE`(0x14) 会被 `start_port` 置起，
 // 命令完成由中断告知；两张基址表的高半 (`PxCLBU` 0x04 / `PxFBU` 0x0C) 仍不写：物理内存只有
 // 512 MiB，而 `init` 判过 `pa < 4 GiB`，复位后那两格本来就是 0
@@ -200,6 +202,153 @@ pub enum AhciError {
     NoApic,
     /// §8.2：这个端口超过重试预算被隔离，命令**没有下发**就返回
     Quarantined,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CaptureIo {
+    pub abar: u64,
+    pub port: u8,
+    pub dma_phys: u64,
+    pub dma_bytes: u32,
+}
+
+/// 为 kdump 预留一个独立端口。普通传输继续使用 `RING`，capture 环只由第二内核在停机后使用。
+#[cfg(feature = "kdump")]
+fn preflight_capture(ctx: DriverCtx, mmio: MmioHandle, port: u8, dma: DmaHandle, dma_phys: u64) -> Result<(), AhciError> {
+    use aurora_capture::{
+        CAPTURE_AHCI_CLIST_OFFSET, CAPTURE_AHCI_CTBL_OFFSET, CAPTURE_AHCI_DATA_OFFSET,
+        CAPTURE_AHCI_RXFIS_OFFSET,
+    };
+    let dma_err = |e: crate::driver::DriverError| AhciError::Ctx(e);
+    let preflight_bytes = 255 * 512usize;
+    let mut fis = [0u8; 20];
+    fis[0] = FIS_TYPE_H2D;
+    fis[1] = 0x80;
+    fis[2] = ATA_WRITE_DMA_EXT;
+    fis[4] = 1;
+    fis[7] = 0xe0;
+    fis[12] = 255;
+    ctx.dma_copy_in(dma, CAPTURE_AHCI_CTBL_OFFSET, &fis).map_err(dma_err)?;
+    let data_pa = dma_phys + CAPTURE_AHCI_DATA_OFFSET as u64;
+    let mut prdt = [0u8; 16];
+    prdt[0..4].copy_from_slice(&(data_pa as u32).to_le_bytes());
+    prdt[8..12].copy_from_slice(&(data_pa >> 32).to_le_bytes()[..4]);
+    prdt[12..16].copy_from_slice(&((preflight_bytes - 1) as u32).to_le_bytes());
+    ctx.dma_copy_in(dma, CAPTURE_AHCI_CTBL_OFFSET + 0x80, &prdt).map_err(dma_err)?;
+    let ctba = dma_phys + CAPTURE_AHCI_CTBL_OFFSET as u64;
+    ctx.dma_write32(dma, CAPTURE_AHCI_CLIST_OFFSET, (1 << 16) | CFL_H2D | HDW_W).map_err(dma_err)?;
+    ctx.dma_write32(dma, CAPTURE_AHCI_CLIST_OFFSET + 4, 0).map_err(dma_err)?;
+    ctx.dma_write32(dma, CAPTURE_AHCI_CLIST_OFFSET + 8, ctba as u32).map_err(dma_err)?;
+    ctx.dma_write32(dma, CAPTURE_AHCI_CLIST_OFFSET + 12, (ctba >> 32) as u32).map_err(dma_err)?;
+    let rx = CAPTURE_AHCI_RXFIS_OFFSET + usize::from(port) * 0x100 + 0x40;
+    ctx.dma_fill(dma, rx, 0, 16).map_err(dma_err)?;
+    if !wait_ms(
+        || {
+            let tfd = r32(port_off(port, P_TFD)).unwrap_or(0xffff);
+            (tfd as u8) & (ATA_STATUS_ERR | ATA_STATUS_BUSY | ATA_STATUS_DRQ) == 0
+                && (tfd >> 8) as u8 == 0
+        },
+        1000,
+    ) {
+        let tfd = r32(port_off(port, P_TFD))?;
+        return Err(AhciError::BadCompletion {
+            status: tfd as u8,
+            error: (tfd >> 8) as u8,
+            dw1: 0,
+            want: preflight_bytes as u32,
+        });
+    }
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    ctx.write32(mmio, port_off(port, P_CI), 1).map_err(AhciError::Ctx)?;
+    if !wait_ms(|| r32(port_off(port, P_CI)).map_or(true, |v| v == 0), 1000) {
+        return Err(AhciError::CmdTimeout);
+    }
+    let tfd = r32(port_off(port, P_TFD))?;
+    let status = tfd as u8;
+    let error = (tfd >> 8) as u8;
+    if status & (ATA_STATUS_ERR | ATA_STATUS_BUSY | ATA_STATUS_DRQ) != 0 || error != 0 {
+        return Err(AhciError::BadCompletion { status, error, dw1: 0, want: preflight_bytes as u32 });
+    }
+    let prdbc = ctx.dma_read32(dma, CAPTURE_AHCI_CLIST_OFFSET + 4).map_err(dma_err)?;
+    let d2h = ctx.dma_read8(dma, rx).map_err(dma_err)?;
+    if prdbc != preflight_bytes as u32 || d2h != FIS_TYPE_D2H {
+        return Err(AhciError::BadCompletion { status, error, dw1: prdbc, want: preflight_bytes as u32 });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "kdump")]
+pub fn prepare_capture(port: u8, dma_phys: u64, dma_bytes: usize) -> Result<CaptureIo, AhciError> {
+    use aurora_capture::{CAPTURE_AHCI_CLIST_OFFSET, CAPTURE_AHCI_RXFIS_OFFSET};
+    let info = info().ok_or(AhciError::NotClaimed)?;
+    if port >= 32 || info.pi & (1u32 << port) == 0 {
+        return Err(AhciError::NoController);
+    }
+    if dma_phys == 0
+        || dma_phys & 0x3ffff != 0
+        || dma_phys >= 4 * 1024 * 1024 * 1024
+        || dma_bytes < 256 * 1024
+        || dma_bytes > u32::MAX as usize
+    {
+        return Err(AhciError::TooBig(0));
+    }
+    let (ctx, mmio) = mmio_ref()?;
+    let capture_dma = ctx.adopt_capture_dma(dma_phys, dma_bytes).map_err(AhciError::Ctx)?;
+    start_port(port)?;
+    read_lba(port, 0, 1)?;
+    if r32(port_off(port, P_SIG))? != SIG_SATA_DISK
+        || r32(port_off(port, P_SSTS))? & SSTS_DET != SSTS_DET_PRESENT
+    {
+        return Err(AhciError::NoController);
+    }
+    if r32(port_off(port, P_CI))? != 0 || r32(port_off(port, P_SACT))? != 0 {
+        return Err(AhciError::IssueStuck(0));
+    }
+    let cmd_off = port_off(port, P_CMD);
+    let cmd = r32(cmd_off)?;
+    w32(cmd_off, cmd & !(CMD_ST | CMD_FRE))?;
+    if !wait_ms(|| r32(cmd_off).map_or(true, |v| v & (P_CMD_CR | P_CMD_FR) == 0), 500) {
+        return Err(AhciError::StopTimeout(r32(cmd_off)?));
+    }
+    let clb = dma_phys + CAPTURE_AHCI_CLIST_OFFSET as u64;
+    let fb = dma_phys + CAPTURE_AHCI_RXFIS_OFFSET as u64 + u64::from(port) * 0x100;
+    w32(port_off(port, P_CLBU), 0)?;
+    w32(port_off(port, P_FBU), 0)?;
+    w32(port_off(port, P_CLB), clb as u32)?;
+    w32(port_off(port, P_FB), fb as u32)?;
+    let mut next = r32(cmd_off)? | CMD_FRE;
+    w32(cmd_off, next)?;
+    if !wait_ms(|| r32(cmd_off).map_or(false, |v| v & P_CMD_FR != 0), 1000) {
+        return Err(AhciError::FrTimeout(r32(cmd_off)?));
+    }
+    w32(port_off(port, P_IE), 0)?;
+    w32(port_off(port, P_SERR), 0xffff_ffff)?;
+    let pending = r32(port_off(port, P_IS))?;
+    w32(port_off(port, P_IS), pending)?;
+    w32(REG_IS, 1u32 << port)?;
+    next |= CMD_ST;
+    w32(cmd_off, next)?;
+    if !wait_ms(|| r32(cmd_off).map_or(false, |v| v & P_CMD_CR != 0), 1000) {
+        return Err(AhciError::CrTimeout(r32(cmd_off)?));
+    }
+    if r32(port_off(port, P_CLB))? != clb as u32
+        || r32(port_off(port, P_CLBU))? != 0
+        || r32(port_off(port, P_FB))? != fb as u32
+        || r32(port_off(port, P_FBU))? != 0
+        || r32(cmd_off)? & (CMD_FRE | CMD_ST) != (CMD_FRE | CMD_ST)
+        || r32(port_off(port, P_CI))? != 0
+        || r32(port_off(port, P_SACT))? != 0
+    {
+        return Err(AhciError::Ctx(crate::driver::DriverError::Internal));
+    }
+    preflight_capture(ctx, mmio, port, capture_dma, dma_phys)?;
+    CAPTURE_PORT.store(u32::from(port) + 1, Ordering::Release);
+    Ok(CaptureIo { abar: info.abar, port, dma_phys, dma_bytes: dma_bytes as u32 })
+}
+
+#[cfg(feature = "kdump")]
+pub fn is_capture_port(num: u8) -> bool {
+    CAPTURE_PORT.load(Ordering::Acquire) == u32::from(num) + 1
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -381,6 +530,8 @@ static CLEAN_ERRORS: AtomicU32 = AtomicU32::new(0);
 static DEAD_PORT: AtomicU32 = AtomicU32::new(0);
 /// 0 = 没查过；否则存的是"引导盘所在端口 + 1"（见 `boot_port`）
 static BOOT_PORT: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "kdump")]
+static CAPTURE_PORT: AtomicU32 = AtomicU32::new(0);
 /// 0 = 不覆盖
 static OP_OVERRIDE: AtomicU32 = AtomicU32::new(0);
 
@@ -1211,6 +1362,10 @@ pub fn read_port(num: u8) -> Result<Port, AhciError> {
 /// `FR` 跟 `FRE`、`CR` 跟 `ST` 是这一段最硬的位置证据：`P_CMD` 或任一位错，
 /// 这里必然在有界窗口内等不到，不可能假绿。
 fn start_port(num: u8) -> Result<Port, AhciError> {
+    #[cfg(feature = "kdump")]
+    if CAPTURE_PORT.load(Ordering::Acquire) == u32::from(num) + 1 {
+        return read_port(num);
+    }
     if DEAD_PORT.load(Ordering::Relaxed) == u32::from(num) + 1 {
         // 模拟"重置也修不好"：设备不回话
         return Err(AhciError::CrTimeout(0xFFFF_FFFF));
@@ -1358,6 +1513,20 @@ pub fn fnv1a64(buf: &[u8]) -> u64 {
 /// （`PxCI` 永远不落），所以这一格不是"写什么都行"。
 /// 本机这条盘只有 131072 个扇区、一次只读 1 个 ⇒ 字节 8/9/10/13 恒为 0，
 /// **没有任何判据走到它们**（要读 >255 扇区或高偏移之前先按 ADR-029 那条实验钉住）。
+#[inline]
+fn with_transfer_lock<R>(num: u8, body: impl FnOnce() -> R) -> Result<R, AhciError> {
+    #[cfg(feature = "kdump")]
+    if CAPTURE_PORT.load(Ordering::Acquire) == u32::from(num) + 1 {
+        return Err(AhciError::Quarantined);
+    }
+    #[cfg(not(feature = "fault-ahci-no-rank-guard"))]
+    let guard = XFER.lock_checked();
+    #[cfg(feature = "fault-ahci-no-rank-guard")]
+    let guard = Some(XFER.lock());
+    let _guard = guard.ok_or(AhciError::Denied("外层锁 rank 高于 XFER，拒绝块 I/O"))?;
+    Ok(body())
+}
+
 pub fn read_lba(num: u8, lba: u64, count: u16) -> Result<Xfer, AhciError> {
     transfer(num, lba, count, false)
 }
@@ -1372,11 +1541,13 @@ pub fn write_lba(num: u8, lba: u64, count: u16) -> Result<Xfer, AhciError> {
         Some(b) if b <= DATA_BYTES => b as u32,
         _ => return Err(AhciError::TooBig(count)),
     };
-    // 先把图案填进数据缓冲：这里**不填哨兵**（填了就把要写的内容覆盖了）
-    for i in 0..bytes as u64 {
-        wb(OFF_DATA + i, pattern_byte(lba, i))?;
-    }
-    transfer(num, lba, count, true)
+    with_transfer_lock(num, || {
+        // 先把图案填进数据缓冲：这里**不填哨兵**（填了就把要写的内容覆盖了）
+        for i in 0..bytes as u64 {
+            wb(OFF_DATA + i, pattern_byte(lba, i))?;
+        }
+        transfer_locked(num, lba, count, true)
+    })?
 }
 
 /// 与 LBA 绑定的图案字节。刻意选成**一行就能在 Python 里逐字重写**的形状：
@@ -1398,10 +1569,12 @@ pub fn write_bytes(num: u8, lba: u64, src: &[u8]) -> Result<Xfer, AhciError> {
     if count > MAX_SECTORS {
         return Err(AhciError::TooBig(count));
     }
-    for (i, b) in src.iter().enumerate() {
-        wb(OFF_DATA + i as u64, *b)?;
-    }
-    transfer(num, lba, count, true)
+    with_transfer_lock(num, || {
+        for (i, b) in src.iter().enumerate() {
+            wb(OFF_DATA + i as u64, *b)?;
+        }
+        transfer_locked(num, lba, count, true)
+    })?
 }
 
 /// 从盘上读一段任意字节进调用方的缓冲（内容判据用 `Xfer.hash`，逐字节比对用 `dst`）。
@@ -1424,12 +1597,10 @@ pub fn read_bytes(num: u8, lba: u64, dst: &mut [u8]) -> Result<Xfer, AhciError> 
 /// 收成一个函数而不是复制一份，是因为"写"最容易出的错就是复制时把完成判据改掉一格
 /// （§12.4.1 规则 3 与 BACKLOG ⑧ 同一课：两条路径上有一条永远不红的判据）。
 fn transfer(num: u8, lba: u64, count: u16, write: bool) -> Result<Xfer, AhciError> {
-    // **整个传输（填缓冲→发命令→等完成→读缓冲）必须互斥**（ADR-190）：
-    // `OFF_DATA` 是全局单块缓冲，两个调用方交错就会互相覆盖。
-    //
-    // 锁的粒度是「一次传输」而不是「一整个 walk」：`walk` 逐簇读，
-    // 每次 `read_checked` 各自拿锁。这样长读不会把别的调用方饿死。
-    let _g = XFER.lock();
+    with_transfer_lock(num, || transfer_locked(num, lba, count, write))?
+}
+
+fn transfer_locked(num: u8, lba: u64, count: u16, write: bool) -> Result<Xfer, AhciError> {
     let mut r = transfer_inner(num, lba, count, write);
     // 发射被吞（写 `PxCI`=1 读回 0）时，这条命令**设备根本没收到**——不是"可能已经落盘的写
     // 失败了"，所以恢复之后重发一次是安全的。实测本机偶发就打在"刚起完口的第一条命令"上

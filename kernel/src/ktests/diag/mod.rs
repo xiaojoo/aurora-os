@@ -4,6 +4,8 @@
 //! 改它等于改判定表覆盖的用例集。
 
 mod crash;
+#[cfg(feature = "kdump-ap-probe")]
+mod capture;
 #[cfg(feature = "handles")]
 mod logread;
 #[cfg(feature = "handles")]

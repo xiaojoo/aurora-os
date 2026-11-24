@@ -25290,3 +25290,272 @@ ADR-242 修完三处编译破损后，整链**第一次真正跑完**（`build/m
 
 **本轮真实状态**：q2 偶发 **1/16**（与上轮 4% 同水平，**没改善**）、整链 PASS 12/16、
 锁序违规 0/16、check 21/21。**这一轮没把 4% 降下来**——收获是归因钉死 + 两个方向被证伪。
+
+## 567. ADR-245：回收脏位 + 持袋宿主栈保护（2026-11-24）
+
+### 改了什么
+
+| 文件 | 改动 |
+|---|---|
+| `kernel/src/sched/mod.rs` | `REAP_PENDING: AtomicUsize` → `ReapSignal: AtomicBool`；扫描前 `swap(false)`，迟到登记留到下一抢占点；当前槽被跳过时重新置脏 |
+| 同上 | `reap` 只在 `Runnable/Running` 宿主上落袋；`Done/Free` 宿主重新置脏并返回 |
+| 同上 | 复用 `Task.on_cpu` 字节打包 CPU/终止待办/释放深度，保持布局不变；保护持袋宿主并延迟兑现 kill |
+| `ktests/common.rs` | `drain_reap_for` 在停表变体里临时启动定时器，结束后按原 RTE 状态恢复，消除对前序用例的时钟依赖 |
+| `kernel/src/ktests/sched/sched.rs` | 新增 `t_reap_late_registration`、`t_reap_host_guard`、`t_release_host_lifetime` 三条确定性回归；一次性 `REAP_YIELD_PROBE` 只在用例置位时主动换人 |
+| `ktests/common.rs`、`ktests/memory/mm.rs`、`ktests/sched/sched.rs` | 三处旧 `REAP_PENDING` 注释同步为“回收脏位”；注释替换前后双档 ELF 摘要不变 |
+
+没有改 q2 的页框、VA、模块栈帧或收尾判据；没有新增锁、没有改锁序、没有新增 syscall。
+
+### 两条缺陷与证据边界
+
+1. **迟到登记丢失是确定缺陷**：旧 `store(waiting)` 会冲掉扫描期间的新登记。
+   新用例在旧写法下稳定 `first=Some(7) late=None`（`run-11157`）。
+2. **局部 bag 的宿主栈泄漏是真根因**：`release_owned_checked` 锁外 `drop(bag)`，
+   `Mapping::drop` 取 VMM 时可开窗；宿主被换走后再回收，会解除承载 bag 的栈。
+   确定性用例在 HEAD 上稳定得到 `host_terminated=true resumed=false free-4 va+1 stack+4`
+   （`run-11773`），与 q2 历史签名逐项一致。真实 q2 红跑 `run-11528` 的 in-flight
+   探针也抓到 `inflight 0→1`、完成项只 `+6`、调用仍 `+7`。
+
+### 同变体 handles A/B
+
+| 组别 | 尝试 | 有效 q2 | q2 红 |
+|---|---:|---:|---:|
+| HEAD `bb4ad95` | 32 | 26 | **3**（`run-11296/11298/11300`，均 `12→16`） |
+| 仅脏位 + Done/Free 闸 | 32 | 30 | **0**（均 `12→12`，尚未保护 Runnable 持袋宿主） |
+| 最终宿主栈保护 | 32 | 32 | **0**（q2 均 `12→12`，确定性宿主回归 32/32 通过） |
+
+HEAD 另有 2 轮已知 `t_syscall_abi_arms` 后 HANG、4 轮 QEMU 宿主 `0xC0000005` 退出；
+修复组 2 轮同一 HANG、3 轮其他用例 FAIL 但 q2 绿。**不是随机化实验，不声称统计归零。**
+只关落袋闸、保留脏位的对照被 18/32 轮宿主异常打断，14 个有效 q2 未复现，**不结论**。
+
+### 更正旧读数
+
+`run-11296/11298` 是 `帧 -4 / VA 0`，`run-11300` 才是 `帧 -4 / VA +1`。
+所以“每次都是 4 帧 + 1 条保留”不成立；准确读数是**模块栈帧稳定 +4，VA 不总是同步变化**。
+
+### 负样本与最终门禁
+
+- 迟到登记：把 `swap(false)` 换成扫完 `store(false)` ⇒ `run-11157` FAIL。
+- 落袋闸：把宿主闸改成恒 `true` ⇒ `run-11240` FAIL。
+- 持袋宿主：删除 `release_depth` 保护 ⇒ `run-11773` 确定性复现 `free-4 va+1 stack+4`；
+  加保护后同一用例 `host_terminated=false resumed=true`，全部回基线。
+- 最终默认档 `90/90`（`run-11917`）、handles `129/129`（`run-11918`）、锁序违规 0；
+  handles 32/32 个 q2 读数均回基线，确定性宿主回归 32/32 通过；`check 21/21`。
+- **完整矩阵 67/82 符合、15 不符**：q2 与宿主回归无红。15 条已全部分类：
+  - 2 条 L4 无级联判据红在修复前矩阵同样存在，单跑仍级联；
+  - 5 条 FAT32/P7 同属 `fat32-exec` 基线，HEAD 同变体同样 `QEMU-EXIT-0`；
+  - 7 条 A3 子变体逐一 HEAD 对照同样 EXCEPTION/HANG/QEMU-EXIT-0；
+  - 1 条 ESP 当前同 ELF 单跑 PASS，属可清除的环境形状。
+  **没有确认由本轮修复引入的产品回归**，但完整矩阵仍不是全绿。
+  此前后两次矩阵曾因 WSL 提交内存耗尽在造镜像时 `MemoryError`，使用者关闭 WSL 后才完成本轮。
+
+### 试过并回退
+
+每 CPU `UnsafeCell<OwnedSet> + AtomicBool busy` 静态暂存袋：能脱离任务栈，但破坏
+`terminate_task` 的“旁观者立即回收”契约，且所有者不再恢复时 busy 可能永久为真。
+已完整回退实现、unsafe 登记和分类规则，不留在最终差异里。
+
+### 未决
+
+1. VA 差 0 的红跑未解释；栈帧 +4 已由确定性用例与 in-flight 读数闭环。
+2. 持袋期间 `terminate_task` 返回 `false`，但 `on_cpu` bit3 的终止待办保证请求随后兑现；
+   调用方不能把 `false` 理解成 kill 被丢弃。
+3. `t_syscall_abi_arms` 后 HANG 仍是既有未决项，同 ELF 复跑可清除，不归因到本轮。
+4. 完整矩阵 15 条偏差已分类为既有 L4 级联、HEAD 同样失败的 FAT32/A3 基线，
+   以及 1 条单跑可清除的 ESP 环境形状；没有确认本轮产品回归。
+
+## 568. ADR-246：map_hole 往返判据改为所有权直查（2026-11-24）
+
+### 问题与实证
+
+`t_map_hole` 旧判据用全局 `reservation_count` / `free_frames` 基线差。AP 工人在窗口内
+并发分配回收时，全局量被无关任务推动。`run-12198` 红跑实际读数是：
+
+    reservation 17 -> 13 -> 12
+    free_frames 97445 -> 97453
+    a保留+1=false b回基线=false c帧回=false d已解映=true
+
+这不是 map_hole 自身泄漏，而是全局基线被并发噪声打红。
+
+### 改动
+
+只改 `ktests/memory/mm.rs` 的判据，产品代码未动：
+
+- `a`：建成后 `is_reserved(va.0)`；
+- `b`：drop 后同一 base 的保留消失；
+- `c`：drop 后 `leaf_value(va.0).is_none()`；
+- `d`：drop 后 `is_mapped(va.0)` 为假。
+
+全局页框/保留计数不再参与往返判定。新判据直接验证本次映射的所有权交还，比全局差值更强。
+
+### 负样本与读数
+
+- 删除 `MmioMapping::drop` 的 `release_va_locked` ⇒ `run-12232` 精确红在
+  `a已登记=true b已放手=false c叶已清=true d未映射=true`。
+- 还原后新判据 handles 连续 **32/32** 全绿。
+- 最终默认档 `run-12233` PASS、handles `run-12234` PASS、`check 21/21`。
+
+### 未决
+
+其他使用全局基线差的用例仍需按同一原则审查；本轮没有改 map_hole 产品实现、锁序或释放语义。
+
+## 569. ADR-247：kdump 阶段 1+2+3 落地（2026-11-24）
+
+### 交付范围
+
+- `kernel/src/capture.rs`：每 CPU 16 KiB static capture 栈、无锁快照、leader CAS、NMI/IST2
+  停车、软件 L4 函数指针入口；AP 未全停或 capture 盘未就绪时禁止跳第二内核。
+- `capture/`：独立 no_std 第二内核，固定 VA `0xffffffffc0000000`，8 MiB 预留；文本 RX、
+  数据 RW/NX、64 KiB 栈与 256 KiB UC DMA 区分；独立 CR3、串口、crash-only AHCI、ELF64 vmcore。
+- AHCI 口 1 专用 raw 捕获盘：启动前接管并做 255 扇区写预检；普通传输随后拒绝该口。
+  vmcore 从 LBA 0 写 2 MiB，不新增 `KIND_CAPTURE`，V1/V2 状态区不变。
+- `tools/aurora.py`：kdump 构建前生成 payload；`run` 后用独立解析器校验 ELF、note、
+  PRSTATUS、CPU/停车数、PT_LOAD 与写入字节数。payload 只在字节变化时重写夹具。
+- 默认档不启用 kdump，且 `aurora-capture` 是可选依赖；避免默认链接与用例布局被无关依赖拖动。
+
+### 实测读数
+
+| 场景 | 结果 |
+|---|---|
+| `run-12504` `kdump,fault-lock-reentrant` | 首条 L4 后无第二条锁序违规；1 CPU、2 MiB、宿主对账绿 |
+| `run-12413` `kdump-ap-probe` | 4 CPU、停车 3/3、38 PT_LOAD、2 MiB、对账绿；同 ELF 重复正向均绿 |
+| `run-12502` `kdump,fault-shootdown-noack` | VMM shootdown L4 后停车 3/3，无 HEAP→GROW 级联，vmcore 绿 |
+| `run-12503` `kdump,fault-crash-oops` | `vector=14`、`CR2=0xffffc00000000008`，与注入常量一致 |
+| `run-12318` 坏 payload | `capture payload checksum mismatch`，未写 vmcore |
+| `run-12319` 坏 DMA | `preinitialized DMA reservation is too small`，未写 vmcore |
+| `run-12320` 坏完成 | `PRDBC does not equal the requested byte count`，未写 vmcore |
+| `run-12321` AP 不停车 | `parked=0/3 failures=3`，未跳第二内核 |
+| 宿主离线变异 | note 校验和、PT_LOAD 范围、PRSTATUS RIP 三类篡改全部精确红 |
+
+最终默认 ELF `91f06c3fb7f4`；默认构建通过，`ktests` **90/90**，`check` **21/21**，
+capture `clippy -D warnings` 通过。完整矩阵 **68/82 符合、14 不符**：2 条既有 L4 级联、
+5 条 FAT32/P7、7 条 A3；本轮没有新增偏差类别，ESP 本轮通过。
+
+### 实施中修掉的量具/实现缺陷
+
+1. capture 栈指针按数组元素前进，首跑 `run-12238` 在切栈后 #DF；改按字节 cast。
+2. capture 首页先被映射成 NX，`run-12240` 入口 #PF；改 64 KiB 文本 RX、数据 RW/NX。
+3. BootInfo repr(C) 填充参与校验，`run-12242` 校验和随机不符；改按字段序列校验。
+4. 第二内核 HHDM 只映射 2 GiB 且 PD 索引错位，MMIO/DMA 不可达；改 4 个 PD、按 PDPT 槽定位。
+5. 静态表物理地址漏加页内偏移，region 读出全 0；改 `phys_of + (va & 0xfff)`。
+6. ELF 程序头数多算 1、`p_paddr/p_filesz/p_memsz` 偏移写错；宿主解析器逐项对账后修正。
+7. QEMU 的 CI/D2H 完成可能晚于首次轮询；改必须观察清零后的新 D2H，PRDBC 按完整 32 位比较。
+   实测 `0x0001fe00` 不能按“只比低 16 位/高 16 位”二选一；D2H 不回显请求 LBA/扇区数。
+8. capture 曾把十进制 39 写 debugexit，QEMU 返回 79；改写成内核枚举值 `0x13`，QEMU 返回 39。
+9. x86-64 `NT_PRSTATUS` 原按错误结构写 304 字节/gregset 起点 80；改标准 336 字节/起点 112
+   与标准寄存器顺序，宿主再逐格核对 RIP/RSP/CS/RFLAGS。
+10. 非可选 capture 依赖与默认 IDT 中的 `cfg!` 分支曾改变默认链接形状：中间矩阵 57/82，
+    `img_phys_lo` 被破坏成内核 VA，触发一批顺序脆弱用例。改可选依赖 + `#[cfg]` 分开默认 IDT
+    后，最终矩阵恢复到 68/82，新增偏差全部消失；**这两轮都不是最终代码，不作为最终读数**。
+11. 提交前审查发现 `write_lba/write_bytes` 绕过 `transfer` 的捕获口隔离闸。`run-12937` 去掉
+    闸后三格全 false（读/任意写/图案写均穿透），并破坏普通 AHCI 命令环；将闸上移到共用
+    `with_transfer_lock(num, ...)` 后，`run-12939` 三格全 true、kdump ktests **92/92**。
+    `t_ahci_claim` 同步只对普通口要求命令环地址相等，捕获口交由独立隔离用例与第二内核校验。
+12. `run-12940` 四核复验：停车 3/3、38 PT_LOAD、2 MiB、宿主对账绿，退出 39。
+13. 提交前最终矩阵 **67/82 符合、15 不符**：12 条既有 FAT32/P7/A3 基线，另 3 条为
+    设备事件对账、A2 正向及同轮 `t_block_wake`。`run-13030` 默认档（`da4ddcb48ac2`）与
+    `run-13029` A2（`0200404e7a1a`）用矩阵同一 ELF 单跑均 PASS；清除后仍只剩 12 条既有偏差。
+
+### 未决与边界
+
+1. 稀疏 vmcore 只含 ELF 元数据/寄存器，不含物理内存内容；内容需 QMP/`pmemsave` 另取，
+   也不是可直接交给 Linux `crash` 的完整转储。
+2. 真机 AHCI/NMI/IST2/UC DMA/持久捕获盘全部未验证；默认档保持关闭。
+3. 软件 L4 无 TrapFrame，完整 GPR 只覆盖真异常；旧 RSP/RBP 与控制寄存器仍有记录。
+4. 真实 `PxCI!=0`、第二内核入口错、capture 初始化前 panic 三类尚未单独取证。
+5. ~~默认 L4 HEAP→GROW 级联~~ **已由 ADR-248 关闭（§570）**；`t_syscall_abi_arms` 后 HANG **已由 ADR-249 关闭（§571）**。
+6. kdump 不改变 ADR-080/W5/W12 的安全启动/身份/槽位边界，不宣称安全启动。
+
+## 570. ADR-248：默认 L4 的 HEAP/VMM → XFER 级联已修（2026-11-24）
+
+### 根因与修法
+
+默认软件 L4 仍走 `exit::finish → crash::ensure_dumped → state_store → AHCI → XFER(4)`。
+首条 L4 若由 HEAP(10) 重入或 VMM(20) shootdown 超时触发，落盘会反向获取 XFER；
+第二次锁序违规再进 `finish`，若 XFER 已被占住，`OpenSpinLock` 没有重入/超时检测，永久自旋。
+
+- `sync::OpenSpinLock::lock_checked()` 在 CAS 前检查外层 rank，`rank>=4` 直接返回 `None`，
+  不获取锁、不增加 `ACQUIRES`、不改 `INNERMOST`；合法路径仍走原有 `lock()` 等待互斥。
+- AHCI 公共入口统一经 `with_transfer_lock`：写方向先取锁再填 DMA，读方向在 `transfer` 取锁。
+- 持锁 L4 的摘要明确降级为 `Denied`，保留串口与无锁 `FATAL_RECORD`，随后正常 `qemu-exit=39`。
+- 不改锁等级、不改状态区 V1/V2 格式/槽位/seq；正常无外层锁的崩溃摘要仍落盘。
+
+调用点核对：启动验签、`state_store`、`AhciDisk` 直读直写都在锁外；`block_io` 请求/回调队列
+先拷出再放锁；`cached_read` 缓存锁只包查表/写回；句柄文件 IO 在取票后全程锁外。未发现合法
+高 rank -> AHCI 路径。
+
+### 读数
+
+| 场景 | 结果 |
+|---|---|
+| `run-12509` `fault-lock-reentrant` | 只有首条 HEAP(10) 重入；随后 `Denied` 与 `qemu-exit=39` |
+| `run-12510` `fault-shootdown-noack` | 只有首条 VMM(20) shootdown L4；随后 `Denied` 与 39 |
+| `run-12511` `fault-ahci-no-rank-guard` | 确定性用例在 `外层 rank=60 本次 rank=4` 重新级联并 HANG，证红入口闸 |
+| `run-12508` `fault-double-free` | 无外层锁，崩溃摘要仍正常落盘 |
+| 默认构建/ktests | **91/91** |
+| `check` | **21/21** |
+| 完整矩阵 | **67/82 符合、15 不符**；两条 L4 行均转绿 |
+
+矩阵 15 条不符的收口：
+
+- 5 条 FAT32/P7、7 条 A3，仍是既有基线偏差；
+- 签名、信号、A2 正向 3 条同 ELF 单跑全部清除：
+  `run-12690` `sig-check`（`b82c0aa7e11f`）、
+  `run-12688` `handles`（`087a21cdf9a0`）、
+  `run-12689` `a2-exec`（`b7d01486ba59`），与矩阵对应 ELF 摘要逐字相同；
+- 因此**链条原始读数仍是 67/82**，同 ELF 清除后只剩 12 条既有 FAT32/P7/A3 偏差。
+  不改判定行、不把环境形状重标成产品修复。
+
+### 量具修正
+
+新 `KT_AHCI_LOCK_RANK_GUARD` 第一版要求窗口内全内核 `acquires` 增量恒为 1。矩阵里 AP 并发
+取别的锁，实测增量 5/10，导致假红；已改为判 `Denied + 无新增 order_violations/reentrant_hits +
+放锁后正常读`，增量只打印。该中间轮 64/82 不作为最终读数。
+
+### 未决
+
+1. `OpenSpinLock` 本身仍缺重入/超时检测；本 ADR 只堵 AHCI 入口，不推广成通用锁修复。
+2. `t_syscall_abi_arms` 后 HANG **已由 ADR-249 关闭（§571）**：真停在下一格 `hproc_worker` 的收工自旋。
+3. 真机未验证；不把 QEMU 结论外推到硬件。
+
+## 571. ADR-249：`t_syscall_abi_arms` 后的 HANG 是 hproc worker 没收工抢占点（2026-11-24）
+
+### 反馈环与最小化
+
+- 20 秒超时、只认“最后一条 `t_syscall_abi_arms -> ok` 且无退出码”的 `handles` 循环：
+  `run-12705` 第 15 轮精确复现。
+- 改成单核后首轮即复现（`run-12752`），排除跨核死锁。
+- QMP `run-12760`：CPU 在 `tsc::spin+48`，`RDI=1000`、`IF=0`、`HLT=0`；
+  定时器/等待/换入计数两次采样全冻结；栈上有 `hproc_worker`、`finish_current`、
+  `aurora_trap_entry` 返回地址。
+- 初始 `HPROC_GO` 等待用 `spin(20_000)`，现场是 `spin(1000)` ⇒ 不是标志没发布，
+  而是 worker 已 `finish_current` 后卡在末尾死循环。
+
+### 修法与读数
+
+`hproc_worker` 在 `finish_current()` 后增加一次 `sched::yield_now()`，再保留原自旋收尾。
+worker 可能以 IF=0 被换入，必须主动建立抢占点；不逐轮发 `int 0xF0`，避免中断风暴。
+
+| 组别 | 结果 |
+|---|---|
+| 修前单核 | 首轮 HANG（`run-12752`） |
+| 修后单核 40 轮 | 该 HANG 0/40；单核 AP 用例按预期 FAIL |
+| 修后四核 40 轮 | 该 HANG **0/40**；36 PASS、4 FAIL |
+| 4 条 FAIL | 全是既有 `t_sdkdemo` 的 `0x100002000` 信箱失败，无新增类别 |
+| 默认 / handles ktests | **91/91 / 153/153** |
+| `check` | **21/21** |
+| 完整矩阵 | **67/82 符合、15 不符**；该 HANG 未再出现 |
+| 同 ELF 清除 | `run-12931` sig-check、`run-12932` fat32-probe、`run-12933` fs-open 全 PASS |
+
+矩阵 15 条不符按族对照 §570：5 条 FAT32/P7、7 条 A3，仍是同一组 12 条既有基线偏差；
+另 3 条（签名、P7 正向、FS-03 ring3）以矩阵同一 ELF 单跑全部清除，SHA 分别为
+`b82c0aa7e11f`、`6500e718fc7c`、`be27e9160dc0`。因此原始链仍记 **67/82**，不重标产品结论。
+`run-12936` 的 A3 VMO 封存仍 HANG，但同 ELF 停在 `clock: calibration refused: NoSamples`，
+不是 `hproc_worker`；归入既有 A3 基线，不在本轮混修。
+
+负样本是删掉这一行回到修前状态：同一循环会重新停在 `hproc_worker` 的 `spin(1000)`。
+只改测试工人，不改调度器、锁序或产品 syscall 语义。
+
+### 未决
+
+其他 `finish_current(); loop { spin }` 工人尚未逐条同型审计；本轮不把结论外推成所有 worker 已安全。

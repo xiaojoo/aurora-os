@@ -145,6 +145,8 @@ pub struct Task {
     /// 任务自己标了 `Done`（=可被调度掉），但抢占判据去问 `state == Running`，
     /// 于是它永远不被换下、等 CPU 的任务永远回不来。`state` 说"能不能被调度"，
     /// `on_cpu` 说"归哪个 CPU 调度"，两件事各自一个字段，`pick_next` 只在本队列里选。
+    /// 低 3 位是 CPU 队列号，bit3 是持袋终止待办，高 4 位是释放深度。
+    /// 打包进既有字节是为了不改变 `Task` / `RunQueue` 布局。
     pub on_cpu: u8,
     pub runs: u64,
     /// 最后一次被换下 CPU 的时刻，用来算"它被晾了多久"
@@ -159,6 +161,36 @@ pub struct Task {
     /// 现在主人是任务本身：结束（自己 `SYS_EXIT` 或被旁观者 `terminate_task`）之后
     /// 由**下一个不是它**的上下文在抢占点释放。
     pub owned: OwnedSet,
+}
+
+impl Task {
+    fn cpu(&self) -> usize {
+        (self.on_cpu & 0b0000_0111) as usize
+    }
+
+    fn release_depth(&self) -> u8 {
+        self.on_cpu >> 4
+    }
+
+    fn add_release_depth(&mut self) {
+        self.on_cpu = self.on_cpu.saturating_add(0x10);
+    }
+
+    fn sub_release_depth(&mut self) {
+        if self.release_depth() != 0 {
+            self.on_cpu -= 0x10;
+        }
+    }
+
+    fn request_termination(&mut self) {
+        self.on_cpu |= 0b0000_1000;
+    }
+
+    fn take_termination_pending(&mut self) -> bool {
+        let pending = self.on_cpu & 0b0000_1000 != 0;
+        self.on_cpu &= !0b0000_1000;
+        pending
+    }
 }
 
 /// 一个任务能持有的映射数上限。**定长而不是 `Vec`**：任务结构住在 per-CPU 静态数组里，
@@ -290,13 +322,34 @@ pub fn spawn_skipped_stale() -> u64 {
     SPAWN_SKIPPED_STALE.load(Ordering::Relaxed)
 }
 
-/// 每个 CPU 一格：**还有几个槽的资源在等"CPU 挪开它"**。为 0 就等于没有待回收，
-/// 所以 `preempt_point` 可以先读这一格再决定要不要扫队列（见 `reap` 的计数语义）。
-/// 为什么需要它：`preempt_point` 在**每次**出中断时都会路过回收检查，
-/// 而绝大多数时候没有任何东西要收。先读这一格（自己的缓存行里，几十周期以内），
-/// 为 0 就直接走——把 8 格的扫描放进 P3/P5 的被测区间是不诚实的代价。
-static REAP_PENDING: [core::sync::atomic::AtomicUsize; crate::arch::x86_64::cpu::MAX_CPUS] =
-    [const { core::sync::atomic::AtomicUsize::new(0) }; crate::arch::x86_64::cpu::MAX_CPUS];
+/// 扫描前领取脏位，扫描期间的新登记留给下一次；收尾清位会吞掉迟到任务。
+pub(crate) struct ReapSignal {
+    dirty: core::sync::atomic::AtomicBool,
+}
+
+impl ReapSignal {
+    pub(crate) const fn new() -> Self {
+        Self { dirty: core::sync::atomic::AtomicBool::new(false) }
+    }
+
+    pub(crate) fn mark(&self) {
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_pending(&self) -> bool {
+        self.dirty.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn scan<T>(&self, scan: impl FnOnce() -> T) -> Option<T> {
+        if !self.dirty.swap(false, Ordering::AcqRel) {
+            return None;
+        }
+        Some(scan())
+    }
+}
+
+static REAP_SIGNAL: [ReapSignal; crate::arch::x86_64::cpu::MAX_CPUS] =
+    [const { ReapSignal::new() }; crate::arch::x86_64::cpu::MAX_CPUS];
 
 /// 本次运行里"任务结束后释放掉的映射数"（判据要看见回收真的发生过，而不是只看见状态变 Free）。
 static REAP_RELEASED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -380,6 +433,10 @@ pub fn terminate_task(task: usize) -> bool {
         if s.tasks[slot].state == TaskState::Free {
             return false;
         }
+        if s.tasks[slot].release_depth() != 0 {
+            s.tasks[slot].request_termination();
+            return false;
+        }
         let was_blocked = match s.tasks[slot].state {
             TaskState::Blocked(tok) => Some(tok),
             _ => None,
@@ -437,7 +494,7 @@ pub fn terminate_task(task: usize) -> bool {
         // 正在 CPU 上：等下一次抢占点换下去（`mark_need` 由调用方负责，
         // SYS_EXIT 的路径会立刻立牌；旁观者路径靠本 CPU 的下一次 tick）。
         // 句柄撤销留给 `reap`：它此刻还在跑，撤销会让它手上的句柄当场失效。
-        REAP_PENDING[cpu].fetch_add(1, Ordering::AcqRel);
+        REAP_SIGNAL[cpu].mark();
     } else {
         // 已经不在 CPU 上了，就地回收安全。**句柄也要在这里撤销**（W3 P5a 实测撞出来的漏洞）：
         // 撤销原来只在 `reap` 里做，而这条路径就地 release_owned 之后袋子空了 ⇒
@@ -494,6 +551,8 @@ pub fn release_stale() -> u64 {
 
 static RELEASE_OWNED_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static RELEASE_OWNED_ITEMS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+// 只由 ktest 置位：在袋子搬出槽位后主动换人，确定性检查宿主栈生命周期。
+pub(crate) static REAP_YIELD_PROBE: AtomicBool = AtomicBool::new(false);
 
 
 pub fn release_owned_stats() -> (u64, u64) {
@@ -505,6 +564,28 @@ pub fn release_owned_stats() -> (u64, u64) {
 
 fn release_owned(cpu: usize, slot: usize) {
     release_owned_checked(cpu, slot, None);
+}
+
+fn release_host_enter() -> usize {
+    let host = current_of(crate::arch::x86_64::cpu::self_slot());
+    let cpu = cpu_of(host);
+    let mut s = rq(cpu);
+    s.tasks[slot_of(host)].add_release_depth();
+    host
+}
+
+fn release_host_exit(host: usize) {
+    let cpu = cpu_of(host);
+    let pending = {
+        let mut s = rq(cpu);
+        let task = &mut s.tasks[slot_of(host)];
+        task.sub_release_depth();
+        task.release_depth() == 0 && task.take_termination_pending()
+    };
+    if pending {
+        let _ = terminate_task(host);
+        mark_need(cpu);
+    }
 }
 
 /// 同上，但**带一个 id 校验**（ADR-244）：只有槽的当前住户仍是 `want_id` 才收。
@@ -551,6 +632,7 @@ fn release_owned_checked(cpu: usize, slot: usize, want_id: Option<u32>) {
             CONTAINER_OWNED_LAST.store(slot as u32, Ordering::Relaxed);
         }
     }
+    let host = release_host_enter();
     // 一次持锁把"取走计数 + 把映射搬出槽位"做完（原来分两次，每次都要重取队列锁）。
     // `drop(bag)` 仍旧留在锁外——那才是真正可能阻塞的一步，合并取锁不能把它带进来。
     let mut bag = OwnedSet::new();
@@ -561,6 +643,8 @@ fn release_owned_checked(cpu: usize, slot: usize, want_id: Option<u32>) {
         if let Some(want) = want_id {
             if s.tasks[slot].id != want {
                 RELEASE_STALE.fetch_add(1, Ordering::Relaxed);
+                drop(s);
+                release_host_exit(host);
                 return;
             }
         }
@@ -576,6 +660,9 @@ fn release_owned_checked(cpu: usize, slot: usize, want_id: Option<u32>) {
         // 而且第一版这里就是靠 `bag.n` 来数释放了几条 —— 而我从没往 bag.n 里加过，
         // 于是 `reap_released()` 恒为 0（现场：页确实被解映射了，计数却说什么都没发生）。
         bag.n = released;
+    }
+    if REAP_YIELD_PROBE.swap(false, Ordering::AcqRel) {
+        yield_now();
     }
     // 把映射从槽位里搬出来再 drop：不能在持有队列句柄的时候逐个 drop，
     // 因为 `Mapping::drop` 要拿 VMM 锁、可能等 shootdown 回执——
@@ -600,6 +687,8 @@ fn release_owned_checked(cpu: usize, slot: usize, want_id: Option<u32>) {
     s.tasks[slot].stack_lo = 0;
     s.tasks[slot].stack_hi = 0;
     s.tasks[slot].guarded = false;
+    drop(s);
+    release_host_exit(host);
 }
 
 /// 抢占点上的回收：把本 CPU 队列里"已 Free、还牵着映射、且不是当前任务"的槽位放手。
@@ -636,79 +725,89 @@ pub fn reap_last() -> (u32, bool) {
         REAP_LAST_HAD_CONTAINER.load(Ordering::Relaxed) != 0,
     )
 }
+pub(crate) fn reap_host_safe(state: TaskState) -> bool {
+    matches!(state, TaskState::Runnable | TaskState::Running)
+}
+
 pub fn reap(cpu: usize) -> usize {
-    if cpu >= crate::arch::x86_64::cpu::MAX_CPUS || REAP_PENDING[cpu].load(Ordering::Acquire) == 0 {
+    if cpu >= crate::arch::x86_64::cpu::MAX_CPUS {
         return 0;
     }
-    let cur = current_of(cpu);
-    let mut retired = 0usize;
-    // 这一轮"该收但收不了"的槽数：只有"它就是当前任务"这一种阻塞原因。
-    let mut waiting = 0usize;
-    for slot in 0..MAX_TASKS {
-        let gi = gidx(cpu, slot);
-        // 一轮里这一格只取放一次队列锁（原来是 3~4 次：state、has_bag、id 各一次）。
-        // 这不是微优化——A/B 之后必须把抢占点上的锁流量降下来（ADR-048 未决 1）。
-        // `continue` 从这个块里离开时句柄先析构，不会带着锁跳出循环体。
-        // **ADR-234：`has_c` 在同一个临界区里算**。
-        //
-        // ADR-233 为了读 `owned` 又取了一次 `rq(cpu)`，结果偶发消失（0/20）。
-        // ADR-232 已证明「无锁 fetch_add 不干扰」—— 差别就在「有没有取锁」。
-        // 所以这里把 `owned` 的遍历并进**本来就要取的那次锁**，不多取一次。
-        let (st, has_bag, _id, has_c) = {
-            let s = rq(cpu);
-            let st = s.tasks[slot].state;
-            let n0 = s.tasks[slot].owned.n;
-            let mut has_c = false;
-            for k in 0..n0.min(MAX_OWNED) {
-                if let Some(OwnedItem::Map(m)) = s.tasks[slot].owned.items[k].as_ref() {
-                    let v = m.virt();
-                    if v.0 >= 0x1000_c0000 && v.0 < 0x1000_d0000 { has_c = true; }
-                }
-            }
-            // Done 的判定带 `|| st == Done` 是因为"被杀但映射为空"也要归化成 Free，
-            // 否则槽位永远停在 Done —— 那正是 M4-1 撞过的"队列被占满"的形状。
-            (st, s.tasks[slot].owned.n > 0 || st == TaskState::Done, s.tasks[slot].id, has_c)
-        };
-        if st != TaskState::Free && st != TaskState::Done {
-            continue;
+    let Some(retired) = REAP_SIGNAL[cpu].scan(|| {
+        let cur = current_of(cpu);
+        // 局部 bag 挂在当前栈上；Done/Free 上下文随时可能被回收，不能在其中 drop 别人的栈。
+        let host_state = rq(cpu).tasks[slot_of(cur)].state;
+        if !reap_host_safe(host_state) {
+            REAP_SIGNAL[cpu].mark();
+            return 0;
         }
-        if !has_bag {
-            continue;
-        }
-        if gi == cur {
-            // **不能收**：它的内核栈就是现在这条栈（或者它正站在里面的用户页上）。
-            // 留着这一格计数，下一轮抢占点再来试；不能因为"这一轮放了别人"就把账抹平。
+        let mut retired = 0usize;
+        for slot in 0..MAX_TASKS {
+            let gi = gidx(cpu, slot);
+            // 一轮里这一格只取放一次队列锁（原来是 3~4 次：state、has_bag、id 各一次）。
+            // 这不是微优化——A/B 之后必须把抢占点上的锁流量降下来（ADR-048 未决 1）。
+            // `continue` 从这个块里离开时句柄先析构，不会带着锁跳出循环体。
+            // **ADR-234：`has_c` 在同一个临界区里算**。
             //
-            // **ADR-232 观测**：这道闸命中几次。纯原子自增，不写串口。
-            REAP_BLOCKED_BY_CUR.fetch_add(1, Ordering::Relaxed);
-            waiting += 1;
-            continue;
+            // ADR-233 为了读 `owned` 又取了一次 `rq(cpu)`，结果偶发消失（0/20）。
+            // ADR-232 已证明「无锁 fetch_add 不干扰」—— 差别就在「有没有取锁」。
+            // 所以这里把 `owned` 的遍历并进**本来就要取的那次锁**，不多取一次。
+            let (st, has_bag, _id, has_c, release_depth) = {
+                let s = rq(cpu);
+                let st = s.tasks[slot].state;
+                let n0 = s.tasks[slot].owned.n;
+                let mut has_c = false;
+                for k in 0..n0.min(MAX_OWNED) {
+                    if let Some(OwnedItem::Map(m)) = s.tasks[slot].owned.items[k].as_ref() {
+                        let v = m.virt();
+                        if v.0 >= 0x1000_c0000 && v.0 < 0x1000_d0000 { has_c = true; }
+                    }
+                }
+                // Done 的判定带 `|| st == Done` 是因为"被杀但映射为空"也要归化成 Free，
+                // 否则槽位永远停在 Done —— 那正是 M4-1 撞过的"队列被占满"的形状。
+                (st, s.tasks[slot].owned.n > 0 || st == TaskState::Done, s.tasks[slot].id, has_c,
+                 s.tasks[slot].release_depth())
+            };
+            if st != TaskState::Free && st != TaskState::Done {
+                continue;
+            }
+            if release_depth != 0 {
+                REAP_SIGNAL[cpu].mark();
+                continue;
+            }
+            if !has_bag {
+                continue;
+            }
+            if gi == cur {
+                // 当前栈不能解映射；重新置脏，换人后的下一次抢占点必须再扫。
+                REAP_BLOCKED_BY_CUR.fetch_add(1, Ordering::Relaxed);
+                REAP_SIGNAL[cpu].mark();
+                continue;
+            }
+            // **ADR-232 观测**：真的要收了。看「收的是不是还没跑完的任务」。
+            REAP_RETIRED.fetch_add(1, Ordering::Relaxed);
+            if st == TaskState::Done {
+                REAP_RETIRED_DONE.fetch_add(1, Ordering::Relaxed);
+            }
+            // **ADR-234 观测**：只 store，不再取锁。
+            REAP_LAST_GI.store(gi as u32, Ordering::Relaxed);
+            if has_c { REAP_LAST_HAD_CONTAINER.store(1, Ordering::Relaxed); }
+            // 任务退出撤销：句柄表里 owner 两格都对的表项在这里清掉。**这是唯一安全的时刻**——
+            // 它的内核栈与用户页都已经不会再被踩（设计 §7）。只读文件对象不持有页框，账只记在手柄表里。
+            #[cfg(feature = "handles")]
+            crate::handle::revoke_task(gi, _id);
+            release_owned(cpu, slot);
+            let mut s = rq(cpu);
+            s.tasks[slot].state = TaskState::Free;
+            s.tasks[slot].frame = 0;
+            s.tasks[slot].runs = 0;
+            s.entries[slot] = None;
+            retired += 1;
         }
-        // **ADR-232 观测**：真的要收了。看「收的是不是还没跑完的任务」。
-        REAP_RETIRED.fetch_add(1, Ordering::Relaxed);
-        if st == TaskState::Done {
-            REAP_RETIRED_DONE.fetch_add(1, Ordering::Relaxed);
-        }
-        // **ADR-234 观测**：只 store，不再取锁。
-        REAP_LAST_GI.store(gi as u32, Ordering::Relaxed);
-        if has_c { REAP_LAST_HAD_CONTAINER.store(1, Ordering::Relaxed); }
-        // 任务退出撤销：句柄表里 owner 两格都对的表项在这里清掉。**这是唯一安全的时刻**——
-        // 它的内核栈与用户页都已经不会再被踩（设计 §7）。只读文件对象不持有页框，账只记在手柄表里。
-        #[cfg(feature = "handles")]
-        crate::handle::revoke_task(gi, _id);
-        release_owned(cpu, slot);
-        let mut s = rq(cpu);
-        s.tasks[slot].state = TaskState::Free;
-        s.tasks[slot].frame = 0;
-        s.tasks[slot].runs = 0;
-        s.entries[slot] = None;
-        retired += 1;
-    }
-    // 计数 = "还在等 CPU 挪开的槽数"，**不是**"发生过几次退出"。
-    // 上一版按后者记账并用 `done` 去减，于是被 `current` 挡住的那个槽会被
-    // 别的槽的释放冲掉账（现场：`released` 涨了 7、槽位是 Free、而 `owned_of` 仍是 5）。
-    // 语义变了就顺手把名字改对：它现在是一个"等待数"。
-    REAP_PENDING[cpu].store(waiting, Ordering::Release);
+        retired
+    }) else {
+        return 0;
+    };
     retired
 }
 
@@ -2427,13 +2526,9 @@ pub fn finish_current() {
         crate::proc::proc_thread_exited(pid, 0);
     }
     my_rq().tasks[slot_of(me)].state = TaskState::Done;
-    // P6c（ADR-071 决策 2 的"确定回收时刻"）：**正常收工也要登记待收**。
-    // 原来只有 `kill_current` 登记，而 `reap` 在 REAP_PENDING 为 0 时直接返回 ⇒
-    // 正常收工的槽要等别人去 kill/exit 才被顺手收掉，这就是"有效容量 5/9"那笔欠账的成因
-    // （改前实测 `本CPU先占=4(其中Done待收=2)`）。登记之后回收时刻是确定的：
-    // 下一次"本 CPU 跑的不是它"的抢占点。此刻它还是 current，所以 reap 会把它记成 waiting
-    // 而保持计数非零，换人之后那一轮才真收 —— 不是立刻收，也不靠运气。
-    REAP_PENDING[cpu_of(me)].fetch_add(1, Ordering::AcqRel);
+    // 正常收工也要登记待收。此刻它还是 current，reap 会重新置脏并跳过这条栈；
+    // 换人后的下一次抢占点再收，既不是立刻收，也不靠覆盖计数记住这件事。
+    REAP_SIGNAL[cpu_of(me)].mark();
     // P6a：**先置 signal 再发布等待者**。这里只原子写，真唤醒在抢占点的 need 闸之后做
     // （收工出口可能在持锁的故障路径上）。M38 实测：把这两句的顺序调换**仍然全绿**——
     // 因为唤醒是延迟到抢占点的，drain 跑起来时两句都已执行完 ⇒ 顺序在本设计里不可观测。
@@ -2460,7 +2555,7 @@ pub fn kill_current() {
         crate::proc::proc_thread_exited(pid, 1);
     }
     my_rq().tasks[slot_of(me)].state = TaskState::Done;
-    REAP_PENDING[cpu].fetch_add(1, Ordering::AcqRel);
+    REAP_SIGNAL[cpu].mark();
     // P6a：被杀也算收工，等待者不该只能等超时（同 finish_current 的顺序）
     task_wait_signal(TW_TASK, me as u32, 1);
     if pid != crate::proc::NO_PROC {
@@ -2476,7 +2571,7 @@ pub fn on_cpu_of(i: usize) -> Option<usize> {
         return None;
     }
     // SAFETY: 只读快照，理由同 `current_of`
-    Some(unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].on_cpu as usize })
+    Some(unsafe { (*RQ[cpu_of(i)].data.get()).tasks[slot_of(i)].cpu() })
 }
 
 /// 第 i 个任务的栈区间与"有没有 guard page"。用例要靠它验证 §6.4 那条不变量。
@@ -2691,7 +2786,7 @@ fn pick_next(prev: usize, cpu: usize) -> usize {
     for k in 0..MAX_TASKS {
         let slot = (start + k) % MAX_TASKS;
         let gi = gidx(cpu, slot);
-        if gi != idle && s.tasks[slot].state == TaskState::Runnable && s.tasks[slot].on_cpu as usize == cpu {
+        if gi != idle && s.tasks[slot].state == TaskState::Runnable && s.tasks[slot].cpu() == cpu {
             return gi;
         }
     }
@@ -2721,8 +2816,8 @@ pub unsafe fn preempt_point(frame: u64, cpu: usize) {
     // **回收点在这里，不在退出函数里**。任务自己结束的那一刻，它正站在要交出去的
     // 那条内核栈上（`SYS_EXIT` 走的就是它的上下文），当场解映射 = 下一次访存就故障
     // = ring0 故障 = 按 §9.2 升 L4。能安全放手的时刻只有一个：本 CPU 上跑的已经不是它。
-    // 抢占点每轮都路过这里，所以先读一格计数（为 0 时一个字节都不多读）。
-    if REAP_PENDING[cpu].load(Ordering::Acquire) != 0 {
+    // 抢占点每轮都路过这里，先读脏位（为 false 时不做队列扫描）。
+    if REAP_SIGNAL[cpu].is_pending() {
         reap(cpu);
     }
     if !crate::arch::x86_64::cpu::runs_sched(cpu) {

@@ -4,6 +4,7 @@
 target/
 **/*.rs.bk
 *.img
+/kernel/fixtures/capture.bin
 serial.log
 .qemu.pid
 

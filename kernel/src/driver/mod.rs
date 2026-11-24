@@ -21,7 +21,7 @@
 use crate::arch::x86_64::apic;
 use crate::hw::{self, HwError, MmioRegion};
 use crate::irq;
-use crate::mm::{self, Mapping, ModuleId, PageFlags, PAGE};
+use crate::mm::{self, Mapping, ModuleId, PageFlags, PAGE, phys_alloc};
 use crate::pci::Dev;
 use core::cell::UnsafeCell;
 
@@ -286,7 +286,7 @@ impl DriverCtx {
         // 而错误现场只说「写不存在的页」，看不出是这里截断的。
         let order = (len / PAGE).ilog2();
         let order = u8::try_from(order).map_err(|_| DriverError::Denied("跨度过大"))?;
-        let frames = mm::phys_alloc(order, self.owner).map_err(|_| DriverError::ResourceExhausted)?;
+        let frames = phys_alloc(order, self.owner).map_err(|_| DriverError::ResourceExhausted)?;
         let bus = frames.base().0;
         let n = frames.count();
         let va = match mm::alloc_va_range(n) {
@@ -308,6 +308,25 @@ impl DriverCtx {
         let slot = t.free_dma_slot().ok_or(DriverError::ResourceExhausted)?;
         let gen = t.fresh_gen();
         t.dma[slot] = Some(DmaEntry { gen, owner: self.owner, map, bus, len });
+        Ok(DmaHandle { slot: slot as u16, gen })
+    }
+
+    #[cfg(feature = "kdump")]
+    pub(crate) fn adopt_capture_dma(&self, phys: u64, len: usize) -> Result<DmaHandle, DriverError> {
+        if len == 0 || len % PAGE != 0 || phys == 0 || phys & (PAGE as u64 - 1) != 0 {
+            return Err(DriverError::Denied("capture DMA 必须是非零整页且物理基址页对齐"));
+        }
+        let pages = len / PAGE;
+        let end = phys.checked_add(len as u64).ok_or(DriverError::Denied("capture DMA 范围溢出"))?;
+        if end > 4 * 1024 * 1024 * 1024 {
+            return Err(DriverError::Denied("capture DMA 越过 32 位 ABAR 边界"));
+        }
+        let map = mm::map_device(phys, pages).map_err(|e| DriverError::Access(HwError::Map(e)))?;
+        // SAFETY: 见表 TableCell；启动期单核 adopt，随后只由 BSP 的 capture 预检读。
+        let t = unsafe { &mut *TABLE.0.get() };
+        let slot = t.free_dma_slot().ok_or(DriverError::ResourceExhausted)?;
+        let gen = t.fresh_gen();
+        t.dma[slot] = Some(DmaEntry { gen, owner: self.owner, map, bus: phys, len });
         Ok(DmaHandle { slot: slot as u16, gen })
     }
 

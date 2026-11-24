@@ -1523,6 +1523,8 @@ fn hproc_worker() -> ! {
     // `exit_current` 返回 `()` 而本函数是 `-> !`，且它直接 `terminate_task` 会把
     // 自己脚下的栈抽掉。`finish_current` 标 Done，下一次 tick 换走。
     crate::sched::finish_current();
+    // 工人可能以 IF=0 被换入；收工后必须主动制造一次抢占点。
+    crate::sched::yield_now();
     loop {
         crate::time::tsc::spin(1000);
     }

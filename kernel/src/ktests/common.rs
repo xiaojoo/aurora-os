@@ -61,7 +61,7 @@ pub(crate) const P7_CALLS: u64 = 32;
 /// 「槽位是 Free 不等于资源回去了」——只是这里没跟着改。
 ///
 /// 后果不是「等得久一点」，而是**漏掉释放**：本函数一返回 true，调用方就不再进 `drain_reap`
-/// 那个窗口，而没有 tick 就没有抢占点，`REAP_PENDING` 就永远不消费 ⇒ 袋里的映射
+/// 那个窗口，而没有 tick 就没有抢占点，回收脏位就永远不被消费 ⇒ 袋里的映射
 /// （内核栈 4 页 + 一条 VA 保留）**再也没人放手**。实测 `t_q2_workload_slots`
 /// 14 次跑 14 次红：`回滚不成立 f97212->97208(差 -4) va17->18(差 1)`。
 ///
@@ -106,6 +106,15 @@ pub(crate) fn drain_reap_for(g: usize) -> bool {
         return true;
     }
     let ticks_before = sched::ticks_of(0);
+    let timer_was_running = apic::state()
+        .and_then(|s| apic::rte_raw(s.timer_rte))
+        .is_some_and(|(low, _)| low & (1 << 16) == 0);
+    if !timer_was_running {
+        if crate::clock::current().is_none() {
+            crate::calibrate_clock_once();
+        }
+        apic::timer_start().ok();
+    }
     let mut hit = false;
     apic::with_interrupts(|| {
         let t0 = tsc::now();
@@ -117,6 +126,9 @@ pub(crate) fn drain_reap_for(g: usize) -> bool {
             tsc::spin(20_000);
         }
     });
+    if !timer_was_running {
+        apic::timer_stop().ok();
+    }
     if !hit {
         crate::log_warn!(
             "reap: 窗口内这个任务的资源没交回 g={} state={:?} owned={} 窗口内 tick {}→{}",

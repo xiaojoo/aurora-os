@@ -61,6 +61,8 @@ BUILD.mkdir(parents=True, exist_ok=True)
 # 不设 AURORA_BUILD 时 BUILD == ROOT/build，行为一个字符都不变。
 IMAGE = BUILD / "aurora.img"
 SERIAL_LOG = BUILD / "serial.log"
+CAPTURE_IMG = BUILD / "kdump-capture.img"
+CAPTURE_IMG_BYTES = 2 * 1024 * 1024
 
 QEMU = TOOLS / "qemu" / "qemu-system-x86_64.exe"
 
@@ -141,7 +143,54 @@ def kernel_path(features: list[str]) -> Path:
     return ROOT / "target" / TARGET / kind / "aurora-kernel"
 
 
+CAPTURE_FIXTURE = ROOT / "kernel" / "fixtures" / "capture.bin"
+CAPTURE_RAW = BUILD / "aurora-capture.bin"
+CAPTURE_RUSTFLAGS = (
+    "-C linker=rust-lld -C link-arg=-Tcapture/linker.ld "
+    "-C relocation-model=static -C panic=abort"
+)
+
+
+def do_build_capture(features: list[str]) -> Path:
+    args = [str(CARGO), "build", "--target", TARGET, "-p", "aurora-capture"]
+    if "kdump-bad-completion" in features:
+        args += ["--features", "kdump-bad-completion"]
+    r = subprocess.run(
+        args,
+        capture_output=True, text=True, cwd=str(ROOT),
+        env={**env(), "RUSTFLAGS": CAPTURE_RUSTFLAGS},
+    )
+    if r.returncode != 0:
+        sys.exit("capture 内核构建失败：" + (r.stdout + r.stderr)[-4000:])
+    objcopy = next((TOOLS / "rustup" / "toolchains").glob(
+        "*/lib/rustlib/*/bin/llvm-objcopy.exe"), None)
+    if objcopy is None:
+        sys.exit("找不到 llvm-objcopy，无法提取 capture 载荷")
+    elf = ROOT / "target" / TARGET / "debug" / "aurora-capture"
+    if sh([str(objcopy), "-O", "binary", "--only-section=.text",
+           "--only-section=.rodata", "--only-section=.data", str(elf),
+           str(CAPTURE_RAW)]) != 0:
+        sys.exit("capture 载荷提取失败")
+    data = CAPTURE_RAW.read_bytes()
+    if len(data) < 18 or data[2:10] != b"AURCAP01":
+        sys.exit("capture 载荷入口标记不成立")
+    changed = not CAPTURE_FIXTURE.exists() or CAPTURE_FIXTURE.read_bytes() != data
+    if changed:
+        CAPTURE_FIXTURE.write_bytes(data)
+    print(f"capture 载荷: {CAPTURE_FIXTURE.relative_to(ROOT)}  {len(data)} 字节  "
+          f"sha256={hashlib.sha256(data).hexdigest()[:12]} "
+          f"{'（夹具已更新）' if changed else '（与夹具一致）'}")
+    return CAPTURE_FIXTURE
+
+
+def ensure_capture_disk() -> None:
+    CAPTURE_IMG.write_bytes(bytes(CAPTURE_IMG_BYTES))
+    print(f"capture 盘: {CAPTURE_IMG.relative_to(ROOT)}  {CAPTURE_IMG_BYTES} 字节（每跑清零）")
+
+
 def kernel_binary(features: list[str]) -> Path:
+    if {"kdump", "kdump-bad-payload", "kdump-ap-probe", "kdump-no-park", "kdump-bad-dma", "kdump-bad-completion"} & set(features):
+        do_build_capture(features)
     if FAT_FEATURES & set(features):
         # 必须在 cargo 之前：`include_bytes!("../fixtures/fat32-mem.img")` 是编译期读的，
         # 那块文件不在仓库里（配方现算），晚一步就是"构建失败"而不是"夹具不对"。
@@ -468,7 +517,7 @@ NVME_PATTERN = 0x7E
 
 VBLK2_MIB = 96
 VBLK2_PATTERN = 0x3C
-NVME_FEATURES = {"nvme"}
+NVME_FEATURES = {"nvme"}
 # ADR-210：xHCI 设备。**必须挂在 QEMU 上**，否则 USB 的每一层都只能
 # 证「推导对」，不能证「真的能跑」（AGENTS.md：涉及硬件的结论要有第二台仪器对账）。
 XHCI_FEATURES = {"xhci"}
@@ -4179,6 +4228,133 @@ def run_serial_rx(cmd: list[str], timeout: int, *, rx_probe: bool,
     return result, bad
 
 
+def _fnv1a64(data: bytes) -> int:
+    value = 0xcbf29ce484222325
+    for byte in data:
+        value = ((value ^ byte) * 0x100000001b3) & 0xffffffffffffffff
+    return value
+
+
+def validate_capture(path: Path, log: str = "") -> tuple[list[str], dict[str, int]]:
+    errors: list[str] = []
+    facts: dict[str, int] = {}
+    data = path.read_bytes()
+    if len(data) < 512 or data[:4] != b"\x7fELF":
+        return ["capture 盘不是完整 ELF64"], facts
+    try:
+        header = struct.unpack_from("<16sHHIQQQIHHHHHH", data, 0)
+    except struct.error:
+        return ["capture ELF 头截断"], facts
+    ident, etype, machine, version, _entry, phoff, _shoff, _flags, ehsize, phentsize, phnum = header[:11]
+    if ident[:7] != b"\x7fELF\x02\x01\x01" or etype != 4 or machine != 62 or version != 1 or _entry != 0:
+        errors.append("capture ELF 标识/类型/机器/版本不成立")
+    if ehsize != 64 or phentsize != 56 or phnum == 0 or phoff + phnum * phentsize > len(data):
+        return errors + ["capture ELF 程序头范围不成立"], facts
+    loads: list[tuple[int, int, int, int]] = []
+    notes: list[tuple[int, bytes, bytes]] = []
+    for index in range(phnum):
+        try:
+            ptype, _pflags, offset, _vaddr, paddr, filesz, memsz, align = struct.unpack_from(
+                "<IIQQQQQQ", data, phoff + index * phentsize)
+        except struct.error:
+            errors.append(f"capture 程序头 {index} 截断")
+            continue
+        if offset + filesz > len(data):
+            errors.append(f"capture 程序头 {index} 文件范围越界")
+            continue
+        if ptype == 1:
+            if filesz != 0 or memsz == 0 or paddr > 0xffffffffffffffff - memsz or align < 4096:
+                errors.append(f"capture PT_LOAD {index} 的稀疏物理范围不成立")
+            loads.append((paddr, memsz, filesz, align))
+        elif ptype == 4:
+            if filesz != memsz or align < 4:
+                errors.append(f"capture PT_NOTE {index} 范围/对齐不成立")
+            pos, end = offset, offset + filesz
+            while pos < end:
+                if end - pos < 16:
+                    errors.append("capture note 头截断")
+                    break
+                namesz, descsz, ntype = struct.unpack_from("<III", data, pos)
+                pos += 16
+                name_end, desc_end = pos + namesz, pos + ((namesz + 3) & ~3) + descsz
+                note_end = desc_end + ((4 - (descsz & 3)) & 3)
+                if note_end > end:
+                    errors.append("capture note 名称/描述范围越界")
+                    break
+                name = data[pos:name_end]
+                desc = data[pos + ((namesz + 3) & ~3):desc_end]
+                notes.append((ntype, name, desc))
+                pos = note_end
+    if len(loads) + 1 != phnum:
+        errors.append("capture 程序头数量不等于 PT_LOAD + 1")
+    aurora = [(name, desc) for ntype, name, desc in notes if ntype == 0x41555241]
+    status = [(name, desc) for ntype, name, desc in notes if ntype == 1]
+    if len(aurora) != len(status) or not aurora:
+        errors.append("capture NT_PRSTATUS/NT_AURORA_CAPTURE 数量不配对")
+    if len(notes) != 2 * len(aurora):
+        errors.append("capture note 段含未知或重复记录")
+    facts["cpus"] = len(aurora)
+    facts["loads"] = len(loads)
+    facts["notes"] = len(notes)
+    seen: set[int] = set()
+    leaders: list[int] = []
+    for index, (name, desc) in enumerate(aurora):
+        if name != b"AURORA\0" or len(desc) != 288:
+            errors.append(f"capture Aurora note {index} 名称/长度不成立")
+            continue
+        magic, nversion, size, checksum, cpu_index, reserved = struct.unpack_from("<QIIQII", desc, 0)
+        zeroed = bytearray(desc)
+        zeroed[16:24] = bytes(8)
+        words = list(struct.unpack_from("<32Q", desc, 32))
+        if magic != 0x4155524341503100 or nversion != 1 or size != 288 or reserved != 0:
+            errors.append(f"capture Aurora note {index} 固定头不成立")
+        if checksum != _fnv1a64(bytes(zeroed)):
+            errors.append(f"capture Aurora note {index} 校验和不成立")
+        if cpu_index != index or cpu_index in seen or words[0] != 1:
+            errors.append(f"capture Aurora note {index} CPU 序号/有效位不成立")
+        seen.add(cpu_index)
+        if words[1] == 0:
+            leaders.append(cpu_index)
+        elif words[1] != 1 or words[2] != 2:
+            errors.append(f"capture Aurora note {index} AP 来源/向量不成立")
+    if len(leaders) != 1:
+        errors.append("capture note 中 leader 来源不唯一")
+    leader_match = re.search(r"capture leader=(\d+)", log)
+    if leader_match and leaders != [int(leader_match.group(1))]:
+        errors.append("capture note leader 与串口 leader 不一致")
+    for index, (name, desc) in enumerate(status):
+        if name != b"CORE\0" or len(desc) != 336:
+            errors.append(f"capture PRSTATUS {index} 名称/长度不成立")
+            continue
+        if index < len(aurora):
+            words = struct.unpack_from("<32Q", aurora[index][1], 32)
+            if struct.unpack_from("<Q", desc, 112 + 16 * 8)[0] != words[5]:
+                errors.append(f"capture PRSTATUS {index} RIP 与 Aurora note 不一致")
+            if struct.unpack_from("<Q", desc, 112 + 19 * 8)[0] != words[6]:
+                errors.append(f"capture PRSTATUS {index} RSP 与 Aurora note 不一致")
+            if struct.unpack_from("<Q", desc, 112 + 17 * 8)[0] != words[23]:
+                errors.append(f"capture PRSTATUS {index} CS 与 Aurora note 不一致")
+            if struct.unpack_from("<Q", desc, 112 + 18 * 8)[0] != words[22]:
+                errors.append(f"capture PRSTATUS {index} RFLAGS 与 Aurora note 不一致")
+    parked = re.search(r"capture leader=\d+ parked=(\d+)/(\d+)", log)
+    if parked:
+        facts["parked"] = int(parked.group(1))
+        facts["targets"] = int(parked.group(2))
+        if facts["parked"] != facts["targets"] or facts["cpus"] != facts["targets"] + 1:
+            errors.append("capture 串口停车数与 note CPU 数不一致")
+    written_values = re.findall(r"ahci\.written=(0x[0-9a-f]+)", log)
+    core_bytes = re.search(r"vmcore\.bytes=(0x[0-9a-f]+)", log)
+    if written_values and core_bytes:
+        facts["written"] = int(written_values[-1], 16)
+        facts["core_bytes"] = int(core_bytes.group(1), 16)
+        if facts["written"] != facts["core_bytes"] or facts["written"] > len(data):
+            errors.append("capture 串口写入字节数与 vmcore 长度/捕获盘不一致")
+    if "vmcore write complete" not in log:
+        errors.append("capture 串口没有完整写盘收尾")
+    facts["sha256"] = int(hashlib.sha256(data).hexdigest()[:16], 16)
+    return errors, facts
+
+
 def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str = "") -> tuple[str, int, str]:
     # 声明放在函数头：挂死取证要**这一跑的跑号**（读 RUN_SEQ），
     # 而 Python 要求 `global` 早于同一作用域里对这个名字的任何使用。
@@ -4285,6 +4461,8 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
         bad = apply_pkg_host_fault(host_fault)
         if bad:
             sys.exit("改包宿主机侧注入不成立：" + " / ".join(bad))
+    if {"kdump", "kdump-bad-payload", "kdump-ap-probe", "kdump-no-park", "kdump-bad-dma", "kdump-bad-completion"} & set(features):
+        ensure_capture_disk()
     SERIAL_LOG.unlink(missing_ok=True)
     code, tpl = ovmf_files()
     # vars 每次从模板重拷：上一次运行写入的 NVRAM 启动项不该影响本次判定（可复现）
@@ -4337,6 +4515,10 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
             wanted_volumes[port] = name
     for port, name in sorted(wanted_volumes.items()):
         cmd += ["-drive", f"if=ide,index={port},format=raw,file={FAT_IMG[name]}"]
+    if {"kdump", "kdump-bad-payload", "kdump-ap-probe", "kdump-no-park", "kdump-bad-dma", "kdump-bad-completion"} & set(features):
+        if 1 in wanted_volumes:
+            sys.exit("kdump 捕获盘固定使用 AHCI 口 1，不能被 FAT 卷占用")
+        cmd += ["-drive", f"if=ide,index=1,format=raw,file={CAPTURE_IMG}"]
     if GPT_FEATURES & set(features):
         # 口号映射沿用上面那条**实测过**的关系（`if=ide,index=N` 落在 ich9-ahci 的口 N）。
         # 这块盘固件不会去读它（不是引导盘、也没有 ESP 里的 BOOTX64.EFI），所以改它不会
@@ -4538,6 +4720,19 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
             verdict = "CONTENT-MISMATCH"
             for b in bad:
                 print("    内容对账:", b)
+    if {"kdump", "kdump-bad-payload", "kdump-ap-probe", "kdump-no-park", "kdump-bad-dma", "kdump-bad-completion"} & set(features) and "vmcore write complete" in log:
+        capture_bad, capture_facts = validate_capture(CAPTURE_IMG, log)
+        if capture_bad:
+            verdict = "CONTENT-MISMATCH"
+            for message in capture_bad:
+                print("    capture 对账:", message)
+        else:
+            print(
+                "    capture 对账: 绿 "
+                f"cpus={capture_facts.get('cpus')} parked={capture_facts.get('parked')}/"
+                f"{capture_facts.get('targets')} loads={capture_facts.get('loads')} "
+                f"bytes={capture_facts.get('written')} sha256={capture_facts.get('sha256', 0):016x}"
+            )
     # 在 do_run 按特性核对，不能靠日志里有没有标记，也不能只在 main/run 对账。
     if serial_rx:
         rx_bad += check_serial_rx(log)

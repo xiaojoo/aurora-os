@@ -5,16 +5,16 @@
 >
 > **2026-11-20（ADR-175 跨 AS 读走物理地址）**：`sched/user` U2 9 → 10（`copy_from_user_in` 里 HHDM 别名的单字节读）。**总数 +1**（530 → 531）。
 
-总计 654 处。U1 85 · U2 162 · U3 13 · U4 223 · U5 128 · U6 43
+总计 705 处。U1 104 · U2 183 · U3 13 · U4 234 · U5 128 · U6 43
 
 | 类别 | 含义 | 处数 |
 |---|---|---|
-| U1 | 架构入口与特殊寄存器 | 85 |
-| U2 | 页表、物理内存与 MMIO | 121 |
+| U1 | 架构入口与特殊寄存器 | 104 |
+| U2 | 页表、物理内存与 MMIO | 183 |
 | U3 | DMA 与设备共享内存 | 13 |
-| U4 | 并发共享状态与 UnsafeCell | 149 |
+| U4 | 并发共享状态与 UnsafeCell | 234 |
 | U5 | 用户指针与地址空间访问 | 128 |
-| U6 | 诊断路径的有限现场读取 | 36 |
+| U6 | 诊断路径的有限现场读取 | 43 |
 
 ### capability/handle
 
@@ -883,3 +883,23 @@ ADR-201：定时器的 128 条 `Slot` 进 `.bss`，八处指针都指向 `TABLE`
 | U5 | 418 | `match unsafe { rt::handle_of_role(c.si_va, rt::ROLE_JOB) } { Some(h) => Some(h), None => {` |
 | U5 | 700 | `let sleep_h = match unsafe { rt::handle_of_role(c.si_va, rt::ROLE_SELF_PROC) } { Some(h) => h, None => {` |
 | U5 | 933 | `let h = match unsafe { rt::handle_of_role(c.si_va, rt::ROLE_SELF_PROC) } { Some(h) => h, None => {` |
+
+### capture
+
+ADR-247 主内核捕获交接与共享 ABI：U1 9（CLI/RSP/RBP、栈切换与第二内核跳转），U2 11（8 MiB 固定 capture 区、HHDM 拷贝、静态物理地址翻译），U4 10（每 CPU UnsafeCell 栈/快照与 BootInfo 单写者）。所有 AP 停车前只写自身槽；旧栈 `Site`/`TrapFrame` 在切栈后复制，捕获终点不返回。
+
+### capture/ahci
+
+U2 5：首 4 GiB HHDM 内的 AHCI MMIO 与 256 KiB DMA 别名；范围、页对齐、32 位 ABAR 边界先验，volatile 访问，单 leader，AP 已停车。
+
+### capture/paging
+
+U1 2（CR3 写/读），U2 2（capture `.bss` 内静态页表与 HHDM/UC 叶子）：表项在切 CR3 前单线程发布，镜像 VA/PA 差固定，切后不再修改。
+
+### capture/serial
+
+U1 3：16550 与 isa-debug-exit 端口 I/O；无内存解引用，IF 已关，THRE 等待有界。
+
+### diag/exit
+
+U1 1：启动期安装的 `extern "C"` 函数指针经 `transmute` 取出；U2 2：调用 capture 入口与停止循环。安装发生在 capture 初始化成功后，失败路径不调用空指针。
