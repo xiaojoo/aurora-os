@@ -2162,6 +2162,237 @@ fn t_read_cached_equiv() -> bool {
 #[cfg(feature = "handles")]
 ktest!(KT_READ_CACHED_EQUIV, t_read_cached_equiv);
 
+/// ADR-250：未命中读盘期间发生失效，迟到旧字节不得重新填表。
+#[cfg(feature = "handles")]
+fn t_cache_invalidate_inflight() -> bool {
+    use crate::filesystem::vfs::{Block, BlockError, MemDisk, SECTOR_BYTES};
+    use crate::filesystem::vfs_ro;
+
+    struct InvalidateDuringRead<'a> {
+        img: &'a [u8],
+        invalidate: core::cell::Cell<bool>,
+    }
+    impl Block for InvalidateDuringRead<'_> {
+        fn read_sectors(&self, lba: u64, dst: &mut [u8]) -> Result<(), BlockError> {
+            let invalidate = self.invalidate.replace(false);
+            let result = MemDisk { img: self.img }.read_sectors(lba, dst);
+            if invalidate {
+                vfs_ro::cache_invalidate();
+            }
+            result
+        }
+    }
+
+    static mut IMG: [u8; SECTOR_BYTES] = [0; SECTOR_BYTES];
+    // SAFETY: 单核判据路径。
+    let img: &mut [u8] = unsafe { &mut *core::ptr::addr_of_mut!(IMG) };
+    for (i, b) in img.iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(37).wrapping_add(11);
+    }
+    vfs_ro::cache_clear();
+    let disk = InvalidateDuringRead { img, invalidate: core::cell::Cell::new(true) };
+    let calls0 = crate::filesystem::vfs::memdisk_read_calls();
+    let mut first = [0u8; SECTOR_BYTES];
+    let first_ok = vfs_ro::cached_read(&disk, 0x51A7, 0, &mut first).is_ok();
+    let calls1 = crate::filesystem::vfs::memdisk_read_calls();
+    let no_late_fill = first_ok && calls1 == calls0 + 1 && vfs_ro::cache_used() == 0;
+
+    let mut second = [0u8; SECTOR_BYTES];
+    let second_ok = vfs_ro::cached_read(&disk, 0x51A7, 0, &mut second).is_ok();
+    let calls2 = crate::filesystem::vfs::memdisk_read_calls();
+    let next_miss = second_ok && first == second && calls2 == calls1 + 1 && vfs_ro::cache_used() == 1;
+    vfs_ro::cache_clear();
+    crate::log_info!(
+        "cache-inflight: 迟到不填={} 次读真未中={} 请求{}->{}->{} ⇒ {}",
+        no_late_fill, next_miss, calls0, calls1, calls2, no_late_fill && next_miss
+    );
+    no_late_fill && next_miss
+}
+#[cfg(feature = "handles")]
+ktest!(KT_CACHE_INVALIDATE_INFLIGHT, t_cache_invalidate_inflight);
+
+/// ADR-250：热缓存命中前仍必须过设备健康闸。
+#[cfg(feature = "handles")]
+fn t_cache_health_guard() -> bool {
+    use crate::filesystem::vfs::{Block, BlockError, MemDisk, Partition, PartitionView, SECTOR_BYTES};
+    use crate::filesystem::vfs_ro;
+
+    struct HealthDisk<'a> {
+        img: &'a [u8],
+        healthy: core::cell::Cell<bool>,
+    }
+    impl Block for HealthDisk<'_> {
+        fn read_sectors(&self, lba: u64, dst: &mut [u8]) -> Result<(), BlockError> {
+            MemDisk { img: self.img }.read_sectors(lba, dst)
+        }
+        fn ensure_readable(&self) -> Result<(), BlockError> {
+            if self.healthy.get() { Ok(()) } else { Err(BlockError::Quarantined) }
+        }
+    }
+
+    let img = [0x5au8; SECTOR_BYTES];
+    let disk = HealthDisk { img: &img, healthy: core::cell::Cell::new(true) };
+    let view = PartitionView { inner: &disk, part: Partition { base: 0, last: 0 } };
+    vfs_ro::cache_clear();
+    let mut out = [0u8; SECTOR_BYTES];
+    let cold = vfs_ro::cached_read(&view, 0x4EA1, 0, &mut out).is_ok();
+    let calls = crate::filesystem::vfs::memdisk_read_calls();
+    disk.healthy.set(false);
+    let blocked = vfs_ro::cached_read(&view, 0x4EA1, 0, &mut out) == Err(BlockError::Quarantined);
+    let no_io = crate::filesystem::vfs::memdisk_read_calls() == calls;
+    disk.healthy.set(true);
+    let recovered = vfs_ro::cached_read(&view, 0x4EA1, 0, &mut out).is_ok() && out == img;
+    let empty = PartitionView { inner: &disk, part: Partition { base: 1, last: 0 } };
+    let empty_blocked = vfs_ro::cached_read(&empty, 0x4EA1, 0, &mut out) == Err(BlockError::BeyondPartition);
+    vfs_ro::cache_clear();
+    crate::log_info!("cache-health: 冷读={} 隔离拒={} 不碰盘={} 恢复={} 空区拒={} ⇒ {}",
+        cold, blocked, no_io, recovered, empty_blocked, cold && blocked && no_io && recovered && empty_blocked);
+    cold && blocked && no_io && recovered && empty_blocked
+}
+#[cfg(feature = "handles")]
+ktest!(KT_CACHE_HEALTH_GUARD, t_cache_health_guard);
+
+/// ADR-250：同盘同几何换内容后，重新挂载必须清掉上一卷页缓存。
+#[cfg(feature = "handles")]
+fn t_cache_remount_invalidates() -> bool {
+    use crate::filesystem::vfs_ro;
+
+    let mut img = [0u8; F32_VOL_BYTES];
+    make_image32(&mut img);
+    let disk = RwDisk::new(&mut img);
+    let fs1 = match ReadOnlyFs::mount(&disk) {
+        Ok(fs) => fs,
+        Err(_) => return false,
+    };
+    let entry = match fs1.lookup("/SUB/INNER.TXT") {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+    let mut cur = match fs1.open(&entry) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let vol = vfs_ro::volume_fingerprint_pub(&disk, &cur.bpb());
+    let mut before = [0u8; FILE_INNER_LEN];
+    let cold = vfs_ro::read_disk_cached(&disk, vol, &mut cur, &mut before).is_ok();
+
+    let mut sector = [0u8; SECTOR_BYTES];
+    if disk.read_sectors(F32_INNER_LBA as u64, &mut sector).is_err() {
+        return false;
+    }
+    sector[0] ^= 0xff;
+    if disk.write_sectors(F32_INNER_LBA as u64, &sector).is_err() {
+        return false;
+    }
+    let fs2 = match ReadOnlyFs::mount(&disk) {
+        Ok(fs) => fs,
+        Err(_) => return false,
+    };
+    let entry2 = match fs2.lookup("/SUB/INNER.TXT") {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+    let mut cur2 = match fs2.open(&entry2) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let mut after = [0u8; FILE_INNER_LEN];
+    let reread = vfs_ro::read_disk_cached(&disk, vol, &mut cur2, &mut after).is_ok();
+    let fresh = reread && after[0] == sector[0] && after != before;
+    vfs_ro::cache_clear();
+    crate::log_info!("cache-remount: 冷读={} 换内容={} 重挂见新={} ⇒ {}",
+        cold, sector[0] != before[0], fresh, cold && fresh);
+    cold && fresh
+}
+#[cfg(feature = "handles")]
+ktest!(KT_CACHE_REMOUNT_INVALIDATES, t_cache_remount_invalidates);
+
+/// ADR-250：写返回失败也可能已落盘，失效必须覆盖失败分支。
+#[cfg(feature = "handles")]
+fn t_cache_failed_write_invalidates() -> bool {
+    use crate::filesystem::vfs::{Block, BlockError, SECTOR_BYTES};
+    use crate::filesystem::vfs_ro;
+
+    struct AmbiguousWriteDisk<'a> {
+        img: core::cell::RefCell<&'a mut [u8]>,
+        fail: core::cell::Cell<bool>,
+        probe_vol: core::cell::Cell<u64>,
+    }
+    impl Block for AmbiguousWriteDisk<'_> {
+        fn read_sectors(&self, lba: u64, dst: &mut [u8]) -> Result<(), BlockError> {
+            let img = self.img.borrow();
+            let start = lba as usize * SECTOR_BYTES;
+            let end = start + dst.len();
+            if dst.is_empty() || dst.len() % SECTOR_BYTES != 0 || end > img.len() {
+                return Err(BlockError::Refused);
+            }
+            dst.copy_from_slice(&img[start..end]);
+            Ok(())
+        }
+        fn write_sectors(&self, lba: u64, src: &[u8]) -> Result<(), BlockError> {
+            let mut img = self.img.borrow_mut();
+            let start = lba as usize * SECTOR_BYTES;
+            let end = start + src.len();
+            if src.is_empty() || src.len() % SECTOR_BYTES != 0 || end > img.len() {
+                return Err(BlockError::Refused);
+            }
+            img[start..end].copy_from_slice(src);
+            drop(img);
+            // 写调用期间填进另一扇区：正确实现必须在写返回后把它一起失效。
+            let probe_vol = self.probe_vol.get();
+            if probe_vol != 0 {
+                let mut probe = [0u8; SECTOR_BYTES];
+                let _ = vfs_ro::cached_read(self, probe_vol, lba + 1, &mut probe);
+            }
+            if self.fail.get() { Err(BlockError::DeviceError) } else { Ok(()) }
+        }
+    }
+
+    let mut img = [0u8; F32_VOL_BYTES];
+    make_image32(&mut img);
+    // 把 INNER.TXT 扩成两扇区，并接上簇 6；只改夹具，不改产品解析器。
+    put32(&mut img, F32_SUB_LBA * SECTOR + 2 * 32 + 28, 1024);
+    fat_set32(&mut img, 5, 6);
+    fat_set32(&mut img, 6, 0x0fff_ffff);
+    let disk = AmbiguousWriteDisk {
+        img: core::cell::RefCell::new(&mut img),
+        fail: core::cell::Cell::new(true),
+        probe_vol: core::cell::Cell::new(0),
+    };
+    let fs = match ReadOnlyFs::mount(&disk) {
+        Ok(fs) => fs,
+        Err(_) => return false,
+    };
+    let entry = match fs.lookup("/SUB/INNER.TXT") {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+    let mut cur = match fs.open(&entry) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let vol = vfs_ro::volume_fingerprint_pub(&disk, &cur.bpb());
+    disk.probe_vol.set(vol);
+    let mut old = [0u8; SECTOR_BYTES];
+    if vfs_ro::cached_read(&disk, vol, F32_INNER_LBA as u64, &mut old).is_err() {
+        return false;
+    }
+    let src = [0xa5u8; SECTOR_BYTES];
+    let write = vfs_ro::write_at(&disk, &mut cur, &src);
+    let invalidated = write == Err(VfsError::Fs(FsError::Io(BlockError::DeviceError)))
+        && vfs_ro::cache_used() == 0;
+    disk.fail.set(false);
+    let mut after = [0u8; SECTOR_BYTES];
+    let reread = vfs_ro::read_disk_cached(&disk, vol, &mut cur, &mut after);
+    let fresh = reread == Ok(SECTOR_BYTES) && after == src && after != old;
+    vfs_ro::cache_clear();
+    crate::log_info!("cache-failed-write: 失败={:?} 已失效={} 重读新={} ⇒ {}",
+        write, invalidated, fresh, invalidated && fresh);
+    invalidated && fresh
+}
+#[cfg(feature = "handles")]
+ktest!(KT_CACHE_FAILED_WRITE_INVALIDATES, t_cache_failed_write_invalidates);
+
 /// ADR-220：**三层联动**的证人。
 ///
 /// ## 要证什么

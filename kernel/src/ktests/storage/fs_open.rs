@@ -1051,6 +1051,7 @@ fn t_fs_open_dup_shared() -> bool {
         Ok(c) => c,
         Err(_) => return false,
     };
+    let vol = vfs_ro::volume_fingerprint_pub(&disk, &cur.bpb());
     let h1 = match handle::grant_vfs_file(
         ident,
         fs_open::PORT,
@@ -1058,18 +1059,34 @@ fn t_fs_open_dup_shared() -> bool {
         cur,
         st,
         handle::RIGHT_READ | handle::RIGHT_DUP,
-        0u64, // vol：容量测试不关心卷身份
+        vol,
     ) {
         Ok(h) => h,
         Err(_) => return false,
     };
+    vfs_ro::cache_clear();
+    let key = crate::filesystem::vfs::DiskKey::Ahci(fs_open::PORT);
+    let req0 = crate::filesystem::block_io::stats_of(key).requests;
     let mut a = [0u8; 16];
     let first = handle::read(h1, ident, &mut a) == Ok(16) && a == refb[..16];
+    let req1 = crate::filesystem::block_io::stats_of(key).requests;
+    let (hits1, misses1, _) = vfs_ro::cache_stats();
+    let cold = first && req1 > req0 && misses1 > 0;
+
+    // 产品句柄重读同一扇区：必须零新增块请求，且缓存命中数确实上涨。
+    let seek0 = handle::seek(h1, ident, 0) == Ok(0);
+    let mut warm_buf = [0u8; 16];
+    let warm_read = handle::read(h1, ident, &mut warm_buf) == Ok(16) && warm_buf == refb[..16];
+    let req2 = crate::filesystem::block_io::stats_of(key).requests;
+    let (hits2, misses2, _) = vfs_ro::cache_stats();
+    let warm = seek0 && warm_read && req2 == req1 && hits2 > hits1 && misses2 == misses1;
+    let seek16 = handle::seek(h1, ident, 16) == Ok(16);
+
     let h2 = match handle::dup(h1, ident, handle::RIGHT_READ) {
         Ok(h) => h,
         Err(_) => return false,
     };
-    // 同一条顺序：dup 之后先让原名字推进，再读第二个名字（复制语义会读到 16..32）。
+    // 同一条顺序：dup 之后先让原名字推进，再读第二个名字（共享语义应读 32..48）。
     let mut b = [0u8; 16];
     let advanced = handle::read(h1, ident, &mut b) == Ok(16) && b == refb[16..32];
     let mut c = [0u8; 16];
@@ -1079,10 +1096,10 @@ fn t_fs_open_dup_shared() -> bool {
     let survive = handle::read(h2, ident, &mut d) == Ok(16) && d == refb[48..64];
     let closed2 = handle::close(h2, ident).is_ok();
     crate::log_info!(
-        "fs-open-dup: 首读={} 原名字推进={} 第二名字共享={} 关一条仍续读={} 端点={}",
-        first, advanced, shared, survive, closed1 && closed2
+        "fs-open-dup: 首读={} 产品缓存冷={} 产品缓存热={} 请求{}->{}->{} 命中{}->{} 原名字推进={} 第二名字共享={} 关一条仍续读={} 端点={}",
+        first, cold, warm, req0, req1, req2, hits1, hits2, advanced, shared, survive, closed1 && closed2
     );
-    first && advanced && shared && survive && closed1 && closed2
+    cold && warm && seek16 && advanced && shared && survive && closed1 && closed2
 }
 ktest!(KT_FS_OPEN_DUP_SHARED, t_fs_open_dup_shared);
 

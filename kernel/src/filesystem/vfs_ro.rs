@@ -357,6 +357,8 @@ impl<'a> ReadOnlyFs<'a> {
                 //
                 // 清一次的代价是 64 条 `Entry` 的零填充（~19 KiB），只在 mount 时做。
                 dentry_clear();
+                // 同盘同几何也可能已换内容；挂载是新卷边界，页缓存必须一起失效。
+                cache_clear();
                 ReadOnlyFs { vol, vol_id }
             })
             .map_err(VfsError::Fs)
@@ -1018,6 +1020,7 @@ pub fn read_disk_cached(
                         next,
                     }));
                 }
+                data_lba(&v, next)?;
                 pending.cluster = next;
                 pending.clusters += 1;
             }
@@ -1115,7 +1118,9 @@ fn fat_set_disk(disk: &dyn Block, v: &Bpb, cluster: u32, value: u32) -> Result<(
             let merged = (old & !v.cluster_mask) | (value & v.cluster_mask);
             sec[in_sec..in_sec + 4].copy_from_slice(&merged.to_le_bytes());
         }
-        disk.write_sectors(lba, &sec).map_err(FsError::Io)?;
+        let written = disk.write_sectors(lba, &sec);
+        cache_invalidate();
+        written.map_err(FsError::Io)?;
     }
     Ok(())
 }
@@ -1292,7 +1297,9 @@ pub fn create_in_dir(
     e[OFF_CLUSTER_LO..OFF_CLUSTER_LO + 2].copy_from_slice(&0u16.to_le_bytes());
     e[OFF_SIZE..OFF_SIZE + 4].copy_from_slice(&0u32.to_le_bytes());
     sec[off..off + DIR_ENTRY].copy_from_slice(&e);
-    disk.write_sectors(lba, &sec).map_err(io)?;
+    let written = disk.write_sectors(lba, &sec);
+    cache_invalidate();
+    written.map_err(io)?;
     Ok((lba, off))
 }
 
@@ -1349,7 +1356,9 @@ pub fn unlink_in_dir(
                 let first_cluster = (hi << 16) | lo;
                 sec[off] = DIR_FREED;
                 dirty = true;
-                disk.write_sectors(lba, &sec).map_err(io)?;
+                let written = disk.write_sectors(lba, &sec);
+                cache_invalidate();
+                written.map_err(io)?;
                 // 释放簇链：**目录项先落盘再放链**。
                 // 反过来的话，中途掉电会留下一条「指向已释放簇的目录项」——
                 // 那是比泄漏更糟的形状（读它会读到别人的数据）。
@@ -1465,14 +1474,16 @@ pub fn write_at(disk: &dyn Block, cur: &mut ReadCursor, src: &[u8]) -> Result<us
         let in_sector = pos % SECTOR_BYTES;
         let lba = base + (off_in_cluster / SECTOR_BYTES) as u64;
         let take = core::cmp::min(SECTOR_BYTES - in_sector, src.len() - done);
-        if in_sector != 0 || take != SECTOR_BYTES {
+        let written = if in_sector != 0 || take != SECTOR_BYTES {
             let mut sec = [0u8; SECTOR_BYTES];
             block_io::read_checked(disk, lba, &mut sec, &block_io::Budget::UNBOUNDED).map_err(io)?;
             sec[in_sector..in_sector + take].copy_from_slice(&src[done..done + take]);
-            disk.write_sectors(lba, &sec).map_err(io)?;
+            disk.write_sectors(lba, &sec)
         } else {
-            disk.write_sectors(lba, &src[done..done + take]).map_err(io)?;
-        }
+            disk.write_sectors(lba, &src[done..done + take])
+        };
+        cache_invalidate();
+        written.map_err(io)?;
         done += take;
         cur.position += take as u32;
     }
@@ -2046,6 +2057,8 @@ struct PageCache {
     hits: u32,
     misses: u32,
     evicted: u32,
+    /// 每次失效递增；未命中读盘后必须仍是同一代，才能填表。
+    generation: u64,
 }
 
 struct PageCacheCell(core::cell::UnsafeCell<PageCache>);
@@ -2058,6 +2071,7 @@ static PAGES: PageCacheCell = PageCacheCell(core::cell::UnsafeCell::new(PageCach
     hits: 0,
     misses: 0,
     evicted: 0,
+    generation: 0,
 }));
 
 static CACHE_LOCK: crate::sync::IrqSpinLock<()> =
@@ -2075,8 +2089,10 @@ static CACHE_LOCK: crate::sync::IrqSpinLock<()> =
 ///
 /// 与 dentry / inode / superblock 同一条教训：**不带卷指纹就会串**。
 pub fn cached_read(disk: &dyn Block, vol: u64, lba: u64, out: &mut [u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+    // 热缓存也不能掩盖端口隔离或空分区；健康闸必须先于命中返回。
+    disk.ensure_readable()?;
     // 先查缓存（锁内只查表，不碰设备）
-    {
+    let generation = {
         let _g = CACHE_LOCK.lock();
         // SAFETY: 持锁期间独占。
         let c = unsafe { &mut *PAGES.0.get() };
@@ -2091,7 +2107,8 @@ pub fn cached_read(disk: &dyn Block, vol: u64, lba: u64, out: &mut [u8; SECTOR_B
             }
         }
         c.misses += 1;
-    }
+        c.generation
+    };
     // 未命中：读盘（锁外）
     let mut buf = [0u8; SECTOR_BYTES];
     block_io::read_checked(disk, lba, &mut buf, &block_io::Budget::UNBOUNDED)?;
@@ -2101,6 +2118,10 @@ pub fn cached_read(disk: &dyn Block, vol: u64, lba: u64, out: &mut [u8; SECTOR_B
         let _g = CACHE_LOCK.lock();
         // SAFETY: 持锁期间独占。
         let c = unsafe { &mut *PAGES.0.get() };
+        // 读盘期间发生写入/清表 ⇒ 这次旧字节仍可交付，但不能重新填回缓存。
+        if c.generation != generation {
+            return Ok(());
+        }
         c.clock = c.clock.wrapping_add(1);
         let now = c.clock;
         // 先找空位
@@ -2141,6 +2162,17 @@ pub fn cache_used() -> usize {
     c.slots.iter().filter(|s| s.valid).count()
 }
 
+/// 失效全部页缓存；写路径与判据共用。不清累计计数。
+pub(crate) fn cache_invalidate() {
+    let _g = CACHE_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let c = unsafe { &mut *PAGES.0.get() };
+    for s in c.slots.iter_mut() {
+        *s = CACHE_EMPTY;
+    }
+    c.generation = c.generation.wrapping_add(1);
+}
+
 /// 清空页缓存（判据用）。
 pub fn cache_clear() {
     let _g = CACHE_LOCK.lock();
@@ -2149,6 +2181,7 @@ pub fn cache_clear() {
     for s in c.slots.iter_mut() {
         *s = CACHE_EMPTY;
     }
+    c.generation = c.generation.wrapping_add(1);
     c.clock = 0;
     c.hits = 0;
     c.misses = 0;

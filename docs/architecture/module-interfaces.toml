@@ -810,7 +810,7 @@ public_api = [
   "fs_rw::PORT", "filesystem::fs_rw", "fs_open::STAT_KIND_FILE", "fs_open::STAT_RECORD_LEN",
   "fs_open::dirent_record", "fs_open::open", "fs_open::stat_record", "vfs_ro::DirState",
   "vfs_ro::Entry", "vfs_ro::PATH_MAX", "vfs_ro::ReadCursor", "vfs_ro::ReadOnlyFs",
-  "vfs_ro::VfsError", "vfs_ro::read_disk", "vfs_ro::seek_disk", "vfs_ro::write_at", "vfs_ro::create_in_dir", "vfs_ro::unlink_in_dir", "fs_rw::disk", "fs_rw::mount", "vfs_ro::PATH_MAX",
+  "vfs_ro::VfsError", "vfs_ro::read_disk", "vfs_ro::read_disk_cached", "vfs_ro::seek_disk", "vfs_ro::write_at", "vfs_ro::create_in_dir", "vfs_ro::unlink_in_dir", "fs_rw::disk", "fs_rw::mount", "vfs_ro::PATH_MAX",
   "fat32::EOC_MARKER", "fat32::FAT16_EOC_MARKER",
   "block_io::Budget", "block_io::read_checked", "vfs::Block", "vfs::BlockError",
   "vfs::FileStat", "vfs::Partition", "vfs::PartitionView", "vfs::DiskKey",

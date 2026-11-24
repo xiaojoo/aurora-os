@@ -205,9 +205,9 @@ pub enum ObjRef {
         cursor: ReadCursor,
         stat: VfsEntry,
         share: Option<u8>,
-        /// **卷指纹**（ADR-221）：读路径要用它走页缓存。
+        /// **缓存命名空间**（ADR-221/250）：卷指纹加上分区区间。
         ///
-        /// 没有它就只能走不缓存的 `read_disk` —— 而缓存版要 `(vol, lba)` 才能命中。
+        /// 分区视图的 LBA 是相对地址；不带区间会让同口不同分区甚至空分区串缓存。
         vol: u64,
     },
     /// 目录句柄不内嵌 `DirCursor`（那会把每槽撑到 1.5 KiB）；`DirState` 是可复制的紧凑游标。
@@ -983,6 +983,95 @@ pub fn grant_file_at(
 
 /// FS-03：打开好的 VFS 文件句柄。`stat` 是打开那一刻的目录项读数，不是实时元数据。
 #[cfg(feature = "fs-open")]
+fn vfs_cache_vol(vol: u64, part: Option<Partition>) -> u64 {
+    let Some(part) = part else {
+        return vol;
+    };
+    let mut h = vol ^ 0x7061_7274_6974_696f;
+    for value in [part.base, part.last] {
+        h = h.wrapping_mul(0x0100_0000_01b3).wrapping_add(value);
+    }
+    h
+}
+
+#[cfg(feature = "fs-open")]
+mod vfs_cache_tests {
+    use super::*;
+
+    pub fn t_vfs_cache_identity() -> bool {
+        let raw = 0x5eed_1234_8765_4321;
+        let whole = vfs_cache_vol(raw, None);
+        let p1 = vfs_cache_vol(raw, Some(Partition { base: 10, last: 19 }));
+        let base_changed = vfs_cache_vol(raw, Some(Partition { base: 11, last: 19 }));
+        let last_changed = vfs_cache_vol(raw, Some(Partition { base: 10, last: 20 }));
+        let other = vfs_cache_vol(raw, Some(Partition { base: 20, last: 29 }));
+        let empty = vfs_cache_vol(raw, Some(Partition { base: 1, last: 0 }));
+        let pure = whole != p1 && p1 != base_changed && p1 != last_changed
+            && p1 != other && p1 != empty && base_changed != last_changed;
+
+        use crate::filesystem::vfs::{Block, BlockError, MemDisk, PartitionView};
+        struct PatternDisk;
+        impl Block for PatternDisk {
+            fn read_sectors(&self, lba: u64, dst: &mut [u8]) -> Result<(), BlockError> {
+                dst.fill(if lba < 4096 { 0x11 } else { 0x22 });
+                Ok(())
+            }
+        }
+        fn read_part(h: Handle, part: Partition, dst: &mut [u8]) -> Result<usize, HErr> {
+            let mut ticket = begin_read(h, (5, 77))?;
+            let view = PartitionView { inner: &PatternDisk, part };
+            let n = ticket.read_chunk(&view, dst)?;
+            finish(ticket, n)?;
+            Ok(n)
+        }
+
+        let img = include_bytes!("../../fixtures/fat32-mem.img");
+        let mem = MemDisk { img };
+        let fs = match vfs_ro::ReadOnlyFs::mount(&mem) {
+            Ok(fs) => fs,
+            Err(_) => return false,
+        };
+        let stat = match fs.lookup("/SHORTCHN.BIN") {
+            Ok(e) => e,
+            Err(_) => return false,
+        };
+        let cursor = match fs.open(&stat) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        let vol = vfs_ro::volume_fingerprint_pub(&mem, &cursor.bpb());
+        reset_for_test();
+        let part1 = Partition { base: 0, last: 4095 };
+        let part2 = Partition { base: 4096, last: 8191 };
+        let h1 = match grant_vfs_file((5, 77), 0, Some(part1), cursor, stat, RIGHT_READ, vol) {
+            Ok(h) => h,
+            Err(_) => return false,
+        };
+        let h2 = match grant_vfs_file((5, 77), 0, Some(part2), cursor, stat, RIGHT_READ, vol) {
+            Ok(h) => h,
+            Err(_) => { let _ = close(h1, (5, 77)); return false; }
+        };
+        vfs_ro::cache_clear();
+        let mut a = [0u8; 16];
+        let mut b = [0u8; 16];
+        let r1 = read_part(h1, part1, &mut a);
+        let r2 = read_part(h2, part2, &mut b);
+        let integrated = r1 == Ok(16) && r2 == Ok(16) && a[0] == 0x11 && b[0] == 0x22;
+        let c1 = close(h1, (5, 77)).is_ok();
+        let c2 = close(h2, (5, 77)).is_ok();
+        vfs_ro::cache_clear();
+        crate::log_info!(
+            "vfs-cache-id: 整盘异区={} base有效={} last有效={} 区间有效={} 空区有效={} 产品接入={} 关={} ⇒ {}",
+            whole != p1, p1 != base_changed, p1 != last_changed, p1 != other, p1 != empty,
+            integrated, c1 && c2, pure && integrated && c1 && c2
+        );
+        pure && integrated && c1 && c2
+    }
+
+    crate::ktest!(KT_VFS_CACHE_IDENTITY, t_vfs_cache_identity);
+}
+
+#[cfg(feature = "fs-open")]
 pub fn grant_vfs_file(
     owner: (usize, u32),
     port: u8,
@@ -992,6 +1081,7 @@ pub fn grant_vfs_file(
     rights: u32,
     vol: u64,
 ) -> Result<Handle, HErr> {
+    let vol = vfs_cache_vol(vol, part);
     let mut g = TABLE.lock();
     insert(g.get(), owner, rights, ObjRef::VfsFile { port, part, cursor, stat, share: None, vol })
 }
@@ -1653,19 +1743,8 @@ impl ReadTicket {
             ReadTicketKind::Fat(ref mut c) => c.read(disk, dst).map_err(HErr::Io),
             #[cfg(feature = "fs-open")]
             ReadTicketKind::Vfs(ref mut c, vol) => {
-                // **保持不缓存版**（ADR-238 实测）：
-                //
-                // 锁序前提已满足（ADR-222 把 `XFER` 改成 `GROW(4)`），
-                // 但**实测启用缓存让失败率从 4/20 涨到 7/20**：
-                //
-                //   `handles,fs-open` 无缓存：4/20
-                //   `handles,fs-open` 有缓存：**7/20**
-                //
-                // 缓存改变了读路径的时序，加剧了那条既有竞态（ADR-228~237：
-                // 探针自己的页在被回收后仍被读）。
-                //
-                // **缓存不能以稳定性为代价** —— 等那条竞态修好再启用。
-                let n = vfs_ro::read_disk(disk, c, dst).map_err(vfs_to_herr)?;
+                // ADR-250：产品读统一走缓存；vol 在 open 时由真实盘身份与 BPB 算出。
+                let n = vfs_ro::read_disk_cached(disk, vol, c, dst).map_err(vfs_to_herr)?;
                 Ok(n)
             }
         }

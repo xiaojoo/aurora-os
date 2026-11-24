@@ -1116,10 +1116,25 @@ fn t_ahci_recovery() -> bool {
             break;
         }
     }
+    let health_disk = crate::filesystem::vfs::AhciDisk { port: vi };
+    let health_view = crate::filesystem::vfs::PartitionView {
+        inner: &health_disk,
+        part: crate::filesystem::vfs::Partition { base: 0, last: 0 },
+    };
+    let health_blocked = <crate::filesystem::vfs::AhciDisk as crate::filesystem::vfs::Block>::ensure_readable(&health_disk)
+        == Err(crate::filesystem::vfs::BlockError::Quarantined)
+        && <crate::filesystem::vfs::PartitionView<'_> as crate::filesystem::vfs::Block>::ensure_readable(&health_view)
+            == Err(crate::filesystem::vfs::BlockError::Quarantined);
+    crate::log_info!("recover: 缓存健康闸 AHCI={} 分区={} ⇒ {}",
+        <crate::filesystem::vfs::AhciDisk as crate::filesystem::vfs::Block>::ensure_readable(&health_disk).is_err(),
+        <crate::filesystem::vfs::PartitionView<'_> as crate::filesystem::vfs::Block>::ensure_readable(&health_view).is_err(),
+        health_blocked);
+
     // 隔离之后再发一条：必须"没下发就返回"，于是 `resets` 一格都不该再动
     let post = ahci::read_lba(vi, 4096, 1);
     let s3 = ahci::stats();
     let fails_fast = quarantined
+        && health_blocked
         && matches!(post, Err(ahci::AhciError::Quarantined))
         && s3.resets == resets_at
         && s3.quarantines == st0.quarantines + 1

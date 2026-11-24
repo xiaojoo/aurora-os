@@ -192,7 +192,7 @@ fn t_fs_rw_syscall23() -> bool {
             return false;
         }
     };
-    // 第三格：授一个**空分区区间**（0..=0）的文件句柄。读在翻译之前就会被 `PartitionView` 拒，
+    // 第三格：授一个**空区间**（base=1, last=0, sectors=0）的文件句柄。读在翻译之前就会被 `PartitionView` 拒，
     // 所以这是确定性的盘侧失败（不需要真让 AHCI 坏掉），专门量"块失败 ⇒ -7"（BACKLOG §364）。
     let ghost_cur = match fs.open(&log) {
         Ok(c) => c,
@@ -206,7 +206,7 @@ fn t_fs_rw_syscall23() -> bool {
     let hbad = match handle::grant_vfs_file(
         ident,
         fs_rw::PORT,
-        Some(crate::filesystem::vfs::Partition { base: 0, last: 0 }),
+        Some(crate::filesystem::vfs::Partition { base: 1, last: 0 }),
         ghost_cur,
         log,
         RIGHT_READ,
@@ -247,12 +247,14 @@ fn syscall23_cells(hw: Handle, hr: Handle, hbad: Handle) -> bool {
     };
     let mut fr = frame0();
     let mut ok = true;
+    vfs_ro::cache_clear();
 
     // 基线：经 10 号读整份 LOG.TXT，并确认游标到了 EOF。
     let base_n = call(&mut fr, user::SYS_FILE_READ, hw.0, va.0, LOG_LEN as u64);
     let mut before = [0u8; LOG_LEN];
     let base_ok = base_n == LOG_LEN as u64 && get_user(va.0, 0, &mut before);
-    ok &= base_ok;
+    let cache_warm = base_ok && vfs_ro::cache_used() > 0;
+    ok &= base_ok && cache_warm;
     ok &= call(&mut fr, user::SYS_FILE_READ, hw.0, va.0, 1) == 0;
 
     // 写 [4,8)：偏移刻意避开 `t_fs_rw_write` 那格的 [8,12)，两条用例不依赖链接顺序。
@@ -318,7 +320,7 @@ fn syscall23_cells(hw: Handle, hr: Handle, hbad: Handle) -> bool {
 
     let live = handle::used();
     crate::log_info!(
-        "fs-rw-23: 写4={} 空写={} 越EOF={} 只读句柄={} 坏指针={} 盘失败={} 读回={} 内容对={} 基线={} 关={} 关后活={}",
+        "fs-rw-23: 写4={} 空写={} 越EOF={} 只读句柄={} 坏指针={} 盘失败={} 读回={} 内容对={} 基线={} 缓存预热={} 关={} 关后活={}",
         wrote,
         empty as i64,
         over as i64,
@@ -328,6 +330,7 @@ fn syscall23_cells(hw: Handle, hr: Handle, hbad: Handle) -> bool {
         read_n,
         cells_ok,
         base_ok,
+        cache_warm,
         c1 == 0 && c2 == 0 && c3 == 0,
         live
     );

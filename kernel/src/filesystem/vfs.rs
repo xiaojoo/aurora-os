@@ -80,6 +80,13 @@ impl Block for PartitionView<'_> {
         self.inner.read_sectors(abs, dst)
     }
 
+    fn ensure_readable(&self) -> Result<(), BlockError> {
+        if self.part.last < self.part.base {
+            return Err(BlockError::BeyondPartition);
+        }
+        self.inner.ensure_readable()
+    }
+
     /// 分区不是一台盘：身份原样取内层（ADR-113）。同一个口上的两个分区落同一桶。
     fn disk_key(&self) -> DiskKey {
         self.inner.disk_key()
@@ -150,6 +157,11 @@ pub trait Block {
         Err(BlockError::Refused)
     }
 
+    /// 缓存命中前也必须过的设备健康闸；默认实现没有额外隔离状态。
+    fn ensure_readable(&self) -> Result<(), BlockError> {
+        Ok(())
+    }
+
     /// 请求层给这台盘分桶用的身份（ADR-113）。默认"未知"：
     /// 新增一个夹具/测试盘不必为了编译去编一个假身份，而真驱动一律覆写它。
     fn disk_key(&self) -> DiskKey {
@@ -214,6 +226,14 @@ impl Block for AhciDisk {
             ahci::write_bytes(self.port, lba + i as u64, chunk).map_err(block_err)?;
         }
         Ok(())
+    }
+
+    fn ensure_readable(&self) -> Result<(), BlockError> {
+        if ahci::state(self.port) == ahci::State::Quarantined {
+            Err(BlockError::Quarantined)
+        } else {
+            Ok(())
+        }
     }
 
     fn disk_key(&self) -> DiskKey {

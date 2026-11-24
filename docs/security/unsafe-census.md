@@ -5,16 +5,16 @@
 >
 > **2026-11-20（ADR-175 跨 AS 读走物理地址）**：`sched/user` U2 9 → 10（`copy_from_user_in` 里 HHDM 别名的单字节读）。**总数 +1**（530 → 531）。
 
-总计 705 处。U1 104 · U2 183 · U3 13 · U4 234 · U5 128 · U6 43
+总计 707 处。U1 104 · U2 183 · U3 13 · U4 235 · U5 128 · U6 44
 
 | 类别 | 含义 | 处数 |
 |---|---|---|
 | U1 | 架构入口与特殊寄存器 | 104 |
 | U2 | 页表、物理内存与 MMIO | 183 |
 | U3 | DMA 与设备共享内存 | 13 |
-| U4 | 并发共享状态与 UnsafeCell | 234 |
+| U4 | 并发共享状态与 UnsafeCell | 235 |
 | U5 | 用户指针与地址空间访问 | 128 |
-| U6 | 诊断路径的有限现场读取 | 43 |
+| U6 | 诊断路径的有限现场读取 | 44 |
 
 ### capability/handle
 
@@ -53,10 +53,14 @@ ADR-214：请求队列的 32 条 `Request` 进 `.bss`，六处指针都指向 `Q
 | U4 | 566 | `unsafe { &mut *DENTRY.0.get() }` （`dentry_put` 持锁期间）|
 | U4 | 585 | `unsafe { &*DENTRY.0.get() }` （`dentry_stats` 持锁期间）|
 | U4 | 596 | `unsafe { &mut *DENTRY.0.get() }` （`dentry_clear` 持锁期间）|
+| U4 | 2169 | `unsafe { &mut *PAGES.0.get() }` （ADR-250 `cache_invalidate` 持 `CACHE_LOCK` 清槽并递增代数）|
 
 ADR-195：dentry 缓存的 64 条 `DentrySlot` 进 `.bss`。五处指针都指向 `DENTRY` 这个
 静态量，长度 `DENTRY_MAX`，生命周期整个内核，访问都在 `RANK_DENTRY(38)` 锁内。
 载荷全为 `Copy` 数值（`Entry` 是 `Copy`），无别名逃逸。
+
+ADR-250：`cache_invalidate` 的指针指向 `PAGES` 静态量，24 个 `CachePage` 生命周期整个内核；
+只在 `CACHE_LOCK`（`RANK_GROW=4`）内清槽与递增 `generation`，临界区不碰设备、无别名逃逸。
 
 ### ktests/storage/vfs_ro
 
@@ -64,10 +68,14 @@ ADR-195：dentry 缓存的 64 条 `DentrySlot` 进 `.bss`。五处指针都指�
 |---|---|---|
 | U6 | 1245 | `unsafe { &mut *core::ptr::addr_of_mut!(IMG) }` （判据的测试盘）|
 | U6 | 1248 | `unsafe { &mut *core::ptr::addr_of_mut!(DST) }` （判据的读缓冲）|
+| U6 | 2188 | `unsafe { &mut *core::ptr::addr_of_mut!(IMG) }` （ADR-250 迟到失效判据的 512 字节测试盘）|
 
 ADR-194：`t_block_merge` 的两个 `static mut`。**故意进 `.bss` 而不进栈**：
 64 KiB 栈数组会打穿内核栈（AGENTS.md 那条纪律），而 128 KiB static 会让收尾路径 HANG。
 所以最终缩到 16 KiB + 8 KiB。两处都只在单核判据路径上读写，没有并发访问者。
+
+ADR-250 新增的 512 字节 `IMG` 同样只在 `t_cache_invalidate_inflight` 的单核判据路径读写；
+`InvalidateDuringRead` 只在第一次设备读时清缓存，用来证明迟到旧读不会重新填表。
 
 ### arch/hooks
 
