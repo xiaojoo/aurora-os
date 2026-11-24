@@ -25559,3 +25559,43 @@ worker 可能以 IF=0 被换入，必须主动建立抢占点；不逐轮发 `in
 ### 未决
 
 其他 `finish_current(); loop { spin }` 工人尚未逐条同型审计；本轮不把结论外推成所有 worker 已安全。
+
+## 572. FAT32/P7 五条基线偏差：`t_handle_table` 1 MiB 栈数组截断整链（2026-11-24）
+
+### 根因
+
+`run-13031/13032` 稳定复现 QEMU 在 `t_handle_reap` 后退出 0，串口没有最终判定。
+`-d int,cpu_reset` 锁定为 `memset+57` 写 `mm::S+0x1000` 时 #PF，同一 RIP 再 #DF，
+最终 Triple fault。来源是 `t_handle_table` 的 `[Handle(0); MAX_HANDLES]`：
+131072×8 B = **1 MiB 内核栈数组**，初始化时打穿栈并覆盖 `.bss`。
+后续 FAT32/P7 五行都被同一次停机截断，不是五个独立产品缺陷。
+
+这违反了 ADR-179 补记一“栈数组不许跟容量走”的既有纪律；补记一修掉了
+`revoke_task/reset_for_test` 的 128 KiB 实例，却漏了 `t_handle_table` 的 1 MiB 实例。
+
+### 修法
+
+- 表满测试改为：正常 grant 首个句柄，锁内复制该 `Entry` 填满其余槽，再 grant 一次
+  必须 `Exhausted`；首个句柄仍真读成功。保留容量与既有句柄判据，去掉容量级栈数组和
+  131072 次 grant 的时间开销。
+- 形状测试改为：`MAX_HANDLES <= u16::MAX` 才测 `slot==MAX_HANDLES` 越界；超过时改测
+  `u16::MAX` 是最大可表示合法 slot。旧写法把 131072 强转成 0，实际在测合法 slot 0。
+- 产品句柄表、FAT32、ELF 装载与 syscall 语义均未改；只修两处测试量具。
+
+### 读数
+
+| 场景 | 结果 |
+|---|---|
+| `run-13031/13032` 修前 | QEMU-EXIT-0；#PF→#DF→Triple fault，停在 `t_handle_reap` |
+| `run-13039` `fat32-exec` | **139/139 PASS**；`t_handle_table` 17 格全 true |
+| `run-13040` 尾格注入 | FAIL35，精确红在 `已喂=16896 这段=393 界=17288 自报=17289` |
+| `run-13041` 段内字节注入 | FAIL35，`字节同=false 跑通=false rodata=Some(90)` |
+| `run-13042` 错误 owner | FAIL35，ring3 魔数错误且表清空=false |
+| `run-13043` `fat32-probe` | PASS33 |
+| `build` / `ktests` / `check` | 通过 / 注册 91 条 / **21/21** |
+| 完整矩阵 | **81/82 符合、1 不符**；FAT32/P7 五行全部符合 |
+| 同 ELF 清除 | `run-13132` `fat32-exec`（`2ab60a906030`）PASS33 |
+
+矩阵唯一红格是同一 `fat32-exec` 跑里的无关 `t_probe_ring3`，不是本次修复回归；同一 ELF
+单跑已清除。7 条 A3 本轮也全部符合，但 A3 ELF 不含本次 `fat32-probe` 门控改动，
+**不能把 A3 转绿归因于本修复**；其长期稳定性仍需独立重复采样。

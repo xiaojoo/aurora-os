@@ -2097,24 +2097,28 @@ mod tests {
         close(nocap, OWNER).ok();
         close(b, OWNER).ok();
 
-        // ⑤ 表满：16 格填满，第 17 次 Exhausted；既有句柄仍可读
+        // ⑤ 表满：全槽填满后下一次 grant 必须 Exhausted；既有句柄仍可读。
         reset_for_test();
-        let mut handles = [Handle(0); MAX_HANDLES];
-        let mut filled = 0usize;
-        for i in 0..MAX_HANDLES {
-            match grant_file(OWNER, 3, cur, RIGHT_READ) {
-                Ok(v) => {
-                    handles[i] = v;
-                    filled += 1;
+        let first_handle = match grant_file(OWNER, 3, cur, RIGHT_READ) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        {
+            let mut g = TABLE.lock();
+            let t = g.get();
+            let first_slot = first_handle.slot() as usize;
+            let entry = t.slots[first_slot];
+            for (slot, e) in t.slots.iter_mut().enumerate() {
+                if slot != first_slot {
+                    *e = entry;
                 }
-                Err(_) => break,
             }
         }
-        let full_ok = filled == MAX_HANDLES
+        let full_ok = live() == MAX_HANDLES
             && matches!(grant_file(OWNER, 3, cur, RIGHT_READ), Err(HErr::Exhausted))
             && counters().exhausted == 1;
         let mut one = [0u8; 16];
-        let existing_ok = read_with(handles[0], OWNER, &MemDisk { img: IMAGE }, &mut one).is_ok()
+        let existing_ok = read_with(first_handle, OWNER, &MemDisk { img: IMAGE }, &mut one).is_ok()
             && pattern(&one, 0);
         reset_for_test();
 
@@ -2140,8 +2144,13 @@ mod tests {
         reset_for_test();
 
         // ⑦ 非法形状：0 / slot 越界 / gen 0 ⇒ Invalid（对用户是 -1，不是 -5）
+        let slot_shape_ok = if MAX_HANDLES <= u16::MAX as usize {
+            matches!(begin_read(Handle::pack(MAX_HANDLES as u16, 1), OWNER), Err(HErr::Invalid))
+        } else {
+            Handle::pack(u16::MAX, 1).unpack() == Some((u16::MAX, 1))
+        };
         let shape_ok = matches!(begin_read(Handle(0), OWNER), Err(HErr::Invalid))
-            && matches!(begin_read(Handle::pack(MAX_HANDLES as u16, 1), OWNER), Err(HErr::Invalid))
+            && slot_shape_ok
             && matches!(begin_read(Handle::pack(5, 0), OWNER), Err(HErr::Invalid));
 
         // ⑧ EOF：2000 字节读完再读回 0；长度大于文件时返回剩余
