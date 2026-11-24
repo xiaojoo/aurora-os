@@ -1329,6 +1329,11 @@ fn sys_thread_create(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     if !ok_code || !ok_stack {
         return E_INVALID;
     }
+    // PML4 必须在 spawn 前取好：spawn 后新任务已可运行，再等 VMM 可能被 tick 换入。
+    let pml4 = match mm::aspace_pml4_of(aslot) {
+        Some(root) => root,
+        None => return E_BAD_HANDLE,
+    };
     // 先登记再 spawn（ADR-073 的顺序：反序的话任务可能两步之间就跑完，那条边看到 NO_PROC）
     if crate::proc::proc_attach_thread(pid).is_err() {
         return E_EXHAUSTED;
@@ -1341,7 +1346,7 @@ fn sys_thread_create(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
         }
     };
     let id = crate::sched::id_of(g);
-    if !crate::sched::set_aspace(g, aslot) || !crate::sched::set_proc_id(g, pid) {
+    if !crate::sched::set_aspace_root(g, aslot, pml4) || !crate::sched::set_proc_id(g, pid) {
         let _ = crate::sched::terminate_task(g);
         let _ = crate::proc::proc_detach_thread(pid);
         return E_EXHAUSTED;

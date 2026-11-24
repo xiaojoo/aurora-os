@@ -25599,3 +25599,68 @@ worker 可能以 IF=0 被换入，必须主动建立抢占点；不逐轮发 `in
 矩阵唯一红格是同一 `fat32-exec` 跑里的无关 `t_probe_ring3`，不是本次修复回归；同一 ELF
 单跑已清除。7 条 A3 本轮也全部符合，但 A3 ELF 不含本次 `fat32-probe` 门控改动，
 **不能把 A3 转绿归因于本修复**；其长期稳定性仍需独立重复采样。
+
+## 573. `t_probe_ring3` dup 结果快照竞态：短窗口从未等过 tick（2026-11-25）
+
+### 精确复现与根因
+
+`run-13108` 的失败签名：子进程已跑、StartupInfo/数据已写、`served=7/21`，但 dup 结果仍 0。
+`run-13149` 用 `fat32-exec` 同一 ELF 循环在 **1/8** 精确复现。
+
+临时诊断标记得到 `before=1 after=0`，子进程 `Runnable runs=1`：dup syscall 已进入，
+用户态还没执行到结果写回。原重试窗口每次只转 16M 周期（约 5 ms），低于本机约 10 ms
+的 tick；每次重新 `timer_start` 又重置计数，所以 7 次窗口都没给子进程第二次调度机会。
+`served` 只证明 syscall 入口被计数，不证明用户态已经返回。
+
+### 修法
+
+只在 dup 结果为 0 时进入最多 4 次补偿窗口；每次明确等一个真实 tick，再在窗口外重读
+VMO。结果非 0（成功句柄或负错误码）立即停止。用户桩、产品 syscall 与判定口径均未改。
+
+### 读数与边界
+
+| 组别 | 结果 |
+|---|---|
+| HEAD 原窗口 | `run-13149` 精确红，1/8 |
+| 只加 16M 周期重试 | 40 轮仍 6 次精确红 |
+| 只改用户桩 rbx | 40 轮仍 3 次精确红 |
+| 最终最小修复（等 tick + 原用户桩） | 40 轮 `t_probe_ring3` **0 失败**；38 PASS，2 条无关既有 flakes |
+| `handles` | `run-13430` PASS33 |
+| `check` | **21/21** |
+| 完整矩阵 | **81/82**；探针行、FAT32/P7 全绿 |
+| 同 ELF 清除唯一 A3 exec | `run-13519`（`4fcda1d68f13`）PASS33 |
+
+**另一种偶发已关闭**：`run-13317` 的 `thread_create=-6`、子进程入口 #PF、`served=7/19`
+发生在 dup 之前；根因与修复见 §574。
+
+## 574. `thread_create` spawn→set_aspace 构造窗口：新线程在 AS 登记前被换入（2026-11-25）
+
+### 根因
+
+`run-13844` 的无诊断 GDB 现场显示：`set_aspace` 前 `task_state=Runnable`、`aslot=0`、
+PML4=`0x31000`、`unmatched_self=0`。任务和 AS 都已就绪，但子进程随后仍在
+`0x300000000` 入口 #PF，`thread_create` 回 `-6`。
+
+`spawn_user` 返回时新任务已经 Runnable；旧 `set_aspace` 还要调用 `aspace_pml4_of`
+取 VMM。VMM 锁等待可能开中断，tick 在 `as_slot/as_pml4` 写入前把新线程换入父 AS，
+入口未映射 ⇒ 子进程被杀 ⇒ `set_aspace` 检查状态时已不可登记。`int 0x80` 入口关 IF
+不能覆盖锁等待主动开窗的这一段。
+
+### 修法
+
+- spawn 前解析并校验子 AS PML4；spawn 后走 crate 内 `set_aspace_root` 只写缓存根表，
+  不再取 VMM。
+- `set_proc_id/block_task`、ABI、锁序、错误码均不变；普通 `set_aspace` 入口保持原语义。
+
+### 读数
+
+| 场景 | 结果 |
+|---|---|
+| 旧路径自然红跑 | `run-13317` / `run-13657` / `run-13844`：`thread_create=-6`、子进程 #PF、`served=7/19` |
+| 新路径单跑 | `run-13845` PASS33 |
+| 新路径 100 轮 | `t_probe_ring3` **0 失败**；98 PASS，2 条无关既有 `t_block_wake` |
+| handles | `run-13946` PASS33 |
+| `check` | **21/21** |
+| 完整矩阵 | **82/82 符合** |
+
+边界：`set_aspace_root` 只供构造路径使用，调用方须在 spawn 前确认 AS 仍活；真机未验证。

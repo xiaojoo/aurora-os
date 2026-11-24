@@ -842,19 +842,19 @@ fn t_probe_ring3() -> bool {
     };
     // 子进程写出来的四个数（经 VMO 帧读，不碰用户页 ⇒ 与 SMAP 无关）
     let mut child = [0u8; 24];
-    let child_read = crate::handle::vmo_of(crate::handle::Handle(data_h), probe_owner, crate::handle::RIGHT_READ)
+    let mut child_read = crate::handle::vmo_of(crate::handle::Handle(data_h), probe_owner, crate::handle::RIGHT_READ)
         .ok()
         .and_then(|vid| crate::vmo::vmo_read(vid, 0, &mut child).ok())
         .map(|n| n == 24)
         .unwrap_or(false);
-    let rd32 = |b: usize| -> u32 {
+    let rd32 = |bytes: &[u8], b: usize| -> u32 {
         let mut x = [0u8; 4];
-        x.copy_from_slice(&child[b..b + 4]);
+        x.copy_from_slice(&bytes[b..b + 4]);
         u32::from_le_bytes(x)
     };
-    let rd64 = |b: usize| -> u64 {
+    let rd64 = |bytes: &[u8], b: usize| -> u64 {
         let mut x = [0u8; 8];
-        x.copy_from_slice(&child[b..b + 8]);
+        x.copy_from_slice(&bytes[b..b + 8]);
         u64::from_le_bytes(x)
     };
     // 交叉核对：子进程读到的 nhandles 与句柄值，必须等于内核回填进那一页的东西
@@ -870,11 +870,37 @@ fn t_probe_ring3() -> bool {
     let si_h0 = u64::from_le_bytes(hb);
     // D2 的硬证人：子进程拿转移来的句柄**真调了一次 dup**，返回值必须是形状合法的句柄。
     // dup 只有在主人已经是子线程时才成功 ⇒ 它证明转移生效，而不只是"表里有个像句柄的数"。
-    let dup_ret = rd64(16);
+    let mut dup_ret = rd64(&child, 16);
+    // served 只证明 dup 已进入；短于一个 tick 的窗口不会让子进程继续执行。
+    if dup_ret == 0 && served2 >= PROBE_CALLS {
+        for _ in 1..4 {
+            apic::timer_start().ok();
+            apic::with_interrupts(|| {
+                let tick_in = apic::ticks();
+                let waited = apic::wait_ticks(tick_in, 1, crate::clock::window_cycles(2));
+                if waited.ticks < 1 {
+                    crate::log_fatal!("probe2: dup 结果窗口没等到 tick");
+                }
+                if !sched::wait_for_boot_task(300_000_000) {
+                    crate::log_fatal!("probe2: dup 结果窗口收不了场");
+                }
+            });
+            apic::timer_stop().ok();
+            child_read = crate::handle::vmo_of(crate::handle::Handle(data_h), probe_owner, crate::handle::RIGHT_READ)
+                .ok()
+                .and_then(|vid| crate::vmo::vmo_read(vid, 0, &mut child).ok())
+                .map(|n| n == 24)
+                .unwrap_or(false);
+            dup_ret = rd64(&child, 16);
+            if dup_ret != 0 {
+                break;
+            }
+        }
+    }
     let child_ok = child_read && si_read
-        && rd32(0) == crate::user::SI_MAGIC
-        && rd32(4) == 4 && si_n == 4
-        && rd64(8) == si_h0 && si_h0 != 0
+        && rd32(&child, 0) == crate::user::SI_MAGIC
+        && rd32(&child, 4) == 4 && si_n == 4
+        && rd64(&child, 8) == si_h0 && si_h0 != 0
         && crate::handle::Handle(dup_ret).unpack().is_some();
     let child_ran = cg != usize::MAX && sched::runs_of(cg) > 0;
     let child_as = crate::proc::proc_aspace(pid, pgen).map(|(a, _)| a);
@@ -932,7 +958,7 @@ fn t_probe_ring3() -> bool {
         magic_ok, abi_ok, handle_ok, write_ok, va_ok, readback == 1, eff, kernel_read,
         x_req, x_ret, xform_ok, x_read, wx_ok, un_ok,
         crate::handle::Handle(proc_h).unpack().is_some(), crate::handle::Handle(thread_h).unpack().is_some(),
-        start_ret, child_read, rd32(0), rd32(4), si_n, rd64(8), si_h0, dup_ret, child_ran,
+        start_ret, child_read, rd32(&child, 0), rd32(&child, 4), si_n, rd64(&child, 8), si_h0, dup_ret, child_ran,
         code_still, child_alive, kills0, user::kills(),
         drained, preaped, jdel, f0, f1, va0, va1, lv0, crate::handle::live(), v0,
         crate::vmo::vmo_count(), served, served2);

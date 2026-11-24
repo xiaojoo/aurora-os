@@ -632,6 +632,60 @@ D2 的**完整形态**这一刀证到了：子进程不只是"看到一个像句
 以及 Done 槽回收（P6c）、`MAX_ADDR_SPACES`/`MAX_OWNED` 两条容量账在真实 workload 下的重算。
 **P7 的 `TRAMPOLINE_VA` 每进程一个那条判据已被本文决策 7 取代**（共享内核半区一份，
 且两容器共存已实测），计划文本里那条负样本不再当判据用。
+## 补记：dup 结果快照必须等真实 tick（2026-11-25，实测）
+
+`run-13108` 的 `t_probe_ring3` 红格是：子进程已运行、StartupInfo 与数据已写、
+`served=7/21`，但 dup 结果仍为 0。`run-13149` 用同一 ELF 循环在 1/8 精确复现。
+
+诊断标记显示 `before=1 after=0`，子进程状态为 `Runnable runs=1`：dup 已进入，但用户态
+还没执行到结果写回。原重试窗口每次只转 16M 周期（约 5 ms），低于本机约 10 ms 的 tick；
+每次重新 `timer_start` 又清零计数，所以 7 次都没等到一次调度。`served` 只证明 syscall
+入口被计数，不证明用户态已经返回。
+
+修法：dup 结果为 0 时，每次明确 `wait_ticks(..., 1, ...)` 等一个真实 tick，再在窗口外
+重读 VMO；最多 4 次，结果非 0（成功句柄或负错误码）立即停止。用户桩、产品 syscall、
+判定口径均未改。
+
+| 组别 | 结果 |
+|---|---|
+| HEAD 原窗口 | `run-13149` 精确红，1/8 |
+| 只加 16M 周期重试 | 40 轮仍 6 次精确红 |
+| 只把用户桩数据指针改成 rbx | 40 轮仍 3 次精确红 |
+| 等真实 tick + 原用户桩（最终最小修复） | 40 轮 `t_probe_ring3` **0 失败**；38 PASS，2 条无关既有 `t_reap_premise`/`t_block_wake` |
+| 完整矩阵 | **81/82**，探针行与 FAT32/P7 全绿；唯一 A3 exec 同 ELF 单跑 `run-13519` PASS |
+
+**另一种失败已关闭**：`run-13317` 的 `thread_create=-6`、子进程入口 #PF、`served=7/19`
+发生在 dup 之前；根因是 spawn 后登记 AS 的窗口，详见下一补记。
+
+## 补记：thread_create 的 spawn→set_aspace 构造窗口（2026-11-25，实测）
+
+`run-13844` 用无诊断 ELF 的 GDB 失败断点抓到：`set_aspace` 调用前
+`task_state=Runnable`、`aslot=0`、PML4=`0x31000`、`unmatched_self=0`。任务和 AS 都已就绪，
+但子进程随后仍在 `0x300000000` 入口 #PF，`thread_create` 回 `-6`。
+
+根因是 `spawn_user` 返回时新任务已经 Runnable，而旧 `set_aspace` 内部还要调用
+`aspace_pml4_of` 取 VMM。VMM 等待可能开中断，tick 在 `as_slot/as_pml4` 写入前把新线程
+换入父 AS；入口未映射 ⇒ 子进程被杀 ⇒ `set_aspace` 再检查状态时已不可登记，返回 false。
+`int 0x80` 入口关 IF 并不能覆盖“锁等待主动开窗”这一段。
+
+修法：
+
+1. `sys_thread_create` 在 spawn 前解析并校验子 AS 的 PML4；
+2. spawn 后改用 `sched::set_aspace_root` 只写已缓存根表，不再取 VMM；
+3. `set_proc_id/block_task` 仍走原路径，ABI、锁序、错误码均不变。
+
+| 组别 | 结果 |
+|---|---|
+| 旧路径自然红跑 | `run-13317` / `run-13657` / `run-13844`：`thread_create=-6`、子进程 #PF、`served=7/19` |
+| 新路径单跑 | `run-13845` PASS33 |
+| 新路径重复采样 | `fat32-exec` **100 轮 `t_probe_ring3` 0 失败**；98 PASS，2 条无关既有 `t_block_wake` |
+| handles | `run-13946` PASS33 |
+| `check` | **21/21** |
+| 完整矩阵 | **82/82 符合** |
+
+边界：`set_aspace_root` 是 crate 内构造路径，调用方必须在 spawn 前确认 AS 仍活；
+本修复不把“缓存 PML4”开放给普通运行时路径。真机未验证。
+
 ## 备选方案
 
 - **一刀做完 P5**：拒绝（决策 1）。换人热路径、句柄种类、ABI、新产物四件事一起动，

@@ -2720,6 +2720,14 @@ pub fn set_aspace(i: usize, slot: u16) -> bool {
         return false;
     }
     let pml4 = if slot == NO_ASPACE { 0 } else { mm::aspace_pml4_of(slot).unwrap_or(0) };
+    set_aspace_root(i, slot, pml4)
+}
+
+/// 写入已在 spawn 前校验的 PML4；thread_create 用它避免新任务可运行后再等 VMM。
+pub(crate) fn set_aspace_root(i: usize, slot: u16, pml4: u64) -> bool {
+    if i >= MAX_TASKS_TOTAL || cpu_of(i) != crate::arch::x86_64::cpu::self_slot() {
+        return false;
+    }
     if slot != NO_ASPACE && pml4 == 0 {
         return false;
     }
