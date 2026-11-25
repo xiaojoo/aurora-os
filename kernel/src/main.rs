@@ -238,6 +238,11 @@ pub extern "C" fn kmain() -> ! {
         exit::finish(exit::Code::BootInvalid);
     }
     crate::log_info!("boot-ok: aurora stage0 serial up (com1 0x3f8)");
+    #[cfg(feature = "kdump-early-panic")]
+    {
+        crate::log_fatal!("kdump-early-panic: capture 入口安装前触发");
+        exit::finish(exit::Code::ExceptionFatal);
+    }
     // B3（ADR-137）：uptime 的启动锚点。放在 stage0 自证之后：再早就可能在
     // 串口失败退出的路径上白记一次，再晚就把 bootloader 那段算漏了。
     clock::record_boot(tsc::now());

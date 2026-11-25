@@ -47,16 +47,15 @@ pub fn finish(code: Code) -> ! {
         {
             let entry = CAPTURE_ENTER.load(Ordering::Acquire);
             if entry == 0 {
+                // 捕获上下文尚未初始化：不能跳入口，落到统一 39 出口并保留原因。
                 serial::line("fatal", format_args!("kdump: capture 入口未安装"));
-                loop {
-                    core::hint::spin_loop();
-                }
+            } else {
+                // SAFETY: 入口由 stage_memory 在 capture 初始化成功后安装；两个指针参数的 C ABI 表示相同。
+                let enter: unsafe extern "C" fn(*const (), *const ()) -> ! =
+                    unsafe { core::mem::transmute(entry) };
+                // SAFETY: 软件 L4 出口处于 ring0，capture 栈与快照已由启动期初始化。
+                unsafe { enter(core::ptr::null(), core::ptr::null()) };
             }
-            // SAFETY: 入口由 stage_memory 在 capture 初始化成功后安装；两个指针参数的 C ABI 表示相同。
-            let enter: unsafe extern "C" fn(*const (), *const ()) -> ! =
-                unsafe { core::mem::transmute(entry) };
-            // SAFETY: 软件 L4 出口处于 ring0，capture 栈与快照已由启动期初始化。
-            unsafe { enter(core::ptr::null(), core::ptr::null()) };
         }
         #[cfg(not(feature = "kdump"))]
         crate::crash::ensure_dumped();

@@ -1,6 +1,7 @@
 # ADR-247：kdump 风格捕获内核、crash-only AHCI 与 vmcore
 
 状态：**已采纳**（2026-11-24；已落地，`kdump` 特性门控，真机未验证）。使用者批准阶段 1+2+3 一次推进。
+2026-11-25 补齐真实 `PxCI!=0`、第二内核入口错、capture 初始化前 panic 三类负样本。
 
 关联：ADR-031（持久状态区）、ADR-042（崩溃现场）、ADR-080/115/116（验签边界）、
 ADR-190/214/215/222（块层与 AHCI 锁）、ADR-245（宿主栈生命周期）、BACKLOG §569。
@@ -73,6 +74,11 @@ ADR-190/214/215/222（块层与 AHCI 锁）、ADR-245（宿主栈生命周期）
 - `tools/aurora.py` 在 kdump 构建前生成 payload，并在 `run` 后用独立 Python 解析器校验
   ELF、note 校验和、CPU/停车数、PRSTATUS 与 Aurora note 一致性、段范围和写入字节数。
 
+2026-11-25 负样本补齐：新增默认关闭的 `kdump-busy-port` / `kdump-bad-entry` /
+`kdump-early-panic`。busy-port 在第二内核写命令前把真实 `PxCI` 置 1 并回读；
+bad-entry 注入 `CAPTURE_VA_BASE+1` 候选，由主内核在跳转前拒绝；early-panic 在
+stage0、capture 入口安装前触发。宿主对账同时要求 rc=39、精确串口锚点/读数行和捕获盘全零。
+
 ## 实测
 
 | 场景 | 读数 |
@@ -85,6 +91,12 @@ ADR-190/214/215/222（块层与 AHCI 锁）、ADR-245（宿主栈生命周期）
 | 宿主篡改 | Aurora note 校验和、PT_LOAD 范围、PRSTATUS RIP 三类变异全部精确变红 |
 | 提交前捕获口隔离补证 | `run-12937` 去掉入口闸后读/两种写全部穿透并破坏命令环，精确红；`run-12939` 恢复后三拒全 true、kdump ktests **92/92** |
 | 提交前四核捕获复验 | `run-12940`：4 CPU、停车 3/3、38 PT_LOAD、2 MiB、宿主对账绿，退出 39 |
+| 真实 `PxCI!=0` | `run-14940`：`error.a=0x1 error.b=0x0`，rc=39，捕获盘全零 |
+| 第二内核入口错 | `run-14849`：跳转前拒绝 `got=…0001 want=…0000`，rc=39，盘全零 |
+| capture 初始化前 panic | `run-14843`：入口未安装，统一 `qemu-exit=39`，盘全零 |
+| 最终正向对照 | `run-14850`：2 MiB vmcore、38 PT_LOAD、宿主对账绿，退出 39 |
+| kdump 正常档 | `run-14851`：**93/93**，退出 33 |
+| 既有坏完成回归 | `run-14848`：PRDBC 精确拒绝，退出 39 |
 
 提交前审查还发现 `write_lba/write_bytes` 曾绕过 `transfer` 的捕获口检查；现将隔离闸上移到
 所有普通读写共用的 `with_transfer_lock(num, ...)`，并让 AHCI 认领测试只对普通命令环要求
@@ -103,8 +115,10 @@ ADR-190/214/215/222（块层与 AHCI 锁）、ADR-245（宿主栈生命周期）
 1. 真机 AHCI 口 1、NMI/IST2、UC DMA 与持久捕获盘全部未测。
 2. 稀疏 vmcore 只含元数据/寄存器，不是可直接交给 Linux `crash` 的完整内存转储。
 3. 软件 L4 没有 TrapFrame，完整 GPR 快照只覆盖真异常路径；控制寄存器与旧 RSP/RBP 仍有。
-4. 真实 `PxCI!=0` 与第二内核入口错两类负样本尚未单独注入；坏完成由 PRDBC 变异覆盖。
-5. capture 初始化完成前的 panic 入口尚未单独取证；默认 L4 HEAP→GROW 级联已由 ADR-248 关闭。
+4. ~~真实 `PxCI!=0` 与第二内核入口错两类负样本尚未单独注入~~ **已补齐（2026-11-25）**；
+   busy-port 读取真实 MMIO 非零值，bad-entry 在跳转前拒绝错误候选，见上表。
+5. ~~capture 初始化完成前的 panic 入口尚未单独取证~~ **已补齐（2026-11-25）**；
+   入口未安装现在记录原因并统一以 39 停机，不再空跳或死循环。
 6. kdump 不提供安全启动/身份/槽位信任根，仍受 ADR-080/W5/W12 约束。
 
 ## 回滚

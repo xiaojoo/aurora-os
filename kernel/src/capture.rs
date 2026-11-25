@@ -315,8 +315,21 @@ pub unsafe extern "C" fn aurora_capture_main(
             }
         }
         let boot_ptr = core::ptr::addr_of!(*boot);
+        let entry = {
+            #[cfg(feature = "kdump-bad-entry")]
+            { CAPTURE_VA_BASE + 1 }
+            #[cfg(not(feature = "kdump-bad-entry"))]
+            { CAPTURE_VA_BASE }
+        };
+        if entry != CAPTURE_VA_BASE {
+            serial::line("kdump", format_args!("capture entry invalid got={:#x} want={:#x}", entry, CAPTURE_VA_BASE));
+            serial::out8(0xf4, 0x13);
+            loop {
+                core::hint::spin_loop();
+            }
+        }
         // SAFETY: 所有 AP 已停车，payload/校验/独立 DMA 已就绪；capture_entry 不返回。
-        unsafe { capture_jump(CAPTURE_VA_BASE, boot_ptr) };
+        unsafe { capture_jump(entry, boot_ptr) };
     }
     loop {
         // SAFETY: 捕获路径的终点；cli+hlt 不访存，NMI 停车桩仍可进入。

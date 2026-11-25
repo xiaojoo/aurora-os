@@ -34,6 +34,9 @@ kdump-ap-probe = ["kdump"]
 kdump-no-park = ["kdump"]
 kdump-bad-dma = ["kdump"]
 kdump-bad-completion = ["kdump"]
+kdump-busy-port = ["kdump", "aurora-capture/kdump-busy-port"]
+kdump-bad-entry = ["kdump"]
+kdump-early-panic = ["kdump"]
 default = []
 # 负样本：让 ktest 里的一条断言故意不成立，用于证明判定契约的尺子能分辨
 # （手册 §12.3 R19）。正常运行时不得带这个 feature 合入。

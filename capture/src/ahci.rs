@@ -206,6 +206,12 @@ impl Ahci {
                 (CMD_FRE | CMD_ST) as u64,
             ));
         }
+        #[cfg(feature = "kdump-busy-port")]
+        let ci = {
+            self.w32(P_CI, 1);
+            self.r32(P_CI)
+        };
+        #[cfg(not(feature = "kdump-busy-port"))]
         let ci = self.r32(P_CI);
         let sact = self.r32(P_SACT);
         if ci != 0 || sact != 0 {

@@ -63,6 +63,20 @@ IMAGE = BUILD / "aurora.img"
 SERIAL_LOG = BUILD / "serial.log"
 CAPTURE_IMG = BUILD / "kdump-capture.img"
 CAPTURE_IMG_BYTES = 2 * 1024 * 1024
+KDUMP_FEATURES = {
+    "kdump", "kdump-bad-payload", "kdump-ap-probe", "kdump-no-park",
+    "kdump-bad-dma", "kdump-bad-completion", "kdump-busy-port",
+    "kdump-bad-entry", "kdump-early-panic",
+}
+CAPTURE_BIN_FEATURES = {"kdump-bad-completion", "kdump-busy-port"}
+KDUMP_NEGATIVE_MARKERS = {
+    "kdump-busy-port": "port is not quiescent (PxCI/PxSACT nonzero)",
+    "kdump-bad-entry": "capture entry invalid",
+    "kdump-early-panic": "kdump: capture 入口未安装",
+}
+KDUMP_NEGATIVE_LINES = {
+    "kdump-busy-port": ("error.a=0x1", "error.b=0x0"),
+}
 
 QEMU = TOOLS / "qemu" / "qemu-system-x86_64.exe"
 
@@ -153,8 +167,9 @@ CAPTURE_RUSTFLAGS = (
 
 def do_build_capture(features: list[str]) -> Path:
     args = [str(CARGO), "build", "--target", TARGET, "-p", "aurora-capture"]
-    if "kdump-bad-completion" in features:
-        args += ["--features", "kdump-bad-completion"]
+    capture_features = [f for f in CAPTURE_BIN_FEATURES if f in features]
+    if capture_features:
+        args += ["--features", ",".join(sorted(capture_features))]
     r = subprocess.run(
         args,
         capture_output=True, text=True, cwd=str(ROOT),
@@ -189,7 +204,7 @@ def ensure_capture_disk() -> None:
 
 
 def kernel_binary(features: list[str]) -> Path:
-    if {"kdump", "kdump-bad-payload", "kdump-ap-probe", "kdump-no-park", "kdump-bad-dma", "kdump-bad-completion"} & set(features):
+    if KDUMP_FEATURES & set(features):
         do_build_capture(features)
     if FAT_FEATURES & set(features):
         # 必须在 cargo 之前：`include_bytes!("../fixtures/fat32-mem.img")` 是编译期读的，
@@ -4235,6 +4250,28 @@ def _fnv1a64(data: bytes) -> int:
     return value
 
 
+def check_kdump_negative(features: list[str], rc: int, log: str) -> list[str]:
+    selected = [f for f in KDUMP_NEGATIVE_MARKERS if f in features]
+    if not selected:
+        return []
+    errors: list[str] = []
+    if rc != 39:
+        errors.append(f"kdump 负样本退出码={rc}，期望 39")
+    log_lines = set(log.splitlines())
+    for feature in selected:
+        if KDUMP_NEGATIVE_MARKERS[feature] not in log:
+            errors.append(f"{feature} 缺少精确锚点 {KDUMP_NEGATIVE_MARKERS[feature]!r}")
+        for line in KDUMP_NEGATIVE_LINES.get(feature, ()):
+            if line not in log_lines:
+                errors.append(f"{feature} 缺少精确读数行 {line!r}")
+    data = CAPTURE_IMG.read_bytes() if CAPTURE_IMG.exists() else b""
+    if len(data) != CAPTURE_IMG_BYTES:
+        errors.append(f"capture 盘长度={len(data)}，期望 {CAPTURE_IMG_BYTES}")
+    elif any(data):
+        errors.append("capture 盘非全零：负样本在拒绝前写了 vmcore")
+    return errors
+
+
 def validate_capture(path: Path, log: str = "") -> tuple[list[str], dict[str, int]]:
     errors: list[str] = []
     facts: dict[str, int] = {}
@@ -4461,7 +4498,7 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
         bad = apply_pkg_host_fault(host_fault)
         if bad:
             sys.exit("改包宿主机侧注入不成立：" + " / ".join(bad))
-    if {"kdump", "kdump-bad-payload", "kdump-ap-probe", "kdump-no-park", "kdump-bad-dma", "kdump-bad-completion"} & set(features):
+    if KDUMP_FEATURES & set(features):
         ensure_capture_disk()
     SERIAL_LOG.unlink(missing_ok=True)
     code, tpl = ovmf_files()
@@ -4515,7 +4552,7 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
             wanted_volumes[port] = name
     for port, name in sorted(wanted_volumes.items()):
         cmd += ["-drive", f"if=ide,index={port},format=raw,file={FAT_IMG[name]}"]
-    if {"kdump", "kdump-bad-payload", "kdump-ap-probe", "kdump-no-park", "kdump-bad-dma", "kdump-bad-completion"} & set(features):
+    if KDUMP_FEATURES & set(features):
         if 1 in wanted_volumes:
             sys.exit("kdump 捕获盘固定使用 AHCI 口 1，不能被 FAT 卷占用")
         cmd += ["-drive", f"if=ide,index=1,format=raw,file={CAPTURE_IMG}"]
@@ -4720,7 +4757,7 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
             verdict = "CONTENT-MISMATCH"
             for b in bad:
                 print("    内容对账:", b)
-    if {"kdump", "kdump-bad-payload", "kdump-ap-probe", "kdump-no-park", "kdump-bad-dma", "kdump-bad-completion"} & set(features) and "vmcore write complete" in log:
+    if KDUMP_FEATURES & set(features) and "vmcore write complete" in log:
         capture_bad, capture_facts = validate_capture(CAPTURE_IMG, log)
         if capture_bad:
             verdict = "CONTENT-MISMATCH"
@@ -4733,6 +4770,15 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
                 f"{capture_facts.get('targets')} loads={capture_facts.get('loads')} "
                 f"bytes={capture_facts.get('written')} sha256={capture_facts.get('sha256', 0):016x}"
             )
+    kdump_negative = [f for f in KDUMP_NEGATIVE_MARKERS if f in features]
+    if kdump_negative:
+        negative_bad = check_kdump_negative(features, rc, log)
+        if negative_bad:
+            verdict = "CONTENT-MISMATCH"
+            for message in negative_bad:
+                print("    capture 负样本对账:", message)
+        else:
+            print("    capture 负样本: 绿 " + ",".join(kdump_negative) + " rc=39 盘全零")
     # 在 do_run 按特性核对，不能靠日志里有没有标记，也不能只在 main/run 对账。
     if serial_rx:
         rx_bad += check_serial_rx(log)

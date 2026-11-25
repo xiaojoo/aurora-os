@@ -18,3 +18,4 @@ workspace = true
 
 [features]
 kdump-bad-completion = []
+kdump-busy-port = []

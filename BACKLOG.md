@@ -25864,3 +25864,47 @@ ADR-220 的未决 1/4 在产品句柄路径关闭，旧 `fs_open::open` 与 exec
 
 - `i_op/f_op` 间接层与 dentry 内嵌 inode 仍未引入，分别拆后续任务，不把本片写成三层全完成。
 - 节点关闭不卸载 superblock；单根/多挂载语义仍按 ADR-220/217，真机未验证。
+
+## 579. ADR-247 补记：kdump 三类剩余负样本补齐（2026-11-25）
+
+### 交付范围
+
+- 新增默认关闭的 `kdump-busy-port` / `kdump-bad-entry` / `kdump-early-panic`；
+  `aurora.py` 的三处 kdump 接线合并为单一 `KDUMP_FEATURES`，capture 二进制特性单独传递。
+- busy-port 在第二内核 `check_quiescent` 中把真实 `PxCI` 置 1 再回读，不伪造返回值；
+  必须同时读到 `error.a=0x1`、`error.b=0x0` 才算命中。
+- bad-entry 注入 `CAPTURE_VA_BASE+1` 候选，主内核在 `capture_jump` 前拒绝并留下 got/want；
+  不让 CPU 真跳错地址后再依赖旧 IDT 递归。
+- early-panic 在 stage0、capture 入口安装前触发；`exit::finish` 的零入口分支改为落到统一 39 出口，
+  非零入口才调用，消除“记录原因后仍空跳”的三重故障路径。
+- 宿主对账要求 rc=39、精确串口锚点/读数行、2 MiB 捕获盘全零；缺一项即 `CONTENT-MISMATCH`。
+
+### 量具与实现红测
+
+| 形状 | 红跑 | 精确红点 / 修正 |
+|---|---|---|
+| early-panic 第一版 | `run-14842` | 只记录原因却仍调用入口 0；QEMU rc=0、无 `qemu-exit`；加 `else` 后 `run-14843` rc=39 |
+| busy-port 判据第一版 | 离线变异 | 合并拒因存在但 CI/SACT 读数错时可假绿；补 `error.a/error.b` 精确行，改错任一读数均红 |
+| busy-port 最终 | `run-14940` | `error.a=0x1 error.b=0x0`、rc=39、盘全零 |
+| bad-entry 最终 | `run-14849` | `got=0xffffffffc0000001 want=0xffffffffc0000000`、rc=39、盘全零 |
+| early-panic 最终 | `run-14843` | `capture 入口未安装` + `qemu-exit=39`、盘全零 |
+| 既有坏完成回归 | `run-14848` | PRDBC 拒绝仍精确红，退出 39 |
+
+离线量具自检覆盖：正确日志/盘全零⇒绿；错误退出码、缺锚点、错 CI、错 SACT、盘非零⇒红。
+
+### 读数
+
+| 场景 | 结果 |
+|---|---|
+| kdump 正常档 | `run-14851`：**93/93**，退出 33 |
+| 正向 vmcore | `run-14850`：2 MiB、38 PT_LOAD、宿主对账绿，退出 39 |
+| capture clippy | `kdump-busy-port,kdump-bad-completion` 全特性 `-D warnings` 通过 |
+| `check` | **22/22** |
+| 完整矩阵 | 原始 **81/82 符合**；唯一偏差是 `中断投递由宿主机数到` 同跑 `t_block_wake` 偶发失败，矩阵同一 ELF `64174c8aefcf…` 单跑 `run-15029` PASS，记环境形状、不归因，按既定规则不再重跑整链 |
+
+### 边界
+
+- 三个特性都默认关闭；默认档不链接 kdump，正常 kdump 档不写 `PxCI`、不拒绝入口、不提前 panic。
+- busy-port 证明的是 QEMU 中真实 MMIO 寄存器非零路径；真机 AHCI 行为仍未验证。
+- bad-entry 是跳转候选的故障注入与跳转前校验，不宣称覆盖真实 CPU 跳错后的所有异常形状。
+- 稀疏 vmcore、真机 NMI/IST2/UC DMA 与安全启动边界保持 ADR-247 原文，不因本片扩大结论。
