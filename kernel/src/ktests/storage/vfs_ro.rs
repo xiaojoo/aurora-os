@@ -1472,6 +1472,119 @@ fn t_dentry_cache() -> bool {
 
 ktest!(KT_DENTRY_CACHE, t_dentry_cache);
 
+fn t_vfs_ops_dispatch() -> bool {
+    static PROBE_INODE_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    static PROBE_READ_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    static PROBE_CACHED_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    static PROBE_WRITE_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    static PROBE_SEEK_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+    #[derive(Debug)]
+    struct ProbeInodeOps;
+    impl vfs_ro::InodeOps for ProbeInodeOps {
+        fn open_file(&self, disk: &dyn Block, bpb: &crate::filesystem::fat32::Bpb, entry: &Entry) -> Result<vfs_ro::ReadCursor, VfsError> {
+            use core::sync::atomic::Ordering;
+            PROBE_INODE_CALLS.fetch_add(1, Ordering::Relaxed);
+            let mut cursor = vfs_ro::open(disk, bpb, entry)?;
+            cursor.set_file_ops_for_test(&PROBE_FILE_OPS);
+            Ok(cursor)
+        }
+    }
+
+    #[derive(Debug)]
+    struct ProbeFileOps;
+    static PROBE_FILE_OPS: ProbeFileOps = ProbeFileOps;
+    impl vfs_ro::FileOps for ProbeFileOps {
+        fn read(&self, _: &dyn Block, _: &mut vfs_ro::ReadCursor, _: &mut [u8]) -> Result<usize, VfsError> {
+            use core::sync::atomic::Ordering;
+            PROBE_READ_CALLS.fetch_add(1, Ordering::Relaxed);
+            Ok(0x51)
+        }
+        fn read_cached(&self, _: &dyn Block, _: u64, _: &mut vfs_ro::ReadCursor, _: &mut [u8]) -> Result<usize, VfsError> {
+            use core::sync::atomic::Ordering;
+            PROBE_CACHED_CALLS.fetch_add(1, Ordering::Relaxed);
+            Ok(0x52)
+        }
+        fn seek(&self, _: &dyn Block, _: &mut vfs_ro::ReadCursor, _: u32) -> Result<u32, VfsError> {
+            use core::sync::atomic::Ordering;
+            PROBE_SEEK_CALLS.fetch_add(1, Ordering::Relaxed);
+            Ok(0x53)
+        }
+        #[cfg(feature = "fs-rw")]
+        fn write(&self, _: &dyn Block, _: &mut vfs_ro::ReadCursor, _: &[u8]) -> Result<usize, VfsError> {
+            use core::sync::atomic::Ordering;
+            PROBE_WRITE_CALLS.fetch_add(1, Ordering::Relaxed);
+            Ok(0x54)
+        }
+    }
+    static PROBE_INODE_OPS: ProbeInodeOps = ProbeInodeOps;
+
+    let mut img = [0u8; VOL_BYTES];
+    make_image(&mut img);
+    let disk = MemDisk { img: &img };
+    let mut fs = match ReadOnlyFs::mount(&disk) {
+        Ok(fs) => fs,
+        Err(_) => return false,
+    };
+    let entry = match fs.lookup("/ROOT.TXT") {
+        Ok(entry) => entry,
+        Err(_) => return false,
+    };
+    let before = vfs_ro::vfs_ops_stats();
+    let mut cursor = match fs.open(&entry) {
+        Ok(cursor) => cursor,
+        Err(_) => return false,
+    };
+    let mut direct = [0u8; 5];
+    let read = fs.read(&mut cursor, &mut direct);
+    let seek = fs.seek(&mut cursor, 0);
+    let vol = vfs_ro::volume_fingerprint_pub(&disk, &cursor.bpb());
+    let mut cached = [0u8; 5];
+    let cached_read = cursor.read_cached(&disk, vol, &mut cached);
+    let after = vfs_ro::vfs_ops_stats();
+    let delta = (
+        after.0 - before.0,
+        after.1 - before.1,
+        after.2 - before.2,
+        after.3 - before.3,
+        after.4 - before.4,
+    );
+    let fat_ok = read == Ok(5) && direct == *b"root\n"
+        && seek == Ok(0) && cached_read == Ok(5) && cached == direct
+        && delta == (1, 1, 1, 0, 1);
+
+    fs.set_inode_ops_for_test(&PROBE_INODE_OPS);
+    let mut probe = match fs.open(&entry) {
+        Ok(cursor) => cursor,
+        Err(_) => return false,
+    };
+    let mut sink = [0u8; 1];
+    let probe_read = fs.read(&mut probe, &mut sink);
+    let probe_cached = probe.read_cached(&disk, vol, &mut sink);
+    let probe_seek = fs.seek(&mut probe, 0);
+    #[cfg(not(feature = "fs-rw"))]
+    let probe_ok = probe_read == Ok(0x51) && probe_cached == Ok(0x52) && probe_seek == Ok(0x53)
+        && PROBE_INODE_CALLS.load(core::sync::atomic::Ordering::Relaxed) == 1
+        && PROBE_READ_CALLS.load(core::sync::atomic::Ordering::Relaxed) == 1
+        && PROBE_CACHED_CALLS.load(core::sync::atomic::Ordering::Relaxed) == 1
+        && PROBE_SEEK_CALLS.load(core::sync::atomic::Ordering::Relaxed) == 1;
+    #[cfg(feature = "fs-rw")]
+    let probe_ok = {
+        let probe_write = probe.write(&disk, &[0xA5]);
+        probe_read == Ok(0x51) && probe_cached == Ok(0x52) && probe_seek == Ok(0x53) && probe_write == Ok(0x54)
+            && PROBE_INODE_CALLS.load(core::sync::atomic::Ordering::Relaxed) == 1
+            && PROBE_READ_CALLS.load(core::sync::atomic::Ordering::Relaxed) == 1
+            && PROBE_CACHED_CALLS.load(core::sync::atomic::Ordering::Relaxed) == 1
+            && PROBE_WRITE_CALLS.load(core::sync::atomic::Ordering::Relaxed) == 1
+            && PROBE_SEEK_CALLS.load(core::sync::atomic::Ordering::Relaxed) == 1
+    };
+    let ok = fat_ok && probe_ok;
+    crate::log_info!("vfs-ops: cursor={} i_open={} f_read={} f_cached={} f_write={} f_seek={} 字节同={} 间接={} ⇒ {}",
+        core::mem::size_of::<vfs_ro::ReadCursor>(), delta.0, delta.1, delta.2, delta.3, delta.4, direct == cached, probe_ok, ok);
+    ok
+}
+ktest!(KT_VFS_OPS_DISPATCH, t_vfs_ops_dispatch);
+
 /// ADR-257：dentry 保存 inode 槽提示，open 校验后 iget；create/unlink 摘除正缓存。
 fn t_dentry_inode_link() -> bool {
     vfs_ro::dentry_clear();

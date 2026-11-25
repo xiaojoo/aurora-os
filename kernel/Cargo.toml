@@ -51,6 +51,8 @@ fault-metadata-rmw-split = ["fs-ro"]
 fault-dentry-no-invalidate = ["fs-ro"]
 fault-dentry-stale-inode = ["fs-ro"]
 fault-dentry-stale-put = ["fs-ro"]
+fault-vfs-ops-bypass = []
+fault-vfs-ops-static = []
 fault-block-rmw-split = []
 fault-block-rmw-false-bind = []
 # A2 切片（ADR-130）：**产品路径上的外部 ELF 执行取证档**——init 编排在 S4a 之后

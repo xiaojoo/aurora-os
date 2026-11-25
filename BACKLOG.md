@@ -26134,3 +26134,22 @@ PASS，按环境形状记“不归因”，判据不动。
 - `check` **21/21**；原始完整矩阵 **81/82**，唯一不符合是 `FS写方向与可写卷对账`，
   红在同跑 `t_sdkdemo` 的 `0x100002000` 未映射；同 ELF `e05e3c3dc3bd` 单跑
   `run-16524` PASS，按环境形状记“不归因”，判据不动。
+
+## 587. ADR-258：VFS i_op/f_op 间接层（2026-11-26）
+
+- 新增 crate 私有 `InodeOps/FileOps` 与 FAT 实现；`ReadOnlyFs` 持 i_op，`ReadCursor`
+  持 f_op。产品句柄 read/seek/write 全部经操作表，旧自由函数保留给 exec/测试。
+- 不改公开 ABI、syscall、锁序、unsafe 或模块依赖；错误、游标提交、缓存、RMW 语义不动。
+- `run-16574`：`cursor=136 i_open=1 f_read=1 f_cached=1 f_write=0 f_seek=1 字节同=true 间接=true`，
+  fs-ro **104/104** PASS；`run-16576`：产品 `f_op=true i_op=true`，fs-open **166/166** PASS；
+  `run-16577`：`写4=4 f_op=true 内容对=true`，fs-rw **170/170** PASS。
+- `run-16578`：绕过 VFS 操作表后计数 `0/0/1/0/0 间接=false`，104 条仅
+  `t_vfs_ops_dispatch` FAIL。`run-16579`：绕过产品操作表后 166 条仅该格、
+  `t_fs_open_dup_shared`、`t_fs_open_node_lifecycle` FAIL；`run-16580`：170 条仅这四格 FAIL。
+  `run-16575` 静态直调 FAT 时计数与字节仍正确，但 `间接=false`，同格精确 FAIL；
+  `run-16581` 在 fs-rw 下同样仅该格 FAIL，覆盖 write 分派。
+- `ReadCursor` 增加 16 字节操作表指针；句柄槽当前实测 `len=16384 pages=3200`，即
+  800 字节/槽（131072 槽为 100 MiB，16384 槽为 12.5 MiB），`MAX_HANDLES=16384` 不变。
+  完整 inode 对象内嵌仍未做。
+- `check` **21/21**；最终完整矩阵 **82/82 符合**，`AURORA_MATRIX_DONE rc=0`。
+  真机未验证；AOCI MCP 不可用，索引未更新。

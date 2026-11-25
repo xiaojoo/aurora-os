@@ -271,10 +271,13 @@ fn syscall23_cells(hw: Handle, hr: Handle, hbad: Handle) -> bool {
 
     // 写 [4,8)：偏移刻意避开 `t_fs_rw_write` 那格的 [8,12)，两条用例不依赖链接顺序。
     let pattern = [0xD3u8, 0xA5, 0x5A, 0xC3];
+    let ops0 = vfs_ro::vfs_ops_stats();
     let w_seek = call(&mut fr, user::SYS_FILE_SEEK, hw.0, 4, 0);
     let put_ok = put_user(va.0, 64, &pattern);
     let wrote = call(&mut fr, user::SYS_FILE_WRITE, hw.0, va.0 + 64, 4);
-    ok &= w_seek == 4 && put_ok && wrote == 4;
+    let ops1 = vfs_ro::vfs_ops_stats();
+    let write_ops = ops1.3 - ops0.3 == 1 && ops1.4 - ops0.4 == 1;
+    ok &= w_seek == 4 && put_ok && wrote == 4 && write_ops;
 
     // 读回：只有 [4,8) 变，其余 60 字节与基线逐字节相同。
     let r_seek = call(&mut fr, user::SYS_FILE_SEEK, hw.0, 0, 0);
@@ -332,8 +335,9 @@ fn syscall23_cells(hw: Handle, hr: Handle, hbad: Handle) -> bool {
 
     let live = handle::used();
     crate::log_info!(
-        "fs-rw-23: 写4={} 空写={} 越EOF={} 只读句柄={} 坏指针={} 盘失败={} 读回={} 内容对={} 基线={} 缓存预热={} 关={} 关后活={}",
+        "fs-rw-23: 写4={} f_op={} 空写={} 越EOF={} 只读句柄={} 坏指针={} 盘失败={} 读回={} 内容对={} 基线={} 缓存预热={} 关={} 关后活={}",
         wrote,
+        write_ops,
         empty as i64,
         over as i64,
         ro_w as i64,

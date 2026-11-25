@@ -33,12 +33,14 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 /// 句柄表容量。
 ///
 /// **`fs-open` 档要小 8 倍**（ADR-189 补记）：那个档的 `Entry` 内嵌 `VfsFile`
-/// 的 `ReadCursor` + `VfsEntry`，单条 760 字节（其它档约 64 字节）。
+/// 的 `ReadCursor` + `VfsEntry`。ADR-189 实测时单条 760 字节；ADR-258 的操作表指针
+/// 让 `ReadCursor` 从 120 增至 136 字节，当前句柄槽实测 `len=16384 pages=3200`，即
+/// **800 字节/槽**（其它档约 64 字节）。
 ///
-/// 131072 x 760 B = **95 MiB**，在 512 MiB 机器上找不到连续块 ⇒
-/// `handle::init 引导失败 OutOfMemory` ⇒ BOOT-INVALID（实测）。
+/// 131072 x 800 B = **100 MiB**，在 512 MiB 机器上找不到连续块 ⇒
+/// `handle::init 引导失败 OutOfMemory` ⇒ BOOT-INVALID（ADR-189 实测）。
 ///
-/// 16384 x 760 B = 12 MiB，安全。**这不是「容量够用」，是「大 Entry 档的合理上限」**：
+/// 16384 x 800 B = 12.5 MiB，安全。**这不是「容量够用」，是「大 Entry 档的合理上限」**：
 /// 真正的解法是把 `VfsFile` 的大字段挪进旁表（像 `cells` 那样），
 /// 那要改十几处读写点，单独一轮做（ADR-189 未决 1）。
 #[cfg(feature = "fs-open")]
@@ -1293,7 +1295,14 @@ pub fn seek(h: Handle, owner: (usize, u32), newpos: u32) -> Result<u32, HErr> {
     };
     let disk = AhciDisk { port };
     let n = read_on_disk(&disk, part, |b| {
-        vfs_ro::seek_disk(b, &mut cursor, newpos).map_err(vfs_to_herr)
+        #[cfg(not(feature = "fault-vfs-ops-bypass"))]
+        {
+            cursor.seek(b, newpos).map_err(vfs_to_herr)
+        }
+        #[cfg(feature = "fault-vfs-ops-bypass")]
+        {
+            vfs_ro::seek_disk(b, &mut cursor, newpos).map_err(vfs_to_herr)
+        }
     })?;
     let mut g = TABLE.lock();
     let t = g.get();
@@ -1912,6 +1921,9 @@ impl ReadTicket {
             #[cfg(feature = "fs-open")]
             ReadTicketKind::Vfs(ref mut c, vol) => {
                 // ADR-250：产品读统一走缓存；vol 在 open 时由真实盘身份与 BPB 算出。
+                #[cfg(not(feature = "fault-vfs-ops-bypass"))]
+                let n = c.read_cached(disk, vol, dst).map_err(vfs_to_herr)?;
+                #[cfg(feature = "fault-vfs-ops-bypass")]
                 let n = vfs_ro::read_disk_cached(disk, vol, c, dst).map_err(vfs_to_herr)?;
                 Ok(n)
             }
@@ -2094,7 +2106,16 @@ pub fn begin_write(h: Handle, owner: (usize, u32)) -> Result<ReadTicket, HErr> {
 #[cfg(feature = "fs-rw")]
 pub fn write_chunk(ticket: &mut ReadTicket, disk: &dyn Block, src: &[u8]) -> Result<usize, HErr> {
     match ticket.kind {
-        ReadTicketKind::Vfs(ref mut c, _) => vfs_ro::write_at(disk, c, src).map_err(vfs_to_herr),
+        ReadTicketKind::Vfs(ref mut c, _) => {
+            #[cfg(not(feature = "fault-vfs-ops-bypass"))]
+            {
+                c.write(disk, src).map_err(vfs_to_herr)
+            }
+            #[cfg(feature = "fault-vfs-ops-bypass")]
+            {
+                vfs_ro::write_at(disk, c, src).map_err(vfs_to_herr)
+            }
+        }
         _ => Err(HErr::Denied),
     }
 }

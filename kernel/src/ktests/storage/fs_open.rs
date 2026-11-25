@@ -1065,6 +1065,7 @@ fn t_fs_open_dup_shared() -> bool {
         Err(_) => return false,
     };
     vfs_ro::cache_clear();
+    let ops0 = vfs_ro::vfs_ops_stats();
     let key = crate::filesystem::vfs::DiskKey::Ahci(fs_open::PORT);
     let req0 = crate::filesystem::block_io::stats_of(key).requests;
     let mut a = [0u8; 16];
@@ -1095,11 +1096,13 @@ fn t_fs_open_dup_shared() -> bool {
     let mut d = [0u8; 16];
     let survive = handle::read(h2, ident, &mut d) == Ok(16) && d == refb[48..64];
     let closed2 = handle::close(h2, ident).is_ok();
+    let ops1 = vfs_ro::vfs_ops_stats();
+    let ops_ok = ops1.2 - ops0.2 == 5 && ops1.4 - ops0.4 == 2;
     crate::log_info!(
-        "fs-open-dup: 首读={} 产品缓存冷={} 产品缓存热={} 请求{}->{}->{} 命中{}->{} 原名字推进={} 第二名字共享={} 关一条仍续读={} 端点={}",
-        first, cold, warm, req0, req1, req2, hits1, hits2, advanced, shared, survive, closed1 && closed2
+        "fs-open-dup: 首读={} 产品缓存冷={} 产品缓存热={} 请求{}->{}->{} 命中{}->{} 原名字推进={} 第二名字共享={} 关一条仍续读={} f_op={} 端点={}",
+        first, cold, warm, req0, req1, req2, hits1, hits2, advanced, shared, survive, ops_ok, closed1 && closed2
     );
-    cold && warm && seek16 && advanced && shared && survive && closed1 && closed2
+    cold && warm && seek16 && advanced && shared && survive && ops_ok && closed1 && closed2
 }
 ktest!(KT_FS_OPEN_DUP_SHARED, t_fs_open_dup_shared);
 
@@ -1116,10 +1119,13 @@ fn t_fs_open_node_lifecycle() -> bool {
     vfs_ro::sb_clear();
     vfs_ro::dentry_clear();
 
+    let product_ops0 = vfs_ro::vfs_ops_stats();
     let opened = match fs_open::open_node_product("/SMALL.BIN", fs_open::OPEN_READ_ONLY) {
         Ok(o) => o,
         Err(_) => { fs_open::set_port(old_port); return false; }
     };
+    let product_ops1 = vfs_ro::vfs_ops_stats();
+    let product_iop = product_ops1.0 - product_ops0.0 == 1;
     let fs_open::OpenedNode::File { port, cursor, stat, node } = opened else {
         fs_open::set_port(old_port);
         return false;
@@ -1245,12 +1251,12 @@ fn t_fs_open_node_lifecycle() -> bool {
     vfs_ro::dentry_clear();
     fs_open::set_port(old_port);
     let ok = consistent && independent && refs1 && node_ok && refs_after_dup && c1
-        && refs_after_first && closed2 && refs_after_last && product_reuse && refs2
+        && refs_after_first && closed2 && refs_after_last && product_reuse && refs2 && product_iop
         && revoked == 2 && refs_after_revoke
         && dc1 && dc2 && dir_refs && reset_ok;
     crate::log_info!(
-        "fs-open-node: 一致={} 独立卷={} open={} dup不增={} 首关={} 末关={} 产品复用={} refs={} revoke={} 目录={} reset={} ⇒ {}",
-        consistent, independent, refs1 && node_ok, refs_after_dup, refs_after_first,
+        "fs-open-node: 一致={} 独立卷={} open={} i_op={} dup不增={} 首关={} 末关={} 产品复用={} refs={} revoke={} 目录={} reset={} ⇒ {}",
+        consistent, independent, refs1 && node_ok, product_iop, refs_after_dup, refs_after_first,
         refs_after_last, product_reuse, refs2, refs_after_revoke, dir_refs, reset_ok, ok
     );
     ok

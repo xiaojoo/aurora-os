@@ -251,6 +251,79 @@ impl DirCursor {
     }
 }
 
+pub(crate) trait InodeOps: Sync {
+    fn open_file(&self, disk: &dyn Block, bpb: &Bpb, entry: &Entry) -> Result<ReadCursor, VfsError>;
+}
+
+pub(crate) trait FileOps: core::fmt::Debug + Sync {
+    fn read(&self, disk: &dyn Block, cur: &mut ReadCursor, dst: &mut [u8]) -> Result<usize, VfsError>;
+    fn read_cached(&self, disk: &dyn Block, vol: u64, cur: &mut ReadCursor, dst: &mut [u8]) -> Result<usize, VfsError>;
+    fn seek(&self, disk: &dyn Block, cur: &mut ReadCursor, newpos: u32) -> Result<u32, VfsError>;
+    #[cfg(feature = "fs-rw")]
+    fn write(&self, disk: &dyn Block, cur: &mut ReadCursor, src: &[u8]) -> Result<usize, VfsError>;
+}
+
+static FAT_INODE_OPS: FatInodeOps = FatInodeOps;
+static FAT_FILE_OPS: FatFileOps = FatFileOps;
+
+static INODE_OPEN_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static FILE_READ_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static FILE_CACHED_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static FILE_WRITE_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static FILE_SEEK_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+pub(crate) fn vfs_ops_stats() -> (u32, u32, u32, u32, u32) {
+    use core::sync::atomic::Ordering;
+    (
+        INODE_OPEN_CALLS.load(Ordering::Relaxed),
+        FILE_READ_CALLS.load(Ordering::Relaxed),
+        FILE_CACHED_CALLS.load(Ordering::Relaxed),
+        FILE_WRITE_CALLS.load(Ordering::Relaxed),
+        FILE_SEEK_CALLS.load(Ordering::Relaxed),
+    )
+}
+
+#[derive(Debug)]
+struct FatInodeOps;
+
+impl InodeOps for FatInodeOps {
+    fn open_file(&self, disk: &dyn Block, bpb: &Bpb, entry: &Entry) -> Result<ReadCursor, VfsError> {
+        use core::sync::atomic::Ordering;
+        INODE_OPEN_CALLS.fetch_add(1, Ordering::Relaxed);
+        open_disk(disk, bpb, entry)
+    }
+}
+
+#[derive(Debug)]
+struct FatFileOps;
+
+impl FileOps for FatFileOps {
+    fn read(&self, disk: &dyn Block, cur: &mut ReadCursor, dst: &mut [u8]) -> Result<usize, VfsError> {
+        use core::sync::atomic::Ordering;
+        FILE_READ_CALLS.fetch_add(1, Ordering::Relaxed);
+        read_disk(disk, cur, dst)
+    }
+
+    fn read_cached(&self, disk: &dyn Block, vol: u64, cur: &mut ReadCursor, dst: &mut [u8]) -> Result<usize, VfsError> {
+        use core::sync::atomic::Ordering;
+        FILE_CACHED_CALLS.fetch_add(1, Ordering::Relaxed);
+        read_disk_cached(disk, vol, cur, dst)
+    }
+
+    fn seek(&self, disk: &dyn Block, cur: &mut ReadCursor, newpos: u32) -> Result<u32, VfsError> {
+        use core::sync::atomic::Ordering;
+        FILE_SEEK_CALLS.fetch_add(1, Ordering::Relaxed);
+        seek_disk(disk, cur, newpos)
+    }
+
+    #[cfg(feature = "fs-rw")]
+    fn write(&self, disk: &dyn Block, cur: &mut ReadCursor, src: &[u8]) -> Result<usize, VfsError> {
+        use core::sync::atomic::Ordering;
+        FILE_WRITE_CALLS.fetch_add(1, Ordering::Relaxed);
+        write_at(disk, cur, src)
+    }
+}
+
 /// 顺序读取游标。位置只在**整次读成功之后**提交，失败时调用方丢弃 dst 前缀即可重试。
 #[derive(Debug, Clone, Copy)]
 pub struct ReadCursor {
@@ -259,6 +332,7 @@ pub struct ReadCursor {
     cluster: u32,
     position: u32,
     clusters: u32,
+    ops: &'static dyn FileOps,
 }
 
 impl ReadCursor {
@@ -285,6 +359,55 @@ impl ReadCursor {
 
     pub(crate) fn current_lba(&self) -> Option<u64> {
         data_lba(&self.bpb, self.cluster).ok()
+    }
+
+    pub(crate) fn read(&mut self, disk: &dyn Block, dst: &mut [u8]) -> Result<usize, VfsError> {
+        #[cfg(not(feature = "fault-vfs-ops-static"))]
+        {
+            self.ops.read(disk, self, dst)
+        }
+        #[cfg(feature = "fault-vfs-ops-static")]
+        {
+            FAT_FILE_OPS.read(disk, self, dst)
+        }
+    }
+
+    pub(crate) fn read_cached(&mut self, disk: &dyn Block, vol: u64, dst: &mut [u8]) -> Result<usize, VfsError> {
+        #[cfg(not(feature = "fault-vfs-ops-static"))]
+        {
+            self.ops.read_cached(disk, vol, self, dst)
+        }
+        #[cfg(feature = "fault-vfs-ops-static")]
+        {
+            FAT_FILE_OPS.read_cached(disk, vol, self, dst)
+        }
+    }
+
+    pub(crate) fn seek(&mut self, disk: &dyn Block, newpos: u32) -> Result<u32, VfsError> {
+        #[cfg(not(feature = "fault-vfs-ops-static"))]
+        {
+            self.ops.seek(disk, self, newpos)
+        }
+        #[cfg(feature = "fault-vfs-ops-static")]
+        {
+            FAT_FILE_OPS.seek(disk, self, newpos)
+        }
+    }
+
+    #[cfg(feature = "fs-rw")]
+    pub(crate) fn write(&mut self, disk: &dyn Block, src: &[u8]) -> Result<usize, VfsError> {
+        #[cfg(not(feature = "fault-vfs-ops-static"))]
+        {
+            self.ops.write(disk, self, src)
+        }
+        #[cfg(feature = "fault-vfs-ops-static")]
+        {
+            FAT_FILE_OPS.write(disk, self, src)
+        }
+    }
+
+    pub(crate) fn set_file_ops_for_test(&mut self, ops: &'static dyn FileOps) {
+        self.ops = ops;
     }
 }
 
@@ -336,6 +459,7 @@ impl DirState {
 /// 单根只读文件系统（ADR-107 §3）：一次挂一个卷，挂载点固定在 `/`。
 pub struct ReadOnlyFs<'a> {
     vol: Volume<'a>,
+    inode_ops: &'static dyn InodeOps,
     /// **卷内容指纹**（ADR-195 补记）：dentry 缓存的键必须带它。
     ///
     /// 只带 `disk_key` + 几何**不够**（实测）：`t_vfs_ro_fat32` 的坏卷与好卷
@@ -373,13 +497,17 @@ impl<'a> ReadOnlyFs<'a> {
                     dentry_clear();
                     cache_clear();
                 }
-                ReadOnlyFs { vol, vol_id }
+                ReadOnlyFs { vol, vol_id, inode_ops: &FAT_INODE_OPS }
             })
             .map_err(VfsError::Fs)
     }
 
     pub fn bpb(&self) -> Bpb {
         self.vol.bpb
+    }
+
+    pub(crate) fn set_inode_ops_for_test(&mut self, ops: &'static dyn InodeOps) {
+        self.inode_ops = ops;
     }
 
     pub fn root(&self) -> Entry {
@@ -401,15 +529,40 @@ impl<'a> ReadOnlyFs<'a> {
 
     /// 打开一个文件的顺序读取游标。目录在 `open` 阶段就拒，避免读路径里再分叉。
     pub fn open(&self, e: &Entry) -> Result<ReadCursor, VfsError> {
-        open(self.vol.disk, &self.vol.bpb, e)
+        #[cfg(not(any(feature = "fault-vfs-ops-bypass", feature = "fault-vfs-ops-static")))]
+        {
+            self.inode_ops.open_file(self.vol.disk, &self.vol.bpb, e)
+        }
+        #[cfg(feature = "fault-vfs-ops-bypass")]
+        {
+            open_disk(self.vol.disk, &self.vol.bpb, e)
+        }
+        #[cfg(all(feature = "fault-vfs-ops-static", not(feature = "fault-vfs-ops-bypass")))]
+        {
+            FAT_INODE_OPS.open_file(self.vol.disk, &self.vol.bpb, e)
+        }
     }
 
     pub fn read(&self, cur: &mut ReadCursor, dst: &mut [u8]) -> Result<usize, VfsError> {
-        read_disk(self.vol.disk, cur, dst)
+        #[cfg(not(feature = "fault-vfs-ops-bypass"))]
+        {
+            cur.read(self.vol.disk, dst)
+        }
+        #[cfg(feature = "fault-vfs-ops-bypass")]
+        {
+            read_disk(self.vol.disk, cur, dst)
+        }
     }
 
     pub fn seek(&self, cur: &mut ReadCursor, newpos: u32) -> Result<u32, VfsError> {
-        seek_disk(self.vol.disk, cur, newpos)
+        #[cfg(not(feature = "fault-vfs-ops-bypass"))]
+        {
+            cur.seek(self.vol.disk, newpos)
+        }
+        #[cfg(feature = "fault-vfs-ops-bypass")]
+        {
+            seek_disk(self.vol.disk, cur, newpos)
+        }
     }
 }
 
@@ -973,6 +1126,10 @@ fn load_sector(disk: &dyn Block, cur: &mut DirCursor) -> Result<bool, VfsError> 
 }
 
 pub fn open(disk: &dyn Block, bpb: &Bpb, e: &Entry) -> Result<ReadCursor, VfsError> {
+    FAT_INODE_OPS.open_file(disk, bpb, e)
+}
+
+fn open_disk(disk: &dyn Block, bpb: &Bpb, e: &Entry) -> Result<ReadCursor, VfsError> {
     if e.is_dir() {
         return Err(VfsError::IsDir);
     }
@@ -990,6 +1147,7 @@ pub fn open(disk: &dyn Block, bpb: &Bpb, e: &Entry) -> Result<ReadCursor, VfsErr
         cluster: e.first_cluster,
         position: 0,
         clusters: 0,
+        ops: &FAT_FILE_OPS,
     })
 }
 
