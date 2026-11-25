@@ -108,16 +108,19 @@ impl Bucket {
 const BUCKETS: usize = 44;
 static STATS: [Bucket; BUCKETS] = [const { Bucket::new() }; BUCKETS];
 
-fn bucket_of(k: DiskKey) -> &'static Bucket {
-    let i = match k {
+fn bucket_index(k: DiskKey) -> usize {
+    match k {
         DiskKey::Unknown => 0,
         DiskKey::Ahci(p) => 1 + (p as usize & 31),
         DiskKey::Virtio(v) => 33 + (v as usize & 7),
         DiskKey::Mem => 41,
         // 今天只支持单台 NVMe，所以 & 1 只是防越界；表化时把 1 改大。
         DiskKey::Nvme(s) => 42 + (s as usize & 1),
-    };
-    &STATS[i]
+    }
+}
+
+fn bucket_of(k: DiskKey) -> &'static Bucket {
+    &STATS[bucket_index(k)]
 }
 
 /// 全部桶的合计（既有判据读的就是这个数，语义不变）。
@@ -187,7 +190,8 @@ pub fn read_at(disk: &dyn Block, lba: u64, dst: &mut [u8], budget: &Budget<'_>) 
             take -= 1;
         }
         if take == 0 {
-            break;
+            b.refused.fetch_add(1, Ordering::Relaxed);
+            return Outcome { sectors_done: done, error: Some(BlockError::Refused) };
         }
         let at = lba + u64::from(done);
         if budget.cancel.load(Ordering::Relaxed) {
@@ -404,11 +408,13 @@ fn sort_and_merge(items: &mut [Request], len: usize) -> usize {
     for i in 0..len {
         if out > 0 {
             let prev = items[out - 1];
-            let end = prev.lba.saturating_add(u64::from(prev.sectors));
-            if end == items[i].lba {
-                // 合并：延长前一条
-                items[out - 1].sectors = prev.sectors.saturating_add(items[i].sectors);
-                continue;
+            if let Some(end) = prev.lba.checked_add(u64::from(prev.sectors)) {
+                if end == items[i].lba {
+                    if let Some(sectors) = prev.sectors.checked_add(items[i].sectors) {
+                        items[out - 1].sectors = sectors;
+                        continue;
+                    }
+                }
             }
         }
         items[out] = items[i];
@@ -416,6 +422,20 @@ fn sort_and_merge(items: &mut [Request], len: usize) -> usize {
     }
     out
 }
+
+#[cfg(feature = "handles")]
+fn t_block_merge_overflow() -> bool {
+    let mut items = [Request { lba: 0, sectors: 0, token: 0, seq: 0 }; 2];
+    items[0] = Request { lba: 0, sectors: u32::MAX, token: 1, seq: 1 };
+    items[1] = Request { lba: u32::MAX as u64, sectors: 1, token: 2, seq: 2 };
+    let issued = sort_and_merge(&mut items, 2);
+    let ok = issued == 2 && items[0].sectors == u32::MAX && items[1].sectors == 1;
+    crate::log_info!("block-merge-overflow: 不合并={} 前请求完整={} 后请求完整={} ⇒ {}",
+        issued == 2, items[0].sectors == u32::MAX, items[1].sectors == 1, ok);
+    ok
+}
+#[cfg(feature = "handles")]
+crate::ktest!(KT_BLOCK_MERGE_OVERFLOW, t_block_merge_overflow);
 
 /// **执行整个队列**（ADR-214）。
 ///
@@ -447,7 +467,8 @@ pub fn drain(disk: &dyn Block, budget: &Budget<'_>) -> DrainReport {
         let mut done = 0u32;
         while done < r.sectors {
             let out = read_at(disk, r.lba + u64::from(done), &mut buf, budget);
-            if out.error.is_some() {
+            if let Some(e) = out.error {
+                sectors_ok += u64::from(done);
                 failed_at = Some(r.token);
                 break;
             }
@@ -620,6 +641,7 @@ pub fn drain_with_cb(disk: &dyn Block, budget: &Budget<'_>) -> DrainReport {
         while done < it.req.sectors {
             let out = read_at(disk, it.req.lba + u64::from(done), &mut buf, budget);
             if let Some(e) = out.error {
+                sectors_ok += u64::from(done);
                 err = Some(e);
                 break;
             }
@@ -650,5 +672,368 @@ pub fn drain_with_cb(disk: &dyn Block, budget: &Budget<'_>) -> DrainReport {
         }
     }
     let _ = reqs;
+    DrainReport { issued: len as u32, merged: 0, sectors_ok, failed_at }
+}
+
+// ---------------------------------------------------------------- ADR-251：按目标延迟完成
+
+/// 调用方定义的块地址空间身份。DiskKey 只是统计桶，不能单独区分同口分区或多个 MemDisk。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TargetId(pub u64);
+
+const EMPTY_REQUEST: Request = Request { lba: 0, sectors: 0, token: 0, seq: 0 };
+
+#[derive(Clone, Copy)]
+struct KeyedRequest {
+    req: Request,
+    target: TargetId,
+}
+
+const EMPTY_KEYED: KeyedRequest = KeyedRequest { req: EMPTY_REQUEST, target: TargetId(0) };
+
+struct KeyedQueue {
+    items: [KeyedRequest; QUEUE_MAX],
+    len: usize,
+    seq: u32,
+    submitted: u32,
+    drained: u32,
+    refused: u32,
+}
+
+impl KeyedQueue {
+    const fn new() -> Self {
+        Self {
+            items: [EMPTY_KEYED; QUEUE_MAX],
+            len: 0,
+            seq: 0,
+            submitted: 0,
+            drained: 0,
+            refused: 0,
+        }
+    }
+}
+
+struct KeyedQueueCell(core::cell::UnsafeCell<KeyedQueue>);
+// SAFETY: 读写全在既有 QUEUE_LOCK 内；载荷全为 Copy。
+unsafe impl Sync for KeyedQueueCell {}
+
+static DISK_QUEUE: KeyedQueueCell = KeyedQueueCell(core::cell::UnsafeCell::new(KeyedQueue::new()));
+
+/// 按目标提交一条批量请求；只入队，不碰设备（ADR-251）。
+pub fn submit_for(target: TargetId, lba: u64, sectors: u32, token: u64) -> bool {
+    if sectors == 0 {
+        return false;
+    }
+    let _g = QUEUE_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let q = unsafe { &mut *DISK_QUEUE.0.get() };
+    if q.len >= QUEUE_MAX {
+        q.refused += 1;
+        return false;
+    }
+    q.seq = q.seq.wrapping_add(1);
+    q.items[q.len] = KeyedRequest {
+        req: Request { lba, sectors, token, seq: q.seq },
+        target,
+    };
+    q.len += 1;
+    q.submitted += 1;
+    true
+}
+
+/// 该目标仍在队列里、尚未被 drain 摘出的请求数；不包含正在执行的快照。
+pub fn pending_for(target: TargetId) -> usize {
+    let _g = QUEUE_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let q = unsafe { &*DISK_QUEUE.0.get() };
+    q.items[..q.len].iter().filter(|r| r.target == target).count()
+}
+
+/// 新批量池的 `(提交, drain调用次数, 拒收)` 累计；drained 含空调用。
+pub fn disk_queue_stats() -> (u32, u32, u32) {
+    let _g = QUEUE_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let q = unsafe { &*DISK_QUEUE.0.get() };
+    (q.submitted, q.drained, q.refused)
+}
+
+/// 清掉该目标尚未摘出的请求，其他目标原样保留；不清累计统计。
+pub fn queue_clear_for(target: TargetId) {
+    let _g = QUEUE_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let q = unsafe { &mut *DISK_QUEUE.0.get() };
+    let mut out = 0usize;
+    for i in 0..q.len {
+        let item = q.items[i];
+        if item.target != target {
+            q.items[out] = item;
+            out += 1;
+        }
+    }
+    q.len = out;
+}
+
+/// 清空新批量池与累计统计（判据用）。
+pub fn disk_queue_clear() {
+    let _g = QUEUE_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let q = unsafe { &mut *DISK_QUEUE.0.get() };
+    q.len = 0;
+    q.seq = 0;
+    q.submitted = 0;
+    q.drained = 0;
+    q.refused = 0;
+}
+
+/// 只执行该目标的请求；target 必须唯一对应传入 disk 的地址空间。
+pub fn drain_for(target: TargetId, disk: &dyn Block, budget: &Budget<'_>) -> DrainReport {
+    let mut items = [EMPTY_REQUEST; QUEUE_MAX];
+    let len = {
+        let _g = QUEUE_LOCK.lock();
+        // SAFETY: 持锁期间独占。
+        let q = unsafe { &mut *DISK_QUEUE.0.get() };
+        let mut taken = 0usize;
+        let mut kept = 0usize;
+        for i in 0..q.len {
+            let item = q.items[i];
+            if item.target == target {
+                items[taken] = item.req;
+                taken += 1;
+            } else {
+                q.items[kept] = item;
+                kept += 1;
+            }
+        }
+        q.len = kept;
+        q.drained += 1;
+        taken
+    };
+    if len == 0 {
+        return DrainReport { issued: 0, merged: 0, sectors_ok: 0, failed_at: None };
+    }
+    let issued = sort_and_merge(&mut items, len);
+    let mut sectors_ok = 0u64;
+    let mut failed_at = None;
+    for i in 0..issued {
+        let r = items[i];
+        let mut done = 0u32;
+        while done < r.sectors {
+            let out = read_at(disk, r.lba + u64::from(done), &mut [0u8; SECTOR_BYTES], budget);
+            if let Some(e) = out.error {
+                sectors_ok += u64::from(done);
+                failed_at = Some(r.token);
+                break;
+            }
+            done += 1;
+        }
+        if failed_at.is_some() {
+            break;
+        }
+        sectors_ok += u64::from(r.sectors);
+    }
+    DrainReport {
+        issued: issued as u32,
+        merged: (len - issued) as u32,
+        sectors_ok,
+        failed_at,
+    }
+}
+
+/// 带调用方上下文的完成回调；ctx 只按值传递，不做指针解释。
+pub type OnCompleteCtx = fn(ctx: u64, token: u64, result: Result<u32, BlockError>);
+
+#[derive(Clone, Copy)]
+struct ContextPending {
+    req: Request,
+    target: TargetId,
+    ctx: u64,
+    cb: OnCompleteCtx,
+}
+
+fn noop_complete_ctx(_: u64, _: u64, _: Result<u32, BlockError>) {}
+
+const EMPTY_CONTEXT: ContextPending = ContextPending {
+    req: EMPTY_REQUEST,
+    target: TargetId(0),
+    ctx: 0,
+    cb: noop_complete_ctx,
+};
+
+struct ContextQueue {
+    items: [ContextPending; QUEUE_MAX],
+    len: usize,
+    seq: u32,
+    delivered: u32,
+    failed: u32,
+    refused: u32,
+}
+
+impl ContextQueue {
+    const fn new() -> Self {
+        Self {
+            items: [EMPTY_CONTEXT; QUEUE_MAX],
+            len: 0,
+            seq: 0,
+            delivered: 0,
+            failed: 0,
+            refused: 0,
+        }
+    }
+}
+
+struct ContextQueueCell(core::cell::UnsafeCell<ContextQueue>);
+// SAFETY: 读写全在既有 CB_LOCK 内；载荷全为 Copy。
+unsafe impl Sync for ContextQueueCell {}
+
+static CTX_QUEUE: ContextQueueCell = ContextQueueCell(core::cell::UnsafeCell::new(ContextQueue::new()));
+
+/// 按目标提交一条带上下文的延迟完成请求。
+pub fn submit_with_cb_ctx(
+    target: TargetId,
+    lba: u64,
+    sectors: u32,
+    token: u64,
+    ctx: u64,
+    cb: OnCompleteCtx,
+) -> bool {
+    if sectors == 0 {
+        return false;
+    }
+    let _g = CB_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let q = unsafe { &mut *CTX_QUEUE.0.get() };
+    if q.len >= QUEUE_MAX {
+        q.refused += 1;
+        return false;
+    }
+    q.seq = q.seq.wrapping_add(1);
+    q.items[q.len] = ContextPending {
+        req: Request { lba, sectors, token, seq: q.seq },
+        target,
+        ctx,
+        cb,
+    };
+    q.len += 1;
+    true
+}
+
+/// 该目标仍在队列里、尚未被 drain 摘出的请求数；不包含正在回调的快照。
+pub fn cb_pending_for(target: TargetId) -> usize {
+    let _g = CB_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let q = unsafe { &*CTX_QUEUE.0.get() };
+    q.items[..q.len].iter().filter(|r| r.target == target).count()
+}
+
+/// 新上下文池的 `(投递, 失败, 拒收)` 累计。
+pub fn ctx_cb_stats() -> (u32, u32, u32) {
+    let _g = CB_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let q = unsafe { &*CTX_QUEUE.0.get() };
+    (q.delivered, q.failed, q.refused)
+}
+
+/// 清掉该目标尚未摘出的请求，其他目标原样保留；不清累计统计。
+pub fn cb_clear_for(target: TargetId) {
+    let _g = CB_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let q = unsafe { &mut *CTX_QUEUE.0.get() };
+    let mut out = 0usize;
+    for i in 0..q.len {
+        let item = q.items[i];
+        if item.target != target {
+            q.items[out] = item;
+            out += 1;
+        }
+    }
+    q.len = out;
+}
+
+/// 清空新上下文池与累计统计（判据用）。
+pub fn ctx_cb_clear() {
+    let _g = CB_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let q = unsafe { &mut *CTX_QUEUE.0.get() };
+    q.len = 0;
+    q.seq = 0;
+    q.delivered = 0;
+    q.failed = 0;
+    q.refused = 0;
+}
+
+/// 显式推进该目标的延迟完成：逐 token 执行并回调，回调全程不持队列锁。
+pub fn drain_with_cb_ctx(target: TargetId, disk: &dyn Block, budget: &Budget<'_>) -> DrainReport {
+    let mut items = [EMPTY_CONTEXT; QUEUE_MAX];
+    let len = {
+        let _g = CB_LOCK.lock();
+        // SAFETY: 持锁期间独占。
+        let q = unsafe { &mut *CTX_QUEUE.0.get() };
+        let mut taken = 0usize;
+        let mut kept = 0usize;
+        for i in 0..q.len {
+            let item = q.items[i];
+            if item.target == target {
+                items[taken] = item;
+                taken += 1;
+            } else {
+                q.items[kept] = item;
+                kept += 1;
+            }
+        }
+        q.len = kept;
+        taken
+    };
+    for i in 1..len {
+        let key_item = items[i];
+        let mut j = i;
+        while j > 0 {
+            let prev = items[j - 1];
+            if !(prev.req.lba > key_item.req.lba
+                || (prev.req.lba == key_item.req.lba && prev.req.seq > key_item.req.seq))
+            {
+                break;
+            }
+            items[j] = prev;
+            j -= 1;
+        }
+        items[j] = key_item;
+    }
+    let mut sectors_ok = 0u64;
+    let mut failed_at = None;
+    let mut buf = [0u8; SECTOR_BYTES];
+    for i in 0..len {
+        let item = items[i];
+        let mut done = 0u32;
+        let mut err = None;
+        while done < item.req.sectors {
+            let out = read_at(disk, item.req.lba + u64::from(done), &mut buf, budget);
+            if let Some(e) = out.error {
+                sectors_ok += u64::from(done);
+                err = Some(e);
+                break;
+            }
+            done += 1;
+        }
+        let result = match err {
+            None => Ok(item.req.sectors),
+            Some(e) => Err(e),
+        };
+        {
+            let _g = CB_LOCK.lock();
+            // SAFETY: 持锁期间独占。
+            let q = unsafe { &mut *CTX_QUEUE.0.get() };
+            if err.is_none() {
+                q.delivered += 1;
+                sectors_ok += u64::from(item.req.sectors);
+            } else {
+                q.failed += 1;
+                if failed_at.is_none() {
+                    failed_at = Some(item.req.token);
+                }
+            }
+        }
+        // 统计先提交、锁已放；回调重入看到当前请求，panic=abort 边界见 ADR-251。
+        (item.cb)(item.ctx, item.req.token, result);
+    }
     DrainReport { issued: len as u32, merged: 0, sectors_ok, failed_at }
 }

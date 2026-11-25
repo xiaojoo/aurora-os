@@ -129,11 +129,14 @@ U2 = 10
 # 2026-11-25 ADR-250：+filesystem/vfs_ro U4 1（cache_invalidate 持 CACHE_LOCK 清槽/递增代数）、
 # +ktests/storage/vfs_ro U6 1（t_cache_invalidate_inflight 的单核 static mut 夹具）。
 # 对账：705+2=707、U4 234+1=235、U6 43+1=44。
-total = 707
+# 2026-11-25 ADR-251：+filesystem/block_io U4 15（按目标批量池 7、上下文回调池 8，
+# 全部复用既有 QUEUE_LOCK/CB_LOCK，载荷 Copy，锁外执行设备与回调）。
+# 对账：707+15=722、U4 235+15=250。
+total = 722
 U1 = 104
 U2 = 183
 U3 = 13
-U4 = 235
+U4 = 250
 U5 = 128
 U6 = 44
 
@@ -192,7 +195,7 @@ U4 = 17
 U4 = 8
 
 [modules."filesystem/block_io"]
-U4 = 14
+U4 = 29
 
 [modules."filesystem/fs_open"]
 U2 = 2

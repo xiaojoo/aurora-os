@@ -1698,6 +1698,316 @@ fn t_block_callback() -> bool {
 #[cfg(feature = "handles")]
 ktest!(KT_BLOCK_CALLBACK, t_block_callback);
 
+
+/// ADR-251：批量请求按目标提取，A 目标执行不能碰 B 目标。
+#[cfg(feature = "handles")]
+fn t_block_per_disk_queue() -> bool {
+    use crate::filesystem::block_io::{self, Budget, Outcome, TargetId};
+    use crate::filesystem::vfs::{Block, BlockError, DiskKey};
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    struct KeyDisk<'a> {
+        key: DiskKey,
+        calls: &'a AtomicU32,
+        limit: u64,
+    }
+    impl Block for KeyDisk<'_> {
+        fn read_sectors(&self, lba: u64, dst: &mut [u8]) -> Result<(), BlockError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if lba >= self.limit {
+                return Err(BlockError::Refused);
+            }
+            dst.fill(match self.key {
+                DiskKey::Ahci(10) => 0x11,
+                DiskKey::Ahci(11) => 0x22,
+                _ => 0x33,
+            });
+            Ok(())
+        }
+        fn disk_key(&self) -> DiskKey {
+            self.key
+        }
+    }
+
+    let ta = TargetId(0xA);
+    let tb = TargetId(0xB);
+    static CALLS_A: AtomicU32 = AtomicU32::new(0);
+    static CALLS_B: AtomicU32 = AtomicU32::new(0);
+    let disk_a = KeyDisk { key: DiskKey::Ahci(10), calls: &CALLS_A, limit: 64 };
+    let disk_b = KeyDisk { key: DiskKey::Ahci(10), calls: &CALLS_B, limit: 64 };
+    block_io::disk_queue_clear();
+    CALLS_A.store(0, Ordering::Relaxed);
+    CALLS_B.store(0, Ordering::Relaxed);
+
+    let submitted = block_io::submit_for(ta, 20, 1, 1)
+        && block_io::submit_for(tb, 10, 1, 2)
+        && block_io::submit_for(ta, 10, 1, 3);
+    let split = submitted
+        && block_io::pending_for(ta) == 2
+        && block_io::pending_for(tb) == 1;
+    let ra = block_io::drain_for(ta, &disk_a, &Budget::UNBOUNDED);
+    let a_only = ra.issued == 2 && ra.sectors_ok == 2 && ra.failed_at.is_none()
+        && CALLS_A.load(Ordering::Relaxed) == 2
+        && CALLS_B.load(Ordering::Relaxed) == 0
+        && block_io::pending_for(ta) == 0
+        && block_io::pending_for(tb) == 1;
+    let _ = block_io::submit_for(ta, 30, 1, 4);
+    let cleared_b = {
+        block_io::queue_clear_for(tb);
+        block_io::pending_for(tb) == 0 && block_io::pending_for(ta) == 1
+    };
+    let _ = block_io::drain_for(ta, &disk_a, &Budget::UNBOUNDED);
+    let resubmitted_b = block_io::submit_for(tb, 10, 1, 2);
+    let rb = block_io::drain_for(tb, &disk_b, &Budget::UNBOUNDED);
+    let b_done = cleared_b && resubmitted_b && rb.issued == 1 && rb.sectors_ok == 1
+        && CALLS_B.load(Ordering::Relaxed) == 1
+        && block_io::pending_for(tb) == 0;
+    let drained0 = block_io::disk_queue_stats().1;
+    let empty = block_io::drain_for(ta, &disk_a, &Budget::UNBOUNDED);
+    let drained1 = block_io::disk_queue_stats().1;
+    let drained_ok = empty.issued == 0 && drained1 == drained0 + 1;
+
+    block_io::disk_queue_clear();
+    let _ = block_io::submit_for(ta, 12, 2, 12);
+    let _ = block_io::submit_for(ta, 10, 2, 10);
+    let merged = block_io::drain_for(ta, &disk_a, &Budget::UNBOUNDED);
+    let merge_ok = merged.issued == 1 && merged.merged == 1 && merged.sectors_ok == 4;
+
+    block_io::disk_queue_clear();
+    CALLS_A.store(0, Ordering::Relaxed);
+    let _ = block_io::submit_for(ta, u64::MAX, 1, 88);
+    let overflow = block_io::drain_for(ta, &disk_a, &Budget::UNBOUNDED);
+    let mut direct_buf = [0u8; 512];
+    let direct = block_io::read_at(&disk_a, u64::MAX, &mut direct_buf, &Budget::UNBOUNDED);
+    let overflow_ok = overflow.failed_at == Some(88) && overflow.sectors_ok == 0
+        && direct == Outcome { sectors_done: 0, error: Some(BlockError::Refused) }
+        && CALLS_A.load(Ordering::Relaxed) == 0;
+
+    struct PartialDisk<'a> { calls: &'a AtomicU32 }
+    impl Block for PartialDisk<'_> {
+        fn read_sectors(&self, lba: u64, dst: &mut [u8]) -> Result<(), BlockError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if lba == 1 { return Err(BlockError::DeviceError); }
+            dst.fill(0x44);
+            Ok(())
+        }
+    }
+    static CALLS_P: AtomicU32 = AtomicU32::new(0);
+    let partial_disk = PartialDisk { calls: &CALLS_P };
+    block_io::disk_queue_clear();
+    let _ = block_io::submit_for(ta, 0, 2, 77);
+    let partial = block_io::drain_for(ta, &partial_disk, &Budget::UNBOUNDED);
+    let partial_ok = partial.failed_at == Some(77) && partial.sectors_ok == 1
+        && CALLS_P.load(Ordering::Relaxed) == 2;
+
+    block_io::disk_queue_clear();
+    let mut filled = 0usize;
+    for i in 0..block_io::QUEUE_MAX {
+        let target = if i % 2 == 0 { ta } else { tb };
+        if block_io::submit_for(target, i as u64, 1, i as u64) {
+            filled += 1;
+        }
+    }
+    let overflow_full = block_io::submit_for(ta, 999, 1, 999);
+    let (_, _, refused) = block_io::disk_queue_stats();
+    let full_ok = filled == block_io::QUEUE_MAX && !overflow_full && refused >= 1;
+    block_io::disk_queue_clear();
+
+    let ok = split && a_only && b_done && drained_ok && merge_ok && overflow_ok
+        && partial_ok && full_ok;
+    crate::log_info!(
+        "block-perdisk: 交错入队={} A不碰B={} 目标清={} B可完成={} drain计数={} 同盘合并={} LBA溢出拒={} 部分成功={}(失败={:?} 扇区={} 调用={}) 满池拒={} ⇒ {}",
+        split, a_only, cleared_b, b_done, drained_ok, merge_ok, overflow_ok, partial_ok,
+        partial.failed_at, partial.sectors_ok, CALLS_P.load(Ordering::Relaxed), full_ok, ok
+    );
+    ok
+}
+#[cfg(feature = "handles")]
+ktest!(KT_BLOCK_PER_DISK_QUEUE, t_block_per_disk_queue);
+
+/// ADR-251：带上下文回调按目标完成，统计先于回调提交，链式请求留到下一轮。
+#[cfg(feature = "handles")]
+fn t_block_context_callback() -> bool {
+    use crate::filesystem::block_io::{self, Budget, Outcome, TargetId};
+    use crate::filesystem::vfs::{Block, BlockError, DiskKey};
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    struct KeyDisk<'a> {
+        key: DiskKey,
+        calls: &'a AtomicU32,
+        fail_at: Option<u64>,
+    }
+    impl Block for KeyDisk<'_> {
+        fn read_sectors(&self, lba: u64, dst: &mut [u8]) -> Result<(), BlockError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if lba >= 64 || self.fail_at == Some(lba) {
+                return Err(BlockError::Refused);
+            }
+            dst.fill(if self.key == DiskKey::Ahci(10) { 0x11 } else { 0x22 });
+            Ok(())
+        }
+        fn disk_key(&self) -> DiskKey {
+            self.key
+        }
+    }
+
+    let ta = TargetId(0xA);
+    let tb = TargetId(0xB);
+    const CTX: u64 = 0x51a7_2026_1125;
+    const CTX2: u64 = CTX + 1;
+    const CTX3: u64 = CTX + 2;
+    static CALLS_A: AtomicU32 = AtomicU32::new(0);
+    static CALLS_B: AtomicU32 = AtomicU32::new(0);
+    static ORDER: AtomicU32 = AtomicU32::new(0);
+    static TOK0: AtomicU32 = AtomicU32::new(0);
+    static TOK1: AtomicU32 = AtomicU32::new(0);
+    static TOK2: AtomicU32 = AtomicU32::new(0);
+    static TOK3: AtomicU32 = AtomicU32::new(0);
+    static BAD_CTX: AtomicU32 = AtomicU32::new(0);
+    static BAD_RESULT: AtomicU32 = AtomicU32::new(0);
+    static OK_COUNT: AtomicU32 = AtomicU32::new(0);
+    static ERR_COUNT: AtomicU32 = AtomicU32::new(0);
+    static ERR_REFUSED: AtomicU32 = AtomicU32::new(0);
+    static CHAIN: AtomicU32 = AtomicU32::new(0);
+    static SAW0: AtomicU32 = AtomicU32::new(0);
+    static SAW1: AtomicU32 = AtomicU32::new(0);
+
+    fn cb(ctx: u64, token: u64, result: Result<u32, BlockError>) {
+        let want_ctx = match token {
+            7 => CTX,
+            42 | 999 => CTX2,
+            99 => CTX3,
+            55 | 56 => CTX,
+            _ => 0,
+        };
+        if ctx != want_ctx {
+            BAD_CTX.fetch_add(1, Ordering::Relaxed);
+        }
+        let n = ORDER.fetch_add(1, Ordering::Relaxed);
+        let slot = match n {
+            0 => &TOK0,
+            1 => &TOK1,
+            2 => &TOK2,
+            _ => &TOK3,
+        };
+        slot.store(token as u32, Ordering::Relaxed);
+        match result {
+            Ok(sectors) => {
+                OK_COUNT.fetch_add(1, Ordering::Relaxed);
+                let want = if token == 7 || token == 42 { 2 } else { 1 };
+                if sectors != want {
+                    BAD_RESULT.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Err(e) => {
+                ERR_COUNT.fetch_add(1, Ordering::Relaxed);
+                if token == 55 && e == BlockError::Refused {
+                    ERR_REFUSED.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        let (delivered, _, _) = block_io::ctx_cb_stats();
+        if n == 0 {
+            SAW0.store(delivered, Ordering::Relaxed);
+        } else if n == 1 {
+            SAW1.store(delivered, Ordering::Relaxed);
+        }
+        if token == 42 {
+            CHAIN.store(1, Ordering::Relaxed);
+            let _ = block_io::submit_with_cb_ctx(TargetId(0xA), 30, 1, 999, CTX2, cb);
+        }
+    }
+
+    let mut disk_a = KeyDisk { key: DiskKey::Ahci(10), calls: &CALLS_A, fail_at: None };
+    let disk_b = KeyDisk { key: DiskKey::Ahci(10), calls: &CALLS_B, fail_at: None };
+    block_io::ctx_cb_clear();
+    CALLS_A.store(0, Ordering::Relaxed);
+    CALLS_B.store(0, Ordering::Relaxed);
+    ORDER.store(0, Ordering::Relaxed);
+    TOK0.store(0, Ordering::Relaxed);
+    TOK1.store(0, Ordering::Relaxed);
+    TOK2.store(0, Ordering::Relaxed);
+    TOK3.store(0, Ordering::Relaxed);
+    BAD_CTX.store(0, Ordering::Relaxed);
+    BAD_RESULT.store(0, Ordering::Relaxed);
+    OK_COUNT.store(0, Ordering::Relaxed);
+    ERR_COUNT.store(0, Ordering::Relaxed);
+    ERR_REFUSED.store(0, Ordering::Relaxed);
+    CHAIN.store(0, Ordering::Relaxed);
+    SAW0.store(0, Ordering::Relaxed);
+    SAW1.store(0, Ordering::Relaxed);
+
+    let submitted = block_io::submit_with_cb_ctx(tb, 5, 1, 99, CTX3, cb)
+        && block_io::submit_with_cb_ctx(ta, 12, 2, 42, CTX2, cb)
+        && block_io::submit_with_cb_ctx(ta, 10, 2, 7, CTX, cb);
+    let split = submitted && block_io::cb_pending_for(ta) == 2 && block_io::cb_pending_for(tb) == 1;
+    let ra = block_io::drain_with_cb_ctx(ta, &disk_a, &Budget::UNBOUNDED);
+    let a_only = ra.issued == 2 && ra.failed_at.is_none()
+        && ORDER.load(Ordering::Relaxed) == 2
+        && TOK0.load(Ordering::Relaxed) == 7
+        && TOK1.load(Ordering::Relaxed) == 42
+        && CALLS_A.load(Ordering::Relaxed) == 4
+        && CALLS_B.load(Ordering::Relaxed) == 0
+        && block_io::cb_pending_for(tb) == 1;
+    let stats_precommit = SAW0.load(Ordering::Relaxed) == 1 && SAW1.load(Ordering::Relaxed) == 2;
+    let chain_ok = CHAIN.load(Ordering::Relaxed) == 1 && block_io::cb_pending_for(ta) == 1;
+    let cleared_b = {
+        block_io::cb_clear_for(tb);
+        block_io::cb_pending_for(tb) == 0
+    };
+    let resubmitted_b = block_io::submit_with_cb_ctx(tb, 5, 1, 99, CTX3, cb);
+    let rb = block_io::drain_with_cb_ctx(tb, &disk_b, &Budget::UNBOUNDED);
+    let b_done = cleared_b && resubmitted_b && rb.issued == 1
+        && TOK2.load(Ordering::Relaxed) == 99
+        && CALLS_B.load(Ordering::Relaxed) == 1;
+    let rc = block_io::drain_with_cb_ctx(ta, &disk_a, &Budget::UNBOUNDED);
+    let chain_done = rc.issued == 1 && TOK3.load(Ordering::Relaxed) == 999;
+    let ctx_ok = BAD_CTX.load(Ordering::Relaxed) == 0
+        && BAD_RESULT.load(Ordering::Relaxed) == 0
+        && OK_COUNT.load(Ordering::Relaxed) == 4;
+
+    block_io::ctx_cb_clear();
+    CALLS_A.store(0, Ordering::Relaxed);
+    let _ = block_io::submit_with_cb_ctx(ta, u64::MAX, 1, 55, CTX, cb);
+    let rf = block_io::drain_with_cb_ctx(ta, &disk_a, &Budget::UNBOUNDED);
+    let (delivered, failed, _) = block_io::ctx_cb_stats();
+    let failure_ok = rf.failed_at == Some(55) && delivered == 0 && failed == 1
+        && ERR_COUNT.load(Ordering::Relaxed) == 1
+        && ERR_REFUSED.load(Ordering::Relaxed) == 1
+        && CALLS_A.load(Ordering::Relaxed) == 0;
+
+    block_io::ctx_cb_clear();
+    disk_a.fail_at = Some(1);
+    let _ = block_io::submit_with_cb_ctx(ta, 0, 2, 56, CTX, cb);
+    let rp = block_io::drain_with_cb_ctx(ta, &disk_a, &Budget::UNBOUNDED);
+    disk_a.fail_at = None;
+    let partial_ok = rp.failed_at == Some(56) && rp.sectors_ok == 1;
+
+    block_io::ctx_cb_clear();
+    let mut filled = 0usize;
+    for i in 0..block_io::QUEUE_MAX {
+        let target = if i % 2 == 0 { ta } else { tb };
+        if block_io::submit_with_cb_ctx(target, i as u64, 1, i as u64, CTX, cb) {
+            filled += 1;
+        }
+    }
+    let overflow_full = block_io::submit_with_cb_ctx(ta, 999, 1, 999, CTX, cb);
+    let (_, _, refused) = block_io::ctx_cb_stats();
+    let full_ok = filled == block_io::QUEUE_MAX && !overflow_full && refused >= 1;
+    block_io::ctx_cb_clear();
+
+    let ok = split && a_only && stats_precommit && chain_ok && b_done && chain_done
+        && ctx_ok && failure_ok && partial_ok && full_ok;
+    crate::log_info!(
+        "block-ctx: 按目标={} ctx={} token={} 统计先提交={} 链式={} 目标清={} B完成={} LBA溢出失败={} 部分成功={}(失败={:?} 扇区={}) 满池拒={} ⇒ {}",
+        split, ctx_ok, a_only, stats_precommit, chain_ok && chain_done, cleared_b, b_done,
+        failure_ok, partial_ok, rp.failed_at, rp.sectors_ok, full_ok, ok
+    );
+    ok
+}
+#[cfg(feature = "handles")]
+ktest!(KT_BLOCK_CONTEXT_CALLBACK, t_block_context_callback);
+
 /// ADR-216：**inode 层**的证人。
 ///
 /// ## 要证什么

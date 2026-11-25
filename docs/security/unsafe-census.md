@@ -5,14 +5,14 @@
 >
 > **2026-11-20（ADR-175 跨 AS 读走物理地址）**：`sched/user` U2 9 → 10（`copy_from_user_in` 里 HHDM 别名的单字节读）。**总数 +1**（530 → 531）。
 
-总计 707 处。U1 104 · U2 183 · U3 13 · U4 235 · U5 128 · U6 44
+总计 722 处。U1 104 · U2 183 · U3 13 · U4 250 · U5 128 · U6 44
 
 | 类别 | 含义 | 处数 |
 |---|---|---|
 | U1 | 架构入口与特殊寄存器 | 104 |
 | U2 | 页表、物理内存与 MMIO | 183 |
 | U3 | DMA 与设备共享内存 | 13 |
-| U4 | 并发共享状态与 UnsafeCell | 235 |
+| U4 | 并发共享状态与 UnsafeCell | 250 |
 | U5 | 用户指针与地址空间访问 | 128 |
 | U6 | 诊断路径的有限现场读取 | 44 |
 
@@ -44,6 +44,28 @@ ADR-179：句柄槽数组从 `.bss` 改为运行时分配。四处的指针来�
 ADR-214：请求队列的 32 条 `Request` 进 `.bss`，六处指针都指向 `QUEUE`，
 生命周期整个内核，访问都在 `QUEUE_LOCK`（`RANK_BLOCK=37`）内。
 载荷全为 Copy 数值。
+
+ADR-251：新增按目标批量池与上下文回调池，共 15 处 U4。两组指针分别指向
+`DISK_QUEUE` / `CTX_QUEUE` 静态量，各 32 槽、生命周期整个内核；访问复用既有
+`QUEUE_LOCK` / `CB_LOCK`（`RANK_BLOCK=37`），载荷全为 Copy。设备 I/O 与回调都在锁外。
+
+| 类别 | 行 | 形状 |
+|---|---|---|
+| U4 | 718 | `unsafe impl Sync for KeyedQueueCell {}` |
+| U4 | 729 | `unsafe { &mut *DISK_QUEUE.0.get() }`（submit_for） |
+| U4 | 748 | `unsafe { &*DISK_QUEUE.0.get() }`（pending_for） |
+| U4 | 756 | `unsafe { &*DISK_QUEUE.0.get() }`（disk_queue_stats） |
+| U4 | 764 | `unsafe { &mut *DISK_QUEUE.0.get() }`（queue_clear_for） |
+| U4 | 780 | `unsafe { &mut *DISK_QUEUE.0.get() }`（disk_queue_clear） |
+| U4 | 794 | `unsafe { &mut *DISK_QUEUE.0.get() }`（drain_for 提取） |
+| U4 | 886 | `unsafe impl Sync for ContextQueueCell {}` |
+| U4 | 904 | `unsafe { &mut *CTX_QUEUE.0.get() }`（submit_with_cb_ctx） |
+| U4 | 924 | `unsafe { &*CTX_QUEUE.0.get() }`（cb_pending_for） |
+| U4 | 932 | `unsafe { &*CTX_QUEUE.0.get() }`（ctx_cb_stats） |
+| U4 | 940 | `unsafe { &mut *CTX_QUEUE.0.get() }`（cb_clear_for） |
+| U4 | 956 | `unsafe { &mut *CTX_QUEUE.0.get() }`（ctx_cb_clear） |
+| U4 | 970 | `unsafe { &mut *CTX_QUEUE.0.get() }`（drain_with_cb_ctx 提取） |
+| U4 | 1024 | `unsafe { &mut *CTX_QUEUE.0.get() }`（回调前提交统计） |
 ### filesystem/vfs_ro
 
 | 类别 | 行 | 形状 |
