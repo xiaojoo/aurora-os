@@ -2180,6 +2180,7 @@ fn proc_sys_worker() -> ! {
     let bail = |code: u64| -> ! {
         put(25, code);
         sched::finish_current();
+        sched::yield_now();
         loop { crate::tsc::spin(1000); }
     };
     let Some(owner) = sched::current_identity() else { bail(1) };
@@ -2369,6 +2370,7 @@ fn proc_sys_worker() -> ! {
     let _ = handle::revoke_task(owner.0, owner.1);
     put(25, 0);
     sched::finish_current();
+    sched::yield_now();
     loop { crate::tsc::spin(1000); }
 }
 
@@ -2488,6 +2490,7 @@ fn wait_sys_exit_thread() -> ! {
     }
     crate::tsc::spin(1_000_000);
     crate::sched::finish_current();
+    crate::sched::yield_now();
     loop {
         crate::tsc::spin(2_000);
     }
@@ -2506,6 +2509,7 @@ fn wait_sys_worker() -> ! {
     let bail = |code: u64| -> ! {
         put(15, code);
         sched::finish_current();
+        sched::yield_now();
         loop { crate::tsc::spin(1000); }
     };
     let Some(owner) = sched::current_identity() else { bail(1) };
@@ -2606,6 +2610,7 @@ fn wait_sys_worker() -> ! {
     if !(r1 && d2 && jd) { bail(12) }
     put(15, 0);
     sched::finish_current();
+    sched::yield_now();
     loop { crate::tsc::spin(1000); }
 }
 
@@ -2712,23 +2717,25 @@ fn vmo_sys_worker() -> ! {
     // 用户缓冲页：真实映射（user+writable），13 的读方向必须过页面校验
     let va = match mm::alloc_user_va_range(1) {
         Some(v) => v,
-        None => { put(0, u64::MAX); sched::finish_current(); loop { crate::tsc::spin(1000); } }
+        None => { put(0, u64::MAX); sched::finish_current(); sched::yield_now(); loop { crate::tsc::spin(1000); } }
     };
     let frames = match mm::phys_alloc(0, mm::MOD_TEST) {
         Ok(fr) => fr,
-        Err(_) => { put(0, u64::MAX); sched::finish_current(); loop { crate::tsc::spin(1000); } }
+        Err(_) => { put(0, u64::MAX); sched::finish_current(); sched::yield_now(); loop { crate::tsc::spin(1000); } }
     };
     let flags = mm::PageFlags::new(true, false, true).ok();
     let map = flags.and_then(|fl| mm::map(va, frames, fl).ok());
     let Some(user_buf) = map else {
         put(0, u64::MAX);
         sched::finish_current();
+        sched::yield_now();
         loop { crate::tsc::spin(1000); }
     };
     let pat = [0x5Au8, 1, 2, 3, 4, 5, 6, 7];
     if copy_to_user(&pat, va.0) != Ok(8) {
         put(0, u64::MAX);
         sched::finish_current();
+        sched::yield_now();
         loop { crate::tsc::spin(1000); }
     }
 

@@ -54,6 +54,7 @@ fn kill_worker() -> ! {
         );
     }
     sched::finish_current();
+    sched::yield_now();
     loop {
         crate::tsc::spin(3_000);
     }

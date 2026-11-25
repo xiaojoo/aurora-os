@@ -14,6 +14,7 @@ fn sched_worker() -> ! {
         tsc::spin(3_000);
     }
     sched::finish_current();
+    sched::yield_now();
     loop {
         tsc::spin(3_000);
     }
@@ -41,6 +42,7 @@ fn sched_worker_forever() -> ! {
 fn yield_partner() -> ! {
     sched::yield_now();
     sched::finish_current();
+    sched::yield_now();
     loop {
         tsc::spin(3_000);
     }
@@ -841,6 +843,7 @@ ktest!(KT_RELEASE_HOST_LIFETIME, t_release_host_lifetime);
 fn idle_probe_partner() -> ! {
     sched::yield_now();
     sched::finish_current();
+    sched::yield_now();
     loop {
         tsc::spin(3_000);
     }
@@ -914,6 +917,7 @@ fn block_wake_worker() -> ! {
     BW_WOKE.store(1, Ordering::Relaxed);
     sched::yield_now();
     sched::finish_current();
+    sched::yield_now();
     loop {
         tsc::spin(3_000);
     }
@@ -988,6 +992,7 @@ fn wq_consumer() -> ! {
         sched::yield_now(); // 把 CPU 还给生产者，让它推进下一轮
     }
     sched::finish_current();
+    sched::yield_now();
     loop {
         tsc::spin(3_000);
     }
@@ -1542,6 +1547,7 @@ fn p6b_waker() -> ! {
         }
     }
     sched::finish_current();
+    sched::yield_now();
     loop {
         tsc::spin(3_000);
     }
@@ -1623,6 +1629,7 @@ fn p7b_blocked_worker() -> ! {
         let _ = q.wait_while_until(P7B_QID, || P7B_FLAG.load(Ordering::Acquire) != 0, tsc::now().wrapping_add(tick * 20));
     }
     sched::finish_current();
+    sched::yield_now();
     loop {
         tsc::spin(3_000);
     }

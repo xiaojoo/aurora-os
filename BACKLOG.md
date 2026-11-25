@@ -26078,3 +26078,22 @@ RMW trait 与 AHCI 实现分别门控到 `fs-ro`/`fs-rw` 与 `fs-rw`，默认档
   `t_open_lock_defer` 精确 FAIL（93 条仅此 1 红）。
 - `run-16049` / `run-16050` / `run-16051`：handles,fs-ro / fs-rw / fat32-exec 全 PASS。
 - `check` **21/21**；完整矩阵 **82/82 符合**（`AURORA_MATRIX_DONE rc=0`）；真机未验证。
+
+## 584. ktest 工人收工后抢占点审计（2026-11-25）
+
+枚举全部 `finish_current()` 后继续自旋的 ktest 工人：`sched_worker`、`yield_partner`、
+`idle_probe_partner`、`block_wake_worker`、waitqueue 工人、`p6b_waker`、
+`p7b_blocked_worker`、`kill_worker`、`proc_sys_worker`、`wait_sys_exit_thread`、
+`wait_sys_worker` 与 `vmo_sys_worker` 失败分支都补一次 `yield_now()`。`p3_worker` 保持
+“只让一次、其余等 tick”，避免 `-d int` 行变成中断风暴；`vmo_sys_worker` 正常尾与
+`as_worker` 原本已有 yield，不重复添加。
+
+这条规则沿用 §153/§571 的既有判据：Done 任务若以 IF=0 被换入，收工后不主动制造抢占点，
+当前槽会继续占 CPU。未新增产品路径或调度语义。`kill_process_threads` 对
+`release_depth != 0` 的 false 仍是有界重扫，超过 64 项同时 pending 的混合场景未构造，
+保留为未验证边界，不在本轮假称关闭。
+
+**读数**：默认 `run-16140`、handles `run-16141`、fs-rw `run-16142` 全 PASS，`check`
+**21/21**。原始完整矩阵 **81/82**，唯一不符合是 `探针几何与宿主机对账`，同跑红在
+`t_sdkdemo` 的 `0x100002000` 信箱未映射；同一 ELF `68ea3999a468` 单跑 `run-16231`
+PASS，按环境形状记“不归因”，判据不动。
