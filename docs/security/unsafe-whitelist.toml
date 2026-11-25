@@ -134,11 +134,13 @@ U2 = 10
 # 对账：707+15=722、U4 235+15=250。
 # 2026-11-25 ADR-255：+arch/x86_64/trap U1 1（resched_self 的 int 0xF0）。
 # 对账：722+1=723、U1 104+1=105。
-total = 723
+# 2026-11-26 ADR-257：+filesystem/vfs_ro U4 3（dentry put/bind/目录失效，均持 DENTRY_LOCK）。
+# 对账：723+3=726、U4 250+3=253。
+total = 726
 U1 = 105
 U2 = 183
 U3 = 13
-U4 = 250
+U4 = 253
 U5 = 128
 U6 = 44
 
@@ -204,7 +206,7 @@ U2 = 2
 
 
 [modules."filesystem/vfs_ro"]
-U4 = 27
+U4 = 30
 
 [modules."ktests/storage/vfs_ro"]
 U6 = 6

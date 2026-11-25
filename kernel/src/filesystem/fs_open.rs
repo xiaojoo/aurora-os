@@ -127,7 +127,7 @@ pub fn mount() -> Result<ReadOnlyFs<'static>, VfsError> {
 
 fn open_on(port: u8, path: &str, flags: u64) -> Result<Opened, VfsError> {
     let disk = AhciDisk { port };
-    let fs = ReadOnlyFs::mount(&disk)?;
+    let fs = ReadOnlyFs::mount_cached(&disk)?;
     let stat = fs.lookup(path)?;
     if stat.is_dir() {
         // 写意图打在目录上没有意义（创建/截断是另一刀）。
@@ -174,7 +174,7 @@ pub fn open_node_product(path: &str, flags: u64) -> Result<OpenedNode, NodeError
     }
     let port = if m.prefix == "/" { self::port() } else { m.port };
     let disk = AhciDisk { port };
-    let fs = ReadOnlyFs::mount(&disk).map_err(NodeError::Vfs)?;
+    let fs = ReadOnlyFs::mount_cached(&disk).map_err(NodeError::Vfs)?;
     let (node, stat) = vfs_ro::open_node_entry(&disk, &fs.bpb(), sub, !m.writable)?;
     if stat.is_dir() {
         if flags == OPEN_WRITE {

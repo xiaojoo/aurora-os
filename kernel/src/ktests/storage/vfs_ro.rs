@@ -1472,6 +1472,158 @@ fn t_dentry_cache() -> bool {
 
 ktest!(KT_DENTRY_CACHE, t_dentry_cache);
 
+/// ADR-257：dentry 保存 inode 槽提示，open 校验后 iget；create/unlink 摘除正缓存。
+fn t_dentry_inode_link() -> bool {
+    vfs_ro::dentry_clear();
+    vfs_ro::inode_clear();
+    let mut img = [0u8; F32_VOL_BYTES];
+    make_image32(&mut img);
+    let rw = RwDisk::new(&mut img);
+    let fs = match vfs_ro::ReadOnlyFs::mount(&rw) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_fatal!("dentry-inode: 挂载失败 {}", e.tag());
+            return false;
+        }
+    };
+    let bpb = fs.bpb();
+    let (n1, _) = match vfs_ro::open_node_entry(&rw, &bpb, "/SUB/INNER.TXT", true) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_fatal!("dentry-inode: 首开失败 {}", e.tag());
+            return false;
+        }
+    };
+    let st1 = vfs_ro::inode_stats();
+    let refs1 = matches!(vfs_ro::inode_peek(n1.vol, n1.cluster), Some(i) if i.refs == 1);
+    let c1 = vfs_ro::close_node(&n1);
+    let (n2, _) = match vfs_ro::open_node_entry(&rw, &bpb, "/SUB/INNER.TXT", true) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_fatal!("dentry-inode: 二开失败 {}", e.tag());
+            return false;
+        }
+    };
+    let st2 = vfs_ro::inode_stats();
+    let refs2 = matches!(vfs_ro::inode_peek(n2.vol, n2.cluster), Some(i) if i.refs == 1);
+    let c2 = vfs_ro::close_node(&n2);
+    let refs0 = matches!(vfs_ro::inode_peek(n2.vol, n2.cluster), Some(i) if i.refs == 0);
+    let reused = n1.inode_slot == n2.inode_slot
+        && st2.0 == st1.0 + 1 && st2.1 == st1.1 && refs1 && refs2 && refs0 && c1 && c2;
+
+    vfs_ro::inode_clear();
+    let guard_occupied = vfs_ro::inode_get(0xDEAD_BEEF, 99, 1, 0).is_some();
+    let (n3, _) = match vfs_ro::open_node_entry(&rw, &bpb, "/SUB/INNER.TXT", true) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_fatal!("dentry-inode: 槽复用后失败 {}", e.tag());
+            return false;
+        }
+    };
+    let stale_ok = vfs_ro::node_consistent(&n3).0
+        && vfs_ro::node_consistent(&n3).1
+        && vfs_ro::inode_peek(n3.vol, n3.cluster).is_some();
+    let c3 = vfs_ro::close_node(&n3);
+    let guard_released = vfs_ro::inode_put(0xDEAD_BEEF, 99);
+
+    let created = vfs_ro::create_in_dir(&rw, &bpb, bpb.root_cluster, b"NEW.TXT").is_ok();
+    let (n4, _) = match vfs_ro::open_node_entry(&rw, &bpb, "/NEW.TXT", true) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_fatal!("dentry-inode: 新文件开失败 {}", e.tag());
+            return false;
+        }
+    };
+    let c4 = vfs_ro::close_node(&n4);
+    let alias = fs.lookup("/new.txt").is_ok();
+    let unlinked = vfs_ro::unlink_in_dir(&rw, &bpb, bpb.root_cluster, b"NEW.TXT").is_ok();
+    let gone = matches!(fs.lookup("/NEW.TXT"), Err(VfsError::NotFound));
+    let gone_alias = matches!(fs.lookup("/new.txt"), Err(VfsError::NotFound));
+    let ok = created && reused && guard_occupied && guard_released && stale_ok && c3 && c4
+        && alias && unlinked && gone && gone_alias;
+    crate::log_info!(
+        "dentry-inode: 复用={} refs={}/{}/{} inode命中={}->{} 异键占槽={} 槽校验={} create={} close={} 别名={} unlink={} 删后查无={}/{} ⇒ {}",
+        reused, refs1, refs2, refs0, st1.0, st2.0, guard_occupied, stale_ok,
+        created, c4, alias, unlinked, gone, gone_alias, ok
+    );
+    ok
+}
+ktest!(KT_DENTRY_INODE_LINK, t_dentry_inode_link);
+
+struct DentryRaceDisk<'a> {
+    inner: RwDisk<'a>,
+    bpb: crate::filesystem::fat32::Bpb,
+    target_cluster: u32,
+    target_lba: u64,
+    fired: core::cell::Cell<bool>,
+}
+
+impl Block for DentryRaceDisk<'_> {
+    fn read_sectors(&self, lba: u64, dst: &mut [u8]) -> Result<(), BlockError> {
+        let result = self.inner.read_sectors(lba, dst);
+        if lba == self.target_lba && !self.fired.get() {
+            self.fired.set(true);
+            let _ = vfs_ro::unlink_in_dir(&self.inner, &self.bpb, self.target_cluster, b"INNER.TXT");
+        }
+        result
+    }
+
+    fn write_sectors(&self, lba: u64, src: &[u8]) -> Result<(), BlockError> {
+        self.inner.write_sectors(lba, src)
+    }
+
+    fn read_modify_write(&self, lba: u64, offset: usize, src: &[u8]) -> Result<(), BlockError> {
+        self.inner.read_modify_write(lba, offset, src)
+    }
+}
+
+/// ADR-257：目录在读盘期间被 unlink，旧 miss 不得把已删项回填。
+fn t_dentry_generation_race() -> bool {
+    let mut img = [0u8; F32_VOL_BYTES];
+    make_image32(&mut img);
+    let rw = RwDisk::new(&mut img);
+    let fs = match vfs_ro::ReadOnlyFs::mount(&rw) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_fatal!("dentry-race: 挂载失败 {}", e.tag());
+            return false;
+        }
+    };
+    let bpb = fs.bpb();
+    let sub = match fs.lookup("/SUB") {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_fatal!("dentry-race: SUB 失败 {}", e.tag());
+            return false;
+        }
+    };
+    let target_cluster = sub.first_cluster;
+    let target_lba = bpb.data_start
+        + (target_cluster as u64 - 2) * bpb.sectors_per_cluster as u64;
+    drop(fs);
+    vfs_ro::dentry_clear();
+    let race = DentryRaceDisk {
+        inner: rw,
+        bpb,
+        target_cluster,
+        target_lba,
+        fired: core::cell::Cell::new(false),
+    };
+    let fs = match vfs_ro::ReadOnlyFs::mount(&race) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_fatal!("dentry-race: 二次挂载失败 {}", e.tag());
+            return false;
+        }
+    };
+    let outcome = fs.lookup("/SUB/INNER.TXT");
+    let fired = race.fired.get();
+    let ok = fired && matches!(outcome, Err(VfsError::NotFound));
+    crate::log_info!("dentry-race: 读中删除={} 结果={:?} ⇒ {}", fired, outcome, ok);
+    ok
+}
+ktest!(KT_DENTRY_GENERATION_RACE, t_dentry_generation_race);
+
 /// ADR-194：**请求队列合并**的证人（切片 D）。
 ///
 /// ## 要证什么

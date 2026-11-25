@@ -349,10 +349,19 @@ pub struct ReadOnlyFs<'a> {
 
 impl<'a> ReadOnlyFs<'a> {
     pub fn mount(disk: &'a dyn Block) -> Result<Self, VfsError> {
+        Self::mount_inner(disk, true)
+    }
+
+    /// 同一已挂载卷的后续 open 复用 dentry/page cache；显式 `mount` 仍清空。
+    pub fn mount_cached(disk: &'a dyn Block) -> Result<Self, VfsError> {
+        Self::mount_inner(disk, false)
+    }
+
+    fn mount_inner(disk: &'a dyn Block, fresh: bool) -> Result<Self, VfsError> {
         Volume::mount(disk)
             .map(|vol| {
                 let vol_id = volume_fingerprint(disk, &vol.bpb);
-                // **每次挂载都清缓存**（ADR-195 补记）。
+                // 显式挂载是新卷边界；复用挂载走 mount_cached，不清缓存。
                 //
                 // 为什么不能只靠指纹：夹具里造坏卷的方式是**改同一块 img 的目录项**，
                 // 而引导扇区（指纹的来源）没变 ⇒ 指纹相同 ⇒ 缓存串了。
@@ -360,9 +369,10 @@ impl<'a> ReadOnlyFs<'a> {
                 // `高半越界被拒` 都变成 false。
                 //
                 // 清一次的代价是 64 条 `Entry` 的零填充（~19 KiB），只在 mount 时做。
-                dentry_clear();
-                // 同盘同几何也可能已换内容；挂载是新卷边界，页缓存必须一起失效。
-                cache_clear();
+                if fresh {
+                    dentry_clear();
+                    cache_clear();
+                }
                 ReadOnlyFs { vol, vol_id }
             })
             .map_err(VfsError::Fs)
@@ -467,6 +477,8 @@ struct DentrySlot {
     name_len: u8,
     /// 解析结果。
     entry: Entry,
+    /// 已解析 inode 的槽提示；`u32::MAX` 表示尚未绑定。提示不持引用，使用时必须校验并 iget。
+    inode_slot: u32,
 }
 
 const DENTRY_EMPTY: DentrySlot = DentrySlot {
@@ -496,10 +508,13 @@ const DENTRY_EMPTY: DentrySlot = DentrySlot {
         write_time: 0,
         write_date: 0,
     },
+    inode_slot: u32::MAX,
 };
 
 struct DentryTable {
     slots: [DentrySlot; DENTRY_MAX],
+    /// 目录失效代际：miss 读盘期间发生失效时，旧解析结果不得回填。
+    generation: u64,
     /// 命中/未命中计数（判据用）。
     hits: u32,
     misses: u32,
@@ -511,6 +526,7 @@ unsafe impl Sync for DentryCell {}
 
 static DENTRY: DentryCell = DentryCell(core::cell::UnsafeCell::new(DentryTable {
     slots: [DENTRY_EMPTY; DENTRY_MAX],
+    generation: 0,
     hits: 0,
     misses: 0,
 }));
@@ -576,8 +592,14 @@ fn dentry_name_hash(name: &[u8]) -> u32 {
     h
 }
 
-/// 查缓存。命中返回 `Some(entry)`，并把 `hits` 加一。
-fn dentry_get(vol: u64, parent_cluster: u32, name: &[u8]) -> Option<Entry> {
+#[derive(Clone, Copy)]
+struct DentryHit {
+    entry: Entry,
+    inode_slot: Option<u32>,
+}
+
+/// 查缓存。命中返回 Entry 与 inode 槽提示，并把 `hits` 加一。
+fn dentry_get(vol: u64, parent_cluster: u32, name: &[u8]) -> Result<DentryHit, u64> {
     let h = dentry_name_hash(name);
     let len = name.len() as u8;
     let _g = DENTRY_LOCK.lock();
@@ -586,36 +608,67 @@ fn dentry_get(vol: u64, parent_cluster: u32, name: &[u8]) -> Option<Entry> {
     for s in t.slots.iter() {
         if s.used && s.vol == vol && s.parent_cluster == parent_cluster && s.name_hash == h && s.name_len == len {
             t.hits += 1;
-            return Some(s.entry);
+            return Ok(DentryHit {
+                entry: s.entry,
+                inode_slot: (s.inode_slot != u32::MAX).then_some(s.inode_slot),
+            });
         }
     }
     t.misses += 1;
-    None
+    Err(t.generation)
 }
 
-/// 写缓存。**满时按「第一个未用，否则覆盖 0 号」**（不做 LRU：判据只关心命中率）。
-fn dentry_put(vol: u64, parent_cluster: u32, name: &[u8], entry: Entry) {
+/// 写缓存。`generation` 已变化则丢弃旧 miss 的解析结果。满时覆盖 0 号。
+fn dentry_put(vol: u64, parent_cluster: u32, name: &[u8], entry: Entry, generation: u64) -> bool {
     let h = dentry_name_hash(name);
     let len = name.len() as u8;
     let _g = DENTRY_LOCK.lock();
     // SAFETY: 持锁期间独占；载荷全为 Copy。
     let t = unsafe { &mut *DENTRY.0.get() };
-    // 先找同一个键（覆盖旧值）
+    #[cfg(not(feature = "fault-dentry-stale-put"))]
+    if t.generation != generation {
+        return false;
+    }
     for s in t.slots.iter_mut() {
         if s.used && s.vol == vol && s.parent_cluster == parent_cluster && s.name_hash == h && s.name_len == len {
             s.entry = entry;
-            return;
+            s.inode_slot = u32::MAX;
+            return true;
         }
     }
-    // 再找空位
     for s in t.slots.iter_mut() {
         if !s.used {
-            *s = DentrySlot { used: true, vol, parent_cluster, name_hash: h, name_len: len, entry };
-            return;
+            *s = DentrySlot { used: true, vol, parent_cluster, name_hash: h, name_len: len, entry, inode_slot: u32::MAX };
+            return true;
         }
     }
-    // 满了：覆盖 0 号（简单、可预测；LRU 的收益在这个容量下不显著）
-    t.slots[0] = DentrySlot { used: true, vol, parent_cluster, name_hash: h, name_len: len, entry };
+    t.slots[0] = DentrySlot { used: true, vol, parent_cluster, name_hash: h, name_len: len, entry, inode_slot: u32::MAX };
+    true
+}
+
+/// 把已解析的 inode 槽绑到同卷同首簇的 dentry。提示不增加引用，真正引用由 open 路径 iget。
+fn dentry_bind_inode(vol: u64, cluster: u32, inode_slot: u32) {
+    let _g = DENTRY_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let t = unsafe { &mut *DENTRY.0.get() };
+    for s in t.slots.iter_mut() {
+        if s.used && s.vol == vol && s.entry.first_cluster == cluster {
+            s.inode_slot = inode_slot;
+        }
+    }
+}
+
+/// create/unlink 成功后失效整个父目录，覆盖大小写与长短名别名，并阻止旧 miss 回填。
+fn dentry_invalidate_dir(vol: u64, parent_cluster: u32) {
+    let _g = DENTRY_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let t = unsafe { &mut *DENTRY.0.get() };
+    t.generation = t.generation.wrapping_add(1);
+    for s in t.slots.iter_mut() {
+        if s.used && s.vol == vol && s.parent_cluster == parent_cluster {
+            *s = DENTRY_EMPTY;
+        }
+    }
 }
 
 /// dentry 缓存统计 `(命中, 未命中, 已用槽)`（ADR-195 的判据用）。
@@ -634,12 +687,19 @@ pub fn dentry_clear() {
     for s in t.slots.iter_mut() {
         *s = DENTRY_EMPTY;
     }
+    t.generation = t.generation.wrapping_add(1);
     t.hits = 0;
     t.misses = 0;
 }
 
+#[derive(Clone, Copy)]
+struct LookupResult {
+    entry: Entry,
+    inode_slot: Option<u32>,
+}
+
 pub fn lookup(disk: &dyn Block, bpb: &Bpb, path: &str) -> Result<Entry, VfsError> {
-    lookup_with_vol(disk, bpb, path, None)
+    lookup_inner(disk, bpb, path, None).map(|r| r.entry)
 }
 
 /// 带卷指纹的路径解析（ADR-195 补记）。
@@ -652,7 +712,24 @@ fn lookup_with_vol(
     path: &str,
     vol: Option<u64>,
 ) -> Result<Entry, VfsError> {
+    lookup_inner(disk, bpb, path, vol).map(|r| r.entry)
+}
 
+fn lookup_with_inode(
+    disk: &dyn Block,
+    bpb: &Bpb,
+    path: &str,
+    vol: u64,
+) -> Result<LookupResult, VfsError> {
+    lookup_inner(disk, bpb, path, Some(vol))
+}
+
+fn lookup_inner(
+    disk: &dyn Block,
+    bpb: &Bpb,
+    path: &str,
+    vol: Option<u64>,
+) -> Result<LookupResult, VfsError> {
     if !path.starts_with('/') {
         return Err(VfsError::NotAbsolute);
     }
@@ -660,6 +737,7 @@ fn lookup_with_vol(
         return Err(VfsError::TooLong);
     }
     let mut cur = root_entry(bpb);
+    let mut inode_slot = None;
     let mut comps = 0usize;
     for part in path.split('/') {
         if part.is_empty() {
@@ -678,25 +756,31 @@ fn lookup_with_vol(
         if !cur.is_dir() {
             return Err(VfsError::NotDir);
         }
-        // **先查 dentry 缓存**（ADR-195）：命中就不碰盘。
-        //
-        // 键是 `(父目录首簇, 名字)`：同一名字在不同目录下是不同项。
         let parent = cur.first_cluster;
-        cur = match vol {
-            // 有卷身份 ⇒ 用缓存
-            Some(v) => match dentry_get(v, parent, part.as_bytes()) {
-                Some(e) => e,
-                None => {
-                    let e = find_child(disk, bpb, &cur, part.as_bytes())?;
-                    dentry_put(v, parent, part.as_bytes(), e);
-                    e
+        let resolved = if let Some(v) = vol {
+            let mut races = 0usize;
+            loop {
+                match dentry_get(v, parent, part.as_bytes()) {
+                    Ok(hit) => break (hit.entry, hit.inode_slot),
+                    Err(generation) => {
+                        let e = find_child(disk, bpb, &cur, part.as_bytes())?;
+                        if dentry_put(v, parent, part.as_bytes(), e, generation) {
+                            break (e, None);
+                        }
+                        races += 1;
+                        if races >= 4 {
+                            return Err(VfsError::NotFound);
+                        }
+                    }
                 }
-            },
-            // 没有 ⇒ **不缓存**（裸调用没有卷身份，用缓存就会串卷）
-            None => find_child(disk, bpb, &cur, part.as_bytes())?,
+            }
+        } else {
+            (find_child(disk, bpb, &cur, part.as_bytes())?, None)
         };
+        cur = resolved.0;
+        inode_slot = resolved.1;
     }
-    Ok(cur)
+    Ok(LookupResult { entry: cur, inode_slot })
 }
 
 /// 在一个目录里找一个名字。
@@ -1313,6 +1397,8 @@ pub fn create_in_dir(
     };
     cache_invalidate();
     written.map_err(io)?;
+    #[cfg(not(feature = "fault-dentry-no-invalidate"))]
+    dentry_invalidate_dir(volume_fingerprint(disk, v), dir_cluster);
     Ok((lba, off))
 }
 
@@ -1375,6 +1461,8 @@ pub fn unlink_in_dir(
                 };
                 cache_invalidate();
                 written.map_err(io)?;
+                #[cfg(not(feature = "fault-dentry-no-invalidate"))]
+                dentry_invalidate_dir(volume_fingerprint(disk, v), dir_cluster);
                 // 释放簇链：**目录项先落盘再放链**。
                 // 反过来的话，中途掉电会留下一条「指向已释放簇的目录项」——
                 // 那是比泄漏更糟的形状（读它会读到别人的数据）。
@@ -1804,6 +1892,8 @@ pub fn inode_get(vol: u64, cluster: u32, size: u32, attr: u8) -> Option<u32> {
     for (i, s) in t.slots.iter_mut().enumerate() {
         if s.used && s.vol == vol && s.cluster == cluster {
             s.refs = s.refs.saturating_add(1);
+            s.size = size;
+            s.attr = attr;
             t.hits += 1;
             return Some(i as u32);
         }
@@ -1826,6 +1916,22 @@ pub fn inode_get(vol: u64, cluster: u32, size: u32, attr: u8) -> Option<u32> {
         }
     }
     None
+}
+
+/// 按 dentry 保存的槽提示取 inode；槽必须仍匹配 `(vol, cluster)`，否则回退 `inode_get`。
+pub(crate) fn inode_get_at(slot: u32, vol: u64, cluster: u32, size: u32, attr: u8) -> Option<u32> {
+    let _g = INODE_LOCK.lock();
+    // SAFETY: 持锁期间独占。
+    let t = unsafe { &mut *INODES.0.get() };
+    let s = t.slots.get_mut(slot as usize)?;
+    if !s.used || s.vol != vol || s.cluster != cluster {
+        return None;
+    }
+    s.refs = s.refs.saturating_add(1);
+    s.size = size;
+    s.attr = attr;
+    t.hits += 1;
+    Some(slot)
 }
 
 /// **还一个 inode 引用**（ADR-216）。返回 `false` = 那个槽本来就不是这个 inode。
@@ -2308,11 +2414,26 @@ pub fn open_node_entry(
             }
         }
     };
-    // 2) 路径解析（dentry 缓存起作用）
-    let entry = lookup_with_vol(disk, bpb, path, Some(vol)).map_err(NodeError::Vfs)?;
-    // 3) inode
-    let inode_slot = inode_get(vol, entry.first_cluster, entry.size, entry.attr)
-        .ok_or(NodeError::NoInode)?;
+    // 2) 路径解析（dentry 缓存起作用，并带回 inode 槽提示）
+    let resolved = lookup_with_inode(disk, bpb, path, vol).map_err(NodeError::Vfs)?;
+    let entry = resolved.entry;
+    // 3) inode：提示槽仍匹配才复用并增加引用；淘汰/复用后回退 iget 并重绑。
+    let inode_slot = if let Some(slot) = resolved.inode_slot {
+        #[cfg(not(feature = "fault-dentry-stale-inode"))]
+        {
+            inode_get_at(slot, vol, entry.first_cluster, entry.size, entry.attr)
+                .or_else(|| inode_get(vol, entry.first_cluster, entry.size, entry.attr))
+                .ok_or(NodeError::NoInode)?
+        }
+        #[cfg(feature = "fault-dentry-stale-inode")]
+        {
+            slot
+        }
+    } else {
+        inode_get(vol, entry.first_cluster, entry.size, entry.attr)
+            .ok_or(NodeError::NoInode)?
+    };
+    dentry_bind_inode(vol, entry.first_cluster, inode_slot);
     Ok((VfsNode {
         sb_slot,
         inode_slot,

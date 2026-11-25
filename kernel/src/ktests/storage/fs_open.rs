@@ -1165,6 +1165,8 @@ fn t_fs_open_node_lifecycle() -> bool {
     let closed2 = handle::close(h2, ident).is_ok();
     let refs_after_last = matches!(vfs_ro::inode_peek(node.vol, node.cluster), Some(i) if i.refs == 0);
 
+    let dentry0 = vfs_ro::dentry_stats();
+    let inode0 = vfs_ro::inode_stats();
     let opened2 = match fs_open::open_node_product("/SMALL.BIN", fs_open::OPEN_READ_ONLY) {
         Ok(o) => o,
         Err(_) => { fs_open::set_port(old_port); return false; }
@@ -1173,6 +1175,11 @@ fn t_fs_open_node_lifecycle() -> bool {
         fs_open::set_port(old_port);
         return false;
     };
+    let dentry1 = vfs_ro::dentry_stats();
+    let inode1 = vfs_ro::inode_stats();
+    let product_reuse = n2.inode_slot == node.inode_slot
+        && dentry1.0 > dentry0.0 && inode1.0 == inode0.0 + 1 && inode1.1 == inode0.1;
+    let refs2 = matches!(vfs_ro::inode_peek(n2.vol, n2.cluster), Some(i) if i.refs == 1);
     let r1 = match handle::grant_vfs_file_node(ident, port, None, cur2, s2, handle::RIGHT_READ | handle::RIGHT_DUP, n2) {
         Ok(h) => h,
         Err(_) => { let _ = vfs_ro::close_node(&n2); fs_open::set_port(old_port); return false; }
@@ -1238,12 +1245,13 @@ fn t_fs_open_node_lifecycle() -> bool {
     vfs_ro::dentry_clear();
     fs_open::set_port(old_port);
     let ok = consistent && independent && refs1 && node_ok && refs_after_dup && c1
-        && refs_after_first && closed2 && refs_after_last && revoked == 2 && refs_after_revoke
+        && refs_after_first && closed2 && refs_after_last && product_reuse && refs2
+        && revoked == 2 && refs_after_revoke
         && dc1 && dc2 && dir_refs && reset_ok;
     crate::log_info!(
-        "fs-open-node: 一致={} 独立卷={} open={} dup不增={} 首关={} 末关={} revoke={} 目录={} reset={} ⇒ {}",
+        "fs-open-node: 一致={} 独立卷={} open={} dup不增={} 首关={} 末关={} 产品复用={} refs={} revoke={} 目录={} reset={} ⇒ {}",
         consistent, independent, refs1 && node_ok, refs_after_dup, refs_after_first,
-        refs_after_last, refs_after_revoke, dir_refs, reset_ok, ok
+        refs_after_last, product_reuse, refs2, refs_after_revoke, dir_refs, reset_ok, ok
     );
     ok
 }

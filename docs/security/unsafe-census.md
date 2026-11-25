@@ -5,14 +5,14 @@
 >
 > **2026-11-20（ADR-175 跨 AS 读走物理地址）**：`sched/user` U2 9 → 10（`copy_from_user_in` 里 HHDM 别名的单字节读）。**总数 +1**（530 → 531）。
 
-总计 723 处。U1 105 · U2 183 · U3 13 · U4 250 · U5 128 · U6 44
+总计 726 处。U1 105 · U2 183 · U3 13 · U4 253 · U5 128 · U6 44
 
 | 类别 | 含义 | 处数 |
 |---|---|---|
 | U1 | 架构入口与特殊寄存器 | 105 |
 | U2 | 页表、物理内存与 MMIO | 183 |
 | U3 | DMA 与设备共享内存 | 13 |
-| U4 | 并发共享状态与 UnsafeCell | 250 |
+| U4 | 并发共享状态与 UnsafeCell | 253 |
 | U5 | 用户指针与地址空间访问 | 128 |
 | U6 | 诊断路径的有限现场读取 | 44 |
 
@@ -73,11 +73,14 @@ ADR-251：新增按目标批量池与上下文回调池，共 15 处 U4。两组
 | U4 | 511 | `unsafe impl Sync for DentryCell {}` （dentry 缓存表的静态量）|
 | U4 | 545 | `unsafe { &mut *DENTRY.0.get() }` （`dentry_get` 持锁期间）|
 | U4 | 566 | `unsafe { &mut *DENTRY.0.get() }` （`dentry_put` 持锁期间）|
+| U4 | 652 | `unsafe { &mut *DENTRY.0.get() }` （`dentry_bind_inode` 持锁期间）|
+| U4 | 664 | `unsafe { &mut *DENTRY.0.get() }` （`dentry_invalidate_dir` 持锁期间）|
+| U4 | 1924 | `unsafe { &mut *INODES.0.get() }` （`inode_get_at` 持锁期间）|
 | U4 | 585 | `unsafe { &*DENTRY.0.get() }` （`dentry_stats` 持锁期间）|
 | U4 | 596 | `unsafe { &mut *DENTRY.0.get() }` （`dentry_clear` 持锁期间）|
 | U4 | 2169 | `unsafe { &mut *PAGES.0.get() }` （ADR-250 `cache_invalidate` 持 `CACHE_LOCK` 清槽并递增代数）|
 
-ADR-195：dentry 缓存的 64 条 `DentrySlot` 进 `.bss`。五处指针都指向 `DENTRY` 这个
+ADR-195：dentry 缓存的 64 条 `DentrySlot` 进 `.bss`。这些指针都指向 `DENTRY` 这个
 静态量，长度 `DENTRY_MAX`，生命周期整个内核，访问都在 `RANK_DENTRY(38)` 锁内。
 载荷全为 `Copy` 数值（`Entry` 是 `Copy`），无别名逃逸。
 

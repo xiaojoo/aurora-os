@@ -26114,3 +26114,23 @@ PASS，按环境形状记“不归因”，判据不动。
 - `check` **21/21**；原始完整矩阵 **81/82**，唯一不符合是 `签名包两份实现同答案`，
   红在两次 PIT 标定均 `WindowVsIntervals`；同 ELF `501b7f138c75` 单跑 `run-16415`
   PASS，按环境形状记“不归因”，判据不动。
+
+## 586. ADR-257：dentry 内嵌 inode 身份与目录失效（2026-11-26）
+
+- `DentrySlot` 保存 inode 槽提示；`inode_get_at` 校验 `used/vol/cluster`、更新 size/attr、
+  增加引用，槽淘汰/复用后回退 `inode_get` 并重绑。提示本身不持引用。
+- 新增 `ReadOnlyFs::mount_cached`，产品 open 复用 dentry/page cache；显式 `mount` 仍清空。
+- create/unlink 成功后失效整个 `(vol, parent_cluster)` 目录，覆盖大小写/长短名别名；
+  dentry generation 阻止旧 miss 在目录失效后回填，连续四次竞争保守返回 `NotFound`。
+- `run-16434`：`复用=true refs=true/true/true inode命中=0->1 异键占槽=true 槽校验=true`，
+  `别名=true 删后查无=true/true`，fs-ro **103/103** PASS。`run-16422`：产品二次 open
+  `产品复用=true refs=true`，fs-open **164/164** PASS。
+- `run-16420`：关闭目录失效后 `删后查无=false/false`，`t_dentry_inode_link` 精确 FAIL。
+  `run-16421`：关闭槽校验后 `复用=false refs=true/false/true 槽校验=false`，同格精确 FAIL。
+  `run-16434`：读中删除目标项后重读得到 `NotFound`；`run-16435` 关闭 generation 后
+  旧 miss 返回 `Ok(Entry)`，`t_dentry_generation_race` 精确 FAIL。
+- 未新增 rename 空壳（当前无调用点）；完整 inode 对象内嵌与 i_op/f_op 仍按任务 #39/#40
+  的后续边界保留。真机未验证；AOCI MCP 本片不可用，索引未更新。
+- `check` **21/21**；原始完整矩阵 **81/82**，唯一不符合是 `FS写方向与可写卷对账`，
+  红在同跑 `t_sdkdemo` 的 `0x100002000` 未映射；同 ELF `e05e3c3dc3bd` 单跑
+  `run-16524` PASS，按环境形状记“不归因”，判据不动。
