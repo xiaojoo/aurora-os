@@ -655,6 +655,13 @@ static WAIT_EVENTS: AtomicUsize = AtomicUsize::new(0);
 static WAIT_SPINS_TOTAL: AtomicUsize = AtomicUsize::new(0);
 static WAIT_MAX_CYCLES: AtomicU64 = AtomicU64::new(0);
 static WAIT_TIMEOUTS: AtomicUsize = AtomicUsize::new(0);
+// may_open 路径中，CAS 成功时若中断窗口仍开着，锁已可见但 held_by 尚未发布。
+// 这个计数必须恒为 0；非 0 表示旁观者可能看到 locked=1 / held_by=UNHELD。
+static OPEN_WINDOW_CAS_SUCCESSES: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn open_window_cas_successes() -> usize {
+    OPEN_WINDOW_CAS_SUCCESSES.load(Ordering::Relaxed)
+}
 
 /// 等锁看门狗（§7.1 R16 的"有界自旋"、§9.6 的看门狗配对）。
 ///
@@ -731,6 +738,7 @@ impl<T: Send> IrqSpinLock<T> {
         let token = cpu_token();
         let slot = crate::arch::x86_64::cpu::self_slot();
         let mut spins = 0u64;
+        let mut window_open = false;
         let t0 = crate::tsc::now();
         // ADR-081 决策 1：**三条件**——目标锁从不在 ISR 取、此刻最内层等级 < TIMER(6)、只在自旋内开。
         // 条件 2 是硬约束：持 HEAP(10) 等 VMM 时若开窗，tick 取 TIMER(6) 会撞 `外层 rank=10 本次 rank=6`。
@@ -740,11 +748,27 @@ impl<T: Send> IrqSpinLock<T> {
         #[cfg(feature = "fault-open-no-rank-guard")]
         let may_open = self.never_taken_in_isr;
         loop {
+            #[cfg(feature = "fault-lock-open-before-cas")]
             if may_open {
                 open_window_raw();
+                window_open = true;
             }
             if self.locked.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                if window_open {
+                    OPEN_WINDOW_CAS_SUCCESSES.fetch_add(1, Ordering::Relaxed);
+                }
                 break;
+            }
+            #[cfg(not(feature = "fault-lock-open-before-cas"))]
+            if may_open {
+                open_window_raw();
+                window_open = true;
+            }
+            core::hint::spin_loop();
+            #[cfg(not(feature = "fault-lock-open-before-cas"))]
+            if may_open {
+                close_window_raw();
+                window_open = false;
             }
             // CAS 失败有两种原因，必须分开：
             // (a) 本 CPU 已经持有 => 重入。IF 已经是 0，持有者永远不会让出，这是自死锁，当场叫。

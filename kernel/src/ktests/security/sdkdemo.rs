@@ -20,7 +20,7 @@
 //! `a3-cred-guest` 档 + ADR-151 那条判定行覆盖——本用例证的是"SDK 样板能跑通
 //! 调号 + 回传结果"这条链。
 
-use crate::ktests::common::SDKDEMO_ELF;
+use crate::ktests::common::{SDKDEMO_ELF, drain_reap};
 use crate::{ktest, user};
 
 /// 在 ring3 跑 `sdkdemo` 并把它的串口输出抓出来。
@@ -108,7 +108,14 @@ fn t_sdkdemo() -> bool {
     // 这与 §366 是同一类：`fs_open.rs` 的注释写过「容器一被 reap，
     // 它名下的页就还给分配器」，所以它在 `IF=0` 窗口里取快照。
     // 这里六个读是纯读、无副作用，提前比关中断简单。
-    let _ = crate::sched::terminate_task(t);
+    #[cfg(not(feature = "fault-sdkdemo-no-cleanup"))]
+    {
+        let _ = crate::sched::terminate_task(t);
+        crate::sched::yield_now();
+        let _ = drain_reap();
+    }
+    let released = !crate::mm::is_reserved(loaded.image_lo)
+        && !crate::mm::is_mapped(loaded.entry);
     // 五个槽全读到了，后面的判据才有意义。读不到时它单独红一格。
     let readable = uid.is_some()
         && gid.is_some()
@@ -135,13 +142,13 @@ fn t_sdkdemo() -> bool {
     // 读数里 `uid=18446744073709551615` 是"没有凭据"的哨兵（u64::MAX）——
     // 本用例这条路径不授凭据，所以那是**正确读数**，判据不据此报红。
     crate::log_info!(
-        "sdkdemo: 判据 读得到={} 38号有回答={} 40号有回答={} 自洽={} \
+        "sdkdemo: 判据 读得到={} 38号有回答={} 40号有回答={} 自洽={} 回收={} \
          读数 uid={:?} gid={:?} caps={:?} dev={:?} consistent={:?}",
-        readable, g1, g2, g3, uid, gid, caps, dev, consistent
+        readable, g1, g2, g3, released, uid, gid, caps, dev, consistent
     );
     // **`readable` 是独立一格**：它红的时候日志直接说「读不到」，
     // 而不再伪装成「40 号没回答」。
-    let ok = readable && g1 && g2 && g3;
+    let ok = readable && g1 && g2 && g3 && released;
     if !ok {
         crate::log_fatal!("sdkdemo: 样板不成立（上面一行是全部读数）");
     }

@@ -25908,3 +25908,50 @@ ADR-220 的未决 1/4 在产品句柄路径关闭，旧 `fs_open::open` 与 exec
 - busy-port 证明的是 QEMU 中真实 MMIO 寄存器非零路径；真机 AHCI 行为仍未验证。
 - bad-entry 是跳转候选的故障注入与跳转前校验，不宣称覆盖真实 CPU 跳错后的所有异常形状。
 - 稀疏 vmcore、真机 NMI/IST2/UC DMA 与安全启动边界保持 ADR-247 原文，不因本片扩大结论。
+
+## 580. ADR-253：IrqSpinLock 开窗自旋的 CAS 元数据窗口（2026-11-25）
+
+### 根因
+
+`run-14229` / `run-14595` 的 rank20 看门狗都显示 `held_by=UNHELD`。原 `may_open`
+路径每轮先 `sti` 再 CAS，CAS 成功后才 `cli` 并发布 `held_by`；另一个 CPU 能在这段
+窗口里看到 `locked=1` 但持有者尚未登记。宿主停顿或中断只是放大窗口，不是根因。
+
+### 修法与判据
+
+- 正常路径先以 IF=0 执行 CAS；失败后才开窗自旋，下一轮 CAS 前重新关窗。
+- 新增 `open_window_cas_successes` 计数，现有跨核竞争用例要求增量恒为 0。
+- 负样本特性 `fault-lock-open-before-cas` 恢复旧顺序；同一用例必须精确红。
+
+| 场景 | 读数 |
+|---|---|
+| 修复前红测 | `run-15030`：`open_window_cas=16000`，竞争用例 FAIL |
+| 修复后默认档 | `run-15031`：`open_window_cas=0`，**92/92** PASS |
+| 恢复旧顺序 | `run-15032`：`open_window_cas=16000`，竞争用例 FAIL |
+| `handles,fs-open` | `run-15033`：**160/160**，`open_window_cas=0` |
+| `fs-rw` 修复前 | `run-15034` / `run-15035`：同 ELF 两次 `t_elf_load_run` 报 `VaTaken` |
+| sdkdemo 清理负样本 | `run-15036`：`回收=false`，`t_sdkdemo` 精确 FAIL |
+| `fs-rw` 修复后 | `run-15037`：**164/164**，sdkdemo `回收=true`、elfload 通过 |
+| `check` | **22/22** |
+| 最终完整矩阵 | **82/82 符合**，退出码 0 |
+
+锁修复改变了链接/时序形状，暴露出 `t_sdkdemo` 只 terminate、未主动建立抢占点并 drain 的
+顺序依赖。该用例现自己 `yield_now + drain_reap` 并直查镜像 VA 已释放；跳过清理的
+`fault-sdkdemo-no-cleanup` 稳定红在 `回收=false`，不再等下一格偶然替它收尾。
+
+### IRQ 取证窗口
+
+首次最终矩阵 **79/82**：`中断投递` / `边沿与消息` / `目的地按SP` 三行都是内核 PASS、
+宿主机 `CONTENT-MISMATCH`，共同形状为 QEMU 已投递 5 次而内核只处理 4 次。三行用同一
+默认 ELF `7ace909df7f1…` 单跑仍红，排除偶发用例失败。
+
+根因是 AP 停机、ktests 结束后直接取 `apic::counts()`，最后一发 AHCI IRQ 已投递但尚未
+进入 handler。新增 1M 周期开窗沉降，再取计数；`fault-no-irq-settle` 跳过它时前两行稳定
+回到 `宿主机=5 内核=4`，修复后三行分别 `5=5`、`5=5`、`10=10`。这不是放宽判据，而是把
+“已投递但未处理”的在途中断在快照前落地。
+
+### 边界
+
+- 锁等级、锁序、看门狗阈值与开窗准入条件均不改。
+- 只关闭已定位的元数据发布窗口，不宣称所有 rank20 超时都已归因；真机未验证。
+- `OpenSpinLock` 的重入/超时仍是单独审计项，不在本片偷换成通用锁。

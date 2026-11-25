@@ -1093,6 +1093,8 @@ fn run_ktests_and_finish() -> ! {
     let pr = trap::p3_resume_stats();
     let pf = trap::p3_fatal_stats();
     let p5 = trap::p5_irq_stats();
+    #[cfg(not(feature = "fault-no-irq-settle"))]
+    apic::with_interrupts(|| tsc::spin(1_000_000));
     let c = apic::counts();
     let rust_irq_total: usize = c.irq.iter().sum::<usize>() + c.unexpected + c.spurious + c.resched;
     let (n1, mean1, min1, max1) = sched::p1_stats();

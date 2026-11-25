@@ -1736,6 +1736,7 @@ ktest!(KT_IF_PATCH, t_if_patch_both_branches);
 /// 如果无锁那轮也丢 0，说明两个 CPU 根本没撞上，那"锁挡住了竞争"这句话就没有证据——
 /// 所以 `wait_events > 0` 和 `unlocked_lost > 0` 两条都是判据，不是装饰。
 fn t_cross_cpu_lock_contention() -> bool {
+    let open0 = sync::open_window_cas_successes();
     let o = match smp::contention_round() {
         Ok(v) => v,
         Err(e) => {
@@ -1744,13 +1745,14 @@ fn t_cross_cpu_lock_contention() -> bool {
         }
     };
     let st = sync::stats();
+    let open_delta = sync::open_window_cas_successes().saturating_sub(open0);
     crate::log_info!(
         "contention: participants={} rounds_per_cpu={} unlocked_lost={} locked_lost={} wait_events={} wait_max={}",
         o.participants, o.rounds_per_cpu, o.unlocked_lost, o.locked_lost, o.wait_events, o.wait_max_cycles
     );
     crate::log_info!(
-        "contention lockdep: acquires={} order_violations={} reentrant_hits={} ack_timeouts={}",
-        st.acquires, st.order_violations, st.reentrant_hits, o.ack_timeouts
+        "contention lockdep: acquires={} order_violations={} reentrant_hits={} ack_timeouts={} open_window_cas={}",
+        st.acquires, st.order_violations, st.reentrant_hits, o.ack_timeouts, open_delta
     );
     // 每 CPU 4000 次自增，丢数比例报出来才有可比性（全丢和丢 1 个是两件事）
     let total = o.participants as u64 * o.rounds_per_cpu;
@@ -1764,6 +1766,7 @@ fn t_cross_cpu_lock_contention() -> bool {
     // 于是同一条用例在两种顺序下给出两种结论——那属于"只有跑的时候才知道顺序错了"的那类故障。
     o.unlocked_lost > 0 && o.locked_lost == 0 && o.wait_events > 0 && o.ack_timeouts == 0
         && st.order_violations == 0 && st.reentrant_hits == 0 && st.wait_timeouts == 0
+        && open_delta == 0
 }
 ktest!(KT_CONTENTION, t_cross_cpu_lock_contention);
 
