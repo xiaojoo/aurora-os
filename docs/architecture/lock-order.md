@@ -25,6 +25,9 @@
 | `RANK_ACPI` | 50 | ACPI 解析结果静态量 | （叶子，目前只在启动期单独使用） | 解析路径不分配物理帧 | 否 |
 | `RANK_TEST` | 60 | 无（跨核竞争用例的自旋占位） | （叶子，**故意**是叶子） | `smp::contention_round`；临界区里只有一次 volatile 读改写 + 一段 `tsc::spin`；`KT_AHCI_LOCK_RANK_GUARD` 也借它制造外层 rank=60，验证 AHCI 在 XFER 前拒绝 | 否 |
 
+ADR-252：`VfsNode` 的 inode 引用在 HANDLE 锁内只从对象/cell 摘下，`close_node` 在锁外执行；
+不在 `RANK_HANDLE(35)` 内取 `INODE_LOCK`，因此不新增嵌套关系。
+
 `RANK_TEST` 单独占一级而不是复用 40/50，是为了让"测试锁混进真实嵌套链"这种错误
 当场报成锁序违规，而不是安静地共用别人的数字。
 

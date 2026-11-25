@@ -2232,6 +2232,16 @@ pub enum NodeError {
     Vfs(VfsError),
 }
 
+impl NodeError {
+    pub fn tag(self) -> &'static str {
+        match self {
+            NodeError::NotMounted => "卷未挂载",
+            NodeError::NoInode => "inode 表满",
+            NodeError::Vfs(e) => e.tag(),
+        }
+    }
+}
+
 /// **打开一个路径，走完三层**（ADR-220）。
 ///
 /// ## 顺序是有意的
@@ -2242,12 +2252,12 @@ pub enum NodeError {
 ///
 /// 反过来（先 dentry 再 superblock）会让「未挂载卷的 dentry 命中」泄漏结果 ——
 /// 与 ADR-195 那条「坏卷结果泄漏给好卷」是同一类错误。
-pub fn open_node(
+pub fn open_node_entry(
     disk: &dyn Block,
     bpb: &Bpb,
     path: &str,
     readonly: bool,
-) -> Result<VfsNode, NodeError> {
+) -> Result<(VfsNode, Entry), NodeError> {
     // 1) superblock
     let vol = volume_fingerprint(disk, bpb);
     let sb_slot = match sb_get(vol) {
@@ -2281,14 +2291,24 @@ pub fn open_node(
     // 3) inode
     let inode_slot = inode_get(vol, entry.first_cluster, entry.size, entry.attr)
         .ok_or(NodeError::NoInode)?;
-    Ok(VfsNode {
+    Ok((VfsNode {
         sb_slot,
         inode_slot,
         vol,
         cluster: entry.first_cluster,
         size: entry.size,
         attr: entry.attr,
-    })
+    }, entry))
+}
+
+/// 打开一个路径，走完三层；只返回节点标识（ADR-220 原契约）。
+pub fn open_node(
+    disk: &dyn Block,
+    bpb: &Bpb,
+    path: &str,
+    readonly: bool,
+) -> Result<VfsNode, NodeError> {
+    open_node_entry(disk, bpb, path, readonly).map(|(node, _)| node)
 }
 
 /// 按槽号查 superblock（判据用）。

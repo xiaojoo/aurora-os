@@ -25817,3 +25817,50 @@ ADR-214/215 的旧全局队列与旧回调 API 一字不动，新增一条加法
 - 真正驱动异步：`Block` 仍同步，当前只是提交/完成分离的延迟推进，不拥有数据缓冲。
 - `panic=abort` 下的生存级回调隔离：只能保证请求已摘出、统计已提交、锁已放，回调 panic 仍终止整机。
 - 每目标独立容量与执行中插入重排仍欠；当前是全局共享 32 槽。
+
+## 578. ADR-252：open_node 接入产品句柄生命周期（2026-11-25）
+
+### 交付范围
+
+ADR-220 的未决 1/4 在产品句柄路径关闭，旧 `fs_open::open` 与 exec 路径不改：
+
+- `open_node_entry` 一次解析同时返回 `VfsNode + Entry`，避免 dentry/inode 二次 lookup；
+- `VfsFile/VfsDir` 与共享 cell 持有节点；dup 共享 open-file-description，不重复 `inode_get`；
+- 首关/末关、revoke、reset 都按共享 cell 引用归还，最后一条名字才 `close_node`；
+- HANDLE 锁内只摘对象/更新 cell，`close_node` 在锁外执行，不新增 `INODE_LOCK` 嵌套；
+- grant 失败立即归还节点；构造失败使用 fail-stop，不吞 `close_node` 错误；
+- 批量释放用固定 `INODE_MAX` 槽按 `(vol, cluster)` 去重，栈数组不随 `MAX_HANDLES` 增长。
+
+### 判据与负样本
+
+`t_fs_open_node_lifecycle` 覆盖产品 open、dup、首关/末关、revoke、目录和 reset；
+`t_fs_open_node_grant_failure` 填满 16384 句柄后走真实 22 号；
+`t_fs_open_node_syscall` 验证真实 syscall 的节点可见性与关闭后消失。
+
+| 变异 | 红跑 | 精确红点 |
+|---|---|---|
+| 最后一次 close 不归还 | `run-14692` | `末关=false refs=1` |
+| dup 重复 `inode_get` | `run-14693` | `dup不增=false` |
+| 满表 grant 不归还 | `run-14694` | `拒=-6 refs=Some(1)` |
+| reset 不归还 | `run-14695` | `reset=false` |
+| 产品 open 提前丢节点 | `run-14696` | `open=false` |
+| syscall 退回旧无节点路径 | `run-14701` | `refs1=false`、满表 `refs=None` |
+
+### 读数
+
+| 场景 | 结果 |
+|---|---|
+| `handles,fs-open` | **160/160**，ELF `69a10f03c01d…` |
+| `fs-rw` | **164/164**，ELF `ccd3f039dced…` |
+| 默认 / handles | **92/92 / 132/132** |
+| `check` | **22/22** |
+| 完整矩阵 | **82/82 符合**，退出码 0 |
+
+第一次完整矩阵在 handles 档构建失败：非 `fs-open` 的 `cell_release`/`close` 仍提到
+`VfsNode`。修复为 cfg 类型别名与空值后，handles 单跑 `run-14752` PASS，
+`handles,fs-open` 复验 `run-14753` PASS，最终矩阵 82 行逐行对账无不符合。
+
+### 边界
+
+- `i_op/f_op` 间接层与 dentry 内嵌 inode 仍未引入，分别拆后续任务，不把本片写成三层全完成。
+- 节点关闭不卸载 superblock；单根/多挂载语义仍按 ADR-220/217，真机未验证。

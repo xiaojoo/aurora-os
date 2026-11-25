@@ -1103,4 +1103,233 @@ fn t_fs_open_dup_shared() -> bool {
 }
 ktest!(KT_FS_OPEN_DUP_SHARED, t_fs_open_dup_shared);
 
+/// ADR-252：产品节点在 dup/close/revoke 下只归还一次 inode 引用。
+#[cfg(feature = "fs-open")]
+fn t_fs_open_node_lifecycle() -> bool {
+    if ahci::init().is_err() { return false; }
+    sched::init_boot_task();
+    let Some(ident) = sched::current_identity() else { return false };
+    let old_port = fs_open::port();
+    fs_open::set_port(fs_open::PORT);
+    handle::reset_for_test();
+    vfs_ro::inode_clear();
+    vfs_ro::sb_clear();
+    vfs_ro::dentry_clear();
+
+    let opened = match fs_open::open_node_product("/SMALL.BIN", fs_open::OPEN_READ_ONLY) {
+        Ok(o) => o,
+        Err(_) => { fs_open::set_port(old_port); return false; }
+    };
+    let fs_open::OpenedNode::File { port, cursor, stat, node } = opened else {
+        fs_open::set_port(old_port);
+        return false;
+    };
+    let consistent = {
+        let (sb, inode, vol) = vfs_ro::node_consistent(&node);
+        sb && inode && vol
+    };
+    let disk = AhciDisk { port };
+    let bpb = cursor.bpb();
+    let mut independent_vol = 0x1000_0000u64 | u64::from(port);
+    independent_vol ^= ((bpb.cluster_bytes as u64) << 8) ^ bpb.clusters;
+    for value in [
+        bpb.total_sectors,
+        bpb.clusters,
+        bpb.cluster_bytes as u64,
+        u64::from(bpb.root_cluster),
+        u64::from(bpb.sectors_per_fat),
+        u64::from(bpb.reserved_sectors),
+    ] {
+        independent_vol = independent_vol.wrapping_mul(0x0100_0000_01b3).wrapping_add(value);
+    }
+    let independent = node.vol == independent_vol;
+    let h1 = match handle::grant_vfs_file_node(
+        ident, port, None, cursor, stat, handle::RIGHT_READ | handle::RIGHT_DUP, node,
+    ) {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = vfs_ro::close_node(&node);
+            fs_open::set_port(old_port);
+            return false;
+        }
+    };
+    let refs1 = matches!(vfs_ro::inode_peek(node.vol, node.cluster), Some(i) if i.refs == 1);
+    let node_ok = handle::vfs_node_of(h1, ident) == Some(node);
+    let h2 = match handle::dup(h1, ident, handle::RIGHT_READ) {
+        Ok(h) => h,
+        Err(_) => { let _ = handle::close(h1, ident); fs_open::set_port(old_port); return false; }
+    };
+    let refs_after_dup = matches!(vfs_ro::inode_peek(node.vol, node.cluster), Some(i) if i.refs == 1);
+    let c1 = handle::close(h1, ident).is_ok();
+    let refs_after_first = matches!(vfs_ro::inode_peek(node.vol, node.cluster), Some(i) if i.refs == 1);
+    let closed2 = handle::close(h2, ident).is_ok();
+    let refs_after_last = matches!(vfs_ro::inode_peek(node.vol, node.cluster), Some(i) if i.refs == 0);
+
+    let opened2 = match fs_open::open_node_product("/SMALL.BIN", fs_open::OPEN_READ_ONLY) {
+        Ok(o) => o,
+        Err(_) => { fs_open::set_port(old_port); return false; }
+    };
+    let fs_open::OpenedNode::File { cursor: cur2, stat: s2, node: n2, .. } = opened2 else {
+        fs_open::set_port(old_port);
+        return false;
+    };
+    let r1 = match handle::grant_vfs_file_node(ident, port, None, cur2, s2, handle::RIGHT_READ | handle::RIGHT_DUP, n2) {
+        Ok(h) => h,
+        Err(_) => { let _ = vfs_ro::close_node(&n2); fs_open::set_port(old_port); return false; }
+    };
+    let r2 = match handle::dup(r1, ident, handle::RIGHT_READ) {
+        Ok(h) => h,
+        Err(_) => { let _ = handle::close(r1, ident); fs_open::set_port(old_port); return false; }
+    };
+    let revoked = handle::revoke_task(ident.0, ident.1);
+    let refs_after_revoke = matches!(vfs_ro::inode_peek(n2.vol, n2.cluster), Some(i) if i.refs == 0)
+        && handle::vfs_node_of(r1, ident).is_none()
+        && handle::vfs_node_of(r2, ident).is_none();
+
+    let dir = match fs_open::open_node_product("/", fs_open::OPEN_READ_ONLY) {
+        Ok(fs_open::OpenedNode::Dir { state, stat, node, .. }) => (state, stat, node),
+        _ => { fs_open::set_port(old_port); return false; }
+    };
+    let (state, stat, node) = dir;
+    let d1 = match handle::grant_vfs_dir_node(ident, port, None, stat, state, handle::RIGHT_READ | handle::RIGHT_DUP, node) {
+        Ok(h) => h,
+        Err(_) => { let _ = vfs_ro::close_node(&node); fs_open::set_port(old_port); return false; }
+    };
+    let d2 = match handle::dup(d1, ident, handle::RIGHT_READ) {
+        Ok(h) => h,
+        Err(_) => { let _ = handle::close(d1, ident); fs_open::set_port(old_port); return false; }
+    };
+    let dc1 = handle::close(d1, ident).is_ok();
+    let dc2 = handle::close(d2, ident).is_ok();
+    let dir_refs = matches!(vfs_ro::inode_peek(node.vol, node.cluster), Some(i) if i.refs == 0);
+
+    let opened3 = match fs_open::open_node_product("/SMALL.BIN", fs_open::OPEN_READ_ONLY) {
+        Ok(fs_open::OpenedNode::File { cursor, stat, node, .. }) => (cursor, stat, node),
+        _ => { fs_open::set_port(old_port); return false; }
+    };
+    let opened4 = match fs_open::open_node_product("/SMALL.BIN", fs_open::OPEN_READ_ONLY) {
+        Ok(fs_open::OpenedNode::File { cursor, stat, node, .. }) => (cursor, stat, node),
+        _ => { fs_open::set_port(old_port); return false; }
+    };
+    let (cur3, stat3, node3) = opened3;
+    let (cur4, stat4, node4) = opened4;
+    let h3 = match handle::grant_vfs_file_node(ident, port, None, cur3, stat3, handle::RIGHT_READ, node3) {
+        Ok(h) => h,
+        Err(_) => { let _ = vfs_ro::close_node(&node3); fs_open::set_port(old_port); return false; }
+    };
+    let h4 = match handle::grant_vfs_file_node(ident, port, None, cur4, stat4, handle::RIGHT_READ | handle::RIGHT_DUP, node4) {
+        Ok(h) => h,
+        Err(_) => { let _ = handle::close(h3, ident); let _ = vfs_ro::close_node(&node4); fs_open::set_port(old_port); return false; }
+    };
+    let h4d = match handle::dup(h4, ident, handle::RIGHT_READ) {
+        Ok(h) => h,
+        Err(_) => { let _ = handle::close(h3, ident); let _ = handle::close(h4, ident); fs_open::set_port(old_port); return false; }
+    };
+    let refs_before_reset = matches!(vfs_ro::inode_peek(node3.vol, node3.cluster), Some(i) if i.refs == 2);
+    let reset_ok = {
+        let _ = (h3, h4, h4d);
+        handle::reset_for_test();
+        refs_before_reset && matches!(vfs_ro::inode_peek(node3.vol, node3.cluster), Some(i) if i.refs == 0)
+    };
+
+    handle::reset_for_test();
+    vfs_ro::inode_clear();
+    vfs_ro::sb_clear();
+    vfs_ro::dentry_clear();
+    fs_open::set_port(old_port);
+    let ok = consistent && independent && refs1 && node_ok && refs_after_dup && c1
+        && refs_after_first && closed2 && refs_after_last && revoked == 2 && refs_after_revoke
+        && dc1 && dc2 && dir_refs && reset_ok;
+    crate::log_info!(
+        "fs-open-node: 一致={} 独立卷={} open={} dup不增={} 首关={} 末关={} revoke={} 目录={} reset={} ⇒ {}",
+        consistent, independent, refs1 && node_ok, refs_after_dup, refs_after_first,
+        refs_after_last, refs_after_revoke, dir_refs, reset_ok, ok
+    );
+    ok
+}
+#[cfg(feature = "fs-open")]
+ktest!(KT_FS_OPEN_NODE_LIFECYCLE, t_fs_open_node_lifecycle);
+
+/// ADR-252：产品 open 在句柄表满时必须归还刚取的 inode。
+#[cfg(feature = "fs-open")]
+fn t_fs_open_node_grant_failure() -> bool {
+    if ahci::init().is_err() { return false; }
+    sched::init_boot_task();
+    let Some(ident) = sched::current_identity() else { return false };
+    let old_port = fs_open::port();
+    fs_open::set_port(fs_open::PORT);
+    handle::reset_for_test();
+    vfs_ro::inode_clear();
+    vfs_ro::sb_clear();
+    vfs_ro::dentry_clear();
+    let disk = AhciDisk { port: fs_open::PORT };
+    let fs = match ReadOnlyFs::mount(&disk) { Ok(f) => f, Err(_) => { fs_open::set_port(old_port); return false; } };
+    let stat = match fs.lookup("/SMALL.BIN") { Ok(e) => e, Err(_) => { fs_open::set_port(old_port); return false; } };
+    let cursor = match fs.open(&stat) { Ok(c) => c, Err(_) => { fs_open::set_port(old_port); return false; } };
+    let vol = vfs_ro::volume_fingerprint_pub(&disk, &fs.bpb());
+    let mut filled = 0usize;
+    for _ in 0..MAX_HANDLES {
+        if handle::grant_vfs_file(ident, fs_open::PORT, None, cursor, stat, RIGHT_READ, 0).is_err() { break; }
+        filled += 1;
+    }
+    let Some(va) = mm::alloc_user_va_range(1) else { handle::reset_for_test(); fs_open::set_port(old_port); return false; };
+    let Ok(frames) = mm::phys_alloc(0, mm::MOD_TEST) else { handle::reset_for_test(); fs_open::set_port(old_port); return false; };
+    let Ok(flags) = mm::PageFlags::new(true, false, true) else { handle::reset_for_test(); fs_open::set_port(old_port); return false; };
+    let Ok(map) = mm::map(va, frames, flags) else { handle::reset_for_test(); fs_open::set_port(old_port); return false; };
+    let put_ok = put_user(va.0, 0, SMALL);
+    let mut fr = frame0();
+    let ret = call(&mut fr, user::SYS_FILE_OPEN, va.0, SMALL.len() as u64, 0);
+    let refs = vfs_ro::inode_peek(vol, stat.first_cluster).map(|i| i.refs);
+    let ok = put_ok && filled == MAX_HANDLES && ret == user::E_EXHAUSTED && refs == Some(0);
+    drop(map);
+    handle::reset_for_test();
+    vfs_ro::inode_clear();
+    vfs_ro::sb_clear();
+    vfs_ro::dentry_clear();
+    fs_open::set_port(old_port);
+    crate::log_info!("fs-open-node-fail: 填表={} 拒={} inode refs={:?} ⇒ {}", filled, ret as i64, refs, ok);
+    ok
+}
+#[cfg(feature = "fs-open")]
+ktest!(KT_FS_OPEN_NODE_GRANT_FAILURE, t_fs_open_node_grant_failure);
+
+/// ADR-252：真实 22 号成功 open 必须持有节点，close 后归还。
+#[cfg(feature = "fs-open")]
+fn t_fs_open_node_syscall() -> bool {
+    if ahci::init().is_err() { return false; }
+    sched::init_boot_task();
+    let Some(ident) = sched::current_identity() else { return false };
+    let old_port = fs_open::port();
+    fs_open::set_port(fs_open::PORT);
+    handle::reset_for_test();
+    vfs_ro::inode_clear();
+    vfs_ro::sb_clear();
+    vfs_ro::dentry_clear();
+    let Some(va) = mm::alloc_user_va_range(1) else { fs_open::set_port(old_port); return false; };
+    let Ok(frames) = mm::phys_alloc(0, mm::MOD_TEST) else { fs_open::set_port(old_port); return false; };
+    let Ok(flags) = mm::PageFlags::new(true, false, true) else { fs_open::set_port(old_port); return false; };
+    let Ok(map) = mm::map(va, frames, flags) else { fs_open::set_port(old_port); return false; };
+    let put_ok = put_user(va.0, 0, SMALL);
+    let mut fr = frame0();
+    let raw = call(&mut fr, user::SYS_FILE_OPEN, va.0, SMALL.len() as u64, 0);
+    let h = Handle(raw);
+    let node = handle::vfs_node_of(h, ident);
+    let refs1 = node.as_ref().is_some_and(|n| matches!(vfs_ro::inode_peek(n.vol, n.cluster), Some(i) if i.refs == 1));
+    let closed = call(&mut fr, user::SYS_HANDLE_CLOSE, raw, 0, 0) == 0;
+    let refs0 = node.as_ref().is_some_and(|n| matches!(vfs_ro::inode_peek(n.vol, n.cluster), Some(i) if i.refs == 0));
+    let gone = handle::vfs_node_of(h, ident).is_none();
+    let ok = put_ok && (raw as i64) > 0 && refs1 && closed && refs0 && gone;
+    drop(map);
+    handle::reset_for_test();
+    vfs_ro::inode_clear();
+    vfs_ro::sb_clear();
+    vfs_ro::dentry_clear();
+    fs_open::set_port(old_port);
+    crate::log_info!("fs-open-node-syscall: open={} refs1={} close={} refs0={} 失效={} ⇒ {}",
+        (raw as i64) > 0, refs1, closed, refs0, gone, ok);
+    ok
+}
+#[cfg(feature = "fs-open")]
+ktest!(KT_FS_OPEN_NODE_SYSCALL, t_fs_open_node_syscall);
+
 ktest!(KT_FS_OPEN_RING3, t_fs_open_ring3);

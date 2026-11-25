@@ -3790,6 +3790,16 @@ fn file_read_h(h: crate::handle::Handle, uptr: u64, want: usize) -> u64 {
     }
 }
 #[cfg(feature = "fs-open")]
+fn node_err_ret(e: crate::filesystem::vfs_ro::NodeError) -> u64 {
+    use crate::filesystem::vfs_ro::NodeError;
+    match e {
+        NodeError::NotMounted => E_IO,
+        NodeError::NoInode => E_EXHAUSTED,
+        NodeError::Vfs(e) => vfs_err_ret(e),
+    }
+}
+
+#[cfg(feature = "fs-open")]
 fn vfs_err_ret(e: crate::filesystem::vfs_ro::VfsError) -> u64 {
     use crate::filesystem::fat32::FsError;
     use crate::filesystem::vfs_ro::VfsError as V;
@@ -3971,33 +3981,34 @@ fn sys_file_open(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     };
     let flags = frame.rdx;
     // 落哪个根由**路径**决定（挂载表，ADR-114）；flags 只表达写意图并对挂载可写性做闸。
-    let opened = match crate::filesystem::fs_open::open(path, flags) {
+    let opened = match crate::filesystem::fs_open::open_node_product(path, flags) {
         Ok(o) => o,
-        Err(e) => return vfs_err_ret(e),
+        Err(e) => return node_err_ret(e),
     };
-    use crate::filesystem::fs_open::Opened;
+    use crate::filesystem::fs_open::OpenedNode;
     let rights = if flags == crate::filesystem::fs_open::OPEN_WRITE {
         crate::handle::RIGHT_READ | crate::handle::RIGHT_WRITE
     } else {
         crate::handle::RIGHT_READ
     };
-    let granted = match opened {
-        Opened::File { port, cursor, stat } => {
-            // **卷指纹必须真算**（ADR-221）：传 0 会让所有卷共用缓存槽，
-            // 不同盘的同 LBA 直接串（实测 `t_sdkdemo` 信箱魔数读到 0）。
-            let vol = {
-                let (d, _) = crate::handle::disk_for(port, None);
-                crate::filesystem::vfs_ro::volume_fingerprint_pub(&d, &cursor.bpb())
-            };
-            crate::handle::grant_vfs_file(owner, port, None, cursor, stat, rights, vol)
-        }
-        Opened::Dir { port, state, stat } => {
-            crate::handle::grant_vfs_dir(owner, port, None, stat, state, rights)
-        }
+    let (node, granted) = match opened {
+        OpenedNode::File { port, cursor, stat, node } => (
+            node,
+            crate::handle::grant_vfs_file_node(owner, port, None, cursor, stat, rights, node),
+        ),
+        OpenedNode::Dir { port, state, stat, node } => (
+            node,
+            crate::handle::grant_vfs_dir_node(owner, port, None, stat, state, rights, node),
+        ),
     };
     match granted {
         Ok(h) => h.0,
-        Err(e) => handle_err(e),
+        Err(e) => {
+            if !crate::filesystem::vfs_ro::close_node(&node) {
+                crate::log_fatal!("file_open: grant 失败后 close_node 失败 vol={:#x} cluster={}", node.vol, node.cluster);
+            }
+            handle_err(e)
+        }
     }
 }
 

@@ -9,7 +9,7 @@
 //! 一个形状都没有，挂在那里等于"用例里写着三级路径、盘上根本没有"。
 
 use crate::filesystem::vfs::AhciDisk;
-use crate::filesystem::vfs_ro::{self, DirState, Entry, ReadOnlyFs, VfsError};
+use crate::filesystem::vfs_ro::{self, DirState, Entry, NodeError, ReadOnlyFs, VfsError, VfsNode};
 
 /// 挂载口。口号与 `tools/aurora.py` 的 `FS_OPEN_PORTS` 各写一份，由 `check-fat32-ports` 对账。
 pub const PORT: u8 = 5;
@@ -63,6 +63,13 @@ static DISK: AhciDisk = AhciDisk { port: PORT };
 pub enum Opened {
     File { port: u8, cursor: vfs_ro::ReadCursor, stat: Entry },
     Dir { port: u8, state: DirState, stat: Entry },
+}
+
+/// 产品句柄路径的三层打开结果；旧 `Opened` 保留给 exec 与既有测试。
+#[derive(Debug, Clone, Copy)]
+pub enum OpenedNode {
+    File { port: u8, cursor: vfs_ro::ReadCursor, stat: Entry, node: VfsNode },
+    Dir { port: u8, state: DirState, stat: Entry, node: VfsNode },
 }
 
 /// 一个挂载点：`prefix` 是命名空间里的前缀，`writable` 决定写意图能不能在这儿过。
@@ -148,6 +155,48 @@ pub fn open(path: &str, flags: u64) -> Result<Opened, VfsError> {
     // `/` 是运行期根（`set_port` 换的就是它）；其余表项用自己登记的口号。
     let port = if m.prefix == "/" { self::port() } else { m.port };
     open_on(port, sub, flags)
+}
+
+fn close_node_checked(node: &VfsNode) {
+    if !vfs_ro::close_node(node) {
+        crate::log_fatal!("fs-open: close_node 失败 vol={:#x} cluster={}", node.vol, node.cluster);
+    }
+}
+
+/// 产品 open：一次解析同时拿三层节点与 Entry，后续构造失败归还 inode 引用。
+pub fn open_node_product(path: &str, flags: u64) -> Result<OpenedNode, NodeError> {
+    if flags != OPEN_READ_ONLY && flags != OPEN_WRITE {
+        return Err(NodeError::Vfs(VfsError::BadFlags));
+    }
+    let (m, sub) = resolve(path).map_err(NodeError::Vfs)?;
+    if flags == OPEN_WRITE && !m.writable {
+        return Err(NodeError::Vfs(VfsError::BadFlags));
+    }
+    let port = if m.prefix == "/" { self::port() } else { m.port };
+    let disk = AhciDisk { port };
+    let fs = ReadOnlyFs::mount(&disk).map_err(NodeError::Vfs)?;
+    let (node, stat) = vfs_ro::open_node_entry(&disk, &fs.bpb(), sub, !m.writable)?;
+    if stat.is_dir() {
+        if flags == OPEN_WRITE {
+            close_node_checked(&node);
+            return Err(NodeError::Vfs(VfsError::BadFlags));
+        }
+        match DirState::new(&fs.bpb(), &stat) {
+            Ok(state) => Ok(OpenedNode::Dir { port, state, stat, node }),
+            Err(e) => {
+                close_node_checked(&node);
+                Err(NodeError::Vfs(e))
+            }
+        }
+    } else {
+        match fs.open(&stat) {
+            Ok(cursor) => Ok(OpenedNode::File { port, cursor, stat, node }),
+            Err(e) => {
+                close_node_checked(&node);
+                Err(NodeError::Vfs(e))
+            }
+        }
+    }
 }
 
 pub fn stat_record(e: &Entry) -> [u8; 48] {

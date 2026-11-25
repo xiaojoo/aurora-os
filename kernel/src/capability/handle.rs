@@ -22,7 +22,7 @@
 
 use crate::filesystem::fat32::{FileCursor, FsError};
 #[cfg(feature = "fs-open")]
-use crate::filesystem::vfs_ro::{self, DirState, Entry as VfsEntry, ReadCursor, VfsError};
+use crate::filesystem::vfs_ro::{self, DirState, Entry as VfsEntry, ReadCursor, VfsError, VfsNode};
 use crate::filesystem::vfs::{AhciDisk, Block, Partition, PartitionView};
 use crate::sync::{IrqSpinLock, RANK_HANDLE};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -209,10 +209,19 @@ pub enum ObjRef {
         ///
         /// 分区视图的 LBA 是相对地址；不带区间会让同口不同分区甚至空分区串缓存。
         vol: u64,
+        /// 产品 open 的三层节点；旧测试 grant 可为 None。
+        node: Option<VfsNode>,
     },
     /// 目录句柄不内嵌 `DirCursor`（那会把每槽撑到 1.5 KiB）；`DirState` 是可复制的紧凑游标。
     #[cfg(feature = "fs-open")]
-    VfsDir { port: u8, part: Option<Partition>, stat: VfsEntry, state: DirState },
+    VfsDir {
+        port: u8,
+        part: Option<Partition>,
+        stat: VfsEntry,
+        state: DirState,
+        share: Option<u8>,
+        node: Option<VfsNode>,
+    },
     Vmo { slot: u8 },
     // ---- P5c-1（ADR-075 决策 4）：四种新 kind。本体各自住在 proc.rs / mm 的 AS 表 / sched 的任务表，
     // 表里只存**带世代号的引用**：`gen`（Thread 用 `id`）对不上就当"这个对象不是当初那个"。
@@ -290,12 +299,24 @@ enum CellCur {
     Vfs(ReadCursor),
 }
 
+#[cfg(feature = "fs-open")]
+type CellNode = Option<VfsNode>;
+#[cfg(not(feature = "fs-open"))]
+type CellNode = ();
+
+#[cfg(feature = "fs-open")]
+const EMPTY_CELL_NODE: CellNode = None;
+#[cfg(not(feature = "fs-open"))]
+const EMPTY_CELL_NODE: CellNode = ();
+
 #[derive(Clone, Copy)]
 struct Cell {
     used: bool,
     gen: u32,
     refs: u16,
     cur: Option<CellCur>,
+    #[cfg(feature = "fs-open")]
+    node: Option<VfsNode>,
 }
 
 const EMPTY_CELL: Cell = Cell {
@@ -303,6 +324,8 @@ const EMPTY_CELL: Cell = Cell {
     gen: 0,
     refs: 0,
     cur: None,
+    #[cfg(feature = "fs-open")]
+    node: None,
 };
 
 /// 句柄槽数组：**运行时分配**，不再是 `.bss` 里的定长数组（ADR-179）。
@@ -516,6 +539,10 @@ const MAX_SHARE: usize = MAX_HANDLES / 2;
 
 /// 占一格共享游标（锁内）。引用数从 1 起；世代 0 留给"从未分配"。
 fn cell_alloc(t: &mut Table, cur: CellCur) -> Option<u8> {
+    cell_alloc_with(t, Some(cur))
+}
+
+fn cell_alloc_with(t: &mut Table, cur: Option<CellCur>) -> Option<u8> {
     for i in 0..MAX_SHARE {
         if !t.cells[i].used {
             let mut gen = t.cells[i].gen.wrapping_add(1);
@@ -526,7 +553,9 @@ fn cell_alloc(t: &mut Table, cur: CellCur) -> Option<u8> {
                 used: true,
                 gen,
                 refs: 1,
-                cur: Some(cur),
+                cur,
+                #[cfg(feature = "fs-open")]
+                node: None,
             };
             return Some(i as u8);
         }
@@ -543,14 +572,82 @@ fn cell_retain(t: &mut Table, i: u8) {
     }
 }
 
-/// 关一条名字：引用减一；最后一条关上才丢格子（世代保留，票上的旧世代因此失效）。
-fn cell_release(t: &mut Table, i: u8) {
+/// 关一条名字；返回是否最后一条与该 cell 持有的节点。
+fn cell_release(t: &mut Table, i: u8) -> (bool, CellNode) {
     if let Some(c) = t.cells.get_mut(i as usize) {
         if c.used {
             c.refs = c.refs.saturating_sub(1);
             if c.refs == 0 {
                 c.used = false;
                 c.cur = None;
+                #[cfg(feature = "fs-open")]
+                let node = c.node.take();
+                #[cfg(not(feature = "fs-open"))]
+                let node = ();
+                return (true, node);
+            }
+        }
+    }
+    (false, EMPTY_CELL_NODE)
+}
+
+#[cfg(feature = "fs-open")]
+fn release_obj_ref(t: &mut Table, obj: ObjRef) -> Option<VfsNode> {
+    match obj {
+        ObjRef::File(FileObj { share, .. }) => {
+            if let Some(i) = share {
+                let _ = cell_release(t, i);
+            }
+            None
+        }
+        ObjRef::VfsFile { share, node, .. } | ObjRef::VfsDir { share, node, .. } => {
+            if let Some(i) = share {
+                let (last, cell_node) = cell_release(t, i);
+                if last { cell_node.or(node) } else { None }
+            } else {
+                node
+            }
+        }
+        _ => None,
+    }
+}
+
+#[cfg(feature = "fs-open")]
+#[derive(Clone, Copy)]
+struct NodeRefCount {
+    node: VfsNode,
+    count: u16,
+}
+
+#[cfg(feature = "fs-open")]
+const EMPTY_NODE_REF: NodeRefCount = NodeRefCount {
+    node: VfsNode { sb_slot: 0, inode_slot: 0, vol: 0, cluster: 0, size: 0, attr: 0 },
+    count: 0,
+};
+
+#[cfg(feature = "fs-open")]
+fn collect_node(counts: &mut [NodeRefCount; crate::filesystem::vfs_ro::INODE_MAX], len: &mut usize, node: Option<VfsNode>) {
+    let Some(node) = node else { return };
+    for i in 0..*len {
+        if counts[i].node.vol == node.vol && counts[i].node.cluster == node.cluster {
+            counts[i].count = counts[i].count.saturating_add(1);
+            return;
+        }
+    }
+    if *len >= counts.len() {
+        crate::log_fatal!("handle: 节点归还收集表满，活节点超过 INODE_MAX");
+        return;
+    }
+    counts[*len] = NodeRefCount { node, count: 1 };
+    *len += 1;
+}
+
+#[cfg(feature = "fs-open")]
+fn release_nodes(counts: &[NodeRefCount], len: usize) {
+    for i in 0..len {
+        for _ in 0..counts[i].count {
+            if !crate::filesystem::vfs_ro::close_node(&counts[i].node) {
+                crate::log_fatal!("handle: close_node 失败 vol={:#x} cluster={}", counts[i].node.vol, counts[i].node.cluster);
             }
         }
     }
@@ -1083,7 +1180,7 @@ pub fn grant_vfs_file(
 ) -> Result<Handle, HErr> {
     let vol = vfs_cache_vol(vol, part);
     let mut g = TABLE.lock();
-    insert(g.get(), owner, rights, ObjRef::VfsFile { port, part, cursor, stat, share: None, vol })
+    insert(g.get(), owner, rights, ObjRef::VfsFile { port, part, cursor, stat, share: None, vol, node: None })
 }
 
 #[cfg(feature = "fs-open")]
@@ -1096,7 +1193,47 @@ pub fn grant_vfs_dir(
     rights: u32,
 ) -> Result<Handle, HErr> {
     let mut g = TABLE.lock();
-    insert(g.get(), owner, rights, ObjRef::VfsDir { port, part, stat, state })
+    insert(g.get(), owner, rights, ObjRef::VfsDir { port, part, stat, state, share: None, node: None })
+}
+
+#[cfg(feature = "fs-open")]
+pub fn grant_vfs_file_node(
+    owner: (usize, u32),
+    port: u8,
+    part: Option<Partition>,
+    cursor: ReadCursor,
+    stat: VfsEntry,
+    rights: u32,
+    node: VfsNode,
+) -> Result<Handle, HErr> {
+    let vol = vfs_cache_vol(node.vol, part);
+    let mut g = TABLE.lock();
+    insert(g.get(), owner, rights, ObjRef::VfsFile { port, part, cursor, stat, share: None, vol, node: Some(node) })
+}
+
+#[cfg(feature = "fs-open")]
+pub fn grant_vfs_dir_node(
+    owner: (usize, u32),
+    port: u8,
+    part: Option<Partition>,
+    stat: VfsEntry,
+    state: DirState,
+    rights: u32,
+    node: VfsNode,
+) -> Result<Handle, HErr> {
+    let mut g = TABLE.lock();
+    insert(g.get(), owner, rights, ObjRef::VfsDir { port, part, stat, state, share: None, node: Some(node) })
+}
+
+#[cfg(feature = "fs-open")]
+pub(crate) fn vfs_node_of(h: Handle, owner: (usize, u32)) -> Option<VfsNode> {
+    let mut g = TABLE.lock();
+    let t = g.get();
+    let slot = check(t, h, owner, 0).ok()?;
+    match t.slots[slot].obj {
+        Some(ObjRef::VfsFile { node, .. }) | Some(ObjRef::VfsDir { node, .. }) => node,
+        _ => None,
+    }
 }
 
 #[cfg(feature = "fs-open")]
@@ -1537,34 +1674,40 @@ fn next_gen(prev: u64) -> u64 {
 /// **放掉 HANDLE(35) 之后**才 `vmo_unref`（它要取 VMM(20)，在锁内调就是 35→20 的反向嵌套）。
 /// 所以"句柄已失效"与"帧已归还"是两个时刻：判据要读 unref 之后的台账。
 pub fn close(h: Handle, owner: (usize, u32)) -> Result<(), HErr> {
-    let obj = {
+    let (obj, node) = {
         let mut g = TABLE.lock();
         let t = g.get();
         let slot = check(t, h, owner, 0)?;
         let obj = t.slots[slot].obj.take();
-        // 共享格子（ADR-108 补记二）：关掉一条名字只减引用，最后一条关上才丢格子。
-        match obj {
-            Some(ObjRef::File(f)) => {
-                if let Some(i) = f.share {
-                    cell_release(t, i);
-                }
-            }
-            #[cfg(feature = "fs-open")]
-            Some(ObjRef::VfsFile { share, .. }) => {
+        #[cfg(feature = "fs-open")]
+        let node = obj.as_ref().and_then(|o| match *o {
+            ObjRef::VfsFile { share, node, .. } | ObjRef::VfsDir { share, node, .. } => {
                 if let Some(i) = share {
-                    cell_release(t, i);
-                }
+                    let (last, cell_node) = cell_release(t, i);
+                    if last { cell_node.or(node) } else { None }
+                } else { node }
             }
-            _ => {}
-        }
+            ObjRef::File(FileObj { share, .. }) => {
+                if let Some(i) = share { let _ = cell_release(t, i); }
+                None
+            }
+            _ => None,
+        });
+        #[cfg(not(feature = "fs-open"))]
+        let node: Option<()> = None;
         t.slots[slot].used = false;
         t.slots[slot].rights = 0;
-        // gen 保留：这一格下一回 grant 在它上面 +1（旧句柄因此变成 Stale）。
         t.c.closes += 1;
-        obj
+        (obj, node)
     };
     if let Some(ObjRef::Vmo { slot }) = obj {
         crate::vmo::vmo_unref(crate::vmo::VmoId::from_slot(slot));
+    }
+    #[cfg(feature = "fs-open")]
+    if let Some(node) = node {
+        if !crate::filesystem::vfs_ro::close_node(&node) {
+            crate::log_fatal!("handle: close_node 失败 vol={:#x} cluster={}", node.vol, node.cluster);
+        }
     }
     Ok(())
 }
@@ -1607,21 +1750,46 @@ pub fn dup(h: Handle, owner: (usize, u32), new_rights: u32) -> Result<Handle, HE
                 Some(ObjRef::File(FileObj { share: Some(i), ..f }))
             }
             #[cfg(feature = "fs-open")]
-            Some(ObjRef::VfsFile { port, part, cursor, stat, share, vol }) => {
+            Some(ObjRef::VfsFile { port, part, cursor, stat, share, vol, node }) => {
+                if !t.slots.iter().any(|e| !e.used) {
+                    t.c.exhausted += 1;
+                    return Err(HErr::Exhausted);
+                }
                 let i = match share {
                     Some(i) => {
                         cell_retain(t, i);
                         i
                     }
-                    None => match cell_alloc(t, CellCur::Vfs(cursor)) {
-                        Some(i) => {
+                    None => {
+                        let i = cell_alloc_with(t, Some(CellCur::Vfs(cursor))).ok_or(HErr::Exhausted)?;
+                        #[cfg(feature = "fs-open")]
+                        { t.cells[i as usize].node = node; }
+                        cell_retain(t, i);
+                        i
+                    }
+                };
+                Some(ObjRef::VfsFile { port, part, cursor, stat, share: Some(i), vol, node })
+            }
+            #[cfg(feature = "fs-open")]
+            Some(ObjRef::VfsDir { port, part, stat, state, share, node }) => {
+                if let Some(node) = node {
+                    if !t.slots.iter().any(|e| !e.used) {
+                        t.c.exhausted += 1;
+                        return Err(HErr::Exhausted);
+                    }
+                    let i = match share {
+                        Some(i) => { cell_retain(t, i); i }
+                        None => {
+                            let i = cell_alloc_with(t, None).ok_or(HErr::Exhausted)?;
+                            t.cells[i as usize].node = Some(node);
                             cell_retain(t, i);
                             i
                         }
-                        None => return Err(HErr::Exhausted),
-                    },
-                };
-                Some(ObjRef::VfsFile { port, part, cursor, stat, share: Some(i), vol })
+                    };
+                    Some(ObjRef::VfsDir { port, part, stat, state, share: Some(i), node: Some(node) })
+                } else {
+                    None
+                }
             }
             Some(_) => None,
             None => {
@@ -1972,34 +2140,23 @@ pub fn used() -> usize {
 pub fn revoke_task(gidx: usize, id: u32) -> usize {
     let mut vmos = [0u8; MAX_REVOKE_VMOS];
     let mut nv = 0usize;
+    #[cfg(feature = "fs-open")]
+    let mut nodes = [EMPTY_NODE_REF; crate::filesystem::vfs_ro::INODE_MAX];
+    #[cfg(feature = "fs-open")]
+    let mut nn = 0usize;
     let n = {
         let mut g = TABLE.lock();
         let t = g.get();
         let mut n = 0u32;
         for i in 0..MAX_HANDLES {
-            if t.slots[i].used && t.slots[i].owner_gidx as usize == gidx && t.slots[i].owner_id == id
-            {
-                match t.slots[i].obj.take() {
-                    Some(ObjRef::Vmo { slot }) => {
-                        // 有界：超出的不收集（VMO 引用会在下面按 slot 释放，
-                        // 但栈数组只容 MAX_REVOKE_VMOS 个——**不能越界写**）。
-                        if nv < vmos.len() {
-                            vmos[nv] = slot;
-                            nv += 1;
-                        }
-                    }
-                    Some(ObjRef::File(f)) => {
-                        if let Some(c) = f.share {
-                            cell_release(t, c);
-                        }
-                    }
-                    #[cfg(feature = "fs-open")]
-                    Some(ObjRef::VfsFile { share, .. }) => {
-                        if let Some(c) = share {
-                            cell_release(t, c);
-                        }
-                    }
-                    _ => {}
+            if t.slots[i].used && t.slots[i].owner_gidx as usize == gidx && t.slots[i].owner_id == id {
+                let obj = t.slots[i].obj.take();
+                if let Some(ObjRef::Vmo { slot }) = obj {
+                    if nv < vmos.len() { vmos[nv] = slot; nv += 1; }
+                }
+                #[cfg(feature = "fs-open")]
+                if let Some(obj) = obj {
+                    collect_node(&mut nodes, &mut nn, release_obj_ref(t, obj));
                 }
                 t.slots[i].used = false;
                 t.slots[i].obj = None;
@@ -2010,6 +2167,8 @@ pub fn revoke_task(gidx: usize, id: u32) -> usize {
         t.c.revoked += n;
         n
     };
+    #[cfg(feature = "fs-open")]
+    release_nodes(&nodes, nn);
     for slot in vmos.iter().take(nv) {
         crate::vmo::vmo_unref(crate::vmo::VmoId::from_slot(*slot));
     }
@@ -2042,6 +2201,18 @@ pub fn preset_gen(slot: usize, gen: u64) {
     if let Some(ObjRef::Vmo { slot }) = obj {
         crate::vmo::vmo_unref(crate::vmo::VmoId::from_slot(slot));
     }
+    #[cfg(feature = "fs-open")]
+    if let Some(obj) = obj {
+        let node = {
+            let mut g = TABLE.lock();
+            release_obj_ref(g.get(), obj)
+        };
+        if let Some(node) = node {
+            if !crate::filesystem::vfs_ro::close_node(&node) {
+                crate::log_fatal!("handle: preset_gen close_node 失败 vol={:#x} cluster={}", node.vol, node.cluster);
+            }
+        }
+    }
 }
 
 /// 只清槽，不清计数器：分段用例之间要清表，但"这一轮发生过几次拒绝"必须能累计到最后的日志。
@@ -2049,24 +2220,34 @@ pub fn preset_gen(slot: usize, gen: u64) {
 pub fn reset_for_test() {
     let mut vmos = [0u8; MAX_REVOKE_VMOS];
     let mut nv = 0usize;
+    #[cfg(feature = "fs-open")]
+    let mut nodes = [EMPTY_NODE_REF; crate::filesystem::vfs_ro::INODE_MAX];
+    #[cfg(feature = "fs-open")]
+    let mut nn = 0usize;
     {
         let mut g = TABLE.lock();
         let t = g.get();
-        for e in t.slots.iter_mut() {
-            if let Some(ObjRef::Vmo { slot }) = e.obj.take() {
-                if nv < vmos.len() {
-                    vmos[nv] = slot;
-                    nv += 1;
-                }
+        for i in 0..MAX_HANDLES {
+            let obj = t.slots[i].obj.take();
+            if let Some(ObjRef::Vmo { slot }) = obj {
+                if nv < vmos.len() { vmos[nv] = slot; nv += 1; }
+            }
+            #[cfg(feature = "fs-open")]
+            if let Some(obj) = obj {
+                collect_node(&mut nodes, &mut nn, release_obj_ref(t, obj));
             }
         }
-        // ADR-179：`slots` 现在是运行时分配的 `SlotArray`，不是定长数组，
-        // 不能再整体赋值。逐项写回 `EMPTY`（语义完全一致）。
-        for e in t.slots.iter_mut() {
-            *e = EMPTY;
+        for e in t.slots.iter_mut() { *e = EMPTY; }
+        #[cfg(feature = "fs-open")]
+        for i in 0..MAX_SHARE {
+            if let Some(node) = t.cells[i].node.take() {
+                collect_node(&mut nodes, &mut nn, Some(node));
+            }
+            t.cells[i] = EMPTY_CELL;
         }
     }
-    // 清表也要把 VMO 的引用还掉，否则用例之间会漏帧（锁外还，同 close/revoke）
+    #[cfg(feature = "fs-open")]
+    release_nodes(&nodes, nn);
     for slot in vmos.iter().take(nv) {
         crate::vmo::vmo_unref(crate::vmo::VmoId::from_slot(*slot));
     }

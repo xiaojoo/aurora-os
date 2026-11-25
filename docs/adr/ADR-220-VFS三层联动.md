@@ -120,3 +120,9 @@ AGENTS.md 已经写了「涉及硬件、存储、网络、签名的结论，要�
 3. **dentry 不存 inode 号** —— 每次 `open_node` 仍要重算 `(vol, cluster)`
 4. **没有 `VfsNode` 的生命周期管理** —— 泄漏一个就少一个 inode 引用
 5. **单根挂载** —— 没有挂载点路径
+
+## 补记（2026-11-25，ADR-252）
+
+未决 1/4 在产品句柄路径关闭：`open_node_entry` 一次返回节点与 Entry，
+`VfsFile/VfsDir` 持有节点，dup 共享引用，close/revoke/reset 在 HANDLE 锁外归还。
+未决 2/3/5 仍按原文保留。
