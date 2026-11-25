@@ -590,8 +590,11 @@ fn t_vfs_ro() -> bool {
 struct RwDisk<'a> {
     img: core::cell::RefCell<&'a mut [u8]>,
     interleave: core::cell::Cell<bool>,
+    race_before_write: core::cell::Cell<bool>,
     lost: core::cell::Cell<bool>,
     race_off: core::cell::Cell<usize>,
+    rmw_calls: core::cell::Cell<usize>,
+    rmw_bytes: core::cell::Cell<usize>,
 }
 
 impl<'a> RwDisk<'a> {
@@ -599,13 +602,20 @@ impl<'a> RwDisk<'a> {
         RwDisk {
             img: core::cell::RefCell::new(buf),
             interleave: core::cell::Cell::new(false),
+            race_before_write: core::cell::Cell::new(false),
             lost: core::cell::Cell::new(false),
             race_off: core::cell::Cell::new(6),
+            rmw_calls: core::cell::Cell::new(0),
+            rmw_bytes: core::cell::Cell::new(0),
         }
     }
 
     fn snapshot(&self) -> alloc::vec::Vec<u8> {
         self.img.borrow().to_vec()
+    }
+
+    fn rmw_counts(&self) -> (usize, usize) {
+        (self.rmw_calls.get(), self.rmw_bytes.get())
     }
 }
 
@@ -641,11 +651,20 @@ impl crate::filesystem::vfs::Block for RwDisk<'_> {
         if end > img.len() {
             return Err(BlockError::Refused);
         }
+        if self.race_before_write.get() {
+            let at = start + self.race_off.get();
+            if at < end {
+                img[at] = 0xEE;
+                self.lost.set(true);
+            }
+        }
         img[start..end].copy_from_slice(src);
         Ok(())
     }
 
     fn read_modify_write(&self, lba: u64, offset: usize, src: &[u8]) -> Result<(), BlockError> {
+        self.rmw_calls.set(self.rmw_calls.get() + 1);
+        self.rmw_bytes.set(self.rmw_bytes.get() + src.len());
         if src.is_empty() || offset > SECTOR_BYTES || src.len() > SECTOR_BYTES - offset {
             return Err(BlockError::Refused);
         }
@@ -1146,6 +1165,70 @@ fn t_vfs_ro_write() -> bool {
 ktest!(KT_VFS_RO, t_vfs_ro);
 ktest!(KT_VFS_RO_FAT32, t_vfs_ro_fat32);
 ktest!(KT_VFS_RO_WRITE, t_vfs_ro_write);
+
+/// ADR-256：FAT 项与目录项 create/unlink 的单扇区原子 RMW。
+fn t_metadata_rmw_atomic() -> bool {
+    let mut img = [0u8; F32_VOL_BYTES];
+    make_image32(&mut img);
+    // FAT32 高 4 位是保留位：写低 28 位时必须原样带回，不能被 RMW 的 4 字节覆盖清掉。
+    let fat_entry = F32_RESERVED * SECTOR + 3 * 4;
+    put32(&mut img, fat_entry, 0xA000_0005);
+    put32(&mut img, (F32_RESERVED + 1) * SECTOR + 3 * 4, 0xA000_0005);
+    let rw = RwDisk::new(&mut img);
+    let fs = match ReadOnlyFs::mount(&rw) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_fatal!("metadata-rmw: 挂载失败 {:?}", e);
+            return false;
+        }
+    };
+    let bpb = fs.bpb();
+    rw.race_off.set(7);
+    rw.lost.set(false);
+    let rmw0 = rw.rmw_counts();
+    rw.race_before_write.set(true);
+    let created = vfs_ro::create_in_dir(&rw, &bpb, bpb.root_cluster, b"NEW.TXT");
+    rw.race_before_write.set(false);
+    let rmw1 = rw.rmw_counts();
+    let create_span = rmw1.0 - rmw0.0 == 1 && rmw1.1 - rmw0.1 == 32;
+    let create_atomic = created.is_ok() && !rw.lost.get() && create_span;
+    let created_at = created.as_ref().ok().copied();
+    let found = matches!(fs.lookup("/NEW.TXT"), Ok(_));
+
+    rw.lost.set(false);
+    rw.race_before_write.set(true);
+    let unlinked = vfs_ro::unlink_in_dir(&rw, &bpb, bpb.root_cluster, b"NEW.TXT");
+    rw.race_before_write.set(false);
+    let rmw2 = rw.rmw_counts();
+    let unlink_span = rmw2.0 - rmw1.0 == 1 && rmw2.1 - rmw1.1 == 1;
+    let unlink_atomic = unlinked.is_ok() && !rw.lost.get() && unlink_span;
+    let gone = created_at.is_some_and(|(lba, off)| {
+        let mut sec = [0u8; SECTOR_BYTES];
+        rw.read_sectors(lba, &mut sec).is_ok() && sec[off] == 0xE5
+    });
+
+    rw.lost.set(false);
+    rw.race_before_write.set(true);
+    let fat_written = vfs_ro::fat_set_disk(&rw, &bpb, 3, 0x0123_4567);
+    rw.race_before_write.set(false);
+    let rmw3 = rw.rmw_counts();
+    let fat_span = rmw3.0 - rmw2.0 == 2 && rmw3.1 - rmw2.1 == 8;
+    let fat_atomic = fat_written.is_ok() && !rw.lost.get() && fat_span;
+    let mut sec = [0u8; SECTOR_BYTES];
+    let read0 = rw.read_sectors(F32_RESERVED as u64, &mut sec).is_ok();
+    let fat0 = u32::from_le_bytes([sec[12], sec[13], sec[14], sec[15]]);
+    let read1 = rw.read_sectors((F32_RESERVED + 1) as u64, &mut sec).is_ok();
+    let fat1 = u32::from_le_bytes([sec[12], sec[13], sec[14], sec[15]]);
+    let fat_ok = read0 && read1 && fat0 == 0xA123_4567 && fat1 == 0xA123_4567;
+    let ok = create_atomic && found && unlink_atomic && gone && fat_atomic && fat_ok;
+    crate::log_info!(
+        "metadata-rmw: create原子={}(32B) 查到={} unlink原子={}(1B) 已删={} FAT原子={}(2×4B) 两份FAT={:08x}/{:08x} ⇒ {}",
+        create_atomic, found, unlink_atomic, gone, fat_atomic, fat0, fat1, ok
+    );
+    ok
+}
+ktest!(KT_METADATA_RMW, t_metadata_rmw_atomic);
+
 ktest!(KT_VFS_RO_LFN, t_vfs_ro_lfn);
 ktest!(KT_VFS_RO_ESP, t_vfs_ro_esp);
 

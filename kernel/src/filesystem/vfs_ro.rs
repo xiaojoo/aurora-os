@@ -1095,7 +1095,7 @@ const ATTR_ARCHIVE: u8 = 0x20;
 ///
 /// **为什么两份都要写**：只改一份，另一份就是坏的。某些工具与 Windows 的 chkdsk 会读第二份，
 /// 而本仓的宿主机对账（`fat32_host_volume`）也读它。少写一份 = 卷在另一个读者眼里是坏的。
-fn fat_set_disk(disk: &dyn Block, v: &Bpb, cluster: u32, value: u32) -> Result<(), FsError> {
+pub(crate) fn fat_set_disk(disk: &dyn Block, v: &Bpb, cluster: u32, value: u32) -> Result<(), FsError> {
     if cluster < MIN_CLUSTER {
         return Err(FsError::BadCluster(cluster));
     }
@@ -1111,18 +1111,22 @@ fn fat_set_disk(disk: &dyn Block, v: &Bpb, cluster: u32, value: u32) -> Result<(
             + (byte_off / SECTOR_BYTES) as u64;
         let mut sec = [0u8; SECTOR_BYTES];
         block_io::read_checked(disk, lba, &mut sec, &block_io::Budget::UNBOUNDED).map_err(FsError::Io)?;
+        let mut entry = [0u8; 4];
         if v.fat_entry_bytes == fat32::FAT16_ENTRY_BYTES {
-            // 高 16 位在 FAT16 里是保留的，写 0 而不是把 value 的高位带进去
-            let le = (value as u16).to_le_bytes();
-            sec[in_sec..in_sec + 2].copy_from_slice(&le);
+            // 高 16 位在 FAT16 里是保留位，写 0 而不是把 value 的高位带进去
+            entry[..2].copy_from_slice(&(value as u16).to_le_bytes());
         } else {
-            // **只改低 28 位**：高 4 位是保留位，规范要求写 0，
-            // 而读出时 `& cluster_mask` 会掩掉它们——不在这里清，两份 FAT 就会在保留位上分叉。
+            // 只改低 28 位；旧高 4 位原样带回，RMW 只覆盖这一项，不碰同扇区邻居。
             let old = u32_at(&sec, in_sec);
-            let merged = (old & !v.cluster_mask) | (value & v.cluster_mask);
-            sec[in_sec..in_sec + 4].copy_from_slice(&merged.to_le_bytes());
+            entry.copy_from_slice(&((old & !v.cluster_mask) | (value & v.cluster_mask)).to_le_bytes());
         }
-        let written = disk.write_sectors(lba, &sec);
+        #[cfg(not(feature = "fault-metadata-rmw-split"))]
+        let written = disk.read_modify_write(lba, in_sec, &entry[..v.fat_entry_bytes]);
+        #[cfg(feature = "fault-metadata-rmw-split")]
+        let written = {
+            sec[in_sec..in_sec + v.fat_entry_bytes].copy_from_slice(&entry[..v.fat_entry_bytes]);
+            disk.write_sectors(lba, &sec)
+        };
         cache_invalidate();
         written.map_err(FsError::Io)?;
     }
@@ -1281,8 +1285,6 @@ pub fn create_in_dir(
     }
     // 找空槽并写目录项
     let (lba, off) = find_free_slot(disk, v, dir_cluster)?.ok_or(VfsError::DirFull)?;
-    let mut sec = [0u8; SECTOR_BYTES];
-    block_io::read_checked(disk, lba, &mut sec, &block_io::Budget::UNBOUNDED).map_err(io)?;
     let mut e = [0u8; DIR_ENTRY];
     e[..11].copy_from_slice(&short);
     e[OFF_ATTR] = ATTR_ARCHIVE;
@@ -1300,8 +1302,15 @@ pub fn create_in_dir(
     }
     e[OFF_CLUSTER_LO..OFF_CLUSTER_LO + 2].copy_from_slice(&0u16.to_le_bytes());
     e[OFF_SIZE..OFF_SIZE + 4].copy_from_slice(&0u32.to_le_bytes());
-    sec[off..off + DIR_ENTRY].copy_from_slice(&e);
-    let written = disk.write_sectors(lba, &sec);
+    #[cfg(not(feature = "fault-metadata-rmw-split"))]
+    let written = disk.read_modify_write(lba, off, &e);
+    #[cfg(feature = "fault-metadata-rmw-split")]
+    let written = {
+        let mut sec = [0u8; SECTOR_BYTES];
+        block_io::read_checked(disk, lba, &mut sec, &block_io::Budget::UNBOUNDED).map_err(io)?;
+        sec[off..off + DIR_ENTRY].copy_from_slice(&e);
+        disk.write_sectors(lba, &sec)
+    };
     cache_invalidate();
     written.map_err(io)?;
     Ok((lba, off))
@@ -1331,7 +1340,6 @@ pub fn unlink_in_dir(
             let lba = base + s;
             let mut sec = [0u8; SECTOR_BYTES];
             block_io::read_checked(disk, lba, &mut sec, &block_io::Budget::UNBOUNDED).map_err(io)?;
-            let mut dirty = false;
             for i in 0..(SECTOR_BYTES / DIR_ENTRY) {
                 let off = i * DIR_ENTRY;
                 let first = sec[off];
@@ -1358,9 +1366,13 @@ pub fn unlink_in_dir(
                 };
                 let lo = u16_at(&sec, off + OFF_CLUSTER_LO) as u32;
                 let first_cluster = (hi << 16) | lo;
-                sec[off] = DIR_FREED;
-                dirty = true;
-                let written = disk.write_sectors(lba, &sec);
+                #[cfg(not(feature = "fault-metadata-rmw-split"))]
+                let written = disk.read_modify_write(lba, off, &[DIR_FREED]);
+                #[cfg(feature = "fault-metadata-rmw-split")]
+                let written = {
+                    sec[off] = DIR_FREED;
+                    disk.write_sectors(lba, &sec)
+                };
                 cache_invalidate();
                 written.map_err(io)?;
                 // 释放簇链：**目录项先落盘再放链**。
@@ -1382,7 +1394,6 @@ pub fn unlink_in_dir(
                         cc = next;
                     }
                 }
-                let _ = dirty;
                 return Ok(());
             }
         }

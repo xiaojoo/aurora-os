@@ -26097,3 +26097,20 @@ RMW trait 与 AHCI 实现分别门控到 `fs-ro`/`fs-rw` 与 `fs-rw`，默认档
 **21/21**。原始完整矩阵 **81/82**，唯一不符合是 `探针几何与宿主机对账`，同跑红在
 `t_sdkdemo` 的 `0x100002000` 信箱未映射；同一 ELF `68ea3999a468` 单跑 `run-16231`
 PASS，按环境形状记“不归因”，判据不动。
+
+## 585. ADR-256：FAT 项与目录项原子 RMW（2026-11-26）
+
+- `fat_set_disk` 对每个 FAT 副本按项宽调用 `read_modify_write`；FAT32 保留旧高 4 位，
+  两份 FAT 同步写低 28 位。
+- `create_in_dir` 直接对 32 字节目录项做 RMW；`unlink_in_dir` 对首字节 `0xE5` 做 RMW。
+  目录项先落盘再放簇的顺序、写后页缓存失效均不变。
+- `fault-metadata-rmw-split` 恢复三处旧拆分路径；`RwDisk` 在写前注入竞争修改并记 `lost`。
+- `run-16325`：create/unlink/FAT 三格原子=true，RMW 区间分别 32B、1B、2×4B，两份 FAT
+  都是 `a1234567`，fs-ro **101/101** PASS。`run-16326`：三格同时原子=false，
+  `t_metadata_rmw_atomic` 精确 FAIL（101 条仅此 1 红）。
+- 新发现：unlink 后 dentry 正缓存不会自动失效，`lookup` 仍可能返回已删项；归任务 #40。
+  本片用原始盘字节验证 `0xE5`，不把该缺陷混成 RMW 失败。
+- 只保证单扇区项更新原子性，不宣称多步 FAT/目录操作是崩溃事务；真机未验证。
+- `check` **21/21**；原始完整矩阵 **81/82**，唯一不符合是 `签名包两份实现同答案`，
+  红在两次 PIT 标定均 `WindowVsIntervals`；同 ELF `501b7f138c75` 单跑 `run-16415`
+  PASS，按环境形状记“不归因”，判据不动。
