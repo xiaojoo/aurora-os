@@ -1769,6 +1769,118 @@ fn t_if_patch_both_branches() -> bool {
 }
 ktest!(KT_IF_PATCH, t_if_patch_both_branches);
 
+static OPEN_LOCK_TEST: sync::OpenSpinLock<()> = sync::OpenSpinLock::new(sync::RANK_GROW, ());
+static OPEN_LOCK_ENTERED: AtomicUsize = AtomicUsize::new(0);
+static OPEN_LOCK_YIELDED: AtomicUsize = AtomicUsize::new(0);
+static OPEN_LOCK_RUNS_BEFORE: AtomicUsize = AtomicUsize::new(0);
+static OPEN_LOCK_RUNS_AFTER: AtomicUsize = AtomicUsize::new(0);
+static OPEN_LOCK_TARGET: AtomicUsize = AtomicUsize::new(0);
+static OPEN_LOCK_TERM_CALLS: AtomicUsize = AtomicUsize::new(0);
+static OPEN_LOCK_TERM_TRUE: AtomicUsize = AtomicUsize::new(0);
+static OPEN_LOCK_TERM_ERROR: AtomicUsize = AtomicUsize::new(0);
+
+fn open_lock_ap_terminate() {
+    let target = OPEN_LOCK_TARGET.load(Ordering::Acquire);
+    OPEN_LOCK_TERM_CALLS.fetch_add(1, Ordering::AcqRel);
+    if sched::terminate_task(target) {
+        OPEN_LOCK_TERM_TRUE.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+fn open_lock_worker() -> ! {
+    let Some(mut guard) = OPEN_LOCK_TEST.lock_checked() else {
+        OPEN_LOCK_TERM_ERROR.store(1, Ordering::Release);
+        sched::finish_current();
+        sched::yield_now();
+        loop { tsc::spin(1_000); }
+    };
+    let me = sched::current_id();
+    OPEN_LOCK_RUNS_BEFORE.store(sched::runs_of(me) as usize, Ordering::Release);
+    OPEN_LOCK_ENTERED.store(1, Ordering::Release);
+    sched::yield_now();
+    OPEN_LOCK_RUNS_AFTER.store(sched::runs_of(me) as usize, Ordering::Release);
+    OPEN_LOCK_YIELDED.store(1, Ordering::Release);
+    OPEN_LOCK_TARGET.store(me, Ordering::Release);
+    if smp::run_ap_role(open_lock_ap_terminate, || {}).is_err() {
+        OPEN_LOCK_TERM_ERROR.store(1, Ordering::Release);
+    }
+    drop(guard);
+    loop { tsc::spin(1_000); }
+}
+
+/// ADR-255：持 OpenSpinLock 时 yield 不换出，AP terminate 只挂待办，Drop 后立即兑现。
+fn t_open_lock_defer() -> bool {
+    if !p6_apic_ready() {
+        return false;
+    }
+    sched::init_boot_task();
+    sched::start_workers();
+    let timer_was_running = apic::timer_running();
+    if !timer_was_running {
+        apic::timer_start().ok();
+    }
+    OPEN_LOCK_ENTERED.store(0, Ordering::Release);
+    OPEN_LOCK_YIELDED.store(0, Ordering::Release);
+    OPEN_LOCK_RUNS_BEFORE.store(0, Ordering::Release);
+    OPEN_LOCK_RUNS_AFTER.store(0, Ordering::Release);
+    OPEN_LOCK_TERM_CALLS.store(0, Ordering::Release);
+    OPEN_LOCK_TERM_TRUE.store(0, Ordering::Release);
+    OPEN_LOCK_TERM_ERROR.store(0, Ordering::Release);
+    let stats0 = sync::open_lock_stats();
+    let g = match sched::spawn(open_lock_worker) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_fatal!("open-lock: spawn 失败 {:?}", e);
+            if !timer_was_running { apic::timer_stop().ok(); }
+            return false;
+        }
+    };
+    let seen = apic::with_interrupts(|| {
+        let t0 = tsc::now();
+        while (OPEN_LOCK_ENTERED.load(Ordering::Acquire) == 0
+            || OPEN_LOCK_YIELDED.load(Ordering::Acquire) == 0
+            || (OPEN_LOCK_TERM_CALLS.load(Ordering::Acquire) == 0
+                && OPEN_LOCK_TERM_ERROR.load(Ordering::Acquire) == 0))
+            && tsc::now().wrapping_sub(t0) < 4_000_000_000
+        {
+            tsc::spin(10_000);
+        }
+        OPEN_LOCK_ENTERED.load(Ordering::Acquire) != 0
+            && OPEN_LOCK_YIELDED.load(Ordering::Acquire) != 0
+    });
+    apic::with_interrupts(|| {
+        let t0 = tsc::now();
+        while sched::owned_of(g) != 0 && tsc::now().wrapping_sub(t0) < 1_000_000_000 {
+            tsc::spin(10_000);
+        }
+    });
+    let calls = OPEN_LOCK_TERM_CALLS.load(Ordering::Acquire);
+    let accepted = OPEN_LOCK_TERM_TRUE.load(Ordering::Acquire) != 0;
+    let error = OPEN_LOCK_TERM_ERROR.load(Ordering::Acquire);
+    let runs_before = OPEN_LOCK_RUNS_BEFORE.load(Ordering::Acquire);
+    let runs_after = OPEN_LOCK_RUNS_AFTER.load(Ordering::Acquire);
+    let stats1 = sync::open_lock_stats();
+    let switch_defers = stats1.0.saturating_sub(stats0.0);
+    let term_defers = stats1.1.saturating_sub(stats0.1);
+    let forced = stats1.2.saturating_sub(stats0.2);
+    let reaped = sched::state_of(g) == sched::TaskState::Free && sched::owned_of(g) == 0;
+    let ok = seen && calls > 0 && !accepted && error == 0 && reaped
+        && runs_before == runs_after && switch_defers > 0 && term_defers > 0 && forced > 0;
+    if !reaped {
+        let _ = sched::terminate_task(g);
+    }
+    if !timer_was_running {
+        apic::timer_stop().ok();
+    }
+    crate::log_info!(
+        "open-lock: seen={} AP调用={} accepted={} error={} runs={}->{} 状态={:?} owned={} 换出延期={} 终止延期={} 强制resched={}",
+        seen, calls, accepted, error, runs_before, runs_after,
+        sched::state_of(g), sched::owned_of(g), switch_defers, term_defers, forced
+    );
+    ok
+}
+ktest!(KT_OPEN_LOCK_DEFER, t_open_lock_defer);
+
 /// 跨 CPU 抢同一把锁。这条用例的**全部价值**在于它自带对照组：
 /// 同一个共享数据、同样的"读—磨—写"，无锁那一轮必须**丢数**，加锁那一轮必须**不丢**。
 /// 如果无锁那轮也丢 0，说明两个 CPU 根本没撞上，那"锁挡住了竞争"这句话就没有证据——

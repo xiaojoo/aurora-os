@@ -26049,3 +26049,32 @@ RMW trait 与 AHCI 实现分别门控到 `fs-ro`/`fs-rw` 与 `fs-rw`，默认档
 - 异步数据缓冲所有权仍是任务 #38。
 - virtio/NVMe 半扇区写当前返回 `Refused`，不宣称已支持原子 RMW；真机未验证。
 - 不改锁等级、锁序或 ABI。
+
+## 583. ADR-255：XFER 持锁禁止换出与终止（2026-11-25）
+
+### 裁决与根因
+
+使用者在三条路线中选择 **禁止持锁换出/终止**。审计确认 `OpenSpinLock` 只有 AHCI
+`XFER` 一个使用者：它不动 IF，持锁期间 tick/resched 可执行 `context_load`；若任务随后被
+`terminate_task` 标 Free 并 reap，guard Drop 不会执行，`locked` 可能永久为 1。正常错误返回
+与 IssueStuck 重发由 RAII 释放，缺口只在持锁换出后的终止/回收。实际发生率未验证。
+
+### 落地契约
+
+- `OpenSpinLock` 增加 per-CPU 持锁深度；CAS、rank、深度发布与 Drop 元数据回收在短暂
+  IF=0 窗口内完成，设备等待仍允许中断。
+- `preempt_point` 见持锁深度非 0 时清 need 并返回，不换出；`terminate_task` 对当前持锁者
+  只置既有 `on_cpu` bit3 待办、立 need 并返回 false，不改 state/frame/proc_id。
+- guard Drop 归零且有待办时恢复 IF，用 `int 0xF0` 立即抢占；抢占点清待办并调用
+  `terminate_task`，随后照常选下一个任务。
+- 不新增 Task 字段、锁或 `sync -> sched` 依赖；统计换出延期、终止延期、强制 resched。
+- 负样本 `fault-xfer-term-no-defer` 只关闭终止延期，新用例必须精确红。
+
+### 验收
+
+- `run-16047`：BSP 工人持锁 yield，三个 AP 调 terminate 全返回 false；`runs=1->1`、
+  `换出延期=2 终止延期=3 强制resched=1`，Free/owned=0，默认 **93/93** PASS。
+- `run-16048`：`fault-xfer-term-no-defer` 下 `accepted=true 终止延期=0 强制resched=0`，
+  `t_open_lock_defer` 精确 FAIL（93 条仅此 1 红）。
+- `run-16049` / `run-16050` / `run-16051`：handles,fs-ro / fs-rw / fat32-exec 全 PASS。
+- `check` **21/21**；完整矩阵 **82/82 符合**（`AURORA_MATRIX_DONE rc=0`）；真机未验证。

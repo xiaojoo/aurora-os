@@ -5,11 +5,11 @@
 >
 > **2026-11-20（ADR-175 跨 AS 读走物理地址）**：`sched/user` U2 9 → 10（`copy_from_user_in` 里 HHDM 别名的单字节读）。**总数 +1**（530 → 531）。
 
-总计 722 处。U1 104 · U2 183 · U3 13 · U4 250 · U5 128 · U6 44
+总计 723 处。U1 105 · U2 183 · U3 13 · U4 250 · U5 128 · U6 44
 
 | 类别 | 含义 | 处数 |
 |---|---|---|
-| U1 | 架构入口与特殊寄存器 | 104 |
+| U1 | 架构入口与特殊寄存器 | 105 |
 | U2 | 页表、物理内存与 MMIO | 183 |
 | U3 | DMA 与设备共享内存 | 13 |
 | U4 | 并发共享状态与 UnsafeCell | 250 |
@@ -179,6 +179,7 @@ ADR-250 新增的 512 字节 `IMG` 同样只在 `t_cache_invalidate_inflight` �
 | U4 | 1252 | `let a = unsafe { &*FAST_AREAS[slot].0.get() }; Some((a.kstack_top, a.slot)) }` |
 | U4 | 1291 | `unsafe { (*FAST_AREAS[slot].0.get()).slot = slot as u64; }` |
 | U1 | 1722 | `seen[i] = unsafe { isr_table[i] }; } let mut n = 0;` |
+| U1 | 197 | `unsafe { core::arch::asm!("int {}", const VEC_RESCHED) }; } ` |
 
 ### boot/limine
 

@@ -132,8 +132,10 @@ U2 = 10
 # 2026-11-25 ADR-251：+filesystem/block_io U4 15（按目标批量池 7、上下文回调池 8，
 # 全部复用既有 QUEUE_LOCK/CB_LOCK，载荷 Copy，锁外执行设备与回调）。
 # 对账：707+15=722、U4 235+15=250。
-total = 722
-U1 = 104
+# 2026-11-25 ADR-255：+arch/x86_64/trap U1 1（resched_self 的 int 0xF0）。
+# 对账：722+1=723、U1 104+1=105。
+total = 723
+U1 = 105
 U2 = 183
 U3 = 13
 U4 = 250
@@ -156,7 +158,7 @@ U1 = 5
 U4 = 12
 
 [modules."arch/x86_64/trap"]
-U1 = 17
+U1 = 18
 U4 = 9
 
 [modules."boot/limine"]

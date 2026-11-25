@@ -25,6 +25,11 @@
 | `RANK_ACPI` | 50 | ACPI 解析结果静态量 | （叶子，目前只在启动期单独使用） | 解析路径不分配物理帧 | 否 |
 | `RANK_TEST` | 60 | 无（跨核竞争用例的自旋占位） | （叶子，**故意**是叶子） | `smp::contention_round`；临界区里只有一次 volatile 读改写 + 一段 `tsc::spin`；`KT_AHCI_LOCK_RANK_GUARD` 也借它制造外层 rank=60，验证 AHCI 在 XFER 前拒绝 | 否 |
 
+ADR-255：`XFER` 的 `OpenSpinLock` 在 CAS/rank/深度发布与 Drop 元数据回收时使用短暂
+IF=0 窗口；设备等待期间仍允许中断。per-CPU 持锁深度非 0 时 `preempt_point` 不换出，
+`terminate_task` 对当前持锁者只挂 `on_cpu` bit3 待办并返回 false；guard Drop 归零后
+用 `int 0xF0` 立即兑现终止。锁等级仍为 `GROW(4)`，不新增锁或嵌套关系。
+
 ADR-252：`VfsNode` 的 inode 引用在 HANDLE 锁内只从对象/cell 摘下，`close_node` 在锁外执行；
 不在 `RANK_HANDLE(35)` 内取 `INODE_LOCK`，因此不新增嵌套关系。
 

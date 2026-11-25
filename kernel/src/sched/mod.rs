@@ -437,6 +437,19 @@ pub fn terminate_task(task: usize) -> bool {
             s.tasks[slot].request_termination();
             return false;
         }
+        #[cfg(not(feature = "fault-xfer-term-no-defer"))]
+        if s.current == task && crate::sync::open_lock_depth(cpu) != 0
+            && crate::sync::request_open_lock_termination(cpu)
+        {
+            s.tasks[slot].request_termination();
+            drop(s);
+            mark_need(cpu);
+            return false;
+        }
+        #[cfg(not(feature = "fault-xfer-term-no-defer"))]
+        if s.current == task {
+            crate::sync::cancel_open_lock_termination(cpu);
+        }
         let was_blocked = match s.tasks[slot].state {
             TaskState::Blocked(tok) => Some(tok),
             _ => None,
@@ -2849,6 +2862,13 @@ pub unsafe fn preempt_point(frame: u64, cpu: usize) {
     if !FLAGS[cpu].need.load(Ordering::Acquire) {
         return;
     }
+    // ADR-255：OpenSpinLock guard 留在当前栈上，持锁期间换出会让 Drop 永远不执行。
+    // 设备等待仍允许中断，但这里只让出 CPU 的动作必须等 guard 归零后再做。
+    if crate::sync::open_lock_depth(cpu) != 0 {
+        crate::sync::note_open_lock_switch_defer();
+        FLAGS[cpu].need.store(false, Ordering::Relaxed);
+        return;
+    }
     // P6：扫定时器轮。**必须在 need 闸之后**：need 只由 tick/resched IPI 立，而那些只在
     // IF=1 时被取走 ⇒ 被中断的上下文不可能持着锁。放在闸之前会让**每次异常出口**都扫轮，
     // 包括持 VMM(20) 时发生的同步 #PF ⇒ `锁序违规 外层 rank=20 本次 rank=6`（实测 3/3 39）。
@@ -2859,6 +2879,14 @@ pub unsafe fn preempt_point(frame: u64, cpu: usize) {
     let t0 = crate::tsc::now();
     let me = current_of(cpu);
     let mslot = slot_of(me);
+    let termination_pending = {
+        let mut s = rq(cpu);
+        s.tasks[mslot].take_termination_pending()
+    };
+    if termination_pending {
+        let _ = terminate_task(me);
+        mark_need(cpu);
+    }
     // 这里只问"异常帧是不是就在当前任务的栈上"，**不问它的 state**：
     // 一个已经自己标成 Done 的任务仍然正占着 CPU，必须照样能被换下去，
     // 否则它就永久霸占处理器（实测：boot 任务再也不被调度，整机挂死）。

@@ -152,6 +152,7 @@ public_api = [
   "trap::p5_samples_total",
   "trap::p_stats_all",
   "trap::probe_page_fault",
+  "trap::resched_self",
   "trap::set_rsp0",
   "trap::ucode_sel",
   "trap::udata_sel",
@@ -515,7 +516,7 @@ error_classes = ["A", "D"]
 resource_ownership = "锁状态、持有者信息、每 CPU 锁序状态、竞争与等待超时统计。"
 error_policy = "rank 违例/重入 → L4；等待超时只记账，由调用方决定是否失败。"
 unsafe_scope = ["sync/mod:U1,U4"]
-test_targets = ["t_lock_reentry_must_escalate"]
+test_targets = ["t_lock_reentry_must_escalate", "t_open_lock_defer"]
 status = "部分落地"
 
 # S6a（ADR-083）：显示子系统。第一片只有帧缓冲窗口，没有字体、没有 fbcon。
@@ -1230,7 +1231,7 @@ known_scc = [
 "pci->memory" = 9
 "resource->memory" = 1
 "resource->sync" = 2
-"sync->arch" = 18
+"sync->arch" = 33
 "sync->diagnostics" = 4
 "sync->time" = 3
 "time->arch" = 1

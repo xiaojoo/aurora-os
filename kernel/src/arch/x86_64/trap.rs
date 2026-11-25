@@ -191,6 +191,12 @@ pub const VEC_SHOOTDOWN: usize = 0xf2;
 /// 它**不置 LAPIC 的 ISR 位**，所以处理侧不发 EOI（与 spurious 同理，见 ADR-020）。
 pub const VEC_RESCHED: usize = 0xf0;
 
+/// 当前已登记任务用它制造一次同步抢占点；调用方保证异常帧能落在自己的内核栈上。
+pub(crate) fn resched_self() {
+    // SAFETY: int 0xF0 由本 CPU 的同步入口接住，压帧位置由当前 rsp 决定。
+    unsafe { core::arch::asm!("int {}", const VEC_RESCHED) };
+}
+
 /// 跨核 resched **IPI**（ADR-055，P4c）。与 `VEC_RESCHED` 分开是**必须的**，不是整洁：
 /// `int 0xF0` 是软件自陷，不置 LAPIC 的 ISR 位，所以不发 EOI；而经 ICR 发来的真实 IPI
 /// **会置目标的 ISR 位**，不发 EOI 就把那个向量留在服务中，目标此后收不到别的中断。

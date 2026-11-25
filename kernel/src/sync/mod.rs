@@ -25,7 +25,8 @@
 //!    "预读说空闲就可以直接写"这种错误分支——旧实现就是这么写出那条假的 L4 的。
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use core::marker::PhantomData;
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LockRank(pub u8);
@@ -454,17 +455,57 @@ pub struct IrqSpinLock<T> {
 /// 持锁期间中断可以进来，所以**临界区必须假设自己被随时打断**。
 /// `transfer_inner` 的每一步都是「读/写本端口的寄存器 + 自旋等 PxCI」，
 /// 被打断只影响延迟，不影响正确性。
+static OPEN_DEPTH: [AtomicUsize; crate::arch::x86_64::cpu::MAX_CPUS] =
+    [const { AtomicUsize::new(0) }; crate::arch::x86_64::cpu::MAX_CPUS];
+static OPEN_TERM_PENDING: [AtomicBool; crate::arch::x86_64::cpu::MAX_CPUS] =
+    [const { AtomicBool::new(false) }; crate::arch::x86_64::cpu::MAX_CPUS];
+static OPEN_SWITCH_DEFERS: AtomicUsize = AtomicUsize::new(0);
+static OPEN_TERM_DEFERS: AtomicUsize = AtomicUsize::new(0);
+static OPEN_FORCED_RESCHED: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn open_lock_depth(cpu: usize) -> usize {
+    OPEN_DEPTH[cpu].load(Ordering::Acquire)
+}
+
+pub(crate) fn note_open_lock_switch_defer() {
+    OPEN_SWITCH_DEFERS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn request_open_lock_termination(cpu: usize) -> bool {
+    OPEN_TERM_PENDING[cpu].store(true, Ordering::Release);
+    let locked = OPEN_DEPTH[cpu].load(Ordering::Acquire) != 0;
+    if locked {
+        OPEN_TERM_DEFERS.fetch_add(1, Ordering::Relaxed);
+    }
+    locked
+}
+
+pub(crate) fn cancel_open_lock_termination(cpu: usize) {
+    OPEN_TERM_PENDING[cpu].store(false, Ordering::Release);
+}
+
+pub(crate) fn open_lock_stats() -> (usize, usize, usize) {
+    (
+        OPEN_SWITCH_DEFERS.load(Ordering::Relaxed),
+        OPEN_TERM_DEFERS.load(Ordering::Relaxed),
+        OPEN_FORCED_RESCHED.load(Ordering::Relaxed),
+    )
+}
+
 pub struct OpenSpinLock<T> {
     locked: AtomicUsize,
     rank: LockRank,
     data: UnsafeCell<T>,
 }
 
-/// `OpenSpinLock` 的 guard：**不还原中断标志**（因为从来没关过）。
+/// `OpenSpinLock` 的 guard：设备等待期间保持调用方的 IF 状态，只有 CAS/rank/深度
+/// 元数据在短暂 IF=0 窗口内发布与回收（ADR-255）。
 pub struct OpenGuard<'a, T: Send> {
     lock: &'a OpenSpinLock<T>,
     /// 取锁前的 `INNERMOST`，Drop 时**还原成它**（不是无条件清 0）。
     prev_rank: u8,
+    slot: usize,
+    _not_send: PhantomData<*mut ()>,
 }
 
 impl<T: Send> OpenSpinLock<T> {
@@ -487,36 +528,31 @@ impl<T: Send> OpenSpinLock<T> {
         Some(self.lock())
     }
 
-    /// 取锁。**不动 IF**。
+    /// 取锁。设备等待期间不关 IF；CAS 与元数据发布本身在短暂 IF=0 窗口内完成。
     pub fn lock(&self) -> OpenGuard<'_, T> {
         ACQUIRES.fetch_add(1, Ordering::Relaxed);
         let slot = crate::arch::x86_64::cpu::self_slot();
         let _ = cpu_token();
-        let mut spins = 0u64;
         loop {
+            let flags = save_and_cli();
             if self.locked.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
-                break;
+                let prev_rank = INNERMOST[slot].swap(self.rank.0, Ordering::Relaxed);
+                OPEN_DEPTH[slot].fetch_add(1, Ordering::AcqRel);
+                if self.rank.0 <= prev_rank && prev_rank != 0 {
+                    ORDER_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
+                    crate::log_fatal!(
+                        "L4 sync: 锁序违规，外层 rank={}({}) 本次 rank={}({})",
+                        prev_rank, LockRank(prev_rank).name(), self.rank.0, self.rank.name()
+                    );
+                    crate::exit::finish(crate::exit::Code::ExceptionFatal);
+                }
+                restore_flags(flags);
+                return OpenGuard { lock: self, prev_rank, slot, _not_send: PhantomData };
             }
-            spins += 1;
-            // **不做超时判**（如实记）：`IrqSpinLock` 有那套（等锁超时升 L4），
-            // 这里省掉是因为块传输的自旋由设备保证有界（PxCI 一定落定或超时返回）。
-            // 若将来发现某块盘会永久不落定，这里要补回来。
+            restore_flags(flags);
+            // **不做超时判**（如实记）：设备等待自身有界；这里只等互斥位。
             core::hint::spin_loop();
         }
-        // **INNERMOST 记账必须在 CAS 成功之后**（实测）：
-        // 第一版在 CAS 之前 swap，竞争失败时不会还原 ⇒ 下一次取同一把锁看到
-        // `外层 rank=37 本次 rank=37` ⇒ L4 崩溃（实测 EXCEPTION(39)）。
-        // 另外 `prev_rank != 0` 那一格：0 表示「没有外层锁」，不是违规。
-        let prev_rank = INNERMOST[slot].swap(self.rank.0, Ordering::Relaxed);
-        if self.rank.0 <= prev_rank && prev_rank != 0 {
-            ORDER_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
-            crate::log_fatal!(
-                "L4 sync: 锁序违规，外层 rank={}({}) 本次 rank={}({})",
-                prev_rank, LockRank(prev_rank).name(), self.rank.0, self.rank.name()
-            );
-            crate::exit::finish(crate::exit::Code::ExceptionFatal);
-        }
-        OpenGuard { lock: self, prev_rank }
     }
 }
 
@@ -529,9 +565,16 @@ impl<T: Send> OpenGuard<'_, T> {
 
 impl<T: Send> Drop for OpenGuard<'_, T> {
     fn drop(&mut self) {
-        let slot = cpu_slot();
-        INNERMOST[slot].store(self.prev_rank, Ordering::Relaxed);
+        let flags = save_and_cli();
+        INNERMOST[self.slot].store(self.prev_rank, Ordering::Relaxed);
         self.lock.locked.store(0, Ordering::Release);
+        let depth = OPEN_DEPTH[self.slot].fetch_sub(1, Ordering::AcqRel);
+        let resched = depth == 1 && OPEN_TERM_PENDING[self.slot].swap(false, Ordering::AcqRel);
+        restore_flags(flags);
+        if resched {
+            OPEN_FORCED_RESCHED.fetch_add(1, Ordering::Relaxed);
+            crate::arch::x86_64::trap::resched_self();
+        }
     }
 }
 // SAFETY: `data` 只能在持有 `locked` 时访问，因此 T: Send 即可跨线程共享。
