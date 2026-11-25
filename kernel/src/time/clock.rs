@@ -23,10 +23,10 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 pub const PIT_HZ: u64 = 1_193_182;
 /// 我们把通道 0 分频到的计数值（`apic::pit_start_100hz`）
 pub const PIT_DIVISOR: u64 = 11_932;
-/// 标定的合理范围：低于 10 MHz 或高于 10 GHz 一律认为标定失败，不做"看起来能用"的换算
-/// 合理区间：低于 100 MHz 或高于 5 GHz 都不像现代 x86-64 的 TSC。
-/// 这不是"物理定律"，是把明显荒唐的读数挡在换算之前——第一次标定报 4.78 GHz
-/// 时这个上限差点放过它，所以真正的防线是上面的漏 tick 检查，这里只是兜底。
+/// 标定的合理范围：低于 100 MHz 或高于 5 GHz 一律认为标定失败，不做"看起来能用"的换算。
+/// 这不是物理定律，是把明显荒唐的读数挡在换算之前；真正防假数的是漏 tick 与两把尺子
+/// 一致性检查。短窗只有四个样本时，相位与宿主抖动曾把边界读数推过 5GHz；标定调用点
+/// 因此多取四个周期的余量，但这里接受的频率端点不变（ADR-036）。
 const MIN_TSC_HZ: u64 = 100_000_000;
 const MAX_TSC_HZ: u64 = 5_000_000_000;
 /// 一次标定至少要几个 tick 间隔。`from_pit_window` 和"要等多久"共用这一个数：
@@ -88,6 +88,31 @@ pub fn from_pit_window(
     intervals: (u64, u64),
     invariant: bool,
 ) -> Result<Calibration, CalibrationError> {
+    let (period, hz) = estimate_pit_window(total_cycles, ticks, max_tick_gap, intervals)?;
+    let (sum, n) = intervals;
+    let c = Calibration {
+        tick_period_cycles: period,
+        tsc_hz: hz,
+        samples: ticks as usize,
+        interval_mean: if n > 0 { sum / n } else { 0 },
+        interval_n: n as usize,
+        invariant,
+    };
+    CAL.store(period, Ordering::Release);
+    CAL_META.store(hz, Ordering::Release);
+    CAL_SUM.store(sum, Ordering::Release);
+    CAL_N.store(n, Ordering::Release);
+    CAL_SAMPLES.store(ticks, Ordering::Release);
+    Ok(c)
+}
+
+/// 不写全局标定状态的纯校验，供边界负样本直接调用。
+pub(crate) fn estimate_pit_window(
+    total_cycles: u64,
+    ticks: u64,
+    max_tick_gap: u64,
+    intervals: (u64, u64),
+) -> Result<(u64, u64), CalibrationError> {
     if ticks < MIN_SAMPLES || total_cycles == 0 {
         return Err(CalibrationError::NoSamples);
     }
@@ -118,20 +143,7 @@ pub fn from_pit_window(
     if hz < MIN_TSC_HZ || hz > MAX_TSC_HZ {
         return Err(CalibrationError::OutOfRange(hz));
     }
-    let c = Calibration {
-        tick_period_cycles: period,
-        tsc_hz: hz,
-        samples: ticks as usize,
-        interval_mean: if n > 0 { sum / n } else { 0 },
-        interval_n: n as usize,
-        invariant,
-    };
-    CAL.store(period, Ordering::Release);
-    CAL_META.store(hz, Ordering::Release);
-    CAL_SUM.store(sum, Ordering::Release);
-    CAL_N.store(n, Ordering::Release);
-    CAL_SAMPLES.store(ticks, Ordering::Release);
-    Ok(c)
+    Ok((period, hz))
 }
 
 #[derive(Debug, Clone, Copy)]

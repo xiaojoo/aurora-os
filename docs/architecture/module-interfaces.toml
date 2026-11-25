@@ -689,7 +689,7 @@ public_api = [
   "driver::DriverCtx", "driver::DmaHandle", "driver::DriverError", "driver::IrqHandle",
   "driver::MmioHandle", "ahci::REG_CAP", "ahci::REG_GHC", "ahci::SECTOR", "ahci::boot_port",
   "ahci::fnv1a64", "ahci::init", "ahci::prepare_capture", "ahci::CaptureIo",
-  "ahci::is_capture_port", "ahci::read_bytes", "ahci::write_bytes", "ahci::AhciError",
+  "ahci::is_capture_port", "ahci::read_bytes", "ahci::write_bytes", "ahci::read_modify_write", "ahci::AhciError",
   "virtio::VirtioError", "virtio::read_block", "virtio::write_block", "virtio::read_block_at",
   "virtio::write_block_at", "virtio::bind_net", "virtio::send_raw", "virtio::receive",
   "virtio::net_info", "ahci::State", "ahci::info", "ahci::state", "nvme::NvmeError",

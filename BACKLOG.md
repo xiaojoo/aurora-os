@@ -25989,3 +25989,63 @@ ADR-220 的未决 1/4 在产品句柄路径关闭，旧 `fs_open::open` 与 exec
 
 - `terminate_task` 的越界/Free/release_depth 待办语义不变；不改锁序、ABI 或进程结局口径。
 - 真机未验证。
+
+## 582. ADR-254：块层原子读-改-写关闭并发半扇区丢更新（2026-11-25）
+
+### 交付范围
+
+- `Block` 新增 `read_modify_write(lba, offset, src)`，默认 `Refused`；不提供设备级事务的
+  驱动明确拒绝半扇区写，不静默退回有竞态的分别读/写。
+- `AhciDisk` 调新增 `ahci::read_modify_write`，在现有 XFER 内完成读扇区、改区间、写回；
+  `PartitionView` 先越界与地址翻译再委托。
+- `vfs_ro::write_at` 的 Partial-sector 分支改调原子 API；整扇区写不变，写后缓存失效不变。
+- 可变内存测试盘在同一借用内完成 RMW；virtio-blk/NVMe 暂不声明该能力。
+- `ahci::rmw_stats` 记录调用与成功进入 XFER 的次数，`rmw_last` 绑定端口/LBA/偏移/内容哈希，
+  fs-rw 真盘用例同时校验增量与本次写入身份。
+
+### 红绿判据
+
+`RwDisk` 在普通 `read_sectors` 里模拟“读后、写前”的竞争写；旧拆分路径会拿旧副本
+覆盖竞争字节，`原子=false`。原子 RMW 不经过该拆分窗口，邻居字节保留。
+
+| 场景 | 读数 |
+|---|---|
+| 旧拆分路径红测 | `run-15851`：`原子=false`，`t_vfs_ro_write` 精确 FAIL（99 条仅此 1 红） |
+| 原子 RMW 修复 | `run-16041`：`原子=true`、`分区RMW=true`、AHCI `RMW=true(次1 绑定true)`、fs-rw **165/165** PASS |
+| 分区翻译负样本 | `run-15801`：删掉 `base+lba` 后 `分区RMW=false`，`t_vfs_ro_write` 精确 FAIL |
+| RMW 身份绑定负样本 | `run-15852`：`绑定false`，`t_fs_rw_write` 精确 FAIL（165 条仅此 1 红） |
+| RMW 失败后失效 | `run-16041`：Partial-sector 写返回 `DeviceError`，缓存清空且重读新内容 |
+| 宿主内容对账 | `LOG.TXT [8,12)=deadbeef`，64 字节读回、邻文件未动均 true |
+| 默认 / handles,fs-ro | `run-15946` **92/92**；`run-16040` **154/154** |
+| fat32-exec 重复 | 修复前同 ELF `0b7cec18c888` **10/10 PASS**；最终 ELF `94794532c171` **3/3 PASS**（142/142） |
+| 静态门禁 | `check` **21/21**，相关五个构建档全过 |
+| 完整矩阵 | `build/matrix-final.log`：**82/82 符合**，`AURORA_MATRIX_DONE rc=0` |
+
+### 验证暴露的量具问题
+
+1. **采样上界**：首矩阵 39/82 的计时类连锁偏差不是 RMW 回归；独立 HEAD 默认档同样
+   只有 21 次切换（判据要求 24）。调度采样 900M→1.8B 周期、两 tick 上界 2→4 窗、
+   单 tick 上界 1→2 窗，判据不变。
+2. **PIT 标定**：ADR-036 的 4 样本门槛与 5GHz 端点不变。宿主 TSC/QPC 五跑为
+   3.18718…GHz，TCG 的 PIT 墙钟受宿主调度影响会拉长，短窗曾读到 5.008GHz 或只有
+   3 个样本。调用点改为停表→清统计→启动、`MIN_SAMPLES+4` 周期上界、首次坏窗重建一次；
+   纯校验新增 5GHz 接受、6GHz 拒绝、漏 tick、少样本、不写全局五格。
+   `run-15947`/`run-15948` 均 PASS，边界与“纯校验不写状态=true”。
+3. **回收自足性**：`t_reap_premise` 原只让出两次，队列已有工人时新工人可能未被选中。
+   修前同 ELF `run-15692`/`run-15694` 都是 `Free/owned=1/released 21→21`；改为最多
+   `MAX_TASKS_TOTAL` 次有界让出后，`run-15946`/`run-16040` 都是 `Free/owned=0`、
+   `released` 增量、`有界让出=true`。
+4. **停表探测**：QMP `run-15822` 抓到 BSP 在 ring3 自跳转、句柄段已完成，PIT/IOAPIC
+   被屏蔽、FAT32 步骤停 31。`wake_task` 后用 `wait_ticks` 开窗探测，一发旧 tick 把用户
+   切上来后没有周期 tick 切回。新增 `apic::timer_running()` 直读 RTE，`t_fat32_exec`、
+   `t_sleep_until`、`t_wait_timeout` 先开表再探测。同一新 ELF `0b7cec18c888` 10/10 PASS，
+   最终 ELF `94794532c171` 再跑 3/3 PASS，原 FAT32 与 q2 停点均未再出现。
+
+RMW trait 与 AHCI 实现分别门控到 `fs-ro`/`fs-rw` 与 `fs-rw`，默认档不链接这段新代码。
+
+### 边界
+
+- 只关闭文件数据覆盖写的同步单扇区 RMW；FAT/目录项元数据拆到任务 **#46**，仍受既有上层串行调用约束。
+- 异步数据缓冲所有权仍是任务 #38。
+- virtio/NVMe 半扇区写当前返回 `Refused`，不宣称已支持原子 RMW；真机未验证。
+- 不改锁等级、锁序或 ABI。

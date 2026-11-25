@@ -1577,7 +1577,69 @@ pub fn write_bytes(num: u8, lba: u64, src: &[u8]) -> Result<Xfer, AhciError> {
     })?
 }
 
-/// 从盘上读一段任意字节进调用方的缓冲（内容判据用 `Xfer.hash`，逐字节比对用 `dst`）。
+/// 在同一个 XFER 临界区内完成单扇区读-改-写，避免两个写者用旧副本互相覆盖。
+#[cfg(feature = "fs-rw")]
+static RMW_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "fs-rw")]
+static RMW_LOCKED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "fs-rw")]
+static RMW_SEQ: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "fs-rw")]
+static RMW_LAST_PORT: AtomicU8 = AtomicU8::new(0);
+#[cfg(feature = "fs-rw")]
+static RMW_LAST_LBA: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "fs-rw")]
+static RMW_LAST_OFFSET: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "fs-rw")]
+static RMW_LAST_HASH: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "fs-rw")]
+pub(crate) fn rmw_stats() -> (usize, usize) {
+    (RMW_CALLS.load(Ordering::Relaxed), RMW_LOCKED.load(Ordering::Relaxed))
+}
+
+#[cfg(feature = "fs-rw")]
+pub(crate) fn rmw_last() -> (usize, u8, u64, usize, u64) {
+    let seq = RMW_SEQ.load(Ordering::Acquire);
+    let offset = RMW_LAST_OFFSET.load(Ordering::Relaxed);
+    #[cfg(feature = "fault-block-rmw-false-bind")]
+    let offset = offset.wrapping_add(1);
+    (
+        seq,
+        RMW_LAST_PORT.load(Ordering::Relaxed),
+        RMW_LAST_LBA.load(Ordering::Relaxed),
+        offset,
+        RMW_LAST_HASH.load(Ordering::Relaxed),
+    )
+}
+
+#[cfg(feature = "fs-rw")]
+pub fn read_modify_write(num: u8, lba: u64, offset: usize, src: &[u8]) -> Result<Xfer, AhciError> {
+    RMW_CALLS.fetch_add(1, Ordering::Relaxed);
+    const sector_bytes: usize = SECTOR as usize;
+    if src.is_empty() || offset >= sector_bytes || src.len() > sector_bytes - offset {
+        return Err(AhciError::Denied("RMW 区间不在单个扇区内"));
+    }
+    with_transfer_lock(num, || {
+        RMW_LOCKED.fetch_add(1, Ordering::Relaxed);
+        let mut sector = [0u8; sector_bytes];
+        transfer_locked(num, lba, 1, false)?;
+        copy_out(0, &mut sector)?;
+        sector[offset..offset + src.len()].copy_from_slice(src);
+        for (i, b) in sector.iter().enumerate() {
+            wb(OFF_DATA + i as u64, *b)?;
+        }
+        let written = transfer_locked(num, lba, 1, true)?;
+        RMW_LAST_PORT.store(num, Ordering::Relaxed);
+        RMW_LAST_LBA.store(lba, Ordering::Relaxed);
+        RMW_LAST_OFFSET.store(offset, Ordering::Relaxed);
+        RMW_LAST_HASH.store(fnv1a64(src), Ordering::Relaxed);
+        RMW_SEQ.fetch_add(1, Ordering::Release);
+        Ok(written)
+    })?
+}
+
+/// 从盘上读一段任意字节进调用方的缓冲（内容判据用 `Xfer.hash`，逐字节比对看 `dst`）。
 pub fn read_bytes(num: u8, lba: u64, dst: &mut [u8]) -> Result<Xfer, AhciError> {
     let count = match dst.len() {
         0 => return Err(AhciError::TooBig(0)),

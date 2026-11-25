@@ -867,15 +867,15 @@ fn t_fat32_exec() -> bool {
             return false;
         }
     };
-    // §199：收尾按原样放回（与 t_handle_reap 同一律）。本用例需要表走，所以照样开；
-    // 旧写法无条件 stop，把表停给了后面所有用例（第二终端的前置条件，BACKLOG §198/§199）。
-    // **放行**：槽已经写好了，现在才让它跑（ADR-190）
+    // §199：收尾按原样放回。先读 RTE 的屏蔽位，不靠 wait_ticks 开窗探测；表若已停，
+    // 但 IRR 里还压着一发旧 tick，探测本身会把用户切上来，之后没有周期 tick 再切回。
+    // 因此必须先启动定时器，再放行用户。
+    let timer_was_running = apic::timer_running();
+    apic::timer_start().ok();
     crate::sched::wake_task(t, token);
     let tick_in = apic::ticks();
     crate::ktests::syscall::elf::fmark(31);
-    let timer_was_running =
-        apic::wait_ticks(tick_in, 2, crate::clock::window_cycles(2)).ticks >= 2;
-    apic::timer_start().ok();
+    let _ = apic::wait_ticks(tick_in, 2, crate::clock::window_cycles(2));
     crate::ktests::syscall::elf::fmark(33);
     let mut rounds = 0u64;
     apic::with_interrupts(|| {

@@ -553,8 +553,9 @@ fn t_vfs_ro() -> bool {
     // "越过 GPT 给的那个区间"是 BeyondPartition。合成一格，负样本就再也分不开是谁拒的。
     // 借用只在这一次里：上面 `make_image(&mut img)` 之后，早先那个 `disk` 已经不再借 `img`，
     // 这里另起一个短借，别把旧绑定的生命周期拖到函数末尾（会的，NLL 一扩就红）。
-    let mut one = [0u8; 512];
-    let (ro_refused, out_beyond, in_refused, bad_shape) = {
+    let one = [0u8; 512];
+    let (ro_refused, out_beyond, in_refused, bad_shape,
+         ro_rmw_refused, rmw_out_beyond, rmw_in_refused, rmw_bad_shape) = {
         let ro = MemDisk { img: &img };
         let part = Partition { base: 0, last: 0 };
         let view = PartitionView { inner: &ro, part };
@@ -563,13 +564,19 @@ fn t_vfs_ro() -> bool {
             view.write_sectors(1, &one) == Err(BlockError::BeyondPartition),
             view.write_sectors(0, &one) == Err(BlockError::Refused),
             ro.write_sectors(0, &one[..SECTOR_BYTES - 1]) == Err(BlockError::Refused),
+            ro.read_modify_write(0, 0, &one[..1]) == Err(BlockError::Refused),
+            view.read_modify_write(1, 0, &one[..1]) == Err(BlockError::BeyondPartition),
+            view.read_modify_write(0, 0, &one[..1]) == Err(BlockError::Refused),
+            ro.read_modify_write(0, SECTOR_BYTES, &one[..1]) == Err(BlockError::Refused),
         )
     };
     crate::log_info!(
-        "vfs-ro: 写方向 只读实现拒={} 分区外拒={} 分区内转发={} 形状拒={}",
-        ro_refused, out_beyond, in_refused, bad_shape
+        "vfs-ro: 写方向 只读实现拒={} 分区外拒={} 分区内转发={} 形状拒={} RMW只读拒={} RMW分区外拒={} RMW转发拒={} RMW形状拒={}",
+        ro_refused, out_beyond, in_refused, bad_shape,
+        ro_rmw_refused, rmw_out_beyond, rmw_in_refused, rmw_bad_shape
     );
-    if !(ro_refused && out_beyond && in_refused && bad_shape) {
+    if !(ro_refused && out_beyond && in_refused && bad_shape
+        && ro_rmw_refused && rmw_out_beyond && rmw_in_refused && rmw_bad_shape) {
         return fail("写方向四种拒绝", VfsError::BadPath);
     }
 
@@ -580,21 +587,31 @@ fn t_vfs_ro() -> bool {
 
 /// 可变内存盘：写方向的判据要"写进去再读回来"，只读的 `MemDisk` 给不了。
 /// 用 `RefCell<&mut [u8]>` 而不是裸指针：这一格不值得开一个 unsafe 白名单条目。
-struct RwDisk<'a>(core::cell::RefCell<&'a mut [u8]>);
+struct RwDisk<'a> {
+    img: core::cell::RefCell<&'a mut [u8]>,
+    interleave: core::cell::Cell<bool>,
+    lost: core::cell::Cell<bool>,
+    race_off: core::cell::Cell<usize>,
+}
 
 impl<'a> RwDisk<'a> {
     fn new(buf: &'a mut [u8]) -> Self {
-        RwDisk(core::cell::RefCell::new(buf))
+        RwDisk {
+            img: core::cell::RefCell::new(buf),
+            interleave: core::cell::Cell::new(false),
+            lost: core::cell::Cell::new(false),
+            race_off: core::cell::Cell::new(6),
+        }
     }
 
     fn snapshot(&self) -> alloc::vec::Vec<u8> {
-        self.0.borrow().to_vec()
+        self.img.borrow().to_vec()
     }
 }
 
 impl crate::filesystem::vfs::Block for RwDisk<'_> {
     fn read_sectors(&self, lba: u64, dst: &mut [u8]) -> Result<(), BlockError> {
-        let img = self.0.borrow();
+        let mut img = self.img.borrow_mut();
         if dst.is_empty() || dst.len() % SECTOR_BYTES != 0 {
             return Err(BlockError::Refused);
         }
@@ -604,11 +621,18 @@ impl crate::filesystem::vfs::Block for RwDisk<'_> {
             return Err(BlockError::Refused);
         }
         dst.copy_from_slice(&img[start..end]);
+        if self.interleave.get() {
+            let at = start + self.race_off.get();
+            if at < end {
+                img[at] = 0xEE;
+                self.lost.set(true);
+            }
+        }
         Ok(())
     }
 
     fn write_sectors(&self, lba: u64, src: &[u8]) -> Result<(), BlockError> {
-        let mut img = self.0.borrow_mut();
+        let mut img = self.img.borrow_mut();
         if src.is_empty() || src.len() % SECTOR_BYTES != 0 {
             return Err(BlockError::Refused);
         }
@@ -618,6 +642,20 @@ impl crate::filesystem::vfs::Block for RwDisk<'_> {
             return Err(BlockError::Refused);
         }
         img[start..end].copy_from_slice(src);
+        Ok(())
+    }
+
+    fn read_modify_write(&self, lba: u64, offset: usize, src: &[u8]) -> Result<(), BlockError> {
+        if src.is_empty() || offset > SECTOR_BYTES || src.len() > SECTOR_BYTES - offset {
+            return Err(BlockError::Refused);
+        }
+        let mut img = self.img.borrow_mut();
+        let start = lba as usize * SECTOR_BYTES;
+        let end = start + SECTOR_BYTES;
+        if end > img.len() {
+            return Err(BlockError::Refused);
+        }
+        img[start + offset..start + offset + src.len()].copy_from_slice(src);
         Ok(())
     }
 }
@@ -1032,10 +1070,13 @@ fn t_vfs_ro_write() -> bool {
     let seek_ok = crate::filesystem::vfs_ro::seek_disk(&rw, &mut cur, 2).is_ok();
     let mut wrote_mis = false;
     if seek_ok {
+        rw.interleave.set(true);
         if let Ok(n) = crate::filesystem::vfs_ro::write_at(&rw, &mut cur, &[0xA5, 0x5A, 0xC3]) {
             wrote_mis = n == 3;
         }
+        rw.interleave.set(false);
     }
+    let atomic_ok = !rw.lost.get();
     wrote_mis = wrote_mis && base_ok;
 
     // (2) 读回 + 邻居：0/1/6 必须还是原值
@@ -1077,11 +1118,29 @@ fn t_vfs_ro_write() -> bool {
         }
     }
 
+    // (5) 分区视图必须把相对 LBA 0 翻成内层 LBA 1，并且只改点名区间。
+    let part = Partition { base: 1, last: 1 };
+    let view = PartitionView { inner: &rw, part };
+    let patch = [0x12u8, 0x34, 0x56];
+    let mut sector = [0u8; SECTOR_BYTES];
+    let before0 = rw.read_sectors(0, &mut sector).ok().map(|_| ahci::fnv1a64(&sector));
+    let before1 = rw.read_sectors(1, &mut sector).ok().map(|_| ahci::fnv1a64(&sector));
+    let mut expected1 = ahci::FNV_OFFSET;
+    for (i, b) in sector.iter().enumerate() {
+        let value = if (9..12).contains(&i) { patch[i - 9] } else { *b };
+        expected1 = ahci::fnv1a_step(expected1, value);
+    }
+    let applied = view.read_modify_write(0, 9, &patch).is_ok();
+    let after0 = rw.read_sectors(0, &mut sector).ok().map(|_| ahci::fnv1a64(&sector));
+    let after1 = rw.read_sectors(1, &mut sector).ok().map(|_| ahci::fnv1a64(&sector));
+    let part_rmw_ok = before0.is_some() && before1.is_some() && applied
+        && after0 == before0 && after1 == Some(expected1) && sector[9..12] == patch;
+
     crate::log_info!(
-        "vfs-ro-w: 覆盖写 非整扇区={} 读回={} 邻居未动={} 越EOF拒={} 空写={}",
-        wrote_mis, read_back, neigh_ok, eof_ok, empty_ok
+        "vfs-ro-w: 覆盖写 非整扇区={} 原子={} 读回={} 邻居未动={} 越EOF拒={} 空写={} 分区RMW={}",
+        wrote_mis, atomic_ok, read_back, neigh_ok, eof_ok, empty_ok, part_rmw_ok
     );
-    wrote_mis && read_back && neigh_ok && eof_ok && empty_ok
+    wrote_mis && atomic_ok && read_back && neigh_ok && eof_ok && empty_ok && part_rmw_ok
 }
 
 ktest!(KT_VFS_RO, t_vfs_ro);
@@ -2656,6 +2715,26 @@ fn t_cache_failed_write_invalidates() -> bool {
             }
             if self.fail.get() { Err(BlockError::DeviceError) } else { Ok(()) }
         }
+        fn read_modify_write(&self, lba: u64, offset: usize, src: &[u8]) -> Result<(), BlockError> {
+            if src.is_empty() || offset > SECTOR_BYTES || src.len() > SECTOR_BYTES - offset {
+                return Err(BlockError::Refused);
+            }
+            {
+                let mut img = self.img.borrow_mut();
+                let start = lba as usize * SECTOR_BYTES;
+                let end = start + SECTOR_BYTES;
+                if end > img.len() {
+                    return Err(BlockError::Refused);
+                }
+                img[start + offset..start + offset + src.len()].copy_from_slice(src);
+            }
+            let probe_vol = self.probe_vol.get();
+            if probe_vol != 0 {
+                let mut probe = [0u8; SECTOR_BYTES];
+                let _ = vfs_ro::cached_read(self, probe_vol, lba + 1, &mut probe);
+            }
+            if self.fail.get() { Err(BlockError::DeviceError) } else { Ok(()) }
+        }
     }
 
     let mut img = [0u8; F32_VOL_BYTES];
@@ -2687,14 +2766,20 @@ fn t_cache_failed_write_invalidates() -> bool {
     if vfs_ro::cached_read(&disk, vol, F32_INNER_LBA as u64, &mut old).is_err() {
         return false;
     }
-    let src = [0xa5u8; SECTOR_BYTES];
-    let write = vfs_ro::write_at(&disk, &mut cur, &src);
+    let src = [0xa5u8; 4];
+    let seek_ok = vfs_ro::seek_disk(&disk, &mut cur, 1).is_ok();
+    let write = if seek_ok {
+        vfs_ro::write_at(&disk, &mut cur, &src)
+    } else {
+        Err(VfsError::BadOffset)
+    };
     let invalidated = write == Err(VfsError::Fs(FsError::Io(BlockError::DeviceError)))
         && vfs_ro::cache_used() == 0;
     disk.fail.set(false);
+    let _ = vfs_ro::seek_disk(&disk, &mut cur, 0);
     let mut after = [0u8; SECTOR_BYTES];
     let reread = vfs_ro::read_disk_cached(&disk, vol, &mut cur, &mut after);
-    let fresh = reread == Ok(SECTOR_BYTES) && after == src && after != old;
+    let fresh = reread == Ok(SECTOR_BYTES) && after[1..5] == src && after != old;
     vfs_ro::cache_clear();
     crate::log_info!("cache-failed-write: 失败={:?} 已失效={} 重读新={} ⇒ {}",
         write, invalidated, fresh, invalidated && fresh);

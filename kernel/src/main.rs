@@ -3478,45 +3478,57 @@ pub fn calibrate_clock_once() -> Option<clock::Calibration> {
         crate::log_fatal!("clock: APIC 起不来，标定无从谈起");
         return None;
     }
-    if apic::timer_start().is_err() {
-        crate::log_fatal!("clock: cannot start timer");
-        return None;
-    }
-    // 窗口里**一行日志都不打**：串口按字节忙等，一次输出就是几十毫秒，
-    // 期间必然跳过好几个 tick，而"观察到的相邻间隔"会把漏掉的 tick 算成更长的周期
-    // （第一次标定报 4.78 GHz 就是这么来的）。
-    let base_ticks = apic::reset_tick_stats();
-    // 窗口按 cycles 给上界，样本目标 20 次；上界 `window_cycles(MIN_SAMPLES)` 是
-    // "任何可信 TSC 都至少能数到 MIN_SAMPLES 次"的那个长度（推导见 clock::window_cycles）。
-    // 原先这里写的是 `r < 4000` 轮：KVM 对照档实测同一颗 QEMU 只换 accel，
-    // 4000 轮在 tcg 档值 2.08 亿 cycles（数到 6 个 tick）、在 kvm 档只值 1.01 亿（数到 4 个），
-    // 样本数正好压在门槛上——第一次调用 3 个就报 NoSamples，第二次同样代码却有 4 个。
-    let w = apic::wait_ticks(base_ticks, 20, clock::window_cycles(clock::MIN_SAMPLES));
-    apic::timer_stop().ok();
-    let inv = cpuid::detect().tsc_inv;
-    let ints = apic::tick_delta_sum();
-    let cal = match clock::from_pit_window(w.cycles, w.ticks, apic::tick_delta_max_cycles(), ints, inv) {
-        Ok(c) => c,
-        Err(e) => {
-            crate::log_fatal!("clock: calibration refused: {:?}", e);
+    // 先停表再清统计，避免 start 与 reset 之间漏进一发在途 tick。watchdog 停表后的
+    // 第一次窗口仍可能撞上设备残留，因此最多重建两次；每次都执行完整停表→清统计→启动，
+    // 不放宽 from_pit_window 的任何判据，两次都拒才报 fatal。
+    let mut last_error = None;
+    for _attempt in 0..2 {
+        apic::timer_stop().ok();
+        let base_ticks = apic::reset_tick_stats();
+        if apic::timer_start().is_err() {
+            crate::log_fatal!("clock: cannot start timer");
             return None;
         }
-    };
-    crate::log_info!(
-        "clock: {} ticks in {} cycles -> tsc_hz={} Hz, tick ~ {:?} us, max_gap={} (PIT divisor {} Hz/{} Hz, invariant={}) 窗口={} cycles 轮数={}",
-        cal.samples, w.cycles, cal.tsc_hz, clock::micros(cal.tick_period_cycles),
-        apic::tick_delta_max_cycles(), clock::PIT_HZ, clock::PIT_DIVISOR, inv,
-        clock::window_cycles(clock::MIN_SAMPLES), w.rounds
-    );
-    // 两把尺子并排印出来：窗口均值（含两端切掉的半段，必然偏高）与 ISR 自己量的相邻间隔均值。
-    // 那条硬不等式在 `clock::from_pit_window` 里判——红起来是标定当场拒，不是一个打印出来的数。
-    crate::log_info!(
-        "clock 两把尺子: 窗口 total={} ÷ ticks={} ⇒ 窗口均值={}；ISR 相邻间隔 n={} 和={} ⇒ 均值={}（估计器用后者）；容许区间={}..{}（上界=和+2×每 tick 最长 {} cycles）",
-        w.cycles, cal.samples, w.cycles / cal.samples as u64,
-        cal.interval_n, ints.0, cal.interval_mean,
-        ints.0, ints.0 + 2 * clock::max_tick_period_cycles(), clock::max_tick_period_cycles(),
-    );
-    Some(cal)
+        // 窗口里**一行日志都不打**：串口按字节忙等，一次输出就是几十毫秒，
+        // 期间必然跳过好几个 tick，而"观察到的相邻间隔"会把漏掉的 tick 算成更长的周期。
+        // 窗口按 cycles 给上界，样本目标 20 次；上界取 `window_cycles(MIN_SAMPLES + 4)`。
+        // 四个周期刚好等于 MIN_SAMPLES 时没有相位余量，宿主一抖就可能只数到 3 个；多取
+        // 四个周期只增加采样，不放宽 `from_pit_window` 的任何判据或 5GHz 端点（ADR-036）。
+        // 原先这里写的是 `r < 4000` 轮：KVM 对照档实测同一颗 QEMU 只换 accel，
+        // 4000 轮在 tcg 档值 2.08 亿 cycles（数到 6 个 tick）、在 kvm 档只值 1.01 亿（数到 4 个），
+        // 样本数正好压在门槛上——第一次调用 3 个就报 NoSamples，第二次同样代码却有 4 个。
+        let w = apic::wait_ticks(base_ticks, 20, clock::window_cycles(clock::MIN_SAMPLES + 4));
+        apic::timer_stop().ok();
+        let inv = cpuid::detect().tsc_inv;
+        let ints = apic::tick_delta_sum();
+        let cal = match clock::from_pit_window(w.cycles, w.ticks, apic::tick_delta_max_cycles(), ints, inv) {
+            Ok(c) => c,
+            Err(e) => {
+                last_error = Some(e);
+                if _attempt == 0 {
+                    crate::log_warn!("clock: first calibration rejected {:?}; retry once", e);
+                }
+                continue;
+            }
+        };
+        crate::log_info!(
+            "clock: {} ticks in {} cycles -> tsc_hz={} Hz, tick ~ {:?} us, max_gap={} (PIT divisor {} Hz/{} Hz, invariant={}) 窗口={} cycles 轮数={}",
+            cal.samples, w.cycles, cal.tsc_hz, clock::micros(cal.tick_period_cycles),
+            apic::tick_delta_max_cycles(), clock::PIT_HZ, clock::PIT_DIVISOR, inv,
+            clock::window_cycles(clock::MIN_SAMPLES + 4), w.rounds
+        );
+        // 两把尺子并排印出来：窗口均值（含两端切掉的半段，必然偏高）与 ISR 自己量的相邻间隔均值。
+        // 那条硬不等式在 `clock::from_pit_window` 里判——红起来是标定当场拒，不是一个打印出来的数。
+        crate::log_info!(
+            "clock 两把尺子: 窗口 total={} ÷ ticks={} ⇒ 窗口均值={}；ISR 相邻间隔 n={} 和={} ⇒ 均值={}（估计器用后者）；容许区间={}..{}（上界=和+2×每 tick 最长 {} cycles）",
+            w.cycles, cal.samples, w.cycles / cal.samples as u64,
+            cal.interval_n, ints.0, cal.interval_mean,
+            ints.0, ints.0 + 2 * clock::max_tick_period_cycles(), clock::max_tick_period_cycles(),
+        );
+        return Some(cal);
+    }
+    crate::log_fatal!("clock: calibration refused: {:?}", last_error);
+    None
 }
 
 

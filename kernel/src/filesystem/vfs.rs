@@ -106,6 +106,18 @@ impl Block for PartitionView<'_> {
         let abs = self.part.base.checked_add(lba).ok_or(BlockError::BeyondPartition)?;
         self.inner.write_sectors(abs, src)
     }
+
+    #[cfg(any(feature = "fs-rw", feature = "fs-ro"))]
+    fn read_modify_write(&self, lba: u64, offset: usize, src: &[u8]) -> Result<(), BlockError> {
+        if src.is_empty() || offset >= SECTOR_BYTES || src.len() > SECTOR_BYTES - offset {
+            return Err(BlockError::Refused);
+        }
+        if lba >= self.part.sectors() {
+            return Err(BlockError::BeyondPartition);
+        }
+        let abs = self.part.base.checked_add(lba).ok_or(BlockError::BeyondPartition)?;
+        self.inner.read_modify_write(abs, offset, src)
+    }
 }
 
 impl BlockError {
@@ -154,6 +166,13 @@ pub trait Block {
     /// 不需要为"我不支持写"说任何话，而"忘了实现写"会表现成 `Refused` 而不是静默成功。
     fn write_sectors(&self, lba: u64, src: &[u8]) -> Result<(), BlockError> {
         let _ = (lba, src);
+        Err(BlockError::Refused)
+    }
+
+    /// 原子完成一个扇区内的读-改-写；默认拒绝，避免驱动静默退回有竞态的两次调用。
+    #[cfg(any(feature = "fs-rw", feature = "fs-ro"))]
+    fn read_modify_write(&self, lba: u64, offset: usize, src: &[u8]) -> Result<(), BlockError> {
+        let _ = (lba, offset, src);
         Err(BlockError::Refused)
     }
 
@@ -226,6 +245,14 @@ impl Block for AhciDisk {
             ahci::write_bytes(self.port, lba + i as u64, chunk).map_err(block_err)?;
         }
         Ok(())
+    }
+
+    #[cfg(feature = "fs-rw")]
+    fn read_modify_write(&self, lba: u64, offset: usize, src: &[u8]) -> Result<(), BlockError> {
+        if src.is_empty() || offset >= SECTOR_BYTES || src.len() > SECTOR_BYTES - offset {
+            return Err(BlockError::Refused);
+        }
+        ahci::read_modify_write(self.port, lba, offset, src).map(|_| ()).map_err(block_err)
     }
 
     fn ensure_readable(&self) -> Result<(), BlockError> {

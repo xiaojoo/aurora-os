@@ -64,12 +64,24 @@ fn t_fs_rw_write() -> bool {
 
     // 写 [8,12)
     let seek_ok = vfs_ro::seek_disk(&disk, &mut cur, 8).is_ok();
+    let want_lba = cur.current_lba();
+    let (rmw_calls0, rmw_locked0) = ahci::rmw_stats();
+    let rmw_last0 = ahci::rmw_last();
     let mut wrote = false;
     if seek_ok {
         if let Ok(n) = vfs_ro::write_at(&disk, &mut cur, &[0xDE, 0xAD, 0xBE, 0xEF]) {
             wrote = n == 4;
         }
     }
+    let (rmw_calls1, rmw_locked1) = ahci::rmw_stats();
+    let rmw_last1 = ahci::rmw_last();
+    let rmw_delta = rmw_calls1.saturating_sub(rmw_calls0);
+    let rmw_bound = rmw_last1.0 == rmw_last0.0 + 1
+        && rmw_last1.1 == fs_rw::PORT
+        && Some(rmw_last1.2) == want_lba
+        && rmw_last1.3 == 8
+        && rmw_last1.4 == ahci::fnv1a64(&[0xDE, 0xAD, 0xBE, 0xEF]);
+    let rmw_ok = rmw_delta == 1 && rmw_locked1.saturating_sub(rmw_locked0) == rmw_delta && rmw_bound;
 
     // 读回
     let back_seek = vfs_ro::seek_disk(&disk, &mut cur, 0).is_ok();
@@ -104,10 +116,10 @@ fn t_fs_rw_write() -> bool {
     } && dhead2 == dhead;
 
     crate::log_info!(
-        "fs-rw: 写读 基线={} DATA基线={} 写4字节={} 读回={} 内容对={} 邻文件未动={}",
-        base_ok, d_ok, wrote, read_back, cells_ok, data_ok
+        "fs-rw: 写读 基线={} DATA基线={} 写4字节={} RMW={}(次{} 绑定{}) 读回={} 内容对={} 邻文件未动={}",
+        base_ok, d_ok, wrote, rmw_ok, rmw_delta, rmw_bound, read_back, cells_ok, data_ok
     );
-    base_ok && d_ok && wrote && read_back && cells_ok && data_ok
+    base_ok && d_ok && wrote && rmw_ok && read_back && cells_ok && data_ok
 }
 
 ktest!(KT_FS_RW_WRITE, t_fs_rw_write);

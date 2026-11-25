@@ -92,7 +92,7 @@ fn t_preempt_round_robin() -> bool {
         let t0 = tsc::now();
         // 目标切换次数从 6 提到 24：P1 的 min 在样本只有 9~11 个时本身抖得厉害，
         // 多采样才让"注入几千周期"这件事判得出来（§12.4.1 规则 3 要求先证明尺子能分辨）。
-        while sched::stats().0 < sw0 + 24 && tsc::now() - t0 < 900_000_000 {
+        while sched::stats().0 < sw0 + 24 && tsc::now() - t0 < 1_800_000_000 {
             sched::WORK[0].fetch_add(1, Ordering::Relaxed);
             tsc::spin(20_000);
             #[cfg(feature = "trace-switch")]
@@ -128,7 +128,7 @@ fn t_preempt_round_robin() -> bool {
     let tick_a = apic::ticks();
     // 这一段本来就是按 cycles 封的界（400_000_000），换成同一个推导式上界，
     // 免得"这一格该给多少"在文件里有两本账。
-    let w_pre = apic::wait_ticks(tick_a, 2, clock::window_cycles(2));
+    let w_pre = apic::wait_ticks(tick_a, 2, clock::window_cycles(4));
     let tick_b = apic::ticks();
     if !timer_was_running {
         apic::timer_stop().ok();
@@ -688,15 +688,26 @@ fn t_reap_premise() -> bool {
             return false;
         }
     };
-    sched::yield_now(); // 换工人上来：它自己 terminate + 让出
-    sched::yield_now(); // 再让一次：给 reap 一个"它已不是 current"的机会
+    // 队列里可能有别的工人；两次让出不足以保证新工人被选中并回收。
+    let mut reaped = false;
+    for _ in 0..=sched::MAX_TASKS_TOTAL {
+        sched::yield_now();
+        let st = sched::state_of(w);
+        let owned = sched::owned_of(w);
+        let released = sched::reap_released();
+        if st == sched::TaskState::Free && owned == 0 && released > released0 {
+            reaped = true;
+            break;
+        }
+    }
     let st = sched::state_of(w);
     let owned = sched::owned_of(w);
     let released = sched::reap_released();
     crate::log_info!(
-        "reap 前提(BACKLOG144): worker=#{} 状态={:?} 名下={} released {} -> {}",
-        w, st, owned, released0, released);
-    st == sched::TaskState::Free && owned == 0 && released > released0
+        "reap 前提(BACKLOG144): worker=#{} 状态={:?} 名下={} released {} -> {} 有界让出={}",
+        w, st, owned, released0, released, reaped
+    );
+    reaped && st == sched::TaskState::Free && owned == 0 && released > released0
 }
 ktest!(KT_REAP_PREMISE, t_reap_premise);
 
@@ -1407,6 +1418,25 @@ fn rte_lo() -> u64 {
 }
 
 
+fn p6_apic_ready() -> bool {
+    if apic::state().is_some() {
+        return true;
+    }
+    let Some(s) = acpi::summary() else {
+        crate::log_fatal!("P6: 没有 ACPI 摘要，APIC 无法初始化");
+        return false;
+    };
+    let Some(m) = s.madt else {
+        crate::log_fatal!("P6: 没有 MADT，APIC 无法初始化");
+        return false;
+    };
+    if apic::get_or_init(&m).is_err() {
+        crate::log_fatal!("P6: APIC 起不来，定时器用例无法执行");
+        return false;
+    }
+    true
+}
+
 /// AP 档：在自己的 CPU 上睡同样长，量自己的 elapsed（tick 源是本地 LAPIC，不是 BSP 的 PIT）
 fn p6_ap_sleeper() {
     let slot = cpu::self_slot();
@@ -1424,6 +1454,9 @@ fn p6_bsp_noop() {}
 /// （`watchdog.rs` 的既有口径）。所以这里 BSP 与 AP **各测一档**，不是一个数糊过去。
 /// 另外三格：确实由定时器叫醒（返回 true）、`fired` 前进、轮上无残留项。
 fn t_sleep_until() -> bool {
+    if !p6_apic_ready() {
+        return false;
+    }
     SLEEP_PROBE[5].store(rte_lo(), Ordering::Relaxed);
     if sched::state_of(0) == sched::TaskState::Free {
         sched::init_boot_task();
@@ -1432,11 +1465,18 @@ fn t_sleep_until() -> bool {
     let tick = clock::current().map_or_else(clock::max_tick_period_cycles, |c| c.tick_period_cycles);
     let d = tick * 2;
     P6_D.store(d, Ordering::Release);
-    // 用例自足：轮靠 tick 扫，而 .ktests 顺序由链接器定，前面的用例可能把表停了
-    // （实测不保证就直接 HANG 3/3）。先量进来时心跳有没有在走，不在走就开表，收尾按原样放回。
+    // 用例自足：轮靠 tick 扫，而 .ktests 顺序由链接器定，前面的用例可能把表停了。
+    // 先看 RTE 屏蔽位并开表，再开中断窗口探测心跳；反过来探测本身可能切到别的任务，
+    // 而停掉的 PIT 没有下一发 tick 把启动上下文切回（run-15826）。
+    let was_running = apic::timer_running();
+    if !was_running {
+        let r = apic::timer_start();
+        SLEEP_PROBE[6].store(1, Ordering::Relaxed);
+        SLEEP_PROBE[7].store(u64::from(r.is_ok()), Ordering::Relaxed);
+        SLEEP_PROBE[8].store(rte_lo(), Ordering::Relaxed);
+    }
     let tick_in = apic::ticks();
     let probe = apic::wait_ticks(tick_in, 2, clock::window_cycles(2));
-    let was_running = probe.ticks >= 2;
     // §201：读数进静态量，**不往串口加行**（理由见 SLEEP_PROBE 头注释）。
     SLEEP_PROBE[0].store(tick_in as u64, Ordering::Relaxed);
     SLEEP_PROBE[1].store(probe.ticks, Ordering::Relaxed);
@@ -1444,12 +1484,6 @@ fn t_sleep_until() -> bool {
     SLEEP_PROBE[3].store(probe.rounds, Ordering::Relaxed);
     SLEEP_PROBE[4].store(u64::from(was_running), Ordering::Relaxed);
     SLEEP_PROBE[9].fetch_add(1, Ordering::Relaxed);
-    if !was_running {
-        let r = apic::timer_start();
-        SLEEP_PROBE[6].store(1, Ordering::Relaxed);
-        SLEEP_PROBE[7].store(u64::from(r.is_ok()), Ordering::Relaxed);
-        SLEEP_PROBE[8].store(rte_lo(), Ordering::Relaxed);
-    }
     let (reg0, fired0, _) = sched::timer_stats(cpu::BSP_SLOT);
     let t0 = tsc::now();
     let bsp_ok = sched::sleep_until(t0.wrapping_add(d));
@@ -1519,18 +1553,22 @@ fn p6b_waker() -> ! {
 /// 场景2：条件先成立 ⇒ 必须 `Condition`，且**轮项被取消**（残留=0）——不取消的话它会占着槽
 /// 一直到 deadline，槽满时后来者就睡不了。另判 `fired` 前进（场景1 真的由定时器叫醒）。
 fn t_wait_timeout() -> bool {
+    if !p6_apic_ready() {
+        return false;
+    }
     if sched::state_of(0) == sched::TaskState::Free {
         sched::init_boot_task();
     }
     let tick = clock::current().map_or_else(clock::max_tick_period_cycles, |c| c.tick_period_cycles);
     let d = tick * 2;
-    // 用例自足于时钟状态（与 t_sleep_until 同一理由：链接顺序可能让前面的用例停过表）
-    let tick_in = apic::ticks();
-    let probe = apic::wait_ticks(tick_in, 2, clock::window_cycles(2));
-    let was_running = probe.ticks >= 2;
+    // 用例自足于时钟状态：先看 RTE 屏蔽位并开表，再开窗口探测，避免旧 tick 把
+    // 别的任务切上来后没有周期 tick 切回（与 t_sleep_until 同一条纪律）。
+    let was_running = apic::timer_running();
     if !was_running {
         apic::timer_start().ok();
     }
+    let tick_in = apic::ticks();
+    let _ = apic::wait_ticks(tick_in, 2, clock::window_cycles(2));
     let Some(q) = sync::wait_queue(P6B_QID) else {
         crate::log_fatal!("wait 时限: 队列取不到");
         return false;
@@ -2316,7 +2354,7 @@ fn t_q2_workload_slots() -> bool {
     // 「宿主机 VM exit 开销随负载漂移」。要验它，得测**余量**而不是「有没有超时」——
     // 超时是个布尔，余量才是抖动的物理量。
     //
-    // 预算 `window_cycles(8)` 是按 **5 GHz 最坏情况**算的（`clock.rs:31` MAX_TSC_HZ），
+    // 预算 `window_cycles(8)` 是按 **5 GHz 最坏情况**算的（`clock.rs` 的 MAX_TSC_HZ），
     // 而实测 TSC 约 3.19 GHz ⇒ 正常余量应当很宽（比值远小于 1）。
     // 若某次跑这个比值接近 1000‰，就说明**那一次宿主确实慢**。
     let budget = clock::window_cycles(8);

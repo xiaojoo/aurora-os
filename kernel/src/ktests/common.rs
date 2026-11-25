@@ -106,9 +106,7 @@ pub(crate) fn drain_reap_for(g: usize) -> bool {
         return true;
     }
     let ticks_before = sched::ticks_of(0);
-    let timer_was_running = apic::state()
-        .and_then(|s| apic::rte_raw(s.timer_rte))
-        .is_some_and(|(low, _)| low & (1 << 16) == 0);
+    let timer_was_running = apic::timer_running();
     if !timer_was_running {
         if crate::clock::current().is_none() {
             crate::calibrate_clock_once();

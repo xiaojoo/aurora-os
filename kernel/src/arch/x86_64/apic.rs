@@ -439,6 +439,12 @@ pub fn timer_start() -> Result<(), ApicError> {
     Ok(())
 }
 
+/// 定时器中断的 RTE 是否未屏蔽。只看硬件门，不用开中断窗口探测，避免探测本身
+/// 把别的任务切上来后，停掉的 PIT 再也没有周期 tick 把原上下文切回。
+pub(crate) fn timer_running() -> bool {
+    state().and_then(|s| rte_raw(s.timer_rte)).is_some_and(|(low, _)| low & (1 << 16) == 0)
+}
+
 /// 关掉定时器中断：先屏蔽 RTE，再停 PIT。
 /// 反过来就会留下一个"已经拉高但没人屏蔽"的线——PIT 在模式 0 下还会再拉一次，
 /// 那次会落在测试窗口之外，把下一个用例的计数起点弄脏。

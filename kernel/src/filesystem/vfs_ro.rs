@@ -282,6 +282,10 @@ impl ReadCursor {
     pub fn first_cluster(&self) -> u32 {
         self.stat.first_cluster
     }
+
+    pub(crate) fn current_lba(&self) -> Option<u64> {
+        data_lba(&self.bpb, self.cluster).ok()
+    }
 }
 
 /// 句柄可持久化的目录游标。它不缓存 512 字节目录扇区，也不缓存 LFN 片段；
@@ -1475,10 +1479,17 @@ pub fn write_at(disk: &dyn Block, cur: &mut ReadCursor, src: &[u8]) -> Result<us
         let lba = base + (off_in_cluster / SECTOR_BYTES) as u64;
         let take = core::cmp::min(SECTOR_BYTES - in_sector, src.len() - done);
         let written = if in_sector != 0 || take != SECTOR_BYTES {
-            let mut sec = [0u8; SECTOR_BYTES];
-            block_io::read_checked(disk, lba, &mut sec, &block_io::Budget::UNBOUNDED).map_err(io)?;
-            sec[in_sector..in_sector + take].copy_from_slice(&src[done..done + take]);
-            disk.write_sectors(lba, &sec)
+            #[cfg(not(feature = "fault-block-rmw-split"))]
+            {
+                disk.read_modify_write(lba, in_sector, &src[done..done + take])
+            }
+            #[cfg(feature = "fault-block-rmw-split")]
+            {
+                let mut sec = [0u8; SECTOR_BYTES];
+                block_io::read_checked(disk, lba, &mut sec, &block_io::Budget::UNBOUNDED).map_err(io)?;
+                sec[in_sector..in_sector + take].copy_from_slice(&src[done..done + take]);
+                disk.write_sectors(lba, &sec)
+            }
         } else {
             disk.write_sectors(lba, &src[done..done + take])
         };

@@ -21,7 +21,7 @@ fn t_timer_ticks_recur() -> bool {
     // §198：收尾按原样放回（与 t_handle_reap 同一律）。本用例需要表走，所以照样开；
     // 但旧写法无条件 stop，把表停给了后面所有用例（实测边界日志钉到本用例）。
     let tick_in = apic::ticks();
-    let timer_was_running = apic::wait_ticks(tick_in, 2, clock::window_cycles(2)).ticks >= 2;
+    let timer_was_running = apic::wait_ticks(tick_in, 2, clock::window_cycles(4)).ticks >= 2;
     if apic::timer_start().is_err() {
         crate::log_fatal!("timer test: 打不开定时器中断");
         return false;
@@ -46,7 +46,7 @@ fn t_timer_ticks_recur() -> bool {
     // 游标：窗口前后各写一格 RTC 用户 RAM 并读回。宿主机拿这两个游标把 trace 里的
     // `vector 32` 投递切进这一段——simple trace 不带时间戳，没有游标就只知道全跑投了几发。
     let mk0 = apic::pit_mark();
-    let w1 = apic::wait_ticks(c0, 2, clock::window_cycles(2));
+    let w1 = apic::wait_ticks(c0, 2, clock::window_cycles(4));
     let mk1 = apic::pit_mark();
     let t1 = apic::ticks();
     // 窗口已关（with_interrupts 退出时 cli）：此刻起计数必须冻住。
@@ -57,13 +57,13 @@ fn t_timer_ticks_recur() -> bool {
     // 关 IF 那一段里 PIT 的边沿没有消失，只是被挡在 IRR 上。重新开中断必须把它们交出来——
     // 这一格证的是"挡住"而不是"丢掉"。三段判据原本没有这一条，"计数冻住"和"再开还能收到"
     // 就混成了同一件事。
-    let w_drain = apic::wait_ticks(t_after_cli, 1, clock::window_cycles(1));
+    let w_drain = apic::wait_ticks(t_after_cli, 1, clock::window_cycles(2));
     let t_drained = apic::ticks();
     // 第三段从**排空之后**起算，数的必须是新到的两个 tick。不排空就会被攒下的 backlog
     // 当场填满（实测：那一段 2 个 tick 只花 10,363,532 cycles，而第一段同样 2 个花
     // 68,040,996——同一个量两次读数差 6.6 倍，说明其中一次没在测它声称的东西）。
     let mk2 = apic::pit_mark();
-    let w2 = apic::wait_ticks(t_drained, 2, clock::window_cycles(2));
+    let w2 = apic::wait_ticks(t_drained, 2, clock::window_cycles(4));
     let mk3 = apic::pit_mark();
     let t2 = apic::ticks();
     // 四格游标单独打一行：宿主机按游标的**先后**把 trace 切成段（simple trace 不带时间戳），
@@ -184,14 +184,14 @@ fn t_no_alloc_in_isr() -> bool {
     // §198：收尾按原样放回（同一律）。本用例需要表走，所以照样开；
     // 但旧写法无条件 stop，把表停给了后面所有用例（实测边界日志钉到本用例）。
     let tick_in = apic::ticks();
-    let timer_was_running = apic::wait_ticks(tick_in, 2, clock::window_cycles(2)).ticks >= 2;
+    let timer_was_running = apic::wait_ticks(tick_in, 2, clock::window_cycles(4)).ticks >= 2;
     if apic::timer_start().is_err() {
         crate::log_fatal!("isr-alloc test: 打不开定时器中断");
         return false;
     }
     // 窗口长度按 cycles 给（同一个理由：轮数是宿主机的函数）。这里只要 1 个 tick，
     // 因为判据看的是"ISR 里发生过一次分配尝试没有"，多等只是让变异样本更难对齐。
-    let w = apic::wait_ticks(t0, 1, clock::window_cycles(1));
+    let w = apic::wait_ticks(t0, 1, clock::window_cycles(2));
     let _ = st;
     if !timer_was_running {
         apic::timer_stop().ok();
@@ -219,11 +219,30 @@ fn t_clock_calibrated_by_pit() -> bool {
     // 两把尺子数的是同一条事件流：窗口里数到 s 个 tick，ISR 就该记到 s-1 段相邻间隔。
     // 差一段就是"有一次 tick 被数了两次"或"有一间隔没记"，那 tsc_hz 直接不可信。
     let cross = cal.samples >= 2 && cal.interval_n + 1 == cal.samples;
+    let state_before = clock::current();
+    let high = clock::estimate_pit_window(200_000_000, 4, 50_000_000, (150_000_000, 3));
+    let absurd = clock::estimate_pit_window(240_000_000, 4, 60_000_000, (180_000_000, 3));
+    let missed = clock::estimate_pit_window(120_000_000, 4, 90_000_000, (90_000_000, 3));
+    let few = clock::estimate_pit_window(90_000_000, 3, 30_000_000, (60_000_000, 2));
+    let state_after = clock::current();
+    let pure = match (state_before, state_after) {
+        (Some(a), Some(b)) => a.tick_period_cycles == b.tick_period_cycles
+            && a.tsc_hz == b.tsc_hz && a.samples == b.samples
+            && a.interval_mean == b.interval_mean && a.interval_n == b.interval_n
+            && a.invariant == b.invariant,
+        (None, None) => true,
+        _ => false,
+    };
+    let range_ok = pure && high.is_ok()
+        && matches!(absurd, Err(clock::CalibrationError::OutOfRange(_)))
+        && matches!(missed, Err(clock::CalibrationError::MissedTicks { .. }))
+        && matches!(few, Err(clock::CalibrationError::NoSamples));
     crate::log_info!(
-        "clock 判据: 单位自洽={} 跨仪器等式={}（samples={} interval_n={} interval_mean={} tsc_hz={}）",
-        unit_ok, cross, cal.samples, cal.interval_n, cal.interval_mean, cal.tsc_hz
+        "clock 判据: 单位自洽={} 跨仪器等式={} 边界={} 纯校验不写状态={}（5GHz={:?} 6GHz={:?} 漏tick={:?} 少样本={:?}；samples={} interval_n={} interval_mean={} tsc_hz={}）",
+        unit_ok, cross, range_ok, pure, high, absurd, missed, few,
+        cal.samples, cal.interval_n, cal.interval_mean, cal.tsc_hz
     );
-    unit_ok && cross
+    unit_ok && cross && range_ok
 }
 ktest!(KT_CLOCK, t_clock_calibrated_by_pit);
 
