@@ -218,4 +218,135 @@ fn t_proc_kill() -> bool {
     );
     ok
 }
+#[cfg(feature = "fault-thread-grant-fail")]
+fn t_thread_create_cleanup() -> bool {
+    use crate::user::{E_EXHAUSTED, SYS_THREAD_CREATE};
+    if sched::current_identity().is_none() {
+        sched::init_boot_task();
+    }
+    let Some(owner) = sched::current_identity() else { return false };
+    let Some((hj, hp, pid, job)) = make_job_proc(owner) else { return false };
+    let pgen = proc::proc_gen(pid).unwrap_or(0);
+    let mut existing = usize::MAX;
+    let shape_ok = (|| {
+        let (aslot, _) = proc::proc_aspace(pid, pgen)?;
+        let base = 0x2_4000_0000u64;
+        let code_frame = crate::mm::phys_alloc(0, crate::mm::MOD_TEST).ok()?;
+        let stack_frame = crate::mm::phys_alloc(0, crate::mm::MOD_TEST).ok()?;
+        let _code_map = crate::mm::aspace_map_slot(
+            aslot,
+            &[code_frame.base().0],
+            crate::mm::VirtAddr(base),
+            crate::mm::PageFlags::USER_RX,
+            crate::mm::MOD_TEST,
+        ).ok()?;
+        let _stack_map = crate::mm::aspace_map_slot(
+            aslot,
+            &[stack_frame.base().0],
+            crate::mm::VirtAddr(base + crate::mm::PAGE as u64),
+            crate::mm::PageFlags::USER_RW,
+            crate::mm::MOD_TEST,
+        ).ok()?;
+        if proc::proc_attach_thread(pid).is_err() {
+            return None;
+        }
+        existing = sched::spawn(kill_worker).ok()?;
+        if !sched::set_proc_id(existing, pid) {
+            return None;
+        }
+        let before = proc::proc_info(pid as usize)?.threads;
+        let mut f = frame0();
+        f.rax = SYS_THREAD_CREATE;
+        f.rdi = hp.0;
+        f.rsi = base;
+        f.rdx = base + 2 * crate::mm::PAGE as u64 - 16;
+        crate::user::set_thread_grant_fail_for_test(true);
+        syscall_dispatch(&mut f);
+        crate::user::set_thread_grant_fail_for_test(false);
+        let after = proc::proc_info(pid as usize)?.threads;
+        let terminated = proc::proc_info(pid as usize)?.terminated;
+        crate::log_info!(
+            "thread-create-cleanup: ret={:#x} threads={}->{} terminated={}",
+            f.rax, before, after, terminated
+        );
+        Some(f.rax == E_EXHAUSTED && before == 1 && after == 1 && !terminated)
+    })().unwrap_or(false);
+    if existing != usize::MAX {
+        let _ = sched::terminate_task(existing);
+    }
+    let _ = crate::ktests::common::drain_reap();
+    let proc_clean = if proc::proc_info(pid as usize).is_some_and(|p| p.terminated) {
+        proc::proc_reap(pid).is_ok()
+    } else {
+        proc::proc_discard(pid).is_ok()
+    };
+    let job_clean = proc::job_destroy(job).is_ok();
+    let hj_clean = handle::close(hj, owner).is_ok();
+    let hp_clean = handle::close(hp, owner).is_ok();
+    let ok = shape_ok && proc_clean && job_clean && hj_clean && hp_clean;
+    crate::log_info!(
+        "thread-create-cleanup: 判据={} 计数={} 进程回收={} Job={} 句柄={}/{}",
+        ok, shape_ok, proc_clean, job_clean, hj_clean, hp_clean
+    );
+    ok
+}
+#[cfg(feature = "fault-thread-grant-fail")]
+ktest!(KT_THREAD_CREATE_CLEANUP, t_thread_create_cleanup);
+
+#[cfg(feature = "handles")]
+fn t_proc_kill_batch() -> bool {
+    const THREADS: usize = 65;
+    if sched::current_identity().is_none() {
+        sched::init_boot_task();
+    }
+    let Some(owner) = sched::current_identity() else { return false };
+    let Some((hj, hp, pid, job)) = make_job_proc(owner) else { return false };
+    let mut gids = [usize::MAX; THREADS];
+    let setup_ok = (|| {
+        for i in 0..THREADS {
+            if proc::proc_attach_thread(pid).is_err() {
+                return None;
+            }
+            let g = sched::spawn(kill_worker).ok()?;
+            let id = sched::id_of(g);
+            if !sched::set_proc_id(g, pid) {
+                return None;
+            }
+            let token = crate::sync::WaitToken { queue: 15, seq: (i as u64) << 32 | u64::from(id) };
+            if !sched::block_task(g, token) {
+                return None;
+            }
+            gids[i] = g;
+        }
+        Some(())
+    })().is_some();
+    let before = proc::proc_info(pid as usize).map_or(0, |p| p.threads);
+    let killed = sched::kill_process_threads(pid);
+    let after = proc::proc_info(pid as usize).map_or(0, |p| p.threads);
+    let all_free = gids.iter().all(|&g| g != usize::MAX && sched::state_of(g) == sched::TaskState::Free);
+    for &g in &gids {
+        if g != usize::MAX && sched::state_of(g) != sched::TaskState::Free {
+            let _ = sched::terminate_task(g);
+        }
+    }
+    let _ = crate::ktests::common::drain_reap();
+    let proc_clean = if proc::proc_info(pid as usize).is_some_and(|p| p.terminated) {
+        proc::proc_reap(pid).is_ok()
+    } else {
+        proc::proc_discard(pid).is_ok()
+    };
+    let job_clean = proc::job_destroy(job).is_ok();
+    let hj_clean = handle::close(hj, owner).is_ok();
+    let hp_clean = handle::close(hp, owner).is_ok();
+    let ok = setup_ok && before == THREADS as u16 && killed == THREADS && after == 0
+        && all_free && proc_clean && job_clean && hj_clean && hp_clean;
+    crate::log_info!(
+        "prockill-batch: 判据={} 建={} 线程={}->{} 杀={} 全Free={} 清理={}/{}/{}/{}",
+        ok, setup_ok, before, after, killed, all_free, proc_clean, job_clean, hj_clean, hp_clean
+    );
+    ok
+}
+#[cfg(feature = "handles")]
+ktest!(KT_PROC_KILL_BATCH, t_proc_kill_batch);
+
 ktest!(KT_PROC_KILL, t_proc_kill);

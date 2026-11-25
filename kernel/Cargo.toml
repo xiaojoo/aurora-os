@@ -44,6 +44,8 @@ negative-probe = []
 fault-lock-open-before-cas = []
 fault-sdkdemo-no-cleanup = []
 fault-no-irq-settle = []
+fault-thread-grant-fail = ["handles"]
+fault-kill-single-batch = ["handles"]
 # A2 切片（ADR-130）：**产品路径上的外部 ELF 执行取证档**——init 编排在 S4a 之后
 # 用 A2 语义（argv 区 + std 句柄继承）启动 execprobe，串口与退出码双锚点判定。
 a2-exec = ["handles"]

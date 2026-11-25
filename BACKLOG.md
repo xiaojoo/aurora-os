@@ -25955,3 +25955,37 @@ ADR-220 的未决 1/4 在产品句柄路径关闭，旧 `fs_open::open` 与 exec
 - 锁等级、锁序、看门狗阈值与开窗准入条件均不改。
 - 只关闭已定位的元数据发布窗口，不宣称所有 rank20 超时都已归因；真机未验证。
 - `OpenSpinLock` 的重入/超时仍是单独审计项，不在本片偷换成通用锁。
+
+## 581. ADR-075 补记：thread_create 失败双扣与 process_kill 单批 64（2026-11-25）
+
+### thread_create 失败清理
+
+`set_proc_id` 成功后，`terminate_task` 已通过 `proc_thread_exited` 归还线程计数；
+原 `block_task` / `grant_thread` 失败路径又调 `proc_detach_thread`，多线程进程会
+`threads 1→0` 却不写终止信号。修法是拆分 `set_aspace_root` / `set_proc_id` 失败分支，
+只有尚未挂 proc_id 的构造失败才 detach；挂上之后由 terminate 统一收口。
+
+局部注入 `fault-thread-grant-fail` 只在测试调用期间置位。`t_thread_create_cleanup`
+先给进程挂一条已有线程，再让第二条在 grant 处失败：
+
+| 场景 | 读数 |
+|---|---|
+| 修复前 | `run-15230`：`ret=-6 threads=1->0 terminated=false`，FAIL |
+| 修复后 | `run-15231`：`ret=-6 threads=1->1 terminated=false`，handles **133/133** PASS |
+
+### process_kill 分批
+
+原 `kill_process_threads` 只终止第一批 64 条，而 syscall 只调用一次；65 线程进程
+会留 1 条。修法是在同一函数内按 64 条分批重扫，最多覆盖全表；栈数组仍固定 64 项。
+
+| 场景 | 读数 |
+|---|---|
+| 单批负样本 | `run-15233`：`线程=65->1 杀=64 全Free=false`，FAIL |
+| 分批修复 | `run-15234`：`线程=65->0 杀=65 全Free=true`，handles **133/133** PASS |
+| `check` | **22/22** |
+| 完整矩阵 | 原始 **81/82 符合**；唯一偏差是 A3 代码字节行同跑 `t_elf_load_run` 偶发失败，同一 ELF `96fa51d57bf0…` 单跑 `run-15323` PASS（166/166，S4b 拒因/合计均对），记环境形状、不归因，不改判据、不重跑整链 |
+
+### 边界
+
+- `terminate_task` 的越界/Free/release_depth 待办语义不变；不改锁序、ABI 或进程结局口径。
+- 真机未验证。

@@ -2431,23 +2431,37 @@ pub fn kill_process_threads(proc_id: u16) -> usize {
     // 直接把内核栈打穿 ⇒ `unexpected vector=8`（Double Fault，反汇编可见
     // `sys_process_kill_core` 里连减三次 `subq $0x1000, %rsp`）。
     //
-    // 一个有进程的线程数不可能到 2048；取 64 并把超出的部分**分批判**
-    // （下面的循环已经按 `list.len()` 截断，多轮调用会继续收剩下的）。
+    // 一个有进程的线程数不可能到 2048；取 64 并把超出的部分在本函数内分批判。
     const KILL_BATCH: usize = 64;
     let mut list = [0usize; KILL_BATCH];
-    let mut n = 0usize;
-    for gi in 0..MAX_TASKS_TOTAL {
-        if state_of(gi) != TaskState::Free && proc_id_of(gi) == proc_id {
-            if n < list.len() {
-                list[n] = gi;
-                n += 1;
+    #[cfg(feature = "fault-kill-single-batch")]
+    let passes = 1;
+    #[cfg(not(feature = "fault-kill-single-batch"))]
+    let passes = MAX_TASKS_TOTAL / KILL_BATCH + 1;
+    let mut killed = 0usize;
+    for _ in 0..passes {
+        let mut n = 0usize;
+        for gi in 0..MAX_TASKS_TOTAL {
+            if state_of(gi) != TaskState::Free && proc_id_of(gi) == proc_id {
+                if n < list.len() {
+                    list[n] = gi;
+                    n += 1;
+                }
             }
         }
-    }
-    let mut killed = 0usize;
-    for gi in list.iter().take(n) {
-        if terminate_task(*gi) {
-            killed += 1;
+        if n == 0 {
+            break;
+        }
+        for gi in list.iter().take(n) {
+            if terminate_task(*gi) {
+                killed += 1;
+            }
+        }
+        #[cfg(feature = "fault-kill-single-batch")]
+        break;
+        #[cfg(not(feature = "fault-kill-single-batch"))]
+        if n < KILL_BATCH {
+            break;
         }
     }
     killed

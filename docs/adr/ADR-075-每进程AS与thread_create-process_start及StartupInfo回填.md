@@ -775,3 +775,40 @@ P5c-1 落地时按四种做，`ObjRef::Thread { gidx, id }` 已在表里）。
 7. ~~**`Thread` 对象要不要独立句柄**~~（**已裁：要**，P5c-1 已发 `ObjRef::Thread`）。设计 §10.6 第 3 条把 `thread_wait` 列为"由用例逼出来再定"。
    Q3 已裁通用 `object_wait`（19 号，P6），所以线程级等待免费得到；但 `Thread` 作为一种 kind
    是否要在 P5c 就发句柄（还是只用 `gidx` 内部标识），本文提议**只内部标识**，等 P6 真需要 wait 它时再发。
+
+## 补记：thread_create 失败清理与 process_kill 分批契约（2026-11-25，实测）
+
+### thread_create：proc_id 登记后的失败只能扣一次
+
+`set_proc_id` 成功后，`terminate_task` 已经通过 `proc_thread_exited` 归还线程计数。
+原 `block_task` / `grant_thread` 失败路径又调 `proc_detach_thread`，会在多线程进程里
+把计数从 1 再扣到 0，却不写终止信号，留下“线程数为 0 但仍 Running”的进程。
+
+修法：把 `set_aspace_root` 与 `set_proc_id` 拆成两个失败分支；只有尚未挂上 proc_id
+的构造失败才 `proc_detach_thread`。挂上之后统一由 `terminate_task` 收口。
+
+局部故障注入 `fault-thread-grant-fail` 只在测试调用期间置位，不污染同档其他
+`thread_create`。`t_thread_create_cleanup` 先给进程挂一条已有线程，再让第二条在
+grant 处失败：
+
+| 场景 | 读数 |
+|---|---|
+| 修复前 | `run-15230`：`ret=-6 threads=1->0 terminated=false`，FAIL |
+| 修复后 | `run-15231`：`ret=-6 threads=1->1 terminated=false`，handles **133/133** PASS |
+
+### process_kill：64 条栈批次必须在本函数内继续
+
+`kill_process_threads` 原来只收集并终止第一批 64 条，而 syscall 只调用一次；
+65 线程进程会留下 1 条。修法是在同一函数内按 64 条分批重扫，最多覆盖
+`MAX_TASKS_TOTAL` 全表；栈数组仍固定 64 项，不随任务容量增长。
+
+`t_proc_kill_batch` 建 65 条停住线程并直接调内核入口。负样本
+`fault-kill-single-batch` 恢复单批：`run-15233` 读到 `线程=65->1 杀=64 全Free=false`；
+正常分批 `run-15234` 为 `线程=65->0 杀=65 全Free=true`，handles **133/133** PASS。
+
+`check` **22/22**；完整矩阵原始 **81/82**，唯一 A3 代码字节行受同跑
+`t_elf_load_run` 偶发失败拖累，同一 ELF `96fa51d57bf0…` 单跑 `run-15323`
+PASS（166/166，S4b 拒因与合计均对），按环境形状、不归因处理。
+
+边界：`terminate_task` 返回 false 的越界/Free/ release_depth 待办语义不变；
+本补记只修调用方重复归还与批次截断，不改锁序、ABI 或进程结局口径。真机未验证。

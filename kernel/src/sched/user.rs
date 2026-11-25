@@ -8,6 +8,8 @@
 //! 生效位与架构偏移 ADR-026、结束与回收 ADR-027、地址分区与落脚页 ADR-028，
 //! 手册 §10.1 / §10.2 / §10.3.1 / §10.7。
 
+#[cfg(feature = "fault-thread-grant-fail")]
+use core::sync::atomic::AtomicBool;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{elf, mm};
@@ -1293,6 +1295,14 @@ fn sys_process_create(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     }
 }
 
+#[cfg(feature = "fault-thread-grant-fail")]
+static THREAD_GRANT_FAIL: AtomicBool = AtomicBool::new(false);
+
+#[cfg(feature = "fault-thread-grant-fail")]
+pub(crate) fn set_thread_grant_fail_for_test(fail: bool) {
+    THREAD_GRANT_FAIL.store(fail, Ordering::Release);
+}
+
 /// 15：在子进程的 AS 里建一条线程，**建出来就停住**，等 16 号回填完 `StartupInfo` 才放它跑。
 ///
 /// 为什么 spawn 与 block 之间不会被抢走：两条用户→内核入口都关 IF——`int 0x80` 是**中断门**
@@ -1346,7 +1356,12 @@ fn sys_thread_create(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
         }
     };
     let id = crate::sched::id_of(g);
-    if !crate::sched::set_aspace_root(g, aslot, pml4) || !crate::sched::set_proc_id(g, pid) {
+    if !crate::sched::set_aspace_root(g, aslot, pml4) {
+        let _ = crate::sched::terminate_task(g);
+        let _ = crate::proc::proc_detach_thread(pid);
+        return E_EXHAUSTED;
+    }
+    if !crate::sched::set_proc_id(g, pid) {
         let _ = crate::sched::terminate_task(g);
         let _ = crate::proc::proc_detach_thread(pid);
         return E_EXHAUSTED;
@@ -1362,17 +1377,24 @@ fn sys_thread_create(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     let _ = (pid, pgen);
     if !crate::sched::block_task(g, start_token(g, id)) {
         let _ = crate::sched::terminate_task(g);
-        let _ = crate::proc::proc_detach_thread(pid);
         return E_EXHAUSTED;
     }
     // 要带 WRITE：16 号"放它跑"是对这条线程的写操作，只有 READ/TRANSFER 的名字不该能启动它
     let rights = crate::handle::RIGHT_READ | crate::handle::RIGHT_WRITE
         | crate::handle::RIGHT_DUP | crate::handle::RIGHT_TRANSFER;
-    match crate::handle::grant_thread(owner, g, id, rights) {
+    #[cfg(feature = "fault-thread-grant-fail")]
+    let granted: Result<crate::handle::Handle, crate::handle::HErr> =
+        if THREAD_GRANT_FAIL.load(Ordering::Acquire) {
+            Err(crate::handle::HErr::Exhausted)
+        } else {
+            crate::handle::grant_thread(owner, g, id, rights)
+        };
+    #[cfg(not(feature = "fault-thread-grant-fail"))]
+    let granted = crate::handle::grant_thread(owner, g, id, rights);
+    match granted {
         Ok(h) => h.0,
         Err(e) => {
             let _ = crate::sched::terminate_task(g);
-            let _ = crate::proc::proc_detach_thread(pid);
             handle_err(e)
         }
     }
