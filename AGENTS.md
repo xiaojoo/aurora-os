@@ -110,9 +110,9 @@ AsyncBlock 真异步核心与 AHCI/virtio-blk/NVMe 单槽适配、独立 ring3 �
    W5 身份/槽位 + ADR-011 正式方案 + W12 生产钥匙（ADR-080 未决 1）。
 3. **真机（M7）零条已测**——`docs/hardware/bringup.md` 的 **51 条**（H-01…H-51）全是
    「待测/未验证」。没有机型就没有 M7 的通过。
-4. **块设备真异步的产品闭环**——ADR-259 的租约状态机、三驱动单槽异步、ring3 broker、同步
-   `read_checked` 等待包装与 `resident-init` 常驻 pump 已交付；仍开：NVMe 队列深度内多
-   outstanding 与禁用/致命态排空。真机未验证，不能写成“已完成”。
+4. **块设备真异步的产品闭环**——ADR-259 的租约状态机、三驱动异步、NVMe 八槽与排空恢复、
+   ring3 broker、同步 `read_checked` 包装与 `resident-init` 常驻 pump 已交付。代码侧闭环，
+   真机未验证，不能写成“真机已完成”。
 
 **长链抖动仍有未归因 residual**：具体成因中的日志放大器、XFER 锁序、信箱回收、q2 持袋栈、
 工人抢占与 thread_create 构造窗口已分别归因/修复；剩余同 ELF 可清除的 SMP/PIT/sdkdemo 等

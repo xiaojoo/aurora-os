@@ -580,13 +580,16 @@ impl AsyncBlock for NvmeDisk {
     }
 
     fn reap(&self, out: &mut [IoCompletion]) -> usize {
+        #[cfg(not(feature = "fault-nvme-multi-drop"))]
+        let cap = out.len().min(crate::nvme::DATA_SLOTS);
+        #[cfg(feature = "fault-nvme-multi-drop")]
         let cap = out.len().min(1);
-        let mut done = [crate::nvme::NvmeIoCompletion { local_id: 0, sectors_done: 0, error: None }; 1];
+        let mut done = [crate::nvme::NvmeIoCompletion { local_id: 0, sectors_done: 0, error: None }; crate::nvme::DATA_SLOTS];
         #[cfg(not(feature = "fault-nvme-reap-drop"))]
         let n = crate::nvme::async_reap(&mut done[..cap]).min(cap);
         #[cfg(feature = "fault-nvme-reap-drop")]
         let n = {
-            // 单槽变异：先消费真实完成，再故意不交给调用方，证“回执不能丢”。
+            // 变异：先消费真实完成，再故意不交给调用方，证“回执不能丢”。
             let _ = crate::nvme::async_reap(&mut done);
             0
         };

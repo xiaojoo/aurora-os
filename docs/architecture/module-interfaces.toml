@@ -708,9 +708,11 @@ public_api = [
   "virtio::async_quarantine_for_test", "virtio::async_recover_for_test",
   "virtio::net_info", "ahci::State", "ahci::info", "ahci::state", "nvme::NvmeError",
   "nvme::read_lba", "nvme::write_lba", "nvme::NvmeCancel", "nvme::NvmeIoCompletion",
-  "nvme::NvmeAsyncStats", "nvme::async_alloc_lease", "nvme::async_copy_in", "nvme::async_copy_out",
+  "nvme::NvmeAsyncStats", "nvme::NvmeDrain", "nvme::DATA_SLOTS", "nvme::DATA_STRIDE",
+  "nvme::async_alloc_lease", "nvme::async_copy_in", "nvme::async_copy_out",
   "nvme::async_submit", "nvme::async_reap", "nvme::async_cancel", "nvme::async_release", "nvme::async_stats",
   "nvme::async_quarantine_for_test", "nvme::async_recover_for_test", "nvme::async_force_sync_timeout_for_test",
+  "nvme::async_drain", "nvme::async_recover", "nvme::async_inject_fatal_for_test", "nvme::async_clear_fatal_for_test",
   "nvme::init", "virtio::probe", "driver::MatchRule", "driver::ProbeOutcome",
   "driver::DriverEntry", "driver::MAX_DRIVERS", "driver::register", "driver::registered", "driver::driver_name",
   "driver::registry_clear", "driver::probe_device", "driver::register_builtin", "driver::matching_rules",
@@ -732,7 +734,7 @@ error_classes = ["A", "B", "C"]
 resource_ownership = "驱动模块身份、MMIO/DMA 能力句柄表、槽位与 generation、授权与撤销状态、驱动资源统计；kdump 专用 AHCI 口与常驻 DMA 环由 capture 编排独占。"
 error_policy = "Denied/WrongContext/ResourceExhausted/MappingError；越权/世代不匹配 → 拒绝并记事件。"
 unsafe_scope = ["driver/mod:U3,U4", "driver/ahci:U4", "driver/virtio:U4", "driver/nvme:U4"]
-test_targets = ["t_driver_ctx", "t_ahci_lock_rank_guard", "t_virtio_async", "t_virtio_lock_rank_guard", "t_virtio_quarantine", "t_ahci_async", "t_ahci_async_write", "t_ahci_async_quarantine", "t_ahci_async_poisoned_reap", "t_ahci_async_cross_port_release", "t_ahci_checked_async_wrap", "t_nvme_async", "t_nvme_checked_async_wrap"]
+test_targets = ["t_driver_ctx", "t_ahci_lock_rank_guard", "t_virtio_async", "t_virtio_lock_rank_guard", "t_virtio_quarantine", "t_ahci_async", "t_ahci_async_write", "t_ahci_async_quarantine", "t_ahci_async_poisoned_reap", "t_ahci_async_cross_port_release", "t_ahci_checked_async_wrap", "t_nvme_async", "t_nvme_checked_async_wrap", "t_nvme_multi", "t_nvme_drain_recover"]
 status = "部分落地"
 
 [modules."pci"]

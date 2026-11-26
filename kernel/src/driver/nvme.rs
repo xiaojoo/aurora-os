@@ -90,6 +90,8 @@ pub const CQE_BYTES: usize = 16;
 pub const SQE_LOG2: u8 = 6;
 /// CQE 16 字节 ⇒ 4。
 pub const CQE_LOG2: u8 = 4;
+pub const CC_CONFIG: u32 = CC_EN | ((SQE_LOG2 as u32) << 16) | ((CQE_LOG2 as u32) << 20);
+pub const AQA_CONFIG: u32 = ((QDEPTH as u32 - 1) & 0xFFF) | (((QDEPTH as u32 - 1) & 0xFFF) << 16);
 
 /// 队列深度。取 8 而不是 MQES 的上限：判据只需要"能排队、能收完成"，
 /// 而 8 条 × 64 字节 = 512 字节 = 正好一页，切起来干净。
@@ -103,14 +105,17 @@ pub const OFF_IO_SQ: usize = 8192;
 pub const OFF_IO_CQ: usize = 12288;
 /// 数据页（一次一扇区）。
 pub const OFF_DATA: usize = 16384;
-/// 总共要几页：4 个环 + 1 个数据页 = 5 页**内容**，但 `alloc_dma` 只接受
+/// 总共要几页：4 个环 + 8 个单扇区数据槽 = 12 页内容，但 `alloc_dma` 只接受
 /// **2 的幂**的页数（它内部是 `(len / PAGE).ilog2()`，向下取整**静默截断**），
-/// 所以取 8。
+/// 所以取 16。
 ///
 /// **实测教训**：第一版写 5，`(5).ilog2() = 2` ⇒ 实际只映了 4 页，
 /// 而 `OFF_DATA = 16384` 在第 5 页 ⇒ 写数据页当场 `#PF err=0x2`。
 /// 这个坑不报错、只截断，所以把契约写在这里。
-pub const DMA_PAGES: usize = 8;
+pub const DMA_PAGES: usize = 16;
+pub const DATA_SLOTS: usize = QDEPTH;
+const PAGE_BYTES: usize = 4096;
+pub const DATA_STRIDE: usize = PAGE_BYTES;
 
 /// Identify 的返回缓冲是 4096 字节（规范固定），而一块 DMA 只有 5 页，
 /// 所以 Identify 复用数据页那一段（它只在初始化时用，与数据读写不重叠）。
@@ -141,7 +146,7 @@ pub enum NvmeError {
     IoQueueNotReady,
     /// 句柄表拒绝（映射/DMA/中断）
     Ctx(DriverError),
-    /// 单槽异步租约已被占用，或适配器已隔离。
+    /// 异步租约表已满，或适配器已隔离。
     AsyncBusy,
     /// 数据长度与租约容量不一致：`(期望, 实际)`。
     BadLen { want: usize, got: usize },
@@ -159,7 +164,7 @@ impl NvmeError {
             NvmeError::QueueTooDeep { .. } => "队列深度超出 CAP.MQES",
             NvmeError::IoQueueNotReady => "I/O 队列还没建（Create I/O CQ/SQ 未做）",
             NvmeError::Ctx(_) => "句柄表拒绝",
-            NvmeError::AsyncBusy => "异步单槽忙或适配器已隔离",
+            NvmeError::AsyncBusy => "异步租约表满或适配器已隔离",
             NvmeError::BadLen { .. } => "数据长度与租约容量不一致",
         }
     }
@@ -233,7 +238,7 @@ enum AsyncSlotState {
     Completed,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct AsyncSlot {
     state: AsyncSlotState,
     local_id: u64,
@@ -251,7 +256,7 @@ impl AsyncSlot {
 }
 
 struct AsyncIoState {
-    slot: AsyncSlot,
+    slots: [AsyncSlot; DATA_SLOTS],
     next_id: u64,
     submitted: u32,
     completed: u32,
@@ -260,12 +265,13 @@ struct AsyncIoState {
     wait_calls: u32,
     poisoned: bool,
     force_sync_timeout: bool,
+    force_fatal: bool,
 }
 
 impl AsyncIoState {
     const fn new() -> Self {
         Self {
-            slot: AsyncSlot::EMPTY,
+            slots: [AsyncSlot::EMPTY; DATA_SLOTS],
             next_id: 1,
             submitted: 0,
             completed: 0,
@@ -274,6 +280,7 @@ impl AsyncIoState {
             wait_calls: 0,
             poisoned: false,
             force_sync_timeout: false,
+            force_fatal: false,
         }
     }
 }
@@ -304,6 +311,14 @@ pub struct NvmeAsyncStats {
     pub wait_calls: u32,
     pub occupied: usize,
     pub poisoned: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NvmeDrain {
+    pub completed: usize,
+    pub outstanding: usize,
+    pub disabled: bool,
+    pub queues_deleted: bool,
 }
 
 struct InnerState {
@@ -350,7 +365,10 @@ fn with_io<R>(body: impl FnOnce(&mut InnerState, &mut AsyncIoState) -> R) -> Res
     // 原始指针建立 `inner` 的可变视图。不能预先创建重叠的 `&mut State`。
     let st = unsafe { &*STATE.0.get() }.as_ref().ok_or(NvmeError::NoDevice)?;
     let inner_ptr = &raw const st.inner as *mut InnerState;
-    let mut io = st.io_lock.lock_checked().ok_or(NvmeError::AsyncBusy)?;
+    let mut io = match st.io_lock.lock_checked() {
+        Some(io) => io,
+        None => return Err(NvmeError::AsyncBusy),
+    };
     // SAFETY: `inner_ptr` 来自已发布的 `UnsafeCell`（`STATE.0.get()`）；此刻持有其唯一 `io_lock`。
     let inner = unsafe {
         &mut *inner_ptr
@@ -462,7 +480,7 @@ pub fn init() -> Result<Reading, NvmeError> {
 
     // ---- 3b) AQA + ASQ + ACQ，然后 CC.EN
     // AQA: 低 12 位 = ASQS（深度-1），高 12 位 = ACQS。两边同深度。
-    let aqa = ((QDEPTH as u32 - 1) & 0xFFF) | (((QDEPTH as u32 - 1) & 0xFFF) << 16);
+    let aqa = AQA_CONFIG;
     wr32(&ctx, mmio, REG_AQA, aqa)?;
     // ASQ/ACQ 是 64 位物理地址：低半 + 高半
     wr32(&ctx, mmio, REG_ASQ, asq_bus as u32)?;
@@ -488,8 +506,7 @@ pub fn init() -> Result<Reading, NvmeError> {
     // 规范 Figure 34：CC = EN(0) | CSS(6..4) | MPS(10..7) | AMS(13..11)
     //   | SHN(15..14) | IOSQES(19..16) | IOCQES(23..20)。
     // SQE 64 字节 ⇒ log2 = 6；CQE 16 字节 ⇒ log2 = 4。
-    let cc = CC_EN | ((SQE_LOG2 as u32) << 16) | ((CQE_LOG2 as u32) << 20);
-    wr32(&ctx, mmio, REG_CC, cc)?;
+    wr32(&ctx, mmio, REG_CC, CC_CONFIG)?;
     // 等 RDY。窗口按"最多转这么多轮"给，而不是按周期——
     // 周期要时钟，而时钟标定可能还没跑（§442 那次就是这么红的）。
     let mut spins = 0u32;
@@ -745,63 +762,55 @@ fn poll_cqe(st: &InnerState, q: Q, cid: u16) -> Result<bool, NvmeError> {
     Ok(got_cid == cid || (phase == 1) == qs.phase)
 }
 
-/// 等一条命令的完成项。返回时已经把 CQ 的头推进过。
-fn wait_cqe(st: &mut InnerState, q: Q, cid: u16) -> Result<(), NvmeError> {
+/// 取走 CQ 头的一条完成；`wait=false` 时只读当前已发布项，不空转。
+fn take_cqe(st: &mut InnerState, q: Q, wait: bool, timeout_cid: u16) -> Result<Option<(u16, u16)>, NvmeError> {
     let qid = q.qid();
     let mut spins = 0u32;
     loop {
-        if spins >= 2_000_000 {
-            return Err(NvmeError::CmdTimeout { cid });
+        if wait && spins >= 2_000_000 {
+            return Err(NvmeError::CmdTimeout { cid: timeout_cid });
         }
         spins += 1;
         let qs = st.q[qid as usize];
-        let cq_off = match qid {
-            0 => OFF_ADMIN_CQ,
-            _ => OFF_IO_CQ,
-        };
+        let cq_off = if qid == 0 { OFF_ADMIN_CQ } else { OFF_IO_CQ };
         let off = cq_off + qs.cq_head as usize * CQE_BYTES;
         let d3 = st.ctx.dma_read32(st.dma, off + 12)?;
-        // CQE 的 DW3 布局。
-        //
-        // **实测（QEMU 11.1）**：CID(0..15) | phase(16) | status(17..31)。
-        // 两条独立证据：
-        //   I/O READ：trace `cid 5 status 0x0` ↔ d3=0x10005
-        //             ⇒ CID=5、phase=1、status=0
-        //   Identify：d3=0x10001 ⇒ CID=1、phase=1、status=0
-        //
-        // **规范 Figure 38 是 CID(16..31) | status(1..15) | phase(0)，与此不同。**
-        // 按规范写时 `0x10001` 恰好也得出 CID=1/status=0/phase=1（**巧合**），
-        // 于是 admin 队列「看起来能用」；而 `0x10005` 在旧假设下得出
-        // CID=1/status=2 ⇒ I/O 命令被判成 CmdFailed。
-        //
-        // **巧合通过的那一次掩盖了布局错误两轮**（BACKLOG §454）。
+        // QEMU 11.1 实测布局：CID(0..15) | phase(16) | status(17..31)。
         let got_cid = (d3 & 0xFFFF) as u16;
         let phase = ((d3 >> 16) & 1) as u8;
         let status = ((d3 >> 17) & 0x7FFF) as u16;
-        // 这一格被写过：CID 是我们的，或 phase 与本圈期望值一致。
-        let written = got_cid == cid || (phase == 1) == qs.phase;
-        if written {
+        if (phase == 1) == qs.phase {
             let qsm = &mut st.q[qid as usize];
             qsm.cq_head = ((qsm.cq_head as usize + 1) % qsm.depth as usize) as u16;
             if qsm.cq_head == 0 {
                 qsm.phase = !qsm.phase;
             }
             let head = qsm.cq_head;
-            // 推 CQ head 门铃：qid 0 = 0x1004、qid 1 = 0x100c
             let cq_db = 0x1000usize + qid as usize * 8 + 4;
             wr32(&st.ctx, st.mmio, cq_db as u64, head as u32)?;
-            if status != 0 {
-                return Err(NvmeError::CmdFailed { cid: got_cid, status });
-            }
-            if got_cid != cid {
-                return Err(NvmeError::CmdFailed { cid: got_cid, status: 0xFFFF });
-            }
-            return Ok(());
+            return Ok(Some((got_cid, status)));
+        }
+        if !wait {
+            return Ok(None);
         }
     }
 }
+
+/// 等指定命令的完成项；admin 与同步路径始终只有一条在飞。
+fn wait_cqe(st: &mut InnerState, q: Q, cid: u16) -> Result<(), NvmeError> {
+    let Some((got_cid, status)) = take_cqe(st, q, true, cid)? else {
+        return Err(NvmeError::CmdTimeout { cid });
+    };
+    if status != 0 {
+        return Err(NvmeError::CmdFailed { cid: got_cid, status });
+    }
+    if got_cid != cid {
+        return Err(NvmeError::CmdFailed { cid: got_cid, status: 0xFFFF });
+    }
+    Ok(())
+}
 /// 发射一条 I/O 命令，不等待完成。同步与异步路径共用，避免两套命令布局漂移。
-fn submit_io(st: &mut InnerState, lba: u64, write: bool) -> Result<u16, NvmeError> {
+fn submit_io(st: &mut InnerState, lba: u64, write: bool, data_off: usize) -> Result<u16, NvmeError> {
     // 走 **I/O 队列**。`submit` 会在 `depth == 0`（队列没建起来）时返回
     // `IoQueueNotReady` —— 那条保护在队列状态里，不在调用方硬编码。
     //
@@ -810,9 +819,10 @@ fn submit_io(st: &mut InnerState, lba: u64, write: bool) -> Result<u16, NvmeErro
     // **opcode 按队列解释，发错队列不会报「队列错」。**
     let op = if write { OP_IO_WRITE } else { OP_IO_READ };
     submit(st, Q::Io, op, 1, |st, off| {
-        // DPTR = PRP1 = 数据页
-        st.ctx.dma_write32(st.dma, off + 24, st.data_bus as u32)?;
-        st.ctx.dma_write32(st.dma, off + 28, (st.data_bus >> 32) as u32)?;
+        // DPTR = PRP1 = 本租约的数据槽
+        let data_bus = st.data_bus + (data_off - OFF_DATA) as u64;
+        st.ctx.dma_write32(st.dma, off + 24, data_bus as u32)?;
+        st.ctx.dma_write32(st.dma, off + 28, (data_bus >> 32) as u32)?;
         // CDW10..11 = SLBA（低 32 / 高 32）
         st.ctx.dma_write32(st.dma, off + 40, lba as u32)?;
         st.ctx.dma_write32(st.dma, off + 44, (lba >> 32) as u32)?;
@@ -848,8 +858,12 @@ fn sync_wait_failed(io: &mut AsyncIoState, error: NvmeError) -> NvmeError {
 fn io_lba(lba: u64, buf: &mut [u8], write: bool) -> Result<(), NvmeError> {
     with_io(|st, io| {
         #[cfg(not(feature = "fault-nvme-sync-interleave"))]
-        if io.poisoned || io.slot.state != AsyncSlotState::Free {
+        if io.poisoned || io.slots.iter().any(|slot| slot.state != AsyncSlotState::Free) {
             return Err(NvmeError::AsyncBusy);
+        }
+        let csts = rd32(&st.ctx, st.mmio, REG_CSTS)?;
+        if io.force_fatal || csts & CSTS_CFS != 0 {
+            return Err(NvmeError::ControllerFatal { csts });
         }
         #[cfg(feature = "fault-nvme-sync-interleave")]
         let _ = io;
@@ -864,7 +878,7 @@ fn io_lba(lba: u64, buf: &mut [u8], write: bool) -> Result<(), NvmeError> {
         } else {
             st.ctx.dma_fill(st.dma, OFF_DATA, 0, crate::mm::PAGE)?;
         }
-        let cid = submit_io(st, lba, write)?;
+        let cid = submit_io(st, lba, write, OFF_DATA)?;
         if let Err(error) = wait_cqe(st, Q::Io, cid) {
             return Err(sync_wait_failed(io, error));
         }
@@ -875,21 +889,44 @@ fn io_lba(lba: u64, buf: &mut [u8], write: bool) -> Result<(), NvmeError> {
     })?
 }
 
-/// 预留唯一 DMA 租约。当前 PRP1/单数据页只支持一个 LBA。
+fn slot_index(io: &AsyncIoState, local_id: u64) -> Option<usize> {
+    io.slots.iter().position(|slot| slot.local_id == local_id && slot.state != AsyncSlotState::Free)
+}
+
+fn slot_data_off(index: usize) -> usize {
+    OFF_DATA + index * DATA_STRIDE
+}
+
+fn finish_completion(io: &mut AsyncIoState, cid: u16, status: u16) -> Option<NvmeIoCompletion> {
+    let slot = io.slots.iter_mut().find(|slot| slot.state == AsyncSlotState::InFlight && slot.cid == cid)?;
+    slot.state = AsyncSlotState::Completed;
+    io.completed += 1;
+    Some(NvmeIoCompletion {
+        local_id: slot.local_id,
+        sectors_done: if status == 0 { slot.sectors } else { 0 },
+        error: if status == 0 { None } else { Some(NvmeError::CmdFailed { cid, status }) },
+    })
+}
+
+/// 预留一个 DMA 数据槽。当前 PRP1/单数据页只支持一个 LBA。
 pub fn async_alloc_lease(sectors: u32) -> Result<u32, NvmeError> {
-    with_io(|_, io| {
+    with_io(|st, io| {
         if sectors != 1 {
             return Err(NvmeError::BadLen { want: 1, got: sectors as usize });
         }
-        if io.poisoned || io.slot.state != AsyncSlotState::Free {
+        let csts = rd32(&st.ctx, st.mmio, REG_CSTS)?;
+        if io.poisoned || io.force_fatal || csts & CSTS_CFS != 0 {
             return Err(NvmeError::AsyncBusy);
         }
+        let Some(index) = io.slots.iter().position(|slot| slot.state == AsyncSlotState::Free) else {
+            return Err(NvmeError::AsyncBusy);
+        };
         if io.next_id == u64::MAX || io.next_id > u64::from(u32::MAX) {
             return Err(NvmeError::AsyncBusy);
         }
         let local_id = io.next_id;
         io.next_id += 1;
-        io.slot = AsyncSlot {
+        io.slots[index] = AsyncSlot {
             state: AsyncSlotState::Reserved,
             local_id,
             sectors,
@@ -899,66 +936,67 @@ pub fn async_alloc_lease(sectors: u32) -> Result<u32, NvmeError> {
     })?
 }
 
-/// 写入 Reserved 租约的数据页；长度必须精确等于租约容量。
+/// 写入 Reserved 租约的数据槽；长度必须精确等于租约容量。
 pub fn async_copy_in(lease: u32, src: &[u8]) -> Result<(), NvmeError> {
     with_io(|st, io| {
-        if u64::from(lease) != io.slot.local_id || io.slot.state != AsyncSlotState::Reserved {
+        let index = slot_index(io, u64::from(lease)).ok_or(NvmeError::AsyncBusy)?;
+        if io.slots[index].state != AsyncSlotState::Reserved {
             return Err(NvmeError::AsyncBusy);
         }
-        let want = io.slot.sectors as usize * st.lba_bytes;
+        let want = io.slots[index].sectors as usize * st.lba_bytes;
         if src.len() != want {
             return Err(NvmeError::BadLen { want, got: src.len() });
         }
-        st.ctx.dma_copy_in(st.dma, OFF_DATA, src).map_err(NvmeError::Ctx)
+        st.ctx.dma_copy_in(st.dma, slot_data_off(index), src).map_err(NvmeError::Ctx)
     })?
 }
 
 /// 从 Completed 租约读回数据。短输出只取前缀，不消费完成或释放租约。
 pub fn async_copy_out(lease: u32, dst: &mut [u8]) -> Result<(), NvmeError> {
     with_io(|st, io| {
-        if u64::from(lease) != io.slot.local_id || io.slot.state != AsyncSlotState::Completed {
+        let index = slot_index(io, u64::from(lease)).ok_or(NvmeError::AsyncBusy)?;
+        if io.slots[index].state != AsyncSlotState::Completed {
             return Err(NvmeError::AsyncBusy);
         }
-        let want = io.slot.sectors as usize * st.lba_bytes;
+        let want = io.slots[index].sectors as usize * st.lba_bytes;
         if dst.len() > want {
             return Err(NvmeError::BadLen { want, got: dst.len() });
         }
-        st.ctx.dma_copy_out(st.dma, OFF_DATA, dst).map_err(NvmeError::Ctx)
+        st.ctx.dma_copy_out(st.dma, slot_data_off(index), dst).map_err(NvmeError::Ctx)
     })?
 }
 
 /// 只发射并返回单调 local_id；完成证据只由 `async_reap` 收集。
 pub fn async_submit(lease: u32, lba: u64, sectors: u32, write: bool) -> Result<u64, NvmeError> {
     with_io(|st, io| {
-        if u64::from(lease) != io.slot.local_id || io.slot.state != AsyncSlotState::Reserved {
+        let index = slot_index(io, u64::from(lease)).ok_or(NvmeError::AsyncBusy)?;
+        if io.slots[index].state != AsyncSlotState::Reserved {
             return Err(NvmeError::AsyncBusy);
         }
-        if sectors != io.slot.sectors {
-            return Err(NvmeError::BadLen { want: io.slot.sectors as usize, got: sectors as usize });
+        if sectors != io.slots[index].sectors {
+            return Err(NvmeError::BadLen { want: io.slots[index].sectors as usize, got: sectors as usize });
         }
-        if io.poisoned || io.slot.local_id == 0 {
+        let csts = rd32(&st.ctx, st.mmio, REG_CSTS)?;
+        if io.poisoned || io.force_fatal || csts & CSTS_CFS != 0 {
             return Err(NvmeError::AsyncBusy);
         }
-        // 队列没建时尚未转移 DMA 所有权，调用方可以安全释放 Reserved 租约。
         if st.q[1].depth == 0 {
             return Err(NvmeError::IoQueueNotReady);
         }
-        let local_id = io.slot.local_id;
-        // 先取得所有权再碰门铃：发射后的任何错误都不允许调用方释放 DMA。
-        io.slot.state = AsyncSlotState::InFlight;
-        let cid = match submit_io(st, lba, write) {
+        let local_id = io.slots[index].local_id;
+        io.slots[index].state = AsyncSlotState::InFlight;
+        let cid = match submit_io(st, lba, write, slot_data_off(index)) {
             Ok(cid) => cid,
-            Err(e) => {
+            Err(error) => {
                 io.poisoned = true;
                 io.bad_used += 1;
-                return Err(e);
+                return Err(error);
             }
         };
-        io.slot.cid = cid;
+        io.slots[index].cid = cid;
         io.submitted += 1;
         #[cfg(feature = "fault-nvme-async-wait")]
         {
-            // 变异证红：submit 里等待即破坏“立即返回”；只观察非消费 CQE，不吞完成。
             io.wait_calls += 1;
             let _ = poll_cqe(st, Q::Io, cid);
         }
@@ -966,51 +1004,44 @@ pub fn async_submit(lease: u32, lba: u64, sectors: u32, write: bool) -> Result<u
     })?
 }
 
-/// 显式完成并取走一条回执。空输出不碰设备；小缓冲不丢回执。
+/// 显式完成并取走回执。先等一条真实 CQE，再非阻塞排空已发布项；小缓冲不丢完成。
 pub fn async_reap(out: &mut [NvmeIoCompletion]) -> usize {
     if out.is_empty() || DriverCtx::in_isr() {
         return 0;
     }
     match with_io(|st, io| -> Result<usize, NvmeError> {
-        if io.slot.state != AsyncSlotState::InFlight {
+        if !io.slots.iter().any(|slot| slot.state == AsyncSlotState::InFlight) {
             return Ok(0);
         }
         #[cfg(feature = "fault-nvme-no-late-reap")]
         if io.poisoned {
             return Ok(0);
         }
-        let slot = io.slot;
-        match wait_cqe(st, Q::Io, slot.cid) {
-            Ok(()) => {
-                io.slot.state = AsyncSlotState::Completed;
-                io.completed += 1;
-                out[0] = NvmeIoCompletion {
-                    local_id: slot.local_id,
-                    sectors_done: slot.sectors,
-                    error: None,
-                };
-                Ok(1)
-            }
-            Err(NvmeError::CmdFailed { cid, status }) => {
-                io.slot.state = AsyncSlotState::Completed;
-                io.completed += 1;
-                out[0] = NvmeIoCompletion {
-                    local_id: slot.local_id,
-                    sectors_done: 0,
-                    error: Some(NvmeError::CmdFailed { cid, status }),
-                };
-                Ok(1)
-            }
-            Err(e) => {
-                // 超时或上下文错误意味着 DMA 所有权不确定：隔离且保留 InFlight，
-                // 之后仍可 reap 一条真实迟到 CQE（本驱动没有 NVMe ISR 顶半）。
+        let first = match take_cqe(st, Q::Io, true, 0) {
+            Ok(Some(cqe)) => cqe,
+            Ok(None) => return Ok(0),
+            Err(error) => {
                 io.poisoned = true;
-                if !matches!(e, NvmeError::CmdTimeout { .. }) {
+                if !matches!(error, NvmeError::CmdTimeout { .. }) {
                     io.bad_used += 1;
                 }
-                Ok(0)
+                return Ok(0);
             }
+        };
+        let mut written = 0usize;
+        let mut next = Some(first);
+        while written < out.len() {
+            let Some((cid, status)) = next else { break };
+            let Some(completion) = finish_completion(io, cid, status) else {
+                io.bad_used += 1;
+                io.poisoned = true;
+                break;
+            };
+            out[written] = completion;
+            written += 1;
+            next = take_cqe(st, Q::Io, false, 0)?;
         }
+        Ok(written)
     }) {
         Ok(Ok(n)) => n,
         _ => 0,
@@ -1023,12 +1054,10 @@ pub fn async_cancel(local_id: u64) -> NvmeCancel {
         return NvmeCancel::InFlight;
     }
     match with_io(|_, io| -> Result<NvmeCancel, NvmeError> {
-        if io.slot.local_id != local_id {
-            return Ok(NvmeCancel::NotFound);
-        }
-        match io.slot.state {
+        let Some(index) = slot_index(io, local_id) else { return Ok(NvmeCancel::NotFound) };
+        match io.slots[index].state {
             AsyncSlotState::Reserved => {
-                io.slot = AsyncSlot::EMPTY;
+                io.slots[index] = AsyncSlot::EMPTY;
                 io.cancelled += 1;
                 Ok(NvmeCancel::Cancelled)
             }
@@ -1045,12 +1074,10 @@ pub fn async_cancel(local_id: u64) -> NvmeCancel {
 /// 释放 Reserved/Completed 租约；InFlight 必须等显式完成，禁止提前回收 DMA。
 pub fn async_release(lease: u32) -> Result<(), NvmeError> {
     with_io(|_, io| {
-        if u64::from(lease) != io.slot.local_id {
-            return Err(NvmeError::AsyncBusy);
-        }
-        match io.slot.state {
+        let index = slot_index(io, u64::from(lease)).ok_or(NvmeError::AsyncBusy)?;
+        match io.slots[index].state {
             AsyncSlotState::Reserved | AsyncSlotState::Completed => {
-                io.slot = AsyncSlot::EMPTY;
+                io.slots[index] = AsyncSlot::EMPTY;
                 Ok(())
             }
             AsyncSlotState::InFlight => Err(NvmeError::AsyncBusy),
@@ -1067,7 +1094,7 @@ pub fn async_stats() -> Option<NvmeAsyncStats> {
             cancelled: io.cancelled,
             bad_used: io.bad_used,
             wait_calls: io.wait_calls,
-            occupied: usize::from(io.slot.state != AsyncSlotState::Free),
+            occupied: io.slots.iter().filter(|slot| slot.state != AsyncSlotState::Free).count(),
             poisoned: io.poisoned,
         })
     })
@@ -1075,33 +1102,141 @@ pub fn async_stats() -> Option<NvmeAsyncStats> {
     .flatten()
 }
 
-/// 用例注入同步等待超时；不真发命令，只验证“超时后必须隔离”的账本转换。
-pub fn async_force_sync_timeout_for_test() {
-    let _ = with_io(|_, io| io.force_sync_timeout = true);
+/// 先排空在途并删除 I/O 队列，再禁用控制器；缺少完成项的租约继续保留。
+pub fn async_drain() -> Result<NvmeDrain, NvmeError> {
+    with_io(|st, io| {
+        io.poisoned = true;
+        let mut completed = 0usize;
+        for _ in 0..DATA_SLOTS {
+            if !io.slots.iter().any(|slot| slot.state == AsyncSlotState::InFlight) {
+                break;
+            }
+            match take_cqe(st, Q::Io, true, 0) {
+                Ok(Some((cid, status))) => {
+                    if finish_completion(io, cid, status).is_some() {
+                        completed += 1;
+                    }
+                }
+                _ => break,
+            }
+        }
+        let mut queues_deleted = false;
+        if !io.slots.iter().any(|slot| slot.state == AsyncSlotState::InFlight) {
+            let sq = submit(st, Q::Admin, OP_DELETE_SQ, 0, |st, off| {
+                st.ctx.dma_write32(st.dma, off + 40, 1)?;
+                Ok(())
+            }).and_then(|cid| wait_cqe(st, Q::Admin, cid));
+            let cq = if sq.is_ok() {
+                submit(st, Q::Admin, OP_DELETE_CQ, 0, |st, off| {
+                    st.ctx.dma_write32(st.dma, off + 40, 1)?;
+                    Ok(())
+                }).and_then(|cid| wait_cqe(st, Q::Admin, cid))
+            } else {
+                Err(NvmeError::AsyncBusy)
+            };
+            queues_deleted = sq.is_ok() && cq.is_ok();
+        }
+        #[cfg(not(feature = "fault-nvme-fatal-no-drain"))]
+        {
+            wr32(&st.ctx, st.mmio, REG_CC, 0)?;
+            let mut spins = 0u32;
+            while rd32(&st.ctx, st.mmio, REG_CSTS)? & CSTS_RDY != 0 {
+                if spins >= 2_000_000 {
+                    return Err(NvmeError::NotReady { csts: rd32(&st.ctx, st.mmio, REG_CSTS)?, spins });
+                }
+                spins += 1;
+            }
+        }
+        let disabled = rd32(&st.ctx, st.mmio, REG_CSTS)? & CSTS_RDY == 0;
+        if disabled {
+            for _ in 0..DATA_SLOTS {
+                let Some((cid, status)) = take_cqe(st, Q::Io, false, 0)? else { break };
+                if finish_completion(io, cid, status).is_some() {
+                    completed += 1;
+                }
+            }
+        }
+        let outstanding = io.slots.iter().filter(|slot| slot.state == AsyncSlotState::InFlight).count();
+        Ok(NvmeDrain { completed, outstanding, disabled, queues_deleted })
+    })?
 }
 
-/// 用例隔离闸：Free 时阻止新租约；InFlight 时模拟超时隔离但保留迟到完成路径。
+/// 仅在全部租约已归还且控制器非致命时恢复：重新使能并重建 I/O 队列。
+pub fn async_recover() -> Result<(), NvmeError> {
+    with_io(|st, io| {
+        let csts = rd32(&st.ctx, st.mmio, REG_CSTS)?;
+        if io.force_fatal || csts & CSTS_CFS != 0 {
+            return Err(NvmeError::ControllerFatal { csts });
+        }
+        #[cfg(not(feature = "fault-nvme-recover-inflight"))]
+        if io.slots.iter().any(|slot| slot.state != AsyncSlotState::Free) {
+            return Err(NvmeError::AsyncBusy);
+        }
+        #[cfg(feature = "fault-nvme-recover-inflight")]
+        let _ = &io.slots;
+        if csts & CSTS_RDY == 0 {
+            st.ctx.dma_fill(st.dma, OFF_ADMIN_SQ, 0, 2 * PAGE_BYTES)?;
+            st.q[0] = QState::new(QDEPTH as u16);
+            wr32(&st.ctx, st.mmio, REG_AQA, AQA_CONFIG)?;
+            wr32(&st.ctx, st.mmio, REG_ASQ, st.asq_bus as u32)?;
+            wr32(&st.ctx, st.mmio, REG_ASQ + 4, (st.asq_bus >> 32) as u32)?;
+            wr32(&st.ctx, st.mmio, REG_ACQ, st.acq_bus as u32)?;
+            wr32(&st.ctx, st.mmio, REG_ACQ + 4, (st.acq_bus >> 32) as u32)?;
+            wr32(&st.ctx, st.mmio, REG_CC, CC_CONFIG)?;
+            let mut spins = 0u32;
+            loop {
+                let now = rd32(&st.ctx, st.mmio, REG_CSTS)?;
+                if now & CSTS_RDY != 0 {
+                    if now & CSTS_CFS != 0 {
+                        return Err(NvmeError::ControllerFatal { csts: now });
+                    }
+                    break;
+                }
+                if spins >= 2_000_000 {
+                    return Err(NvmeError::NotReady { csts: now, spins });
+                }
+                spins += 1;
+            }
+        }
+        st.ctx.dma_fill(st.dma, OFF_IO_SQ, 0, 2 * PAGE_BYTES)?;
+        st.q[1] = QState::new(0);
+        create_io_queues(st)?;
+        io.poisoned = false;
+        Ok(())
+    })?
+}
+
+/// 用例隔离闸：禁止新租约，但保留在途槽的迟到完成路径。
 pub fn async_quarantine_for_test() -> Result<(), NvmeError> {
     with_io(|_, io| {
-        if matches!(io.slot.state, AsyncSlotState::Free | AsyncSlotState::InFlight) {
-            io.poisoned = true;
-            Ok(())
-        } else {
-            Err(NvmeError::AsyncBusy)
-        }
+        io.poisoned = true;
+        Ok(())
     })?
 }
 
 /// 只在没有在飞命令时解除隔离；有 InFlight 时绝不能假装设备已经恢复。
 pub fn async_recover_for_test() -> Result<(), NvmeError> {
     with_io(|_, io| {
-        if io.slot.state == AsyncSlotState::Free {
+        if io.slots.iter().all(|slot| slot.state == AsyncSlotState::Free) && !io.force_fatal {
             io.poisoned = false;
             Ok(())
         } else {
             Err(NvmeError::AsyncBusy)
         }
     })?
+}
+
+pub fn async_inject_fatal_for_test() {
+    let _ = with_io(|_, io| io.force_fatal = true);
+}
+
+pub fn async_clear_fatal_for_test() {
+    let _ = with_io(|_, io| io.force_fatal = false);
+}
+
+/// 用例注入同步等待超时；不真发命令，只验证“超时后必须隔离”的账本转换。
+pub fn async_force_sync_timeout_for_test() {
+    let _ = with_io(|_, io| io.force_sync_timeout = true);
 }
 
 /// 从 PCI 三件套认领设备（判据用它证明"这台设备真的是 NVMe"）。

@@ -3401,19 +3401,32 @@ def qmp_pmemsave(port: int, addr: int, size: int, path: Path) -> str:
 KBD_INJECT_CHAR = "a"
 
 
-def qmp_inject_and_shoot(port: int, shoot_path: Path, delay_s: float) -> list[str]:
-    """等 `delay_s` 秒后注入 `KBD_INJECT_CHAR`，再等 1 秒截屏。返回读数行。
+def qmp_inject_and_shoot(
+    port: int,
+    shoot_path: Path,
+    delay_s: float,
+    serial_path: Path | None = None,
+    ready_anchor: str | None = None,
+) -> list[str]:
+    """等就绪锚点或固定延迟后注入 `KBD_INJECT_CHAR`，再等 1 秒截屏。
 
-    **为什么必须并发**：`do_run` 在 QMP 分支里阻塞等 QEMU 退出，
-    而注入与截屏要在内核还在跑的时候做——`t_kbd_inject` 正在等那个键。
-
-    延迟是必须的：QEMU 起来到内核跑 ktests 之间隔着 OVMF 引导 + 内核初始化。
-    太早注入按键会丢（`kbd` 的环还没建），太晚 `t_kbd_inject` 已经超时。
+    固定延迟曾把按键送进尚未建好的 PS/2 环；ps2-kbd 档因此等待串口明确报
+    `kbd: 已开 IRQ=1`，锚点超时就失败，不拿一次盲注入冒充设备证据。
     """
     import time
 
     out: list[str] = []
-    time.sleep(delay_s)
+    if serial_path is not None and ready_anchor is not None:
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline:
+            text = serial_path.read_text(encoding="utf-8", errors="replace") if serial_path.exists() else ""
+            if ready_anchor in text:
+                break
+            time.sleep(0.05)
+        else:
+            return [f"注入取消：串口未在 20s 内出现就绪锚点 {ready_anchor!r}"]
+    else:
+        time.sleep(delay_s)
     err = qmp_input_key(port, [KBD_INJECT_CHAR], True)
     if err:
         out.append("注入失败（按下）：" + err)
@@ -4704,7 +4717,11 @@ def do_run(features: list[str], timeout: int, extra: str = "", host_fault: str =
             if _need_inject:
                 _shoot.unlink(missing_ok=True)
                 def _worker():
-                    _inject_notes.extend(qmp_inject_and_shoot(qmp_port, _shoot, 2.5))
+                    if "ps2-kbd" in set(features):
+                        _inject_notes.extend(qmp_inject_and_shoot(
+                            qmp_port, _shoot, 2.5, SERIAL_LOG, "kbd: 已开 IRQ=1"))
+                    else:
+                        _inject_notes.extend(qmp_inject_and_shoot(qmp_port, _shoot, 2.5))
                 import threading as _th
                 _inject_thread = _th.Thread(target=_worker, name="qmp-inject", daemon=True)
                 _inject_thread.start()

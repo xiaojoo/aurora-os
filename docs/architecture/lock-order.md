@@ -21,7 +21,7 @@
 | `RANK_GROW` | 4 | **块设备传输（`driver/ahci.rs` 的 `XFER`）** | 会等完成中断 => 中断里取 TIMER(6) => 必须低于 6（ADR-222）；AHCI 入口拒绝任何外层 rank>=4 的调用（ADR-248）；ADR-259 起锁内还保护单槽异步租约状态 |
 | `RANK_GROW` | 4 | 页缓存槽与失效代数（`filesystem/vfs_ro.rs` 的 `CACHE_LOCK`） | （叶子：只读写 24 个槽） | **ADR-250（2026-11-25）**：缓存命中不碰设备；未命中先放锁再走块层，写扇区返回后再失效。与 HEAP/XFER 同 rank 但从不嵌套。 | 否 |
 | `RANK_GROW` | 4 | virtio-blk 队列互斥（`driver/virtio.rs` 的 `io_lock`） | 驱动内部叶子；轮询 used.idx 时保持 IF | **ADR-259（2026-11-26）**：同步/异步共用，异步槽非 Free 时拒绝同步穿插；设备等待有界，ISR 不取此锁。 | 否 |
-| `RANK_GROW` | 4 | NVMe 单槽 DMA 租约与异步台账（`driver/nvme.rs` 的 `State.io_lock`） | 驱动内部叶子；轮询 CQ 时保持 IF | **ADR-259 第4片（2026-11-26）**：同步 `io_lba` 与全部异步入口共用；Reserved/InFlight/Completed 均拒绝同步穿插，poisoned 拒绝新工作但允许回收已发射命令的迟到 CQE；ISR 在取锁前拒绝。 | 否 |
+| `RANK_GROW` | 4 | NVMe 八槽 DMA 租约与异步台账（`driver/nvme.rs` 的 `State.io_lock`） | 驱动内部叶子；轮询 CQ 时保持 IF | **ADR-259 第4片/补记（2026-11-26）**：同步 `io_lba` 与全部异步入口共用；任一非 Free 槽拒绝同步穿插，poisoned 拒绝新工作但允许迟到 CQE；排空按“完成→删 SQ/CQ→禁用”，恢复重写 AQA/ASQ/ACQ 并重建 I/O 队列；ISR 在取锁前拒绝。 | 否 |
 | `RANK_BLOCK` | 37 | 块层请求队列 / 完成回调（`block_io.rs` 的 `QUEUE_LOCK`/`CB_LOCK`）| （叶子：只读写静态表）|
 | `RANK_DENTRY` | 38 | dentry 缓存（`filesystem/vfs_ro.rs` 的 `DENTRY_LOCK`，ADR-195）| （叶子：只读写缓存表）| **ADR-195（2026-11-22）**：路径解析的 `(卷指纹, 父簇, 名字)` → `Entry` 缓存。**叶子锁**：临界区里只读写那 64 条 `DentrySlot`，不取任何别的锁。比 `RANK_BLOCK(37)` 深：缓存命中时**不碰盘**。**每次 `ReadOnlyFs::mount` 都清缓存** —— 夹具造坏卷的方式是改同一块 img 的目录项，引导扇区指纹不变 ⇒ 不清就会把好卷的结果返回给坏卷（实测两个用例红）。| 否 |
 | `RANK_NOTIFY` | 39 | 用户完成通知账本（`filesystem/block_notify.rs` 的 `NOTIFY_LOCK`）| （叶子：只读写定长 Copy 记录）| **ADR-259 第5片（2026-11-26）**：只存 token/result/seq 与端点身份，不碰 VMO、Proc、DMA 或回调；页面镜像在锁外完成。满队列拒绝而不覆盖未确认记录。 | 否 |

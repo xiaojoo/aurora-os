@@ -26251,6 +26251,18 @@ PASS，按环境形状记“不归因”，判据不动。
   镜像/确认；`run-17966` shell 收工后 broker stop=Ok(1)（同档既有 sdkdemo 红格不归因于本片）。
   `check` **21/21**；完整矩阵 **91/91 符合**（`build/notify-product-matrix.log`，退出码 0）。
   真机未验证；AOCI MCP 不可用，索引未更新。
+- NVMe 多 outstanding/排空补记：DMA 扩为 16 页（4 队列页 + 8 数据槽），CQE 按 CID 认槽，
+  单次 reap 可排空 8 条；drain 顺序为收完在途→删 SQ/CQ→禁用，缺完成项保留租约；
+  recover 要求租约全 Free/CFS=0，重写 AQA/ASQ/ACQ 与 Admin 环后重建 I/O 队列。
+  `run-17981` **100/100 PASS**，八请求单次回收 8/8、两次禁用/恢复、致命拒恢复、Reserved 拒恢复全真。
+  `run-17982/17983/17984` 分别红单次回收/禁用/在途恢复格。整链曾出现同步绕过负样本 HANG，
+  同 ELF `run-18088` 单跑恢复 FAIL(35)；PS/2 行则暴露宿主机固定 2.5s 注入早于环就绪，
+  改为等待串口 `kbd: 已开 IRQ=1` 后，带 QMP 的同 ELF `run-18091` PASS。直跑 `run` 未开 QMP
+  不能作为 PS/2 行清除证据；缺锚点负样本明确“注入取消”，有锚点分支才尝试 QMP 注入。
+  最终独立进程整链 **91/91 符合**（`build/nvme-multi-matrix-detached.out.log`）；NVMe 同一 ELF
+  `f2dfa4fb8ecf` 的 `run-18319/18385/18386` 为 3/3 PASS，八请求单次回收与两次恢复逐跑为真。
+  此前亲和性/块请求两条偏差以原 ELF `run-18189/18190` 单跑清除，按环境形状记“不归因”，判据不动。
+  真机未验证；AOCI MCP 不可用，索引未更新。
 - 第 6 片同步等待包装：`Block::as_async()` 默认 None，AHCI/virtio-blk/NVMe 返回自身异步视图；
   `read_checked` 真驱动快路按 RequestId 精确领取完成，复制后释放租约，取消/死线仍在扇区边界，
   分桶计数不变。最多显式 reap 两次，未完成则报 NotSettled 并保留 InFlight/租约给迟到 pump；
