@@ -202,6 +202,8 @@ pub enum AhciError {
     NoApic,
     /// §8.2：这个端口超过重试预算被隔离，命令**没有下发**就返回
     Quarantined,
+    /// ADR-259 第3片：同步/异步共用槽被租约占用，或全局 DMA 所有权已隔离
+    AsyncBusy,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -520,7 +522,92 @@ static PORT_STATE: [AtomicU8; 32] = [const { AtomicU8::new(0) }; 32];
 // 后果是整机 HANG，而 `fs-open` 档因此从未跑通过（ADR-221 发现）。
 //
 // 取 `GROW(4)`：与 `CACHE_LOCK` / `STATE_LOCK` 同一档，都是「持锁期间会走到更深的锁」。
-static XFER: crate::sync::OpenSpinLock<()> = crate::sync::OpenSpinLock::new(crate::sync::RANK_GROW, ());
+/// ADR-259 第3片：全局只有一条命令槽与一块 `OFF_DATA`，因此租约也只有一个。
+/// `Reserved -> InFlight -> Completed` 的生命周期与同步入口的 Free 判据共用这把锁；
+/// ISR 只置通知旗，不取锁、不推进状态。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AsyncSlotState {
+    Free,
+    Reserved,
+    InFlight,
+    Completed,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AsyncSlot {
+    state: AsyncSlotState,
+    local_id: u64,
+    num: u8,
+    lba: u64,
+    count: u16,
+    write: bool,
+}
+
+impl AsyncSlot {
+    const EMPTY: Self = Self {
+        state: AsyncSlotState::Free,
+        local_id: 0,
+        num: 0,
+        lba: 0,
+        count: 0,
+        write: false,
+    };
+}
+
+struct AsyncIoState {
+    slot: AsyncSlot,
+    next_id: u64,
+    submitted: u32,
+    completed: u32,
+    cancelled: u32,
+    bad_used: u32,
+    wait_calls: u32,
+    poisoned: bool,
+}
+
+impl AsyncIoState {
+    const fn new() -> Self {
+        Self {
+            slot: AsyncSlot::EMPTY,
+            next_id: 1,
+            submitted: 0,
+            completed: 0,
+            cancelled: 0,
+            bad_used: 0,
+            wait_calls: 0,
+            poisoned: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AhciCancel {
+    Cancelled,
+    InFlight,
+    NotFound,
+    Completed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AhciIoCompletion {
+    pub local_id: u64,
+    pub sectors_done: u32,
+    pub error: Option<AhciError>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AhciAsyncStats {
+    pub submitted: u32,
+    pub completed: u32,
+    pub cancelled: u32,
+    pub bad_used: u32,
+    pub wait_calls: u32,
+    pub occupied: usize,
+    pub poisoned: bool,
+}
+
+static XFER: crate::sync::OpenSpinLock<AsyncIoState> =
+    crate::sync::OpenSpinLock::new(crate::sync::RANK_GROW, AsyncIoState::new());
 static PORT_RESETS: [AtomicU32; 32] = [const { AtomicU32::new(0) }; 32];
 /// 每个端口因"发射被吞"而重置的次数，与 §8.2 的故障预算分开数（见 `recover_for_issue`）
 static PORT_ISSUE_RESETS: [AtomicU32; 32] = [const { AtomicU32::new(0) }; 32];
@@ -566,22 +653,52 @@ fn wedges(e: &AhciError) -> bool {
     )
 }
 
+fn quarantine_async(st: &mut AsyncIoState) {
+    #[cfg(not(feature = "fault-ahci-no-quarantine"))]
+    {
+        st.poisoned = true;
+    }
+    #[cfg(feature = "fault-ahci-no-quarantine")]
+    {
+        let _ = st;
+    }
+}
+
+/// 完成取证后的 BadCompletion 也有两类：设备明确报错已经静止，可以归还租约；
+/// BSY/DRQ 仍置起则 DMA 所有权不明，必须与超时同样隔离。
+fn completion_uncertain(e: &AhciError) -> bool {
+    match e {
+        AhciError::BadCompletion { status, .. } => {
+            status & (ATA_STATUS_BUSY | ATA_STATUS_DRQ) != 0
+        }
+        AhciError::Ctx(_) => true,
+        _ => false,
+    }
+}
+
 /// §8.2 的 `Resetting`：把端口停干净再重新起一次（`start_port` 本身就是这个动作）。
 /// 成功 ⇒ 回到 `Running`；失败累加预算，超了就 `Quarantined`。
+/// ADR-259 第3片把重试预算放在同一次调用里：第一次恢复失败后 poisoned 必须拒绝
+/// 新提交，不能靠下一次 I/O 再偷偷试一遍；成功也必须等 `PxCI/PxSACT` 都为零。
 fn recover(num: u8) -> State {
-    PORT_RESETS[usize::from(num & 31)].fetch_add(1, Ordering::Relaxed);
-    match start_port(num) {
-        Ok(_) => State::Running,
-        Err(_) => {
-            if PORT_RESETS[usize::from(num & 31)].load(Ordering::Relaxed) >= RETRY_BUDGET {
-                PORT_STATE[usize::from(num & 31)].store(ST_QUARANTINED, Ordering::Relaxed);
-                QUARANTINES.fetch_add(1, Ordering::Relaxed);
-                State::Quarantined
-            } else {
-                State::Running
+    let mut last = Ok(());
+    for _ in 0..RETRY_BUDGET {
+        PORT_RESETS[usize::from(num & 31)].fetch_add(1, Ordering::Relaxed);
+        last = start_port(num).and_then(|_| {
+            if r32(port_off(num, P_CI))? != 0 || r32(port_off(num, P_SACT))? != 0 {
+                return Err(AhciError::DrainStuck(r32(port_off(num, P_CI))?));
             }
+            Ok(())
+        });
+        if last.is_ok() {
+            PORT_STATE[usize::from(num & 31)].store(ST_RUNNING, Ordering::Relaxed);
+            return State::Running;
         }
     }
+    PORT_STATE[usize::from(num & 31)].store(ST_QUARANTINED, Ordering::Relaxed);
+    QUARANTINES.fetch_add(1, Ordering::Relaxed);
+    let _ = last;
+    State::Quarantined
 }
 
 /// 因"发射被吞"而做的重置**不进 §8.2 的故障预算**：设备没报错，是那条命令根本没进设备，
@@ -623,9 +740,43 @@ pub fn pending_cmds(num: u8) -> Result<u32, AhciError> {
 /// 把端口放回 `Running` 并重新起一次。**这不是 §8.2 状态机的一条边**
 /// （真机上隔离是终态，要等热插拔或驱动重载），它存在的理由是 `.ktests` 的顺序
 /// 由链接器决定，用例不许把后面那个用例的盘留在隔离态。
+/// ADR-259 第3片：只有重新起口且 `PxCI/PxSACT` 均为零，才确认旧 DMA 已静止；
+/// 此前不得清 poisoned，也不得把 InFlight 槽归还给租约层。
 pub fn release_quarantine(num: u8) -> Result<Port, AhciError> {
-    PORT_STATE[usize::from(num & 31)].store(ST_RUNNING, Ordering::Relaxed);
-    start_port(num)
+    with_transfer_state(num, |st| {
+        let port = start_port(num)?;
+        if r32(port_off(num, P_CI))? != 0 || r32(port_off(num, P_SACT))? != 0 {
+            return Err(AhciError::DrainStuck(r32(port_off(num, P_CI))?));
+        }
+        if !wait_ms(|| r32(port_off(num, P_TFD)).map_or(true, |v| (v as u8) & (ATA_STATUS_BUSY | ATA_STATUS_DRQ) == 0), 1000) {
+            return Err(AhciError::BadCompletion { status: 0, error: 0, dw1: 0, want: 0 });
+        }
+        #[cfg(not(feature = "fault-ahci-cross-port-clear"))]
+        if st.slot.state == AsyncSlotState::Free || st.slot.num == num {
+            st.slot = AsyncSlot::EMPTY;
+            st.poisoned = false;
+        }
+        #[cfg(feature = "fault-ahci-cross-port-clear")]
+        {
+            st.slot = AsyncSlot::EMPTY;
+            st.poisoned = false;
+        }
+        PORT_STATE[usize::from(num & 31)].store(ST_RUNNING, Ordering::Relaxed);
+        Ok(port)
+    })?
+}
+
+/// ADR-259 第3片负样本/策略探针：只置全局 DMA 隔离，不碰设备。
+pub fn async_quarantine_for_test() -> Result<(), AhciError> {
+    with_transfer_state(0, |st| {
+        quarantine_async(st);
+        Ok(())
+    })?
+}
+
+/// 与 `release_quarantine` 同一套静默证据，供策略探针在恢复后继续跑后续用例。
+pub fn async_recover_for_test(num: u8) -> Result<(), AhciError> {
+    release_quarantine(num).map(|_| ())
 }
 
 /// 关掉端口引擎（清 `ST`）⇒ 命令没人接走 ⇒ `PxCI` 恒为 1 ⇒ 卡住类错误。
@@ -1514,7 +1665,11 @@ pub fn fnv1a64(buf: &[u8]) -> u64 {
 /// 本机这条盘只有 131072 个扇区、一次只读 1 个 ⇒ 字节 8/9/10/13 恒为 0，
 /// **没有任何判据走到它们**（要读 >255 扇区或高偏移之前先按 ADR-029 那条实验钉住）。
 #[inline]
-fn with_transfer_lock<R>(num: u8, body: impl FnOnce() -> R) -> Result<R, AhciError> {
+fn with_transfer_state<R>(num: u8, body: impl FnOnce(&mut AsyncIoState) -> R) -> Result<R, AhciError> {
+    let _ = num;
+    if DriverCtx::in_isr() {
+        return Err(AhciError::Ctx(DriverError::WrongContext));
+    }
     #[cfg(feature = "kdump")]
     if CAPTURE_PORT.load(Ordering::Acquire) == u32::from(num) + 1 {
         return Err(AhciError::Quarantined);
@@ -1523,8 +1678,25 @@ fn with_transfer_lock<R>(num: u8, body: impl FnOnce() -> R) -> Result<R, AhciErr
     let guard = XFER.lock_checked();
     #[cfg(feature = "fault-ahci-no-rank-guard")]
     let guard = Some(XFER.lock());
-    let _guard = guard.ok_or(AhciError::Denied("外层锁 rank 高于 XFER，拒绝块 I/O"))?;
-    Ok(body())
+    let mut guard = guard.ok_or(AhciError::Denied("外层锁 rank 高于 XFER，拒绝块 I/O"))?;
+    Ok(body(guard.get()))
+}
+
+#[inline]
+fn sync_slot_ready(num: u8, st: &AsyncIoState) -> Result<(), AhciError> {
+    // 端口隔离必须先于全局 DMA 所有权：隔离语义是“不再碰设备”，不能被 poisoned 改报成忙。
+    if state_of(num) == State::Quarantined {
+        return Err(AhciError::Quarantined);
+    }
+    #[cfg(not(feature = "fault-ahci-sync-interleave"))]
+    if st.poisoned || st.slot.state != AsyncSlotState::Free {
+        return Err(AhciError::AsyncBusy);
+    }
+    #[cfg(feature = "fault-ahci-sync-interleave")]
+    {
+        let _ = st;
+    }
+    Ok(())
 }
 
 pub fn read_lba(num: u8, lba: u64, count: u16) -> Result<Xfer, AhciError> {
@@ -1541,12 +1713,13 @@ pub fn write_lba(num: u8, lba: u64, count: u16) -> Result<Xfer, AhciError> {
         Some(b) if b <= DATA_BYTES => b as u32,
         _ => return Err(AhciError::TooBig(count)),
     };
-    with_transfer_lock(num, || {
+    with_transfer_state(num, |st| {
+        sync_slot_ready(num, st)?;
         // 先把图案填进数据缓冲：这里**不填哨兵**（填了就把要写的内容覆盖了）
         for i in 0..bytes as u64 {
             wb(OFF_DATA + i, pattern_byte(lba, i))?;
         }
-        transfer_locked(num, lba, count, true)
+        transfer_locked(num, lba, count, true, st)
     })?
 }
 
@@ -1569,11 +1742,12 @@ pub fn write_bytes(num: u8, lba: u64, src: &[u8]) -> Result<Xfer, AhciError> {
     if count > MAX_SECTORS {
         return Err(AhciError::TooBig(count));
     }
-    with_transfer_lock(num, || {
+    with_transfer_state(num, |st| {
+        sync_slot_ready(num, st)?;
         for (i, b) in src.iter().enumerate() {
             wb(OFF_DATA + i as u64, *b)?;
         }
-        transfer_locked(num, lba, count, true)
+        transfer_locked(num, lba, count, true, st)
     })?
 }
 
@@ -1620,16 +1794,17 @@ pub fn read_modify_write(num: u8, lba: u64, offset: usize, src: &[u8]) -> Result
     if src.is_empty() || offset >= sector_bytes || src.len() > sector_bytes - offset {
         return Err(AhciError::Denied("RMW 区间不在单个扇区内"));
     }
-    with_transfer_lock(num, || {
+    with_transfer_state(num, |st| {
+        sync_slot_ready(num, st)?;
         RMW_LOCKED.fetch_add(1, Ordering::Relaxed);
         let mut sector = [0u8; sector_bytes];
-        transfer_locked(num, lba, 1, false)?;
+        transfer_locked(num, lba, 1, false, st)?;
         copy_out(0, &mut sector)?;
         sector[offset..offset + src.len()].copy_from_slice(src);
         for (i, b) in sector.iter().enumerate() {
             wb(OFF_DATA + i as u64, *b)?;
         }
-        let written = transfer_locked(num, lba, 1, true)?;
+        let written = transfer_locked(num, lba, 1, true, st)?;
         RMW_LAST_PORT.store(num, Ordering::Relaxed);
         RMW_LAST_LBA.store(lba, Ordering::Relaxed);
         RMW_LAST_OFFSET.store(offset, Ordering::Relaxed);
@@ -1650,19 +1825,31 @@ pub fn read_bytes(num: u8, lba: u64, dst: &mut [u8]) -> Result<Xfer, AhciError> 
     if count > MAX_SECTORS {
         return Err(AhciError::TooBig(count));
     }
-    let x = transfer(num, lba, count, false)?;
-    copy_out(0, dst)?;
-    Ok(x)
+    with_transfer_state(num, |st| {
+        sync_slot_ready(num, st)?;
+        let x = transfer_locked(num, lba, count, false, st)?;
+        copy_out(0, dst)?;
+        Ok(x)
+    })?
 }
 
 /// 读与写共用的骨架：填 FIS、PRDT、表头，发射，等落定，取证。
 /// 收成一个函数而不是复制一份，是因为"写"最容易出的错就是复制时把完成判据改掉一格
 /// （§12.4.1 规则 3 与 BACKLOG ⑧ 同一课：两条路径上有一条永远不红的判据）。
 fn transfer(num: u8, lba: u64, count: u16, write: bool) -> Result<Xfer, AhciError> {
-    with_transfer_lock(num, || transfer_locked(num, lba, count, write))?
+    with_transfer_state(num, |st| {
+        sync_slot_ready(num, st)?;
+        transfer_locked(num, lba, count, write, st)
+    })?
 }
 
-fn transfer_locked(num: u8, lba: u64, count: u16, write: bool) -> Result<Xfer, AhciError> {
+fn transfer_locked(
+    num: u8,
+    lba: u64,
+    count: u16,
+    write: bool,
+    st: &mut AsyncIoState,
+) -> Result<Xfer, AhciError> {
     let mut r = transfer_inner(num, lba, count, write);
     // 发射被吞（写 `PxCI`=1 读回 0）时，这条命令**设备根本没收到**——不是"可能已经落盘的写
     // 失败了"，所以恢复之后重发一次是安全的。实测本机偶发就打在"刚起完口的第一条命令"上
@@ -1673,12 +1860,15 @@ fn transfer_locked(num: u8, lba: u64, count: u16, write: bool) -> Result<Xfer, A
         recover_for_issue(num);
         r = transfer_inner(num, lba, count, write);
     }
-    // 错误分三类处置：卡住 ⇒ 走 §8.2 的 `Resetting`；干净错误（设备正常完成但带 ERR/ABRT）
-    // ⇒ 只计数；其余（参数、隔离、未认领）⇒ 什么都没发生。
-    // 不分类就会出现"设备回一个 ABRT，驱动就把控制器抖一遍"的过度反应。
+    // 错误分三类处置：卡住 ⇒ 先隔离全局 DMA 所有权，再走 §8.2 的 `Resetting`；
+    // 干净错误（设备正常完成但带 ERR/ABRT）⇒ 只计数；其余（参数、隔离、未认领）⇒ 什么都没发生。
+    // 只有恢复函数确认 `PxCI/PxSACT` 均为零才清 poisoned；检测到不等于已经恢复。
     match &r {
-        Err(e) if wedges(e) => {
-            recover(num);
+        Err(e) if wedges(e) || completion_uncertain(e) => {
+            quarantine_async(st);
+            if recover(num) == State::Running {
+                st.poisoned = false;
+            }
         }
         Err(AhciError::BadCompletion { .. }) => {
             CLEAN_ERRORS.fetch_add(1, Ordering::Relaxed);
@@ -1688,7 +1878,23 @@ fn transfer_locked(num: u8, lba: u64, count: u16, write: bool) -> Result<Xfer, A
     r
 }
 
+struct Issued {
+    bytes: u32,
+    d2h: u64,
+    ci: usize,
+    tfd_off: usize,
+    f: u64,
+    p: u64,
+}
+
+/// 同步路径仍是一个入口：同一份构造/发射之后立刻调用同一份完成取证。
 fn transfer_inner(num: u8, lba: u64, count: u16, write: bool) -> Result<Xfer, AhciError> {
+    let issued = issue_transfer(num, lba, count, write)?;
+    collect_transfer(num, &issued)
+}
+
+/// 只构造并发射；不等待、不读完成证据。异步 `submit` 与同步路径共用这一份。
+fn issue_transfer(num: u8, lba: u64, count: u16, write: bool) -> Result<Issued, AhciError> {
     if count == 0 || count > MAX_SECTORS {
         return Err(AhciError::TooBig(count));
     }
@@ -1766,6 +1972,13 @@ fn transfer_inner(num: u8, lba: u64, count: u16, write: bool) -> Result<Xfer, Ah
     if issued & 1 == 0 {
         return Err(AhciError::IssueStuck(issued));
     }
+    Ok(Issued { bytes, d2h, ci, tfd_off: port_off(num, P_TFD), f, p })
+}
+
+/// 唯一一套完成判据：`wait_settled` + BSY/DRQ 二次有界等待 + 状态/D2H/PRDBC 取证。
+/// 同步路径在 `transfer_inner` 里调用，异步路径只由 `async_reap` 调用。
+fn collect_transfer(num: u8, issued: &Issued) -> Result<Xfer, AhciError> {
+    let Issued { bytes, d2h, ci, tfd_off, f, p } = *issued;
     // 落定有两种形状（M5-g② 起还有第三种来源，见 `wait_settled`）：`PxCI` 落下（规范那条），
     // 或接收区出现一条 `ERR` 置起、`BSY`/`DRQ` 已清的新 D2H。第二种是必需的：本机在命令带错时
     // **不释放 `PxCI`**（QEMU `ahci_clear_cmd_issue` 只在 `!ERR && !BSY && !DRQ` 时清这一格），
@@ -1774,7 +1987,6 @@ fn transfer_inner(num: u8, lba: u64, count: u16, write: bool) -> Result<Xfer, Ah
     // M5-g②：`wait_settled` 的落定条件里已经含 BSY/DRQ 清这一项（旗子只负责叫醒，不负责放行），
     // 下面这一次是同一条件的**第二台仪器**：它今天几乎必然立刻通过，留着是因为
     // "谁放行数据拷贝"这件事不该只有一处判断。
-    let tfd_off = port_off(num, P_TFD);
     let settled = wait_settled(ci, d2h, tfd_off);
     if !settled {
         return Err(AhciError::CmdTimeout);
@@ -1868,6 +2080,257 @@ fn transfer_inner(num: u8, lba: u64, count: u16, write: bool) -> Result<Xfer, Ah
         untouched,
         hash,
     })
+}
+
+// ------------------------------------------------------------------ ADR-259 第3片：单槽真异步
+
+fn check_async_port(num: u8) -> Result<(), AhciError> {
+    if num >= 32 {
+        return Err(AhciError::Denied("端口号越界"));
+    }
+    let info = info().ok_or(AhciError::NotClaimed)?;
+    if info.pi & (1u32 << num) == 0 {
+        return Err(AhciError::NoController);
+    }
+    if state_of(num) == State::Quarantined {
+        return Err(AhciError::Quarantined);
+    }
+    Ok(())
+}
+
+/// 预占唯一槽。租约就是这次预占的单调 local_id，尚未 submit 也能据此取消；
+/// 归还时核对 id，旧租约不能误释放后来复用同一槽的新请求。
+pub fn async_alloc_lease(num: u8, sectors: u32) -> Result<u32, AhciError> {
+    with_transfer_state(num, |st| {
+        check_async_port(num)?;
+        if sectors == 0 || sectors > u32::from(MAX_SECTORS) {
+            return Err(AhciError::TooBig(sectors.min(u32::from(u16::MAX)) as u16));
+        }
+        if st.poisoned || st.slot.state != AsyncSlotState::Free {
+            return Err(AhciError::AsyncBusy);
+        }
+        if st.next_id == u64::MAX || st.next_id > u64::from(u32::MAX) {
+            return Err(AhciError::AsyncBusy);
+        }
+        let local_id = st.next_id;
+        let lease = u32::try_from(local_id).map_err(|_| AhciError::AsyncBusy)?;
+        st.next_id += 1;
+        st.slot = AsyncSlot {
+            state: AsyncSlotState::Reserved,
+            local_id,
+            num,
+            count: sectors as u16,
+            ..AsyncSlot::EMPTY
+        };
+        Ok(lease)
+    })?
+}
+
+pub fn async_copy_in(num: u8, lease: u32, src: &[u8]) -> Result<(), AhciError> {
+    with_transfer_state(num, |st| {
+        check_async_port(num)?;
+        if u64::from(lease) != st.slot.local_id || st.slot.state != AsyncSlotState::Reserved || st.slot.num != num {
+            return Err(AhciError::AsyncBusy);
+        }
+        let want = usize::from(st.slot.count) * SECTOR as usize;
+        if src.len() != want {
+            return Err(AhciError::Denied("copy_in 长度与租约扇区数不一致"));
+        }
+        let (ctx, dma) = dma_ref()?;
+        ctx.dma_copy_in(dma, idx(OFF_DATA), src).map_err(AhciError::Ctx)
+    })?
+}
+
+pub fn async_copy_out(num: u8, lease: u32, dst: &mut [u8]) -> Result<(), AhciError> {
+    with_transfer_state(num, |st| {
+        check_async_port(num)?;
+        if u64::from(lease) != st.slot.local_id || st.slot.state != AsyncSlotState::Completed || st.slot.num != num {
+            return Err(AhciError::AsyncBusy);
+        }
+        let want = usize::from(st.slot.count) * SECTOR as usize;
+        if dst.len() > want {
+            return Err(AhciError::Denied("copy_out 超过租约容量"));
+        }
+        let (ctx, dma) = dma_ref()?;
+        ctx.dma_copy_out(dma, idx(OFF_DATA), dst).map_err(AhciError::Ctx)
+    })?
+}
+
+/// 只发射并返回单调 local_id；完成证据只由 `async_reap` 收集。
+pub fn async_submit(num: u8, lease: u32, lba: u64, count: u16, write: bool) -> Result<u64, AhciError> {
+    with_transfer_state(num, |st| {
+        check_async_port(num)?;
+        if u64::from(lease) != st.slot.local_id || st.slot.state != AsyncSlotState::Reserved || st.slot.num != num {
+            return Err(AhciError::AsyncBusy);
+        }
+        if count == 0 || count != st.slot.count {
+            return Err(AhciError::Denied("submit 扇区数与租约不一致"));
+        }
+        if st.poisoned || st.slot.local_id == 0 {
+            return Err(AhciError::AsyncBusy);
+        }
+        let local_id = st.slot.local_id;
+        st.slot.lba = lba;
+        st.slot.write = write;
+        // 先取得所有权再碰 PxCI：发射后的任何错误都不允许调用方释放这块 DMA。
+        st.slot.state = AsyncSlotState::InFlight;
+        let mut r = issue_transfer(num, lba, count, write);
+        if matches!(r, Err(AhciError::IssueStuck(_))) {
+            crate::log_warn!("ahci-async: 发射被吞 口{} ⇒ 恢复后重发一次", num);
+            recover_for_issue(num);
+            r = issue_transfer(num, lba, count, write);
+        }
+        let _issued = match r {
+            Ok(issued) => issued,
+            Err(e) => {
+                if matches!(e, AhciError::IssueStuck(_)) {
+                    st.slot = AsyncSlot::EMPTY;
+                } else {
+                    quarantine_async(st);
+                }
+                return Err(e);
+            }
+        };
+        st.submitted += 1;
+        #[cfg(feature = "fault-ahci-async-wait")]
+        {
+            st.wait_calls += 1;
+            let _ = wait_settled(_issued.ci, _issued.d2h, _issued.tfd_off);
+        }
+        Ok(local_id)
+    })?
+}
+
+/// 显式完成并取走一条回执。空输出缓冲不碰设备、不消费完成；小缓冲也不会丢回执。
+pub fn async_reap(num: u8, out: &mut [AhciIoCompletion]) -> usize {
+    if out.is_empty() || DriverCtx::in_isr() {
+        return 0;
+    }
+    match with_transfer_state(num, |st| -> Result<usize, AhciError> {
+        if check_async_port(num).is_err() || st.slot.state != AsyncSlotState::InFlight
+            || st.slot.num != num
+        {
+            return Ok(0);
+        }
+        #[cfg(feature = "fault-ahci-no-late-reap")]
+        if st.poisoned {
+            return Ok(0);
+        }
+        let slot = st.slot;
+        let issued = match issue_metadata_for_reap(num, &slot) {
+            Some(issued) => issued,
+            None => {
+                st.bad_used += 1;
+                quarantine_async(st);
+                return Ok(0);
+            }
+        };
+        match collect_transfer(num, &issued) {
+            Ok(_x) => {
+                st.slot.state = AsyncSlotState::Completed;
+                st.completed += 1;
+                out[0] = AhciIoCompletion {
+                    local_id: slot.local_id,
+                    sectors_done: u32::from(slot.count),
+                    error: None,
+                };
+                Ok(1)
+            }
+            Err(e) if wedges(&e) || completion_uncertain(&e) => {
+                quarantine_async(st);
+                Ok(0)
+            }
+            Err(e) => {
+                CLEAN_ERRORS.fetch_add(1, Ordering::Relaxed);
+                st.slot.state = AsyncSlotState::Completed;
+                st.completed += 1;
+                out[0] = AhciIoCompletion {
+                    local_id: slot.local_id,
+                    sectors_done: 0,
+                    error: Some(e),
+                };
+                Ok(1)
+            }
+        }
+    }) {
+        Ok(Ok(n)) => n,
+        _ => 0,
+    }
+}
+
+/// `issue_transfer` 返回的几何元数据在提交后只存槽字段；这里按同一组常量重建偏移，
+/// 不复制完成判据。命令表内容已经发出，不能被重写。
+fn issue_metadata_for_reap(num: u8, slot: &AsyncSlot) -> Option<Issued> {
+    if slot.state != AsyncSlotState::InFlight || slot.count == 0 || slot.count > MAX_SECTORS {
+        return None;
+    }
+    Some(Issued {
+        bytes: u32::from(slot.count) * SECTOR as u32,
+        d2h: rx_off(num) + RX_D2H,
+        ci: port_off(num, P_CI),
+        tfd_off: port_off(num, P_TFD),
+        f: OFF_CTBL + CTBL_CFIS,
+        p: OFF_CTBL + CTBL_PRDT,
+    })
+}
+
+pub fn async_cancel(num: u8, local_id: u64) -> AhciCancel {
+    if DriverCtx::in_isr() {
+        return AhciCancel::InFlight;
+    }
+    match with_transfer_state(num, |st| -> Result<AhciCancel, AhciError> {
+        if st.slot.num != num || st.slot.local_id != local_id {
+            return Ok(AhciCancel::NotFound);
+        }
+        match st.slot.state {
+            AsyncSlotState::Reserved => {
+                st.slot = AsyncSlot::EMPTY;
+                st.cancelled += 1;
+                Ok(AhciCancel::Cancelled)
+            }
+            AsyncSlotState::InFlight => Ok(AhciCancel::InFlight),
+            AsyncSlotState::Completed => Ok(AhciCancel::Completed),
+            AsyncSlotState::Free => Ok(AhciCancel::NotFound),
+        }
+    }) {
+        Ok(Ok(result)) => result,
+        _ => AhciCancel::InFlight,
+    }
+}
+
+pub fn async_release(num: u8, lease: u32) -> Result<(), AhciError> {
+    with_transfer_state(num, |st| {
+        if u64::from(lease) != st.slot.local_id || st.slot.num != num {
+            return Err(AhciError::Denied("租约不属于这个端口"));
+        }
+        match st.slot.state {
+            AsyncSlotState::Reserved | AsyncSlotState::Completed => {
+                st.slot = AsyncSlot::EMPTY;
+                Ok(())
+            }
+            AsyncSlotState::InFlight => Err(AhciError::AsyncBusy),
+            AsyncSlotState::Free => Err(AhciError::Denied("租约已经释放")),
+        }
+    })?
+}
+
+pub fn async_stats() -> Option<AhciAsyncStats> {
+    if DriverCtx::in_isr() {
+        return None;
+    }
+    with_transfer_state(0, |st| {
+        Some(AhciAsyncStats {
+            submitted: st.submitted,
+            completed: st.completed,
+            cancelled: st.cancelled,
+            bad_used: st.bad_used,
+            wait_calls: st.wait_calls,
+            occupied: usize::from(st.slot.state != AsyncSlotState::Free),
+            poisoned: st.poisoned,
+        })
+    })
+    .ok()
+    .flatten()
 }
 
 /// 数据缓冲的开头若干字节（用例据此打印可辨认的 ASCII 见证）。

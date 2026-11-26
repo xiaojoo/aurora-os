@@ -5323,7 +5323,7 @@ def check_scratch_write(log: str) -> list[str]:
     这一条把"确实落到盘上了"交给另一台仪器。图案按 LBA 取，所以"写错了偏移"也会在这里露出来。
     """
     bad: list[str] = []
-    rows = re.findall(r"写 lba=(\d+) 计数=(\d+) ", log)
+    rows = re.findall(r"(?:ahci: 写|ahci-async-write: 写) lba=(\d+) 计数=(\d+) ", log)
     if not rows:
         # 正常构建没有第二次盘，写用例根本不注册 ⇒ 没有写记录是**正确的**。
         # 但带 `ahci-scratch` 的那一跑一定有（它的取证行 `高LBA 第二块盘口=` 是设备给的标记），

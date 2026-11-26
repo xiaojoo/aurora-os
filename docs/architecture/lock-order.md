@@ -18,7 +18,7 @@
 | `RANK_PMM` | 30 | 物理帧位图与 `free_frames` 计数 | 台账(40) | `phys_alloc`/`phys_free` 结束时记账 | 否 |
 | `RANK_HANDLE` | 35 | 用户句柄表（`kernel/src/handle.rs`，`handles` 特性） | 台账(40) | ADR-007 裁决 E（2026-11-07 批准，同日落地）：第一版对象是只读文件、**不持有页框** ⇒ 表锁内只许调台账、不许调 mm；盘 I/O 在锁外（取票/提交两段）。**P5c-1 起再加一条**：对象**活性判定**也在锁外（`resolve` 取完引用放锁，再判 `mm::aspace_live` ⇒ 那一步要取 VMM(20)）。负样本 M19：把判定留在 35 之内 ⇒ `L4 sync: 锁序违规，外层 rank=35 本次 rank=20` ⇒ EXCEPTION(39) | 否 |
 | `RANK_NET` | 36 | socket 表（`network/socket.rs` 的 `TABLE`，ADR-181） | （叶子：队列操作全在本锁内完成） | **ADR-181（2026-11-22）**：socket 表只被 `handle` 层的 socket 句柄操作调用，那些路径已持 `RANK_HANDLE(35)` ⇒ 本锁必须比 35 深。它内部不取任何锁，所以 36 是安全下界。**收包路径今天只从用户态 syscall 侧调**，不从中断里调；若将来接到真收包中断，这一格要改成「是」并重跑 ADR-081 决策 2 的判据 | 否 |
-| `RANK_GROW` | 4 | **块设备传输（`driver/ahci.rs` 的 `XFER`）** | 会等完成中断 => 中断里取 TIMER(6) => 必须低于 6（ADR-222）；AHCI 入口拒绝任何外层 rank>=4 的调用（ADR-248）|
+| `RANK_GROW` | 4 | **块设备传输（`driver/ahci.rs` 的 `XFER`）** | 会等完成中断 => 中断里取 TIMER(6) => 必须低于 6（ADR-222）；AHCI 入口拒绝任何外层 rank>=4 的调用（ADR-248）；ADR-259 起锁内还保护单槽异步租约状态 |
 | `RANK_GROW` | 4 | 页缓存槽与失效代数（`filesystem/vfs_ro.rs` 的 `CACHE_LOCK`） | （叶子：只读写 24 个槽） | **ADR-250（2026-11-25）**：缓存命中不碰设备；未命中先放锁再走块层，写扇区返回后再失效。与 HEAP/XFER 同 rank 但从不嵌套。 | 否 |
 | `RANK_GROW` | 4 | virtio-blk 队列互斥（`driver/virtio.rs` 的 `io_lock`） | 驱动内部叶子；轮询 used.idx 时保持 IF | **ADR-259（2026-11-26）**：同步/异步共用，异步槽非 Free 时拒绝同步穿插；设备等待有界，ISR 不取此锁。 | 否 |
 | `RANK_BLOCK` | 37 | 块层请求队列 / 完成回调（`block_io.rs` 的 `QUEUE_LOCK`/`CB_LOCK`）| （叶子：只读写静态表）|

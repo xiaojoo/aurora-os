@@ -692,6 +692,10 @@ public_api = [
   "driver::MmioHandle", "ahci::REG_CAP", "ahci::REG_GHC", "ahci::SECTOR", "ahci::boot_port",
   "ahci::fnv1a64", "ahci::init", "ahci::prepare_capture", "ahci::CaptureIo",
   "ahci::is_capture_port", "ahci::read_bytes", "ahci::write_bytes", "ahci::read_modify_write", "ahci::AhciError",
+  "ahci::AhciCancel", "ahci::AhciIoCompletion", "ahci::AhciAsyncStats",
+  "ahci::async_alloc_lease", "ahci::async_copy_in", "ahci::async_copy_out", "ahci::async_submit",
+  "ahci::async_reap", "ahci::async_cancel", "ahci::async_release", "ahci::async_stats",
+  "ahci::async_quarantine_for_test", "ahci::async_recover_for_test",
   "virtio::VirtioError", "virtio::read_block", "virtio::write_block", "virtio::read_block_at",
   "virtio::write_block_at", "virtio::bind_net", "virtio::send_raw", "virtio::receive",
   "virtio::ASYNC_SLOTS", "virtio::VirtioCancel", "virtio::VirtioIoCompletion",
@@ -721,7 +725,7 @@ error_classes = ["A", "B", "C"]
 resource_ownership = "驱动模块身份、MMIO/DMA 能力句柄表、槽位与 generation、授权与撤销状态、驱动资源统计；kdump 专用 AHCI 口与常驻 DMA 环由 capture 编排独占。"
 error_policy = "Denied/WrongContext/ResourceExhausted/MappingError；越权/世代不匹配 → 拒绝并记事件。"
 unsafe_scope = ["driver/mod:U3,U4", "driver/ahci:U4", "driver/virtio:U4"]
-test_targets = ["t_driver_ctx", "t_ahci_lock_rank_guard", "t_virtio_async", "t_virtio_lock_rank_guard", "t_virtio_quarantine"]
+test_targets = ["t_driver_ctx", "t_ahci_lock_rank_guard", "t_virtio_async", "t_virtio_lock_rank_guard", "t_virtio_quarantine", "t_ahci_async", "t_ahci_async_write", "t_ahci_async_quarantine", "t_ahci_async_poisoned_reap", "t_ahci_async_cross_port_release"]
 status = "部分落地"
 
 [modules."pci"]
@@ -1201,7 +1205,7 @@ known_scc = [
 
 [baseline.ring_edge_sites]
   "time->sync" = 4
-  "driver->sync" = 5
+  "driver->sync" = 6
 "driver->network" = 2
   "network->sync" = 5
   "network->driver" = 9

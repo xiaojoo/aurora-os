@@ -26217,3 +26217,9 @@ PASS，按环境形状记“不归因”，判据不动。
   `run-17134` 锁秩绕过 EXCEPTION，`run-17135` 关闭隔离仅 `t_virtio_quarantine` FAIL。
   `check` **21/21**；`driver→arch` 55→56（共享 ISR helper）、`driver→sync` 3→5（新队列锁）。
   完整矩阵 **82/82 符合**，`AURORA_MATRIX_DONE rc=0`。
+- 第 3 片 AHCI 单槽：XFER 锁内租约状态、共享 issue/collect、非阻塞 submit、显式 reap、
+  同步互斥、poisoned 隔离、迟到完成回收、跨口恢复保护；`recover` 同调用耗尽预算。
+  `run-17298` ahci-scratch **100/100 PASS**，默认 `run-17289` **94/94 PASS**。
+  `run-17294/17295/17296/17297/17292/17293/17299` 分别证红等待/穿插/隔离/丢完成/迟到/跨口清槽；
+  部分变异后续状态级联，保留实际 FAIL 名单。真机未验证；NVMe 与用户 broker 尚未接入。
+  `driver→sync` 棘轮因 XFER 状态升级 5→6。`check` **21/21**；完整矩阵 **82/82 符合**。

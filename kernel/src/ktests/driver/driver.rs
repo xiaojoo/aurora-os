@@ -1101,7 +1101,9 @@ fn t_ahci_recovery() -> bool {
     // 也就是说它分辨不了"排空有没有发生"。真在量这件事的是上面 `healed` 的整段回执。
     let drained = ahci::pending_cmds(vi) == Ok(0);
 
-    // 3 修不好 → 隔离：让恢复本身必然失败，重试到预算
+    // 3 修不好 → 隔离：ADR-259 第3片在同一次恢复调用里耗尽预算。
+    // poisoned 会拒绝下一次 I/O，因此不能像旧状态机那样靠循环里的后续命令慢慢凑预算。
+    let pre_quarantine_resets = ahci::resets_of(vi);
     ahci::inject_dead_port(vi);
     let mut quarantined = false;
     let mut resets_at = 0u32;
@@ -1138,8 +1140,8 @@ fn t_ahci_recovery() -> bool {
         && matches!(post, Err(ahci::AhciError::Quarantined))
         && s3.resets == resets_at
         && s3.quarantines == st0.quarantines + 1
-        // 预算是按口累计的：停在 RETRY_BUDGET 说明这一口自己试够了次数
-        && ahci::resets_of(vi) == ahci::RETRY_BUDGET;
+        // 本次隔离调用自己试够 RETRY_BUDGET；先前成功恢复的次数不计入这段增量。
+        && ahci::resets_of(vi) == pre_quarantine_resets + ahci::RETRY_BUDGET;
 
     // `.ktests` 的顺序由链接器决定，隔离态不能留给后面的用例（真机上它是终态）
     ahci::revive_port();
@@ -1167,7 +1169,7 @@ fn t_ahci_recovery() -> bool {
         drained
     );
     crate::log_info!(
-        "recover: 已隔离={}(第{}次命令) 隔离后快速失败且不再碰设备={} 撤销隔离后能用={} 引导盘照常={} 计数 全局resets={} 受害口resets={} 引导口resets={} 隔离数={} 干净错误={} 预算={} 被吞重发合计={} 引导口被吞={}",
+        "recover: 已隔离={}(第{}次命令) 隔离后快速失败且不再碰设备={} 撤销隔离后能用={} 引导盘照常={} 计数 全局resets={} 受害口resets={}(隔离前={}) 引导口resets={} 隔离数={} 干净错误={} 预算={} 被吞重发合计={} 引导口被吞={}",
         quarantined,
         tries,
         fails_fast,
@@ -1175,6 +1177,7 @@ fn t_ahci_recovery() -> bool {
         boot_ok,
         s3.resets,
         ahci::resets_of(vi),
+        pre_quarantine_resets,
         ahci::resets_of(bt),
         s3.quarantines,
         s3.clean_errors,
@@ -1212,6 +1215,415 @@ fn t_ahci_recovery() -> bool {
 }
 #[cfg(feature = "ahci-scratch")]
 ktest!(KT_AHCI_RECOVERY, t_ahci_recovery);
+/// ADR-259 第3片：单槽只发不等。空 reap 缓冲必须原样保留完成；
+/// 小缓冲由适配器只交出调用方容量，不能先把回执消费掉。
+fn ahci_async_wait(disk: &crate::filesystem::vfs::AhciDisk) -> Option<crate::filesystem::vfs::IoCompletion> {
+    use crate::filesystem::vfs::AsyncBlock;
+    let mut one = [crate::filesystem::vfs::IoCompletion { local_id: 0, sectors_done: 0, error: None }; 1];
+    for _ in 0..20_000 {
+        if disk.reap(&mut one) > 0 {
+            return Some(one[0]);
+        }
+        crate::tsc::spin(50_000);
+    }
+    None
+}
+
+fn ahci_block_wait(
+    disk: &crate::filesystem::vfs::AhciDisk,
+    target: crate::filesystem::block_io::TargetId,
+) -> Option<crate::filesystem::block_io::LeaseClaim> {
+    use crate::filesystem::block_io;
+    for _ in 0..20_000 {
+        if let Some(claim) = block_io::async_take_completion(target) {
+            return Some(claim);
+        }
+        let _ = block_io::async_poll(disk);
+        crate::tsc::spin(50_000);
+    }
+    None
+}
+
+/// ADR-259 第3片：AHCI 单槽异步读、块层路由、取消/释放与同步互斥。
+/// 判据分别钉住：submit 不等、第二租约被拒、非 Free 槽拒绝同步、回执可 copy-out、
+/// 空输出不消费、完成态可取消、单调 id、稳定且唯一的 adapter_id。
+fn t_ahci_async() -> bool {
+    use crate::filesystem::block_io::{self, TargetId};
+    use crate::filesystem::vfs::{AhciDisk, AsyncBlock, Block, CancelResult, IoCompletion, IoRequest};
+
+    if ahci::init().is_err() {
+        crate::log_fatal!("ahci-async: AHCI 认领失败");
+        return false;
+    }
+    let port = match ahci::boot_port() {
+        Ok(p) => p,
+        Err(e) => {
+            crate::log_fatal!("ahci-async: 找不到引导口 {:?}", e);
+            return false;
+        }
+    };
+    let disk = AhciDisk { port };
+    let mut expected = [0u8; 512];
+    if ahci::read_bytes(port, 0, &mut expected).is_err() {
+        crate::log_fatal!("ahci-async: 同步基线读失败");
+        return false;
+    }
+    let before = ahci::async_stats().unwrap_or_default();
+    if before.occupied != 0 || before.poisoned {
+        crate::log_fatal!("ahci-async: 用例不是自足的，起始槽 occupied={} poisoned={}", before.occupied, before.poisoned);
+        return false;
+    }
+    let adapter = disk.adapter_id();
+    let adapter_ok = adapter.0 == 0x4100_0000 | u64::from(port)
+        && disk.adapter_id() == adapter
+        && AhciDisk { port: port.wrapping_add(1) }.adapter_id() != adapter;
+
+    // Reserved 也属于非 Free：同步入口不许借用它的数据缓冲。这个探针不发射异步命令，
+    // 因此 sync-interleave 负样本变红后不会破坏一条真正在途的 DMA。
+    let Ok(reserved) = disk.alloc_lease(1) else {
+        crate::log_fatal!("ahci-async: 预占失败");
+        return false;
+    };
+    let mut sync_tmp = [0u8; 512];
+    let sync_busy_reserved = matches!(disk.read_sectors(0, &mut sync_tmp), Err(crate::filesystem::vfs::BlockError::NotSettled));
+    let cancel_reserved = disk.cancel(u64::from(reserved.0)) == CancelResult::Cancelled;
+    let cancel_stats = ahci::async_stats().unwrap_or_default();
+    let cancelled_count = cancel_stats.cancelled == before.cancelled + 1;
+    // cancel(Reserved) 已经释放所有权；同一个 lease 再 release 必须失败，不能误放后来的请求。
+    let release_after_cancel = disk.release_lease(reserved).is_err();
+
+    // 直接适配器：submit 返回时 wait_calls 必须一格不动（负样本会 +1）。
+    let Ok(read_lease) = disk.alloc_lease(1) else {
+        crate::log_fatal!("ahci-async: 读租约分配失败");
+        return false;
+    };
+    let read_id = match disk.submit(IoRequest { lba: 0, sectors: 1, token: 301, write: false }, read_lease) {
+        Ok(id) => id,
+        Err(e) => {
+            crate::log_fatal!("ahci-async: 读提交失败 {:?}", e);
+            return false;
+        }
+    };
+    let after_submit = ahci::async_stats().unwrap_or_default();
+    let immediate = after_submit.wait_calls == before.wait_calls;
+    let second_lease = matches!(disk.alloc_lease(1), Err(crate::filesystem::vfs::BlockError::NotSettled));
+    let sync_busy_inflight = {
+        #[cfg(not(feature = "fault-ahci-sync-interleave"))]
+        {
+            matches!(disk.read_sectors(0, &mut sync_tmp), Err(crate::filesystem::vfs::BlockError::NotSettled))
+        }
+        #[cfg(feature = "fault-ahci-sync-interleave")]
+        {
+            // 负样本只通过上面的 Reserved 格变红；这里故意不真去穿插一条在途 DMA。
+            true
+        }
+    };
+    let cancel_inflight = disk.cancel(read_id) == CancelResult::InFlight;
+    let release_inflight = disk.release_lease(read_lease).is_err();
+    let read_done = ahci_async_wait(&disk);
+    let mut got = [0u8; 512];
+    let read_ok = read_done.as_ref().is_some_and(|c| {
+        c.local_id == read_id && c.sectors_done == 1 && c.error.is_none()
+            && disk.copy_out(read_lease, &mut got) == Ok(())
+    }) && got == expected;
+    let cancel_completed = disk.cancel(read_id) == CancelResult::Completed;
+    let released_read = disk.release_lease(read_lease).is_ok();
+    let stale_release = disk.release_lease(read_lease).is_err();
+
+    // 块层路由：AdapterId 既是 TargetId，又是 copy-out/release 的认主证件。
+    let target = TargetId(adapter.0);
+    let routed = block_io::async_submit(&disk, target, 0, 1, false, 302, None);
+    let mut routed_claim = routed.as_ref().ok().and_then(|_| ahci_block_wait(&disk, target));
+    let mut routed_data = [0u8; 512];
+    let routed_ok = routed.is_ok() && routed_claim.as_ref().is_some_and(|c| {
+        c.token == 302 && c.sectors == 1 && c.sectors_done == 1 && c.error.is_none()
+            && block_io::async_copy_out(&disk, c, &mut routed_data) == Ok(())
+    }) && routed_data == expected;
+    let routed_release = routed_claim.as_mut().is_some_and(|c| block_io::async_release(&disk, c).is_ok());
+
+    // 空输出不碰设备、不消费完成；随后正常的一格输出必须仍取得到同一条回执。
+    let Ok(small_lease) = disk.alloc_lease(1) else {
+        crate::log_fatal!("ahci-async: 小缓冲租约分配失败");
+        return false;
+    };
+    let small_id = match disk.submit(IoRequest { lba: 0, sectors: 1, token: 303, write: false }, small_lease) {
+        Ok(id) => id,
+        Err(e) => {
+            crate::log_fatal!("ahci-async: 小缓冲提交失败 {:?}", e);
+            return false;
+        }
+    };
+    let empty_before = ahci::async_stats().unwrap_or_default();
+    let mut empty: [IoCompletion; 0] = [];
+    let empty_reap = disk.reap(&mut empty) == 0;
+    let empty_after = ahci::async_stats().unwrap_or_default();
+    let empty_untouched = empty_after.completed == empty_before.completed
+        && empty_after.wait_calls == empty_before.wait_calls;
+    let small_done = ahci_async_wait(&disk);
+    let mut small_data = [0u8; 16];
+    let small_ok = small_id > read_id && small_done.as_ref().is_some_and(|c| {
+        c.local_id == small_id && c.sectors_done == 1 && c.error.is_none()
+            && disk.copy_out(small_lease, &mut small_data) == Ok(())
+    }) && small_data == expected[..16];
+    let _ = disk.release_lease(small_lease);
+
+    let after = ahci::async_stats().unwrap_or_default();
+    let submitted = after.submitted.saturating_sub(before.submitted);
+    let completed = after.completed.saturating_sub(before.completed);
+    let wait_delta = after.wait_calls.saturating_sub(before.wait_calls);
+    let stats_ok = submitted == 3 && completed == 3 && wait_delta == 0
+        && after.bad_used == before.bad_used && after.occupied == 0 && !after.poisoned;
+    let ok = adapter_ok && sync_busy_reserved && cancel_reserved && cancelled_count && release_after_cancel
+        && immediate && second_lease && sync_busy_inflight && cancel_inflight && release_inflight
+        && read_ok && cancel_completed && released_read && stale_release && routed_ok && routed_release
+        && empty_reap && empty_untouched && small_ok && stats_ok;
+    crate::log_info!(
+        "ahci-async: adapter={:#x} 立即={} 预约互斥={} 在途互斥={} 第二租约拒={} 取消={}/{}/{} 取消后释放拒={} 释放={}/{} 读={} 块层={} 空缓冲={} 小缓冲={} id={}→{} 计数={}/{}/{} wait={} ⇒ {}",
+        adapter.0, immediate, sync_busy_reserved, sync_busy_inflight, second_lease,
+        cancel_reserved, cancel_inflight, cancel_completed, release_after_cancel, release_inflight, released_read,
+        read_ok, routed_ok, empty_reap && empty_untouched, small_ok, read_id, small_id,
+        submitted, completed, after.bad_used.saturating_sub(before.bad_used), wait_delta, ok
+    );
+    if !ok {
+        crate::log_fatal!("ahci-async: 单槽异步判据不成立（上面一行是全部读数）");
+    }
+    ok
+}
+ktest!(KT_AHCI_ASYNC, t_ahci_async);
+
+#[cfg(feature = "ahci-scratch")]
+/// ADR-259 第3片：异步写与异步回读，区间与既有 4096/6144/6152 用例错开。
+/// 宿主机 `qemu-io` 按日志中的 LBA/计数再读一遍，第二台仪器见 tools/aurora.py。
+fn t_ahci_async_write() -> bool {
+    use crate::filesystem::vfs::{AhciDisk, AsyncBlock, IoRequest};
+
+    let e = match ahci::enumerate() {
+        Ok(e) => e,
+        Err(err) => {
+            crate::log_fatal!("ahci-async-write: 枚举失败 {:?}", err);
+            return false;
+        }
+    };
+    let mut scratch = None;
+    for i in 0..e.n_disks {
+        let p = e.disks[i];
+        if ahci::read_lba(p, 1, 1).is_err() {
+            continue;
+        }
+        let is_gpt = ahci::data_head(8).map(|h| &h[..8] == b"EFI PART").unwrap_or(false);
+        if !is_gpt {
+            scratch = Some(p);
+            break;
+        }
+    }
+    let Some(port) = scratch else {
+        crate::log_fatal!("ahci-async-write: 没找到 scratch 盘");
+        return false;
+    };
+    const LBA: u64 = 7168;
+    const COUNT: u16 = 8;
+    let disk = AhciDisk { port };
+    let before = ahci::async_stats().unwrap_or_default();
+    let mut src = [0u8; COUNT as usize * 512];
+    for (i, b) in src.iter_mut().enumerate() {
+        *b = ahci::pattern_byte(LBA, i as u64);
+    }
+    let want_hash = ahci::fnv1a64(&src);
+    let Ok(write_lease) = disk.alloc_lease(COUNT as u32) else {
+        crate::log_fatal!("ahci-async-write: 写租约分配失败");
+        return false;
+    };
+    if disk.copy_in(write_lease, &src).is_err() {
+        crate::log_fatal!("ahci-async-write: copy_in 失败");
+        return false;
+    }
+    let write_id = match disk.submit(IoRequest { lba: LBA, sectors: COUNT as u32, token: 304, write: true }, write_lease) {
+        Ok(id) => id,
+        Err(err) => {
+            crate::log_fatal!("ahci-async-write: 写提交失败 {:?}", err);
+            return false;
+        }
+    };
+    let submit_stats = ahci::async_stats().unwrap_or_default();
+    let immediate = submit_stats.wait_calls == before.wait_calls;
+    let write_done = ahci_async_wait(&disk);
+    let write_ok = write_done.as_ref().is_some_and(|c| {
+        c.local_id == write_id && c.sectors_done == u32::from(COUNT) && c.error.is_none()
+    });
+    let write_release = disk.release_lease(write_lease).is_ok();
+
+    let Ok(read_lease) = disk.alloc_lease(COUNT as u32) else {
+        crate::log_fatal!("ahci-async-write: 回读租约分配失败");
+        return false;
+    };
+    let read_id = match disk.submit(IoRequest { lba: LBA, sectors: COUNT as u32, token: 305, write: false }, read_lease) {
+        Ok(id) => id,
+        Err(err) => {
+            crate::log_fatal!("ahci-async-write: 回读提交失败 {:?}", err);
+            return false;
+        }
+    };
+    let read_done = ahci_async_wait(&disk);
+    let mut back = [0u8; COUNT as usize * 512];
+    let read_ok = read_id > write_id && read_done.as_ref().is_some_and(|c| {
+        c.local_id == read_id && c.sectors_done == u32::from(COUNT) && c.error.is_none()
+            && disk.copy_out(read_lease, &mut back) == Ok(())
+    }) && back == src;
+    let read_release = disk.release_lease(read_lease).is_ok();
+    let after = ahci::async_stats().unwrap_or_default();
+    let stats_ok = after.submitted.saturating_sub(before.submitted) == 2
+        && after.completed.saturating_sub(before.completed) == 2
+        && after.wait_calls == before.wait_calls && after.occupied == 0 && !after.poisoned;
+    let ok = immediate && write_ok && write_release && read_ok && read_release && stats_ok;
+    crate::log_info!(
+        "ahci-async-write: 写 lba={} 计数={} 端口={} 哈希={:#018x} 立即={} 写={} 释放={} 回读={} 释放={} id={}→{} 计数={}/{}/{} ⇒ {}",
+        LBA, COUNT, port, want_hash, immediate, write_ok, write_release, read_ok, read_release,
+        write_id, read_id, after.submitted.saturating_sub(before.submitted),
+        after.completed.saturating_sub(before.completed), after.wait_calls.saturating_sub(before.wait_calls), ok
+    );
+    if !ok {
+        crate::log_fatal!("ahci-async-write: 异步写/回读判据不成立");
+    }
+    ok
+}
+#[cfg(feature = "ahci-scratch")]
+ktest!(KT_AHCI_ASYNC_WRITE, t_ahci_async_write);
+
+#[cfg(feature = "ahci-scratch")]
+/// ADR-259 第3片：真实超时后的全局 DMA 隔离。楔住端口 → submit → reap 超时；
+/// 在确认 PxCI/PxSACT 静止前不得分配、同步穿插或释放 InFlight 租约。
+fn t_ahci_async_quarantine() -> bool {
+    use crate::filesystem::vfs::{AhciDisk, AsyncBlock, Block, BlockError, IoRequest};
+
+    if ahci::init().is_err() {
+        crate::log_fatal!("ahci-async-quarantine: AHCI 认领失败");
+        return false;
+    }
+    let port = match ahci::boot_port() {
+        Ok(p) => p,
+        Err(e) => {
+            crate::log_fatal!("ahci-async-quarantine: 找不到引导口 {:?}", e);
+            return false;
+        }
+    };
+    let disk = AhciDisk { port };
+    let before = ahci::async_stats().unwrap_or_default();
+    if before.occupied != 0 || before.poisoned {
+        crate::log_fatal!("ahci-async-quarantine: 起始异步状态不干净");
+        return false;
+    }
+    if ahci::wedge_port(port).is_err() {
+        crate::log_fatal!("ahci-async-quarantine: 楔口失败");
+        return false;
+    }
+    let Ok(lease) = disk.alloc_lease(1) else {
+        crate::log_fatal!("ahci-async-quarantine: 租约分配失败");
+        return false;
+    };
+    let submitted = disk.submit(IoRequest { lba: 0, sectors: 1, token: 306, write: false }, lease);
+    let mut one = [crate::filesystem::vfs::IoCompletion { local_id: 0, sectors_done: 0, error: None }; 1];
+    let reaped = if submitted.is_ok() { disk.reap(&mut one) } else { 0 };
+    let after = ahci::async_stats().unwrap_or_default();
+    let poisoned = after.poisoned;
+    let new_lease = matches!(disk.alloc_lease(1), Err(BlockError::NotSettled));
+    let mut buf = [0u8; 512];
+    let sync_busy = matches!(disk.read_sectors(0, &mut buf), Err(BlockError::NotSettled));
+    let health = disk.ensure_readable() == Err(BlockError::Quarantined);
+    let release_busy = disk.release_lease(lease).is_err();
+    let recovered = ahci::async_recover_for_test(port).is_ok();
+    let healed = ahci::async_stats().is_some_and(|s| !s.poisoned && s.occupied == 0)
+        && disk.read_sectors(0, &mut buf).is_ok();
+    let ok = submitted.is_ok() && reaped == 0 && poisoned && new_lease && sync_busy && health
+        && release_busy && recovered && healed;
+    crate::log_info!(
+        "ahci-async-quarantine: 提交={} reap={} poisoned={} 新租约拒={} 同步拒={} 健康闸={} 在途释放拒={} 静默后恢复={} 恢复后可读={} ⇒ {}",
+        submitted.is_ok(), reaped, poisoned, new_lease, sync_busy, health, release_busy, recovered, healed, ok
+    );
+    if !ok {
+        crate::log_fatal!("ahci-async-quarantine: 超时隔离策略判据不成立");
+    }
+    ok
+}
+#[cfg(feature = "ahci-scratch")]
+ktest!(KT_AHCI_ASYNC_QUARANTINE, t_ahci_async_quarantine);
+
+#[cfg(feature = "ahci-scratch")]
+fn t_ahci_async_poisoned_reap() -> bool {
+    use crate::filesystem::vfs::{AhciDisk, AsyncBlock, IoRequest};
+
+    if ahci::init().is_err() {
+        return false;
+    }
+    let Ok(port) = ahci::boot_port() else { return false };
+    let disk = AhciDisk { port };
+    let mut expected = [0u8; 512];
+    if ahci::read_bytes(port, 0, &mut expected).is_err() {
+        return false;
+    }
+    let before = ahci::async_stats().unwrap_or_default();
+    let Ok(lease) = disk.alloc_lease(1) else { return false };
+    let id = match disk.submit(IoRequest { lba: 0, sectors: 1, token: 307, write: false }, lease) {
+        Ok(id) => id,
+        Err(_) => return false,
+    };
+    let poisoned = ahci::async_quarantine_for_test().is_ok();
+    let done = ahci_async_wait(&disk);
+    let mut got = [0u8; 512];
+    let late_ok = done.as_ref().is_some_and(|c| {
+        c.local_id == id && c.sectors_done == 1 && c.error.is_none()
+            && disk.copy_out(lease, &mut got) == Ok(())
+    }) && got == expected;
+    let released = disk.release_lease(lease).is_ok();
+    let recovered = ahci::async_recover_for_test(port).is_ok();
+    let after = ahci::async_stats().unwrap_or_default();
+    let clean = !after.poisoned && after.occupied == 0
+        && after.completed == before.completed + 1;
+    let ok = poisoned && late_ok && released && recovered && clean;
+    crate::log_info!("ahci-async-late: poisoned={} 迟到完成={} 释放={} 恢复={} 台账净={} ⇒ {}",
+        poisoned, late_ok, released, recovered, clean, ok);
+    ok
+}
+#[cfg(feature = "ahci-scratch")]
+ktest!(KT_AHCI_ASYNC_POISONED_REAP, t_ahci_async_poisoned_reap);
+
+#[cfg(feature = "ahci-scratch")]
+fn t_ahci_async_cross_port_release() -> bool {
+    use crate::filesystem::vfs::{AhciDisk, AsyncBlock, IoRequest};
+
+    if ahci::init().is_err() {
+        return false;
+    }
+    let Ok(port) = ahci::boot_port() else { return false };
+    let Ok(enumerated) = ahci::enumerate() else { return false };
+    let mut other = None;
+    for i in 0..enumerated.n_disks {
+        let candidate = enumerated.disks[i];
+        if candidate != port && ahci::read_lba(candidate, 0, 1).is_ok() {
+            other = Some(candidate);
+            break;
+        }
+    }
+    let Some(other) = other else { return false };
+    let disk = AhciDisk { port };
+    let Ok(lease) = disk.alloc_lease(1) else { return false };
+    let id = match disk.submit(IoRequest { lba: 0, sectors: 1, token: 308, write: false }, lease) {
+        Ok(id) => id,
+        Err(_) => return false,
+    };
+    let other_recovered = ahci::release_quarantine(other).is_ok();
+    let occupied = ahci::async_stats().is_some_and(|s| s.occupied == 1 && !s.poisoned);
+    let done = ahci_async_wait(&disk);
+    let completed = done.as_ref().is_some_and(|c| c.local_id == id && c.error.is_none());
+    let released = disk.release_lease(lease).is_ok();
+    let clean = ahci::async_stats().is_some_and(|s| s.occupied == 0 && !s.poisoned);
+    let ok = other_recovered && occupied && completed && released && clean;
+    crate::log_info!("ahci-async-cross: 他口恢复={} 原口在途保留={} 完成={} 释放={} 净={} ⇒ {}",
+        other_recovered, occupied, completed, released, clean, ok);
+    ok
+}
+#[cfg(feature = "ahci-scratch")]
+ktest!(KT_AHCI_ASYNC_CROSS_PORT_RELEASE, t_ahci_async_cross_port_release);
+
 
 /// 只给 `KT_IRQ_AHCI` 第六格用的一颗空处理函数：它永远说"不是我的"。
 /// 要一颗**不接线到任何设备**的认领，是为了让"撤销→复用同一格→旧句柄必须被拒"

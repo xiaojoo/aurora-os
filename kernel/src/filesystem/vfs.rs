@@ -11,7 +11,7 @@
 //! 三个互相作证的实现之外还有两台仪器：宿主机 `tools/aurora.py` 用 Python 把同一块卷再解析一遍，
 //! 以及造夹具的 `mtools`（`minfo` 的原文记在 BACKLOG 78）。
 
-use crate::ahci::{self, AhciError};
+use crate::ahci::{self, AhciError, AhciIoCompletion};
 use crate::virtio;
 
 /// 块设备的一次读失败。**每一格一个成因**，不许合并——合并之后"设备没接走这条命令"和
@@ -297,7 +297,9 @@ impl Block for AhciDisk {
     }
 
     fn ensure_readable(&self) -> Result<(), BlockError> {
-        if ahci::state(self.port) == ahci::State::Quarantined {
+        if ahci::state(self.port) == ahci::State::Quarantined
+            || ahci::async_stats().is_some_and(|s| s.poisoned)
+        {
             Err(BlockError::Quarantined)
         } else {
             Ok(())
@@ -310,6 +312,60 @@ impl Block for AhciDisk {
     /// 真驱动可以合并（ADR-194 补记）：128 扇区留足余量。
     fn max_transfer_sectors(&self) -> u32 {
         128
+    }
+}
+
+impl AsyncBlock for AhciDisk {
+    fn adapter_id(&self) -> AdapterId {
+        // 端口号稳定映射到独立命名空间，不与 virtio 的 0x5600_0000 冲突。
+        AdapterId(0x4100_0000 | u64::from(self.port))
+    }
+
+    fn alloc_lease(&self, sectors: u32) -> Result<IoLease, BlockError> {
+        ahci::async_alloc_lease(self.port, sectors).map(IoLease).map_err(block_err)
+    }
+
+    fn copy_in(&self, lease: IoLease, src: &[u8]) -> Result<(), BlockError> {
+        ahci::async_copy_in(self.port, lease.0, src).map_err(block_err)
+    }
+
+    fn copy_out(&self, lease: IoLease, dst: &mut [u8]) -> Result<(), BlockError> {
+        ahci::async_copy_out(self.port, lease.0, dst).map_err(block_err)
+    }
+
+    fn submit(&self, request: IoRequest, lease: IoLease) -> Result<u64, BlockError> {
+        let count = u16::try_from(request.sectors).map_err(|_| BlockError::Refused)?;
+        ahci::async_submit(self.port, lease.0, request.lba, count, request.write).map_err(block_err)
+    }
+
+    fn reap(&self, out: &mut [IoCompletion]) -> usize {
+        let cap = out.len().min(1);
+        let mut done = [AhciIoCompletion { local_id: 0, sectors_done: 0, error: None }; 2];
+        #[cfg(not(feature = "fault-ahci-reap-drop"))]
+        let n = ahci::async_reap(self.port, &mut done[..cap]).min(cap);
+        #[cfg(feature = "fault-ahci-reap-drop")]
+        let n = ahci::async_reap(self.port, &mut done).min(cap);
+        for i in 0..n {
+            out[i] = IoCompletion {
+                local_id: done[i].local_id,
+                sectors_done: done[i].sectors_done,
+                error: done[i].error.map(block_err),
+            };
+        }
+        n
+    }
+
+    fn cancel(&self, local_id: u64) -> CancelResult {
+        match ahci::async_cancel(self.port, local_id) {
+            ahci::AhciCancel::Cancelled => CancelResult::Cancelled,
+            ahci::AhciCancel::InFlight => CancelResult::InFlight,
+            ahci::AhciCancel::NotFound => CancelResult::NotFound,
+            ahci::AhciCancel::Completed => CancelResult::Completed,
+        }
+    }
+
+    fn release_lease(&self, lease: IoLease) -> Result<(), BlockError> {
+        ahci::async_release(self.port, lease.0).map_err(block_err)
     }
 }
 
@@ -556,6 +612,7 @@ fn block_err(e: AhciError) -> BlockError {
         | AhciError::Ctx(_) => BlockError::NoDevice,
         AhciError::IssueStuck(_) => BlockError::NotIssued,
         AhciError::CmdTimeout
+        | AhciError::AsyncBusy
         | AhciError::CrTimeout(_)
         | AhciError::FrTimeout(_)
         | AhciError::StopTimeout(_)
