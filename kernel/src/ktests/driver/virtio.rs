@@ -485,12 +485,17 @@ fn t_virtio_async() -> bool {
     });
     if let Some(c) = late_claim.as_mut() { let _ = block_io::async_release(&disk, c); }
 
+    let wrap_before = virtio::async_stats(0).unwrap_or((0, 0, 0, 0, 0, 0));
+    let mut wrapped = [0u8; 512];
+    let wrap_read = block_io::read_checked(&disk, 0, &mut wrapped, &block_io::Budget::UNBOUNDED);
     let after = virtio::async_stats(0).unwrap_or((0, 0, 0, 0, 0, 0));
-    let stats_ok = after.0 - before.0 == 7 && after.1 - before.1 == 7
+    let wrap_ok = wrap_read == Ok(()) && wrapped == [0x5C; 512]
+        && after.0 == wrap_before.0 + 1 && after.1 == wrap_before.1 + 1 && after.4 == 0;
+    let stats_ok = after.0 - before.0 == 8 && after.1 - before.1 == 8
         && after.2 == before.2 && after.3 == before.3 && after.4 == 0 && after.5 == 0;
-    let ok = read_ok && small_ok && two_ok && write_ok && sync_back && late_ok && stats_ok;
-    crate::log_info!("vblk-async: 读={} 小缓冲={} 双在途={} 同步拒穿插={} 写={} 写票={:?} 同步回读={} 迟到={} 计数={:?} ⇒ {}",
-        read_ok, small_ok, two_ok, sync_busy, write_ok, write_claim.as_ref().map(|c| (c.token, c.sectors_done, c.error)), sync_back, late_ok, after, ok);
+    let ok = read_ok && small_ok && two_ok && write_ok && sync_back && late_ok && wrap_ok && stats_ok;
+    crate::log_info!("vblk-async: 读={} 小缓冲={} 双在途={} 同步拒穿插={} 写={} 写票={:?} 同步回读={} 迟到={} 包装={} 计数={:?} ⇒ {}",
+        read_ok, small_ok, two_ok, sync_busy, write_ok, write_claim.as_ref().map(|c| (c.token, c.sectors_done, c.error)), sync_back, late_ok, wrap_ok, after, ok);
     ok
 }
 #[cfg(feature = "virtio-blk")]

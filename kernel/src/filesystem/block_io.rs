@@ -238,20 +238,132 @@ pub fn read_at(disk: &dyn Block, lba: u64, dst: &mut [u8], budget: &Budget<'_>) 
     Outcome { sectors_done: n, error: None }
 }
 
-/// 既有调用点用的薄包装：只要 `Result`，不要 `Outcome`。
-///
-/// 它不是"绕过请求层"的路——计数、取消、死线都在 `read_at` 里，这里只是把
-/// `Outcome.error` 摊回 `Result`。有意让 `Budget` 出现在签名里：将来接死线的调用点
-/// 不该为了这件事再改一次调用形状。
+fn wait_async_segment(
+    disk: &dyn AsyncBlock,
+    request: RequestId,
+    sectors: u32,
+    dst: &mut [u8],
+    budget: &Budget<'_>,
+) -> Outcome {
+    let mut polls = 0u32;
+    loop {
+        let now = if budget.deadline == u64::MAX { u64::MAX } else { (budget.clock)() };
+        let _ = async_poll_at(disk, now);
+        #[cfg(not(feature = "fault-block-wrap-take-any"))]
+        let claim = async_take_completion_request(request);
+        #[cfg(feature = "fault-block-wrap-take-any")]
+        let claim = async_take_completion(request.target);
+        let Some(mut claim) = claim else {
+            polls += 1;
+            #[cfg(not(feature = "fault-block-wrap-no-bound"))]
+            if polls >= 2 {
+                return Outcome { sectors_done: 0, error: Some(BlockError::NotSettled) };
+            }
+            #[cfg(feature = "fault-block-wrap-no-bound")]
+            let _ = polls;
+            core::hint::spin_loop();
+            continue;
+        };
+        let landed = claim.sectors_done.min(sectors);
+        let copied = if landed == 0 {
+            Ok(())
+        } else {
+            async_copy_out(disk, &claim, &mut dst[..landed as usize * SECTOR_BYTES])
+        };
+        let released = async_release(disk, &mut claim);
+        if let Err(error) = released {
+            return Outcome { sectors_done: landed, error: Some(error) };
+        }
+        if let Err(error) = copied {
+            return Outcome { sectors_done: landed, error: Some(error) };
+        }
+        return match claim.error {
+            Some(error) => Outcome { sectors_done: landed, error: Some(error) },
+            None if landed == sectors => Outcome { sectors_done: sectors, error: None },
+            None => Outcome { sectors_done: landed, error: Some(BlockError::DeviceError) },
+        };
+    }
+}
+
+fn read_at_async(disk: &dyn Block, async_disk: &dyn AsyncBlock, lba: u64, dst: &mut [u8], budget: &Budget<'_>) -> Outcome {
+    let b = bucket_of(disk.disk_key());
+    b.requests.fetch_add(1, Ordering::Relaxed);
+    if dst.is_empty() || dst.len() % SECTOR_BYTES != 0 {
+        b.refused.fetch_add(1, Ordering::Relaxed);
+        return Outcome { sectors_done: 0, error: Some(BlockError::Refused) };
+    }
+    let n = (dst.len() / SECTOR_BYTES) as u32;
+    let bounded = budget.deadline != u64::MAX;
+    let dev_cap = disk.max_transfer_sectors().max(1).min(128);
+    let cap = if !bounded && !budget.has_cancel() { dev_cap } else { 1 };
+    let target = TargetId(async_disk.adapter_id().0);
+    let mut done = 0u32;
+    while done < n {
+        let mut take = (n - done).min(cap);
+        while take > 0 && lba.checked_add(u64::from(done) + u64::from(take)).is_none() {
+            take -= 1;
+        }
+        if take == 0 {
+            b.refused.fetch_add(1, Ordering::Relaxed);
+            return Outcome { sectors_done: done, error: Some(BlockError::Refused) };
+        }
+        let at = lba + u64::from(done);
+        if budget.cancel.load(Ordering::Relaxed) {
+            b.cancels.fetch_add(1, Ordering::Relaxed);
+            return Outcome { sectors_done: done, error: Some(BlockError::Refused) };
+        }
+        if bounded && (budget.clock)() >= budget.deadline {
+            b.timeouts.fetch_add(1, Ordering::Relaxed);
+            return Outcome { sectors_done: done, error: Some(BlockError::NotSettled) };
+        }
+        let off = done as usize * SECTOR_BYTES;
+        let mut request_sectors = take;
+        let request = loop {
+            match async_submit_deadline(async_disk, target, at, request_sectors, false, 0, budget.deadline, None) {
+                Ok(request) => break request,
+                Err(SubmitError::Block(BlockError::Refused)) if request_sectors > 1 => {
+                    request_sectors = 1;
+                }
+                Err(SubmitError::Full) => {
+                    b.timeouts.fetch_add(1, Ordering::Relaxed);
+                    return Outcome { sectors_done: done, error: Some(BlockError::NotSettled) };
+                }
+                Err(SubmitError::Block(error)) => {
+                    return Outcome { sectors_done: done, error: Some(error) };
+                }
+            }
+        };
+        let segment = wait_async_segment(async_disk, request, request_sectors, &mut dst[off..off + request_sectors as usize * SECTOR_BYTES], budget);
+        if segment.sectors_done == 0 && segment.error == Some(BlockError::NotSettled) {
+            b.timeouts.fetch_add(1, Ordering::Relaxed);
+        }
+        b.sectors_ok.fetch_add(u64::from(segment.sectors_done), Ordering::Relaxed);
+        done += segment.sectors_done;
+        if let Some(error) = segment.error {
+            return Outcome { sectors_done: done, error: Some(error) };
+        }
+    }
+    Outcome { sectors_done: n, error: None }
+}
+
+/// 既有调用点用的薄包装：真驱动走 AsyncBlock 等待，内存盘/旧测试盘保留同步回退。
+/// 计数、取消、死线仍由请求层拥有；设备不确认取消时等待迟到真实完成，不提前还租约。
 pub fn read_checked(
     disk: &dyn Block,
     lba: u64,
     dst: &mut [u8],
     budget: &Budget<'_>,
 ) -> Result<(), BlockError> {
+    #[cfg(not(feature = "fault-block-wrap-sync"))]
+    if let Some(async_disk) = disk.as_async() {
+        return match read_at_async(disk, async_disk, lba, dst, budget).error {
+            None => Ok(()),
+            Some(error) => Err(error),
+        };
+    }
     match read_at(disk, lba, dst, budget).error {
         None => Ok(()),
-        Some(e) => Err(e),
+        Some(error) => Err(error),
     }
 }
 
@@ -1307,20 +1419,20 @@ pub fn async_poll_at(disk: &dyn AsyncBlock, now: u64) -> usize {
                 None
             }
         });
-        let Some((local_id, state, entry_target)) = pending else { continue };
+        let Some((local_id, state, _entry_target)) = pending else { continue };
         if disk.cancel(local_id) == CancelResult::Cancelled {
             let queued = with_queue(|q| {
                 if !matches!(q.async_entries[slot].state, AsyncState::InFlight | AsyncState::TimedOut) {
                     return false;
                 }
-                let token = q.async_entries[slot].token;
+                let _token = q.async_entries[slot].token;
                 let ok = ready_async(q, slot, 0, Some(BlockError::NotSettled));
                 if ok {
                     q.async_completed += 1;
                     q.async_timeouts += 1;
                     #[cfg(all(feature = "block-notify", not(feature = "fault-notify-drop-wire")))]
                     let _ = crate::filesystem::block_notify::publish(
-                        token, entry_target.0, Err(BlockError::NotSettled), [0; 16],
+                        _token, _entry_target.0, Err(BlockError::NotSettled), [0; 16],
                     );
                 }
                 ok
@@ -1390,6 +1502,25 @@ pub fn async_take_completion(target: TargetId) -> Option<LeaseClaim> {
         q.async_ready_len -= 1;
         if let Some(slot) = q.async_entries.iter().position(|e| {
             e.target == target && e.seq == completion.request.seq && e.state == AsyncState::Ready
+        }) {
+            q.async_entries[slot] = ASYNC_ENTRY_EMPTY;
+        }
+        Some(LeaseClaim { completion, released: false })
+    })
+}
+
+pub(crate) fn async_take_completion_request(request: RequestId) -> Option<LeaseClaim> {
+    if crate::arch::x86_64::apic::in_isr() {
+        return None;
+    }
+    with_queue(|q| {
+        let pos = q.async_ready[..q.async_ready_len].iter().position(|completion| completion.request == request)?;
+        let completion = q.async_ready[pos];
+        q.async_ready[pos] = q.async_ready[q.async_ready_len - 1];
+        q.async_ready_len -= 1;
+        if let Some(slot) = q.async_entries.iter().position(|entry| {
+            entry.adapter == request.adapter && entry.target == request.target
+                && entry.seq == request.seq && entry.state == AsyncState::Ready
         }) {
             q.async_entries[slot] = ASYNC_ENTRY_EMPTY;
         }

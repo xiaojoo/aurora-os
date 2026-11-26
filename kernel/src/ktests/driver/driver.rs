@@ -1392,6 +1392,37 @@ fn t_ahci_async() -> bool {
 ktest!(KT_AHCI_ASYNC, t_ahci_async);
 
 #[cfg(feature = "ahci-scratch")]
+fn t_ahci_checked_async_wrap() -> bool {
+    use crate::filesystem::block_io;
+    use crate::filesystem::vfs::{AhciDisk, Block};
+    if ahci::init().is_err() {
+        return false;
+    }
+    let Ok(port) = ahci::boot_port() else { return false };
+    let disk = AhciDisk { port };
+    let before = ahci::async_stats().unwrap_or_default();
+    let mut expected = [0u8; 512];
+    if ahci::read_bytes(port, 0, &mut expected).is_err() {
+        return false;
+    }
+    let mut got = [0u8; 512];
+    let read = block_io::read_checked(&disk, 0, &mut got, &block_io::Budget::UNBOUNDED);
+    let after = ahci::async_stats().unwrap_or_default();
+    let ok = read == Ok(()) && got == expected
+        && after.submitted == before.submitted + 1
+        && after.completed == before.completed + 1
+        && after.occupied == 0 && !after.poisoned;
+    crate::log_info!("ahci-wrap: read={:?} 内容={} 异步={}->{} 完成={}->{} 占槽={} ⇒ {}",
+        read, got == expected, before.submitted, after.submitted, before.completed, after.completed, after.occupied, ok);
+    if !ok {
+        crate::log_fatal!("ahci-wrap: read_checked 未走 AHCI 异步核心");
+    }
+    ok
+}
+#[cfg(feature = "ahci-scratch")]
+ktest!(KT_AHCI_CHECKED_ASYNC_WRAP, t_ahci_checked_async_wrap);
+
+#[cfg(feature = "ahci-scratch")]
 /// ADR-259 第3片：异步写与异步回读，区间与既有 4096/6144/6152 用例错开。
 /// 宿主机 `qemu-io` 按日志中的 LBA/计数再读一遍，第二台仪器见 tools/aurora.py。
 fn t_ahci_async_write() -> bool {

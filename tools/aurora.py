@@ -651,7 +651,7 @@ FAT_PORTS = {3: "fat32-small", 4: "fat32-wide"}
 FS_OPEN_FEATURES = {"fs-open"}
 # A3 切片：execprobe 的 22 号 open 打的是 fs_open::PORT=5 的 deep 卷（fs_open 自 mount 固定卷）。
 # 所以这一档的镜像也要装配 deep 卷——与 fs-open 同一份夹具、同一条指纹闸。
-A3_EXEC_FEATURES = {"a3-exec", "a3-shell", "a3-exec-bad", "a3-exec-seal", "a3-ls-deep"}
+A3_EXEC_FEATURES = {"a3-exec", "a3-shell", "a3-exec-bad", "a3-exec-seal", "a3-ls-deep", "a3-cred-guest"}
 FS_OPEN_PORTS = {5: "fat32-deep"}
 # ADR-111：写方向单独一档，挂在**可写**卷上（口 4）。它与 `FS_OPEN_PORTS` 一样要与内核的
 # `filesystem/fs_rw.rs` 的 `PORT` 对账（`check-fat32-ports` 里那一格扩成两张表）。
@@ -10095,6 +10095,11 @@ def do_test(timeout: int) -> int:
     vuav, vuarc, vualog = do_run(["fault-vmo-atomic-unaligned"], timeout)
     vua_verdict = "FAIL" if vuav == "FAIL" and ktest_named(vualog, "t_vmo_object") == "failed" else "CONTENT-MISMATCH"
 
+    print("=== 同步读负样本：read_checked 绕过异步核心 ===")
+    IMAGE.unlink(missing_ok=True)
+    bwsv, bwsrc, bwslog = do_run(["ahci-scratch", "fault-block-wrap-sync"], timeout)
+    bws_verdict = "FAIL" if bwsv == "FAIL" and ktest_named(bwslog, "t_ahci_checked_async_wrap") == "failed" else "CONTENT-MISMATCH"
+
     # =====================================================================
     # 裁决 C（BACKLOG §473）：把「慢」做成可见的量。
     #
@@ -11022,6 +11027,7 @@ def do_test(timeout: int) -> int:
         ("端点替换不重投必须红", bdr_verdict, bdrrc, "FAIL", 35),
         ("用户退出3当fatal必须升L4", bpf_verdict, bpfrc, "EXCEPTION", 39),
         ("共享页未对齐原子访问必须红", vua_verdict, vuarc, "FAIL", 35),
+        ("同步读绕过异步核心必须红", bws_verdict, bwsrc, "FAIL", 35),
         # ADR-170：输入域的第二台仪器。宿主机 QMP `input-send-event` 注入 'a'，
         # 内核从**真实 PS/2 端口**收到 97。`t_ps2_kbd_decode` 只证解码，
         # 这一行证两端（端口 → 解码 → 环）。
@@ -11167,6 +11173,7 @@ def do_test(timeout: int) -> int:
         "端点替换不重投必须红": bdrlog,
         "用户退出3当fatal必须升L4": bpflog,
         "共享页未对齐原子访问必须红": vualog,
+        "同步读绕过异步核心必须红": bwslog,
 "按键注入与输入通路对账": kbdlog,
 "变体用时偏离中位数": perflog,
         "网卡第一帧与 pcap 对账": ntlog,

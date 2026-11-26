@@ -26246,3 +26246,15 @@ PASS，按环境形状记“不归因”，判据不动。
   `run-17559/17623/17624` 为 3/3 PASS。`check` **21/21**，unsafe 合计 741；完整矩阵
   **90/90 符合**（`build/block-notify-slice5-matrix.log`，退出码 0）。常驻主循环 pump 与产品
   异步请求者仍未接；真机未验证；AOCI MCP 不可用，索引未更新。
+- 第 6 片同步等待包装：`Block::as_async()` 默认 None，AHCI/virtio-blk/NVMe 返回自身异步视图；
+  `read_checked` 真驱动快路按 RequestId 精确领取完成，复制后释放租约，取消/死线仍在扇区边界，
+  分桶计数不变。最多显式 reap 两次，未完成则报 NotSettled 并保留 InFlight/租约给迟到 pump；
+  队列满映射 NotSettled，驱动错误原样透传。virtio 包装格并入既有 `t_virtio_async`，避免探针复位后的顺序依赖。
+  `run-17760` fs-ro **107/107**、`run-17627` ahci-scratch **101/101**、`run-17639` virtio-blk
+  **100/100**、`run-17630` NVMe **98/98**。`run-17626/17628/17640/17632` 关闭快路分别红 fake/
+  AHCI/virtio/NVMe；`run-17761` 按 target 乱领完成红精确领取格；`run-17757` 去掉有界等待复现 HANG。
+  全链 `a3-cred-guest` 曾同 ELF 两次口5 HANG，QMP 见 CI=1/TFD=BSY；根因是宿主机
+  `A3_EXEC_FEATURES` 漏该变体、deep 卷未挂口5，空盘同步错误被无界异步等待放大。补接线后有界返回，
+  `run-17753` **173/173 PASS**。`check` **21/21**；91 行矩阵当轮 90/91，唯一 `FS-03文件ABI`
+  偏差是同档既有 `t_sdkdemo`，目标 fs-open 取证为真；同 ELF `2a804da8338f` 的 `run-17859`
+  **169/169 PASS**，记环境形状、不归因，不改判据、不重跑整链。真机未验证；AOCI MCP 不可用，索引未更新。

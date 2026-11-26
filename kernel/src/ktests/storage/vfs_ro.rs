@@ -1484,6 +1484,109 @@ impl crate::filesystem::vfs::AsyncBlock for FakeAsyncDisk {
     }
 }
 
+impl crate::filesystem::vfs::Block for FakeAsyncDisk {
+    fn read_sectors(&self, lba: u64, dst: &mut [u8]) -> Result<(), BlockError> {
+        if dst.is_empty() || dst.len() % SECTOR != 0 {
+            return Err(BlockError::Refused);
+        }
+        let start = lba.checked_mul(SECTOR as u64).and_then(|value| usize::try_from(value).ok());
+        let Some(start) = start else { return Err(BlockError::Refused) };
+        let end = start.checked_add(dst.len()).ok_or(BlockError::Refused)?;
+        if end > 4 * SECTOR {
+            return Err(BlockError::Refused);
+        }
+        dst.copy_from_slice(&self.data.borrow()[start..end]);
+        Ok(())
+    }
+
+    fn disk_key(&self) -> DiskKey {
+        DiskKey::Unknown
+    }
+
+    fn max_transfer_sectors(&self) -> u32 {
+        4
+    }
+
+    fn as_async(&self) -> Option<&dyn crate::filesystem::vfs::AsyncBlock> {
+        Some(self)
+    }
+}
+
+#[cfg(feature = "fs-ro")]
+fn wrap_clock() -> u64 {
+    100
+}
+
+#[cfg(feature = "fs-ro")]
+fn t_block_checked_async_wrap() -> bool {
+    use crate::filesystem::block_io::{self, Budget, TargetId};
+    use crate::filesystem::vfs::DiskKey;
+    block_io::queue_clear();
+    let disk = FakeAsyncDisk::new(0xA60);
+    let target = TargetId(0xA60);
+    let async0 = block_io::async_stats();
+    let stats0 = block_io::stats_of(DiskKey::Unknown);
+    let decoy = block_io::async_submit(&disk, target, 0, 1, false, 999, None);
+    let decoy_poll = block_io::async_poll(&disk);
+    let mut data = [0u8; 2 * SECTOR];
+    let read = block_io::read_checked(&disk, 0, &mut data, &Budget::UNBOUNDED);
+    let async1 = block_io::async_stats();
+    let read_ok = read == Ok(()) && data.as_slice() == &disk.data.borrow()[..2 * SECTOR]
+        && async1.0 == async0.0 + 2 && async1.1 == async0.1 + 2
+        && async1.4 == 1 && async1.5 == 1 && disk.queue.borrow().is_empty();
+    let mut remaining = block_io::async_take_completion(target);
+    let exact_take = remaining.as_ref().is_some_and(|claim| claim.token == 999 && claim.error.is_none());
+    let remaining_released = remaining.as_mut().is_some_and(|claim| block_io::async_release(&disk, claim).is_ok());
+    let async2 = block_io::async_stats();
+
+    let cancel = core::sync::atomic::AtomicBool::new(true);
+    let cancel_budget = Budget { deadline: u64::MAX, clock: wrap_clock, cancel: &cancel };
+    let mut one = [0u8; SECTOR];
+    let cancelled = block_io::read_checked(&disk, 0, &mut one, &cancel_budget);
+    let cancel_ok = cancelled == Err(BlockError::Refused) && async2.0 == async1.0;
+
+    let never = core::sync::atomic::AtomicBool::new(false);
+    let deadline_budget = Budget { deadline: 50, clock: wrap_clock, cancel: &never };
+    let expired = block_io::read_checked(&disk, 0, &mut one, &deadline_budget);
+    let async3 = block_io::async_stats();
+    let deadline_ok = expired == Err(BlockError::NotSettled) && async3.0 == async2.0;
+
+    disk.fail_next.set(true);
+    let failed = block_io::read_checked(&disk, 0, &mut one, &Budget::UNBOUNDED);
+    let async4 = block_io::async_stats();
+    let failure_ok = failed == Err(BlockError::DeviceError) && async4.0 == async3.0 + 1;
+
+    disk.stuck.set(true);
+    let stuck = block_io::read_checked(&disk, 0, &mut one, &Budget::UNBOUNDED);
+    disk.stuck.set(false);
+    let _ = block_io::async_poll(&disk);
+    let mut late = block_io::async_take_completion(target);
+    let bounded_ok = stuck == Err(BlockError::NotSettled);
+    let late_ok = late.as_ref().is_some_and(|claim| claim.sectors_done == 1 && claim.error.is_none());
+    let late_released = late.as_mut().is_some_and(|claim| block_io::async_release(&disk, claim).is_ok());
+    let leases_clean = disk.leases.iter().all(|used| !used.get()) && disk.queue.borrow().is_empty();
+    let stats1 = block_io::stats_of(DiskKey::Unknown);
+    let counts_ok = stats1.requests.wrapping_sub(stats0.requests) == 5
+        && stats1.sectors_ok.wrapping_sub(stats0.sectors_ok) == 2
+        && stats1.cancels.wrapping_sub(stats0.cancels) == 1
+        && stats1.timeouts.wrapping_sub(stats0.timeouts) == 2;
+    let ok = decoy.is_ok() && decoy_poll == 1 && read_ok && exact_take && remaining_released
+        && cancel_ok && deadline_ok && failure_ok && bounded_ok && late_ok
+        && late_released && leases_clean && counts_ok;
+    crate::log_info!(
+        "block-wrap: 诱饵={}/{} 异步读={} 精确领取={}/{} 取消={} 死线={} 失败={} 有界失败={} 迟到={}/{} 租约清={} 计数={} ⇒ {}",
+        decoy.is_ok(), decoy_poll, read_ok, exact_take, remaining_released,
+        cancel_ok, deadline_ok, failure_ok, bounded_ok, late_ok, late_released, leases_clean, counts_ok, ok
+    );
+    if !ok {
+        crate::log_fatal!("block-wrap: read_checked 异步等待包装判据不成立");
+    }
+    ok
+}
+
+#[cfg(feature = "fs-ro")]
+ktest!(KT_BLOCK_CHECKED_ASYNC_WRAP, t_block_checked_async_wrap);
+
 fn t_block_async_core() -> bool {
     use crate::filesystem::block_io::{self, SubmitError, TargetId};
     use crate::filesystem::vfs::CancelResult;

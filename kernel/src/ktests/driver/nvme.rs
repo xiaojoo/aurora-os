@@ -492,3 +492,32 @@ fn t_nvme_async() -> bool {
 
 #[cfg(feature = "nvme")]
 ktest!(KT_NVME_ASYNC, t_nvme_async);
+
+#[cfg(feature = "nvme")]
+fn t_nvme_checked_async_wrap() -> bool {
+    use crate::filesystem::block_io;
+    use crate::filesystem::vfs::{Block, NvmeDisk};
+    if nvme::init().is_err() {
+        return false;
+    }
+    let disk = NvmeDisk;
+    let before = nvme::async_stats().unwrap_or_default();
+    let mut expected = [0u8; 512];
+    if nvme::read_lba(0, &mut expected).is_err() {
+        return false;
+    }
+    let mut got = [0u8; 512];
+    let read = block_io::read_checked(&disk, 0, &mut got, &block_io::Budget::UNBOUNDED);
+    let after = nvme::async_stats().unwrap_or_default();
+    let ok = read == Ok(()) && got == expected
+        && after.submitted == before.submitted + 1 && after.completed == before.completed + 1
+        && after.occupied == 0 && !after.poisoned;
+    crate::log_info!("nvme-wrap: read={:?} 内容={} 异步={}->{} 完成={}->{} 占槽={} ⇒ {}",
+        read, got == expected, before.submitted, after.submitted, before.completed, after.completed, after.occupied, ok);
+    if !ok {
+        crate::log_fatal!("nvme-wrap: read_checked 未走 NVMe 异步核心");
+    }
+    ok
+}
+#[cfg(feature = "nvme")]
+ktest!(KT_NVME_CHECKED_ASYNC_WRAP, t_nvme_checked_async_wrap);

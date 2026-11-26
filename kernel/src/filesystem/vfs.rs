@@ -199,6 +199,11 @@ pub trait Block {
     fn max_transfer_sectors(&self) -> u32 {
         1
     }
+
+    /// 真驱动给出异步视图；内存盘/旧测试盘默认没有，请求层保留同步回退。
+    fn as_async(&self) -> Option<&dyn AsyncBlock> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -313,6 +318,10 @@ impl Block for AhciDisk {
     fn max_transfer_sectors(&self) -> u32 {
         128
     }
+
+    fn as_async(&self) -> Option<&dyn AsyncBlock> {
+        Some(self)
+    }
 }
 
 impl AsyncBlock for AhciDisk {
@@ -407,6 +416,10 @@ impl Block for VirtioDisk {
     /// 真驱动可以合并（ADR-194 补记）：128 扇区留足余量。
     fn max_transfer_sectors(&self) -> u32 {
         128
+    }
+
+    fn as_async(&self) -> Option<&dyn AsyncBlock> {
+        Some(self)
     }
 }
 
@@ -535,6 +548,10 @@ impl Block for NvmeDisk {
     /// 真驱动可以合并（ADR-194 补记）：128 扇区留足余量。
     fn max_transfer_sectors(&self) -> u32 {
         128
+    }
+
+    fn as_async(&self) -> Option<&dyn AsyncBlock> {
+        Some(self)
     }
 }
 
