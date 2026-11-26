@@ -26210,3 +26210,10 @@ PASS，按环境形状记“不归因”，判据不动。
   37→1 反序均 EXCEPTION(39)。`check` **21/21**；完整矩阵 **82/82 符合**；
   默认 **93/93**、handles **134/134**、fs-open **167/167**、fs-rw **171/171**。
 - 真驱动与用户 broker 尚未接入；真机未验证；AOCI MCP 不可用，索引未更新。
+- 第 2 片 virtio-blk：8 槽 DMA 异步环、rank4 `io_lock`、同步拒穿插、方向相关 used_len、
+  小缓冲不丢完成、ISR 拒绝、同步超时 `poisoned` 隔离；`release_lease` 改为可失败并在成功后
+  才标记 claim 已释放。`run-17130` **99/99 PASS**，计数 `(7,7,0,0,0,0)`。
+  `run-17131/17132/17133` 分别丢完成/提交内等待/同步穿插，均仅 `t_virtio_async` FAIL；
+  `run-17134` 锁秩绕过 EXCEPTION，`run-17135` 关闭隔离仅 `t_virtio_quarantine` FAIL。
+  `check` **21/21**；`driver→arch` 55→56（共享 ISR helper）、`driver→sync` 3→5（新队列锁）。
+  完整矩阵 **82/82 符合**，`AURORA_MATRIX_DONE rc=0`。

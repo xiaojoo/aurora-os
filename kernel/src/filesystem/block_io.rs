@@ -1202,7 +1202,7 @@ pub fn async_submit_deadline(
     let lease = disk.alloc_lease(sectors).map_err(SubmitError::Block)?;
     if let Some(src) = src {
         if let Err(e) = disk.copy_in(lease, src) {
-            disk.release_lease(lease);
+            let _ = disk.release_lease(lease);
             return Err(SubmitError::Block(e));
         }
     }
@@ -1224,7 +1224,7 @@ pub fn async_submit_deadline(
         Some((slot, seq))
     });
     let Some((slot, seq)) = reserved else {
-        disk.release_lease(lease);
+        let _ = disk.release_lease(lease);
         return Err(SubmitError::Full);
     };
     let request = IoRequest { lba, sectors, token, write };
@@ -1236,12 +1236,12 @@ pub fn async_submit_deadline(
                 q.async_submitted += 1;
             });
             #[cfg(feature = "fault-async-early-release")]
-            disk.release_lease(lease);
+            let _ = disk.release_lease(lease);
             Ok(RequestId { adapter, target, seq })
         }
         Err(e) => {
             with_queue(|q| q.async_entries[slot] = ASYNC_ENTRY_EMPTY);
-            disk.release_lease(lease);
+            let _ = disk.release_lease(lease);
             Err(SubmitError::Block(e))
         }
     }
@@ -1413,7 +1413,7 @@ pub fn async_release(disk: &dyn AsyncBlock, claim: &mut LeaseClaim) -> Result<()
         return Err(BlockError::Refused);
     }
     let _driver = ASYNC_DRIVER_GATE.lock();
-    disk.release_lease(claim.lease);
+    disk.release_lease(claim.lease)?;
     claim.released = true;
     Ok(())
 }
@@ -1456,7 +1456,7 @@ pub fn async_cancel(disk: &dyn AsyncBlock, request: RequestId) -> CancelResult {
                 }
             });
             if release {
-                disk.release_lease(lease);
+                let _ = disk.release_lease(lease);
             }
             result
         }

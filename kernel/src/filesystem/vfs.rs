@@ -239,7 +239,7 @@ pub trait AsyncBlock {
     fn submit(&self, request: IoRequest, lease: IoLease) -> Result<u64, BlockError>;
     fn reap(&self, out: &mut [IoCompletion]) -> usize;
     fn cancel(&self, local_id: u64) -> CancelResult;
-    fn release_lease(&self, lease: IoLease);
+    fn release_lease(&self, lease: IoLease) -> Result<(), BlockError>;
 }
 
 /// 打开一个文件要交回来的东西：大小、起始簇，以及**扫描的覆盖面**。
@@ -354,6 +354,61 @@ impl Block for VirtioDisk {
     }
 }
 
+impl AsyncBlock for VirtioDisk {
+    fn adapter_id(&self) -> AdapterId {
+        AdapterId(0x5600_0000 | u64::from(self.index))
+    }
+
+    fn alloc_lease(&self, sectors: u32) -> Result<IoLease, BlockError> {
+        if sectors != 1 {
+            return Err(BlockError::Refused);
+        }
+        virtio::async_alloc_lease(self.index as usize).map(IoLease).map_err(virtio_block_err)
+    }
+
+    fn copy_in(&self, lease: IoLease, src: &[u8]) -> Result<(), BlockError> {
+        virtio::async_copy_in(self.index as usize, lease.0, src).map_err(virtio_block_err)
+    }
+
+    fn copy_out(&self, lease: IoLease, dst: &mut [u8]) -> Result<(), BlockError> {
+        virtio::async_copy_out(self.index as usize, lease.0, dst).map_err(virtio_block_err)
+    }
+
+    fn submit(&self, request: IoRequest, lease: IoLease) -> Result<u64, BlockError> {
+        virtio::async_submit(self.index as usize, lease.0, request.lba, request.write)
+            .map_err(virtio_block_err)
+    }
+
+    fn reap(&self, out: &mut [IoCompletion]) -> usize {
+        let cap = out.len().min(virtio::ASYNC_SLOTS);
+        let mut done = [virtio::VirtioIoCompletion { local_id: 0, sectors_done: 0, error: None }; virtio::ASYNC_SLOTS];
+        #[cfg(not(feature = "fault-virtio-reap-drop"))]
+        let n = virtio::async_reap(self.index as usize, &mut done[..cap]).min(cap);
+        #[cfg(feature = "fault-virtio-reap-drop")]
+        let n = virtio::async_reap(self.index as usize, &mut done).min(cap);
+        for i in 0..n {
+            out[i] = IoCompletion {
+                local_id: done[i].local_id,
+                sectors_done: done[i].sectors_done,
+                error: done[i].error.map(virtio_block_err),
+            };
+        }
+        n
+    }
+
+    fn cancel(&self, local_id: u64) -> CancelResult {
+        match virtio::async_cancel(self.index as usize, local_id) {
+            virtio::VirtioCancel::Cancelled => CancelResult::Cancelled,
+            virtio::VirtioCancel::InFlight => CancelResult::InFlight,
+            virtio::VirtioCancel::NotFound => CancelResult::NotFound,
+        }
+    }
+
+    fn release_lease(&self, lease: IoLease) -> Result<(), BlockError> {
+        virtio::async_release(self.index as usize, lease.0).map_err(virtio_block_err)
+    }
+}
+
 fn virtio_block_err(e: virtio::VirtioError) -> BlockError {
     use virtio::VirtioError as V;
     match e {
@@ -370,6 +425,7 @@ fn virtio_block_err(e: virtio::VirtioError) -> BlockError {
         | V::DeviceRefused(_)
         | V::BadQueue(_) => BlockError::NoDevice,
         V::UsedTimeout => BlockError::NotSettled,
+        V::AsyncBusy => BlockError::NotSettled,
         V::BadLen(_) => BlockError::Refused,
         // 块路径上收到网卡的解析错，说明调用方向错了——不当"超时"也不当"没设备"。
         V::NotV4 { .. } => BlockError::DeviceError,

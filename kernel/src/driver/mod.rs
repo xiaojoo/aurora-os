@@ -271,7 +271,11 @@ impl DriverCtx {
 
     // ----------------------------------------------------------------- DMA
 
-    /// 申请一段**连续物理内存**并映射成 Uncacheable。`len` 必须是整页的非零倍数：
+    pub(crate) fn in_isr() -> bool {
+        apic::in_isr()
+    }
+
+/// 申请一段**连续物理内存**并映射成 Uncacheable。`len` 必须是整页的非零倍数：
     /// 页框分配按 2 的幂走，而把"向上取整"藏在接口里会让调用方以为自己拿到了
     /// 请求的那个长度（对齐、边界、回收三处都会跟着错）。
     pub fn alloc_dma(&self, len: usize) -> Result<DmaHandle, DriverError> {

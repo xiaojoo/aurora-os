@@ -99,6 +99,8 @@ pub enum VirtioError {
     BadLen(usize),
     /// `queue_size` 是 0 或大到放不下我预留的环
     BadQueue(u16),
+    /// 异步请求还在队列里时，旧同步入口拒绝穿插，避免抢 used 环。
+    AsyncBusy,
     /// 收到/要解的那一包不是 IPv4/UDP/BOOTP。`guard` 点名是哪一格拒的（1 长度或以太类型号、
     /// 2 IPv4 头长或协议号、3 UDP 目的端口），否则红了只能说不知道是哪一格
     NotV4 { at: usize, guard: u8 },
@@ -418,6 +420,108 @@ const O_DATA: usize = 0x3000; // 一个扇区
 const O_REQ: usize = 0x3400; // 16 B 请求头
 const O_STATUS: usize = 0x3410; // 1 B 状态
 
+pub const ASYNC_SLOTS: usize = 8;
+const ASYNC_BASE: usize = 0x4000;
+const ASYNC_STRIDE: usize = 0x400;
+const ASYNC_DATA: usize = 0;
+const ASYNC_REQ: usize = 0x200;
+const ASYNC_STATUS: usize = 0x3F0;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AsyncSlotState {
+    Free,
+    Reserved,
+    InFlight,
+    Completed,
+}
+
+#[derive(Clone, Copy)]
+struct AsyncSlot {
+    state: AsyncSlotState,
+    local_id: u64,
+    sector: u64,
+    write: bool,
+}
+
+impl AsyncSlot {
+    const EMPTY: Self = Self { state: AsyncSlotState::Free, local_id: 0, sector: 0, write: false };
+}
+
+struct AsyncIoState {
+    slots: [AsyncSlot; ASYNC_SLOTS],
+    next_id: u64,
+    used_seen: u32,
+    submitted: u32,
+    completed: u32,
+    cancelled: u32,
+    bad_used: u32,
+    wait_calls: u32,
+    poisoned: bool,
+}
+
+impl AsyncIoState {
+    const fn new() -> Self {
+        Self {
+            slots: [AsyncSlot::EMPTY; ASYNC_SLOTS],
+            next_id: 1,
+            used_seen: 0,
+            submitted: 0,
+            completed: 0,
+            cancelled: 0,
+            bad_used: 0,
+            wait_calls: 0,
+            poisoned: false,
+        }
+    }
+}
+
+fn quarantine_async(st: &mut AsyncIoState) {
+    #[cfg(not(feature = "fault-virtio-no-quarantine"))]
+    {
+        st.poisoned = true;
+    }
+    #[cfg(feature = "fault-virtio-no-quarantine")]
+    {
+        let _ = st;
+    }
+}
+
+pub fn async_quarantine_for_test(i: usize) -> Result<(), VirtioError> {
+    if DriverCtx::in_isr() {
+        return Err(VirtioError::Ctx(DriverError::WrongContext));
+    }
+    b_at(i, |d| {
+        let mut io = d.io_lock.lock_checked().ok_or(VirtioError::AsyncBusy)?;
+        quarantine_async(io.get());
+        Ok(())
+    })
+}
+
+pub fn async_recover_for_test(i: usize) -> Result<(), VirtioError> {
+    if DriverCtx::in_isr() {
+        return Err(VirtioError::Ctx(DriverError::WrongContext));
+    }
+    b_at(i, |d| {
+        let mut io = d.io_lock.lock_checked().ok_or(VirtioError::AsyncBusy)?;
+        io.get().poisoned = false;
+        Ok(())
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VirtioCancel {
+    Cancelled,
+    InFlight,
+    NotFound,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VirtioIoCompletion {
+    pub local_id: u64,
+    pub sectors_done: u32,
+    pub error: Option<VirtioError>,
+}
+
 /// 一条请求跑完之后能拿回来的读数。**判据只用读数，不用"我觉得成功了"**
 #[derive(Clone, Copy, Debug)]
 pub struct Xfer {
@@ -449,13 +553,12 @@ pub struct Bound {
     cc: usize,
     /// 这台设备的 BDF（表顺序的证据，ADR-112）
     bdf: u32,
-    /// 这台设备上一次消费的 used.idx（表化之前是全局一格）
-    used_seen: core::sync::atomic::AtomicU32,
+    /// 同步/异步共用队列互斥；设备等待期间不关中断。
+    io_lock: crate::sync::OpenSpinLock<AsyncIoState>,
 }
 
 struct DevCell(core::cell::UnsafeCell<Option<Bound>>);
-// SAFETY: 只有 BSP 在驱动路径上取用；所有写入都在 `bind_one` 内。表化（ADR-112）之后
-//         前提不变：每个槽一台设备、每台设备各自那一个 used_seen，不存在跨槽借用。
+// SAFETY: 槽在 bind 后不再换 Bound；队列与异步槽由每设备 io_lock 串行，get 先挡越界。
 unsafe impl Sync for DevCell {}
 
 impl DevCell {
@@ -627,7 +730,7 @@ fn bind_one(dev: Dev, slot: usize) -> Result<(), VirtioError> {
         enable_readback,
         cc,
         bdf: dev.bdf,
-        used_seen: core::sync::atomic::AtomicU32::new(0),
+        io_lock: crate::sync::OpenSpinLock::new(crate::sync::RANK_GROW, AsyncIoState::new()),
     };
     // SAFETY: 见 `DevCell`；`slot < MAX_VBLK` 由 `bind_all` 保证，每槽只写一次
     unsafe { *DEVS[slot].0.get() = Some(bound) };
@@ -724,10 +827,25 @@ fn put_desc(
 /// 一条请求：描述符链 [头(可读) → 数据(读=可写/写=可读) → 状态(可写)]，通知，有界等回执。
 /// `buf` 是调用方的那个扇区：读方向在成功后被填，写方向在发射前被填。
 fn do_io_at(i: usize, sector: u64, write: bool, buf: &mut [u8]) -> Result<Xfer, VirtioError> {
+    if DriverCtx::in_isr() {
+        return Err(VirtioError::Ctx(DriverError::WrongContext));
+    }
     if buf.len() != SECTOR_BYTES {
         return Err(VirtioError::BadLen(buf.len()));
     }
     b_at(i, |d| {
+        #[cfg(not(feature = "fault-virtio-lock-rank-bypass"))]
+        let mut io = d.io_lock.lock_checked().ok_or(VirtioError::AsyncBusy)?;
+        #[cfg(feature = "fault-virtio-lock-rank-bypass")]
+        let mut io = d.io_lock.lock();
+        let st = io.get();
+        if st.poisoned {
+            return Err(VirtioError::AsyncBusy);
+        }
+        #[cfg(not(feature = "fault-virtio-sync-interleave"))]
+        if st.slots.iter().any(|s| s.state != AsyncSlotState::Free) {
+            return Err(VirtioError::AsyncBusy);
+        }
         let c = &d.ctx;
         let (mmio, dma, qsize) = (d.mmio, d.dma, d.qsize as usize);
         // 1. 请求头
@@ -756,18 +874,23 @@ fn do_io_at(i: usize, sector: u64, write: bool, buf: &mut [u8]) -> Result<Xfer, 
         // 5. 敲门。写的是**队列号**（u16），地址按 notify 能力的 multiplier 算出来的那一个
         c.write16(mmio, d.notify, 0).map_err(VirtioError::Ctx)?;
         // 6. 有界等 `used.idx` 前进（今天不认领中断，只能轮询）
-        let seen = d.used_seen.load(Ordering::Relaxed) as u16;
-        let got = wait_u16(
+        let seen = st.used_seen as u16;
+        let got = match wait_u16(
             || c.dma_read16(dma, O_USED + 2),
             |v| v != seen,
             2000,
-        )
-        .ok_or(VirtioError::UsedTimeout)?;
+        ) {
+            Some(v) => v,
+            None => {
+                quarantine_async(st);
+                return Err(VirtioError::UsedTimeout);
+            }
+        };
         let eslot = usize::from(seen % qsize as u16) * 8;
         let used_id = c.dma_read32(dma, O_USED + 4 + eslot).map_err(VirtioError::Ctx)?;
         let used_len = c.dma_read32(dma, O_USED + 4 + eslot + 4).map_err(VirtioError::Ctx)?;
         let status = c.dma_read8(dma, O_STATUS).map_err(VirtioError::Ctx)?;
-        d.used_seen.store(u32::from(got), Ordering::Relaxed);
+        st.used_seen = u32::from(got);
         c.dma_copy_out(dma, O_DATA, buf).map_err(VirtioError::Ctx)?;
         let hash = crate::ahci::fnv1a64(buf);
         Ok(Xfer { sector, avail_idx: avail, used_idx: got, used_id, used_len, status, hash })
@@ -796,6 +919,225 @@ pub fn write_block_at(i: usize, sector: u64, src: &[u8]) -> Result<Xfer, VirtioE
 
 pub fn write_block(sector: u64, src: &[u8]) -> Result<Xfer, VirtioError> {
     write_block_at(0, sector, src)
+}
+
+fn async_offsets(slot: usize) -> (usize, usize, usize) {
+    let base = ASYNC_BASE + slot * ASYNC_STRIDE;
+    (base + ASYNC_DATA, base + ASYNC_REQ, base + ASYNC_STATUS)
+}
+
+pub fn async_alloc_lease(i: usize) -> Result<u32, VirtioError> {
+    if DriverCtx::in_isr() {
+        return Err(VirtioError::Ctx(DriverError::WrongContext));
+    }
+    b_at(i, |d| {
+        if (d.qsize as usize) < ASYNC_SLOTS * 3 {
+            return Err(VirtioError::BadQueue(d.qsize));
+        }
+        let mut io = d.io_lock.lock_checked().ok_or(VirtioError::AsyncBusy)?;
+        let st = io.get();
+        if st.poisoned {
+            return Err(VirtioError::AsyncBusy);
+        }
+        let slot = st.slots.iter().position(|s| s.state == AsyncSlotState::Free)
+            .ok_or(VirtioError::Ctx(DriverError::ResourceExhausted))?;
+        st.slots[slot].state = AsyncSlotState::Reserved;
+        Ok(slot as u32)
+    })
+}
+
+pub fn async_copy_in(i: usize, slot: u32, src: &[u8]) -> Result<(), VirtioError> {
+    if DriverCtx::in_isr() {
+        return Err(VirtioError::Ctx(DriverError::WrongContext));
+    }
+    let slot = slot as usize;
+    if slot >= ASYNC_SLOTS || src.len() != SECTOR_BYTES {
+        return Err(VirtioError::BadLen(src.len()));
+    }
+    b_at(i, |d| {
+        let mut io = d.io_lock.lock_checked().ok_or(VirtioError::AsyncBusy)?;
+        if io.get().slots[slot].state != AsyncSlotState::Reserved {
+            return Err(VirtioError::AsyncBusy);
+        }
+        let (data, _, _) = async_offsets(slot);
+        d.ctx.dma_copy_in(d.dma, data, src).map_err(VirtioError::Ctx)
+    })
+}
+
+pub fn async_copy_out(i: usize, slot: u32, dst: &mut [u8]) -> Result<(), VirtioError> {
+    if DriverCtx::in_isr() {
+        return Err(VirtioError::Ctx(DriverError::WrongContext));
+    }
+    let slot = slot as usize;
+    if slot >= ASYNC_SLOTS || dst.len() != SECTOR_BYTES {
+        return Err(VirtioError::BadLen(dst.len()));
+    }
+    b_at(i, |d| {
+        let mut io = d.io_lock.lock_checked().ok_or(VirtioError::AsyncBusy)?;
+        if io.get().slots[slot].state != AsyncSlotState::Completed {
+            return Err(VirtioError::AsyncBusy);
+        }
+        let (data, _, _) = async_offsets(slot);
+        d.ctx.dma_copy_out(d.dma, data, dst).map_err(VirtioError::Ctx)
+    })
+}
+
+pub fn async_submit(i: usize, slot: u32, sector: u64, write: bool) -> Result<u64, VirtioError> {
+    if DriverCtx::in_isr() {
+        return Err(VirtioError::Ctx(DriverError::WrongContext));
+    }
+    let slot = slot as usize;
+    if slot >= ASYNC_SLOTS {
+        return Err(VirtioError::BadQueue(slot as u16));
+    }
+    b_at(i, |d| {
+        let mut io = d.io_lock.lock_checked().ok_or(VirtioError::AsyncBusy)?;
+        let st = io.get();
+        if st.poisoned {
+            return Err(VirtioError::AsyncBusy);
+        }
+        if st.slots[slot].state != AsyncSlotState::Reserved {
+            return Err(VirtioError::AsyncBusy);
+        }
+        let c = &d.ctx;
+        let (data, req, status) = async_offsets(slot);
+        c.dma_write32(d.dma, req, if write { T_OUT } else { T_IN }).map_err(VirtioError::Ctx)?;
+        c.dma_write32(d.dma, req + 4, 0).map_err(VirtioError::Ctx)?;
+        c.dma_write32(d.dma, req + 8, sector as u32).map_err(VirtioError::Ctx)?;
+        c.dma_write32(d.dma, req + 12, (sector >> 32) as u32).map_err(VirtioError::Ctx)?;
+        c.dma_fill(d.dma, status, 0xEE, 1).map_err(VirtioError::Ctx)?;
+        if !write {
+            c.dma_fill(d.dma, data, 0xEE, SECTOR_BYTES).map_err(VirtioError::Ctx)?;
+        }
+        let head = (slot * 3) as u16;
+        let flags_mid = DESC_F_NEXT | if write { 0 } else { DESC_F_WRITE };
+        put_desc(c, d.dma, O_DESC, slot * 3, d.bus + req as u64, 16, DESC_F_NEXT, head + 1)?;
+        put_desc(c, d.dma, O_DESC, slot * 3 + 1, d.bus + data as u64, SECTOR_BYTES as u32, flags_mid, head + 2)?;
+        put_desc(c, d.dma, O_DESC, slot * 3 + 2, d.bus + status as u64, 1, DESC_F_WRITE, 0)?;
+        let avail = c.dma_read16(d.dma, O_AVAIL + 2).map_err(VirtioError::Ctx)?;
+        let ring = usize::from(avail % d.qsize) * 2;
+        c.dma_write16(d.dma, O_AVAIL + 4 + ring, head).map_err(VirtioError::Ctx)?;
+        c.dma_write16(d.dma, O_AVAIL + 2, avail.wrapping_add(1)).map_err(VirtioError::Ctx)?;
+        c.write16(d.mmio, d.notify, 0).map_err(VirtioError::Ctx)?;
+        let local_id = st.next_id;
+        st.next_id = st.next_id.wrapping_add(1);
+        st.slots[slot].state = AsyncSlotState::InFlight;
+        st.slots[slot].local_id = local_id;
+        st.slots[slot].sector = sector;
+        st.slots[slot].write = write;
+        st.submitted += 1;
+        #[cfg(feature = "fault-virtio-async-wait")]
+        {
+            st.wait_calls += 1;
+            let _ = wait_u16(|| c.dma_read16(d.dma, O_USED + 2), |v| v != st.used_seen as u16, 2000);
+        }
+        Ok(local_id)
+    })
+}
+
+pub fn async_reap(i: usize, out: &mut [VirtioIoCompletion]) -> usize {
+    if DriverCtx::in_isr() {
+        return 0;
+    }
+    b_at(i, |d| {
+        let mut io = d.io_lock.lock_checked().ok_or(VirtioError::AsyncBusy)?;
+        let st = io.get();
+        let c = &d.ctx;
+        let used = c.dma_read16(d.dma, O_USED + 2).map_err(VirtioError::Ctx)?;
+        let mut n = 0usize;
+        while st.used_seen as u16 != used && n < out.len() {
+            let eslot = usize::from(st.used_seen as u16 % d.qsize) * 8;
+            let head = c.dma_read32(d.dma, O_USED + 4 + eslot).map_err(VirtioError::Ctx)?;
+            let used_len = c.dma_read32(d.dma, O_USED + 4 + eslot + 4).map_err(VirtioError::Ctx)?;
+            if head as usize % 3 != 0 || head as usize / 3 >= ASYNC_SLOTS {
+                st.bad_used += 1;
+                st.used_seen = st.used_seen.wrapping_add(1);
+                out[n] = VirtioIoCompletion { local_id: 0, sectors_done: 0, error: Some(VirtioError::DeviceRefused(head)) };
+                n += 1;
+                continue;
+            }
+            let slot = head as usize / 3;
+            if st.slots[slot].state != AsyncSlotState::InFlight {
+                st.bad_used += 1;
+                st.used_seen = st.used_seen.wrapping_add(1);
+                out[n] = VirtioIoCompletion { local_id: 0, sectors_done: 0, error: Some(VirtioError::DeviceRefused(head)) };
+                n += 1;
+                continue;
+            }
+            let (_, _, status_off) = async_offsets(slot);
+            let status = c.dma_read8(d.dma, status_off).map_err(VirtioError::Ctx)?;
+            st.used_seen = st.used_seen.wrapping_add(1);
+            let want_len = if st.slots[slot].write { 1 } else { SECTOR_BYTES as u32 + 1 };
+            let error = if status == S_OK && used_len == want_len {
+                None
+            } else {
+                crate::log_info!("virtio-async: 完成异常 slot={} status={} used_len={} head={}", slot, status, used_len, head);
+                Some(VirtioError::DeviceRefused(u32::from(status) | (used_len << 8)))
+            };
+            out[n] = VirtioIoCompletion {
+                local_id: st.slots[slot].local_id,
+                sectors_done: if error.is_none() { 1 } else { 0 },
+                error,
+            };
+            st.slots[slot].state = AsyncSlotState::Completed;
+            st.completed += 1;
+            n += 1;
+        }
+        Ok(n)
+    }).unwrap_or(0)
+}
+
+pub fn async_cancel(i: usize, local_id: u64) -> VirtioCancel {
+    if DriverCtx::in_isr() {
+        return VirtioCancel::InFlight;
+    }
+    b_at(i, |d| {
+        let mut io = d.io_lock.lock_checked().ok_or(VirtioError::AsyncBusy)?;
+        let st = io.get();
+        if let Some(slot) = st.slots.iter().position(|s| s.local_id == local_id && s.state == AsyncSlotState::Reserved) {
+            st.slots[slot] = AsyncSlot::EMPTY;
+            st.cancelled += 1;
+            Ok(VirtioCancel::Cancelled)
+        } else if st.slots.iter().any(|s| s.local_id == local_id && s.state == AsyncSlotState::InFlight) {
+            Ok(VirtioCancel::InFlight)
+        } else {
+            Ok(VirtioCancel::NotFound)
+        }
+    }).unwrap_or(VirtioCancel::InFlight)
+}
+
+pub fn async_release(i: usize, slot: u32) -> Result<(), VirtioError> {
+    if DriverCtx::in_isr() {
+        return Err(VirtioError::Ctx(DriverError::WrongContext));
+    }
+    let slot = slot as usize;
+    if slot >= ASYNC_SLOTS {
+        return Err(VirtioError::NoDevice);
+    }
+    b_at(i, |d| {
+        let mut io = d.io_lock.lock_checked().ok_or(VirtioError::AsyncBusy)?;
+        let st = io.get();
+        match st.slots[slot].state {
+            AsyncSlotState::Completed | AsyncSlotState::Reserved => {
+                st.slots[slot] = AsyncSlot::EMPTY;
+                Ok(())
+            }
+            AsyncSlotState::InFlight => Err(VirtioError::AsyncBusy),
+            AsyncSlotState::Free => Err(VirtioError::NoDevice),
+        }
+    })
+}
+
+pub fn async_stats(i: usize) -> Option<(u32, u32, u32, u32, u32, usize)> {
+    if DriverCtx::in_isr() {
+        return None;
+    }
+    b_at(i, |d| {
+        let mut io = d.io_lock.lock_checked().ok_or(VirtioError::AsyncBusy)?;
+        let st = io.get();
+        Ok((st.submitted, st.completed, st.cancelled, st.bad_used, st.wait_calls,
+            st.slots.iter().filter(|s| s.state != AsyncSlotState::Free).count()))
+    }).ok()
 }
 
 // ==================================================== M8-a①：virtio-net 与第一帧

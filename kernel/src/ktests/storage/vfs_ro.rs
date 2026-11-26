@@ -1473,10 +1473,13 @@ impl crate::filesystem::vfs::AsyncBlock for FakeAsyncDisk {
         }
     }
 
-    fn release_lease(&self, lease: crate::filesystem::vfs::IoLease) {
+    fn release_lease(&self, lease: crate::filesystem::vfs::IoLease) -> Result<(), BlockError> {
         let slot = lease.0 as usize;
         if slot >= 4 || !self.leases[slot].replace(false) {
             self.double_release.set(self.double_release.get() + 1);
+            Err(BlockError::Refused)
+        } else {
+            Ok(())
         }
     }
 }
