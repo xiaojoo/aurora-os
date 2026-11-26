@@ -5,14 +5,14 @@
 >
 > **2026-11-20（ADR-175 跨 AS 读走物理地址）**：`sched/user` U2 9 → 10（`copy_from_user_in` 里 HHDM 别名的单字节读）。**总数 +1**（530 → 531）。
 
-总计 726 处。U1 105 · U2 183 · U3 13 · U4 253 · U5 128 · U6 44
+总计 727 处。U1 105 · U2 183 · U3 13 · U4 254 · U5 128 · U6 44
 
 | 类别 | 含义 | 处数 |
 |---|---|---|
 | U1 | 架构入口与特殊寄存器 | 105 |
 | U2 | 页表、物理内存与 MMIO | 183 |
 | U3 | DMA 与设备共享内存 | 13 |
-| U4 | 并发共享状态与 UnsafeCell | 253 |
+| U4 | 并发共享状态与 UnsafeCell | 254 |
 | U5 | 用户指针与地址空间访问 | 128 |
 | U6 | 诊断路径的有限现场读取 | 44 |
 
@@ -40,6 +40,7 @@ ADR-179：句柄槽数组从 `.bss` 改为运行时分配。四处的指针来�
 | U4 | 340 | `unsafe { &*QUEUE.0.get() }` （`queue_stats`）|
 | U4 | 351 | `unsafe { &mut *QUEUE.0.get() }` （`queue_clear`）|
 | U4 | 400 | `unsafe { &mut *QUEUE.0.get() }` （`drain` 取快照）|
+| U4 | 340 | `unsafe { &mut *QUEUE.0.get() }` （ADR-259 `with_queue`，持 `QUEUE_LOCK`，闭包不借出引用）|
 
 ADR-214：请求队列的 32 条 `Request` 进 `.bss`，六处指针都指向 `QUEUE`，
 生命周期整个内核，访问都在 `QUEUE_LOCK`（`RANK_BLOCK=37`）内。

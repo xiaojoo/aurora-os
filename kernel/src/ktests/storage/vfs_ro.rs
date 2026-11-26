@@ -1345,6 +1345,331 @@ fn t_block_io_budget() -> bool {
 
 ktest!(KT_BLOCK_IO_BUDGET, t_block_io_budget);
 
+struct FakeAsyncDisk {
+    id: u64,
+    leases: [core::cell::Cell<bool>; 4],
+    data: core::cell::RefCell<[u8; 4 * SECTOR]>,
+    queue: core::cell::RefCell<alloc::collections::VecDeque<(u64, crate::filesystem::vfs::IoRequest, crate::filesystem::vfs::IoLease)>>,
+    next: core::cell::Cell<u64>,
+    duplicate_next: core::cell::Cell<bool>,
+    fail_next: core::cell::Cell<bool>,
+    stuck: core::cell::Cell<bool>,
+    late_next: core::cell::Cell<bool>,
+    double_release: core::cell::Cell<usize>,
+}
+
+impl FakeAsyncDisk {
+    fn new(id: u64) -> Self {
+        let mut data = [0u8; 4 * SECTOR];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(7);
+        }
+        Self {
+            id,
+            leases: [const { core::cell::Cell::new(false) }; 4],
+            data: core::cell::RefCell::new(data),
+            queue: core::cell::RefCell::new(alloc::collections::VecDeque::new()),
+            next: core::cell::Cell::new(1),
+            duplicate_next: core::cell::Cell::new(false),
+            fail_next: core::cell::Cell::new(false),
+            stuck: core::cell::Cell::new(false),
+            late_next: core::cell::Cell::new(false),
+            double_release: core::cell::Cell::new(0),
+        }
+    }
+}
+
+impl crate::filesystem::vfs::AsyncBlock for FakeAsyncDisk {
+    fn adapter_id(&self) -> crate::filesystem::vfs::AdapterId {
+        crate::filesystem::vfs::AdapterId(self.id)
+    }
+
+    fn alloc_lease(&self, sectors: u32) -> Result<crate::filesystem::vfs::IoLease, BlockError> {
+        if sectors == 0 || sectors > 4 {
+            return Err(BlockError::Refused);
+        }
+        let slot = self.leases.iter().position(|used| !used.get()).ok_or(BlockError::Refused)?;
+        self.leases[slot].set(true);
+        Ok(crate::filesystem::vfs::IoLease(slot as u32))
+    }
+
+    fn copy_in(&self, lease: crate::filesystem::vfs::IoLease, src: &[u8]) -> Result<(), BlockError> {
+        let slot = lease.0 as usize;
+        if slot >= 4 || !self.leases[slot].get() || src.len() > 4 * SECTOR {
+            return Err(BlockError::Refused);
+        }
+        self.data.borrow_mut()[slot * SECTOR..slot * SECTOR + src.len()].copy_from_slice(src);
+        Ok(())
+    }
+
+    fn copy_out(&self, lease: crate::filesystem::vfs::IoLease, dst: &mut [u8]) -> Result<(), BlockError> {
+        let slot = lease.0 as usize;
+        if slot >= 4 || !self.leases[slot].get() || dst.len() > 4 * SECTOR {
+            return Err(BlockError::Refused);
+        }
+        dst.copy_from_slice(&self.data.borrow()[slot * SECTOR..slot * SECTOR + dst.len()]);
+        Ok(())
+    }
+
+    fn submit(&self, request: crate::filesystem::vfs::IoRequest, lease: crate::filesystem::vfs::IoLease) -> Result<u64, BlockError> {
+        let id = self.next.get();
+        self.next.set(id + 1);
+        self.queue.borrow_mut().push_back((id, request, lease));
+        Ok(id)
+    }
+
+    fn reap(&self, out: &mut [crate::filesystem::vfs::IoCompletion]) -> usize {
+        if self.stuck.get() {
+            return 0;
+        }
+        self.late_next.set(false);
+        let Some((id, request, lease)) = self.queue.borrow_mut().pop_front() else { return 0 };
+        let slot = lease.0 as usize;
+        let mut error = None;
+        let mut sectors_done = request.sectors;
+        if slot >= 4 || !self.leases[slot].get() {
+            error = Some(BlockError::DeviceError);
+            sectors_done = 0;
+        } else if self.fail_next.replace(false) {
+            error = Some(BlockError::DeviceError);
+            sectors_done = 0;
+        } else {
+            let len = request.sectors as usize * SECTOR;
+            let off = request.lba as usize * SECTOR;
+            if off + len <= 4 * SECTOR {
+                let mut tmp = [0u8; 4 * SECTOR];
+                if request.write {
+                    tmp[..len].copy_from_slice(&self.data.borrow()[slot * SECTOR..slot * SECTOR + len]);
+                    self.data.borrow_mut()[off..off + len].copy_from_slice(&tmp[..len]);
+                } else {
+                    tmp[..len].copy_from_slice(&self.data.borrow()[off..off + len]);
+                    self.data.borrow_mut()[slot * SECTOR..slot * SECTOR + len].copy_from_slice(&tmp[..len]);
+                }
+            } else {
+                error = Some(BlockError::Refused);
+                sectors_done = 0;
+            }
+        }
+        let completion = crate::filesystem::vfs::IoCompletion { local_id: id, sectors_done, error };
+        out[0] = completion;
+        if self.duplicate_next.replace(false) {
+            out[1] = completion;
+            2
+        } else {
+            1
+        }
+    }
+
+    fn cancel(&self, local_id: u64) -> crate::filesystem::vfs::CancelResult {
+        if self.stuck.get() || self.late_next.get() {
+            return crate::filesystem::vfs::CancelResult::InFlight;
+        }
+        let mut q = self.queue.borrow_mut();
+        if let Some(pos) = q.iter().position(|item| item.0 == local_id) {
+            q.remove(pos);
+            crate::filesystem::vfs::CancelResult::Cancelled
+        } else {
+            crate::filesystem::vfs::CancelResult::NotFound
+        }
+    }
+
+    fn release_lease(&self, lease: crate::filesystem::vfs::IoLease) {
+        let slot = lease.0 as usize;
+        if slot >= 4 || !self.leases[slot].replace(false) {
+            self.double_release.set(self.double_release.get() + 1);
+        }
+    }
+}
+
+fn t_block_async_core() -> bool {
+    use crate::filesystem::block_io::{self, SubmitError, TargetId};
+    use crate::filesystem::vfs::CancelResult;
+
+    block_io::queue_clear();
+    let disk = FakeAsyncDisk::new(0xA59);
+    let other = FakeAsyncDisk::new(0xA5B);
+    let target = TargetId(0xA59);
+    let id = match block_io::async_submit(&disk, target, 1, 1, false, 42, None) {
+        Ok(id) => id,
+        Err(_) => return false,
+    };
+    let no_early = disk.queue.borrow().len() == 1
+        && block_io::async_take_completion(target).is_none()
+        && block_io::async_pending(target) == 1;
+    let polled = block_io::async_poll(&disk) == 1;
+    let completion = block_io::async_take_completion(target);
+    let once = block_io::async_take_completion(target).is_none();
+    let mut bytes = [0u8; SECTOR];
+    let read_ok = completion.as_ref().is_some_and(|c| {
+        c.request == id && c.token == 42 && c.sectors_done == 1 && c.error.is_none()
+            && block_io::async_copy_out(&disk, c, &mut bytes).is_ok()
+    });
+    let mut too_big = [0u8; 2 * SECTOR];
+    let bounded = completion.as_ref().is_some_and(|c| {
+        block_io::async_copy_out(&disk, c, &mut too_big) == Err(BlockError::Refused)
+    });
+    let wrong_copy = completion.as_ref().is_some_and(|c| {
+        block_io::async_copy_out(&other, c, &mut bytes) == Err(BlockError::Refused)
+    });
+    let read_bytes_ok = bytes == disk.data.borrow()[SECTOR..2 * SECTOR];
+    if let Some(mut c) = completion {
+        let _ = block_io::async_release(&disk, &mut c);
+    }
+
+    let mut pattern = [0u8; SECTOR];
+    pattern[..4].copy_from_slice(&[0xDEu8, 0xAD, 0xBE, 0xEF]);
+    let bad_len = matches!(block_io::async_submit(&disk, target, 2, 1, true, 46, Some(&pattern[..4])), Err(SubmitError::Block(BlockError::Refused)));
+    let write_id = block_io::async_submit(&disk, target, 2, 1, true, 43, Some(&pattern)).is_ok();
+    block_io::async_poll(&disk);
+    let write_completion = block_io::async_take_completion(target);
+    let write_ok = write_completion.as_ref().is_some_and(|c| c.token == 43 && c.error.is_none());
+    if let Some(mut c) = write_completion {
+        let _ = block_io::async_release(&disk, &mut c);
+    }
+    let mut written = [0u8; SECTOR];
+    let write_read = block_io::async_submit(&disk, target, 2, 1, false, 44, None).is_ok();
+    block_io::async_poll(&disk);
+    let write_back = block_io::async_take_completion(target);
+    let written_ok = write_back.as_ref().is_some_and(|c| block_io::async_copy_out(&disk, c, &mut written).is_ok());
+    if let Some(mut c) = write_back {
+        let _ = block_io::async_release(&disk, &mut c);
+    }
+
+    let cancel_id = match block_io::async_submit(&disk, target, 0, 1, false, 45, None) {
+        Ok(id) => id,
+        Err(_) => return false,
+    };
+    let cancelled = block_io::async_cancel(&disk, cancel_id) == CancelResult::Cancelled
+        && block_io::async_pending(target) == 0
+        && block_io::async_poll(&disk) == 0;
+
+    let mut full = true;
+    for i in 0..4 {
+        full &= block_io::async_submit(&disk, target, i as u64, 1, false, 50 + i as u64, None).is_ok();
+    }
+    full &= matches!(block_io::async_submit(&disk, target, 3, 1, false, 60, None), Err(SubmitError::Block(BlockError::Refused)));
+    for _ in 0..4 {
+        block_io::async_poll(&disk);
+        while let Some(mut c) = block_io::async_take_completion(target) {
+            let _ = block_io::async_release(&disk, &mut c);
+        }
+    }
+
+    disk.fail_next.set(true);
+    let failed_id = block_io::async_submit(&disk, target, 0, 1, false, 70, None).is_ok();
+    block_io::async_poll(&disk);
+    let failed = block_io::async_take_completion(target);
+    let failure_ok = failed.as_ref().is_some_and(|c| c.token == 70 && c.sectors_done == 0 && c.error == Some(BlockError::DeviceError));
+    if let Some(mut c) = failed {
+        let _ = block_io::async_release(&disk, &mut c);
+    }
+
+    disk.duplicate_next.set(true);
+    let duplicate_id = match block_io::async_submit(&disk, target, 0, 1, false, 80, None) {
+        Ok(id) => id,
+        Err(_) => return false,
+    };
+    let duplicate_poll = block_io::async_poll(&disk);
+    let duplicate = block_io::async_take_completion(target);
+    let duplicate_ok = duplicate.as_ref().is_some_and(|c| c.request == duplicate_id && c.token == 80)
+        && block_io::async_take_completion(target).is_none();
+    if let Some(mut c) = duplicate {
+        let _ = block_io::async_release(&disk, &mut c);
+    }
+
+    let wrong_claim = match block_io::async_submit(&disk, target, 0, 1, false, 84, None) {
+        Ok(id) => id,
+        Err(_) => return false,
+    };
+    block_io::async_poll(&disk);
+    let mut wrong_claim = block_io::async_take_completion(target);
+    let wrong_adapter = wrong_claim.as_mut().is_some_and(|c| {
+        block_io::async_release(&other, c) == Err(BlockError::Refused)
+            && block_io::async_release(&disk, c) == Ok(())
+            && block_io::async_release(&disk, c) == Err(BlockError::Refused)
+    });
+
+    let target_b = TargetId(0xA5A);
+    let route_a = block_io::async_submit(&disk, target, 0, 1, false, 81, None).is_ok();
+    let route_b = block_io::async_submit(&disk, target_b, 0, 1, false, 82, None).is_ok();
+    let mut routed = route_a && route_b;
+    for _ in 0..2 {
+        routed &= block_io::async_poll(&disk) == 1;
+    }
+    let route_ca = block_io::async_take_completion(target);
+    let route_cb = block_io::async_take_completion(target_b);
+    routed &= route_ca.as_ref().is_some_and(|c| c.token == 81)
+        && route_cb.as_ref().is_some_and(|c| c.token == 82);
+    if let Some(mut c) = route_ca { let _ = block_io::async_release(&disk, &mut c); }
+    if let Some(mut c) = route_cb { let _ = block_io::async_release(&disk, &mut c); }
+
+    let cross_target = TargetId(0xA5C);
+    other.next.set(disk.next.get());
+    let cross_a = block_io::async_submit(&disk, cross_target, 0, 1, false, 85, None).is_ok();
+    let cross_b = block_io::async_submit(&other, cross_target, 0, 1, false, 86, None).is_ok();
+    let cross_poll_b = cross_a && cross_b && block_io::async_poll(&other) == 1;
+    let mut cross_cb = block_io::async_take_completion(cross_target);
+    let cross_b_ok = cross_poll_b && cross_cb.as_ref().is_some_and(|c| c.token == 86)
+        && block_io::async_pending(cross_target) == 1;
+    if let Some(c) = cross_cb.as_mut() { let _ = block_io::async_release(&other, c); }
+    let cross_poll_a = block_io::async_poll(&disk) == 1;
+    let mut cross_ca = block_io::async_take_completion(cross_target);
+    let cross_a_ok = cross_poll_a && cross_ca.as_ref().is_some_and(|c| c.token == 85);
+    if let Some(c) = cross_ca.as_mut() { let _ = block_io::async_release(&disk, c); }
+
+    let clear_id = match block_io::async_submit(&disk, target, 0, 1, false, 83, None) {
+        Ok(id) => id,
+        Err(_) => return false,
+    };
+    block_io::queue_clear();
+    let clear_kept = block_io::async_pending(target) == 1
+        && block_io::async_cancel(&disk, clear_id) == CancelResult::Cancelled;
+
+    disk.stuck.set(true);
+    let timeout_id = match block_io::async_submit_deadline(&disk, target, 0, 1, false, 90, 10, None) {
+        Ok(id) => id,
+        Err(_) => return false,
+    };
+    let timeout_held = block_io::async_poll_at(&disk, 10) == 0
+        && block_io::async_pending(target) == 1
+        && block_io::async_take_completion(target).is_none();
+    disk.stuck.set(false);
+    let timeout_poll = block_io::async_poll_at(&disk, 10) == 1;
+    let mut timeout_claim = block_io::async_take_completion(target);
+    let timeout_ok = timeout_held && timeout_poll
+        && timeout_claim.as_ref().is_some_and(|c| c.request == timeout_id && c.token == 90
+            && c.sectors_done == 0 && c.error == Some(BlockError::NotSettled));
+    if let Some(c) = timeout_claim.as_mut() { let _ = block_io::async_release(&disk, c); }
+
+    disk.stuck.set(true);
+    let late_id = match block_io::async_submit_deadline(&disk, target, 0, 1, false, 91, 20, None) {
+        Ok(id) => id,
+        Err(_) => return false,
+    };
+    let late_marked = block_io::async_poll_at(&disk, 20) == 0;
+    disk.stuck.set(false);
+    disk.late_next.set(true);
+    let late_poll = block_io::async_poll_at(&disk, 20) == 1;
+    let mut late_claim = block_io::async_take_completion(target);
+    let late_ok = late_marked && late_poll && late_claim.as_ref().is_some_and(|c| {
+        c.request == late_id && c.token == 91 && c.sectors_done == 1 && c.error.is_none()
+    });
+    if let Some(c) = late_claim.as_mut() { let _ = block_io::async_release(&disk, c); }
+
+    let stats = block_io::async_stats();
+    let ok = no_early && polled && once && read_ok && bounded && wrong_copy && read_bytes_ok
+        && write_id && write_ok && write_read && written_ok && written[..4] == pattern[..4] && bad_len
+        && cancelled && full && failed_id && failure_ok && duplicate_poll == 1 && duplicate_ok
+        && routed && clear_kept && wrong_adapter && cross_a_ok && cross_b_ok && timeout_ok && late_ok
+        && stats.3 == 1 && stats.4 == 0 && stats.5 == 0 && stats.6 == 1 && stats.7 == 1 && disk.double_release.get() == 0;
+    crate::log_info!("block-async: 提交不执行={} 轮询={} 完成一次={} 租约可读={} 租约边界={} 字节同={} 写回={} 写字节同={} 写长度={} 取消={} 池满={} 失败={} 重复={} 多目标={} 清队列留途={} 适配器={} 跨盘={} 超时={} 迟到={} 双释放={} 台账={:?} ⇒ {}",
+        no_early, polled, once, read_ok, bounded, read_bytes_ok, written_ok,
+        written[..4] == pattern[..4], bad_len, cancelled, full, failure_ok, duplicate_ok, routed, clear_kept,
+        wrong_adapter, cross_a_ok && cross_b_ok, timeout_ok, late_ok, disk.double_release.get(), stats, ok);
+    ok
+}
+ktest!(KT_BLOCK_ASYNC_CORE, t_block_async_core);
+
 /// 测试用的「可合并」盘（ADR-194 补记）：把 `MemDisk` 包一层并覆写上限。
 ///
 /// 存在的理由：`MemDisk` 的默认上限是 1（不可合并），而 `t_block_merge` 要测的正是合并。

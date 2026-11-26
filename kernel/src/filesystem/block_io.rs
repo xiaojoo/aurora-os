@@ -18,7 +18,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use super::vfs::{Block, BlockError, DiskKey, SECTOR_BYTES};
+use super::vfs::{AdapterId, AsyncBlock, Block, BlockError, CancelResult, DiskKey, IoCompletion, IoLease, IoRequest, SECTOR_BYTES};
 
 /// 一次请求的预算。`deadline` 是**绝对 tick**，`clock` 是"现在几点"的注入源；
 /// `cancel` 指向调用方那一格旗（通常是它自己任务里的一个 `AtomicBool`）。
@@ -266,6 +266,7 @@ pub fn read_checked(
 /// 需求侧：一次文件读可能拆成十几条块请求（FAT 链跳转 + 目录项扫描），
 /// 32 覆盖「一条路径解析」的量级。满了 `submit` 回 `None`（不静默丢弃）。
 pub const QUEUE_MAX: usize = 32;
+pub const ASYNC_MAX: usize = 32;
 
 /// 一条待执行的请求（ADR-214）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -301,6 +302,16 @@ struct Queue {
     submitted: u32,
     drained: u32,
     refused: u32,
+    async_entries: [AsyncEntry; ASYNC_MAX],
+    async_ready: [Completion; ASYNC_MAX],
+    async_ready_len: usize,
+    async_seq: u64,
+    async_submitted: u32,
+    async_completed: u32,
+    async_cancelled: u32,
+    async_duplicates: u32,
+    async_timeouts: u32,
+    async_late: u32,
 }
 
 struct QueueCell(core::cell::UnsafeCell<Queue>);
@@ -314,11 +325,31 @@ static QUEUE: QueueCell = QueueCell(core::cell::UnsafeCell::new(Queue {
     submitted: 0,
     drained: 0,
     refused: 0,
+    async_entries: [ASYNC_ENTRY_EMPTY; ASYNC_MAX],
+    async_ready: [ASYNC_COMPLETION_EMPTY; ASYNC_MAX],
+    async_ready_len: 0,
+    async_seq: 0,
+    async_submitted: 0,
+    async_completed: 0,
+    async_cancelled: 0,
+    async_duplicates: 0,
+    async_timeouts: 0,
+    async_late: 0,
 }));
 
 /// 队列的锁。**叶子锁**：临界区里只读写那 32 条 `Request`。
 static QUEUE_LOCK: crate::sync::IrqSpinLock<()> =
     crate::sync::IrqSpinLock::new(crate::sync::RANK_BLOCK, ());
+
+fn with_queue<R>(f: impl FnOnce(&mut Queue) -> R) -> R {
+    let _g = QUEUE_LOCK.lock();
+    // SAFETY: 持锁期间独占；Queue 载荷全为 Copy，闭包返回后不借出队列引用。
+    let q = unsafe { &mut *QUEUE.0.get() };
+    f(q)
+}
+
+static ASYNC_DRIVER_GATE: crate::sync::IrqSpinLock<()> =
+    crate::sync::IrqSpinLock::new(crate::sync::RANK_BLOCK_DRIVER, ());
 
 /// **提交一条请求**（ADR-214）。
 ///
@@ -363,6 +394,10 @@ pub fn queue_stats() -> (u32, u32, u32) {
 
 /// 清空队列（判据用）。
 pub fn queue_clear() {
+    if crate::arch::x86_64::apic::in_isr() {
+        return;
+    }
+    let _driver = ASYNC_DRIVER_GATE.lock();
     let _g = QUEUE_LOCK.lock();
     // SAFETY: 持锁期间独占。
     let q = unsafe { &mut *QUEUE.0.get() };
@@ -371,6 +406,18 @@ pub fn queue_clear() {
     q.submitted = 0;
     q.drained = 0;
     q.refused = 0;
+    if q.async_entries.iter().all(|e| e.state == AsyncState::Empty) {
+        q.async_entries = [ASYNC_ENTRY_EMPTY; ASYNC_MAX];
+        q.async_ready = [ASYNC_COMPLETION_EMPTY; ASYNC_MAX];
+        q.async_ready_len = 0;
+        q.async_seq = 0;
+        q.async_submitted = 0;
+        q.async_completed = 0;
+        q.async_cancelled = 0;
+        q.async_duplicates = 0;
+        q.async_timeouts = 0;
+        q.async_late = 0;
+    }
 }
 
 /// **把队列排序并合并相邻请求**（ADR-214）。
@@ -1036,4 +1083,406 @@ pub fn drain_with_cb_ctx(target: TargetId, disk: &dyn Block, budget: &Budget<'_>
         (item.cb)(item.ctx, item.req.token, result);
     }
     DrainReport { issued: len as u32, merged: 0, sectors_ok, failed_at }
+}
+
+// ---------------------------------------------------------------- ADR-259：真异步核心
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RequestId {
+    pub adapter: AdapterId,
+    pub target: TargetId,
+    pub seq: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Completion {
+    pub request: RequestId,
+    pub token: u64,
+    pub lease: IoLease,
+    pub sectors: u32,
+    pub sectors_done: u32,
+    pub error: Option<BlockError>,
+}
+
+pub struct LeaseClaim {
+    completion: Completion,
+    released: bool,
+}
+
+impl core::ops::Deref for LeaseClaim {
+    type Target = Completion;
+    fn deref(&self) -> &Self::Target {
+        &self.completion
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubmitError {
+    Full,
+    Block(BlockError),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AsyncState {
+    Empty,
+    Submitting,
+    InFlight,
+    TimedOut,
+    Ready,
+}
+
+#[derive(Clone, Copy)]
+struct AsyncEntry {
+    state: AsyncState,
+    adapter: AdapterId,
+    target: TargetId,
+    seq: u64,
+    local_id: u64,
+    lease: IoLease,
+    sectors: u32,
+    deadline: u64,
+    token: u64,
+}
+
+const ASYNC_ENTRY_EMPTY: AsyncEntry = AsyncEntry {
+    state: AsyncState::Empty,
+    adapter: AdapterId(0),
+    target: TargetId(0),
+    seq: 0,
+    local_id: 0,
+    lease: IoLease(0),
+    sectors: 0,
+    deadline: u64::MAX,
+    token: 0,
+};
+
+const ASYNC_COMPLETION_EMPTY: Completion = Completion {
+    request: RequestId { adapter: AdapterId(0), target: TargetId(0), seq: 0 },
+    token: 0,
+    lease: IoLease(0),
+    sectors: 0,
+    sectors_done: 0,
+    error: None,
+};
+
+pub fn async_submit(
+    disk: &dyn AsyncBlock,
+    target: TargetId,
+    lba: u64,
+    sectors: u32,
+    write: bool,
+    token: u64,
+    src: Option<&[u8]>,
+) -> Result<RequestId, SubmitError> {
+    async_submit_deadline(disk, target, lba, sectors, write, token, u64::MAX, src)
+}
+
+pub fn async_submit_deadline(
+    disk: &dyn AsyncBlock,
+    target: TargetId,
+    lba: u64,
+    sectors: u32,
+    write: bool,
+    token: u64,
+    deadline: u64,
+    src: Option<&[u8]>,
+) -> Result<RequestId, SubmitError> {
+    if crate::arch::x86_64::apic::in_isr() {
+        return Err(SubmitError::Block(BlockError::Refused));
+    }
+    let _driver = ASYNC_DRIVER_GATE.lock();
+    let adapter = disk.adapter_id();
+    if sectors == 0 || (write && src.is_none()) || (!write && src.is_some()) {
+        return Err(SubmitError::Block(BlockError::Refused));
+    }
+    let want = sectors.checked_mul(SECTOR_BYTES as u32).ok_or(SubmitError::Block(BlockError::Refused))? as usize;
+    if write && src.is_some_and(|src| src.len() != want) {
+        return Err(SubmitError::Block(BlockError::Refused));
+    }
+    let lease = disk.alloc_lease(sectors).map_err(SubmitError::Block)?;
+    if let Some(src) = src {
+        if let Err(e) = disk.copy_in(lease, src) {
+            disk.release_lease(lease);
+            return Err(SubmitError::Block(e));
+        }
+    }
+    let reserved = with_queue(|q| {
+        let slot = q.async_entries.iter().position(|e| e.state == AsyncState::Empty)?;
+        q.async_seq = q.async_seq.wrapping_add(1);
+        let seq = q.async_seq;
+        q.async_entries[slot] = AsyncEntry {
+            state: AsyncState::Submitting,
+            adapter,
+            target,
+            seq,
+            local_id: 0,
+            lease,
+            sectors,
+            deadline,
+            token,
+        };
+        Some((slot, seq))
+    });
+    let Some((slot, seq)) = reserved else {
+        disk.release_lease(lease);
+        return Err(SubmitError::Full);
+    };
+    let request = IoRequest { lba, sectors, token, write };
+    match disk.submit(request, lease) {
+        Ok(local_id) => {
+            with_queue(|q| {
+                q.async_entries[slot].state = AsyncState::InFlight;
+                q.async_entries[slot].local_id = local_id;
+                q.async_submitted += 1;
+            });
+            #[cfg(feature = "fault-async-early-release")]
+            disk.release_lease(lease);
+            Ok(RequestId { adapter, target, seq })
+        }
+        Err(e) => {
+            with_queue(|q| q.async_entries[slot] = ASYNC_ENTRY_EMPTY);
+            disk.release_lease(lease);
+            Err(SubmitError::Block(e))
+        }
+    }
+}
+
+fn ready_async(q: &mut Queue, slot: usize, sectors_done: u32, error: Option<BlockError>) -> bool {
+    if q.async_ready_len >= ASYNC_MAX {
+        return false;
+    }
+    let entry = q.async_entries[slot];
+    q.async_ready[q.async_ready_len] = Completion {
+        request: RequestId { adapter: entry.adapter, target: entry.target, seq: entry.seq },
+        token: entry.token,
+        lease: entry.lease,
+        sectors: entry.sectors,
+        sectors_done,
+        error,
+    };
+    q.async_ready_len += 1;
+    q.async_entries[slot].state = AsyncState::Ready;
+    true
+}
+
+fn adapter_matches_id(actual: AdapterId, expected: AdapterId) -> bool {
+    #[cfg(not(feature = "fault-async-skip-adapter-check"))]
+    {
+        actual == expected
+    }
+    #[cfg(feature = "fault-async-skip-adapter-check")]
+    {
+        let _ = (actual, expected);
+        true
+    }
+}
+
+pub fn async_poll(disk: &dyn AsyncBlock) -> usize {
+    async_poll_at(disk, u64::MAX)
+}
+
+pub fn async_poll_at(disk: &dyn AsyncBlock, now: u64) -> usize {
+    if crate::arch::x86_64::apic::in_isr() {
+        return 0;
+    }
+    let _driver = ASYNC_DRIVER_GATE.lock();
+    let adapter = disk.adapter_id();
+    #[cfg(feature = "fault-async-gate-reenter")]
+    let _bad = ASYNC_DRIVER_GATE.lock();
+    let mut expired = 0usize;
+    #[cfg(not(feature = "fault-async-no-timeout"))]
+    let scan = if now == u64::MAX { 0 } else { ASYNC_MAX };
+    #[cfg(feature = "fault-async-no-timeout")]
+    let scan = 0;
+    #[cfg(not(feature = "fault-async-no-timeout"))]
+    for slot in 0..scan {
+        let pending = with_queue(|q| {
+            let e = q.async_entries[slot];
+            if adapter_matches_id(e.adapter, adapter)
+                && matches!(e.state, AsyncState::InFlight | AsyncState::TimedOut)
+                && e.deadline != u64::MAX && now != u64::MAX && now >= e.deadline
+            {
+                Some((e.local_id, e.state))
+            } else {
+                None
+            }
+        });
+        let Some((local_id, state)) = pending else { continue };
+        if disk.cancel(local_id) == CancelResult::Cancelled {
+            let queued = with_queue(|q| {
+                if !matches!(q.async_entries[slot].state, AsyncState::InFlight | AsyncState::TimedOut) {
+                    return false;
+                }
+                let ok = ready_async(q, slot, 0, Some(BlockError::NotSettled));
+                if ok {
+                    q.async_completed += 1;
+                    q.async_timeouts += 1;
+                }
+                ok
+            });
+            if queued { expired += 1; }
+        } else if state == AsyncState::InFlight {
+            with_queue(|q| {
+                if q.async_entries[slot].state == AsyncState::InFlight {
+                    q.async_entries[slot].state = AsyncState::TimedOut;
+                }
+            });
+        }
+    }
+    let mut done = [IoCompletion { local_id: 0, sectors_done: 0, error: None }; ASYNC_MAX];
+    let n = disk.reap(&mut done).min(ASYNC_MAX);
+    with_queue(|q| {
+        let mut accepted = expired;
+        for item in &done[..n] {
+            let Some(slot) = q.async_entries.iter().position(|e| {
+                adapter_matches_id(e.adapter, adapter) && matches!(e.state, AsyncState::InFlight | AsyncState::TimedOut)
+                    && e.local_id == item.local_id
+            }) else {
+                q.async_duplicates += 1;
+                continue;
+            };
+            let was_late = q.async_entries[slot].state == AsyncState::TimedOut;
+            let entry = q.async_entries[slot];
+            #[cfg(not(feature = "fault-async-drop-token"))]
+            let token = entry.token;
+            #[cfg(feature = "fault-async-drop-token")]
+            let token = 0;
+            q.async_entries[slot].token = token;
+            if !ready_async(q, slot, item.sectors_done, item.error) {
+                q.async_duplicates += 1;
+                continue;
+            }
+            q.async_completed += 1;
+            #[cfg(not(feature = "fault-async-drop-late"))]
+            if was_late { q.async_late += 1; }
+            accepted += 1;
+            #[cfg(feature = "fault-async-duplicate-complete")]
+            if q.async_ready_len < ASYNC_MAX {
+                q.async_ready[q.async_ready_len] = q.async_ready[q.async_ready_len - 1];
+                q.async_ready_len += 1;
+                q.async_completed += 1;
+                accepted += 1;
+            }
+        }
+        accepted
+    })
+}
+
+pub fn async_take_completion(target: TargetId) -> Option<LeaseClaim> {
+    if crate::arch::x86_64::apic::in_isr() {
+        return None;
+    }
+    with_queue(|q| {
+        #[cfg(feature = "fault-async-gate-order")]
+        let _bad = ASYNC_DRIVER_GATE.lock();
+        let pos = q.async_ready[..q.async_ready_len].iter().position(|c| c.request.target == target)?;
+        let completion = q.async_ready[pos];
+        q.async_ready[pos] = q.async_ready[q.async_ready_len - 1];
+        q.async_ready_len -= 1;
+        if let Some(slot) = q.async_entries.iter().position(|e| {
+            e.target == target && e.seq == completion.request.seq && e.state == AsyncState::Ready
+        }) {
+            q.async_entries[slot] = ASYNC_ENTRY_EMPTY;
+        }
+        Some(LeaseClaim { completion, released: false })
+    })
+}
+
+pub fn async_copy_out(disk: &dyn AsyncBlock, claim: &LeaseClaim, dst: &mut [u8]) -> Result<(), BlockError> {
+    if crate::arch::x86_64::apic::in_isr() || claim.released {
+        return Err(BlockError::Refused);
+    }
+    #[cfg(not(feature = "fault-async-skip-adapter-check"))]
+    if disk.adapter_id() != claim.request.adapter {
+        return Err(BlockError::Refused);
+    }
+    let cap = claim.sectors.checked_mul(SECTOR_BYTES as u32).ok_or(BlockError::Refused)? as usize;
+    if dst.len() > cap {
+        return Err(BlockError::Refused);
+    }
+    let _driver = ASYNC_DRIVER_GATE.lock();
+    disk.copy_out(claim.lease, dst)
+}
+
+pub fn async_release(disk: &dyn AsyncBlock, claim: &mut LeaseClaim) -> Result<(), BlockError> {
+    if crate::arch::x86_64::apic::in_isr() || claim.released {
+        return Err(BlockError::Refused);
+    }
+    #[cfg(not(feature = "fault-async-skip-adapter-check"))]
+    if disk.adapter_id() != claim.request.adapter {
+        return Err(BlockError::Refused);
+    }
+    let _driver = ASYNC_DRIVER_GATE.lock();
+    disk.release_lease(claim.lease);
+    claim.released = true;
+    Ok(())
+}
+
+pub fn async_cancel(disk: &dyn AsyncBlock, request: RequestId) -> CancelResult {
+    if crate::arch::x86_64::apic::in_isr() {
+        return CancelResult::InFlight;
+    }
+    let _driver = ASYNC_DRIVER_GATE.lock();
+    let plan: Result<(u64, IoLease), CancelResult> = with_queue(|q| {
+        let e = q.async_entries.iter().find(|e| {
+            e.adapter == disk.adapter_id() && e.target == request.target && e.seq == request.seq && e.state != AsyncState::Empty
+        }).ok_or(CancelResult::NotFound)?;
+        match e.state {
+            AsyncState::Ready => Err(CancelResult::Completed),
+            AsyncState::Submitting => Err(CancelResult::InFlight),
+            AsyncState::InFlight | AsyncState::TimedOut => Ok((e.local_id, e.lease)),
+            AsyncState::Empty => unreachable!(),
+        }
+    });
+    let (local_id, lease) = match plan {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    match disk.cancel(local_id) {
+        CancelResult::Cancelled => {
+            let (release, result) = with_queue(|q| {
+                if let Some(slot) = q.async_entries.iter().position(|e| {
+                    e.adapter == disk.adapter_id() && e.target == request.target && e.seq == request.seq && e.state != AsyncState::Empty
+                }) {
+                    if q.async_entries[slot].state == AsyncState::Ready {
+                        (false, CancelResult::Completed)
+                    } else {
+                        q.async_entries[slot] = ASYNC_ENTRY_EMPTY;
+                        q.async_cancelled += 1;
+                        (true, CancelResult::Cancelled)
+                    }
+                } else {
+                    (true, CancelResult::Cancelled)
+                }
+            });
+            if release {
+                disk.release_lease(lease);
+            }
+            result
+        }
+        other => other,
+    }
+}
+
+pub fn async_pending(target: TargetId) -> usize {
+    if crate::arch::x86_64::apic::in_isr() {
+        return 0;
+    }
+    with_queue(|q| q.async_entries.iter().filter(|e| e.target == target && e.state != AsyncState::Empty).count())
+}
+
+pub fn async_stats() -> (u32, u32, u32, u32, usize, usize, u32, u32) {
+    if crate::arch::x86_64::apic::in_isr() {
+        return (0, 0, 0, 0, 0, 0, 0, 0);
+    }
+    with_queue(|q| (
+        q.async_submitted,
+        q.async_completed,
+        q.async_cancelled,
+        q.async_duplicates,
+        q.async_entries.iter().filter(|e| e.state != AsyncState::Empty).count(),
+        q.async_ready_len,
+        q.async_timeouts,
+        q.async_late,
+    ))
 }

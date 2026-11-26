@@ -201,6 +201,47 @@ pub trait Block {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdapterId(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IoLease(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IoRequest {
+    pub lba: u64,
+    pub sectors: u32,
+    pub token: u64,
+    pub write: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IoCompletion {
+    pub local_id: u64,
+    pub sectors_done: u32,
+    pub error: Option<BlockError>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelResult {
+    Cancelled,
+    InFlight,
+    NotFound,
+    Completed,
+}
+
+/// 驱动适配器：`submit` 返回的 local_id 必须单调且不复用；`reap/cancel/submit` 由 block_io 的驱动门闩串行化。
+pub trait AsyncBlock {
+    fn adapter_id(&self) -> AdapterId;
+    fn alloc_lease(&self, sectors: u32) -> Result<IoLease, BlockError>;
+    fn copy_in(&self, lease: IoLease, src: &[u8]) -> Result<(), BlockError>;
+    fn copy_out(&self, lease: IoLease, dst: &mut [u8]) -> Result<(), BlockError>;
+    fn submit(&self, request: IoRequest, lease: IoLease) -> Result<u64, BlockError>;
+    fn reap(&self, out: &mut [IoCompletion]) -> usize;
+    fn cancel(&self, local_id: u64) -> CancelResult;
+    fn release_lease(&self, lease: IoLease);
+}
+
 /// 打开一个文件要交回来的东西：大小、起始簇，以及**扫描的覆盖面**。
 ///
 /// `entries_seen` 与 `lfn_entries` 不是装饰：前者证明扫描真的走过了若干条目录项而不是

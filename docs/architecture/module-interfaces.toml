@@ -163,7 +163,7 @@ public_api = [
   "x86_64::smp",
 ]
 allowed_callers = [
-  "diagnostics", "driver", "input", "integration", "irq", "memory", "sched", "sync", "time"
+  "diagnostics", "driver", "input", "integration", "irq", "memory", "sched", "storage", "sync", "time"
 ]
 dependencies = ["boot", "diagnostics", "irq", "memory", "pci", "sync", "time"]
 forbidden_dependencies = ["sched"]
@@ -490,6 +490,7 @@ source_modules = ["sync"]
 public_api = [
   "sync::IrqSpinLock",
   "sync::RANK_GROW",
+  "sync::RANK_BLOCK_DRIVER",
   "sync::RANK_HEAP",
   "sync::RANK_RUNQ",
   "sync::RANK_TIMER",
@@ -820,6 +821,7 @@ public_api = [
   "block_io::ctx_cb_stats", "block_io::cb_clear_for", "block_io::ctx_cb_clear",
   "block_io::drain_with_cb_ctx",
   "vfs::Block", "vfs::BlockError",
+  "vfs::AsyncBlock", "vfs::AdapterId", "vfs::IoLease", "vfs::IoRequest", "vfs::IoCompletion", "vfs::CancelResult",
   "vfs::FileStat", "vfs::Partition", "vfs::PartitionView", "vfs::DiskKey",
   "filesystem/part::PART_RECORD_LEN", "filesystem/part::PartError",
   "filesystem/part::PartInfo", "filesystem/part::part_read_block",
@@ -828,7 +830,7 @@ public_api = [
 ]
 allowed_callers = ["capability", "integration", "sched"]
 dependencies = [
-  "sync", "driver"]
+  "arch", "sync", "driver"]
 forbidden_dependencies = []
 known_violations = []
 context = ["KERNEL", "IRQ_OFF", "ISR_TOP"]

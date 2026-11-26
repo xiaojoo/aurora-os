@@ -42,7 +42,7 @@ impl LockRank {
     /// 这个函数只读常量、不进临界区、不分配，可以安全地在崩溃路径调用。
     pub const fn name(self) -> &'static str {
         match self.0 {
-            1 => "BOOT",
+            1 => "BLK_DRV",
             2 => "STACK",
             3 => "TEST_MOD",
             4 => "GROW",
@@ -69,6 +69,8 @@ impl LockRank {
 /// 今天真实的嵌套链只有一条，所以这张表的次序不是排版而是调用关系：
 /// `堆(10) -> VMM(20) -> PMM(30) -> 台账(40)`；ACPI(50) 目前只在启动期单独用。
 /// 新增一把锁必须先改 `docs/architecture/lock-order.md`（§7.1 的原文要求）。
+/// 等级 1：块异步驱动门闩；必须先于驱动锁与块队列锁（ADR-259）。
+pub const RANK_BLOCK_DRIVER: LockRank = LockRank(1);
 /// 等级 4：堆增长锁（ADR-081 决策 4）。**必须低于 TIMER(6)**，这不是排版而是死锁条件：
 /// 增长要调 `mm::map`(VMM20)，而等 VMM 时若持着 rank>=6 的锁就不能开窗（开窗会让 tick 取
 /// TIMER(6) 撞锁序），于是取不到 shootdown IPI ⇒ 请求方超时升 L4（BACKLOG §204 的根因）。

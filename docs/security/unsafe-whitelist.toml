@@ -136,11 +136,13 @@ U2 = 10
 # 对账：722+1=723、U1 104+1=105。
 # 2026-11-26 ADR-257：+filesystem/vfs_ro U4 3（dentry put/bind/目录失效，均持 DENTRY_LOCK）。
 # 对账：723+3=726、U4 250+3=253。
-total = 726
+# 2026-11-26 ADR-259：+filesystem/block_io U4 1（with_queue 持 QUEUE_LOCK，闭包不借出队列引用）。
+# 对账：726+1=727、U4 253+1=254。
+total = 727
 U1 = 105
 U2 = 183
 U3 = 13
-U4 = 253
+U4 = 254
 U5 = 128
 U6 = 44
 
@@ -199,7 +201,7 @@ U4 = 17
 U4 = 8
 
 [modules."filesystem/block_io"]
-U4 = 29
+U4 = 30
 
 [modules."filesystem/fs_open"]
 U2 = 2

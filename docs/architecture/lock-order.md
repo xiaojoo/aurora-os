@@ -8,6 +8,7 @@
 
 | 锁 | 等级 | 保护的量 | 允许在它内部获取 | 依据（实测的调用关系） | 是否在中断上下文取（ADR-081 决策 2：`never_taken_in_isr` 的**唯一依据来源**） |
 | --- | --- | --- | --- | --- | --- |
+| `RANK_BLOCK_DRIVER` | 1 | 块异步驱动门闩（`block_io.rs`，串行 submit/reap/cancel/lease 访问） | GROW(4)、HEAP(10)、VMM(20)、PMM(30)、台账(40)、BLOCK(37) | **ADR-259（2026-11-26）**：门闩必须先于驱动锁与块队列锁；所有入口拒绝 ISR，等待按 rank<6 可开窗。 | 否 |
 | `RANK_GROW` | 4 | 堆**增长**这件事的串行化（`heap::GROW`，不保护堆状态本身） | HEAP(10)、VMM(20)、PMM(30)、台账(40) | **ADR-081 决策 4（2026-11-11，提议→落地）**：增长要调 `mm::map`(VMM20)，而等 VMM 时若持 rank≥6 的锁就不能开窗（开窗会让 tick 取 TIMER(6) 撞锁序）⇒ 取不到 shootdown IPI ⇒ 请求方超时升 L4（BACKLOG §204 根因）。持 GROW(4) 等 VMM 时 `INNERMOST=4 < 6` ⇒ 满足开窗条件。取锁顺序：**GROW(4) → HEAP(10) 读快照 → 放 HEAP → 只持 GROW 调 `mm::map` → 再取 HEAP 提交**。`init()` 是**故意例外**（启动期单核，仍持 HEAP 增长，ADR-081 决策 5） | 否 |
 | `RANK_WAITQ` | 5 | `sync::WaitQueue` 的链表头尾、waiter 槽与计数 | RUNQ(8)、HEAP(10)、VMM(20)、PMM(30)、台账(40) | **已落地（ADR-053/P4b，2026-11-08）**：持等待队列锁时叫醒别人即取运行队列锁；实测负样本 `重入获取 rank=5` ⇒ 39、`锁序违规，外层 rank=8 本次 rank=5` ⇒ 39 | **是**（保守判是：唤醒路径与 RUNQ 同在中断上下文；判 false 只损失优化不损失正确性） |
 | `RANK_TIMER` | 6 | 每 CPU 定时器轮的到期项与计数（`sched::WHEELS`） | RUNQ(8)、HEAP(10)、VMM(20)、PMM(30)、台账(40) | **已落地（ADR-058/P6，2026-11-08）**：`wait_while` 持 WAITQ(5) 注册到期项（5→6），tick 扫轮持 TIMER 叫醒要取 RUNQ(8)（6→8）。扫轮**必须在 need 闸之后**，否则持 VMM 时的同步 #PF 会撞 `外层 rank=20 本次 rank=6`（实测 3/3 39） | **是** |
