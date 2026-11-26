@@ -26234,3 +26234,15 @@ PASS，按环境形状记“不归因”，判据不动。
   均仅 `t_nvme_async` FAIL；`run-17496` 关闭迟到 reap 红在 `迟到=false` 并保留后续 NVMe 级联。
   `check` **21/21**；完整矩阵 **82/82 符合**（`build/nvme-slice4-matrix.log`，退出码 0）。
   真机未验证；用户 broker 未接入；AOCI MCP 不可用，索引未更新。
+- 第 5 片用户通知 broker：VMO 增加对齐 AtomicU64 发布原语；rank39 定长账本保留未确认 seq，
+  满队列拒绝、端点世代校验、替换后重投；`block_io` 完成镜像 token/result/sectors。
+  `aurora-user-shell` 第二 bin `notify` 经既有 11/14/15/16 号启动，无新 syscall。
+  `run-17519` block-notify **139/139 PASS**：ring3 退出 `0/3/0`，panic 保留 1 条，替换后
+  `acked_seq=2/retained=0`，句柄/Proc/VMO 回基线，`exits +3`、`kills` 不增、会话 VA 清零。
+  监督者必须等 `owned_of(gidx)==0` 再 reap；早期负样本布局在此前置条件缺失时双释放，已收口。
+  最终负样本 `run-17520/17521/17522/17526/17514` 分别丢接线/跳过世代/覆盖未确认/不重投/未对齐，
+  均红目标格；`run-17523/17525` 锁秩绕过与用户退出 3 当 fatal 均 EXCEPTION(39)。
+  `run-17526` 另有既有 `t_sdkdemo` 红格，不归因于通知变异。同一 ELF `9823dd9596a6` 的
+  `run-17559/17623/17624` 为 3/3 PASS。`check` **21/21**，unsafe 合计 741；完整矩阵
+  **90/90 符合**（`build/block-notify-slice5-matrix.log`，退出码 0）。常驻主循环 pump 与产品
+  异步请求者仍未接；真机未验证；AOCI MCP 不可用，索引未更新。

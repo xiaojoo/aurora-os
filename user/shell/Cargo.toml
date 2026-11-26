@@ -11,6 +11,10 @@ publish = false
 name = "shell"
 path = "src/main.rs"
 
+[[bin]]
+name = "notify"
+path = "src/notify.rs"
+
 [lints]
 workspace = true
 

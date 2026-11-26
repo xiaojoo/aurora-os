@@ -31,7 +31,7 @@ capability 的产品路径也已接通（`handles` 档 init 授 Job+Console，22
   ②53/54 不许挂原始以太网帧的 handler（两族语义不合并）；③（ADR-176）内核**声明**的每个 `pub const SYS_X` 也必须有臂，
   豁免仅 `SYS_RESERVED_FIRST/LAST`（哨兵）与 `SYS_NOT_A_NUMBER`（99，专供「未知号回 -1」的负样本）。
   判据 3 只对账「有没有臂」，不证臂里干的对不对 —— `=> E_NOSYS` 的空壳照样绿，那是设计意图。
-- `test`：**判定表 82 行**，每行各拿自己那一跑的串口日志与退出码。
+- `test`：**判定表 90 行**，每行各拿自己那一跑的串口日志与退出码。
   判定值契约：PASS=33、FAIL=35、BOOT-INVALID=37、EXCEPTION=39、HANG=-1，
   另有量具级的 CONTENT-MISMATCH / SEQ-BROKEN。
 - `bench`：四把尺子（P1 切换 / P2 MMIO 与 DMA / P3 故障恢复 / P4 串口量对照），
@@ -86,7 +86,7 @@ capability 的产品路径也已接通（`handles` 档 init 授 Job+Console，22
   `tools/patch_fat32_file.py`（P7 用它把 hello.elf 换进两卷，写后复验）；整卷 mformat 仍卡着（78h-6 / 80f-1）。
 - 提交按 **explicit 文件名** stage，不要 `git add -A`；未跟踪的架构规范 V1.0 不是本轮产物，别顺手带上。
 
-## 当前进度快照（2026-11-26，HEAD 见 `git log -1`）
+## 当前进度快照（2026-11-27，HEAD 见 `git log -1`）
 
 **这一节只写实测过的。** 2026-11-21 的旧快照保留在 BACKLOG；不要再把旧容量或旧缺口当现状。
 
@@ -97,7 +97,8 @@ capability 的产品路径也已接通（`handles` 档 init 授 Job+Console，22
 FAT32 覆盖写/create/unlink 与原子 RMW、GPT/FAT16/ESP 分区层、用户态装载器与 shell 外部命令、
 capability 句柄与 fd 表、信号往返、`mmap/munmap/mprotect`、demand-zero/COW、socket 双栈、
 IPv6/TCP、xHCI 真设备探针与命令环切片、帧缓冲文本与窗口系统、显示/输入 QMP 第二台仪器、
-块请求队列/超时/取消/按盘延迟完成/上下文回调、产品页缓存、VFS i_op/f_op（ADR-258）。
+块请求队列/超时/取消/按盘延迟完成/上下文回调、产品页缓存、VFS i_op/f_op（ADR-258）、
+AsyncBlock 真异步核心与 AHCI/virtio-blk/NVMe 单槽适配、独立 ring3 完成通知 broker（ADR-259）。
 验签已接启动路径，但当前仍是**只检测不拒启**。
 
 仍然开着的四个里程碑缺口（2026-11-26 复核）：
@@ -109,13 +110,13 @@ IPv6/TCP、xHCI 真设备探针与命令环切片、帧缓冲文本与窗口系�
    W5 身份/槽位 + ADR-011 正式方案 + W12 生产钥匙（ADR-080 未决 1）。
 3. **真机（M7）零条已测**——`docs/hardware/bringup.md` 的 **51 条**（H-01…H-51）全是
    「待测/未验证」。没有机型就没有 M7 的通过。
-4. **块设备抽象的真异步与生存级回调隔离**——队列、取消、超时、延迟完成与上下文回调
-   已交付（ADR-214/215/251）；`Block` 仍是同步签名，回调不拥有数据缓冲，`panic=abort`
-   下回调 panic 仍终止整机。该未决项需要架构裁决，不能写成“已完成”。
+4. **块设备真异步的产品闭环**——ADR-259 的租约状态机、三驱动单槽异步与 ring3 broker 已交付；
+   仍开：常驻主循环 pump/产品异步请求者、同步 `read_checked` 包装、NVMe 队列深度内多
+   outstanding 与禁用/致命态排空。真机未验证，不能写成“已完成”。
 
 **长链抖动仍有未归因 residual**：具体成因中的日志放大器、XFER 锁序、信箱回收、q2 持袋栈、
 工人抢占与 thread_create 构造窗口已分别归因/修复；剩余同 ELF 可清除的 SMP/PIT/sdkdemo 等
-偶发不能宣称根因关闭。最终判定表 **82/82 符合**；q2 同一 ELF `46135e5b…` **100/100 PASS**；
+偶发不能宣称根因关闭。最终判定表 **90/90 符合**；q2 同一 ELF `46135e5b…` **100/100 PASS**；
 A3 同一 ELF `cff867b864f2…` **99/100 PASS**，唯一 `t_ap_released_and_ticking` 偏差经同 ELF
 `run-16895` 单跑 PASS，按环境形状记“不归因”。
 

@@ -281,6 +281,11 @@ SHELL_PKG = "aurora-user-shell"
 SHELL_ELF = ROOT / "target" / TARGET / "debug" / "shell"
 SHELL_FIXTURE = ROOT / "kernel" / "fixtures" / "shell.elf"
 SHELL_RUSTFLAGS = "-C link-arg=-Tuser/shell/link.ld -C relocation-model=static -C panic=abort -C opt-level=1 -C debuginfo=0"
+# ADR-259 第5片：同包第二 bin，独立 ring3 通知 broker；链接纪律与 shell 相同。
+NOTIFY_PKG = "aurora-user-shell"
+NOTIFY_ELF = ROOT / "target" / TARGET / "debug" / "notify"
+NOTIFY_FIXTURE = ROOT / "kernel" / "fixtures" / "notify.elf"
+NOTIFY_RUSTFLAGS = SHELL_RUSTFLAGS
 # FS-03 切片 D（ADR-108 决策 8）：第四个用户产物 = ring3 文件探针。构建纪律与 probe/shell 逐条相同，
 # 只换包名、产物名与链接脚本。它**只在 `fs-open` 构建里被内核 include_bytes!**，
 # 但产物每次都造：构建不该看特性的脸色，看不看是内核编译期决定的。
@@ -362,7 +367,7 @@ def do_build_execprobe() -> Path:
 def do_build_shell() -> Path:
     """S5c：构建串口 shell 并落成夹具。与 do_build_probe 逐条同形（含"只在字节真变了才覆写"）。"""
     r = subprocess.run(
-        [str(CARGO), "build", "--target", TARGET, "-p", SHELL_PKG],
+        [str(CARGO), "build", "--target", TARGET, "-p", SHELL_PKG, "--bin", "shell"],
         capture_output=True, text=True, cwd=str(ROOT),
         env={**env(), "RUSTFLAGS": SHELL_RUSTFLAGS},
     )
@@ -377,6 +382,26 @@ def do_build_shell() -> Path:
     print(f"shell 程序: {SHELL_FIXTURE.relative_to(ROOT)}  {len(data)} 字节  "
           f"sha256={hashlib.sha256(data).hexdigest()[:12]} {'（夹具已更新）' if changed else '（与夹具一致）'}")
     return SHELL_FIXTURE
+
+
+def do_build_notify() -> Path:
+    """ADR-259：构建独立 ring3 通知 broker 并落成夹具。"""
+    r = subprocess.run(
+        [str(CARGO), "build", "--target", TARGET, "-p", NOTIFY_PKG, "--bin", "notify"],
+        capture_output=True, text=True, cwd=str(ROOT),
+        env={**env(), "RUSTFLAGS": NOTIFY_RUSTFLAGS},
+    )
+    if r.returncode != 0:
+        sys.exit("notify broker 构建失败：" + (r.stdout + r.stderr)[-3000:])
+    data = NOTIFY_ELF.read_bytes()
+    NOTIFY_FIXTURE.parent.mkdir(exist_ok=True)
+    changed = not NOTIFY_FIXTURE.exists() or NOTIFY_FIXTURE.read_bytes() != data
+    if changed:
+        NOTIFY_FIXTURE.write_bytes(data)
+    import hashlib
+    print(f"通知 broker: {NOTIFY_FIXTURE.relative_to(ROOT)}  {len(data)} 字节  "
+          f"sha256={hashlib.sha256(data).hexdigest()[:12]} {'（夹具已更新）' if changed else '（与夹具一致）'}")
+    return NOTIFY_FIXTURE
 
 
 def do_build_probe() -> Path:
@@ -404,6 +429,7 @@ def do_build(features: list[str]) -> Path:
     do_build_user()
     do_build_probe()
     do_build_shell()
+    do_build_notify()
     do_build_fileprobe()
     do_build_execprobe()
     do_build_sdkdemo()
@@ -10023,6 +10049,53 @@ def do_test(timeout: int) -> int:
         print(f"    DATA.BIN 大小={_nf.group(1)} 走过={_nf.group(2)} 簇数={_nf.group(3)}")
 
     # =====================================================================
+    # ADR-259 第5片：独立 ring3 broker、共享页确认、死亡/替换重投与 panic 隔离。
+    print("=== 用户完成通知 broker：ring3 0/3/0、替换重投与资源收尾 ===")
+    IMAGE.unlink(missing_ok=True)
+    bnv, bnrc, bnlog = do_run(["block-notify"], timeout)
+    bn_bad = []
+    for _name in ("t_block_notify_core", "t_block_notify_wire", "t_block_notify_page", "t_block_notify_ring3"):
+        bn_bad += ktest_row(bnlog, _name)
+    bn_verdict = bnv if bnv != "PASS" else ("PASS" if not bn_bad else "CONTENT-MISMATCH")
+    for x in bn_bad:
+        print("    broker 对账:", x)
+
+    print("=== 通知负样本：跳过端点世代 ===")
+    IMAGE.unlink(missing_ok=True)
+    bngv, bngrc, bnglog = do_run(["block-notify", "fault-notify-skip-gen"], timeout)
+    bng_verdict = "FAIL" if bngv == "FAIL" and ktest_named(bnglog, "t_block_notify_core") == "failed" else "CONTENT-MISMATCH"
+
+    print("=== 通知负样本：覆盖未确认记录 ===")
+    IMAGE.unlink(missing_ok=True)
+    bnov, bnorc, bnolog = do_run(["block-notify", "fault-notify-overwrite"], timeout)
+    bno_verdict = "FAIL" if bnov == "FAIL" and ktest_named(bnolog, "t_block_notify_core") == "failed" else "CONTENT-MISMATCH"
+
+    print("=== 通知负样本：绕过 rank39 锁秩闸 ===")
+    IMAGE.unlink(missing_ok=True)
+    blrv, blrrc, blrlog = do_run(["block-notify", "fault-notify-lock-rank"], timeout)
+    blr_verdict = "EXCEPTION" if blrv == "EXCEPTION" and "本次 rank=39(NOTIFY)" in blrlog else "CONTENT-MISMATCH"
+
+    print("=== 通知负样本：block_io 完成不入通知账本 ===")
+    IMAGE.unlink(missing_ok=True)
+    bdwv, bdwrc, bdwlog = do_run(["block-notify", "fault-notify-drop-wire"], timeout)
+    bdw_verdict = "FAIL" if bdwv == "FAIL" and ktest_named(bdwlog, "t_block_notify_wire") == "failed" else "CONTENT-MISMATCH"
+
+    print("=== 通知负样本：替换端点后不重投 ===")
+    IMAGE.unlink(missing_ok=True)
+    bdrv, bdrrc, bdrlog = do_run(["block-notify", "fault-notify-drop-replay"], timeout)
+    bdr_verdict = "FAIL" if bdrv == "FAIL" and ktest_named(bdrlog, "t_block_notify_ring3") == "failed" else "CONTENT-MISMATCH"
+
+    print("=== 通知负样本：把用户退出码 3 当内核 fatal ===")
+    IMAGE.unlink(missing_ok=True)
+    bpfv, bpfrc, bpflog = do_run(["block-notify", "fault-notify-panic-fatal"], timeout)
+    bpf_verdict = "EXCEPTION" if bpfv == "EXCEPTION" and "notify-panic-fatal" in bpflog else "CONTENT-MISMATCH"
+
+    print("=== 共享页负样本：AtomicU64 未对齐访问 ===")
+    IMAGE.unlink(missing_ok=True)
+    vuav, vuarc, vualog = do_run(["fault-vmo-atomic-unaligned"], timeout)
+    vua_verdict = "FAIL" if vuav == "FAIL" and ktest_named(vualog, "t_vmo_object") == "failed" else "CONTENT-MISMATCH"
+
+    # =====================================================================
     # 裁决 C（BACKLOG §473）：把「慢」做成可见的量。
     #
     # §472 的发现：`a2-exec-bad` 连跑 8 次有 4 次 HANG，而正常 6.0 秒、
@@ -10940,6 +11013,15 @@ def do_test(timeout: int) -> int:
         # ADR-172：NVMe 上挂真卷。这一行证的是**文件系统层**，
         # 与 `t_nvme_all` 的设备层三格是不同层的证据（两层各自能独立红）。
         ("NVMe 卷上读出文件与宿主机对账", nvf_verdict, nvfrc, "PASS", 33),
+        # ADR-259 第5片：四格核内接线 + 独立 ring3 生命周期；负样本各自只咬目标格。
+        ("用户通知broker与ring3重投", bn_verdict, bnrc, "PASS", 33),
+        ("通知端点世代不校验必须红", bng_verdict, bngrc, "FAIL", 35),
+        ("覆盖未确认通知必须红", bno_verdict, bnorc, "FAIL", 35),
+        ("通知锁秩绕过必须升L4", blr_verdict, blrrc, "EXCEPTION", 39),
+        ("完成通知接线丢失必须红", bdw_verdict, bdwrc, "FAIL", 35),
+        ("端点替换不重投必须红", bdr_verdict, bdrrc, "FAIL", 35),
+        ("用户退出3当fatal必须升L4", bpf_verdict, bpfrc, "EXCEPTION", 39),
+        ("共享页未对齐原子访问必须红", vua_verdict, vuarc, "FAIL", 35),
         # ADR-170：输入域的第二台仪器。宿主机 QMP `input-send-event` 注入 'a'，
         # 内核从**真实 PS/2 端口**收到 97。`t_ps2_kbd_decode` 只证解码，
         # 这一行证两端（端口 → 解码 → 环）。
@@ -11077,6 +11159,14 @@ def do_test(timeout: int) -> int:
         "virtio 写落盘与宿主机对账": vvilog,
 "帧缓冲图案与显存对账": fblog,
 "NVMe 卷上读出文件与宿主机对账": nvflog,
+        "用户通知broker与ring3重投": bnlog,
+        "通知端点世代不校验必须红": bnglog,
+        "覆盖未确认通知必须红": bnolog,
+        "通知锁秩绕过必须升L4": blrlog,
+        "完成通知接线丢失必须红": bdwlog,
+        "端点替换不重投必须红": bdrlog,
+        "用户退出3当fatal必须升L4": bpflog,
+        "共享页未对齐原子访问必须红": vualog,
 "按键注入与输入通路对账": kbdlog,
 "变体用时偏离中位数": perflog,
         "网卡第一帧与 pcap 对账": ntlog,

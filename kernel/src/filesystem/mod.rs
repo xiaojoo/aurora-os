@@ -5,6 +5,8 @@
 //! 驱动不知道什么是目录项。
 
 pub mod block_io;
+#[cfg(feature = "block-notify")]
+pub mod block_notify;
 pub mod fat32;
 #[cfg(any(feature = "gpt-probe", feature = "fs-ro"))]
 pub mod gpt;

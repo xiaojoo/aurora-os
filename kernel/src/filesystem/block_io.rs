@@ -1302,21 +1302,26 @@ pub fn async_poll_at(disk: &dyn AsyncBlock, now: u64) -> usize {
                 && matches!(e.state, AsyncState::InFlight | AsyncState::TimedOut)
                 && e.deadline != u64::MAX && now != u64::MAX && now >= e.deadline
             {
-                Some((e.local_id, e.state))
+                Some((e.local_id, e.state, e.target))
             } else {
                 None
             }
         });
-        let Some((local_id, state)) = pending else { continue };
+        let Some((local_id, state, entry_target)) = pending else { continue };
         if disk.cancel(local_id) == CancelResult::Cancelled {
             let queued = with_queue(|q| {
                 if !matches!(q.async_entries[slot].state, AsyncState::InFlight | AsyncState::TimedOut) {
                     return false;
                 }
+                let token = q.async_entries[slot].token;
                 let ok = ready_async(q, slot, 0, Some(BlockError::NotSettled));
                 if ok {
                     q.async_completed += 1;
                     q.async_timeouts += 1;
+                    #[cfg(all(feature = "block-notify", not(feature = "fault-notify-drop-wire")))]
+                    let _ = crate::filesystem::block_notify::publish(
+                        token, entry_target.0, Err(BlockError::NotSettled), [0; 16],
+                    );
                 }
                 ok
             });
@@ -1355,6 +1360,10 @@ pub fn async_poll_at(disk: &dyn AsyncBlock, now: u64) -> usize {
             q.async_completed += 1;
             #[cfg(not(feature = "fault-async-drop-late"))]
             if was_late { q.async_late += 1; }
+            #[cfg(all(feature = "block-notify", not(feature = "fault-notify-drop-wire")))]
+            let _ = crate::filesystem::block_notify::publish(
+                token, entry.target.0, item.error.map_or(Ok(item.sectors_done), Err), [0; 16],
+            );
             accepted += 1;
             #[cfg(feature = "fault-async-duplicate-complete")]
             if q.async_ready_len < ASYNC_MAX {

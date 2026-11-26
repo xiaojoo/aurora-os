@@ -147,12 +147,19 @@ U2 = 10
 # 2026-11-26 ADR-259 第4片：driver/nvme U4 7→4（设备状态访问收口到 with_io 的锁内临界区），
 # with_io 的 inner 字段地址转换登记 U2 1。
 # 对账：727-3+1=725、U4 254-3=251、U2 183+1=184。
-total = 725
-U1 = 105
-U2 = 184
+# 2026-11-26 ADR-259 第5片：+memory/vmo U2 1（共享页 AtomicU64 发布视图）。
+# 对账：725+1=726、U2 184+1=185。
+# 2026-11-26 ADR-259 第5片：+filesystem/block_notify U4 2（Sync 保证与锁内可变视图）。
+# 对账：726+2=728、U4 251+2=253。
+# 2026-11-26 ADR-259 第5片：user/runtime +U1 1/+U5 1（find_role），
+# +user/shell/notify U1 2/U5 9（SI 与共享环访问、RIP 相对 panic 探针）。
+# 对账：728+13=741、U1 105+3=108、U5 128+10=138。
+total = 741
+U1 = 108
+U2 = 185
 U3 = 13
-U4 = 251
-U5 = 128
+U4 = 253
+U5 = 138
 U6 = 44
 
 [modules."arch/hooks"]
@@ -211,6 +218,10 @@ U4 = 8
 
 [modules."filesystem/block_io"]
 U4 = 30
+
+[modules."filesystem/block_notify"]
+# ADR-259 第5片：通知账本 UnsafeCell 的 Sync 与锁内可变视图；NOTIFY_LOCK(39) 是唯一访问门。
+U4 = 2
 
 [modules."filesystem/fs_open"]
 U2 = 2
@@ -289,7 +300,9 @@ U2 = 83
 U4 = 9
 
 [modules."memory/vmo"]
-U2 = 3
+# ADR-259 第5片：共享页 AtomicU64 视图。指针来自本对象持有的物理帧 + HHDM，
+# 范围 8 字节，offset 按 8 对齐且 end 已核界；VMM 锁串行对象生命周期，封存页拒绝。
+U2 = 4
 U4 = 2
 
 [modules."sched/mod"]
@@ -364,8 +377,8 @@ U1 = 6
 U5 = 6
 
 [modules."user/runtime"]
-U1 = 5
-U5 = 57
+U1 = 6
+U5 = 58
 
 [modules."user/runtime/exec"]
 U1 = 1
@@ -377,6 +390,12 @@ U5 = 11
 [modules."user/shell"]
 U1 = 3
 U5 = 6
+
+[modules."user/shell/notify"]
+# ADR-259 第5片：ring3 broker 的 SI/共享环指针与 RIP 相对 panic 探针。
+# SI 由 process_start 校验；ring_va 来自同页 args，内核映射一页 user+RW；偏移先核长度/容量。
+U1 = 2
+U5 = 9
 
 [modules."user/shell/registry"]
 U5 = 6

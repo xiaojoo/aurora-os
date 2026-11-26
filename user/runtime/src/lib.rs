@@ -1112,23 +1112,28 @@ pub fn sleep_ms(h: Handle, ms: u64) -> Result<(), RTError> {
 /// `si_va` 必须是内核映射好的那一页（`process_start` 校验过 user+只读，user.rs:722），
 /// 且在本函数读取期间不被解映射。
 pub unsafe fn find_console(si_va: u64) -> Option<Handle> {
+    // SAFETY: 契约与 find_role 相同；角色号是 ROLE_LOG。
+    unsafe { find_role(si_va, ROLE_LOG) }
+}
+
+/// 按角色取 StartupInfo 句柄；broker 用它找 ROLE_SELF_THREAD 作为有界睡眠对象。
+///
+/// # Safety
+/// `si_va` 必须是内核映射好的那一页（`process_start` 校验过 user+只读），
+/// 且在本函数读取期间不被解映射。
+pub unsafe fn find_role(si_va: u64, wanted_role: u32) -> Option<Handle> {
     let base = si_va as *const u8;
-    // SAFETY: 见函数契约；只读前 24 字节头，都在那一页内，u32 读取用 read_unaligned 对齐无所谓。
+    // SAFETY: 只读头部与描述表，范围由 nhandles 上界夹在一页内。
     let magic = unsafe { core::ptr::read_unaligned(base.add(SI_OFF_MAGIC) as *const u32) };
     if magic != SI_MAGIC {
         return None;
     }
-    // SAFETY: 头部 8 字节处的 nhandles（u32），同在那一页内。
     let n = unsafe { core::ptr::read_unaligned(base.add(SI_OFF_NHANDLES) as *const u32) } as usize;
     let n = if n > MAX_STARTUP_HANDLES { MAX_STARTUP_HANDLES } else { n };
     for i in 0..n {
-        // SAFETY: 第 i 条描述的起点 = 24 + i*16，最多 16 条 ⇒ 最远 24+15*16+16 = 280 字节，
-        // 仍在那一页内。
         let d = unsafe { base.add(SI_OFF_HANDLES + i * SI_DESC_BYTES) };
-        // SAFETY: 描述内 role 字段（u32），落在该条 16 字节内。
         let role = unsafe { core::ptr::read_unaligned(d.add(SI_DESC_ROLE) as *const u32) };
-        if role == ROLE_LOG {
-            // SAFETY: 描述内 handle 字段（u64），落在该条 16 字节内。
+        if role == wanted_role {
             return Some(unsafe { core::ptr::read_unaligned(d.add(SI_DESC_HANDLE) as *const u64) });
         }
     }

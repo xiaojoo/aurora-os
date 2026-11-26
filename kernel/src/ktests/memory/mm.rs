@@ -1610,17 +1610,25 @@ fn t_vmo_object() -> bool {
     // ③ 清零见证：没写过的地方读回全 0（分配器毒化过 0xA5，所以忘了清零会红在这一格）
     let mut zb = [0xFFu8; 16];
     let zeroed = vmo::vmo_read(id, mm::PAGE + 8, &mut zb) == Ok(16) && zb.iter().all(|&b| b == 0);
+    // ADR-259：共享通知页的 Acquire/Release 发布原语；未对齐与越界必须拒绝。
+    use core::sync::atomic::Ordering;
+    let atom_value = 0x1122_3344_5566_7788u64;
+    let atom_write = vmo::vmo_atomic_store(id, 8, atom_value, Ordering::Release);
+    let atom_read = vmo::vmo_atomic_load(id, 8, Ordering::Acquire);
+    let atomic_ok = atom_write == Ok(()) && atom_read == Ok(atom_value);
+    let atomic_bound_ok = vmo::vmo_atomic_load(id, 9, Ordering::Acquire) == Err(vmo::VmoError::BadLength)
+        && vmo::vmo_atomic_load(id, 2 * mm::PAGE, Ordering::Acquire) == Err(vmo::VmoError::BadLength);
     // ④ 最后一个引用消失 ⇒ 帧回基线、对象数归零、三本计数对得上
     vmo::vmo_unref(id);
     let f1 = mm::free_frames();
     let (c1, r1, b1) = vmo::counters();
-    let base_ok = f1 == f0 && vmo::vmo_count() == 0 && c1 == c0 + 1 && r1 == r0 + 1 && b1 == b0 + 6;
+    let base_ok = f1 == f0 && vmo::vmo_count() == 0 && c1 == c0 + 1 && r1 == r0 + 1 && b1 == b0 + 14;
     crate::log_info!(
-        "vmo(P4): 写读={} 越界={} 清零={} 基线=(free{}->{} n{} created{}->{} released{}->{} bytes{}->{})",
-        io_ok, bound_ok, zeroed, f0, f1, vmo::vmo_count(), c0, c1, r0, r1, b0, b1);
-    let ok = io_ok && bound_ok && zeroed && base_ok;
+        "vmo(P4): 写读={} 越界={} 清零={} 原子={}/{} 基线=(free{}->{} n{} created{}->{} released{}->{} bytes{}->{})",
+        io_ok, bound_ok, zeroed, atomic_ok, atomic_bound_ok, f0, f1, vmo::vmo_count(), c0, c1, r0, r1, b0, b1);
+    let ok = io_ok && bound_ok && zeroed && atomic_ok && atomic_bound_ok && base_ok;
     if !ok {
-        crate::log_fatal!("vmo: 判据不成立 写读={} 越界={} 清零={} 基线={}", io_ok, bound_ok, zeroed, base_ok);
+        crate::log_fatal!("vmo: 判据不成立 写读={} 越界={} 清零={} 原子={}/{} 基线={}", io_ok, bound_ok, zeroed, atomic_ok, atomic_bound_ok, base_ok);
     }
     ok
 }

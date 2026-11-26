@@ -56,6 +56,7 @@ impl LockRank {
             36 => "NET",
             37 => "BLOCK",
             38 => "DENTRY",
+            39 => "NOTIFY",
             40 => "LEDGER",
             50 => "ACPI",
             60 => "TEST",
@@ -117,6 +118,8 @@ pub const RANK_BLOCK: LockRank = LockRank(37);
 /// 比 `RANK_BLOCK(37)` 深：路径解析可能发生在持有块层锁的上下文里（虽然今天没有），
 /// 而缓存命中时**不碰盘**，所以放在 38 是安全的。
 pub const RANK_DENTRY: LockRank = LockRank(38);
+/// 用户完成通知账本（`filesystem/block_notify.rs`，ADR-259）。叶子锁，只读写 Copy 记录。
+pub const RANK_NOTIFY: LockRank = LockRank(39);
 pub const RANK_LEDGER: LockRank = LockRank(40);
 pub const RANK_ACPI: LockRank = LockRank(50);
 /// 跨核竞争用例专用（`smp::CONTENTION_LOCK`）。排在最内层是因为它**不嵌套任何东西**：
@@ -767,6 +770,15 @@ impl<T: Send> IrqSpinLock<T> {
 
     pub fn rank(&self) -> LockRank {
         self.rank
+    }
+
+    /// 外层 rank 合法时才等待获取；非法嵌套在 CAS 前拒绝，不污染锁状态。
+    pub fn lock_checked(&self) -> Option<IrqGuard<'_, T>> {
+        let outer = INNERMOST[cpu_slot()].load(Ordering::Relaxed);
+        if outer != 0 && self.rank.0 <= outer {
+            return None;
+        }
+        Some(self.lock())
     }
 
     /// 关中断获取。重入、看门狗到期、违反锁序**当场升 L4**（§9.2：继续跑就是不可恢复的状态）。

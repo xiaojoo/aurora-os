@@ -5,15 +5,15 @@
 >
 > **2026-11-20（ADR-175 跨 AS 读走物理地址）**：`sched/user` U2 9 → 10（`copy_from_user_in` 里 HHDM 别名的单字节读）。**总数 +1**（530 → 531）。
 
-总计 725 处。U1 105 · U2 184 · U3 13 · U4 251 · U5 128 · U6 44
+总计 741 处。U1 108 · U2 185 · U3 13 · U4 253 · U5 138 · U6 44
 
 | 类别 | 含义 | 处数 |
 |---|---|---|
-| U1 | 架构入口与特殊寄存器 | 105 |
-| U2 | 页表、物理内存与 MMIO | 184 |
+| U1 | 架构入口与特殊寄存器 | 108 |
+| U2 | 页表、物理内存与 MMIO | 185 |
 | U3 | DMA 与设备共享内存 | 13 |
-| U4 | 并发共享状态与 UnsafeCell | 251 |
-| U5 | 用户指针与地址空间访问 | 128 |
+| U4 | 并发共享状态与 UnsafeCell | 253 |
+| U5 | 用户指针与地址空间访问 | 138 |
 | U6 | 诊断路径的有限现场读取 | 44 |
 
 ### capability/handle
@@ -561,7 +561,15 @@ ADR-213：xHCI 的运行期状态（三块 DMA 句柄 + 环游标）进 `.bss`�
 | U2 | 160 | `unsafe { core::ptr::write_bytes((pa + hhdm) as *mut u8, 0, PAGE) }; frames[got] = pa / PAGE as u64; got += 1;` |
 | U2 | 273 | `unsafe { core::ptr::copy(src.as_ptr().add(done), (pa + hhdm) as *mut u8, k) }; done += k; }` |
 | U2 | 306 | `unsafe { core::ptr::copy((pa + hhdm) as *const u8, dst.as_mut_ptr().add(done), k) }; done += k; }` |
+| U2 | 340 | `let atom = unsafe { &*(pa as *const core::sync::atomic::AtomicU64) };` |
 
+
+### filesystem/block_notify
+
+| 类别 | 行 | 形状 |
+|---|---|---|
+| U4 | 105 | `unsafe impl Sync for Cell {}` |
+| U4 | 119 | `let state = unsafe { &mut *STATE.0.get() };` |
 
 ### network/socket
 
@@ -847,12 +855,14 @@ ADR-201：定时器的 128 条 `Slot` 进 `.bss`，八处指针都指向 `TABLE`
 | U5 | 1032 | `let ret = unsafe { syscall_abi(SYS_PCI_ENUM, buf.as_mut_ptr() as u64, cursor, 0, buf.len() as u64) };` |
 | U5 | 1046 | `let ret = unsafe { syscall_abi(SYS_CLOCK_UPTIME, 0, 0, 0, 0) }; if ret < 0 { Err(RTError(ret))` |
 | U5 | 1071 | `let ret = unsafe { syscall_abi(SYS_OBJECT_WAIT, h, signals, timeout_ms, 0) }; decode_wait(ret) }` |
-| U1 | 1114 | `pub unsafe fn find_console(si_va: u64) -> Option<Handle> { let base = si_va as *const u8; // SAFETY: 见函数契约；只读前` |
-| U5 | 1117 | `let magic = unsafe { core::ptr::read_unaligned(base.add(SI_OFF_MAGIC) as *const u32) }; if magic != SI_MAGIC {` |
-| U5 | 1122 | `let n = unsafe { core::ptr::read_unaligned(base.add(SI_OFF_NHANDLES) as *const u32) } as usize; let n = if n >` |
-| U5 | 1127 | `let d = unsafe { base.add(SI_OFF_HANDLES + i * SI_DESC_BYTES) }; // SAFETY: 描述内 role 字段（u32），落在该条 16 字节内。 let ` |
-| U5 | 1129 | `let role = unsafe { core::ptr::read_unaligned(d.add(SI_DESC_ROLE) as *const u32) }; if role == ROLE_LOG { // S` |
-| U5 | 1132 | `return Some(unsafe { core::ptr::read_unaligned(d.add(SI_DESC_HANDLE) as *const u64) }); } }` |
+| U1 | 1114 | `pub unsafe fn find_console(si_va: u64) -> Option<Handle> {` |
+| U5 | 1116 | `unsafe { find_role(si_va, ROLE_LOG) }` |
+| U1 | 1124 | `pub unsafe fn find_role(si_va: u64, wanted_role: u32) -> Option<Handle> {` |
+| U5 | 1127 | `let magic = unsafe { core::ptr::read_unaligned(base.add(SI_OFF_MAGIC) as *const u32) };` |
+| U5 | 1131 | `let n = unsafe { core::ptr::read_unaligned(base.add(SI_OFF_NHANDLES) as *const u32) } as usize;` |
+| U5 | 1134 | `let d = unsafe { base.add(SI_OFF_HANDLES + i * SI_DESC_BYTES) };` |
+| U5 | 1135 | `let role = unsafe { core::ptr::read_unaligned(d.add(SI_DESC_ROLE) as *const u32) };` |
+| U5 | 1137 | `return Some(unsafe { core::ptr::read_unaligned(d.add(SI_DESC_HANDLE) as *const u64) });` |
 | U5 | 1158 | `let ret = unsafe { syscall_abi( SYS_DNS_RESOLVE,` |
 | U5 | 1192 | `let ret = unsafe { syscall_abi(SYS_FILE_WRITE, h, buf.as_ptr() as u64, buf.len() as u64, 0) } as i64;` |
 | U5 | 1215 | `let ret = unsafe { syscall_abi(SYS_SYSINFO, blk.as_mut_ptr() as u64, blk.len() as u64, 0, 0) } as i64;` |
@@ -906,6 +916,22 @@ ADR-201：定时器的 128 条 `Slot` 进 `.bss`，八处指针都指向 `TABLE`
 | U5 | 376 | `unsafe { if !SINK_ON { return None;` |
 | U5 | 474 | `let console = match unsafe { rt::find_console(si_va) } { Some(h) => h, None => {` |
 | U5 | 489 | `if let Some(argv) = unsafe { rt::args_at(si_va) } { let line = argv.split(\|&b\| b == 0).next().unwrap_or(&[])` |
+
+### user/shell/notify
+
+| 类别 | 行 | 形状 |
+|---|---|---|
+| U5 | 20 | `unsafe { core::ptr::read_unaligned(bytes.as_ptr().add(offset) as *const u32) }` |
+| U5 | 25 | `unsafe { core::ptr::read_unaligned(bytes.as_ptr().add(offset) as *const u64) }` |
+| U1 | 38 | `unsafe fn run(si_va: u64) -> u32 {` |
+| U5 | 40 | `let Some(args) = (unsafe { rt::args_at(si_va) }) else { return 2 };` |
+| U5 | 52 | `let Some(self_thread) = (unsafe { rt::find_role(si_va, rt::ROLE_SELF_THREAD) }) else { return 2 };` |
+| U5 | 56 | `unsafe { core::ptr::copy_nonoverlapping(base, header.as_mut_ptr(), RING_HEADER) };` |
+| U5 | 65 | `let producer = unsafe { &*((ring_va + OFF_PRODUCER as u64) as *const AtomicU64) };` |
+| U5 | 66 | `let consumed = unsafe { &*((ring_va + OFF_CONSUMED as u64) as *mut AtomicU64) };` |
+| U5 | 75 | `unsafe { core::ptr::copy_nonoverlapping(base.add(offset), record.as_mut_ptr(), RING_RECORD) };` |
+| U1 | 82 | `unsafe { core::arch::asm!("lea {0}, [rip + {sym}]"` |
+| U5 | 99 | `let code = unsafe { run(si_va) };` |
 
 ### user/shell/registry
 

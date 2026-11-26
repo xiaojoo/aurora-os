@@ -20,6 +20,9 @@ pub(crate) static PROBE_ELF: &[u8] = include_bytes!("../../fixtures/probe.elf");
 /// 只在 `handles` 档嵌入：控制台句柄要经 `grant_console` 授予，默认档没有这条路。
 #[cfg(feature = "handles")]
 pub(crate) static SHELL_ELF: &[u8] = include_bytes!("../../fixtures/shell.elf");
+/// ADR-259 第5片：独立 ring3 通知 broker，与 shell 同包但单独链接产物。
+#[cfg(feature = "block-notify")]
+pub(crate) static NOTIFY_ELF: &[u8] = include_bytes!("../../fixtures/notify.elf");
 /// 第四个用户产物（FS-03 切片 D，ADR-108 决策 8）：第一个在 ring3 打 22/24/25/26 的调用方。
 /// 只在 `fs-open` 档嵌入——没有那一族号，这个容器除了 `-1` 什么都测不到。
 #[cfg(feature = "fs-open")]

@@ -21,3 +21,5 @@ mod gpt;
 mod esp;
 #[cfg(feature = "fs-ro")]
 mod vfs_ro;
+#[cfg(feature = "block-notify")]
+mod block_notify;

@@ -310,6 +310,61 @@ pub fn vmo_read(id: VmoId, offset: usize, dst: &mut [u8]) -> Result<usize, VmoEr
     })
 }
 
+fn with_atomic_u64<R>(
+    id: VmoId,
+    offset: usize,
+    body: impl FnOnce(&core::sync::atomic::AtomicU64) -> R,
+) -> Result<R, VmoError> {
+    #[cfg(not(feature = "fault-vmo-atomic-unaligned"))]
+    if offset % core::mem::align_of::<u64>() != 0 {
+        return Err(VmoError::BadLength);
+    }
+    let end = offset.checked_add(core::mem::size_of::<u64>()).ok_or(VmoError::BadLength)?;
+    mm::with_vmm_lock(|| {
+        let t = tbl();
+        let e = t.items.get(usize::from(id.slot)).ok_or(VmoError::NoSuch)?;
+        if !e.used {
+            return Err(VmoError::NoSuch);
+        }
+        if end > usize::from(e.pages) * PAGE {
+            return Err(VmoError::BadLength);
+        }
+        let page = offset / PAGE;
+        let within = offset % PAGE;
+        if mm::frame_sealed(e.frames[page]) {
+            return Err(VmoError::Sealed);
+        }
+        let pa = e.frames[page] * PAGE as u64 + within as u64 + mm::hhdm();
+        // SAFETY: pa 来自本对象当前持有的帧，refs>0 时不会归还；end 已核界，offset 按 8 对齐；
+        // HHDM 覆盖该物理页，AtomicU64 的布局与对齐由 u64 保证；VMM 锁串行对象生命周期。
+        let atom = unsafe { &*(pa as *const core::sync::atomic::AtomicU64) };
+        Ok(body(atom))
+    })
+}
+
+/// 共享页发布用原子读；调用方给 Acquire/Relaxed 等顺序，不替它吞掉。
+pub fn vmo_atomic_load(
+    id: VmoId,
+    offset: usize,
+    order: core::sync::atomic::Ordering,
+) -> Result<u64, VmoError> {
+    with_atomic_u64(id, offset, |atom| atom.load(order))
+}
+
+/// 共享页发布用原子写；计入字节账，越界/未对齐/封存页明确拒绝。
+pub fn vmo_atomic_store(
+    id: VmoId,
+    offset: usize,
+    value: u64,
+    order: core::sync::atomic::Ordering,
+) -> Result<(), VmoError> {
+    let result = with_atomic_u64(id, offset, |atom| atom.store(value, order));
+    if result.is_ok() {
+        mm::with_vmm_lock(|| tbl().bytes_written += 8);
+    }
+    result
+}
+
 /// 对象有几页（syscall 14 要先知道长度才能发 VA；不存在返回 None）。
 pub fn vmo_pages(id: VmoId) -> Option<usize> {
     mm::with_vmm_lock(|| {

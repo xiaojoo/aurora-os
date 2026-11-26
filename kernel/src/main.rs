@@ -41,6 +41,8 @@ mod irq;
 mod ktests;
 mod memory;
 mod network;
+#[cfg(feature = "block-notify")]
+pub(crate) mod notify_broker;
 mod resource;
 mod sched;
 mod security;
