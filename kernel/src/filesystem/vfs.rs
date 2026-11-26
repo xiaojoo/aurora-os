@@ -525,9 +525,75 @@ impl Block for NvmeDisk {
         // 今天只支持单台，所以槽号恒 0。表化留给「多台 NVMe」那次。
         DiskKey::Nvme(0)
     }
+    fn ensure_readable(&self) -> Result<(), BlockError> {
+        if crate::nvme::async_stats().is_some_and(|s| s.poisoned) {
+            Err(BlockError::Quarantined)
+        } else {
+            Ok(())
+        }
+    }
     /// 真驱动可以合并（ADR-194 补记）：128 扇区留足余量。
     fn max_transfer_sectors(&self) -> u32 {
         128
+    }
+}
+
+#[cfg(feature = "nvme")]
+impl AsyncBlock for NvmeDisk {
+    fn adapter_id(&self) -> AdapterId {
+        // 单台 NVMe 的稳定身份；与 AHCI 0x41…、virtio-blk 0x56… 分隔。
+        AdapterId(0x6100_0000)
+    }
+
+    fn alloc_lease(&self, sectors: u32) -> Result<IoLease, BlockError> {
+        crate::nvme::async_alloc_lease(sectors).map(IoLease).map_err(nvme_block_err)
+    }
+
+    fn copy_in(&self, lease: IoLease, src: &[u8]) -> Result<(), BlockError> {
+        crate::nvme::async_copy_in(lease.0, src).map_err(nvme_block_err)
+    }
+
+    fn copy_out(&self, lease: IoLease, dst: &mut [u8]) -> Result<(), BlockError> {
+        crate::nvme::async_copy_out(lease.0, dst).map_err(nvme_block_err)
+    }
+
+    fn submit(&self, request: IoRequest, lease: IoLease) -> Result<u64, BlockError> {
+        crate::nvme::async_submit(lease.0, request.lba, request.sectors, request.write)
+            .map_err(nvme_block_err)
+    }
+
+    fn reap(&self, out: &mut [IoCompletion]) -> usize {
+        let cap = out.len().min(1);
+        let mut done = [crate::nvme::NvmeIoCompletion { local_id: 0, sectors_done: 0, error: None }; 1];
+        #[cfg(not(feature = "fault-nvme-reap-drop"))]
+        let n = crate::nvme::async_reap(&mut done[..cap]).min(cap);
+        #[cfg(feature = "fault-nvme-reap-drop")]
+        let n = {
+            // 单槽变异：先消费真实完成，再故意不交给调用方，证“回执不能丢”。
+            let _ = crate::nvme::async_reap(&mut done);
+            0
+        };
+        for i in 0..n {
+            out[i] = IoCompletion {
+                local_id: done[i].local_id,
+                sectors_done: done[i].sectors_done,
+                error: done[i].error.map(nvme_block_err),
+            };
+        }
+        n
+    }
+
+    fn cancel(&self, local_id: u64) -> CancelResult {
+        match crate::nvme::async_cancel(local_id) {
+            crate::nvme::NvmeCancel::Cancelled => CancelResult::Cancelled,
+            crate::nvme::NvmeCancel::InFlight => CancelResult::InFlight,
+            crate::nvme::NvmeCancel::NotFound => CancelResult::NotFound,
+            crate::nvme::NvmeCancel::Completed => CancelResult::Completed,
+        }
+    }
+
+    fn release_lease(&self, lease: IoLease) -> Result<(), BlockError> {
+        crate::nvme::async_release(lease.0).map_err(nvme_block_err)
     }
 }
 
@@ -547,6 +613,8 @@ fn nvme_block_err(e: crate::nvme::NvmeError) -> BlockError {
         // 真正该做的是给 `BlockError` 加一个 `NotImplemented`——
         // 那要改块层的公开契约，留给 ADR-169 的下一轮。
         N::IoQueueNotReady => BlockError::NoDevice,
+        N::AsyncBusy => BlockError::NotSettled,
+        N::BadLen { .. } => BlockError::Refused,
     }
 }
 

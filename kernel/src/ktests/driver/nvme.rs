@@ -142,3 +142,353 @@ fn t_nvme_all() -> bool {
 // `ktest!` 的第一个参数是**任意的 static 名**（宏体里是 `#[used] static $name`），
 // 不是预定义常量——照既有写法 `ktest!(KT_PCI, t_pci_config);`。
 ktest!(KT_NVME, t_nvme_all);
+
+#[cfg(feature = "nvme")]
+fn nvme_async_wait(disk: &crate::filesystem::vfs::NvmeDisk) -> Option<crate::filesystem::vfs::IoCompletion> {
+    use crate::filesystem::vfs::AsyncBlock;
+    let mut one = [crate::filesystem::vfs::IoCompletion { local_id: 0, sectors_done: 0, error: None }; 1];
+    for _ in 0..4 {
+        if disk.reap(&mut one) > 0 {
+            return Some(one[0]);
+        }
+        crate::tsc::spin(10_000);
+    }
+    None
+}
+
+#[cfg(feature = "nvme")]
+fn nvme_block_wait(
+    disk: &crate::filesystem::vfs::NvmeDisk,
+    target: crate::filesystem::block_io::TargetId,
+) -> Option<crate::filesystem::block_io::LeaseClaim> {
+    use crate::filesystem::block_io;
+    for _ in 0..200 {
+        if let Some(claim) = block_io::async_take_completion(target) {
+            return Some(claim);
+        }
+        let _ = block_io::async_poll(disk);
+        crate::tsc::spin(10_000);
+    }
+    None
+}
+
+#[cfg(feature = "nvme")]
+fn nvme_fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// ADR-259 第4片：NVMe 单槽只发不等、显式 reap、租约互斥与 poisoned 迟到完成。
+/// 所有阶段自足清理；负样本只让对应判据变红，不在 Reserved 探针里真去覆盖在途 DMA。
+#[cfg(feature = "nvme")]
+fn t_nvme_async() -> bool {
+    use crate::arch::x86_64::smp;
+    use crate::filesystem::block_io::{self, TargetId};
+    use crate::filesystem::vfs::{
+        AsyncBlock, Block, BlockError, CancelResult, IoCompletion, IoRequest, NvmeDisk,
+    };
+
+    if nvme::init().is_err() {
+        crate::log_fatal!("nvme-async: NVMe 认领失败");
+        return false;
+    }
+    let disk = NvmeDisk;
+    let Some(before) = nvme::async_stats() else {
+        crate::log_fatal!("nvme-async: 异步台账不可读");
+        return false;
+    };
+    if before.occupied != 0 || before.poisoned {
+        crate::log_fatal!("nvme-async: 用例不是自足的，起始 occupied={} poisoned={}", before.occupied, before.poisoned);
+        return false;
+    }
+    let mut expected = [0u8; 512];
+    if disk.read_sectors(0, &mut expected).is_err() {
+        crate::log_fatal!("nvme-async: 同步基线读失败");
+        return false;
+    }
+    let adapter = disk.adapter_id();
+    let adapter_ok = adapter.0 == 0x6100_0000
+        && disk.adapter_id() == adapter
+        && adapter != crate::filesystem::vfs::AdapterId(0x4100_0000)
+        && adapter != crate::filesystem::vfs::AdapterId(0x5600_0000);
+
+    // 外层 rank 高于 GROW 时，lock_checked 必须在 CAS 前拒绝，不能留下锁序违规。
+    let (rank_rejected, rank_clean) = {
+        let stats_before = crate::sync::stats();
+        let _outer = smp::CONTENTION_LOCK.lock();
+        let rejected = matches!(disk.alloc_lease(1), Err(BlockError::NotSettled));
+        let stats_after = crate::sync::stats();
+        (
+            rejected,
+            stats_after.order_violations == stats_before.order_violations
+                && stats_after.reentrant_hits == stats_before.reentrant_hits,
+        )
+    };
+
+    // Reserved 也拥有 DMA 数据页；同步读不得穿插。变异档在这里真发一条同步读，
+    // 但此刻没有异步命令在飞，不会覆盖在途 DMA。
+    let Ok(reserved) = disk.alloc_lease(1) else {
+        crate::log_fatal!("nvme-async: 预占失败");
+        return false;
+    };
+    let mut sync_tmp = [0u8; 512];
+    let sync_busy_reserved = matches!(disk.read_sectors(0, &mut sync_tmp), Err(BlockError::NotSettled));
+    let cancel_reserved = disk.cancel(u64::from(reserved.0)) == CancelResult::Cancelled;
+    let cancelled_count = nvme::async_stats().is_some_and(|s| s.cancelled == before.cancelled + 1);
+    let release_after_cancel = disk.release_lease(reserved).is_err();
+    if !(rank_rejected && rank_clean && sync_busy_reserved && cancel_reserved && cancelled_count && release_after_cancel) {
+        crate::log_fatal!(
+            "nvme-async: 前置互斥失败 rank={}/{} reserved={} cancel={}/{} release拒={}",
+            rank_rejected, rank_clean, sync_busy_reserved, cancel_reserved, cancelled_count, release_after_cancel
+        );
+        return false;
+    }
+
+    // 直接适配器：submit 返回时 wait_calls 必须一格不动。
+    let Ok(read_lease) = disk.alloc_lease(1) else {
+        crate::log_fatal!("nvme-async: 读租约分配失败");
+        return false;
+    };
+    let read_id = match disk.submit(IoRequest { lba: 0, sectors: 1, token: 401, write: false }, read_lease) {
+        Ok(id) => id,
+        Err(e) => {
+            crate::log_fatal!("nvme-async: 读提交失败 {:?}", e);
+            let _ = disk.release_lease(read_lease);
+            return false;
+        }
+    };
+    let immediate = nvme::async_stats().is_some_and(|s| s.wait_calls == before.wait_calls);
+    let second_lease = matches!(disk.alloc_lease(1), Err(BlockError::NotSettled));
+    let sync_busy_inflight = {
+        #[cfg(not(feature = "fault-nvme-sync-interleave"))]
+        {
+            matches!(disk.read_sectors(0, &mut sync_tmp), Err(BlockError::NotSettled))
+        }
+        #[cfg(feature = "fault-nvme-sync-interleave")]
+        {
+            // Reserved 格已经证红；这里不真去穿插一条在途 DMA。
+            true
+        }
+    };
+    let cancel_inflight = disk.cancel(read_id) == CancelResult::InFlight;
+    let release_inflight = disk.release_lease(read_lease).is_err();
+    let read_done = nvme_async_wait(&disk);
+    let mut got = [0u8; 512];
+    let read_ok = read_done.as_ref().is_some_and(|c| {
+        c.local_id == read_id && c.sectors_done == 1 && c.error.is_none()
+            && disk.copy_out(read_lease, &mut got) == Ok(())
+    }) && got == expected;
+    let cancel_completed = read_done.as_ref().is_some_and(|c| disk.cancel(c.local_id) == CancelResult::Completed);
+    let released_read = disk.release_lease(read_lease).is_ok();
+    let stale_release = disk.release_lease(read_lease).is_err();
+    if !(immediate && second_lease && sync_busy_inflight && cancel_inflight && release_inflight
+        && read_ok && cancel_completed && released_read && stale_release)
+    {
+        crate::log_fatal!(
+            "nvme-async: 读阶段失败 immediate={} second={} sync={} cancel={} release拒={} read={} completed取消={} release={}/{}",
+            immediate, second_lease, sync_busy_inflight, cancel_inflight, release_inflight,
+            read_ok, cancel_completed, released_read, stale_release
+        );
+        return false;
+    }
+
+    // 经 VFS AsyncBlock 路由到 block_io，证 AdapterId/LeaseClaim 认主与释放闭环。
+    let target = TargetId(adapter.0);
+    let routed = block_io::async_submit(&disk, target, 0, 1, false, 402, None);
+    let mut routed_claim = routed.as_ref().ok().and_then(|_| nvme_block_wait(&disk, target));
+    let mut routed_data = [0u8; 512];
+    let routed_ok = routed.is_ok() && routed_claim.as_ref().is_some_and(|c| {
+        c.token == 402 && c.sectors == 1 && c.sectors_done == 1 && c.error.is_none()
+            && block_io::async_copy_out(&disk, c, &mut routed_data) == Ok(())
+    }) && routed_data == expected;
+    let routed_release = routed_claim.as_mut().is_some_and(|c| block_io::async_release(&disk, c).is_ok());
+    if !(routed_ok && routed_release) {
+        crate::log_fatal!("nvme-async: block_io 路由失败 routed={}/{} release={}", routed.is_ok(), routed_ok, routed_release);
+        return false;
+    }
+
+    // 空输出不消费；短 copy_out 只取前缀，租约仍须显式释放。
+    let Ok(small_lease) = disk.alloc_lease(1) else {
+        crate::log_fatal!("nvme-async: 小缓冲租约分配失败");
+        return false;
+    };
+    let small_id = match disk.submit(IoRequest { lba: 0, sectors: 1, token: 403, write: false }, small_lease) {
+        Ok(id) => id,
+        Err(e) => {
+            crate::log_fatal!("nvme-async: 小缓冲提交失败 {:?}", e);
+            let _ = disk.release_lease(small_lease);
+            return false;
+        }
+    };
+    let Some(empty_before) = nvme::async_stats() else {
+        crate::log_fatal!("nvme-async: 空回收前台账不可读");
+        return false;
+    };
+    let mut empty: [IoCompletion; 0] = [];
+    let empty_reap = disk.reap(&mut empty) == 0;
+    let Some(empty_after) = nvme::async_stats() else {
+        crate::log_fatal!("nvme-async: 空回收后台账不可读");
+        return false;
+    };
+    let empty_untouched = empty_after.completed == empty_before.completed
+        && empty_after.wait_calls == empty_before.wait_calls;
+    let small_done = nvme_async_wait(&disk);
+    let mut small_data = [0u8; 16];
+    let small_ok = small_id > read_id && small_done.as_ref().is_some_and(|c| {
+        c.local_id == small_id && c.sectors_done == 1 && c.error.is_none()
+            && disk.copy_out(small_lease, &mut small_data) == Ok(())
+    }) && small_data == expected[..16];
+    let small_release = disk.release_lease(small_lease).is_ok();
+    if !(empty_reap && empty_untouched && small_ok && small_release) {
+        crate::log_fatal!("nvme-async: 小缓冲失败 empty={}/{} small={} release={}", empty_reap, empty_untouched, small_ok, small_release);
+        return false;
+    }
+
+    // 真写 + 真回读。写盘末尾空闲 LBA，避免碰 FAT32 夹具；宿主机随后按锚点独立读盘。
+    let Some(nsze) = nvme::nsze() else {
+        crate::log_fatal!("nvme-async: 容量不可读");
+        return false;
+    };
+    if nsze <= 16 {
+        crate::log_fatal!("nvme-async: 容量不足，无法选择安全写 LBA");
+        return false;
+    }
+    let write_lba = nsze - 16;
+    let src = [0xA5u8; 512];
+    let write_hash = nvme_fnv1a64(&src);
+    let Ok(write_lease) = disk.alloc_lease(1) else {
+        crate::log_fatal!("nvme-async: 写租约分配失败");
+        return false;
+    };
+    if disk.copy_in(write_lease, &src).is_err() {
+        crate::log_fatal!("nvme-async: copy_in 失败");
+        let _ = disk.release_lease(write_lease);
+        return false;
+    }
+    let write_id = match disk.submit(IoRequest { lba: write_lba, sectors: 1, token: 404, write: true }, write_lease) {
+        Ok(id) => id,
+        Err(e) => {
+            crate::log_fatal!("nvme-async: 写提交失败 {:?}", e);
+            let _ = disk.release_lease(write_lease);
+            return false;
+        }
+    };
+    let write_immediate = nvme::async_stats().is_some_and(|s| s.wait_calls == before.wait_calls);
+    let write_done = nvme_async_wait(&disk);
+    let write_ok = write_done.as_ref().is_some_and(|c| {
+        c.local_id == write_id && c.sectors_done == 1 && c.error.is_none()
+    });
+    let write_release = disk.release_lease(write_lease).is_ok();
+    let Ok(back_lease) = disk.alloc_lease(1) else {
+        crate::log_fatal!(
+            "nvme-async: 回读租约分配失败 write_done={} write_release={} stats={:?}",
+            write_done.is_some(), write_release, nvme::async_stats()
+        );
+        return false;
+    };
+    let back_id = match disk.submit(IoRequest { lba: write_lba, sectors: 1, token: 405, write: false }, back_lease) {
+        Ok(id) => id,
+        Err(e) => {
+            crate::log_fatal!("nvme-async: 回读提交失败 {:?}", e);
+            let _ = disk.release_lease(back_lease);
+            return false;
+        }
+    };
+    let back_done = nvme_async_wait(&disk);
+    let mut back = [0u8; 512];
+    let write_read_ok = back_id > write_id && back_done.as_ref().is_some_and(|c| {
+        c.local_id == back_id && c.sectors_done == 1 && c.error.is_none()
+            && disk.copy_out(back_lease, &mut back) == Ok(())
+    }) && back == src;
+    let back_release = disk.release_lease(back_lease).is_ok();
+    crate::log_info!("nvme-async-write: 写 lba={} 计数=1 哈希={:#018x}", write_lba, write_hash);
+    if !(write_immediate && write_ok && write_release && write_read_ok && back_release) {
+        crate::log_fatal!("nvme-async: 写/回读失败 immediate={} write={}/{} read={}/{}", write_immediate, write_ok, write_release, write_read_ok, back_release);
+        return false;
+    }
+
+    // 设备完成错误必须原样交给 lease，不能伪装成丢失或 poison。
+    let Ok(error_lease) = disk.alloc_lease(1) else {
+        crate::log_fatal!("nvme-async: 错误回执租约分配失败");
+        return false;
+    };
+    let error_id = match disk.submit(IoRequest { lba: nsze, sectors: 1, token: 406, write: false }, error_lease) {
+        Ok(id) => id,
+        Err(e) => {
+            crate::log_fatal!("nvme-async: 错误回执提交失败 {:?}", e);
+            let _ = disk.release_lease(error_lease);
+            return false;
+        }
+    };
+    let error_done = nvme_async_wait(&disk);
+    let completion_error_ok = error_done.as_ref().is_some_and(|c| {
+        c.local_id == error_id && c.sectors_done == 0 && c.error == Some(BlockError::DeviceError)
+    });
+    let error_release = disk.release_lease(error_lease).is_ok();
+    let error_clean = nvme::async_stats().is_some_and(|s| !s.poisoned && s.occupied == 0);
+    if !(completion_error_ok && error_release && error_clean) {
+        crate::log_fatal!("nvme-async: 完成错误未原样带回 error={} release={} clean={}", completion_error_ok, error_release, error_clean);
+        return false;
+    }
+
+    // 模拟超时隔离后，仍允许 reap 真实迟到 CQE；完成后才能释放并解除 poison。
+    let Ok(late_lease) = disk.alloc_lease(1) else {
+        crate::log_fatal!("nvme-async: 迟到完成租约分配失败");
+        return false;
+    };
+    let late_id = match disk.submit(IoRequest { lba: 0, sectors: 1, token: 407, write: false }, late_lease) {
+        Ok(id) => id,
+        Err(e) => {
+            crate::log_fatal!("nvme-async: 迟到完成提交失败 {:?}", e);
+            let _ = disk.release_lease(late_lease);
+            return false;
+        }
+    };
+    let poisoned = nvme::async_quarantine_for_test().is_ok();
+    let poisoned_health = disk.ensure_readable() == Err(BlockError::Quarantined);
+    let late_done = nvme_async_wait(&disk);
+    let mut late_data = [0u8; 512];
+    let late_ok = late_done.as_ref().is_some_and(|c| {
+        c.local_id == late_id && c.sectors_done == 1 && c.error.is_none()
+            && disk.copy_out(late_lease, &mut late_data) == Ok(())
+    }) && late_data == expected;
+    let late_release = disk.release_lease(late_lease).is_ok();
+    let recovered = nvme::async_recover_for_test().is_ok();
+
+    // 同步等待超时也必须关闭新 I/O；注入不真发命令，随后可在 Free 槽上恢复。
+    nvme::async_force_sync_timeout_for_test();
+    let sync_timeout = matches!(disk.read_sectors(0, &mut sync_tmp), Err(BlockError::NotSettled));
+    let sync_quarantined = nvme::async_stats().is_some_and(|s| s.poisoned);
+    let sync_recovered = sync_quarantined && nvme::async_recover_for_test().is_ok();
+    let Some(after) = nvme::async_stats() else {
+        crate::log_fatal!("nvme-async: 收尾台账不可读");
+        return false;
+    };
+    let submitted = after.submitted.saturating_sub(before.submitted);
+    let completed = after.completed.saturating_sub(before.completed);
+    let wait_delta = after.wait_calls.saturating_sub(before.wait_calls);
+    let stats_ok = submitted == 7 && completed == 7 && wait_delta == 0
+        && after.bad_used == before.bad_used && after.occupied == 0 && !after.poisoned;
+    let ok = adapter_ok && poisoned && poisoned_health && late_ok && late_release && recovered
+        && sync_timeout && sync_quarantined && sync_recovered && stats_ok;
+    crate::log_info!(
+        "nvme-async: adapter={:#x} rank={}/{} 立即={} 预约互斥={} 在途互斥={} 第二租约拒={} 取消={}/{}/{} 释放拒={}/{} 读={} 块层={} 空缓冲={} 小缓冲={} 写回读={} 完成错误={} poisoned={} 迟到={} 恢复={} 同步超时隔离={}/{}/{} 计数={}/{}/{} wait={} ⇒ {}",
+        adapter.0, rank_rejected, rank_clean, immediate, sync_busy_reserved, sync_busy_inflight,
+        second_lease, cancel_reserved, cancel_inflight, cancel_completed, release_after_cancel,
+        release_inflight, read_ok, routed_ok, empty_reap && empty_untouched, small_ok,
+        write_read_ok, completion_error_ok, poisoned, late_ok, recovered,
+        sync_timeout, sync_quarantined, sync_recovered,
+        submitted, completed, after.bad_used.saturating_sub(before.bad_used), wait_delta, ok
+    );
+    if !ok {
+        crate::log_fatal!("nvme-async: 单槽异步判据不成立（上面一行是全部读数）");
+    }
+    ok
+}
+
+#[cfg(feature = "nvme")]
+ktest!(KT_NVME_ASYNC, t_nvme_async);

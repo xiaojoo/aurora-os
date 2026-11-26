@@ -529,6 +529,8 @@ NVME_MIB = 64
 # 图案与 VBLK(0x5C) / VBLK2(0x3C) 都不撞：这样「读到的字节是不是 NVMe 那块盘的」
 # 能一眼分辨（判据的读回对账靠它）。
 NVME_PATTERN = 0x7E
+# ADR-259 第4片：异步真写使用独立图案，宿主机按日志 LBA 读回核对。
+NVME_ASYNC_PATTERN = 0xA5
 
 VBLK2_MIB = 96
 VBLK2_PATTERN = 0x3C
@@ -3586,6 +3588,37 @@ def check_nvme_fat(log: str) -> list[str]:
     return bad
 
 
+def check_nvme_async(log: str) -> list[str]:
+    """ADR-259 第4片：客户机异步写落后，宿主机用 qemu-io 读同一 raw 偏移。
+
+    内核的回读仍在客户机内；这一格独立读盘，证“确实落到 NVMe 介质”，
+    同时按日志 LBA 对偏移，避免写错位置也被同内容回读掩盖。
+    """
+    bad: list[str] = []
+    m = re.search(r"nvme-async-write: 写 lba=(\d+) 计数=(\d+) 哈希=(0x[0-9a-fA-F]+)", log)
+    if not m:
+        return ["串口没有 `nvme-async-write: 写 lba=… 计数=… 哈希=…`（异步写用例没跑到结论）"]
+    lba, count, logged_hash = int(m.group(1)), int(m.group(2)), int(m.group(3), 16)
+    if count != 1:
+        return [f"NVMe 异步写计数 {count} != 1（当前 PRP1 单槽契约）"]
+    off = lba * 512
+    if off + count * 512 > NVME_MIB * 1024 * 1024:
+        bad.append(f"NVMe 异步写越出 raw 盘：lba={lba} count={count}")
+        return bad
+    try:
+        got = qemu_io_read(off, count * 512, NVME_IMG, "raw")
+    except Exception as e:  # noqa: BLE001 - 门禁要把读不到本身报成一条问题
+        return [f"宿主机读不到 NVMe raw 盘 lba={lba}：{e}"]
+    want = bytes([NVME_ASYNC_PATTERN]) * (count * 512)
+    diff = sum(1 for a, b in zip(got, want) if a != b)
+    if diff:
+        bad.append(f"NVMe raw 盘 lba={lba} 计数={count}：宿主机读到 {diff} 个字节与异步图案不符")
+    want_hash = fnv1a64(want)
+    if logged_hash != want_hash:
+        bad.append(f"NVMe 异步写哈希不符：内核 {logged_hash:#018x}，宿主机重算 {want_hash:#018x}")
+    return bad
+
+
 def check_fb_pattern(log: str, ppm: tuple[int, int, bytes] | str) -> list[str]:
     """显示域的宿主机侧对账：从 `screendump` 的 PPM 里取样，与内核图案对账。
 
@@ -5296,14 +5329,15 @@ def pattern_byte(lba: int, i: int) -> int:
     return (((i * 7) + lba) & 0xFF) ^ 0x3C
 
 
-def qemu_io_read(off: int, length: int, path: Path = SCRATCH) -> bytes:
-    """用 QEMU 自己的工具读 qcow2 的一段字节（宿主机这一侧的仪器）。
+def qemu_io_read(off: int, length: int, path: Path = SCRATCH, fmt: str = "qcow2") -> bytes:
+    """用 QEMU 自己的工具读一段字节（宿主机这一侧的仪器）。
 
     QEMU 已经退出，所以不存在"客户机还开着文件"的竞态；读到的就是落到盘上的内容。
     输出是 `偏移: 16 个十六进制字节  ASCII` 的 hexdump，只取十六进制那一段。
+    `fmt` 默认保持 qcow2；NVMe 的真卷是 raw，调用方必须显式说明。
     """
     r = subprocess.run(
-        [str(TOOLS / "qemu" / "qemu-io.exe"), "-f", "qcow2", "-c", f"read -v {hex(off)} {length}", str(path)],
+        [str(TOOLS / "qemu" / "qemu-io.exe"), "-f", fmt, "-c", f"read -v {hex(off)} {length}", str(path)],
         capture_output=True, text=True, encoding="utf-8", errors="replace", env=env(),
     )
     out = bytearray()
@@ -9973,13 +10007,14 @@ def do_test(timeout: int) -> int:
         print(f"    注入 {KBD_INJECT_CHAR!r}({_want}) ⇒ 内核收到 {_kb.group(1)}")
 
     # =====================================================================
-    # ADR-172：NVMe 上挂真卷。这一次跑同时给出**两层**证据：
-    #   `t_nvme_all` 三格 = 设备层（认到、容量、能读扇区）
-    #   `t_nvme_fat`     = 文件系统层（能挂、文件内容对）
-    # 两层各自能独立红，所以两行判据来自同一次启动、不合并成一个布尔。
-    print("=== NVMe：设备层三格 + 文件系统层挂载 ===")
+    # ADR-172/259：NVMe 上挂真卷。这一次跑同时给出**三层**证据：
+    #   `t_nvme_all`  三格 = 设备层（认到、容量、能读扇区）
+    #   `t_nvme_fat`       = 文件系统层（能挂、文件内容对）
+    #   `t_nvme_async`     = 单槽真异步 + 宿主机 raw 盘写后对账
+    # 三层各自能独立红，所以判据来自同一次启动、不合并成一个布尔。
+    print("=== NVMe：设备层三格 + 文件系统层挂载 + 单槽真异步 ===")
     nvfv, nvfrc, nvflog = do_run(["nvme"], timeout)
-    nvf_bad = check_nvme_fat(nvflog)
+    nvf_bad = check_nvme_fat(nvflog) + check_nvme_async(nvflog)
     nvf_verdict = nvfv if nvfv != "PASS" else ("PASS" if not nvf_bad else "CONTENT-MISMATCH")
     for x in nvf_bad:
         print("    对账:", x)

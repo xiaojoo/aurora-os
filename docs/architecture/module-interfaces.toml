@@ -703,7 +703,10 @@ public_api = [
   "virtio::async_submit", "virtio::async_reap", "virtio::async_cancel", "virtio::async_release", "virtio::async_stats",
   "virtio::async_quarantine_for_test", "virtio::async_recover_for_test",
   "virtio::net_info", "ahci::State", "ahci::info", "ahci::state", "nvme::NvmeError",
-  "nvme::read_lba", "nvme::write_lba",
+  "nvme::read_lba", "nvme::write_lba", "nvme::NvmeCancel", "nvme::NvmeIoCompletion",
+  "nvme::NvmeAsyncStats", "nvme::async_alloc_lease", "nvme::async_copy_in", "nvme::async_copy_out",
+  "nvme::async_submit", "nvme::async_reap", "nvme::async_cancel", "nvme::async_release", "nvme::async_stats",
+  "nvme::async_quarantine_for_test", "nvme::async_recover_for_test", "nvme::async_force_sync_timeout_for_test",
   "nvme::init", "virtio::probe", "driver::MatchRule", "driver::ProbeOutcome",
   "driver::DriverEntry", "driver::MAX_DRIVERS", "driver::register", "driver::registered", "driver::driver_name",
   "driver::registry_clear", "driver::probe_device", "driver::register_builtin", "driver::matching_rules",
@@ -724,8 +727,8 @@ context = ["KERNEL"]
 error_classes = ["A", "B", "C"]
 resource_ownership = "驱动模块身份、MMIO/DMA 能力句柄表、槽位与 generation、授权与撤销状态、驱动资源统计；kdump 专用 AHCI 口与常驻 DMA 环由 capture 编排独占。"
 error_policy = "Denied/WrongContext/ResourceExhausted/MappingError；越权/世代不匹配 → 拒绝并记事件。"
-unsafe_scope = ["driver/mod:U3,U4", "driver/ahci:U4", "driver/virtio:U4"]
-test_targets = ["t_driver_ctx", "t_ahci_lock_rank_guard", "t_virtio_async", "t_virtio_lock_rank_guard", "t_virtio_quarantine", "t_ahci_async", "t_ahci_async_write", "t_ahci_async_quarantine", "t_ahci_async_poisoned_reap", "t_ahci_async_cross_port_release"]
+unsafe_scope = ["driver/mod:U3,U4", "driver/ahci:U4", "driver/virtio:U4", "driver/nvme:U4"]
+test_targets = ["t_driver_ctx", "t_ahci_lock_rank_guard", "t_virtio_async", "t_virtio_lock_rank_guard", "t_virtio_quarantine", "t_ahci_async", "t_ahci_async_write", "t_ahci_async_quarantine", "t_ahci_async_poisoned_reap", "t_ahci_async_cross_port_release", "t_nvme_async"]
 status = "部分落地"
 
 [modules."pci"]
@@ -843,7 +846,7 @@ forbidden_dependencies = []
 known_violations = []
 context = ["KERNEL", "IRQ_OFF", "ISR_TOP"]
 error_classes = ["A", "B", "D"]
-resource_ownership = "AHCI/virtio-blk 设备路径、块读写请求、FAT32 只读解析与薄 VFS；GPT 只读解析（ADR-078，gpt-probe 档）自成一格，不挂载文件系统、不存分区名单表。"
+resource_ownership = "AHCI/virtio-blk/NVMe 设备路径、块读写请求、FAT32 只读解析与薄 VFS；GPT 只读解析（ADR-078，gpt-probe 档）自成一格，不挂载文件系统、不存分区名单表。"
 error_policy = "BlockError/FsError/GptError 分层；设备超时/离线 → 错误 + 重试/隔离；读失败不许读成 0；GPT 每道闸各一个点名变体，BlockError 原样透传不吞不改名。"
 unsafe_scope = []
 test_targets = ["t_ahci_claim", "t_ahci_disk", "t_ahci_high_lba", "t_ahci_write", "t_ahci_recovery", "t_fat32", "t_fat32_mem", "t_fat32_exec", "t_fat16", "t_gpt", "t_vfs_ro", "t_vfs_ro_fat32", "t_vfs_ro_lfn", "t_vfs_ro_esp", "t_block_io_budget", "t_block_merge_overflow", "t_fs_open_node_lifecycle", "t_fs_open_node_grant_failure", "t_fs_open_node_syscall", "t_block_per_disk_queue", "t_block_context_callback", "t_virtio_probe", "t_virtio_io", "t_virtio_block", "t_virtio_two", "t_net_tx", "t_net_rx"]
@@ -1205,7 +1208,7 @@ known_scc = [
 
 [baseline.ring_edge_sites]
   "time->sync" = 4
-  "driver->sync" = 6
+  "driver->sync" = 7
 "driver->network" = 2
   "network->sync" = 5
   "network->driver" = 9

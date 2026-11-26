@@ -73,6 +73,12 @@ fault-ahci-no-quarantine = []
 fault-ahci-reap-drop = []
 fault-ahci-no-late-reap = []
 fault-ahci-cross-port-clear = []
+# ADR-259 第4片（NVMe 单槽真异步）的五颗变异探针。
+fault-nvme-async-wait = []
+fault-nvme-sync-interleave = []
+fault-nvme-sync-no-quarantine = []
+fault-nvme-reap-drop = []
+fault-nvme-no-late-reap = []
 fault-block-rmw-split = []
 fault-block-rmw-false-bind = []
 # A2 切片（ADR-130）：**产品路径上的外部 ELF 执行取证档**——init 编排在 S4a 之后

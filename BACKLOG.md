@@ -26223,3 +26223,14 @@ PASS，按环境形状记“不归因”，判据不动。
   `run-17294/17295/17296/17297/17292/17293/17299` 分别证红等待/穿插/隔离/丢完成/迟到/跨口清槽；
   部分变异后续状态级联，保留实际 FAIL 名单。真机未验证；NVMe 与用户 broker 尚未接入。
   `driver→sync` 棘轮因 XFER 状态升级 5→6。`check` **21/21**；完整矩阵 **82/82 符合**。
+- 第 4 片 NVMe 单槽：`State.io_lock` 串行同步/异步，复用 `OFF_DATA` 与 SQ/CQ；submit 只发射，
+  reap 显式等 CQE，CmdFailed 原样回执，CmdTimeout/不确定提交置 poison，迟到真实完成仍可回收。
+  同步等待超时同样隔离；Reserved/InFlight/Completed 拒绝同步穿插，ISR/非法外层 rank 取锁前拒绝。
+  `run-17403` **97/97 PASS**，同一 ELF `6c4b9596be86` 的 `run-17401/17402/17403` 为 3/3；
+  计数 `7/7/0`、`wait_calls=0`，写 LBA `131056` 的宿主机 raw 盘 512 字节全为 `0xA5`。
+  宿主机对账仪器自检：原日志绿、伪哈希红、错 LBA 红。`run-17398`（另一 ELF）曾写完成超时，
+  只加诊断后通过，差异不归因，未冒充同 ELF 清除。`driver→sync` 6→7，unsafe 合计 725。
+  最终码态 `run-17492/17493/17494/17495` 分别证红提交内等待/同步穿插/关闭同步超时隔离/丢完成，
+  均仅 `t_nvme_async` FAIL；`run-17496` 关闭迟到 reap 红在 `迟到=false` 并保留后续 NVMe 级联。
+  `check` **21/21**；完整矩阵 **82/82 符合**（`build/nvme-slice4-matrix.log`，退出码 0）。
+  真机未验证；用户 broker 未接入；AOCI MCP 不可用，索引未更新。

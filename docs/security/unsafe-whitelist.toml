@@ -94,7 +94,13 @@ U4 = 6
 U4 = 3
 
 [modules."driver/nvme"]
-U4 = 7
+# ADR-259 第4片：UnsafeCell 的 Sync 保证、init 的启动期单写发布、with_io 的锁内可变访问。
+# 指针来源是自家 static；地址范围为 Option<State>；对齐由 Rust 布局保证；生命周期整个内核；
+# 发布后并发访问由 State.io_lock(RANK_GROW) 串行化；ISR 在取锁前拒绝；不变量由 init/with_io 保证。
+U4 = 4
+# with_io 从已发布 State 取 inner 字段地址再转为可变指针；范围仅 InnerState，布局与对齐由 Rust 保证，
+# 生命周期整个内核；同一 io_lock 是唯一并发访问门，ISR/非法外层 rank 在取锁前拒绝。
+U2 = 1
 [modules."capability/handle"]
 U2 = 10
 # ADR-179：句柄槽数组从 .bss 改为运行时分配（phys_alloc_above + 清零循环 +
@@ -138,11 +144,14 @@ U2 = 10
 # 对账：723+3=726、U4 250+3=253。
 # 2026-11-26 ADR-259：+filesystem/block_io U4 1（with_queue 持 QUEUE_LOCK，闭包不借出队列引用）。
 # 对账：726+1=727、U4 253+1=254。
-total = 727
+# 2026-11-26 ADR-259 第4片：driver/nvme U4 7→4（设备状态访问收口到 with_io 的锁内临界区），
+# with_io 的 inner 字段地址转换登记 U2 1。
+# 对账：727-3+1=725、U4 254-3=251、U2 183+1=184。
+total = 725
 U1 = 105
-U2 = 183
+U2 = 184
 U3 = 13
-U4 = 254
+U4 = 251
 U5 = 128
 U6 = 44
 

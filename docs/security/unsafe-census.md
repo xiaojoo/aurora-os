@@ -5,14 +5,14 @@
 >
 > **2026-11-20（ADR-175 跨 AS 读走物理地址）**：`sched/user` U2 9 → 10（`copy_from_user_in` 里 HHDM 别名的单字节读）。**总数 +1**（530 → 531）。
 
-总计 727 处。U1 105 · U2 183 · U3 13 · U4 254 · U5 128 · U6 44
+总计 725 处。U1 105 · U2 184 · U3 13 · U4 251 · U5 128 · U6 44
 
 | 类别 | 含义 | 处数 |
 |---|---|---|
 | U1 | 架构入口与特殊寄存器 | 105 |
-| U2 | 页表、物理内存与 MMIO | 183 |
+| U2 | 页表、物理内存与 MMIO | 184 |
 | U3 | DMA 与设备共享内存 | 13 |
-| U4 | 并发共享状态与 UnsafeCell | 254 |
+| U4 | 并发共享状态与 UnsafeCell | 251 |
 | U5 | 用户指针与地址空间访问 | 128 |
 | U6 | 诊断路径的有限现场读取 | 44 |
 
@@ -326,13 +326,12 @@ ADR-213：xHCI 的运行期状态（三块 DMA 句柄 + 环游标）进 `.bss`�
 
 | 类别 | 行 | 形状 |
 |---|---|---|
-| U4 | 199 | `unsafe impl Sync for Cell {}  /// 一个队列的提交/完成游标。` |
-| U4 | 252 | `unsafe { (*STATE.0.get()).as_ref().map(\|s\| s.reading) } } ` |
-| U4 | 258 | `unsafe { (*STATE.0.get()).as_ref().map(\|s\| s.nsze) } } ` |
-| U4 | 264 | `unsafe { (*STATE.0.get()).as_ref().map(\|s\| s.lba_bytes) } } ` |
-| U4 | 288 | `if unsafe { (*STATE.0.get()).is_some() } { // 幂等：已经初始化过就直接回读数 return Ok(reading().unwrap_or_else(\|\| unreacha` |
-| U4 | 492 | `unsafe { *STATE.0.get() = Some(st) }; Ok(out) }` |
-| U4 | 696 | `let st = unsafe { (*STATE.0.get()).as_mut() }.ok_or(NvmeError::NoDevice)?; let n = buf.len().min(st.lba_bytes)` |
+| U4 | 207 | `unsafe impl Sync for Cell {}` |
+| U4 | 349 | `let st = unsafe { &*STATE.0.get() }.as_ref().ok_or(NvmeError::NoDevice)?;` |
+| U2 | 350 | `let inner_ptr = &raw const st.inner as *mut InnerState;` |
+| U4 | 354 | `let inner = unsafe { &mut *inner_ptr };` |
+| U4 | 389 | `if unsafe { (*STATE.0.get()).is_some() } {` |
+| U4 | 598 | `unsafe { *STATE.0.get() = Some(device) };` |
 
 ### driver/virtio
 
