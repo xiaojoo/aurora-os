@@ -115,6 +115,14 @@ impl RunningBroker {
     }
 
     pub fn wait(self) -> Result<u32, BrokerError> {
+        self.finish(false)
+    }
+
+    pub fn stop(self) -> Result<u32, BrokerError> {
+        self.finish(true)
+    }
+
+    fn finish(self, kill_first: bool) -> Result<u32, BrokerError> {
         let mut cleanup = Cleanup {
             active: true,
             owner: self.owner,
@@ -132,9 +140,13 @@ impl RunningBroker {
             ring_handle: Some(self.ring_handle),
             endpoint: Some(self.endpoint),
         };
-        let first = crate::arch::x86_64::apic::with_interrupts(|| {
-            crate::sched::wait_for_proc(self.pid, crate::clock::window_cycles(64))
-        });
+        let first = if kill_first {
+            None
+        } else {
+            crate::arch::x86_64::apic::with_interrupts(|| {
+                crate::sched::wait_for_proc(self.pid, crate::clock::window_cycles(64))
+            })
+        };
         if first.is_none() {
             let _ = crate::sched::terminate_task(self.gidx);
             let second = crate::arch::x86_64::apic::with_interrupts(|| {
@@ -149,7 +161,11 @@ impl RunningBroker {
         }
         let _ = handle::revoke_task(self.gidx, self.tid);
         let consumed = vmo::vmo_atomic_load(self.vmo, block_notify::OFF_CONSUMED, Ordering::Acquire)?;
-        block_notify::confirm_acked(self.endpoint, consumed)?;
+        if let Err(error) = block_notify::confirm_acked(self.endpoint, consumed) {
+            if error != block_notify::NotifyError::StaleEndpoint {
+                return Err(error.into());
+            }
+        }
         let info = proc::proc_info(self.pid as usize).ok_or(BrokerError::Dead)?;
         if info.gen != self.proc_gen || !info.terminated {
             return Err(BrokerError::Wait("broker Proc 世代或终止态不符"));

@@ -26244,8 +26244,13 @@ PASS，按环境形状记“不归因”，判据不动。
   均红目标格；`run-17523/17525` 锁秩绕过与用户退出 3 当 fatal 均 EXCEPTION(39)。
   `run-17526` 另有既有 `t_sdkdemo` 红格，不归因于通知变异。同一 ELF `9823dd9596a6` 的
   `run-17559/17623/17624` 为 3/3 PASS。`check` **21/21**，unsafe 合计 741；完整矩阵
-  **90/90 符合**（`build/block-notify-slice5-matrix.log`，退出码 0）。常驻主循环 pump 与产品
-  异步请求者仍未接；真机未验证；AOCI MCP 不可用，索引未更新。
+  **90/90 符合**（`build/block-notify-slice5-matrix.log`，退出码 0）。常驻产品闭环已接
+  `resident-init + block-notify`：mode2 broker 持续消费，主循环 pump/死亡重建/退出 stop；
+  产品 read_checked 请求经 Completion/LeaseClaim 入通知。broker 改用 ROLE_SELF_PROC 有界睡眠。
+  `run-17864` 139/139 后产品读 Ok、ring3 确认 seq=2 并驻留；`run-17866` 关 pump 后无种子读/
+  镜像/确认；`run-17966` shell 收工后 broker stop=Ok(1)（同档既有 sdkdemo 红格不归因于本片）。
+  `check` **21/21**；完整矩阵 **91/91 符合**（`build/notify-product-matrix.log`，退出码 0）。
+  真机未验证；AOCI MCP 不可用，索引未更新。
 - 第 6 片同步等待包装：`Block::as_async()` 默认 None，AHCI/virtio-blk/NVMe 返回自身异步视图；
   `read_checked` 真驱动快路按 RequestId 精确领取完成，复制后释放租约，取消/死线仍在扇区边界，
   分桶计数不变。最多显式 reap 两次，未完成则报 NotSettled 并保留 InFlight/租约给迟到 pump；

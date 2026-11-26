@@ -110,15 +110,13 @@ AsyncBlock 真异步核心与 AHCI/virtio-blk/NVMe 单槽适配、独立 ring3 �
    W5 身份/槽位 + ADR-011 正式方案 + W12 生产钥匙（ADR-080 未决 1）。
 3. **真机（M7）零条已测**——`docs/hardware/bringup.md` 的 **51 条**（H-01…H-51）全是
    「待测/未验证」。没有机型就没有 M7 的通过。
-4. **块设备真异步的产品闭环**——ADR-259 的租约状态机、三驱动单槽异步、ring3 broker 与同步
-   `read_checked` 等待包装已交付；仍开：常驻主循环 pump/产品异步请求者、NVMe 队列深度内多
+4. **块设备真异步的产品闭环**——ADR-259 的租约状态机、三驱动单槽异步、ring3 broker、同步
+   `read_checked` 等待包装与 `resident-init` 常驻 pump 已交付；仍开：NVMe 队列深度内多
    outstanding 与禁用/致命态排空。真机未验证，不能写成“已完成”。
 
 **长链抖动仍有未归因 residual**：具体成因中的日志放大器、XFER 锁序、信箱回收、q2 持袋栈、
 工人抢占与 thread_create 构造窗口已分别归因/修复；剩余同 ELF 可清除的 SMP/PIT/sdkdemo 等
-偶发不能宣称根因关闭。判定表 **91 行**，最近整链 **90/91 符合**；唯一 `FS-03文件ABI`
-是同档既有 `t_sdkdemo` 红格，目标取证为真，同 ELF `run-17859` **169/169 PASS**，记环境形状、不归因。
-q2 同一 ELF `46135e5b…` **100/100 PASS**；
+偶发不能宣称根因关闭。最终判定表 **91/91 符合**；q2 同一 ELF `46135e5b…` **100/100 PASS**；
 A3 同一 ELF `cff867b864f2…` **99/100 PASS**，唯一 `t_ap_released_and_ticking` 偏差经同 ELF
 `run-16895` 单跑 PASS，按环境形状记“不归因”。
 

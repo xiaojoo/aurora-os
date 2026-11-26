@@ -1272,6 +1272,27 @@ fn park_until_init_exits(init: Option<usize>) {
     {
         let Some(first) = init else { return };
         let mut gidx: Option<usize> = Some(first);
+        #[cfg(feature = "block-notify")]
+        let mut notify = {
+            let broker = crate::notify_broker::spawn(2);
+            if let Ok(broker) = broker.as_ref() {
+                crate::log_info!("notify-resident: broker 已起 pid={} gen={}", broker.pid, broker.proc_gen);
+            } else {
+                crate::log_warn!("notify-resident: broker 创建失败");
+            }
+            #[cfg(not(feature = "fault-notify-no-product-pump"))]
+            if let Ok(port) = ahci::boot_port() {
+                let mut sector = [0u8; 512];
+                let read = crate::filesystem::block_io::read_checked(
+                    &crate::filesystem::vfs::AhciDisk { port }, 0, &mut sector,
+                    &crate::filesystem::block_io::Budget::UNBOUNDED,
+                );
+                crate::log_info!("notify-resident: 产品异步读={:?}", read);
+            }
+            broker.ok()
+        };
+        #[cfg(feature = "block-notify")]
+        let mut notify_acked = crate::filesystem::block_notify::stats().acked_seq;
         crate::log_info!(
             "resident-init: 判定已出，等 init（任务={}）收工；没人喂命令就不会退出",
             first
@@ -1333,6 +1354,10 @@ fn park_until_init_exits(init: Option<usize>) {
                         ls.nested,
                         ls.timeouts
                     );
+                    #[cfg(feature = "block-notify")]
+                    if let Some(broker) = notify.take() {
+                        crate::log_info!("notify-resident: broker 停止={:?}", broker.stop());
+                    }
                     crate::log_info!("resident-init: init 已收工 ⇒ 系统停机");
                     return;
                 }
@@ -1361,6 +1386,27 @@ fn park_until_init_exits(init: Option<usize>) {
                         }
                         None => crate::log_warn!("新建: 会话 {} 失败（资源墙）句柄表={}/16", slot, crate::handle::used()),
                     }
+                }
+            }
+            #[cfg(all(feature = "block-notify", not(feature = "fault-notify-no-product-pump")))]
+            if let Some(broker) = notify.as_ref() {
+                match broker.pump() {
+                    Ok(written) if written != 0 => {
+                        crate::log_info!("notify-resident: 镜像 {} 条完成记录", written);
+                    }
+                    Err(error) => {
+                        crate::log_warn!("notify-resident: broker pump 失败 {:?} ⇒ 重建", error);
+                        if let Some(old) = notify.take() {
+                            crate::log_info!("notify-resident: 旧 broker 收工={:?}", old.wait());
+                        }
+                        notify = crate::notify_broker::spawn(2).ok();
+                    }
+                    _ => {}
+                }
+                let acked = crate::filesystem::block_notify::stats().acked_seq;
+                if acked != notify_acked {
+                    crate::log_info!("notify-resident: ring3 已确认 seq={}", acked);
+                    notify_acked = acked;
                 }
             }
             #[cfg(feature = "fbcon-live")]

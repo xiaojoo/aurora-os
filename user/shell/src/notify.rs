@@ -45,11 +45,11 @@ unsafe fn run(si_va: u64) -> u32 {
     let capacity = u32_at(args, 16) as usize;
     let record_bytes = u32_at(args, 20) as usize;
     let mode = u32_at(args, 24);
-    if ring_va == 0 || ring_va % 4096 != 0 || capacity != RING_SLOTS || record_bytes != RING_RECORD || mode > 1 {
+    if ring_va == 0 || ring_va % 4096 != 0 || capacity != RING_SLOTS || record_bytes != RING_RECORD || mode > 2 {
         return 2;
     }
     // SAFETY: 同一 StartupInfo 页，角色表由内核回填且读取期间不解映射。
-    let Some(self_thread) = (unsafe { rt::find_role(si_va, rt::ROLE_SELF_THREAD) }) else { return 2 };
+    let Some(self_proc) = (unsafe { rt::find_role(si_va, rt::ROLE_SELF_PROC) }) else { return 2 };
     let base = ring_va as *const u8;
     let mut header = [0u8; RING_HEADER];
     // SAFETY: ring_va 是内核映射的一页 user+RW，头部 32 字节在页内。
@@ -86,9 +86,13 @@ unsafe fn run(si_va: u64) -> u32 {
                 }
             }
             consumed.store(acked + 1, Ordering::Release);
-            return 0;
+            if mode == 0 {
+                return 0;
+            }
         }
-        let _ = rt::sleep_ms(self_thread, 1);
+        if rt::sleep_ms(self_proc, 1).is_err() {
+            return 5;
+        }
     }
     4
 }
