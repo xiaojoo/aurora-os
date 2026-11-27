@@ -26289,3 +26289,9 @@ PASS，按环境形状记“不归因”，判据不动。
   `run-18562` handles **135/135**、`run-18563` fs-ro **107/107**；`check` **21/21**，unsafe
   741→724（block_io U4 -16、旧测试 U6 -1）；最终独立进程整链 **91/91 符合**
   （`build/callback-remove-matrix.out.log`）。真机未验证；AOCI MCP 不可用，索引未更新。
+- virtio/NVMe 原子 RMW（ADR-254 扩展）：两驱动在各自 `io_lock` 内完成单扇区读、区间修改、写回；
+  virtio 提取 `do_io_locked`、NVMe 提取 `io_lba_locked`，不二次取锁、不退回拆分读写。
+  `run-18667` fs-rw+virtio **178/178**、`run-18669` fs-rw+NVMe **179/179**；`run-18665/18670`
+  注入读后竞争写再写旧副本，分别红两驱动原子格。宿主 `qemu-io` 独立读回整扇区，目标 4B 与
+  508B 邻居全对；日志 LBA+1 的离线负样本两盘均红。`check` **21/21**；新增两条宿主对账行后，
+  最终独立进程整链 **93/93 符合**（`build/rmw-matrix.out.log`）。真机未验证；AOCI MCP 不可用，索引未更新。

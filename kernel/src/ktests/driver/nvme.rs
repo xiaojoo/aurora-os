@@ -525,6 +525,49 @@ fn t_nvme_checked_async_wrap() -> bool {
 #[cfg(feature = "nvme")]
 ktest!(KT_NVME_CHECKED_ASYNC_WRAP, t_nvme_checked_async_wrap);
 
+#[cfg(feature = "fs-rw")]
+fn t_nvme_rmw() -> bool {
+    use crate::filesystem::vfs::{Block, BlockError, NvmeDisk};
+    if nvme::init().is_err() {
+        return false;
+    }
+    let disk = NvmeDisk;
+    let lba = 120_000;
+    let mut initial = [0u8; 512];
+    for (i, b) in initial.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    if nvme::write_lba(lba, &initial).is_err() {
+        return false;
+    }
+    let src = [0xDE, 0xAD, 0xBE, 0xEF];
+    #[cfg(feature = "fault-nvme-rmw-lost-update")]
+    nvme::async_arm_rmw_competitor_for_test();
+    let written = disk.read_modify_write(lba, 256, &src);
+    let mut after = [0u8; 512];
+    let read_ok = disk.read_sectors(lba, &mut after) == Ok(());
+    let mut expected = initial;
+    expected[256..260].copy_from_slice(&src);
+    if cfg!(feature = "fault-nvme-rmw-lost-update") {
+        expected[0] ^= 0x5A;
+    }
+    let atomic = written == Ok(()) && read_ok && after == expected;
+    let empty = disk.read_modify_write(lba, 256, &[]) == Err(BlockError::Refused);
+    let edge = disk.read_modify_write(lba, 512, &[1]) == Err(BlockError::Refused);
+    let overflow = disk.read_modify_write(lba, 510, &[1, 2, 3]) == Err(BlockError::Refused);
+    let ok = atomic && empty && edge && overflow;
+    crate::log_info!(
+        "nvme-rmw: lba={} offset=256 src=deadbeef 原子={} 空={} 边界={} 越界={} ⇒ {}",
+        lba, atomic, empty, edge, overflow, ok
+    );
+    if !ok {
+        crate::log_fatal!("nvme-rmw: 非整扇区原子读改写不成立");
+    }
+    ok
+}
+#[cfg(all(feature = "nvme", feature = "fs-rw"))]
+ktest!(KT_NVME_RMW, t_nvme_rmw);
+
 #[cfg(feature = "nvme")]
 fn t_nvme_submit_ownership() -> bool {
     if nvme::init().is_err() {

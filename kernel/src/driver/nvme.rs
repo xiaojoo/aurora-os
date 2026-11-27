@@ -894,45 +894,79 @@ fn sync_wait_failed(io: &mut AsyncIoState, error: NvmeError) -> NvmeError {
     error
 }
 
-fn io_lba(lba: u64, buf: &mut [u8], write: bool) -> Result<(), NvmeError> {
-    with_io(|st, io| {
-        #[cfg(not(feature = "fault-nvme-sync-interleave"))]
-        if io.poisoned || io.slots.iter().any(|slot| slot.state != AsyncSlotState::Free) {
-            return Err(NvmeError::AsyncBusy);
-        }
-        let csts = rd32(&st.ctx, st.mmio, REG_CSTS)?;
-        if io.force_fatal || csts & CSTS_CFS != 0 {
-            return Err(NvmeError::ControllerFatal { csts });
-        }
-        #[cfg(feature = "fault-nvme-sync-interleave")]
-        let _ = io;
-        if io.force_sync_timeout {
-            io.force_sync_timeout = false;
-            return Err(sync_wait_failed(io, NvmeError::CmdTimeout { cid: 0 }));
-        }
-        let n = buf.len().min(st.lba_bytes);
-        // 先把数据搬进 DMA 数据页（读方向则先清，免得读到上一条的残留）
-        if write {
-            st.ctx.dma_copy_in(st.dma, OFF_DATA, &buf[..n])?;
-        } else {
-            st.ctx.dma_fill(st.dma, OFF_DATA, 0, crate::mm::PAGE)?;
-        }
-        let cid = match submit_io(st, lba, write, OFF_DATA) {
-            Ok(cid) => cid,
-            Err(IssueFailure::BeforeDoorbell(error)) => return Err(error),
-            Err(IssueFailure::AfterDoorbell { cid, error }) => {
-                // 门铃可能已接走命令：先在原调用内排空真实 CQE，超时则隔离，绝不把 OFF_DATA 交给下一条 I/O。
-                let _ = wait_cqe(st, Q::Io, cid);
-                return Err(sync_wait_failed(io, error));
-            }
-        };
-        if let Err(error) = wait_cqe(st, Q::Io, cid) {
+fn io_lba_locked(
+    st: &mut InnerState,
+    io: &mut AsyncIoState,
+    lba: u64,
+    buf: &mut [u8],
+    write: bool,
+) -> Result<(), NvmeError> {
+    #[cfg(not(feature = "fault-nvme-sync-interleave"))]
+    if io.poisoned || io.slots.iter().any(|slot| slot.state != AsyncSlotState::Free) {
+        return Err(NvmeError::AsyncBusy);
+    }
+    let csts = rd32(&st.ctx, st.mmio, REG_CSTS)?;
+    if io.force_fatal || csts & CSTS_CFS != 0 {
+        return Err(NvmeError::ControllerFatal { csts });
+    }
+    #[cfg(feature = "fault-nvme-sync-interleave")]
+    let _ = io;
+    if io.force_sync_timeout {
+        io.force_sync_timeout = false;
+        return Err(sync_wait_failed(io, NvmeError::CmdTimeout { cid: 0 }));
+    }
+    let n = buf.len().min(st.lba_bytes);
+    if write {
+        st.ctx.dma_copy_in(st.dma, OFF_DATA, &buf[..n])?;
+    } else {
+        st.ctx.dma_fill(st.dma, OFF_DATA, 0, crate::mm::PAGE)?;
+    }
+    let cid = match submit_io(st, lba, write, OFF_DATA) {
+        Ok(cid) => cid,
+        Err(IssueFailure::BeforeDoorbell(error)) => return Err(error),
+        Err(IssueFailure::AfterDoorbell { cid, error }) => {
+            let _ = wait_cqe(st, Q::Io, cid);
             return Err(sync_wait_failed(io, error));
         }
-        if !write {
-            st.ctx.dma_copy_out(st.dma, OFF_DATA, &mut buf[..n])?;
+    };
+    if let Err(error) = wait_cqe(st, Q::Io, cid) {
+        return Err(sync_wait_failed(io, error));
+    }
+    if !write {
+        st.ctx.dma_copy_out(st.dma, OFF_DATA, &mut buf[..n])?;
+    }
+    Ok(())
+}
+
+fn io_lba(lba: u64, buf: &mut [u8], write: bool) -> Result<(), NvmeError> {
+    with_io(|st, io| io_lba_locked(st, io, lba, buf, write))?
+}
+
+#[cfg(all(feature = "fs-rw", feature = "fault-nvme-rmw-lost-update"))]
+static RMW_COMPETING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(all(feature = "fs-rw", feature = "fault-nvme-rmw-lost-update"))]
+pub(crate) fn async_arm_rmw_competitor_for_test() {
+    RMW_COMPETING.store(true, core::sync::atomic::Ordering::Release);
+}
+
+#[cfg(feature = "fs-rw")]
+pub fn read_modify_write(lba: u64, offset: usize, src: &[u8]) -> Result<(), NvmeError> {
+    const SECTOR: usize = 512;
+    if src.is_empty() || offset >= SECTOR || src.len() > SECTOR - offset {
+        return Err(NvmeError::BadLen { want: SECTOR - offset.min(SECTOR), got: src.len() });
+    }
+    with_io(|st, io| {
+        let mut data = [0u8; SECTOR];
+        io_lba_locked(st, io, lba, &mut data, false)?;
+        data[offset..offset + src.len()].copy_from_slice(src);
+        #[cfg(feature = "fault-nvme-rmw-lost-update")]
+        if RMW_COMPETING.swap(false, core::sync::atomic::Ordering::AcqRel) {
+            let mut competing = data;
+            competing[0] ^= 0x5A;
+            io_lba_locked(st, io, lba, &mut competing, true)?;
         }
-        Ok(())
+        io_lba_locked(st, io, lba, &mut data, true)
     })?
 }
 

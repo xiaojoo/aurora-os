@@ -549,7 +549,7 @@ VBLK_MIB = 64
 VBLK_PATTERN = 0x5C
 VBLK_FEATURES = {
     "virtio-blk", "virtio-msix-probe", "virtio-two-probe",
-    "fault-virtio-submit-ctx", "fault-virtio-submit-lose-owner",
+    "fault-virtio-submit-ctx", "fault-virtio-submit-lose-owner", "fault-virtio-rmw-lost-update",
 }
 # ADR-112：第二台 virtio-blk。容量**故意不同**（96 MiB vs 64 MiB）——"两台都在"不能只看台数，
 # 每一台自报的容量要与宿主机 `qemu-img info` 各自那份文件对上；图案也不同，环串了会立刻露。
@@ -566,7 +566,7 @@ VBLK2_MIB = 96
 VBLK2_PATTERN = 0x3C
 NVME_FEATURES = {
     "nvme", "fault-nvme-submit-ctx", "fault-nvme-submit-lose-owner", "fault-nvme-drain-drop-completion",
-    "fault-nvme-sync-submit-ctx",
+    "fault-nvme-sync-submit-ctx", "fault-nvme-rmw-lost-update",
 }
 # ADR-210：xHCI 设备。**必须挂在 QEMU 上**，否则 USB 的每一层都只能
 # 证「推导对」，不能证「真的能跑」（AGENTS.md：涉及硬件的结论要有第二台仪器对账）。
@@ -3662,6 +3662,38 @@ def check_nvme_async(log: str) -> list[str]:
     want_hash = fnv1a64(want)
     if logged_hash != want_hash:
         bad.append(f"NVMe 异步写哈希不符：内核 {logged_hash:#018x}，宿主机重算 {want_hash:#018x}")
+    return bad
+
+
+def check_driver_rmw(log: str, kind: str) -> list[str]:
+    """宿主机独立读回 virtio/NVMe 的 RMW 扇区，验证目标区间与所有邻居字节。"""
+    bad: list[str] = []
+    m = re.search(
+        rf"{kind}-rmw: lba=(\d+) offset=(\d+) src=([0-9a-fA-F]+) 原子=(true|false)",
+        log,
+    )
+    if not m:
+        return [f"串口没有 {kind}-rmw 的 lba/offset/src/原子 读数"]
+    lba, offset = int(m.group(1)), int(m.group(2))
+    try:
+        src = bytes.fromhex(m.group(3))
+    except ValueError:
+        return [f"{kind}-rmw src 不是偶数位十六进制：{m.group(3)}"]
+    if m.group(4) != "true":
+        bad.append(f"{kind}-rmw 内核原子格为 false")
+    if not src or offset >= 512 or len(src) > 512 - offset:
+        return bad + [f"{kind}-rmw 区间形状非法：offset={offset} len={len(src)}"]
+    want = bytearray(i % 251 for i in range(512))
+    want[offset:offset + len(src)] = src
+    path, fmt = (VBLK, "qcow2") if kind == "vblk" else (NVME_IMG, "raw")
+    try:
+        got = qemu_io_read(lba * 512, 512, path, fmt)
+    except Exception as e:  # noqa: BLE001 - 读盘失败必须成为对账偏差
+        return bad + [f"宿主机读不到 {kind} RMW lba={lba}：{e}"]
+    if got != bytes(want):
+        diff = sum(1 for a, b in zip(got, want) if a != b)
+        first = next((i for i, (a, b) in enumerate(zip(got, want)) if a != b), None)
+        bad.append(f"{kind} RMW lba={lba} 宿主机读回 {diff} 字节不符，首差={first}")
     return bad
 
 
@@ -10072,6 +10104,23 @@ def do_test(timeout: int) -> int:
     if _nf:
         print(f"    DATA.BIN 大小={_nf.group(1)} 走过={_nf.group(2)} 簇数={_nf.group(3)}")
 
+    # ADR-254 后续：virtio/NVMe 的单扇区原子 RMW，宿主独立读回整扇区对账。
+    print("=== virtio-blk 原子 RMW：内核格 + 宿主整扇区对账 ===")
+    IMAGE.unlink(missing_ok=True)
+    rmwv, rmwvc, rmwvlog = do_run(["fs-rw", "virtio-blk"], timeout)
+    rmwv_bad = ktest_row(rmwvlog, "t_virtio_rmw") + check_driver_rmw(rmwvlog, "vblk")
+    rmwv_verdict = rmwv if rmwv != "PASS" else ("PASS" if not rmwv_bad else "CONTENT-MISMATCH")
+    for x in rmwv_bad:
+        print("    virtio RMW 对账:", x)
+
+    print("=== NVMe 原子 RMW：内核格 + 宿主整扇区对账 ===")
+    IMAGE.unlink(missing_ok=True)
+    rmwn, rmwnc, rmwnlog = do_run(["fs-rw", "nvme"], timeout)
+    rmwn_bad = ktest_row(rmwnlog, "t_nvme_rmw") + check_driver_rmw(rmwnlog, "nvme")
+    rmwn_verdict = rmwn if rmwn != "PASS" else ("PASS" if not rmwn_bad else "CONTENT-MISMATCH")
+    for x in rmwn_bad:
+        print("    NVMe RMW 对账:", x)
+
     # =====================================================================
     # ADR-259 第5片：独立 ring3 broker、共享页确认、死亡/替换重投与 panic 隔离。
     print("=== 用户完成通知 broker：ring3 0/3/0、替换重投与资源收尾 ===")
@@ -11042,6 +11091,8 @@ def do_test(timeout: int) -> int:
         # ADR-172：NVMe 上挂真卷。这一行证的是**文件系统层**，
         # 与 `t_nvme_all` 的设备层三格是不同层的证据（两层各自能独立红）。
         ("NVMe 卷上读出文件与宿主机对账", nvf_verdict, nvfrc, "PASS", 33),
+        ("virtio-blk 原子RMW与宿主对账", rmwv_verdict, rmwvc, "PASS", 33),
+        ("NVMe 原子RMW与宿主对账", rmwn_verdict, rmwnc, "PASS", 33),
         # ADR-259 第5片：四格核内接线 + 独立 ring3 生命周期；负样本各自只咬目标格。
         ("用户通知broker与ring3重投", bn_verdict, bnrc, "PASS", 33),
         ("通知端点世代不校验必须红", bng_verdict, bngrc, "FAIL", 35),
@@ -11189,6 +11240,8 @@ def do_test(timeout: int) -> int:
         "virtio 写落盘与宿主机对账": vvilog,
 "帧缓冲图案与显存对账": fblog,
 "NVMe 卷上读出文件与宿主机对账": nvflog,
+        "virtio-blk 原子RMW与宿主对账": rmwvlog,
+        "NVMe 原子RMW与宿主对账": rmwnlog,
         "用户通知broker与ring3重投": bnlog,
         "通知端点世代不校验必须红": bnglog,
         "覆盖未确认通知必须红": bnolog,

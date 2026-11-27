@@ -396,6 +396,49 @@ fn t_virtio_block() -> bool {
 #[cfg(feature = "virtio-blk")]
 ktest!(KT_VIRTIO_BLOCK, t_virtio_block);
 
+#[cfg(feature = "fs-rw")]
+fn t_virtio_rmw() -> bool {
+    use crate::filesystem::vfs::{Block, BlockError, VirtioDisk};
+    if virtio::bind().is_err() {
+        return false;
+    }
+    let disk = VirtioDisk { index: 0 };
+    let lba = 100_000;
+    let mut initial = [0u8; 512];
+    for (i, b) in initial.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    if virtio::write_block_at(0, lba, &initial).is_err() {
+        return false;
+    }
+    let src = [0xDE, 0xAD, 0xBE, 0xEF];
+    #[cfg(feature = "fault-virtio-rmw-lost-update")]
+    virtio::async_arm_rmw_competitor_for_test();
+    let written = disk.read_modify_write(lba, 256, &src);
+    let mut after = [0u8; 512];
+    let read_ok = disk.read_sectors(lba, &mut after) == Ok(());
+    let mut expected = initial;
+    expected[256..260].copy_from_slice(&src);
+    if cfg!(feature = "fault-virtio-rmw-lost-update") {
+        expected[0] ^= 0x5A;
+    }
+    let atomic = written == Ok(()) && read_ok && after == expected;
+    let empty = disk.read_modify_write(lba, 256, &[]) == Err(BlockError::Refused);
+    let edge = disk.read_modify_write(lba, 512, &[1]) == Err(BlockError::Refused);
+    let overflow = disk.read_modify_write(lba, 510, &[1, 2, 3]) == Err(BlockError::Refused);
+    let ok = atomic && empty && edge && overflow;
+    crate::log_info!(
+        "vblk-rmw: lba={} offset=256 src=deadbeef 原子={} byte0={:x}/{:x} 空={} 边界={} 越界={} ⇒ {}",
+        lba, atomic, after[0], expected[0], empty, edge, overflow, ok
+    );
+    if !ok {
+        crate::log_fatal!("vblk-rmw: 非整扇区原子读改写不成立");
+    }
+    ok
+}
+#[cfg(all(feature = "virtio-blk", feature = "fs-rw"))]
+ktest!(KT_VIRTIO_RMW, t_virtio_rmw);
+
 #[cfg(feature = "virtio-blk")]
 fn t_virtio_async() -> bool {
     use crate::filesystem::block_io::{self, TargetId};

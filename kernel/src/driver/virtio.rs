@@ -833,6 +833,65 @@ fn put_desc(
 
 /// 一条请求：描述符链 [头(可读) → 数据(读=可写/写=可读) → 状态(可写)]，通知，有界等回执。
 /// `buf` 是调用方的那个扇区：读方向在成功后被填，写方向在发射前被填。
+fn do_io_locked(
+    d: &Bound,
+    st: &mut AsyncIoState,
+    sector: u64,
+    write: bool,
+    buf: &mut [u8],
+) -> Result<Xfer, VirtioError> {
+    if st.poisoned {
+        return Err(VirtioError::AsyncBusy);
+    }
+    #[cfg(not(feature = "fault-virtio-sync-interleave"))]
+    if st.slots.iter().any(|s| s.state != AsyncSlotState::Free) {
+        return Err(VirtioError::AsyncBusy);
+    }
+    let c = &d.ctx;
+    let (mmio, dma, qsize) = (d.mmio, d.dma, d.qsize as usize);
+    c.dma_write32(dma, O_REQ, if write { T_OUT } else { T_IN }).map_err(VirtioError::Ctx)?;
+    c.dma_write32(dma, O_REQ + 4, 0).map_err(VirtioError::Ctx)?;
+    c.dma_write32(dma, O_REQ + 8, sector as u32).map_err(VirtioError::Ctx)?;
+    c.dma_write32(dma, O_REQ + 12, (sector >> 32) as u32).map_err(VirtioError::Ctx)?;
+    c.dma_fill(dma, O_STATUS, 0xEE, 1).map_err(VirtioError::Ctx)?;
+    if write {
+        c.dma_copy_in(dma, O_DATA, buf).map_err(VirtioError::Ctx)?;
+    } else {
+        c.dma_fill(dma, O_DATA, 0xEE, SECTOR_BYTES).map_err(VirtioError::Ctx)?;
+    }
+    let flags_mid = DESC_F_NEXT | if write { 0 } else { DESC_F_WRITE };
+    put_desc(c, dma, O_DESC, 0, d.bus + O_REQ as u64, 16, DESC_F_NEXT, 1)?;
+    put_desc(c, dma, O_DESC, 1, d.bus + O_DATA as u64, SECTOR_BYTES as u32, flags_mid, 2)?;
+    put_desc(c, dma, O_DESC, 2, d.bus + O_STATUS as u64, 1, DESC_F_WRITE, 0)?;
+    let avail = c.dma_read16(dma, O_AVAIL + 2).map_err(VirtioError::Ctx)?;
+    let slot = usize::from(avail % qsize as u16) * 2;
+    c.dma_write16(dma, O_AVAIL + 4 + slot, 0).map_err(VirtioError::Ctx)?;
+    c.dma_write16(dma, O_AVAIL + 2, avail.wrapping_add(1)).map_err(VirtioError::Ctx)?;
+    c.write16(mmio, d.notify, 0).map_err(VirtioError::Ctx)?;
+    let seen = st.used_seen as u16;
+    let got = match wait_u16(
+        || c.dma_read16(dma, O_USED + 2),
+        |v| v != seen,
+        2000,
+    ) {
+        Some(v) => v,
+        None => {
+            quarantine_async(st);
+            return Err(VirtioError::UsedTimeout);
+        }
+    };
+    let eslot = usize::from(seen % qsize as u16) * 8;
+    let used_id = c.dma_read32(dma, O_USED + 4 + eslot).map_err(VirtioError::Ctx)?;
+    let used_len = c.dma_read32(dma, O_USED + 4 + eslot + 4).map_err(VirtioError::Ctx)?;
+    let status = c.dma_read8(dma, O_STATUS).map_err(VirtioError::Ctx)?;
+    st.used_seen = u32::from(got);
+    c.dma_copy_out(dma, O_DATA, buf).map_err(VirtioError::Ctx)?;
+    let hash = crate::ahci::fnv1a64(buf);
+    Ok(Xfer { sector, avail_idx: avail, used_idx: got, used_id, used_len, status, hash })
+}
+
+/// 一条请求：描述符链 [头(可读) → 数据(读=可写/写=可读) → 状态(可写)]，通知，有界等回执。
+/// `buf` 是调用方的那个扇区：读方向在成功后被填，写方向在发射前被填。
 fn do_io_at(i: usize, sector: u64, write: bool, buf: &mut [u8]) -> Result<Xfer, VirtioError> {
     if DriverCtx::in_isr() {
         return Err(VirtioError::Ctx(DriverError::WrongContext));
@@ -845,62 +904,7 @@ fn do_io_at(i: usize, sector: u64, write: bool, buf: &mut [u8]) -> Result<Xfer, 
         let mut io = d.io_lock.lock_checked().ok_or(VirtioError::AsyncBusy)?;
         #[cfg(feature = "fault-virtio-lock-rank-bypass")]
         let mut io = d.io_lock.lock();
-        let st = io.get();
-        if st.poisoned {
-            return Err(VirtioError::AsyncBusy);
-        }
-        #[cfg(not(feature = "fault-virtio-sync-interleave"))]
-        if st.slots.iter().any(|s| s.state != AsyncSlotState::Free) {
-            return Err(VirtioError::AsyncBusy);
-        }
-        let c = &d.ctx;
-        let (mmio, dma, qsize) = (d.mmio, d.dma, d.qsize as usize);
-        // 1. 请求头
-        c.dma_write32(dma, O_REQ, if write { T_OUT } else { T_IN }).map_err(VirtioError::Ctx)?;
-        c.dma_write32(dma, O_REQ + 4, 0).map_err(VirtioError::Ctx)?;
-        c.dma_write32(dma, O_REQ + 8, sector as u32).map_err(VirtioError::Ctx)?;
-        c.dma_write32(dma, O_REQ + 12, (sector >> 32) as u32).map_err(VirtioError::Ctx)?;
-        // 2. 状态字节先填哨兵：设备没写与设备写了 0 要分得开（与 AHCI 那条同一原理）
-        c.dma_fill(dma, O_STATUS, 0xEE, 1).map_err(VirtioError::Ctx)?;
-        if write {
-            c.dma_copy_in(dma, O_DATA, buf).map_err(VirtioError::Ctx)?;
-        } else {
-            // 读方向：数据缓冲填哨兵，"没搬"与"搬回一堆 0"分得开
-            c.dma_fill(dma, O_DATA, 0xEE, SECTOR_BYTES).map_err(VirtioError::Ctx)?;
-        }
-        // 3. 三个描述符
-        let flags_mid = DESC_F_NEXT | if write { 0 } else { DESC_F_WRITE };
-        put_desc(c, dma, O_DESC, 0, d.bus + O_REQ as u64, 16, DESC_F_NEXT, 1)?;
-        put_desc(c, dma, O_DESC, 1, d.bus + O_DATA as u64, SECTOR_BYTES as u32, flags_mid, 2)?;
-        put_desc(c, dma, O_DESC, 2, d.bus + O_STATUS as u64, 1, DESC_F_WRITE, 0)?;
-        // 4. 生产者环：把链头 0 挂进去，然后 `idx` +1
-        let avail = c.dma_read16(dma, O_AVAIL + 2).map_err(VirtioError::Ctx)?;
-        let slot = usize::from(avail % qsize as u16) * 2;
-        c.dma_write16(dma, O_AVAIL + 4 + slot, 0).map_err(VirtioError::Ctx)?;
-        c.dma_write16(dma, O_AVAIL + 2, avail.wrapping_add(1)).map_err(VirtioError::Ctx)?;
-        // 5. 敲门。写的是**队列号**（u16），地址按 notify 能力的 multiplier 算出来的那一个
-        c.write16(mmio, d.notify, 0).map_err(VirtioError::Ctx)?;
-        // 6. 有界等 `used.idx` 前进（今天不认领中断，只能轮询）
-        let seen = st.used_seen as u16;
-        let got = match wait_u16(
-            || c.dma_read16(dma, O_USED + 2),
-            |v| v != seen,
-            2000,
-        ) {
-            Some(v) => v,
-            None => {
-                quarantine_async(st);
-                return Err(VirtioError::UsedTimeout);
-            }
-        };
-        let eslot = usize::from(seen % qsize as u16) * 8;
-        let used_id = c.dma_read32(dma, O_USED + 4 + eslot).map_err(VirtioError::Ctx)?;
-        let used_len = c.dma_read32(dma, O_USED + 4 + eslot + 4).map_err(VirtioError::Ctx)?;
-        let status = c.dma_read8(dma, O_STATUS).map_err(VirtioError::Ctx)?;
-        st.used_seen = u32::from(got);
-        c.dma_copy_out(dma, O_DATA, buf).map_err(VirtioError::Ctx)?;
-        let hash = crate::ahci::fnv1a64(buf);
-        Ok(Xfer { sector, avail_idx: avail, used_idx: got, used_id, used_len, status, hash })
+        do_io_locked(d, io.get(), sector, write, buf)
     })
 }
 
@@ -926,6 +930,39 @@ pub fn write_block_at(i: usize, sector: u64, src: &[u8]) -> Result<Xfer, VirtioE
 
 pub fn write_block(sector: u64, src: &[u8]) -> Result<Xfer, VirtioError> {
     write_block_at(0, sector, src)
+}
+
+#[cfg(all(feature = "fs-rw", feature = "fault-virtio-rmw-lost-update"))]
+static RMW_COMPETING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "fs-rw")]
+#[cfg(feature = "fault-virtio-rmw-lost-update")]
+pub(crate) fn async_arm_rmw_competitor_for_test() {
+    RMW_COMPETING.store(true, core::sync::atomic::Ordering::Release);
+}
+
+#[cfg(feature = "fs-rw")]
+pub fn read_modify_write(i: usize, sector: u64, offset: usize, src: &[u8]) -> Result<Xfer, VirtioError> {
+    if src.is_empty() || offset >= SECTOR_BYTES || src.len() > SECTOR_BYTES - offset {
+        return Err(VirtioError::BadLen(src.len()));
+    }
+    b_at(i, |d| {
+        #[cfg(not(feature = "fault-virtio-lock-rank-bypass"))]
+        let mut io = d.io_lock.lock_checked().ok_or(VirtioError::AsyncBusy)?;
+        #[cfg(feature = "fault-virtio-lock-rank-bypass")]
+        let mut io = d.io_lock.lock();
+        let st = io.get();
+        let mut data = [0u8; SECTOR_BYTES];
+        do_io_locked(d, st, sector, false, &mut data)?;
+        data[offset..offset + src.len()].copy_from_slice(src);
+        #[cfg(feature = "fault-virtio-rmw-lost-update")]
+        if RMW_COMPETING.swap(false, core::sync::atomic::Ordering::AcqRel) {
+            let mut competing = data;
+            competing[0] ^= 0x5A;
+            do_io_locked(d, st, sector, true, &mut competing)?;
+        }
+        do_io_locked(d, st, sector, true, &mut data)
+    })
 }
 
 fn async_offsets(slot: usize) -> (usize, usize, usize) {

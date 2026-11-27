@@ -412,6 +412,14 @@ impl Block for VirtioDisk {
         Ok(())
     }
 
+    #[cfg(feature = "fs-rw")]
+    fn read_modify_write(&self, lba: u64, offset: usize, src: &[u8]) -> Result<(), BlockError> {
+        if src.is_empty() || offset >= SECTOR_BYTES || src.len() > SECTOR_BYTES - offset {
+            return Err(BlockError::Refused);
+        }
+        virtio::read_modify_write(self.index as usize, lba, offset, src).map(|_| ()).map_err(virtio_block_err)
+    }
+
     fn disk_key(&self) -> DiskKey {
         DiskKey::Virtio(self.index)
     }
@@ -534,6 +542,14 @@ impl Block for NvmeDisk {
             crate::nvme::write_lba(lba + i as u64, chunk).map_err(nvme_block_err)?;
         }
         Ok(())
+    }
+
+    #[cfg(feature = "fs-rw")]
+    fn read_modify_write(&self, lba: u64, offset: usize, src: &[u8]) -> Result<(), BlockError> {
+        if src.is_empty() || offset >= SECTOR_BYTES || src.len() > SECTOR_BYTES - offset {
+            return Err(BlockError::Refused);
+        }
+        crate::nvme::read_modify_write(lba, offset, src).map_err(nvme_block_err)
     }
 
     fn disk_key(&self) -> DiskKey {
