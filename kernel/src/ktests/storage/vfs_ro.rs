@@ -1482,6 +1482,10 @@ impl crate::filesystem::vfs::AsyncBlock for FakeAsyncDisk {
             Ok(())
         }
     }
+
+    fn max_transfer_sectors(&self) -> u32 {
+        4
+    }
 }
 
 impl crate::filesystem::vfs::Block for FakeAsyncDisk {

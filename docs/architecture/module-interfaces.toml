@@ -702,7 +702,7 @@ public_api = [
   "ahci::async_quarantine_for_test", "ahci::async_recover_for_test",
   "virtio::VirtioError", "virtio::read_block", "virtio::write_block", "virtio::read_block_at",
   "virtio::write_block_at", "virtio::read_modify_write", "virtio::bind_net", "virtio::send_raw", "virtio::receive",
-  "virtio::ASYNC_SLOTS", "virtio::VirtioCancel", "virtio::VirtioIoCompletion",
+  "virtio::ASYNC_SLOTS", "virtio::ASYNC_MAX_SECTORS", "virtio::VirtioCancel", "virtio::VirtioIoCompletion",
   "virtio::async_alloc_lease", "virtio::async_copy_in", "virtio::async_copy_out",
   "virtio::async_submit", "virtio::async_reap", "virtio::async_cancel", "virtio::async_release", "virtio::async_stats",
   "virtio::async_quarantine_for_test", "virtio::async_recover_for_test",

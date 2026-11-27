@@ -413,6 +413,7 @@ const SECTOR_BYTES: usize = 512;
 /// 一段连续 DMA 内存当整条队列的三段环 + 请求头 + 数据 + 状态。
 /// 布局是手工定的（不靠"接着排"）：偏移要能写进判据里，也要能被宿主机那边按同一张表重算。
 const DMA_PAGES: usize = 8;
+const BLK_DMA_PAGES: usize = 16;
 const O_DESC: usize = 0x0000; // 256 × 16 B
 const O_AVAIL: usize = 0x1000; // flags + idx + 256 × u16
 const O_USED: usize = 0x2000; // flags + idx + 256 × {u32,u32}
@@ -421,11 +422,13 @@ const O_REQ: usize = 0x3400; // 16 B 请求头
 const O_STATUS: usize = 0x3410; // 1 B 状态
 
 pub const ASYNC_SLOTS: usize = 8;
+pub const ASYNC_MAX_SECTORS: u32 = 8;
 const ASYNC_BASE: usize = 0x4000;
-const ASYNC_STRIDE: usize = 0x400;
+const ASYNC_STRIDE: usize = 0x1200;
 const ASYNC_DATA: usize = 0;
-const ASYNC_REQ: usize = 0x200;
-const ASYNC_STATUS: usize = 0x3F0;
+const ASYNC_REQ: usize = 0x1000;
+const ASYNC_STATUS: usize = 0x1010;
+const _: () = assert!(ASYNC_BASE + ASYNC_SLOTS * ASYNC_STRIDE <= BLK_DMA_PAGES * 4096);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AsyncSlotState {
@@ -440,6 +443,7 @@ struct AsyncSlot {
     state: AsyncSlotState,
     local_id: u64,
     sector: u64,
+    sectors: u32,
     write: bool,
     submit_error: Option<VirtioError>,
 }
@@ -449,6 +453,7 @@ impl AsyncSlot {
         state: AsyncSlotState::Free,
         local_id: 0,
         sector: 0,
+        sectors: 0,
         write: false,
         submit_error: None,
     };
@@ -511,6 +516,24 @@ pub fn async_recover_for_test(i: usize) -> Result<(), VirtioError> {
     b_at(i, |d| {
         let mut io = d.io_lock.lock_checked().ok_or(VirtioError::AsyncBusy)?;
         io.get().poisoned = false;
+        Ok(())
+    })
+}
+
+pub fn rebind_for_test(i: usize) -> Result<(), VirtioError> {
+    if DriverCtx::in_isr() {
+        return Err(VirtioError::Ctx(DriverError::WrongContext));
+    }
+    b_at(i, |d| {
+        let mut io = d.io_lock.lock_checked().ok_or(VirtioError::AsyncBusy)?;
+        handshake(&d.ctx, d.mmio, d.cc)?;
+        let (qsize, _, enable, _) = setup_vq(&d.ctx, d.mmio, d.cc, d.dma, d.bus, 0, O_DESC, O_AVAIL, O_USED)?;
+        if qsize != d.qsize || enable != 1 {
+            return Err(VirtioError::DeviceRefused(u32::from(qsize) | (u32::from(enable) << 16)));
+        }
+        d.ctx.write8(d.mmio, d.cc + CC_STATUS, ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK)
+            .map_err(VirtioError::Ctx)?;
+        *io.get() = AsyncIoState::new();
         Ok(())
     })
 }
@@ -709,7 +732,7 @@ fn bind_one(dev: Dev, slot: usize) -> Result<(), VirtioError> {
     let ctx = DriverCtx::for_device(MOD_VIRTIO, dev);
     let mmio = ctx.map_mmio(common.bar).map_err(VirtioError::Ctx)?;
     let cc = common.offset as usize;
-    let dma = ctx.alloc_dma(DMA_PAGES * crate::mm::PAGE).map_err(VirtioError::Ctx)?;
+    let dma = ctx.alloc_dma(BLK_DMA_PAGES * crate::mm::PAGE).map_err(VirtioError::Ctx)?;
     let bus = ctx.bus_addr(dma).map_err(VirtioError::Ctx)?;
 
     handshake(&ctx, mmio, cc)?;
@@ -970,7 +993,10 @@ fn async_offsets(slot: usize) -> (usize, usize, usize) {
     (base + ASYNC_DATA, base + ASYNC_REQ, base + ASYNC_STATUS)
 }
 
-pub fn async_alloc_lease(i: usize) -> Result<u32, VirtioError> {
+pub fn async_alloc_lease(i: usize, sectors: u32) -> Result<u32, VirtioError> {
+    if sectors == 0 || sectors > ASYNC_MAX_SECTORS {
+        return Err(VirtioError::BadLen(sectors as usize * SECTOR_BYTES));
+    }
     if DriverCtx::in_isr() {
         return Err(VirtioError::Ctx(DriverError::WrongContext));
     }
@@ -986,6 +1012,7 @@ pub fn async_alloc_lease(i: usize) -> Result<u32, VirtioError> {
         let slot = st.slots.iter().position(|s| s.state == AsyncSlotState::Free)
             .ok_or(VirtioError::Ctx(DriverError::ResourceExhausted))?;
         st.slots[slot].state = AsyncSlotState::Reserved;
+        st.slots[slot].sectors = sectors;
         Ok(slot as u32)
     })
 }
@@ -995,13 +1022,16 @@ pub fn async_copy_in(i: usize, slot: u32, src: &[u8]) -> Result<(), VirtioError>
         return Err(VirtioError::Ctx(DriverError::WrongContext));
     }
     let slot = slot as usize;
-    if slot >= ASYNC_SLOTS || src.len() != SECTOR_BYTES {
+    if slot >= ASYNC_SLOTS {
         return Err(VirtioError::BadLen(src.len()));
     }
     b_at(i, |d| {
         let mut io = d.io_lock.lock_checked().ok_or(VirtioError::AsyncBusy)?;
-        if io.get().slots[slot].state != AsyncSlotState::Reserved {
-            return Err(VirtioError::AsyncBusy);
+        let st = io.get();
+        if st.slots[slot].state != AsyncSlotState::Reserved
+            || src.len() != st.slots[slot].sectors as usize * SECTOR_BYTES
+        {
+            return Err(VirtioError::BadLen(src.len()));
         }
         let (data, _, _) = async_offsets(slot);
         d.ctx.dma_copy_in(d.dma, data, src).map_err(VirtioError::Ctx)
@@ -1013,13 +1043,16 @@ pub fn async_copy_out(i: usize, slot: u32, dst: &mut [u8]) -> Result<(), VirtioE
         return Err(VirtioError::Ctx(DriverError::WrongContext));
     }
     let slot = slot as usize;
-    if slot >= ASYNC_SLOTS || dst.len() != SECTOR_BYTES {
+    if slot >= ASYNC_SLOTS {
         return Err(VirtioError::BadLen(dst.len()));
     }
     b_at(i, |d| {
         let mut io = d.io_lock.lock_checked().ok_or(VirtioError::AsyncBusy)?;
-        if io.get().slots[slot].state != AsyncSlotState::Completed {
-            return Err(VirtioError::AsyncBusy);
+        let st = io.get();
+        if st.slots[slot].state != AsyncSlotState::Completed
+            || dst.len() != st.slots[slot].sectors as usize * SECTOR_BYTES
+        {
+            return Err(VirtioError::BadLen(dst.len()));
         }
         let (data, _, _) = async_offsets(slot);
         d.ctx.dma_copy_out(d.dma, data, dst).map_err(VirtioError::Ctx)
@@ -1034,7 +1067,7 @@ pub(crate) fn async_arm_submit_ctx_for_test() {
     SUBMIT_CTX.store(true, core::sync::atomic::Ordering::Release);
 }
 
-pub fn async_submit(i: usize, slot: u32, sector: u64, write: bool) -> Result<u64, VirtioError> {
+pub fn async_submit(i: usize, slot: u32, sector: u64, sectors: u32, write: bool) -> Result<u64, VirtioError> {
     if DriverCtx::in_isr() {
         return Err(VirtioError::Ctx(DriverError::WrongContext));
     }
@@ -1048,10 +1081,18 @@ pub fn async_submit(i: usize, slot: u32, sector: u64, write: bool) -> Result<u64
         if st.poisoned {
             return Err(VirtioError::AsyncBusy);
         }
-        if st.slots[slot].state != AsyncSlotState::Reserved {
+        if st.slots[slot].state != AsyncSlotState::Reserved
+            || sectors == 0
+            || sectors > ASYNC_MAX_SECTORS
+            || sectors != st.slots[slot].sectors
+        {
             return Err(VirtioError::AsyncBusy);
         }
         let c = &d.ctx;
+        #[cfg(not(feature = "fault-virtio-async-short-desc"))]
+        let bytes = sectors as usize * SECTOR_BYTES;
+        #[cfg(feature = "fault-virtio-async-short-desc")]
+        let bytes = SECTOR_BYTES;
         let (data, req, status) = async_offsets(slot);
         c.dma_write32(d.dma, req, if write { T_OUT } else { T_IN }).map_err(VirtioError::Ctx)?;
         c.dma_write32(d.dma, req + 4, 0).map_err(VirtioError::Ctx)?;
@@ -1059,12 +1100,12 @@ pub fn async_submit(i: usize, slot: u32, sector: u64, write: bool) -> Result<u64
         c.dma_write32(d.dma, req + 12, (sector >> 32) as u32).map_err(VirtioError::Ctx)?;
         c.dma_fill(d.dma, status, 0xEE, 1).map_err(VirtioError::Ctx)?;
         if !write {
-            c.dma_fill(d.dma, data, 0xEE, SECTOR_BYTES).map_err(VirtioError::Ctx)?;
+            c.dma_fill(d.dma, data, 0xEE, bytes).map_err(VirtioError::Ctx)?;
         }
         let head = (slot * 3) as u16;
         let flags_mid = DESC_F_NEXT | if write { 0 } else { DESC_F_WRITE };
         put_desc(c, d.dma, O_DESC, slot * 3, d.bus + req as u64, 16, DESC_F_NEXT, head + 1)?;
-        put_desc(c, d.dma, O_DESC, slot * 3 + 1, d.bus + data as u64, SECTOR_BYTES as u32, flags_mid, head + 2)?;
+        put_desc(c, d.dma, O_DESC, slot * 3 + 1, d.bus + data as u64, bytes as u32, flags_mid, head + 2)?;
         put_desc(c, d.dma, O_DESC, slot * 3 + 2, d.bus + status as u64, 1, DESC_F_WRITE, 0)?;
         let avail = c.dma_read16(d.dma, O_AVAIL + 2).map_err(VirtioError::Ctx)?;
         let ring = usize::from(avail % d.qsize) * 2;
@@ -1077,10 +1118,13 @@ pub fn async_submit(i: usize, slot: u32, sector: u64, write: bool) -> Result<u64
         st.slots[slot].state = AsyncSlotState::InFlight;
         st.slots[slot].local_id = local_id;
         st.slots[slot].sector = sector;
+        st.slots[slot].sectors = sectors;
         st.slots[slot].write = write;
         st.slots[slot].submit_error = None;
         let mut pending_error = c.dma_write16(d.dma, O_AVAIL + 2, avail.wrapping_add(1))
             .map_err(VirtioError::Ctx).err();
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        let _ = c.read16(d.mmio, 0);
         if let Err(error) = c.write16(d.mmio, d.notify, 0) {
             if pending_error.is_none() {
                 pending_error = Some(VirtioError::Ctx(error));
@@ -1141,7 +1185,7 @@ pub fn async_reap(i: usize, out: &mut [VirtioIoCompletion]) -> usize {
             let (_, _, status_off) = async_offsets(slot);
             let status = c.dma_read8(d.dma, status_off).map_err(VirtioError::Ctx)?;
             st.used_seen = st.used_seen.wrapping_add(1);
-            let want_len = if st.slots[slot].write { 1 } else { SECTOR_BYTES as u32 + 1 };
+            let want_len = if st.slots[slot].write { 1 } else { st.slots[slot].sectors * SECTOR_BYTES as u32 + 1 };
             let device_ok = status == S_OK && used_len == want_len;
             let device_error = if device_ok {
                 None
@@ -1152,7 +1196,7 @@ pub fn async_reap(i: usize, out: &mut [VirtioIoCompletion]) -> usize {
             let error = st.slots[slot].submit_error.or(device_error);
             out[n] = VirtioIoCompletion {
                 local_id: st.slots[slot].local_id,
-                sectors_done: if device_ok { 1 } else { 0 },
+                sectors_done: if device_ok { st.slots[slot].sectors } else { 0 },
                 error,
             };
             st.slots[slot].state = AsyncSlotState::Completed;

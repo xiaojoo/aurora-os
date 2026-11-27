@@ -261,7 +261,9 @@ fn wait_async_segment(
             }
             #[cfg(feature = "fault-block-wrap-no-bound")]
             let _ = polls;
-            core::hint::spin_loop();
+            for _ in 0..64 {
+                core::hint::spin_loop();
+            }
             continue;
         };
         let landed = claim.sectors_done.min(sectors);
@@ -294,7 +296,7 @@ fn read_at_async(disk: &dyn Block, async_disk: &dyn AsyncBlock, lba: u64, dst: &
     }
     let n = (dst.len() / SECTOR_BYTES) as u32;
     let bounded = budget.deadline != u64::MAX;
-    let dev_cap = disk.max_transfer_sectors().max(1).min(128);
+    let dev_cap = async_disk.max_transfer_sectors().max(1).min(128);
     let cap = if !bounded && !budget.has_cancel() { dev_cap } else { 1 };
     let target = TargetId(async_disk.adapter_id().0);
     let mut done = 0u32;

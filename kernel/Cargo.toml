@@ -71,6 +71,7 @@ fault-virtio-no-quarantine = []
 fault-virtio-submit-ctx = []
 fault-virtio-submit-lose-owner = ["fault-virtio-submit-ctx"]
 fault-virtio-rmw-lost-update = []
+fault-virtio-async-short-desc = []
 # ADR-259 第3片（AHCI 单槽真异步）的四颗变异探针。
 fault-ahci-async-wait = []
 fault-ahci-sync-interleave = []

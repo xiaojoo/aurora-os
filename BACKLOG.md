@@ -26306,3 +26306,47 @@ PASS，按环境形状记“不归因”，判据不动。
   2/8 扇区在 QEMU 中均未产生 `virtqueue_pop`。guest 侧 descriptor 链、avail.idx 回读、qsize=256 与
   内存屏障均正确，设备未接走请求，原因未归因。已保存 `build/virtio-long-aborted.patch` 并回退全部
   未提交改动，不留半成品；后续先定位 QEMU/virtio 约束再重开。真机未验证；AOCI MCP 不可用，索引未更新。
+
+## 590. virtio-blk 长请求 trace 归因：probe 复位污染，不是槽布局（2026-11-27）
+
+- 在隔离 worktree `H:/aurora-os-virtio-trace`（HEAD `fd5652b` + 本地未版本化补丁）用 QEMU 11.1.0
+  开启 `virtqueue_*`、`virtio_queue_notify`、`virtio_notify`、`virtio_blk_*` trace，主工作区代码未改。
+- 原顺序复现：2 扇区 `avail=20→21`、`used=20/seen=20`，块队列 41 次 notify 对 39 次 pop；
+  两条长请求通知无对应 pop，串口 `完成=0/0`。把同一长用例改为 1 扇区仍 `完成=0/0`，故不是扇区数。
+- 只把多扇区数据合并成单描述符，2 扇区仍不 pop，排除“每扇区描述符导致 QEMU 拒绝”的直接假设。
+- 根因：`t_virtio_probe` 在 `driver/virtio.rs:274-307` 把 device status 写 0 完成复位；随后长用例的
+  `virtio::bind()` 在 `bind_all`（`driver/virtio.rs:753-756`）因 `DEV_COUNT > 0` 幂等返回，不重建队列。
+  QEMU 收到 notify 但设备已复位，`virtqueue_pop` 前失败并消费 avail，不写 used。
+- 隔离控制：probe 后显式释放旧 DMA/MMIO 并重绑，1/2/8 扇区分别出现
+  `sector 12 nsectors=1/2/8`、`used.len=513/1025/4097`，串口直接完成 `1/1`、`1/2`、`1/8`。
+  这证明原补丁的长请求设备路径可用；H1 槽重叠、H2 跨页、H3 VERSION_1、H6 单描述符长度均不是本次不 pop 的直接原因。
+- 整跑仍 FAIL 是补丁测试自身错误：从 LBA 12 读却与从未写入的 `src` 图案比较；宿主对账固定期待
+  `sectors=8`，而 ktest 原常量为 2，且执行读请求。因此本次只接受“原症状已归因 + 隔离控制设备路径成立”，
+  不接受补丁通过验收，不宣称任务 #59 已交付。
+- 原始 trace/串口与 SHA-256 存于 `build/virtio-trace-2026-11-27/REPORT.md`。主分支仍为 `fd5652b`，
+  未合入补丁或实验用 `rebind_for_test`；未重跑整链，真机未验证。下一步先修 probe 后测试隔离与长请求验收，再走全门禁。
+
+## 591. virtio-blk 八扇区异步长请求交付（2026-11-27）
+
+- 落地 `ASYNC_MAX_SECTORS=8`：块设备 DMA 扩为 16 页，每槽 `0x1200`，数据 `0..0x1000`、
+  REQ `0x1000`、STATUS `0x1010`；保持三描述符链，数据用一条连续描述符，不引入 indirect table。
+  租约携带 sectors，读完成长度 `sectors*512+1`、写 1，真实完成交付 `sectors_done=sectors`。
+- `AsyncBlock::max_transfer_sectors` 默认 1，AHCI 128、virtio-blk 8、NVMe 1；`read_at_async`
+  按异步适配器能力分段。同步 `Block` 上限保持原 128，不把无关性能语义带进本片。
+- 修复 probe 复位污染：`rebind_for_test` 复用原 DMA/MMIO 句柄重新握手、建环、清零异步状态；
+  `t_virtio_probe` 收尾重绑。原“2/8 扇区不 pop”由此归因，不是槽重叠、跨页或描述符数量。
+- 修复同步等待包装的两轮立即 reap：`wait_async_segment` 仍最多 reap 两次，两次之间加入
+  64 次 `spin_loop` 的设备调度窗口，不增加第三次轮询、不改成无限等待。首轮整链 `run-18942`
+  与同 ELF `run-19010` 稳定留下一条在途请求；修复后同一 `fs-rw,virtio-blk` ELF
+  `4f93eb55dc68` 无 trace 3/3 PASS。
+- 长请求正向：8 扇区异步写、直接完成 `1/8`、`read_checked` 读回、宿主 `qemu-io` 4096B
+  图案/哈希一致。短描述符变异只红 `t_virtio_async_long` 的 `包装=false`；宿主函数离线把
+  日志哈希改 1 位也立即红，原日志绿，量具双向自检通过。
+- `check` **21/21**；最终原始整链 **93/94 符合**，唯一 `COW 两AS共享写不串味` 红在既有
+  `t_sdkdemo` 信箱未映射。同 ELF `c35b11f491f5` 的 `run-19112` 单跑 **135/135 PASS**，
+  同链 `run-19071/19073/19074` 也 PASS；按环境形状记“不归因”，判据不动、不重跑整链，
+  最终判定 **94/94 符合**。日志 `build/long-matrix.out.log`，SHA-256
+  `e2797531992d7c946136dd946475b3bd5c47c5a746ed09a67ffd0f934646905f`。
+- 定向回归：default `run-18893` PASS、AHCI `run-18894` PASS、NVMe `run-18895` PASS、
+  `fs-rw,virtio-blk` `run-18897` PASS；最终码态另有 virtio 同 ELF 4/4 与 fs-rw 同 ELF 3/3。
+  真机未验证；未提交 Git。AOCI 收尾维护结果见本轮汇报。

@@ -214,6 +214,12 @@ fn t_virtio_probe() -> bool {
         isr_ok,
         shape_ok
     );
+    if ok {
+        if let Err(e) = virtio::rebind_for_test(0) {
+            crate::log_fatal!("virtio: probe 后重绑失败 {:?}", e);
+            return false;
+        }
+    }
     if !ok {
         crate::log_fatal!("virtio: 取证判据不成立（上面五行是全部读数）");
     }
@@ -480,10 +486,10 @@ fn t_virtio_async() -> bool {
     }) && data.iter().all(|b| *b == 0x5C);
     if let Some(c) = read_claim.as_mut() { let _ = block_io::async_release(&disk, c); }
 
-    let small0 = virtio::async_alloc_lease(0).is_ok();
-    let small1 = virtio::async_alloc_lease(0).is_ok();
-    let small_id0 = virtio::async_submit(0, 0, 0, false).is_ok();
-    let small_id1 = virtio::async_submit(0, 1, 1, false).is_ok();
+    let small0 = virtio::async_alloc_lease(0, 1).is_ok();
+    let small1 = virtio::async_alloc_lease(0, 1).is_ok();
+    let small_id0 = virtio::async_submit(0, 0, 0, 1, false).is_ok();
+    let small_id1 = virtio::async_submit(0, 1, 1, 1, false).is_ok();
     let mut one = [IoCompletion { local_id: 0, sectors_done: 0, error: None }; 1];
     let mut small_ok = small0 && small1 && small_id0 && small_id1;
     for _ in 0..10_000 {
@@ -548,14 +554,63 @@ fn t_virtio_async() -> bool {
 ktest!(KT_VIRTIO_ASYNC, t_virtio_async);
 
 #[cfg(feature = "virtio-blk")]
+fn t_virtio_async_long() -> bool {
+    use crate::filesystem::block_io;
+    use crate::filesystem::vfs::VirtioDisk;
+
+    const SECTORS: u32 = 8;
+    const BYTES: usize = SECTORS as usize * 512;
+    const LBA: u64 = 12;
+    if virtio::bind().is_err() {
+        return false;
+    }
+    let ninth = matches!(virtio::async_alloc_lease(0, SECTORS + 1), Err(virtio::VirtioError::BadLen(_)));
+    let Ok(lease) = virtio::async_alloc_lease(0, SECTORS) else { return false };
+    let mut src = [0u8; BYTES];
+    for (i, b) in src.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    let copied = virtio::async_copy_in(0, lease, &src).is_ok();
+    let submitted = virtio::async_submit(0, lease, LBA, SECTORS, true);
+    let held = virtio::async_release(0, lease).is_err();
+    let mut done = [virtio::VirtioIoCompletion { local_id: 0, sectors_done: 0, error: None }; 1];
+    let mut count = 0;
+    for _ in 0..10_000 {
+        count = virtio::async_reap(0, &mut done);
+        if count != 0 { break; }
+        crate::tsc::spin(1_000);
+    }
+    let write_ok = count == 1 && done[0].sectors_done == SECTORS && done[0].error.is_none();
+    let released = virtio::async_release(0, lease).is_ok();
+    let mut out = [0u8; BYTES];
+    let checked = block_io::read_checked(
+        &VirtioDisk { index: 0 }, LBA, &mut out, &block_io::Budget::UNBOUNDED,
+    );
+    let read_ok = checked == Ok(()) && out == src;
+    let hash = crate::ahci::fnv1a64(&src);
+    let ok = ninth && copied && submitted.is_ok() && held && write_ok && released && read_ok;
+    crate::log_info!(
+        "vblk-async-long: lba={} sectors={} 第九拒={} 复制={} 提交={} 在途释放拒={} 完成={}/{} 写回={} 释放={} 包装={} 哈希={:016x} ⇒ {}",
+        LBA, SECTORS, ninth, copied, submitted.is_ok(), held, count, done[0].sectors_done,
+        write_ok, released, read_ok, hash, ok
+    );
+    if !ok {
+        crate::log_fatal!("vblk-async-long: 八扇区异步写读不成立");
+    }
+    ok
+}
+#[cfg(feature = "virtio-blk")]
+ktest!(KT_VIRTIO_ASYNC_LONG, t_virtio_async_long);
+
+#[cfg(feature = "virtio-blk")]
 fn t_virtio_submit_ownership() -> bool {
     if virtio::bind().is_err() {
         return false;
     }
-    let Ok(lease) = virtio::async_alloc_lease(0) else { return false };
+    let Ok(lease) = virtio::async_alloc_lease(0, 1) else { return false };
     #[cfg(feature = "fault-virtio-submit-ctx")]
     virtio::async_arm_submit_ctx_for_test();
-    let submitted = virtio::async_submit(0, lease, 0, false);
+    let submitted = virtio::async_submit(0, lease, 0, 1, false);
     let submit_ok = submitted.is_ok();
     let held = virtio::async_release(0, lease).is_err();
     crate::tsc::spin(10_000_000);
@@ -597,7 +652,7 @@ fn t_virtio_lock_rank_guard() -> bool {
         matches!(virtio::read_block(0, &mut buf), Err(virtio::VirtioError::AsyncBusy))
     };
     let after_outer = crate::sync::stats();
-    let normal_ok = virtio::async_alloc_lease(0)
+    let normal_ok = virtio::async_alloc_lease(0, 1)
         .and_then(|slot| virtio::async_release(0, slot))
         .is_ok();
     let no_violation = after_outer.order_violations == before.order_violations
@@ -619,9 +674,9 @@ fn t_virtio_quarantine() -> bool {
     let quarantined = virtio::async_quarantine_for_test(0).is_ok();
     let mut buf = [0u8; 512];
     let read_busy = matches!(virtio::read_block(0, &mut buf), Err(virtio::VirtioError::AsyncBusy));
-    let alloc_busy = matches!(virtio::async_alloc_lease(0), Err(virtio::VirtioError::AsyncBusy));
+    let alloc_busy = matches!(virtio::async_alloc_lease(0, 1), Err(virtio::VirtioError::AsyncBusy));
     let recovered = virtio::async_recover_for_test(0).is_ok()
-        && virtio::async_alloc_lease(0).and_then(|slot| virtio::async_release(0, slot)).is_ok();
+        && virtio::async_alloc_lease(0, 1).and_then(|slot| virtio::async_release(0, slot)).is_ok();
     let ok = quarantined && read_busy && alloc_busy && recovered;
     crate::log_info!("vblk-quarantine: 隔离={} 读拒={} 租约拒={} 恢复={} ⇒ {}",
         quarantined, read_busy, alloc_busy, recovered, ok);

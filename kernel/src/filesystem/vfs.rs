@@ -247,6 +247,9 @@ pub trait AsyncBlock {
     fn reap(&self, out: &mut [IoCompletion]) -> usize;
     fn cancel(&self, local_id: u64) -> CancelResult;
     fn release_lease(&self, lease: IoLease) -> Result<(), BlockError>;
+    fn max_transfer_sectors(&self) -> u32 {
+        1
+    }
 }
 
 /// 打开一个文件要交回来的东西：大小、起始簇，以及**扫描的覆盖面**。
@@ -378,6 +381,10 @@ impl AsyncBlock for AhciDisk {
     fn release_lease(&self, lease: IoLease) -> Result<(), BlockError> {
         ahci::async_release(self.port, lease.0).map_err(block_err)
     }
+
+    fn max_transfer_sectors(&self) -> u32 {
+        128
+    }
 }
 
 /// virtio-blk 的 `Block` 适配器（AGENTS 缺口 4 / BACKLOG 78h-3 的第一格）。
@@ -439,10 +446,10 @@ impl AsyncBlock for VirtioDisk {
     }
 
     fn alloc_lease(&self, sectors: u32) -> Result<IoLease, BlockError> {
-        if sectors != 1 {
+        if sectors == 0 || sectors > virtio::ASYNC_MAX_SECTORS {
             return Err(BlockError::Refused);
         }
-        virtio::async_alloc_lease(self.index as usize).map(IoLease).map_err(virtio_block_err)
+        virtio::async_alloc_lease(self.index as usize, sectors).map(IoLease).map_err(virtio_block_err)
     }
 
     fn copy_in(&self, lease: IoLease, src: &[u8]) -> Result<(), BlockError> {
@@ -454,7 +461,7 @@ impl AsyncBlock for VirtioDisk {
     }
 
     fn submit(&self, request: IoRequest, lease: IoLease) -> Result<u64, BlockError> {
-        virtio::async_submit(self.index as usize, lease.0, request.lba, request.write)
+        virtio::async_submit(self.index as usize, lease.0, request.lba, request.sectors, request.write)
             .map_err(virtio_block_err)
     }
 
@@ -485,6 +492,10 @@ impl AsyncBlock for VirtioDisk {
 
     fn release_lease(&self, lease: IoLease) -> Result<(), BlockError> {
         virtio::async_release(self.index as usize, lease.0).map_err(virtio_block_err)
+    }
+
+    fn max_transfer_sectors(&self) -> u32 {
+        virtio::ASYNC_MAX_SECTORS
     }
 }
 

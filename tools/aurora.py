@@ -552,6 +552,7 @@ VBLK_PATTERN = 0x5C
 VBLK_FEATURES = {
     "virtio-blk", "virtio-msix-probe", "virtio-two-probe",
     "fault-virtio-submit-ctx", "fault-virtio-submit-lose-owner", "fault-virtio-rmw-lost-update",
+    "fault-virtio-async-short-desc",
 }
 # ADR-112：第二台 virtio-blk。容量**故意不同**（96 MiB vs 64 MiB）——"两台都在"不能只看台数，
 # 每一台自报的容量要与宿主机 `qemu-img info` 各自那份文件对上；图案也不同，环串了会立刻露。
@@ -5177,6 +5178,8 @@ def check_disk_content(log: str) -> list[str]:
     # 于是 M5-c③ 说的"两台仪器"实际上只有一台在跑（BACKLOG ㊵）。
     bad += check_scratch_write(log)
     bad += check_virtio_capacity(log)
+    if "vblk-async-long:" in log:
+        bad += check_virtio_async_long(log)
     bad += check_state_record(log)
     return bad
 
@@ -5203,6 +5206,29 @@ def check_vblk_write(log: str) -> list[str]:
         diff = sum(1 for i, ch in enumerate(got) if ch != pattern_byte(8, i))
         return [f"virtio 盘扇区 8：宿主机读到 {host:#018x}，内核说 {want:#018x}（{diff} 个字节与图案不符）"]
     return []
+
+
+def check_virtio_async_long(log: str) -> list[str]:
+    """宿主独立读回 virtio-blk 八扇区异步写，校验长度、图案与哈希。"""
+    m = re.search(r"vblk-async-long: lba=(\d+) sectors=8 .*哈希=([0-9a-f]{16}) ⇒ (true|false)", log)
+    if not m:
+        return ["串口缺少 vblk-async-long 八扇区读数"]
+    bad: list[str] = []
+    lba, logged = int(m.group(1)), int(m.group(2), 16)
+    if m.group(3) != "true":
+        bad.append("vblk-async-long 内核结论为 false")
+    want = bytes(i % 251 for i in range(4096))
+    try:
+        got = qemu_io_read(lba * 512, len(want), VBLK, "qcow2")
+    except Exception as e:  # noqa: BLE001 - 读不到本身就是要报的一条
+        return bad + [f"宿主读不到 virtio 八扇区 lba={lba}：{e}"]
+    if got != want:
+        diff = sum(1 for a, b in zip(got, want) if a != b)
+        bad.append(f"virtio 八扇区 lba={lba} 宿主机读回 {diff} 字节不符")
+    host = fnv1a64(want)
+    if logged != host:
+        bad.append(f"virtio 八扇区哈希 {logged:016x} != 宿主 {host:016x}")
+    return bad
 
 
 NET_FRAME_RE = re.compile(
