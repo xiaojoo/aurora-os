@@ -26302,3 +26302,7 @@ PASS，按环境形状记“不归因”，判据不动。
   `mount BadMagic`。宿主独立 newc 解析器对真实日志零偏差，改 init 哈希离线负样本红。
   `check` **21/21**；新增宿主对账行后最终独立进程整链 **94/94 符合**
   （`build/initramfs-matrix.out.log`）。真机未验证；AOCI MCP 不可用，索引未更新。
+- virtio-blk 多扇区异步长请求（未交付）：尝试扩 DMA/描述符并让租约携带 sectors；1 扇区既有路径正常，
+  2/8 扇区在 QEMU 中均未产生 `virtqueue_pop`。guest 侧 descriptor 链、avail.idx 回读、qsize=256 与
+  内存屏障均正确，设备未接走请求，原因未归因。已保存 `build/virtio-long-aborted.patch` 并回退全部
+  未提交改动，不留半成品；后续先定位 QEMU/virtio 约束再重开。真机未验证；AOCI MCP 不可用，索引未更新。
