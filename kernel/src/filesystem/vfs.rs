@@ -236,6 +236,8 @@ pub enum CancelResult {
 }
 
 /// 驱动适配器：`submit` 返回的 local_id 必须单调且不复用；`reap/cancel/submit` 由 block_io 的驱动门闩串行化。
+/// `submit` 的 `Err` 只表示确定未发射、租约仍归调用方；发射后不确定错误必须返回 `Ok(local_id)`，
+/// 由 `reap` 在真实完成上交付原始错误与真实 `sectors_done`，不能提前释放仍可能被设备写入的 DMA。
 pub trait AsyncBlock {
     fn adapter_id(&self) -> AdapterId;
     fn alloc_lease(&self, sectors: u32) -> Result<IoLease, BlockError>;

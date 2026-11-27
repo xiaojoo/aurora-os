@@ -26275,3 +26275,11 @@ PASS，按环境形状记“不归因”，判据不动。
   `run-17753` **173/173 PASS**。`check` **21/21**；91 行矩阵当轮 90/91，唯一 `FS-03文件ABI`
   偏差是同档既有 `t_sdkdemo`，目标 fs-open 取证为真；同 ELF `2a804da8338f` 的 `run-17859`
   **169/169 PASS**，记环境形状、不归因，不改判据、不重跑整链。真机未验证；AOCI MCP 不可用，索引未更新。
+- 提交所有权/完成事实补记：`AsyncBlock::submit` 的 Err 只允许确定未发射；AHCI PxCI、virtio avail.idx、
+  NVMe SQ 门铃尝试后的不确定错误保存 local_id 与原错误，真实完成再交付。NVMe drain 的 CQE 存入
+  Completed 槽待 reap 领取，不吞回执；同步门铃后错误原调用内排空 CQE，超时则隔离。通知分别编码
+  sectors_done 与 BlockError，64B ring3 ABI 不变。正向 `run-18387` notify 140/140、`run-18459`
+  NVMe 101/101、`run-18395` virtio 100/100、`run-18396` AHCI 102/102；ctx `run-18460/18399/18400`
+  三驱动 PASS，同步 `run-18462` PASS。负样本 `run-18464/18402/18403` 丢所有权、`run-18461` drain 丢回执、
+  `run-18463` 关闭同步隔离、`run-18404` 清零错误完成扇区数，均红各自目标格。`check` **21/21**；
+  最终独立进程整链 **91/91 符合**（`build/submit-owner-matrix2.out.log`）。真机未验证；AOCI MCP 不可用，索引未更新。

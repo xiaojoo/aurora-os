@@ -244,6 +244,8 @@ struct AsyncSlot {
     local_id: u64,
     sectors: u32,
     cid: u16,
+    submit_error: Option<NvmeError>,
+    completion: Option<NvmeIoCompletion>,
 }
 
 impl AsyncSlot {
@@ -252,6 +254,8 @@ impl AsyncSlot {
         local_id: 0,
         sectors: 0,
         cid: 0,
+        submit_error: None,
+        completion: None,
     };
 }
 
@@ -693,6 +697,32 @@ fn identify(st: &mut InnerState, cns: u32, nsid: u32, out: &mut [u8]) -> Result<
     Ok(())
 }
 
+enum IssueFailure {
+    BeforeDoorbell(NvmeError),
+    AfterDoorbell { cid: u16, error: NvmeError },
+}
+
+impl From<DriverError> for IssueFailure {
+    fn from(error: DriverError) -> Self {
+        Self::BeforeDoorbell(NvmeError::Ctx(error))
+    }
+}
+
+impl From<NvmeError> for IssueFailure {
+    fn from(error: NvmeError) -> Self {
+        Self::BeforeDoorbell(error)
+    }
+}
+
+impl From<IssueFailure> for NvmeError {
+    fn from(failure: IssueFailure) -> Self {
+        match failure {
+            IssueFailure::BeforeDoorbell(error)
+            | IssueFailure::AfterDoorbell { error, .. } => error,
+        }
+    }
+}
+
 /// 提交一条命令：写 SQE，敲门铃。`fill` 负责写命令特有的那几个 DWORD。
 /// 命令发给哪个队列。**这个区分是必须的**：opcode 按队列解释，
 /// 发错队列不会报「队列错」，只会被当成另一条命令（见 `OP_*` 的注释）。
@@ -715,12 +745,12 @@ fn submit(
     opcode: u8,
     nsid: u32,
     fill: impl FnOnce(&mut InnerState, usize) -> Result<(), NvmeError>,
-) -> Result<u16, NvmeError> {
+) -> Result<u16, IssueFailure> {
     let qid = q.qid();
     let qs = st.q[qid as usize];
     // 队列没建就明确拒绝（I/O 队列要等 Create I/O CQ/SQ 之后才有）
     if qs.depth == 0 {
-        return Err(NvmeError::IoQueueNotReady);
+        return Err(IssueFailure::BeforeDoorbell(NvmeError::IoQueueNotReady));
     }
     let slot = qs.sq_tail as usize;
     // SQE 基址与门铃偏移都跟着 qid 走（stride = 8，因为 CAP.DSTRD = 0）。
@@ -740,14 +770,23 @@ fn submit(
     st.ctx.dma_write32(st.dma, off + 4, nsid)?;
     fill(st, off)?;
 
+    // 屏障失败时尚未推进 SQ tail，调用方可安全放弃这条 Reserved 租约。
+    rd32(&st.ctx, st.mmio, REG_CSTS).map_err(IssueFailure::from)?;
     let qs = &mut st.q[qid as usize];
+    // 敲门铃。qid 0 = admin(0x1000)、qid 1 = I/O(0x1008)。
     qs.sq_tail = ((qs.sq_tail as usize + 1) % qs.depth as usize) as u16;
     let tail = qs.sq_tail;
-    // **屏障**：SQE 是 DMA 写、门铃是 MMIO 写，PCIe 上两者没有隐含顺序。
-    // 一次 MMIO **读**是可靠屏障——读会强制之前的写完成。
-    let _ = rd32(&st.ctx, st.mmio, REG_CSTS)?;
-    // 敲门铃。qid 0 = admin(0x1000)、qid 1 = I/O(0x1008)。
-    wr32(&st.ctx, st.mmio, db_off as u64, tail as u32)?;    Ok(cid)
+    // 门铃写一旦尝试，命令是否已被设备接走就不由调用方证明；错误必须携带 CID 留在途。
+    wr32(&st.ctx, st.mmio, db_off as u64, tail as u32)
+        .map_err(|error| IssueFailure::AfterDoorbell { cid, error })?;
+    #[cfg(feature = "fault-nvme-sync-submit-ctx")]
+    if SYNC_SUBMIT_CTX.swap(false, core::sync::atomic::Ordering::AcqRel) {
+        return Err(IssueFailure::AfterDoorbell {
+            cid,
+            error: NvmeError::Ctx(DriverError::Io),
+        });
+    }
+    Ok(cid)
 }
 
 /// 只看当前 CQ 头，不推进游标、不敲门铃。用于变异证红与完成观察。
@@ -810,7 +849,7 @@ fn wait_cqe(st: &mut InnerState, q: Q, cid: u16) -> Result<(), NvmeError> {
     Ok(())
 }
 /// 发射一条 I/O 命令，不等待完成。同步与异步路径共用，避免两套命令布局漂移。
-fn submit_io(st: &mut InnerState, lba: u64, write: bool, data_off: usize) -> Result<u16, NvmeError> {
+fn submit_io(st: &mut InnerState, lba: u64, write: bool, data_off: usize) -> Result<u16, IssueFailure> {
     // 走 **I/O 队列**。`submit` 会在 `depth == 0`（队列没建起来）时返回
     // `IoQueueNotReady` —— 那条保护在队列状态里，不在调用方硬编码。
     //
@@ -878,7 +917,15 @@ fn io_lba(lba: u64, buf: &mut [u8], write: bool) -> Result<(), NvmeError> {
         } else {
             st.ctx.dma_fill(st.dma, OFF_DATA, 0, crate::mm::PAGE)?;
         }
-        let cid = submit_io(st, lba, write, OFF_DATA)?;
+        let cid = match submit_io(st, lba, write, OFF_DATA) {
+            Ok(cid) => cid,
+            Err(IssueFailure::BeforeDoorbell(error)) => return Err(error),
+            Err(IssueFailure::AfterDoorbell { cid, error }) => {
+                // 门铃可能已接走命令：先在原调用内排空真实 CQE，超时则隔离，绝不把 OFF_DATA 交给下一条 I/O。
+                let _ = wait_cqe(st, Q::Io, cid);
+                return Err(sync_wait_failed(io, error));
+            }
+        };
         if let Err(error) = wait_cqe(st, Q::Io, cid) {
             return Err(sync_wait_failed(io, error));
         }
@@ -897,15 +944,23 @@ fn slot_data_off(index: usize) -> usize {
     OFF_DATA + index * DATA_STRIDE
 }
 
-fn finish_completion(io: &mut AsyncIoState, cid: u16, status: u16) -> Option<NvmeIoCompletion> {
+fn finish_completion(io: &mut AsyncIoState, cid: u16, status: u16, reported: bool) -> Option<NvmeIoCompletion> {
     let slot = io.slots.iter_mut().find(|slot| slot.state == AsyncSlotState::InFlight && slot.cid == cid)?;
     slot.state = AsyncSlotState::Completed;
     io.completed += 1;
-    Some(NvmeIoCompletion {
+    let status_error = (status != 0).then_some(NvmeError::CmdFailed { cid, status });
+    let error = slot.submit_error.or(status_error);
+    let completion = NvmeIoCompletion {
         local_id: slot.local_id,
         sectors_done: if status == 0 { slot.sectors } else { 0 },
-        error: if status == 0 { None } else { Some(NvmeError::CmdFailed { cid, status }) },
-    })
+        error,
+    };
+    slot.completion = if reported || cfg!(feature = "fault-nvme-drain-drop-completion") {
+        None
+    } else {
+        Some(completion)
+    };
+    Some(completion)
 }
 
 /// 预留一个 DMA 数据槽。当前 PRP1/单数据页只支持一个 LBA。
@@ -967,6 +1022,22 @@ pub fn async_copy_out(lease: u32, dst: &mut [u8]) -> Result<(), NvmeError> {
 }
 
 /// 只发射并返回单调 local_id；完成证据只由 `async_reap` 收集。
+#[cfg(feature = "fault-nvme-submit-ctx")]
+static SUBMIT_CTX: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "fault-nvme-sync-submit-ctx")]
+static SYNC_SUBMIT_CTX: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "fault-nvme-sync-submit-ctx")]
+pub(crate) fn async_arm_sync_submit_ctx_for_test() {
+    SYNC_SUBMIT_CTX.store(true, core::sync::atomic::Ordering::Release);
+}
+
+#[cfg(feature = "fault-nvme-submit-ctx")]
+pub(crate) fn async_arm_submit_ctx_for_test() {
+    SUBMIT_CTX.store(true, core::sync::atomic::Ordering::Release);
+}
+
 pub fn async_submit(lease: u32, lba: u64, sectors: u32, write: bool) -> Result<u64, NvmeError> {
     with_io(|st, io| {
         let index = slot_index(io, u64::from(lease)).ok_or(NvmeError::AsyncBusy)?;
@@ -984,17 +1055,27 @@ pub fn async_submit(lease: u32, lba: u64, sectors: u32, write: bool) -> Result<u
             return Err(NvmeError::IoQueueNotReady);
         }
         let local_id = io.slots[index].local_id;
-        io.slots[index].state = AsyncSlotState::InFlight;
-        let cid = match submit_io(st, lba, write, slot_data_off(index)) {
-            Ok(cid) => cid,
-            Err(error) => {
-                io.poisoned = true;
-                io.bad_used += 1;
-                return Err(error);
-            }
+        let (cid, mut pending_error) = match submit_io(st, lba, write, slot_data_off(index)) {
+            Ok(cid) => (cid, None),
+            Err(IssueFailure::BeforeDoorbell(error)) => return Err(error),
+            Err(IssueFailure::AfterDoorbell { cid, error }) => (cid, Some(error)),
         };
+        #[cfg(feature = "fault-nvme-submit-ctx")]
+        if SUBMIT_CTX.swap(false, core::sync::atomic::Ordering::AcqRel) {
+            pending_error = Some(NvmeError::Ctx(DriverError::Io));
+        }
+        io.slots[index].state = AsyncSlotState::InFlight;
         io.slots[index].cid = cid;
+        io.slots[index].submit_error = pending_error;
+        if pending_error.is_some() {
+            io.poisoned = true;
+            io.bad_used += 1;
+        }
         io.submitted += 1;
+        #[cfg(feature = "fault-nvme-submit-lose-owner")]
+        if let Some(error) = pending_error {
+            return Err(error);
+        }
         #[cfg(feature = "fault-nvme-async-wait")]
         {
             io.wait_calls += 1;
@@ -1010,8 +1091,18 @@ pub fn async_reap(out: &mut [NvmeIoCompletion]) -> usize {
         return 0;
     }
     match with_io(|st, io| -> Result<usize, NvmeError> {
-        if !io.slots.iter().any(|slot| slot.state == AsyncSlotState::InFlight) {
-            return Ok(0);
+        let mut written = 0usize;
+        for slot in &mut io.slots {
+            if written == out.len() { break; }
+            if slot.state == AsyncSlotState::Completed {
+                if let Some(completion) = slot.completion.take() {
+                    out[written] = completion;
+                    written += 1;
+                }
+            }
+        }
+        if written != 0 || !io.slots.iter().any(|slot| slot.state == AsyncSlotState::InFlight) {
+            return Ok(written);
         }
         #[cfg(feature = "fault-nvme-no-late-reap")]
         if io.poisoned {
@@ -1028,11 +1119,10 @@ pub fn async_reap(out: &mut [NvmeIoCompletion]) -> usize {
                 return Ok(0);
             }
         };
-        let mut written = 0usize;
         let mut next = Some(first);
         while written < out.len() {
             let Some((cid, status)) = next else { break };
-            let Some(completion) = finish_completion(io, cid, status) else {
+            let Some(completion) = finish_completion(io, cid, status, true) else {
                 io.bad_used += 1;
                 io.poisoned = true;
                 break;
@@ -1113,7 +1203,7 @@ pub fn async_drain() -> Result<NvmeDrain, NvmeError> {
             }
             match take_cqe(st, Q::Io, true, 0) {
                 Ok(Some((cid, status))) => {
-                    if finish_completion(io, cid, status).is_some() {
+                    if finish_completion(io, cid, status, false).is_some() {
                         completed += 1;
                     }
                 }
@@ -1125,12 +1215,12 @@ pub fn async_drain() -> Result<NvmeDrain, NvmeError> {
             let sq = submit(st, Q::Admin, OP_DELETE_SQ, 0, |st, off| {
                 st.ctx.dma_write32(st.dma, off + 40, 1)?;
                 Ok(())
-            }).and_then(|cid| wait_cqe(st, Q::Admin, cid));
+            }).map_err(NvmeError::from).and_then(|cid| wait_cqe(st, Q::Admin, cid));
             let cq = if sq.is_ok() {
                 submit(st, Q::Admin, OP_DELETE_CQ, 0, |st, off| {
                     st.ctx.dma_write32(st.dma, off + 40, 1)?;
                     Ok(())
-                }).and_then(|cid| wait_cqe(st, Q::Admin, cid))
+                }).map_err(NvmeError::from).and_then(|cid| wait_cqe(st, Q::Admin, cid))
             } else {
                 Err(NvmeError::AsyncBusy)
             };
@@ -1151,7 +1241,7 @@ pub fn async_drain() -> Result<NvmeDrain, NvmeError> {
         if disabled {
             for _ in 0..DATA_SLOTS {
                 let Some((cid, status)) = take_cqe(st, Q::Io, false, 0)? else { break };
-                if finish_completion(io, cid, status).is_some() {
+                if finish_completion(io, cid, status, false).is_some() {
                     completed += 1;
                 }
             }

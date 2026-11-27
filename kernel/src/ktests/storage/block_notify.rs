@@ -16,6 +16,9 @@ fn endpoint(vmo: u8, generation: u64) -> NotifyEndpoint {
 
 struct NotifyFakeDisk {
     state: core::sync::atomic::AtomicU8,
+    sectors: u32,
+    sectors_done: u32,
+    error: Option<BlockError>,
 }
 
 impl crate::filesystem::vfs::AsyncBlock for NotifyFakeDisk {
@@ -24,7 +27,7 @@ impl crate::filesystem::vfs::AsyncBlock for NotifyFakeDisk {
     }
 
     fn alloc_lease(&self, sectors: u32) -> Result<crate::filesystem::vfs::IoLease, BlockError> {
-        if sectors != 1 {
+        if sectors == 0 || sectors != self.sectors {
             return Err(BlockError::Refused);
         }
         self.state.compare_exchange(0, 1, core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Acquire)
@@ -36,7 +39,9 @@ impl crate::filesystem::vfs::AsyncBlock for NotifyFakeDisk {
     }
 
     fn copy_out(&self, _: crate::filesystem::vfs::IoLease, dst: &mut [u8]) -> Result<(), BlockError> {
-        if self.state.load(core::sync::atomic::Ordering::Acquire) != 3 || dst.len() > 512 {
+        if self.state.load(core::sync::atomic::Ordering::Acquire) != 3
+            || dst.len() > self.sectors as usize * 512
+        {
             return Err(BlockError::Refused);
         }
         dst.fill(0x5A);
@@ -48,7 +53,7 @@ impl crate::filesystem::vfs::AsyncBlock for NotifyFakeDisk {
         request: crate::filesystem::vfs::IoRequest,
         _: crate::filesystem::vfs::IoLease,
     ) -> Result<u64, BlockError> {
-        if request.sectors != 1 {
+        if request.sectors != self.sectors {
             return Err(BlockError::Refused);
         }
         self.state.compare_exchange(1, 2, core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Acquire)
@@ -59,7 +64,11 @@ impl crate::filesystem::vfs::AsyncBlock for NotifyFakeDisk {
         if out.is_empty() || self.state.compare_exchange(2, 3, core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Acquire).is_err() {
             return 0;
         }
-        out[0] = crate::filesystem::vfs::IoCompletion { local_id: 1, sectors_done: 1, error: None };
+        out[0] = crate::filesystem::vfs::IoCompletion {
+            local_id: 1,
+            sectors_done: self.sectors_done,
+            error: self.error,
+        };
         1
     }
 
@@ -78,7 +87,12 @@ fn t_block_notify_wire() -> bool {
     use crate::filesystem::vfs::AsyncBlock;
     block_notify::reset_for_test();
     block_io::queue_clear();
-    let disk = NotifyFakeDisk { state: core::sync::atomic::AtomicU8::new(0) };
+    let disk = NotifyFakeDisk {
+        state: core::sync::atomic::AtomicU8::new(0),
+        sectors: 1,
+        sectors_done: 1,
+        error: None,
+    };
     let Ok(endpoint) = block_notify::install(endpoint(5, 0)) else { return false };
     let target = TargetId(disk.adapter_id().0);
     let submitted = block_io::async_submit(&disk, target, 0, 1, false, 777, None);
@@ -110,6 +124,49 @@ fn t_block_notify_wire() -> bool {
 
 ktest!(KT_BLOCK_NOTIFY_WIRE, t_block_notify_wire);
 
+fn t_block_notify_partial() -> bool {
+    use crate::filesystem::block_io::{self, TargetId};
+    use crate::filesystem::vfs::AsyncBlock;
+    block_notify::reset_for_test();
+    block_io::queue_clear();
+    let disk = NotifyFakeDisk {
+        state: core::sync::atomic::AtomicU8::new(0),
+        sectors: 2,
+        sectors_done: 2,
+        error: Some(BlockError::DeviceError),
+    };
+    let Ok(endpoint) = block_notify::install(endpoint(8, 0)) else { return false };
+    let target = TargetId(disk.adapter_id().0);
+    let submitted = block_io::async_submit(&disk, target, 0, 2, false, 778, None);
+    let polled = block_io::async_poll(&disk);
+    let notice = block_notify::next_to_write(endpoint).ok().flatten();
+    let notice_ok = notice.as_ref().is_some_and(|record| {
+        record.token == 778 && record.result == 4 && record.sectors_done == 2
+    });
+    let mut claim = submitted.as_ref().ok().and_then(|_| block_io::async_take_completion(target));
+    let completion_ok = claim.as_ref().is_some_and(|claim| {
+        claim.sectors_done == 2 && claim.error == Some(BlockError::DeviceError)
+    });
+    let released = claim.as_mut().is_some_and(|claim| block_io::async_release(&disk, claim).is_ok());
+    let acked = notice.as_ref().is_some_and(|record| {
+        block_notify::mark_published(endpoint, record.seq).is_ok()
+            && block_notify::confirm_acked(endpoint, record.seq).is_ok()
+    });
+    let clean = block_notify::stats().retained == 0
+        && disk.state.load(core::sync::atomic::Ordering::Acquire) == 0;
+    let ok = submitted.is_ok() && polled == 1 && notice_ok && completion_ok && released && acked && clean;
+    crate::log_info!(
+        "block-notify-partial: 提交={} poll={} 通知={} 完成={} 释放={} 确认={} 收尾={} ⇒ {}",
+        submitted.is_ok(), polled, notice_ok, completion_ok, released, acked, clean, ok
+    );
+    if !ok {
+        crate::log_fatal!("block-notify-partial: 错误完成的部分扇区数被丢失");
+    }
+    ok
+}
+
+ktest!(KT_BLOCK_NOTIFY_PARTIAL, t_block_notify_partial);
+
 fn t_block_notify_page() -> bool {
     use crate::notify_broker;
     use crate::vmo;
@@ -118,7 +175,7 @@ fn t_block_notify_page() -> bool {
     let Ok(page) = vmo::vmo_create(1) else { return false };
     let init = notify_broker::init_ring(page, 0).is_ok();
     let Ok(first) = block_notify::install(endpoint(6, 0)) else { return false };
-    let published = block_notify::publish(0x9876, 0x55, Ok(9), [0x33; 16]);
+    let published = block_notify::publish(0x9876, 0x55, 9, None, [0x33; 16]);
     let record = block_notify::next_to_write(first).ok().flatten();
     let mirrored = record.as_ref().is_some_and(|record| notify_broker::mirror_record(page, first, *record).is_ok());
     let producer = vmo::vmo_atomic_load(page, block_notify::OFF_PRODUCER, Ordering::Acquire);
@@ -130,7 +187,7 @@ fn t_block_notify_page() -> bool {
 
     let reinit = notify_broker::init_ring(page, 1).is_ok();
     let Ok(second) = block_notify::install(endpoint(7, 0)) else { return false };
-    let published2 = block_notify::publish(0x9877, 0x55, Err(BlockError::DeviceError), [0; 16]);
+    let published2 = block_notify::publish(0x9877, 0x55, 0, Some(BlockError::DeviceError), [0; 16]);
     let record2 = block_notify::next_to_write(second).ok().flatten();
     let mirrored2 = record2.as_ref().is_some_and(|record| {
         record.seq == 2 && notify_broker::mirror_record(page, second, *record).is_ok()
@@ -173,11 +230,11 @@ fn t_block_notify_ring3() -> bool {
         crate::log_fatal!("block-notify-ring3: 首个 broker 创建失败");
         return false;
     };
-    let seq1 = block_notify::publish(0xface, 0x77, Ok(1), [0x11; 16]);
+    let seq1 = block_notify::publish(0xface, 0x77, 1, None, [0x11; 16]);
     let pump1 = first.pump();
     let code1 = first.wait();
 
-    let seq2 = block_notify::publish(0xbeef, 0x77, Err(BlockError::NotSettled), [0x22; 16]);
+    let seq2 = block_notify::publish(0xbeef, 0x77, 0, Some(BlockError::NotSettled), [0x22; 16]);
     let Ok(panic_broker) = notify_broker::spawn(1) else {
         crate::log_fatal!("block-notify-ring3: panic broker 创建失败");
         return false;
@@ -230,8 +287,8 @@ fn t_block_notify_core() -> bool {
             return false;
         }
     };
-    let s1 = block_notify::publish(101, 0x41, Ok(1), [0; 16]);
-    let s2 = block_notify::publish(102, 0x41, Err(BlockError::NotSettled), [0; 16]);
+    let s1 = block_notify::publish(101, 0x41, 1, None, [0; 16]);
+    let s2 = block_notify::publish(102, 0x41, 0, Some(BlockError::NotSettled), [0; 16]);
     let record1 = block_notify::next_to_write(first).ok().flatten();
     let publish1 = record1.as_ref().is_some_and(|record| {
         record.seq == 1 && record.token == 101 && record.target == 0x41 && record.result == 0 && record.sectors_done == 1
@@ -270,9 +327,9 @@ fn t_block_notify_core() -> bool {
     };
     let mut fill_ok = true;
     for token in 0..block_notify::NOTIFY_SLOTS as u64 {
-        fill_ok &= block_notify::publish(token, 1, Ok(1), [0; 16]).is_ok();
+        fill_ok &= block_notify::publish(token, 1, 1, None, [0; 16]).is_ok();
     }
-    let full_refused = block_notify::publish(99, 1, Ok(1), [0; 16]) == Err(NotifyError::Full);
+    let full_refused = block_notify::publish(99, 1, 1, None, [0; 16]) == Err(NotifyError::Full);
     let retained = block_notify::stats().retained == block_notify::NOTIFY_SLOTS;
     let first_intact = block_notify::next_to_write(fill_endpoint).ok().flatten().is_some_and(|r| r.seq == 1);
     let mut drain_ok = true;

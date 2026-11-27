@@ -526,6 +526,69 @@ fn t_nvme_checked_async_wrap() -> bool {
 ktest!(KT_NVME_CHECKED_ASYNC_WRAP, t_nvme_checked_async_wrap);
 
 #[cfg(feature = "nvme")]
+fn t_nvme_submit_ownership() -> bool {
+    if nvme::init().is_err() {
+        return false;
+    }
+    let Ok(lease) = nvme::async_alloc_lease(1) else { return false };
+    #[cfg(feature = "fault-nvme-submit-ctx")]
+    nvme::async_arm_submit_ctx_for_test();
+    let submitted = nvme::async_submit(lease, 0, 1, false);
+    let submit_ok = submitted.is_ok();
+    let held = nvme::async_release(lease).is_err();
+    crate::tsc::spin(10_000_000);
+    let drained = nvme::async_drain();
+    let drain_ok = drained.as_ref().is_ok_and(|report| {
+        report.completed == 1 && report.outstanding == 0 && report.disabled && report.queues_deleted
+    });
+    let mut done = [crate::nvme::NvmeIoCompletion { local_id: 0, sectors_done: 0, error: None }; 1];
+    let count = nvme::async_reap(&mut done);
+    let duplicate = nvme::async_reap(&mut done) == 0;
+    let want_error = cfg!(feature = "fault-nvme-submit-ctx")
+        .then_some(nvme::NvmeError::Ctx(crate::driver::DriverError::Io));
+    let completion_ok = duplicate && count == 1 && done[0].sectors_done == 1 && done[0].error == want_error
+        && submitted.as_ref().is_ok_and(|id| done[0].local_id == *id);
+    let released = nvme::async_release(lease).is_ok();
+    let recovered = nvme::async_recover().is_ok();
+    let ok = submit_ok && held && drain_ok && completion_ok && released && recovered;
+    crate::log_info!(
+        "nvme-submit-owner: 提交={} 在途释放拒={} 排空={:?} 完成={} 释放={} 恢复={} ⇒ {}",
+        submit_ok, held, drained, completion_ok, released, recovered, ok
+    );
+    if !ok {
+        crate::log_fatal!("nvme-submit-owner: 发射后错误丢失了租约身份");
+    }
+    ok
+}
+#[cfg(feature = "nvme")]
+ktest!(KT_NVME_SUBMIT_OWNERSHIP, t_nvme_submit_ownership);
+
+#[cfg(feature = "fault-nvme-sync-submit-ctx")]
+fn t_nvme_sync_submit_ownership() -> bool {
+    if nvme::init().is_err() {
+        return false;
+    }
+    nvme::async_arm_sync_submit_ctx_for_test();
+    let mut sector = [0u8; 512];
+    let result = nvme::read_lba(0, &mut sector);
+    let rejected = result == Err(nvme::NvmeError::Ctx(crate::driver::DriverError::Io));
+    let quarantined = nvme::async_stats().is_some_and(|stats| stats.poisoned);
+    let recovered = nvme::async_recover_for_test().is_ok();
+    let reread = recovered && nvme::read_lba(0, &mut sector).is_ok();
+    let ok = rejected && quarantined && recovered && reread;
+    crate::log_info!(
+        "nvme-sync-submit-owner: 原错误={} 隔离={} 恢复={} 重读={} ⇒ {}",
+        rejected, quarantined, recovered, reread, ok
+    );
+    if !ok {
+        crate::log_fatal!("nvme-sync-submit-owner: 门铃后错误未排空并隔离");
+    }
+    ok
+}
+#[cfg(feature = "fault-nvme-sync-submit-ctx")]
+ktest!(KT_NVME_SYNC_SUBMIT_OWNERSHIP, t_nvme_sync_submit_ownership);
+
+#[cfg(feature = "nvme")]
 fn t_nvme_multi() -> bool {
     use crate::filesystem::vfs::{AsyncBlock, BlockError, IoCompletion, IoLease, IoRequest, NvmeDisk};
     if nvme::init().is_err() {

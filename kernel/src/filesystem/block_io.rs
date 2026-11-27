@@ -1432,7 +1432,7 @@ pub fn async_poll_at(disk: &dyn AsyncBlock, now: u64) -> usize {
                     q.async_timeouts += 1;
                     #[cfg(all(feature = "block-notify", not(feature = "fault-notify-drop-wire")))]
                     let _ = crate::filesystem::block_notify::publish(
-                        _token, _entry_target.0, Err(BlockError::NotSettled), [0; 16],
+                        _token, _entry_target.0, 0, Some(BlockError::NotSettled), [0; 16],
                     );
                 }
                 ok
@@ -1474,7 +1474,7 @@ pub fn async_poll_at(disk: &dyn AsyncBlock, now: u64) -> usize {
             if was_late { q.async_late += 1; }
             #[cfg(all(feature = "block-notify", not(feature = "fault-notify-drop-wire")))]
             let _ = crate::filesystem::block_notify::publish(
-                token, entry.target.0, item.error.map_or(Ok(item.sectors_done), Err), [0; 16],
+                token, entry.target.0, item.sectors_done, item.error, [0; 16],
             );
             accepted += 1;
             #[cfg(feature = "fault-async-duplicate-complete")]

@@ -405,6 +405,9 @@ fn t_virtio_async() -> bool {
         crate::log_fatal!("vblk-async: 绑定失败 {:?}", e);
         return false;
     }
+    if !t_virtio_submit_ownership() {
+        return false;
+    }
     let disk = VirtioDisk { index: 0 };
     let target = TargetId(0x5600_0000);
     let before = virtio::async_stats(0).unwrap_or((0, 0, 0, 0, 0, 0));
@@ -500,6 +503,43 @@ fn t_virtio_async() -> bool {
 }
 #[cfg(feature = "virtio-blk")]
 ktest!(KT_VIRTIO_ASYNC, t_virtio_async);
+
+#[cfg(feature = "virtio-blk")]
+fn t_virtio_submit_ownership() -> bool {
+    if virtio::bind().is_err() {
+        return false;
+    }
+    let Ok(lease) = virtio::async_alloc_lease(0) else { return false };
+    #[cfg(feature = "fault-virtio-submit-ctx")]
+    virtio::async_arm_submit_ctx_for_test();
+    let submitted = virtio::async_submit(0, lease, 0, false);
+    let submit_ok = submitted.is_ok();
+    let held = virtio::async_release(0, lease).is_err();
+    crate::tsc::spin(10_000_000);
+    let mut done = [virtio::VirtioIoCompletion { local_id: 0, sectors_done: 0, error: None }; 1];
+    let mut count = 0;
+    for _ in 0..10_000 {
+        count = virtio::async_reap(0, &mut done);
+        if count != 0 { break; }
+        crate::tsc::spin(1_000);
+    }
+    let want_error = cfg!(feature = "fault-virtio-submit-ctx")
+        .then_some(virtio::VirtioError::Ctx(crate::driver::DriverError::Io));
+    let completion_ok = count == 1 && done[0].sectors_done == 1 && done[0].error == want_error
+        && submitted.as_ref().is_ok_and(|id| done[0].local_id == *id);
+    let released = virtio::async_release(0, lease).is_ok();
+    let recovered = virtio::async_recover_for_test(0).is_ok();
+    let stats = virtio::async_stats(0);
+    let ok = submit_ok && held && completion_ok && released && recovered;
+    crate::log_info!(
+        "vblk-submit-owner: 提交={} 在途释放拒={} 完成={}/{:?} 释放={} 恢复={} 计数={:?} ⇒ {}",
+        submit_ok, held, completion_ok, done[0], released, recovered, stats, ok
+    );
+    if !ok {
+        crate::log_fatal!("vblk-submit-owner: 发射后错误丢失了租约身份");
+    }
+    ok
+}
 
 #[cfg(feature = "virtio-blk")]
 fn t_virtio_lock_rank_guard() -> bool {

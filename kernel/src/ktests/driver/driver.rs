@@ -1654,6 +1654,48 @@ fn t_ahci_async_cross_port_release() -> bool {
 }
 #[cfg(feature = "ahci-scratch")]
 ktest!(KT_AHCI_ASYNC_CROSS_PORT_RELEASE, t_ahci_async_cross_port_release);
+#[cfg(feature = "ahci-scratch")]
+fn t_ahci_submit_ownership() -> bool {
+    use crate::filesystem::vfs::{AhciDisk, AsyncBlock, BlockError, IoCompletion};
+
+    let Ok(port) = ahci::boot_port() else { return false };
+    let disk = AhciDisk { port };
+    let Ok(lease) = disk.alloc_lease(1) else { return false };
+    #[cfg(feature = "fault-ahci-submit-ctx")]
+    ahci::async_arm_submit_ctx_for_test();
+    let submitted = disk.submit(crate::filesystem::vfs::IoRequest {
+        lba: 0,
+        sectors: 1,
+        token: 310,
+        write: false,
+    }, lease);
+    let submit_ok = submitted.is_ok();
+    let held = disk.release_lease(lease).is_err();
+    let mut done = [IoCompletion { local_id: 0, sectors_done: 0, error: None }; 1];
+    let mut count = 0;
+    for _ in 0..10_000 {
+        count = disk.reap(&mut done);
+        if count != 0 { break; }
+        crate::tsc::spin(1_000);
+    }
+    let want_error = cfg!(feature = "fault-ahci-submit-ctx")
+        .then_some(BlockError::NoDevice);
+    let completion_ok = count == 1 && done[0].sectors_done == 1 && done[0].error == want_error
+        && submitted.as_ref().is_ok_and(|id| done[0].local_id == *id);
+    let released = disk.release_lease(lease).is_ok();
+    let recovered = ahci::async_recover_for_test(port).is_ok();
+    let ok = submit_ok && held && completion_ok && released && recovered;
+    crate::log_info!(
+        "ahci-submit-owner: 提交={} 在途释放拒={} 完成={} 释放={} 恢复={} ⇒ {}",
+        submit_ok, held, completion_ok, released, recovered, ok
+    );
+    if !ok {
+        crate::log_fatal!("ahci-submit-owner: 发射后错误丢失了租约身份");
+    }
+    ok
+}
+#[cfg(feature = "ahci-scratch")]
+ktest!(KT_AHCI_SUBMIT_OWNERSHIP, t_ahci_submit_ownership);
 
 
 /// 只给 `KT_IRQ_AHCI` 第六格用的一颗空处理函数：它永远说"不是我的"。

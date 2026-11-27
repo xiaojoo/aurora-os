@@ -541,6 +541,7 @@ struct AsyncSlot {
     lba: u64,
     count: u16,
     write: bool,
+    submit_error: Option<AhciError>,
 }
 
 impl AsyncSlot {
@@ -551,6 +552,7 @@ impl AsyncSlot {
         lba: 0,
         count: 0,
         write: false,
+        submit_error: None,
     };
 }
 
@@ -1878,6 +1880,7 @@ fn transfer_locked(
     r
 }
 
+#[derive(Clone, Copy)]
 struct Issued {
     bytes: u32,
     d2h: u64,
@@ -1893,15 +1896,48 @@ fn transfer_inner(num: u8, lba: u64, count: u16, write: bool) -> Result<Xfer, Ah
     collect_transfer(num, &issued)
 }
 
-/// 只构造并发射；不等待、不读完成证据。异步 `submit` 与同步路径共用这一份。
+#[cfg(feature = "fault-ahci-submit-ctx")]
+static SUBMIT_CTX: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "fault-ahci-submit-ctx")]
+pub(crate) fn async_arm_submit_ctx_for_test() {
+    SUBMIT_CTX.store(true, core::sync::atomic::Ordering::Release);
+}
+
+enum IssueFailure {
+    BeforeIssue(AhciError),
+    AfterIssue { error: AhciError, issued: Issued },
+}
+
+impl From<AhciError> for IssueFailure {
+    fn from(error: AhciError) -> Self {
+        Self::BeforeIssue(error)
+    }
+}
+
+impl From<IssueFailure> for AhciError {
+    fn from(failure: IssueFailure) -> Self {
+        match failure {
+            IssueFailure::BeforeIssue(error)
+            | IssueFailure::AfterIssue { error, .. } => error,
+        }
+    }
+}
+
+/// 同步路径只取原错误；异步路径还需要知道 PxCI 之后是否仍拥有 DMA。
 fn issue_transfer(num: u8, lba: u64, count: u16, write: bool) -> Result<Issued, AhciError> {
+    issue_transfer_phased(num, lba, count, write).map_err(AhciError::from)
+}
+
+/// 只构造并发射；不等待、不读完成证据。异步 `submit` 与同步路径共用这一份。
+fn issue_transfer_phased(num: u8, lba: u64, count: u16, write: bool) -> Result<Issued, IssueFailure> {
     if count == 0 || count > MAX_SECTORS {
-        return Err(AhciError::TooBig(count));
+        return Err(IssueFailure::BeforeIssue(AhciError::TooBig(count)));
     }
     // 隔离之后一个寄存器都不再碰：这条判据靠"`resets` 计数不再增长"来验，
     // 不是靠"返回了 Err"——返回 Err 也可能是真的又试了一次
     if state_of(num) == State::Quarantined {
-        return Err(AhciError::Quarantined);
+        return Err(IssueFailure::BeforeIssue(AhciError::Quarantined));
     }
     // 注入的是"计数被少编程"：命令里写 1 个扇区，而缓冲与回读都按 `count` 个准备。
     // PRD 长度跟着命令走，所以这注入的是**驱动自己的不一致**，不是设备行为。
@@ -1967,12 +2003,27 @@ fn issue_transfer(num: u8, lba: u64, count: u16, write: bool) -> Result<Issued, 
     let d2h = rx_off(num) + RX_D2H;
     wb(d2h, 0)?;
     let ci = port_off(num, P_CI);
-    w32(ci, 1)?;
-    let issued = r32(ci)?;
-    if issued & 1 == 0 {
-        return Err(AhciError::IssueStuck(issued));
+    let issued = Issued {
+        bytes,
+        d2h,
+        ci,
+        tfd_off: port_off(num, P_TFD),
+        f,
+        p,
+    };
+    w32(ci, 1).map_err(|error| IssueFailure::AfterIssue { error, issued })?;
+    let bits = r32(ci).map_err(|error| IssueFailure::AfterIssue { error, issued })?;
+    if bits & 1 == 0 {
+        return Err(IssueFailure::BeforeIssue(AhciError::IssueStuck(bits)));
     }
-    Ok(Issued { bytes, d2h, ci, tfd_off: port_off(num, P_TFD), f, p })
+    #[cfg(feature = "fault-ahci-submit-ctx")]
+    if SUBMIT_CTX.swap(false, core::sync::atomic::Ordering::AcqRel) {
+        return Err(IssueFailure::AfterIssue {
+            error: AhciError::Ctx(DriverError::Io),
+            issued,
+        });
+    }
+    Ok(issued)
 }
 
 /// 唯一一套完成判据：`wait_settled` + BSY/DRQ 二次有界等待 + 状态/D2H/PRDBC 取证。
@@ -2172,30 +2223,32 @@ pub fn async_submit(num: u8, lease: u32, lba: u64, count: u16, write: bool) -> R
         let local_id = st.slot.local_id;
         st.slot.lba = lba;
         st.slot.write = write;
-        // 先取得所有权再碰 PxCI：发射后的任何错误都不允许调用方释放这块 DMA。
-        st.slot.state = AsyncSlotState::InFlight;
-        let mut r = issue_transfer(num, lba, count, write);
-        if matches!(r, Err(AhciError::IssueStuck(_))) {
+        let mut attempt = issue_transfer_phased(num, lba, count, write);
+        if matches!(attempt, Err(IssueFailure::BeforeIssue(AhciError::IssueStuck(_)))) {
             crate::log_warn!("ahci-async: 发射被吞 口{} ⇒ 恢复后重发一次", num);
             recover_for_issue(num);
-            r = issue_transfer(num, lba, count, write);
+            attempt = issue_transfer_phased(num, lba, count, write);
         }
-        let _issued = match r {
-            Ok(issued) => issued,
-            Err(e) => {
-                if matches!(e, AhciError::IssueStuck(_)) {
-                    st.slot = AsyncSlot::EMPTY;
-                } else {
-                    quarantine_async(st);
-                }
-                return Err(e);
+        let (issued, pending_error) = match attempt {
+            Ok(issued) => (issued, None),
+            Err(IssueFailure::BeforeIssue(error)) => return Err(error),
+            Err(IssueFailure::AfterIssue { error, issued }) => {
+                quarantine_async(st);
+                (issued, Some(error))
             }
         };
+        // PxCI 写一旦尝试，DMA 所有权就不再归调用方；错误只能随真实完成交付。
+        st.slot.state = AsyncSlotState::InFlight;
+        st.slot.submit_error = pending_error;
         st.submitted += 1;
+        #[cfg(feature = "fault-ahci-submit-lose-owner")]
+        if let Some(error) = pending_error {
+            return Err(error);
+        }
         #[cfg(feature = "fault-ahci-async-wait")]
         {
             st.wait_calls += 1;
-            let _ = wait_settled(_issued.ci, _issued.d2h, _issued.tfd_off);
+            let _ = wait_settled(issued.ci, issued.d2h, issued.tfd_off);
         }
         Ok(local_id)
     })?
@@ -2232,7 +2285,7 @@ pub fn async_reap(num: u8, out: &mut [AhciIoCompletion]) -> usize {
                 out[0] = AhciIoCompletion {
                     local_id: slot.local_id,
                     sectors_done: u32::from(slot.count),
-                    error: None,
+                    error: slot.submit_error,
                 };
                 Ok(1)
             }
@@ -2247,7 +2300,7 @@ pub fn async_reap(num: u8, out: &mut [AhciIoCompletion]) -> usize {
                 out[0] = AhciIoCompletion {
                     local_id: slot.local_id,
                     sectors_done: 0,
-                    error: Some(e),
+                    error: slot.submit_error.or(Some(e)),
                 };
                 Ok(1)
             }

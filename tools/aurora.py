@@ -533,6 +533,7 @@ SCRATCH_LBA = 1 << 28          # 只有 LBA 的字节 8（位 31:24）参与才�
 SCRATCH_PATTERN = 0xA5
 SCRATCH_FEATURES = {
     "ahci-scratch", "fault-ahci-highlba", "fault-ahci-write-dir", "fault-ahci-write-partial",
+    "fault-ahci-submit-ctx", "fault-ahci-submit-lose-owner",
 }
 # §8.5：这些文件是"驱动"，只能通过 `driver.rs` 的句柄表碰硬件。新增驱动就加进这张表，
 # 于是它从第一天起就受 `check-driver-ctx` 约束（不加进来 = 没人管它，这条网关就会慢慢变假）。
@@ -546,7 +547,10 @@ DRIVER_MODULES = ["driver/ahci.rs", "driver/virtio.rs"]
 VBLK = BUILD / "virtio-disk.qcow2"
 VBLK_MIB = 64
 VBLK_PATTERN = 0x5C
-VBLK_FEATURES = {"virtio-blk", "virtio-msix-probe", "virtio-two-probe"}
+VBLK_FEATURES = {
+    "virtio-blk", "virtio-msix-probe", "virtio-two-probe",
+    "fault-virtio-submit-ctx", "fault-virtio-submit-lose-owner",
+}
 # ADR-112：第二台 virtio-blk。容量**故意不同**（96 MiB vs 64 MiB）——"两台都在"不能只看台数，
 # 每一台自报的容量要与宿主机 `qemu-img info` 各自那份文件对上；图案也不同，环串了会立刻露。
 VBLK2 = BUILD / "virtio-disk2.qcow2"
@@ -560,7 +564,10 @@ NVME_ASYNC_PATTERN = 0xA5
 
 VBLK2_MIB = 96
 VBLK2_PATTERN = 0x3C
-NVME_FEATURES = {"nvme"}
+NVME_FEATURES = {
+    "nvme", "fault-nvme-submit-ctx", "fault-nvme-submit-lose-owner", "fault-nvme-drain-drop-completion",
+    "fault-nvme-sync-submit-ctx",
+}
 # ADR-210：xHCI 设备。**必须挂在 QEMU 上**，否则 USB 的每一层都只能
 # 证「推导对」，不能证「真的能跑」（AGENTS.md：涉及硬件的结论要有第二台仪器对账）。
 XHCI_FEATURES = {"xhci"}
@@ -10071,7 +10078,7 @@ def do_test(timeout: int) -> int:
     IMAGE.unlink(missing_ok=True)
     bnv, bnrc, bnlog = do_run(["block-notify"], timeout)
     bn_bad = []
-    for _name in ("t_block_notify_core", "t_block_notify_wire", "t_block_notify_page", "t_block_notify_ring3"):
+    for _name in ("t_block_notify_core", "t_block_notify_wire", "t_block_notify_partial", "t_block_notify_page", "t_block_notify_ring3"):
         bn_bad += ktest_row(bnlog, _name)
     bn_verdict = bnv if bnv != "PASS" else ("PASS" if not bn_bad else "CONTENT-MISMATCH")
     for x in bn_bad:

@@ -136,16 +136,16 @@ fn same_endpoint(a: NotifyEndpoint, b: NotifyEndpoint) -> bool {
     }
 }
 
-fn result_code(result: Result<u32, BlockError>) -> (i32, u32) {
-    match result {
-        Ok(sectors) => (0, sectors),
-        Err(BlockError::NoDevice) => (1, 0),
-        Err(BlockError::NotIssued) => (2, 0),
-        Err(BlockError::NotSettled) => (3, 0),
-        Err(BlockError::DeviceError) => (4, 0),
-        Err(BlockError::Quarantined) => (5, 0),
-        Err(BlockError::Refused) => (6, 0),
-        Err(BlockError::BeyondPartition) => (7, 0),
+fn result_code(error: Option<BlockError>) -> i32 {
+    match error {
+        None => 0,
+        Some(BlockError::NoDevice) => 1,
+        Some(BlockError::NotIssued) => 2,
+        Some(BlockError::NotSettled) => 3,
+        Some(BlockError::DeviceError) => 4,
+        Some(BlockError::Quarantined) => 5,
+        Some(BlockError::Refused) => 6,
+        Some(BlockError::BeyondPartition) => 7,
     }
 }
 
@@ -185,7 +185,8 @@ pub fn endpoint() -> Option<NotifyEndpoint> {
 pub fn publish(
     token: u64,
     target: u64,
-    result: Result<u32, BlockError>,
+    sectors_done: u32,
+    error: Option<BlockError>,
     diagnostic: [u8; 16],
 ) -> Result<u64, NotifyError> {
     with_state(|state| {
@@ -196,7 +197,11 @@ pub fn publish(
         }
         let seq = state.next_seq;
         state.next_seq = seq.checked_add(1).ok_or(NotifyError::Exhausted)?;
-        let (result, sectors_done) = result_code(result);
+        let result = result_code(error);
+        #[cfg(not(feature = "fault-notify-drop-sectors"))]
+        let sectors_done = sectors_done;
+        #[cfg(feature = "fault-notify-drop-sectors")]
+        let sectors_done = if error.is_some() { 0 } else { sectors_done };
         let record = NotifyRecord { seq, token, target, result, sectors_done, diagnostic };
         let slot = if cfg!(feature = "fault-notify-overwrite") && state.slots.iter().all(Option::is_some) {
             state.full = state.full.saturating_add(1);

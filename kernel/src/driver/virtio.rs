@@ -441,10 +441,17 @@ struct AsyncSlot {
     local_id: u64,
     sector: u64,
     write: bool,
+    submit_error: Option<VirtioError>,
 }
 
 impl AsyncSlot {
-    const EMPTY: Self = Self { state: AsyncSlotState::Free, local_id: 0, sector: 0, write: false };
+    const EMPTY: Self = Self {
+        state: AsyncSlotState::Free,
+        local_id: 0,
+        sector: 0,
+        write: false,
+        submit_error: None,
+    };
 }
 
 struct AsyncIoState {
@@ -982,6 +989,14 @@ pub fn async_copy_out(i: usize, slot: u32, dst: &mut [u8]) -> Result<(), VirtioE
     })
 }
 
+#[cfg(feature = "fault-virtio-submit-ctx")]
+static SUBMIT_CTX: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "fault-virtio-submit-ctx")]
+pub(crate) fn async_arm_submit_ctx_for_test() {
+    SUBMIT_CTX.store(true, core::sync::atomic::Ordering::Release);
+}
+
 pub fn async_submit(i: usize, slot: u32, sector: u64, write: bool) -> Result<u64, VirtioError> {
     if DriverCtx::in_isr() {
         return Err(VirtioError::Ctx(DriverError::WrongContext));
@@ -1017,15 +1032,37 @@ pub fn async_submit(i: usize, slot: u32, sector: u64, write: bool) -> Result<u64
         let avail = c.dma_read16(d.dma, O_AVAIL + 2).map_err(VirtioError::Ctx)?;
         let ring = usize::from(avail % d.qsize) * 2;
         c.dma_write16(d.dma, O_AVAIL + 4 + ring, head).map_err(VirtioError::Ctx)?;
-        c.dma_write16(d.dma, O_AVAIL + 2, avail.wrapping_add(1)).map_err(VirtioError::Ctx)?;
-        c.write16(d.mmio, d.notify, 0).map_err(VirtioError::Ctx)?;
+        if st.next_id == u64::MAX {
+            return Err(VirtioError::AsyncBusy);
+        }
         let local_id = st.next_id;
-        st.next_id = st.next_id.wrapping_add(1);
+        st.next_id += 1;
         st.slots[slot].state = AsyncSlotState::InFlight;
         st.slots[slot].local_id = local_id;
         st.slots[slot].sector = sector;
         st.slots[slot].write = write;
+        st.slots[slot].submit_error = None;
+        let mut pending_error = c.dma_write16(d.dma, O_AVAIL + 2, avail.wrapping_add(1))
+            .map_err(VirtioError::Ctx).err();
+        if let Err(error) = c.write16(d.mmio, d.notify, 0) {
+            if pending_error.is_none() {
+                pending_error = Some(VirtioError::Ctx(error));
+            }
+        }
+        #[cfg(feature = "fault-virtio-submit-ctx")]
+        if SUBMIT_CTX.swap(false, core::sync::atomic::Ordering::AcqRel) {
+            pending_error = Some(VirtioError::Ctx(DriverError::Io));
+        }
+        st.slots[slot].submit_error = pending_error;
+        if pending_error.is_some() {
+            quarantine_async(st);
+            st.bad_used += 1;
+        }
         st.submitted += 1;
+        #[cfg(feature = "fault-virtio-submit-lose-owner")]
+        if let Some(error) = pending_error {
+            return Err(error);
+        }
         #[cfg(feature = "fault-virtio-async-wait")]
         {
             st.wait_calls += 1;
@@ -1068,15 +1105,17 @@ pub fn async_reap(i: usize, out: &mut [VirtioIoCompletion]) -> usize {
             let status = c.dma_read8(d.dma, status_off).map_err(VirtioError::Ctx)?;
             st.used_seen = st.used_seen.wrapping_add(1);
             let want_len = if st.slots[slot].write { 1 } else { SECTOR_BYTES as u32 + 1 };
-            let error = if status == S_OK && used_len == want_len {
+            let device_ok = status == S_OK && used_len == want_len;
+            let device_error = if device_ok {
                 None
             } else {
                 crate::log_info!("virtio-async: 完成异常 slot={} status={} used_len={} head={}", slot, status, used_len, head);
                 Some(VirtioError::DeviceRefused(u32::from(status) | (used_len << 8)))
             };
+            let error = st.slots[slot].submit_error.or(device_error);
             out[n] = VirtioIoCompletion {
                 local_id: st.slots[slot].local_id,
-                sectors_done: if error.is_none() { 1 } else { 0 },
+                sectors_done: if device_ok { 1 } else { 0 },
                 error,
             };
             st.slots[slot].state = AsyncSlotState::Completed;
