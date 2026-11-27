@@ -20,3 +20,5 @@ pub mod vfs_ro;
 pub mod fs_open;
 #[cfg(feature = "fs-rw")]
 pub mod fs_rw;
+#[cfg(all(feature = "handles", feature = "fs-open", feature = "fs-rw"))]
+pub mod fsw_lock;

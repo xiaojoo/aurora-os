@@ -195,6 +195,18 @@ A 等 B 的回执，B 等 A 放锁 ⇒ 互等到 SHOOTDOWN_DEADLINE_CYCLES（≈
 "先定回内核根"是防**空转出来的绿**：CR3 已经在目标表上时提前返回会同时短路掉取锁与登记，
 增量 0 就成了假证人。
 
+## 非 lockdep 的互斥：`FSW`（卷写互斥，ADR-265）
+
+| 项 | 值 |
+| --- | --- |
+| 实现 | `filesystem/fsw_lock.rs`：`AtomicBool BUSY` + `yield_now` 退避；持有者 `OWNER=(gidx,id)` |
+| 等级 | **无**。不进 `INNERMOST` 栈，不占 1..9 的剩余格；`sync::stats().acquires` 不计它 |
+| 保护的量 | 可写卷的“定位目录项 → 读 size → 写数据 → 改 size”整段；70/71/80 号在锁内，22 号 open 的 lookup+pin 也在锁内 |
+| 约束 | 不得在持有任何 `IrqSpinLock`/`OpenSpinLock` 时调 `fsw_lock::lock()`——它会 `yield_now`，持自旋锁换出。lockdep 看不见这条，只靠 syscall 入口调用点约束 |
+| 被杀 | 等待者每 64 轮查持有者；`Free` 但仍在任一 CPU 上运行不算死，确认离 CPU 后才接管并计 `FSW_ORPHANED`；Drop 只释放自己这一代 OWNER |
+| 公平性 | 取决于调度器；当前纯轮转，引入优先级后需优先级继承 |
+| 计数 | `FSW_ACQUIRES / CONTENDED / YIELDS / ORPHANED / GAVE_UP` |
+
 ## 尚未覆盖的（写清楚，不留白）
 
 - **持锁期间禁止**（§7.1）：睡眠、堆分配（`RANK_HEAP` 自己除外，它是分配器的叶子锁）、

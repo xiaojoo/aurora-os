@@ -26,6 +26,7 @@
 use aurora_user_runtime as rt;
 
 mod parser;
+mod redir;
 mod registry;
 
 // A2 接线：调用号（SYS_*）与 StartupInfo 布局（SI_*）随 syscall 底座一起迁到

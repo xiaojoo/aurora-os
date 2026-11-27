@@ -90,6 +90,8 @@ pub enum VfsError {
     AlreadyExists,
     /// 目录里没有空槽了（整条目录链都满）
     DirFull,
+    /// 目标文件正被打开（inode 引用 > 0），本次写方向操作被拒（ADR-265）。
+    Busy,
 }
 
 impl VfsError {
@@ -108,6 +110,7 @@ impl VfsError {
             VfsError::BadName => "名字不合 8.3",
             VfsError::AlreadyExists => "目标已存在",
             VfsError::DirFull => "目录已满",
+            VfsError::Busy => "文件正被打开",
         }
     }
 }
@@ -849,6 +852,8 @@ pub fn dentry_clear() {
 struct LookupResult {
     entry: Entry,
     inode_slot: Option<u32>,
+    #[cfg(feature = "fs-dirloc")]
+    parent: u32,
 }
 
 pub fn lookup(disk: &dyn Block, bpb: &Bpb, path: &str) -> Result<Entry, VfsError> {
@@ -891,6 +896,8 @@ fn lookup_inner(
     }
     let mut cur = root_entry(bpb);
     let mut inode_slot = None;
+    #[cfg(feature = "fs-dirloc")]
+    let mut last_parent = cur.first_cluster;
     let mut comps = 0usize;
     for part in path.split('/') {
         if part.is_empty() {
@@ -910,6 +917,10 @@ fn lookup_inner(
             return Err(VfsError::NotDir);
         }
         let parent = cur.first_cluster;
+        #[cfg(feature = "fs-dirloc")]
+        {
+            last_parent = parent;
+        }
         let resolved = if let Some(v) = vol {
             let mut races = 0usize;
             loop {
@@ -933,7 +944,11 @@ fn lookup_inner(
         cur = resolved.0;
         inode_slot = resolved.1;
     }
-    Ok(LookupResult { entry: cur, inode_slot })
+    #[cfg(feature = "fs-dirloc")]
+    let result = LookupResult { entry: cur, inode_slot, parent: last_parent };
+    #[cfg(not(feature = "fs-dirloc"))]
+    let result = LookupResult { entry: cur, inode_slot };
+    Ok(result)
 }
 
 /// 在一个目录里找一个名字。
@@ -1482,6 +1497,211 @@ fn find_free_slot(disk: &dyn Block, v: &Bpb, dir_cluster: u32) -> Result<Option<
 /// 第一次写入时才分配（那是扩展那一刀，不在本切片）。
 ///
 /// 已存在同名 ⇒ `AlreadyExists`（调用方映射成 `-1`：今天没有 `EEXIST`，见 ADR-177 决策 4）。
+/// 目录项的物理位置（ADR-265，默认关）。
+#[cfg(feature = "fs-dirloc")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirLoc {
+    pub dir_cluster: u32,
+    /// 1 基序号；0 表示无位置。
+    pub idx1: u32,
+}
+
+#[cfg(feature = "fs-dirloc")]
+impl DirLoc {
+    pub const NONE: DirLoc = DirLoc { dir_cluster: 0, idx1: 0 };
+    pub fn is_some(&self) -> bool { self.idx1 != 0 && self.dir_cluster >= MIN_CLUSTER }
+    pub fn from_entry(dir_cluster: u32, e: &Entry) -> DirLoc {
+        if e.is_root || e.entries_seen == 0 || dir_cluster < MIN_CLUSTER { return DirLoc::NONE; }
+        DirLoc { dir_cluster, idx1: e.entries_seen }
+    }
+    fn idx0(&self) -> u32 { self.idx1 - 1 }
+}
+
+#[cfg(feature = "fs-dirloc")]
+fn loc_to_lba(disk: &dyn Block, v: &Bpb, loc: DirLoc) -> Result<(u64, usize), VfsError> {
+    let per_sector = SECTOR_BYTES / DIR_ENTRY;
+    let per_cluster = per_sector * v.sectors_per_cluster as usize;
+    if !loc.is_some() { return Err(VfsError::NotFound); }
+    let (clu_steps, in_clu) = ((loc.idx0() as usize) / per_cluster, (loc.idx0() as usize) % per_cluster);
+    let (c, _) = walk_to(disk, v, loc.dir_cluster, clu_steps as u32)?;
+    let lba = cluster_to_lba(v, c) + (in_clu / per_sector) as u64;
+    Ok((lba, (in_clu % per_sector) * DIR_ENTRY))
+}
+
+#[cfg(feature = "fs-dirloc")]
+fn locate_file_entry(disk: &dyn Block, v: &Bpb, loc: DirLoc, short: &[u8; 11]) -> Result<(u64, usize, u32, u32), VfsError> {
+    let (lba, off) = loc_to_lba(disk, v, loc)?;
+    let mut sec = [0u8; SECTOR_BYTES];
+    block_io::read_checked(disk, lba, &mut sec, &block_io::Budget::UNBOUNDED).map_err(io)?;
+    let first = sec[off];
+    if first == DIR_END || first == DIR_FREED { return Err(VfsError::NotFound); }
+    if sec[off + OFF_ATTR] & 0x0F == 0x0F { return Err(VfsError::NotFound); }
+    if sec[off..off + 11] != short[..] { return Err(VfsError::NotFound); }
+    if sec[off + OFF_ATTR] & 0x10 != 0 { return Err(VfsError::IsDir); }
+    let hi = if v.fat_entry_bytes == 4usize { u16_at(&sec, off + OFF_CLUSTER_HI) as u32 } else { 0 };
+    let lo = u16_at(&sec, off + OFF_CLUSTER_LO) as u32;
+    Ok((lba, off, (hi << 16) | lo, u32_at(&sec, off + OFF_SIZE)))
+}
+
+/// 在目录里找名为 `name` 的普通文件目录项。
+fn find_file_entry(disk: &dyn Block, v: &Bpb, dir_cluster: u32, name: &[u8]) -> Result<(u64, usize, u32, u32), VfsError> {
+    let short = encode_short_name(name).ok_or(VfsError::BadName)?;
+    let mut c = dir_cluster;
+    let mut guard = 0u32;
+    loop {
+        guard += 1;
+        if guard > 4096 { return Err(VfsError::Fs(FsError::BadCluster(dir_cluster))); }
+        let base = cluster_to_lba(v, c);
+        for s in 0..v.sectors_per_cluster as u64 {
+            let lba = base + s;
+            let mut sec = [0u8; SECTOR_BYTES];
+            block_io::read_checked(disk, lba, &mut sec, &block_io::Budget::UNBOUNDED).map_err(io)?;
+            for i in 0..(SECTOR_BYTES / DIR_ENTRY) {
+                let off = i * DIR_ENTRY;
+                let first = sec[off];
+                if first == DIR_END { break; }
+                if first == DIR_FREED { continue; }
+                if sec[off + OFF_ATTR] & 0x0F == 0x0F { continue; }
+                if sec[off..off + 11] != short { continue; }
+                if sec[off + OFF_ATTR] & 0x10 != 0 { return Err(VfsError::IsDir); }
+                let hi = if v.fat_entry_bytes == 4usize { u16_at(&sec, off + OFF_CLUSTER_HI) as u32 } else { 0 };
+                let lo = u16_at(&sec, off + OFF_CLUSTER_LO) as u32;
+                return Ok((lba, off, (hi << 16) | lo, u32_at(&sec, off + OFF_SIZE)));
+            }
+        }
+        let next = fat_next_disk(disk, v, c)?;
+        if next == 0 || next >= fat32::EOC_MARKER { return Err(VfsError::NotFound); }
+        c = next;
+    }
+}
+
+/// 走到链尾，返回 `(尾簇, 链长)`。
+fn chain_tail(disk: &dyn Block, v: &Bpb, first: u32) -> Result<(u32, u32), VfsError> {
+    check_entry_cluster(v, first)?;
+    let (mut c, mut n) = (first, 1u32);
+    loop {
+        let next = fat_next_disk(disk, v, c)?;
+        if next == 0 || next >= fat32::EOC_MARKER { return Ok((c, n)); }
+        check_entry_cluster(v, next)?;
+        n += 1;
+        if n > v.clusters as u32 { return Err(VfsError::Fs(FsError::BadCluster(c))); }
+        c = next;
+    }
+}
+
+/// 从 `first` 沿链走 `steps` 步。
+fn walk_to(disk: &dyn Block, v: &Bpb, first: u32, steps: u32) -> Result<(u32, u32), VfsError> {
+    let mut c = first;
+    for _ in 0..steps {
+        let next = fat_next_disk(disk, v, c)?;
+        if next == 0 || next >= fat32::EOC_MARKER { return Err(VfsError::Fs(FsError::BadCluster(c))); }
+        check_entry_cluster(v, next)?;
+        c = next;
+    }
+    Ok((c, steps))
+}
+
+/// 向簇内写入字节，不改 FAT/目录项。
+fn write_cluster_bytes(disk: &dyn Block, v: &Bpb, c: u32, off: usize, src: &[u8]) -> Result<(), VfsError> {
+    let base = cluster_to_lba(v, c);
+    let (mut pos, mut done) = (off, 0usize);
+    while done < src.len() {
+        let lba = base + (pos / SECTOR_BYTES) as u64;
+        let in_sec = pos % SECTOR_BYTES;
+        let take = core::cmp::min(SECTOR_BYTES - in_sec, src.len() - done);
+        let r = if in_sec != 0 || take != SECTOR_BYTES {
+            disk.read_modify_write(lba, in_sec, &src[done..done + take])
+        } else {
+            disk.write_sectors(lba, &src[done..done + take])
+        };
+        cache_invalidate();
+        r.map_err(io)?;
+        pos += take;
+        done += take;
+    }
+    Ok(())
+}
+
+/// 按名追加。调用方必须已持 FSW 锁。
+pub fn append_in_dir(disk: &dyn Block, v: &Bpb, dir_cluster: u32, name: &[u8], src: &[u8]) -> Result<usize, VfsError> {
+    if src.is_empty() { return Ok(0); }
+    let (dlba, doff, first, size) = find_file_entry(disk, v, dir_cluster, name)?;
+    append_core(disk, v, dir_cluster, dlba, doff, first, size, src)
+}
+
+/// 按句柄位置追加（默认关）。调用方必须已持 FSW 锁。
+#[cfg(feature = "fs-dirloc")]
+pub fn append_at_loc(
+    disk: &dyn Block, v: &Bpb, loc: DirLoc, short: &[u8; 11], h_first: u32, src: &[u8],
+) -> Result<(usize, u32), VfsError> {
+    if src.is_empty() { return Ok((0, h_first)); }
+    let (dlba, doff, first, size) = locate_file_entry(disk, v, loc, short)?;
+    if h_first >= MIN_CLUSTER && first >= MIN_CLUSTER && first != h_first {
+        return Err(VfsError::NotFound);
+    }
+    let n = append_core(disk, v, loc.dir_cluster, dlba, doff, first, size, src)?;
+    let (_, _, nf, _) = locate_file_entry(disk, v, loc, short)?;
+    Ok((n, nf))
+}
+
+/// 追加主体。调用方必须已持 FSW 锁；size 最后改。
+fn append_core(
+    disk: &dyn Block, v: &Bpb, dir_cluster: u32, dlba: u64, doff: usize, first: u32, size: u32, src: &[u8],
+) -> Result<usize, VfsError> {
+    let mut new_first = first;
+    (size as u64).checked_add(src.len() as u64).filter(|t| *t <= u32::MAX as u64).ok_or(VfsError::BadOffset)?;
+    let cb = v.cluster_bytes as u32;
+    let mut done = 0usize;
+    let (mut tail, mut tail_used) = if first >= MIN_CLUSTER {
+        let (t, n) = chain_tail(disk, v, first)?;
+        let expect = (size + cb - 1) / cb;
+        if size > 0 && n < expect { return Err(VfsError::Fs(FsError::BadCluster(t))); }
+        let used = if size == 0 { 0 } else { ((size - 1) % cb) + 1 };
+        let (tc, _) = walk_to(disk, v, first, if size == 0 { 0 } else { (size - 1) / cb })?;
+        (tc, used)
+    } else {
+        (0, cb)
+    };
+    let mut committed = size;
+    while done < src.len() {
+        if tail_used == cb {
+            let nc = alloc_cluster(disk, v).map_err(VfsError::Fs)?;
+            let take = core::cmp::min(cb as usize, src.len() - done);
+            write_cluster_bytes(disk, v, nc, 0, &src[done..done + take])?;
+            if tail >= MIN_CLUSTER {
+                fat_set_disk(disk, v, tail, nc).map_err(VfsError::Fs)?;
+            } else {
+                new_first = nc;
+            }
+            tail = nc;
+            tail_used = take as u32;
+            done += take;
+            committed += take as u32;
+        } else {
+            let room = (cb - tail_used) as usize;
+            let take = core::cmp::min(room, src.len() - done);
+            write_cluster_bytes(disk, v, tail, tail_used as usize, &src[done..done + take])?;
+            tail_used += take as u32;
+            done += take;
+            committed += take as u32;
+        }
+    }
+    if size == 0 && new_first >= MIN_CLUSTER && new_first != first {
+        let mut c = [0u8; 4];
+        c[..2].copy_from_slice(&((new_first >> 16) as u16).to_le_bytes());
+        c[2..].copy_from_slice(&(new_first as u16).to_le_bytes());
+        if v.fat_entry_bytes == 4usize {
+            disk.read_modify_write(dlba, doff + OFF_CLUSTER_HI, &c[..2]).map_err(io)?;
+        }
+        disk.read_modify_write(dlba, doff + OFF_CLUSTER_LO, &c[2..]).map_err(io)?;
+    }
+    disk.read_modify_write(dlba, doff + OFF_SIZE, &committed.to_le_bytes()).map_err(io)?;
+    cache_invalidate();
+    #[cfg(not(feature = "fault-dentry-no-invalidate"))]
+    dentry_invalidate_dir(volume_fingerprint(disk, v), dir_cluster);
+    Ok(done)
+}
+
 pub fn create_in_dir(
     disk: &dyn Block,
     v: &Bpb,
@@ -1610,6 +1830,15 @@ pub fn unlink_in_dir(
                 };
                 let lo = u16_at(&sec, off + OFF_CLUSTER_LO) as u32;
                 let first_cluster = (hi << 16) | lo;
+                // 空文件与根目录共用 inode 键 (vol, 0)，不能对首簇 0 查钉住（R8）。
+                if first_cluster >= MIN_CLUSTER {
+                    let vol = volume_fingerprint(disk, v);
+                    if let Some(ino) = inode_peek(vol, first_cluster) {
+                        if ino.refs > 0 {
+                            return Err(VfsError::Busy);
+                        }
+                    }
+                }
                 #[cfg(not(feature = "fault-metadata-rmw-split"))]
                 let written = disk.read_modify_write(lba, off, &[DIR_FREED]);
                 #[cfg(feature = "fault-metadata-rmw-split")]
@@ -2505,6 +2734,8 @@ pub struct VfsNode {
     pub cluster: u32,
     pub size: u32,
     pub attr: u8,
+    #[cfg(feature = "fs-dirloc")]
+    pub dloc: DirLoc,
 }
 
 /// 联动失败原因（ADR-220）。
@@ -2599,6 +2830,8 @@ pub fn open_node_entry(
         cluster: entry.first_cluster,
         size: entry.size,
         attr: entry.attr,
+        #[cfg(feature = "fs-dirloc")]
+        dloc: DirLoc::from_entry(resolved.parent, &entry),
     }, entry))
 }
 

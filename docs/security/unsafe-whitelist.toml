@@ -159,12 +159,14 @@ U2 = 10
 # 对账：741-17=724、U4 253-16=237、U6 44-1=43。
 # 2026-11-27 S1/ADR-261：security/rand 的 RDRAND/RDSEED 指令 +U1 2。
 # 对账：724+2=726、U1 108+2=110。
-total = 726
+# 2026-11-27 S2/S3/ADR-264：runtime 新增 create/unlink/append 三个 syscall 调用块 +U5 3。
+# 对账：726+3=729、U5 138+3=141。
+total = 729
 U1 = 110
 U2 = 185
 U3 = 13
 U4 = 237
-U5 = 138
+U5 = 141
 U6 = 43
 
 [modules."arch/hooks"]
@@ -390,7 +392,7 @@ U5 = 6
 
 [modules."user/runtime"]
 U1 = 6
-U5 = 58
+U5 = 61
 
 [modules."user/runtime/exec"]
 U1 = 1

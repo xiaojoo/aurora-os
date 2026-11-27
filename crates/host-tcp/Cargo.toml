@@ -1,0 +1,16 @@
+[package]
+name = "host-tcp"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# S2-7：TCP 可靠性的纯函数层。no_std、无分配、无锁、无 unsafe；内核与宿主机共用同一份源码。
+# 新增 crate 须同步登记 docs/architecture/crates.toml 与根 Cargo.toml members（§2.5 R10）。
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }

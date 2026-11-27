@@ -2,7 +2,7 @@
   "format": "aurora-sbom-v1",
   "generator": "tools/aurora.py release",
   "note": "workspace 与外部 crate 数均由 cargo metadata 实测；许可证策略见 docs/architecture/crates.toml",
-  "workspace_packages": 10,
+  "workspace_packages": 11,
   "external_packages": 16,
   "packages": [
     {
@@ -119,6 +119,13 @@
     },
     {
       "name": "host-initramfs",
+      "version": "0.1.0",
+      "license": "",
+      "source": "workspace",
+      "description": ""
+    },
+    {
+      "name": "host-tcp",
       "version": "0.1.0",
       "license": "",
       "source": "workspace",

@@ -624,7 +624,8 @@ struct NodeRefCount {
 
 #[cfg(feature = "fs-open")]
 const EMPTY_NODE_REF: NodeRefCount = NodeRefCount {
-    node: VfsNode { sb_slot: 0, inode_slot: 0, vol: 0, cluster: 0, size: 0, attr: 0 },
+    node: VfsNode { sb_slot: 0, inode_slot: 0, vol: 0, cluster: 0, size: 0, attr: 0,
+        #[cfg(feature = "fs-dirloc")] dloc: crate::filesystem::vfs_ro::DirLoc::NONE },
     count: 0,
 };
 

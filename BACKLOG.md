@@ -26384,3 +26384,31 @@ PASS，按环境形状记“不归因”，判据不动。
 - 未做/未验证：TCP ISS 随机化、Miri、真机、密码学外部审计；TSC 抖动不宣称达到硬件熵源强度。
   本次将 S1 diff 合入当前 `main`（包含已交付的 virtio-blk 八扇区长请求），未覆盖
   `H:/aurora-os-wb` 的并行改动；AOCI 收尾维护结果见本轮汇报。
+
+## 593. S2/S3 合并：host-tcp、用户态同步、80 号 append 与 FSW 卷写互斥（2026-11-27）
+
+- 输入：`aurora-S2S3-合并版.zip`，sha256 `9846d2a3bcf8401875377f689c86123340d34998d80816988d86d5ec97c0b75f`。
+  基线 `45d6487`，在隔离工作树 `H:/aurora-os-s23-merge` 手动合入；压缩包 README 明确代码未编译/未运行，
+  `.diff` 是不可直接 apply 的伪 diff。归档 README 未复制进产品树。
+- `host-tcp`：新增 RTO/多段重传/发送窗口/乱序重组纯函数 crate，宿主测试 **23/23**；
+  `on_ack` 补 `snd_nxt` 上界，非法 ACK 不得确认未发送序号。内核只把 RTO 常量改为 1 s/60 s，
+  host-tcp **未接入内核**。ADR-203 补记并入原 ADR，ADR-205 的全局载荷覆盖窗口同步标注为扩大 5 倍。
+- 用户态同步（ADR-263）：`runtime/sync.rs` 合入，无新 syscall/unsafe/堆；修正无时钟或时钟失效时
+  Event 永久轮询。**没有产品调用者、ktest、M1–M3 变异或参数门禁，验收未完成。**
+- 文件扩展写（ADR-264/265）：80 号真实分派与 nosys 臂、runtime 封装、FSW `AtomicBool + yield_now`、
+  非空打开文件 unlink 拒绝、可选 `fs-dirloc` 均已落地。open 的 lookup+pin 与 unlink/create/append
+  共用 FSW；FSW 不接管仍在 CPU 上的持有者，Drop 只释放自己这一代 OWNER。
+- 新增判据：`t_fs_append_basic`、`t_fs_unlink_pinned`、`t_fsw_lock`、`t_fs_append_concurrent`。
+  首轮并发格因用例把 10 字节路径写死成 11 而 48 次全失败，已修并加错误计数。临时变异 FSW 直接放行后，
+  该格红为 `size=376/384、错误=1、撞锁=0`；源文件 SHA-256 精确还原后回绿。
+- 登记：workspace/SBOM 增 host-tcp；unsafe 726→729（runtime U5 +3）；module-interfaces 增
+  `fsw_lock::lock`、`DirLoc`、`append_in_dir` 与 `capability/sched/storage` SCC/环边；lock-order 同步。
+- 验证：default、`fs-rw`、`fs-dirloc` 三种构建通过；`check` **21/21**；host-tcp **23/23**、
+  host-initramfs **11/11**；`fs-rw` QEMU **176/176**。最终完整判定表 **106/106 符合**，日志
+  `build/s23-matrix-final.log`，sha256 `b0c44053f8cfb3a911d791df5b4dfedfdbae07b1afd00d8f776688862af3e27d`。
+- 审查修正：FSW 孤儿接管误判仍在 CPU 上的持有者、open/unlink 竞态、无时钟 Event 超时失效、
+  host-tcp ACK 上界缺失，四项均已修。旧 Drop 世代校验与 open 共用 FSW 无专用竞态负样本。
+- 明确遗漏：shell `>`/`>>`/`<` 只有词法解析器，执行未接；`>` 三次 syscall 仍有文件缺失中间态；
+  扩展写掉电点注入、宿主独立 FAT 对账、满盘负样本未做；`fs-dirloc` 默认关、`append_at_loc` 无产品调用者、
+  `VfsNode`/`Entry` 实际容量未实测；空文件钉住 R8、复合原子性 R9、开启条件 R10、Busy 映射 R11、
+  `cmd_top` 降级 R12 仍待裁决。真机未验证。

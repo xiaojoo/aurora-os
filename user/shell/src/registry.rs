@@ -691,9 +691,7 @@ fn cmd_top(c: &Ctx) -> bool {
         }
     };
     let Some(job) = job_of(c) else { return true };
-    // 睡眠句柄：**ROLE_SELF_PROC**（19 号只支持 Proc 对象——SELF_THREAD 会被
-    // `wait_on_proc` 拒成 -4，见 §401 的实测；本片修的是 §401 发现的既有欠账：
-    // top 的帧间睡眠自 first 版就一直在静默失败，"每秒刷新"实际是忙转连打）。
+    // 睡眠句柄：ROLE_SELF_PROC（19 号只支持 Proc 对象；SELF_THREAD 会被拒成 -4）。
     // 等自己的 Proc terminate 永不发生 ⇒ 正好睡满 1 s，真阻塞不忙转。
     // 拿不到就没有可睡的对象——如实降级（不假装刷新）。
     // SAFETY: si_va 契约同 job_of（内核校验并映射、只读、存活期不解映射）。
@@ -907,7 +905,7 @@ fn cmd_uptime(c: &Ctx) -> bool {
 ///
 /// **为什么这就是内核原语**：`signals = 0` 的 19 号等一个永不置位的信号图，
 /// 唯一出路是超时 ⇒ 真阻塞、不让 CPU 空转（`rt::sleep_ms` 的注释已记）。
-/// 句柄用 `ROLE_SELF_THREAD`（Thread 对象永不终止，与 `cmd_top` 同款）。
+/// 句柄用 `ROLE_SELF_PROC`（19 号只支持 Proc 对象；等自己的 Proc terminate 永不发生 ⇒ 睡满超时）。
 /// 范围 1..=`rt::WAIT_MAX_MS`（60000）：0 毫秒没有语义（usage），超过上限
 /// 内核回 `-1`（WAIT_MAX_MS 双侧同数）。
 /// 成功**无输出**（Unix 惯例）；错误打码（-1/-4）。
@@ -927,9 +925,8 @@ fn cmd_sleep(c: &Ctx) -> bool {
     };
     // **ROLE_SELF_PROC 而不是 SELF_THREAD**：19 号今天只支持 Proc 对象
     // （user.rs 的 wait_on_proc：非 Proc 一律 -4），Thread 句柄直接被拒——
-    // 实测 sleep 打出 -4。等**自己的 Proc** terminate 永不发生 ⇒ 正好睡满超时，
-    // 语义等价且真阻塞。（cmd_top 用 SELF_THREAD 睡失败但错误被忽略，
-    // 是它自己的既有欠账，不在本片。）
+    // 实测 SELF_THREAD 会打出 -4。等**自己的 Proc** terminate 永不发生 ⇒ 正好睡满超时，
+    // 语义等价且真阻塞。（`cmd_top` 的同款欠账已在 §401 修复，见其 694–698 行。）
     let h = match unsafe { rt::handle_of_role(c.si_va, rt::ROLE_SELF_PROC) } {
         Some(h) => h,
         None => {

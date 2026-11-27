@@ -226,6 +226,10 @@ pub const SYS_MPROTECT: u64 = 66;
 pub const SYS_FS_CREATE: u64 = 70;
 /// 71：`fs_unlink` —— 删一个文件。`rdi`=路径、`rsi`=路径长 → 0。
 pub const SYS_FS_UNLINK: u64 = 71;
+/// 80：`file_append` —— 把一段字节追加到可写卷根目录下已存在文件的末尾。
+/// `rdi`=路径指针、`rsi`=路径长、`rdx`=数据指针、`r10`=数据长 → 追加的字节数。
+/// 单次数据长度 ≤ `SECTOR_BYTES`(512)；不放宽 23 号的 EOF 语义。
+pub const SYS_FILE_APPEND: u64 = 80;
 // ---- ADR-186：fd 号段（72–75）
 /// 把一个句柄装进当前进程的 fd 表，返回 fd。
 pub const SYS_FD_INSTALL: u64 = 72;
@@ -664,6 +668,7 @@ fn sys_fs_create(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     if name.is_empty() || name.contains('/') {
         return E_NOT_SUPPORTED;
     }
+    let Some(_fsw) = crate::filesystem::fsw_lock::lock() else { return E_EXHAUSTED };
     let fs = match crate::filesystem::fs_rw::mount() {
         Ok(f) => f,
         Err(_) => return E_IO,
@@ -716,6 +721,7 @@ fn sys_fs_unlink(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     if name.is_empty() || name.contains('/') {
         return E_NOT_SUPPORTED;
     }
+    let Some(_fsw) = crate::filesystem::fsw_lock::lock() else { return E_EXHAUSTED };
     let fs = match crate::filesystem::fs_rw::mount() {
         Ok(f) => f,
         Err(_) => return E_IO,
@@ -730,6 +736,71 @@ fn sys_fs_unlink(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
         Err(crate::filesystem::vfs_ro::VfsError::NotFound) => E_NOT_FOUND,
         Err(crate::filesystem::vfs_ro::VfsError::BadName) => E_INVALID,
         Err(crate::filesystem::vfs_ro::VfsError::IsDir) => E_IS_DIR,
+        Err(crate::filesystem::vfs_ro::VfsError::Busy) => E_DENIED,
+        Err(e) => vfs_err_ret(e),
+    }
+}
+
+/// 80：按路径追加到根目录下已存在文件。单次 ≤512 B，先拷后锁。
+#[cfg(all(feature = "handles", feature = "fs-open", feature = "fs-rw"))]
+fn sys_file_append(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let plen = frame.rsi as usize;
+    let dlen = frame.r10 as usize;
+    if plen == 0 || dlen == 0 {
+        return E_INVALID;
+    }
+    if plen > crate::filesystem::vfs_ro::PATH_MAX {
+        return E_TOO_LONG;
+    }
+    if dlen > crate::filesystem::vfs::SECTOR_BYTES {
+        return E_TOO_LONG;
+    }
+    if crate::sched::current_identity().is_none() {
+        return E_BAD_HANDLE;
+    }
+    let mut pbuf = [0u8; crate::filesystem::vfs_ro::PATH_MAX];
+    match copy_from_user(frame.rdi, &mut pbuf[..plen]) {
+        Ok(n) if n == plen => {}
+        Ok(_) => return E_FAULT,
+        Err(e) => {
+            BAD_PTRS.fetch_add(1, Ordering::Relaxed);
+            return ptr_err_to_ret(e);
+        }
+    }
+    let Ok(path) = core::str::from_utf8(&pbuf[..plen]) else {
+        return E_INVALID;
+    };
+    let Some(name) = path.strip_prefix('/') else {
+        return E_INVALID;
+    };
+    if name.is_empty() || name.contains('/') {
+        return E_NOT_SUPPORTED;
+    }
+    let mut dbuf = [0u8; crate::filesystem::vfs::SECTOR_BYTES];
+    match copy_from_user(frame.rdx, &mut dbuf[..dlen]) {
+        Ok(n) if n == dlen => {}
+        Ok(_) => return E_FAULT,
+        Err(e) => {
+            BAD_PTRS.fetch_add(1, Ordering::Relaxed);
+            return ptr_err_to_ret(e);
+        }
+    }
+    let Some(_fsw) = crate::filesystem::fsw_lock::lock() else { return E_EXHAUSTED };
+    let fs = match crate::filesystem::fs_rw::mount() {
+        Ok(f) => f,
+        Err(_) => return E_IO,
+    };
+    let (bpb, root) = (fs.bpb(), fs.root());
+    match crate::filesystem::vfs_ro::append_in_dir(
+        crate::filesystem::fs_rw::disk(), &bpb, root.first_cluster, name.as_bytes(), &dbuf[..dlen],
+    ) {
+        Ok(n) => {
+            FS_APPEND_CALLS.fetch_add(1, Ordering::Relaxed);
+            n as u64
+        }
+        Err(crate::filesystem::vfs_ro::VfsError::NotFound) => E_NOT_FOUND,
+        Err(crate::filesystem::vfs_ro::VfsError::IsDir) => E_IS_DIR,
+        Err(crate::filesystem::vfs_ro::VfsError::BadName) => E_INVALID,
         Err(e) => vfs_err_ret(e),
     }
 }
@@ -3841,6 +3912,7 @@ fn vfs_err_ret(e: crate::filesystem::vfs_ro::VfsError) -> u64 {
         V::Fs(_) => E_IO,
         V::BadName | V::AlreadyExists => E_INVALID,
         V::DirFull => E_EXHAUSTED,
+        V::Busy => E_DENIED,
     }
 }
 
@@ -4003,7 +4075,15 @@ fn sys_file_open(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     };
     let flags = frame.rdx;
     // 落哪个根由**路径**决定（挂载表，ADR-114）；flags 只表达写意图并对挂载可写性做闸。
-    let opened = match crate::filesystem::fs_open::open_node_product(path, flags) {
+    let opened = {
+        #[cfg(all(feature = "handles", feature = "fs-open", feature = "fs-rw"))]
+        let _fsw = match crate::filesystem::fsw_lock::lock() {
+            Some(g) => g,
+            None => return E_EXHAUSTED,
+        };
+        crate::filesystem::fs_open::open_node_product(path, flags)
+    };
+    let opened = match opened {
         Ok(o) => o,
         Err(e) => return node_err_ret(e),
     };
@@ -4370,6 +4450,7 @@ static MMAP_PAGES: AtomicU64 = AtomicU64::new(0);
 /// 「建了 10 个删了 9 个」与「建了 1 个删了 0 个」的区别。
 static FS_CREATE_CALLS: AtomicU64 = AtomicU64::new(0);
 static FS_UNLINK_CALLS: AtomicU64 = AtomicU64::new(0);
+static FS_APPEND_CALLS: AtomicU64 = AtomicU64::new(0);
 /// ADR-177 信号族：三个号各自的调用次数。
 static SIGACTION_CALLS: AtomicU64 = AtomicU64::new(0);
 static SIGRETURN_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -4408,6 +4489,10 @@ pub fn fs_create_calls() -> u64 {
 }
 pub fn fs_unlink_calls() -> u64 {
     FS_UNLINK_CALLS.load(Ordering::Relaxed)
+}
+/// 80 号成功调用次数（判据读数）。
+pub fn fs_append_calls() -> u64 {
+    FS_APPEND_CALLS.load(Ordering::Relaxed)
 }
 /// ADR-177 信号族：三个号各自的调用次数。
 pub fn sigaction_calls() -> u64 {
@@ -4986,6 +5071,10 @@ pub fn syscall_dispatch(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> boo
         SYS_FS_CREATE => sys_fs_create(frame),
         #[cfg(all(feature = "handles", feature = "fs-open", feature = "fs-rw"))]
         SYS_FS_UNLINK => sys_fs_unlink(frame),
+        #[cfg(all(feature = "handles", feature = "fs-open", feature = "fs-rw"))]
+        SYS_FILE_APPEND => sys_file_append(frame),
+        #[cfg(not(all(feature = "handles", feature = "fs-open", feature = "fs-rw")))]
+        SYS_FILE_APPEND => nosys(),
         // ---- 67/68/69：信号族（ADR-177 决策 1）。
         // **注意 sigreturn 收 `&mut`**：它要整份覆盖当前 frame，`iretq` 才能回到被中断处。
         #[cfg(feature = "handles")]

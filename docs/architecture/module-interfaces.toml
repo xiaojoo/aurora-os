@@ -471,7 +471,7 @@ public_api = [
   "sched::set_cred",
   "user::mac_for_retx",
 ]
-allowed_callers = ["integration"]
+allowed_callers = ["integration", "storage"]
 dependencies = [
   "arch", "boot", "capability", "diagnostics", "display", "driver", "input", "memory", "pci",
   "security", "storage", "sync", "time", "network",
@@ -812,7 +812,7 @@ owner = "storage"
 layer = "service"
 source_modules = [
   "filesystem", "filesystem/block_io", "filesystem/block_notify", "filesystem/fat32", "filesystem/fs_open",
-  "filesystem/fs_rw", "filesystem/gpt", "filesystem/initramfs", "filesystem/vfs", "filesystem/vfs_ro",
+  "filesystem/fs_rw", "filesystem/fsw_lock", "filesystem/gpt", "filesystem/initramfs", "filesystem/vfs", "filesystem/vfs_ro",
   "filesystem/part"
 ]
 public_api = [
@@ -850,10 +850,11 @@ public_api = [
   "filesystem/part::PartInfo", "filesystem/part::part_read_block",
   "filesystem/part::part_read_from", "filesystem::part", "gpt::HEADER_LBA",
   "vfs_ro::dentry_stats", "vfs_ro::dentry_clear", "vfs_ro::DENTRY_MAX",
+  "fsw_lock::lock", "vfs_ro::DirLoc", "vfs_ro::append_in_dir",
 ]
 allowed_callers = ["capability", "integration", "sched"]
 dependencies = [
-  "arch", "sync", "driver"]
+  "arch", "sync", "driver", "sched"]
 forbidden_dependencies = []
 known_violations = []
 context = ["KERNEL", "IRQ_OFF", "ISR_TOP"]
@@ -1229,6 +1230,7 @@ status = "部分落地"
 # 当前产品代码的强连通分量（Task B 冻结基线）：新增环成员或改环 ⇒ check 红。
 known_scc = [
   ["arch", "boot", "diagnostics", "driver", "irq", "memory", "network", "pci", "resource", "sync", "time"],
+  ["capability", "sched", "storage"],
 ]
 
 [baseline.ring_edge_sites]
@@ -1274,3 +1276,22 @@ known_scc = [
 "sync->time" = 3
 "time->arch" = 1
 "time->diagnostics" = 3
+  "capability->memory" = 27
+  "capability->network" = 6
+  "capability->storage" = 25
+  "capability->sync" = 1
+  "sched->arch" = 462
+  "sched->boot" = 1
+  "sched->capability" = 129
+  "sched->diagnostics" = 11
+  "sched->driver" = 38
+  "sched->memory" = 220
+  "sched->network" = 124
+  "sched->pci" = 3
+  "sched->storage" = 125
+  "sched->sync" = 28
+  "sched->time" = 24
+  "storage->arch" = 36
+  "storage->driver" = 61
+  "storage->sched" = 4
+  "storage->sync" = 13

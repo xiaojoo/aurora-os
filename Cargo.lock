@@ -115,6 +115,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "host-tcp"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"

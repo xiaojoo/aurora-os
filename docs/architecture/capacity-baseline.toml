@@ -149,6 +149,8 @@ reason = "全局表 vs Linux 每进程 files_struct；131072 = 32768 进程 x 4 
 is_tradeoff = true
 cost = "Entry 结构见 handle.rs；131072 格全局表"
 
+# [fs-dirloc] VfsNode 32 B -> 40 B（+8 B/槽）；fs-open 16384 槽 -> +128 KiB，
+# 全表 131072 槽 -> +1 MiB。默认关闭，未实测。
 [[const]]
 kernel_const = "MAX_HANDLES_PER_PROC"
 value = 1024

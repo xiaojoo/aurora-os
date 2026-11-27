@@ -5,7 +5,7 @@
 >
 > **2026-11-20（ADR-175 跨 AS 读走物理地址）**：`sched/user` U2 9 → 10（`copy_from_user_in` 里 HHDM 别名的单字节读）。**总数 +1**（530 → 531）。
 
-总计 726 处。U1 110 · U2 185 · U3 13 · U4 237 · U5 138 · U6 43
+总计 729 处。U1 110 · U2 185 · U3 13 · U4 237 · U5 141 · U6 43
 
 | 类别 | 含义 | 处数 |
 |---|---|---|
@@ -878,6 +878,9 @@ ADR-201：定时器的 128 条 `Slot` 进 `.bss`，八处指针都指向 `TABLE`
 | U5 | 1388 | `let ret = unsafe { syscall_abi(SYS_NET_SEND, frame.as_ptr() as u64, frame.len() as u64, 0, 0) }; if ret == 0 {` |
 | U5 | 1398 | `let ret = unsafe { syscall_abi(SYS_NET_RECV, buf.as_mut_ptr() as u64, buf.len() as u64, timeout_ms, 0) }; Ok(r` |
 | U5 | 1407 | `let ret = unsafe { syscall_abi(SYS_NET_INFO, blk.as_mut_ptr() as u64, 0, 0, 0) } as i64; if ret < 0 { Err(RTEr` |
+| U5 | 1492 | `let ret = unsafe { syscall_abi(SYS_FS_CREATE, path.as_ptr() as u64, path.len() as u64, 0, 0) };` |
+| U5 | 1499 | `let ret = unsafe { syscall_abi(SYS_FS_UNLINK, path.as_ptr() as u64, path.len() as u64, 0, 0) };` |
+| U5 | 1511 | `let ret = unsafe { syscall_abi(SYS_FILE_APPEND, path.as_ptr() as u64, path.len() as u64, buf.len() as u64, buf.as_ptr() as u64) };` |
 
 ### user/runtime/exec
 

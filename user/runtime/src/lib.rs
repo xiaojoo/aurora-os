@@ -22,6 +22,8 @@
 pub mod elf;
 /// A3 外部 ELF 的装载与启动编排层（22/25 → 12/13/14 → 11/15/16/17）。
 pub mod exec;
+/// ADR-263 选 C：纯用户态同步原语（无新增 syscall）。
+pub mod sync;
 
 // ---------------------------------------------------------------------------
 // 句柄
@@ -1087,8 +1089,8 @@ pub fn object_wait(h: Handle, signals: u64, timeout_ms: u64) -> Result<Option<Wa
 /// `top` 每秒刷新需要的形状。**时限上限**沿用 [`WAIT_MAX_MS`]（内核 user.rs:885
 /// 与本库 108 行同数），调用方传更大的毫秒回 [`RTError::INVALID`]。
 ///
-/// `h` 通常传 16 号回填进 SI 表的 `ROLE_SELF_THREAD` 句柄（Thread 对象，永不终止）；
-/// 传 Proc 句柄则退化为"最多睡 ms 毫秒、提前醒来当真醒了"的形状，调用方自行判别。
+/// `h` 必须是 `ROLE_SELF_PROC` 句柄（等自己的 Proc terminate 永不发生，故正好睡满超时）。
+/// 传 `ROLE_SELF_THREAD` 会得到 -4（内核 19 号只支持 Proc 对象）。
 pub fn sleep_ms(h: Handle, ms: u64) -> Result<(), RTError> {
     match object_wait(h, 0, ms) {
         // 超时 = 睡满；提前醒来（拿到信号）也按"睡到了"交付——本原语的语义是
@@ -1116,7 +1118,7 @@ pub unsafe fn find_console(si_va: u64) -> Option<Handle> {
     unsafe { find_role(si_va, ROLE_LOG) }
 }
 
-/// 按角色取 StartupInfo 句柄；broker 用它找 ROLE_SELF_THREAD 作为有界睡眠对象。
+/// 按角色取 StartupInfo 句柄；broker 用它找 `ROLE_SELF_PROC` 作为有界睡眠对象。
 ///
 /// # Safety
 /// `si_va` 必须是内核映射好的那一页（`process_start` 校验过 user+只读），
@@ -1475,6 +1477,80 @@ pub fn is_local_subnet(our_ip: &[u8; 4], mask: &[u8; 4], dst: &[u8; 4]) -> bool 
 /// 下一跳（ADR-147）：目标该去解谁的 MAC。本子网 -> 目标；外部 -> 网关。
 pub fn next_hop(our_ip: &[u8; 4], mask: &[u8; 4], dst: &[u8; 4], gateway: &[u8; 4]) -> [u8; 4] {
     if is_local_subnet(our_ip, mask, dst) { *dst } else { *gateway }
+}
+
+/// 70：在可写卷根目录建一个空文件（ADR-118/177）。
+pub const SYS_FS_CREATE: u64 = 70;
+/// 71：删除可写卷根目录下的一个文件。被打开的非空文件回 `DENIED`(-4)（ADR-265）。
+pub const SYS_FS_UNLINK: u64 = 71;
+/// 80：把字节追加到可写卷根目录下已存在文件的末尾（ADR-264 方案 A）。
+pub const SYS_FILE_APPEND: u64 = 80;
+
+pub fn fs_create(path: &[u8]) -> Result<(), RTError> {
+    if path.is_empty() { return Err(RTError::INVALID); }
+    if path.len() > PATH_MAX { return Err(RTError::TOOLONG); }
+    let ret = unsafe { syscall_abi(SYS_FS_CREATE, path.as_ptr() as u64, path.len() as u64, 0, 0) };
+    if ret < 0 { Err(RTError(ret)) } else { Ok(()) }
+}
+
+pub fn fs_unlink(path: &[u8]) -> Result<(), RTError> {
+    if path.is_empty() { return Err(RTError::INVALID); }
+    if path.len() > PATH_MAX { return Err(RTError::TOOLONG); }
+    let ret = unsafe { syscall_abi(SYS_FS_UNLINK, path.as_ptr() as u64, path.len() as u64, 0, 0) };
+    if ret < 0 { Err(RTError(ret)) } else { Ok(()) }
+}
+
+/// 单次追加上限，与内核 80 号 `SECTOR_BYTES` 同数（ADR-265 决策 4）。
+pub const APPEND_CHUNK: usize = 512;
+
+/// 80：追加。`data` ≤ [`APPEND_CHUNK`]；更长分块，块内原子、块间可能交错。
+pub fn file_append(path: &[u8], data: &[u8]) -> Result<usize, RTError> {
+    if path.is_empty() || data.is_empty() { return Err(RTError::INVALID); }
+    if path.len() > PATH_MAX || data.len() > APPEND_CHUNK { return Err(RTError::TOOLONG); }
+    let ret = unsafe {
+        syscall_abi(SYS_FILE_APPEND, path.as_ptr() as u64, path.len() as u64, data.as_ptr() as u64, data.len() as u64)
+    };
+    if ret < 0 { Err(RTError(ret)) } else { Ok(ret as usize) }
+}
+
+/// `>` 的落盘结果。
+pub struct Overwrite { pub written: usize, pub err: Option<RTError> }
+
+/// `>` = unlink + create + append（ADR-264 决策 4 方案 B）。
+/// 非原子：unlink 与 create 之间掉电会丢目标；被打开的非空文件会报 -4。
+pub fn overwrite_file(path: &[u8], data: &[u8]) -> Overwrite {
+    match fs_unlink(path) {
+        Ok(()) | Err(RTError::NOTFOUND) => {}
+        Err(e) => return Overwrite { written: 0, err: Some(e) },
+    }
+    if let Err(e) = fs_create(path) { return Overwrite { written: 0, err: Some(e) }; }
+    let mut done = 0usize;
+    while done < data.len() {
+        let end = core::cmp::min(done + APPEND_CHUNK, data.len());
+        match file_append(path, &data[done..end]) {
+            Ok(n) if n > 0 => done += n,
+            Ok(_) => return Overwrite { written: done, err: Some(RTError::IO) },
+            Err(e) => return Overwrite { written: done, err: Some(e) },
+        }
+    }
+    Overwrite { written: done, err: None }
+}
+
+/// `>>`：目标不存在则先建，再追加。
+pub fn append_file(path: &[u8], data: &[u8]) -> Overwrite {
+    if let Err(e) = fs_create(path) {
+        if e != RTError::INVALID { return Overwrite { written: 0, err: Some(e) }; }
+    }
+    let mut done = 0usize;
+    while done < data.len() {
+        let end = core::cmp::min(done + APPEND_CHUNK, data.len());
+        match file_append(path, &data[done..end]) {
+            Ok(n) if n > 0 => done += n,
+            Ok(_) => return Overwrite { written: done, err: Some(RTError::IO) },
+            Err(e) => return Overwrite { written: done, err: Some(e) },
+        }
+    }
+    Overwrite { written: done, err: None }
 }
 
 pub fn net_build_arp(our_mac: &[u8; 6], our_ip: &[u8; 4], target_ip: &[u8; 4]) -> [u8; 42] {
