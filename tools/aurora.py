@@ -426,6 +426,8 @@ def do_build_probe() -> Path:
 
 
 def do_build(features: list[str]) -> Path:
+    if "initramfs-probe" in features:
+        subprocess.run([sys.executable, str(ROOT / "tools" / "make_initramfs.py")], cwd=ROOT, env=env(), check=True)
     do_build_user()
     do_build_probe()
     do_build_shell()
@@ -3694,6 +3696,57 @@ def check_driver_rmw(log: str, kind: str) -> list[str]:
         diff = sum(1 for a, b in zip(got, want) if a != b)
         first = next((i for i, (a, b) in enumerate(zip(got, want)) if a != b), None)
         bad.append(f"{kind} RMW lba={lba} 宿主机读回 {diff} 字节不符，首差={first}")
+    return bad
+
+
+def check_initramfs(log: str) -> list[str]:
+    """宿主按 cpio newc 独立解析夹具，核对内核三份文件哈希与边界读数。"""
+    bad: list[str] = []
+    fixture = ROOT / "kernel" / "fixtures" / "initramfs.cpio"
+    try:
+        image = fixture.read_bytes()
+    except OSError as e:
+        return [f"宿主读不到 initramfs 夹具：{e}"]
+    if hashlib.sha256(image).hexdigest() != "7187107c3fbae38960a643cb658d5cff75e33703a7773fd5d1451211d934f0b0":
+        bad.append("initramfs 夹具 sha256 与确定性配方不符")
+    files: dict[bytes, bytes] = {}
+    off = 0
+    try:
+        while True:
+            header = image[off:off + 110]
+            if len(header) != 110 or header[:6] != b"070701":
+                raise ValueError("bad newc header")
+            fields = [int(header[6 + i * 8:14 + i * 8], 16) for i in range(13)]
+            size, namesize = fields[6], fields[11]
+            name_start = off + 110
+            name_end = name_start + namesize
+            name = image[name_start:name_end - 1]
+            data = (name_end + 3) & ~3
+            payload = image[data:data + size]
+            if len(payload) != size:
+                raise ValueError("truncated payload")
+            off = (data + size + 3) & ~3
+            if name == b"TRAILER!!!":
+                break
+            files[name] = payload
+    except (ValueError, IndexError) as e:
+        return bad + [f"宿主 newc 解析失败：{e}"]
+    m = re.search(
+        r"initramfs: entries=(\d+) init_sha=([0-9a-f]{16}) config_sha=([0-9a-f]{16}) "
+        r"neighbor_sha=([0-9a-f]{16}) eof=(true|false) seek=(true|false) errors=(true|false) ⇒ (true|false)",
+        log,
+    )
+    if not m:
+        return bad + ["串口没有 initramfs 的三份哈希/EOF/seek/errors 读数"]
+    if int(m.group(1)) != len(files):
+        bad.append(f"initramfs 条目数 {m.group(1)} != 宿主 {len(files)}")
+    for index, name in ((2, b"init"), (3, b"etc/config"), (4, b"dir/file")):
+        want = fnv1a64(files[name])
+        if int(m.group(index), 16) != want:
+            bad.append(f"initramfs {name.decode()} 哈希 {m.group(index)} != 宿主 {want:016x}")
+    for index, label in ((5, "eof"), (6, "seek"), (7, "errors"), (8, "结论")):
+        if m.group(index) != "true":
+            bad.append(f"initramfs 内核 {label}=false")
     return bad
 
 
@@ -10121,6 +10174,14 @@ def do_test(timeout: int) -> int:
     for x in rmwn_bad:
         print("    NVMe RMW 对账:", x)
 
+    print("=== initramfs：cpio newc 只读对象 + 宿主独立解析 ===")
+    IMAGE.unlink(missing_ok=True)
+    iv, irc, ilog = do_run(["initramfs-probe"], timeout)
+    i_bad = ktest_row(ilog, "t_initramfs_core") + ktest_row(ilog, "t_initramfs_corrupt") + check_initramfs(ilog)
+    i_verdict = iv if iv != "PASS" else ("PASS" if not i_bad else "CONTENT-MISMATCH")
+    for x in i_bad:
+        print("    initramfs 对账:", x)
+
     # =====================================================================
     # ADR-259 第5片：独立 ring3 broker、共享页确认、死亡/替换重投与 panic 隔离。
     print("=== 用户完成通知 broker：ring3 0/3/0、替换重投与资源收尾 ===")
@@ -11093,6 +11154,7 @@ def do_test(timeout: int) -> int:
         ("NVMe 卷上读出文件与宿主机对账", nvf_verdict, nvfrc, "PASS", 33),
         ("virtio-blk 原子RMW与宿主对账", rmwv_verdict, rmwvc, "PASS", 33),
         ("NVMe 原子RMW与宿主对账", rmwn_verdict, rmwnc, "PASS", 33),
+        ("initramfs newc只读与宿主解析对账", i_verdict, irc, "PASS", 33),
         # ADR-259 第5片：四格核内接线 + 独立 ring3 生命周期；负样本各自只咬目标格。
         ("用户通知broker与ring3重投", bn_verdict, bnrc, "PASS", 33),
         ("通知端点世代不校验必须红", bng_verdict, bngrc, "FAIL", 35),
@@ -11242,6 +11304,7 @@ def do_test(timeout: int) -> int:
 "NVMe 卷上读出文件与宿主机对账": nvflog,
         "virtio-blk 原子RMW与宿主对账": rmwvlog,
         "NVMe 原子RMW与宿主对账": rmwnlog,
+        "initramfs newc只读与宿主解析对账": ilog,
         "用户通知broker与ring3重投": bnlog,
         "通知端点世代不校验必须红": bnglog,
         "覆盖未确认通知必须红": bnolog,

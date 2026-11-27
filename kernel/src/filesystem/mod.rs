@@ -8,6 +8,7 @@ pub mod block_io;
 #[cfg(feature = "block-notify")]
 pub mod block_notify;
 pub mod fat32;
+pub mod initramfs;
 #[cfg(any(feature = "gpt-probe", feature = "fs-ro"))]
 pub mod gpt;
 pub mod vfs;

@@ -26295,3 +26295,10 @@ PASS，按环境形状记“不归因”，判据不动。
   注入读后竞争写再写旧副本，分别红两驱动原子格。宿主 `qemu-io` 独立读回整扇区，目标 4B 与
   508B 邻居全对；日志 LBA+1 的离线负样本两盘均红。`check` **21/21**；新增两条宿主对账行后，
   最终独立进程整链 **93/93 符合**（`build/rmw-matrix.out.log`）。真机未验证；AOCI MCP 不可用，索引未更新。
+- initramfs 只读挂载对象（ADR-260）：新增借用镜像的 `Initramfs`，完整校验 cpio newc 头、名字、
+  4B 对齐、数据边界、TRAILER 与零尾填充；支持绝对路径 lookup、普通文件 open/read/seek，目录与
+  符号链接明确拒绝跟随。无分配、无锁、无 unsafe，不接 FAT VFS/init/NS_ROOT。`run-18772`
+  initramfs-probe **96/96**，6 条目、三份哈希、EOF/seek/错误格全真；`run-18774` 跳对齐红
+  `mount BadMagic`。宿主独立 newc 解析器对真实日志零偏差，改 init 哈希离线负样本红。
+  `check` **21/21**；新增宿主对账行后最终独立进程整链 **94/94 符合**
+  （`build/initramfs-matrix.out.log`）。真机未验证；AOCI MCP 不可用，索引未更新。

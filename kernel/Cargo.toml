@@ -19,6 +19,8 @@ workspace = true
 
 [features]
 nvme = []
+initramfs-probe = []
+fault-initramfs-no-align = []
 xhci = []
 
 # ADR-213：命令环闭环（Enable Slot）。**默认关** —— 见 ADR-213 未决 1：

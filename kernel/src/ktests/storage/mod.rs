@@ -23,3 +23,5 @@ mod esp;
 mod vfs_ro;
 #[cfg(feature = "block-notify")]
 mod block_notify;
+#[cfg(feature = "initramfs-probe")]
+mod initramfs;
