@@ -364,6 +364,7 @@ public_api = [
   "elf::describe",
   "elf::parse",
   "proc::ProcInfo",
+  "proc::ProcError",
   "proc::proc_info",
   "proc::NO_PROC",
   "proc::job_create",
@@ -371,6 +372,7 @@ public_api = [
   "proc::job_residual",
   "proc::proc_residual",
   "proc::proc_reap",
+  "proc::proc_reap_gen",
   "proc::job_of",
   "proc::job_destroy",
   "proc::proc_thread_exited",
@@ -591,7 +593,8 @@ layer = "service"
 source_modules = [
   "network", "network/arp", "network/arp_table", "network/dhcp", "network/dns", "network/eth",
   "network/icmp", "network/ifaddr", "network/ipv4", "network/ipv6", "network/ndp",
-  "network/proto", "network/tcp", "network/tcp_conn", "network/socket", "network/udp"
+  "network/proto", "network/tcp", "network/tcp_conn", "network/socket", "network/udp",
+  "network/isn_source", "network/fw"
 ]
 # 今天只有边界声明与 `NetError`：协议实现仍在 `driver/virtio.rs` 里，**待搬迁**
 # （ADR-166 未决 1）。先登记"这个域存在、依赖谁、谁能调"，搬迁时往这里加成员。
@@ -666,6 +669,14 @@ public_api = [
   "socket::tcp_close",
   "socket::TcpInfo",
   "socket::SocketTcp",
+  # ADR-266：ISN/临时端口来源（socket.rs 内部与 sched/user.rs 调用）。
+  "isn_source::init_secret", "isn_source::is_ready", "isn_source::legacy_isn", "isn_source::now_us",
+  "isn_source::isn_for", "isn_source::ephemeral", "isn_source::ISN_WEAK", "isn_source::ISN_STRONG", "isn_source::ISN_NOCLOCK",
+  # ADR-267：最小防火墙（`fw` 特性；sched/user.rs 的 81/82 号与 ktests 调用）。
+  "fw::filter", "fw::filter_icmp6_frame", "fw::load", "fw::clear", "fw::enable", "fw::disable",
+  "fw::stats", "fw::stats_record", "fw::FwStats", "fw::MAX_FW_INSNS", "fw::FW_PROG_BYTES_MAX",
+  "fw::FW_LOAD_ENABLE", "fw::FW_CTL_CLEAR", "fw::FW_CTL_ENABLE", "fw::FW_CTL_DISABLE", "fw::FW_CTL_STATS",
+  "fw::FW_STATS_LEN", "fw::FW_STATS_MAGIC",
 ]
 # 今天**无人调用**（协议还在 driver 里）；按实测填空，搬迁后再长出来。
 allowed_callers = ["driver", "capability", "sched", "integration"]
@@ -676,7 +687,7 @@ allowed_callers = ["driver", "capability", "sched", "integration"]
 # 登记表写的是「现在是什么」，不是「打算变成什么」——计划属 ADR，事实属这里。
 # ADR-171：协议拆成 7 个文件后 `network` **不再依赖 driver**
 # （`fnv1a64` 换成自带的 `eth::frame_hash`）⇒ 出环。
-dependencies = ["sync", "driver", "time"]
+dependencies = ["sync", "driver", "time", "security"]
 forbidden_dependencies = ["storage", "display", "input"]
 known_violations = []
 test_targets = []
@@ -1034,7 +1045,7 @@ public_api = [
   "rand::is_seeded",
   "rand::sources",
 ]
-allowed_callers = ["integration", "sched"]
+allowed_callers = ["integration", "sched", "network"]
 dependencies = ["arch", "sync", "time"]
 forbidden_dependencies = []
 known_violations = []
@@ -1229,7 +1240,7 @@ status = "部分落地"
 [baseline]
 # 当前产品代码的强连通分量（Task B 冻结基线）：新增环成员或改环 ⇒ check 红。
 known_scc = [
-  ["arch", "boot", "diagnostics", "driver", "irq", "memory", "network", "pci", "resource", "sync", "time"],
+  ["arch", "boot", "diagnostics", "driver", "irq", "memory", "network", "pci", "resource", "security", "sync", "time"],
   ["capability", "sched", "storage"],
 ]
 
@@ -1237,7 +1248,7 @@ known_scc = [
   "time->sync" = 4
   "driver->sync" = 7
 "driver->network" = 2
-  "network->sync" = 5
+  "network->sync" = 6
   "network->driver" = 9
 "arch->boot" = 2
 "arch->diagnostics" = 19
@@ -1246,7 +1257,7 @@ known_scc = [
 "arch->pci" = 6
 "arch->sync" = 3
 "arch->time" = 23
-  "network->time" = 6
+  "network->time" = 7
 "boot->diagnostics" = 11
 "diagnostics->arch" = 32
 "diagnostics->driver" = 15
@@ -1280,13 +1291,13 @@ known_scc = [
   "capability->network" = 6
   "capability->storage" = 25
   "capability->sync" = 1
-  "sched->arch" = 462
+  "sched->arch" = 471
   "sched->boot" = 1
-  "sched->capability" = 129
+  "sched->capability" = 133
   "sched->diagnostics" = 11
   "sched->driver" = 38
-  "sched->memory" = 220
-  "sched->network" = 124
+  "sched->memory" = 221
+  "sched->network" = 143
   "sched->pci" = 3
   "sched->storage" = 125
   "sched->sync" = 28
@@ -1295,3 +1306,8 @@ known_scc = [
   "storage->driver" = 61
   "storage->sched" = 4
   "storage->sync" = 13
+  "network->security" = 2
+  "sched->security" = 21
+  "security->arch" = 6
+  "security->sync" = 2
+  "security->time" = 3

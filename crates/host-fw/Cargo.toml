@@ -1,0 +1,19 @@
+[package]
+name = "host-fw"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# ADR-267：最小防火墙的纯函数/纯数据层（字节码、加载期验证器、有界执行器、规则编译、帧解析）。
+# no_std、无分配、无锁、无 unsafe（`#![forbid(unsafe_code)]`）；宿主机 `cargo test -p host-fw` 可测，
+# 内核经 `kernel/Cargo.toml` 的 optional path 依赖（`fw` 特性）共用同一份源码。
+# 新增 crate 须同步：docs/architecture/crates.toml 的 crate.* 与 license.pending.*、根 Cargo.toml members。
+#
+# **零依赖**（含 dev-dependencies）：测试用自带的 xorshift 伪随机数，不引入 proptest，
+# 因此 SBOM 的外部包集合不变。
+[lib]
+path = "src/lib.rs"
+
+# 手册 §1.3 第 7 条：[workspace.lints] 不会自动作用到成员 crate；check-lints-wired 要求每个成员都有这两行。
+[lints]
+workspace = true

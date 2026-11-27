@@ -1112,6 +1112,11 @@ fn put_hex1(h: rt::Handle, d: u8) {
 /// 这类写法在 `relocation-model=static` 下会把 panic Location 提升成 `.rodata` 常量，
 /// 取址即 32 位绝对重定位（本仓已在 `put_u64` 与 `dispatch+0xce9` 上各撞过；本轮第一次
 /// 是 cmd_cd 里的 `cwd[..n].copy_from_slice`）。
+/// S3 补完：供 `main.rs` 的重定向执行解析目标路径（与 cat/write 同一归一规则）。
+pub fn resolve_redir_path(st: &ShellState, target: &[u8], out: &mut [u8; 160]) -> Option<usize> {
+    resolve_path(st, Some(target), out)
+}
+
 #[inline(never)]
 fn resolve_path(st: &ShellState, arg: Option<&[u8]>, out: &mut [u8; 160]) -> Option<usize> {
     let arg: &[u8] = match arg {

@@ -47,6 +47,16 @@ reason = "A2 用户态运行时库（总设计切片，2026-11-16）：unsafe �
 scope = "src/lib.rs：syscall_abi 的 int 0x80（rax/rdi/rsi/rdx/r10）· 18 个封装函数各自的调用块 · find_console 的 read_unaligned（头 24 字节 + 最多 16 条描述，全在那一页内）"
 expires = "A2 接线片（shell 迁入 runtime）之后 unsafe 面若无变化则维持；若新增号或读新页，回这条账重登记"
 
+[crate.host-fw]
+reason = "ADR-267 纯函数防火墙层；源码只有 #![forbid(unsafe_code)]，没有任何实际 unsafe 块。登记此项是因为 check-unsafe 的包级文本扫描把 forbid 行也计入含 unsafe 行。"
+scope = "src/lib.rs: #![forbid(unsafe_code)]"
+expires = "永久：本 crate 始终保持 forbid(unsafe_code)"
+
+[crate.host-svc]
+reason = "ADR-269 纯函数服务监督层；源码只有 #![forbid(unsafe_code)]，没有任何实际 unsafe 块。登记此项是因为 check-unsafe 的包级文本扫描把 forbid 行也计入含 unsafe 行。"
+scope = "src/lib.rs: #![forbid(unsafe_code)]"
+expires = "永久：本 crate 始终保持 forbid(unsafe_code)"
+
 [crate.aurora-user-execprobe]
 reason = "A2 外部命令探针（ADR-130）：unsafe 需求是 msgs_base 的 RIP 相对 lea、panic 自跳转、对自家静态 blob 的切片、以及对 rt::handle_of_role / rt::args_at 两个 unsafe fn 的调用；不碰任何内核对象"
 scope = "src/main.rs：msgs_base 的 lea 块 · msg 的 from_raw_parts · panic 自跳转 · _start 的两处 runtime unsafe fn 调用"
@@ -161,12 +171,15 @@ U2 = 10
 # 对账：724+2=726、U1 108+2=110。
 # 2026-11-27 S2/S3/ADR-264：runtime 新增 create/unlink/append 三个 syscall 调用块 +U5 3。
 # 对账：726+3=729、U5 138+3=141。
-total = 729
-U1 = 110
+# 2026-11-27 S3 重定向接线 + ADR-267：+user/shell U1 2/U5 3、+user/runtime U5 1 ⇒ 729+6=735、U1 110+2=112、U5 141+4=145。
+# 2026-11-27 ADR-270：+user/runtime U5 1（proc_reap）⇒ 735+1=736、U5 145+1=146。
+# **以本机 `aurora.py check` 的实测普查为准**：分类是规则算的，本行为按规则手算，未跑过。
+total = 736
+U1 = 112
 U2 = 185
 U3 = 13
 U4 = 237
-U5 = 141
+U5 = 146
 U6 = 43
 
 [modules."arch/hooks"]
@@ -392,7 +405,9 @@ U5 = 6
 
 [modules."user/runtime"]
 U1 = 6
-U5 = 61
+U5 = 63
+# ADR-270：proc_reap（83 号）的 syscall 调用块 +1。
+# ADR-267：fw_call（81/82 号的唯一 syscall 块；指针/长度在三个 safe 封装里先拒）。
 
 [modules."user/runtime/exec"]
 U1 = 1
@@ -402,8 +417,10 @@ U1 = 1
 U5 = 11
 
 [modules."user/shell"]
-U1 = 3
-U5 = 6
+U1 = 5
+U5 = 9
+# S3 补完（重定向执行）：+U1 2（in_base/redir_err 的 RIP 相对 lea）、+U5 3（redir_err 取 RMSGS 切片；
+# `<` 的 IN_BUF 可变/只读切片各一）。指针来源均为本程序 .rodata/.bss 的 'static 数组，长度取自常量。
 
 [modules."user/shell/notify"]
 # ADR-259 第5片：ring3 broker 的 SI/共享环指针与 RIP 相对 panic 探针。

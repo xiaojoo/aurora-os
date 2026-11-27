@@ -1,0 +1,22 @@
+[package]
+name = "host-svc"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# ADR-269 §2.3：S5c 用户态服务监督的**纯函数层**（单元文件解析、退避表、熔断环）。
+# no_std、无堆、无 unsafe、零依赖（含 dev-dependencies）；不含任何 syscall，
+# 所以引入它不会改变任何用户 ELF / 内核镜像的字节（ELF 字节稳定性纪律）。
+# 新增 crate 须同步：docs/architecture/crates.toml 的 crate.* 与 license.pending.*、根 Cargo.toml members。
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# 与测试同名的变异开关（宿主 `cargo test --features fault-svc-*` 必须变红，证明测试会咬）。
+fault-svc-breaker-never-trips = []
+fault-svc-backoff-no-clamp = []
+fault-svc-parse-accept-dup = []

@@ -11,10 +11,10 @@
 //! * 静态缓冲、无堆、**任何输入不 panic**：全部下标走 `get`。
 //! * 已知限制（沿用 ADR-155 对 `|` 的取舍）：本函数在 `split_pipe` 之后、逐段调用；引号状态以**段内**计。
 //!
-//! 已用 Python 等价移植跑过 12 个用例 + 2 万条随机字节 fuzz；Rust 版仍须本机 `cargo test`（user/shell 是 no_std 二进制，
-//! 纯逻辑建议另抽 crate 做宿主机测试，见 README）。
+//! S3 补完：已由 `main.rs::run_one_redirected` 调用。`#[cfg(test)]` 用例需本机 `cargo test`
+//! （user/shell 是 no_std 二进制，纯逻辑建议另抽 crate 做宿主机测试）。
 
-/// 重定向目标路径最大长度（与 runtime `PATH_MAX` 一致即可；这里只存借用，不拷贝）。
+/// 一行里最多接受的重定向条数（超出记 `TooMany`）。目标只存借用，不拷贝。
 pub const REDIR_MAX: usize = 3;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

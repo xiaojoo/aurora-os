@@ -5,15 +5,15 @@
 >
 > **2026-11-20（ADR-175 跨 AS 读走物理地址）**：`sched/user` U2 9 → 10（`copy_from_user_in` 里 HHDM 别名的单字节读）。**总数 +1**（530 → 531）。
 
-总计 729 处。U1 110 · U2 185 · U3 13 · U4 237 · U5 141 · U6 43
+总计 736 处。U1 112 · U2 185 · U3 13 · U4 237 · U5 146 · U6 43
 
 | 类别 | 含义 | 处数 |
 |---|---|---|
-| U1 | 架构入口与特殊寄存器 | 110 |
+| U1 | 架构入口与特殊寄存器 | 112 |
 | U2 | 页表、物理内存与 MMIO | 185 |
 | U3 | DMA 与设备共享内存 | 13 |
 | U4 | 并发共享状态与 UnsafeCell | 237 |
-| U5 | 用户指针与地址空间访问 | 138 |
+| U5 | 用户指针与地址空间访问 | 146 |
 | U6 | 诊断路径的有限现场读取 | 43 |
 
 ### capability/handle
@@ -881,6 +881,8 @@ ADR-201：定时器的 128 条 `Slot` 进 `.bss`，八处指针都指向 `TABLE`
 | U5 | 1492 | `let ret = unsafe { syscall_abi(SYS_FS_CREATE, path.as_ptr() as u64, path.len() as u64, 0, 0) };` |
 | U5 | 1499 | `let ret = unsafe { syscall_abi(SYS_FS_UNLINK, path.as_ptr() as u64, path.len() as u64, 0, 0) };` |
 | U5 | 1511 | `let ret = unsafe { syscall_abi(SYS_FILE_APPEND, path.as_ptr() as u64, path.len() as u64, buf.len() as u64, buf.as_ptr() as u64) };` |
+| U5 | 1016 | `let ret = unsafe { syscall_abi(SYS_PROC_REAP, proc_h, 0, 0, 0) };` |
+| U5 | 1678 | `unsafe { syscall_abi(nr, a1, a2, a3, 0) }` |
 
 ### user/runtime/exec
 
@@ -918,6 +920,10 @@ ADR-201：定时器的 128 条 `Slot` 进 `.bss`，八处指针都指向 `TABLE`
 | U5 | 376 | `unsafe { if !SINK_ON { return None;` |
 | U5 | 474 | `let console = match unsafe { rt::find_console(si_va) } { Some(h) => h, None => {` |
 | U5 | 489 | `if let Some(argv) = unsafe { rt::args_at(si_va) } { let line = argv.split(\|&b\| b == 0).next().unwrap_or(&[])` |
+| U1 | 366 | `unsafe { core::arch::asm!("lea {}, [rip + {sym}]", out(reg) b, sym = sym RMSGS,` |
+| U5 | 371 | `let m = unsafe { core::slice::from_raw_parts((b + off as u64) as *const u8, len) };` |
+| U5 | 422 | `let dst = unsafe { core::slice::from_raw_parts_mut(in_base(), IN_CAP) };` |
+| U5 | 426 | `let data: &'static [u8] = unsafe { core::slice::from_raw_parts(in_base() as *const u8, n) };` |
 
 ### user/shell/notify
 

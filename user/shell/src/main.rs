@@ -273,8 +273,7 @@ fn con_write(h: u64, s: &[u8]) {
 fn run_segments(console: u64, si_va: u64, raw: &[u8], st: &mut ShellState) -> bool {
     let (segs, nseg) = parser::split_pipe(raw);
     if nseg <= 1 {
-        let parsed = parser::parse(raw);
-        return registry::dispatch(console, si_va, &parsed, st);
+        return run_one_redirected(console, si_va, raw, st);
     }
     let mut carry: &[u8] = &[];
     let mut trunc = false;
@@ -283,23 +282,34 @@ fn run_segments(console: u64, si_va: u64, raw: &[u8], st: &mut ShellState) -> bo
     while i < nseg {
         let last = i + 1 == nseg;
         let seg = segs.get(i).copied().unwrap_or(&[]);
+        if last {
+            // 最后一段允许 `> f` / `>> f`；`<` 只允许首段（见下）。
+            registry::set_stdin(if i == 0 { &[] } else { carry });
+            if !run_one_redirected_with_stdin(console, si_va, seg, st, i != 0) {
+                quit = true;
+            }
+            i += 1;
+            continue;
+        }
+        let mut cbuf = [0u8; LINE_MAX];
+        let sp = redir::strip(seg, &mut cbuf);
+        if sp.n != 0 || sp.err.is_some() {
+            // 非末段带重定向：`a > f | b` 在 POSIX 里合法，但本 shell 的管道是顺序缓冲，
+            // 此处明确拒绝而不是静默忽略（不假装成功）。
+            redir_err(console, RM_PIPE);
+            break;
+        }
         let parsed = parser::parse(seg);
         if parsed.cmd.is_empty() {
             con_write(console, msg(M_PIPE_EMPTY));
             break;
         }
         registry::set_stdin(if i == 0 { &[] } else { carry });
-        if last {
-            if !registry::dispatch(console, si_va, &parsed, st) {
-                quit = true;
-            }
-        } else {
-            sink_begin();
-            let _ = registry::dispatch(console, si_va, &parsed, st);
-            let (buf, tr) = sink_take();
-            carry = buf;
-            trunc = trunc || tr;
-        }
+        sink_begin();
+        let _ = registry::dispatch(console, si_va, &parsed, st);
+        let (buf, tr) = sink_take();
+        carry = buf;
+        trunc = trunc || tr;
         i += 1;
     }
     registry::set_stdin(&[]);
@@ -307,6 +317,140 @@ fn run_segments(console: u64, si_va: u64, raw: &[u8], st: &mut ShellState) -> bo
         con_write(console, msg(M_PIPE_TRUNC));
     }
     !quit
+}
+
+// ---------------------------------------------------------------- S3 补完：`>` `>>` `<` 执行
+//
+// 词法层（`redir.rs`）早已就绪，但此前 `run_segments` 从不调用它，三种重定向在产品里都是死的。
+// 这里把它接上，**复用既有 sink 缓冲**捕获命令输出，命令结束后一次性落盘：
+//   `>`  → `rt::overwrite_file`（非原子，R9 待裁决，见 runtime 注释）
+//   `>>` → `rt::append_file`
+//   `<`  → `rt::read_file_into` 读进 STDIN_BUF，经 `registry::set_stdin` 交给命令
+// 输出超过 SINK_CAP(4096) 时 sink 会置截断标志——重定向到文件时**拒绝落盘并报错**，
+// 绝不把被截断的内容当完整结果写进去。
+
+/// `<` 输入缓冲（与 SINK_CAP 同量级）。
+const IN_CAP: usize = 4096;
+static mut IN_BUF: [u8; IN_CAP] = [0; IN_CAP];
+
+/// RIP 相对取 IN_BUF 基址（理由同 `sink_base`：避免 32 位绝对重定位）。
+#[inline]
+fn in_base() -> *mut u8 {
+    let p: *mut u8;
+    // SAFETY: lea 只算地址；IN_BUF 是 'static 定长数组。
+    unsafe {
+        core::arch::asm!("lea {0}, [rip + {1}]", out(reg) p, sym IN_BUF,
+                         options(nostack, preserves_flags));
+    }
+    p
+}
+
+/// 重定向错误提示：独立 blob + RIP 相对 lea 取址（与 `MSGS` 同一纪律，避免 `R_X86_64_32S`）。
+/// **不并入 MSGS**：并入要重排全部偏移常量。码：0 空目标 1 引号未闭合 2 条数过多 3 非末段带重定向
+/// 4 写入失败 5 输出被截断拒绝落盘 6 读入失败 7 `<` 与管道输入冲突。
+static RMSGS: [u8; 228] = *b"redirect: empty target\x0aredirect: unterminated quote\x0aredirect: too many\x0aredirect: not allowed before pipe\x0aredirect: write failed\x0aredirect: output truncated, not written\x0aredirect: read failed\x0aredirect: input only on first segment\x0a";
+const RM_EMPTY: (usize, usize) = (0, 23);
+const RM_QUOTE: (usize, usize) = (23, 29);
+const RM_MANY: (usize, usize) = (52, 19);
+const RM_PIPE: (usize, usize) = (71, 34);
+const RM_WRITE: (usize, usize) = (105, 23);
+const RM_TRUNC: (usize, usize) = (128, 40);
+const RM_READ: (usize, usize) = (168, 22);
+const RM_INPUT: (usize, usize) = (190, 38);
+
+#[inline(never)]
+fn redir_err(console: u64, m: (usize, usize)) {
+    let (off, len) = m;
+    let b: u64;
+    // SAFETY: lea 只算地址不访存；RMSGS 是本程序 .rodata 里的 'static 数组。
+    unsafe {
+        core::arch::asm!("lea {}, [rip + {sym}]", out(reg) b, sym = sym RMSGS,
+                         options(nomem, nostack, preserves_flags));
+    }
+    // SAFETY: (off,len) 取自上面 RM，均落在 RMSGS 内；只读、'static。
+    let m = unsafe { core::slice::from_raw_parts((b + off as u64) as *const u8, len) };
+    let _ = rt::console_write(console, m);
+}
+
+/// 单段（无管道）执行，带重定向。
+fn run_one_redirected(console: u64, si_va: u64, seg: &[u8], st: &mut ShellState) -> bool {
+    run_one_redirected_with_stdin(console, si_va, seg, st, false)
+}
+
+/// `piped_in`：本段 stdin 已由管道设置，此时再出现 `<` 视为冲突。
+fn run_one_redirected_with_stdin(console: u64, si_va: u64, seg: &[u8], st: &mut ShellState, piped_in: bool) -> bool {
+    let mut cbuf = [0u8; LINE_MAX];
+    let sp = redir::strip(seg, &mut cbuf);
+    if let Some(e) = sp.err {
+        redir_err(console, match e {
+            redir::RedirError::EmptyTarget => RM_EMPTY,
+            redir::RedirError::UnterminatedQuote => RM_QUOTE,
+            redir::RedirError::TooMany => RM_MANY,
+        });
+        return true;
+    }
+    let cmd = cbuf.get(..sp.cmd_len).unwrap_or(&[]);
+    if sp.n == 0 {
+        let parsed = parser::parse(cmd);
+        return registry::dispatch(console, si_va, &parsed, st);
+    }
+    // 取最后一个 `<` 与最后一个 `>`/`>>`（与 POSIX 一致：后者覆盖前者）
+    let mut in_t: Option<&[u8]> = None;
+    let mut out_t: Option<(redir::Kind, &[u8])> = None;
+    let mut k = 0usize;
+    while k < sp.n {
+        if let Some(r) = sp.redirs.get(k) {
+            match r.kind {
+                redir::Kind::In => in_t = Some(r.target),
+                _ => out_t = Some((r.kind, r.target)),
+            }
+        }
+        k += 1;
+    }
+    if in_t.is_some() && piped_in {
+        redir_err(console, RM_INPUT);
+        return true;
+    }
+    // 路径解析成绝对路径（与 cat/write 同一规则）
+    let mut ibuf = [0u8; 160];
+    let mut obuf = [0u8; 160];
+    // `<`：读入 IN_BUF，交给命令当 stdin
+    if let Some(t) = in_t {
+        let Some(il) = registry::resolve_redir_path(st, t, &mut ibuf) else { redir_err(console, RM_READ); return true; };
+        let ip = ibuf.get(..il).unwrap_or(&[]);
+        // SAFETY: IN_BUF 单线程独占；`in_base` 是 RIP 相对取址；长度 IN_CAP 即数组长。
+        let dst = unsafe { core::slice::from_raw_parts_mut(in_base(), IN_CAP) };
+        match rt::read_file_into(ip, dst) {
+            Ok(n) => {
+                // SAFETY: 同上；n <= IN_CAP；'static 数组，下一次 `<` 前命令已结束。
+                let data: &'static [u8] = unsafe { core::slice::from_raw_parts(in_base() as *const u8, n) };
+                registry::set_stdin(data);
+            }
+            Err(_) => { redir_err(console, RM_READ); return true; }
+        }
+    }
+    let parsed = parser::parse(cmd);
+    let keep_going;
+    match out_t {
+        None => {
+            keep_going = if parsed.cmd.is_empty() { true } else { registry::dispatch(console, si_va, &parsed, st) };
+        }
+        Some((kind, t)) => {
+            let Some(ol) = registry::resolve_redir_path(st, t, &mut obuf) else { redir_err(console, RM_WRITE); registry::set_stdin(&[]); return true; };
+            let op = obuf.get(..ol).unwrap_or(&[]);
+            sink_begin();
+            keep_going = if parsed.cmd.is_empty() { true } else { registry::dispatch(console, si_va, &parsed, st) };
+            let (data, trunc) = sink_take();
+            if trunc {
+                redir_err(console, RM_TRUNC);
+            } else {
+                let res = if kind == redir::Kind::Append { rt::append_file(op, data) } else { rt::overwrite_file(op, data) };
+                if res.err.is_some() { redir_err(console, RM_WRITE); }
+            }
+        }
+    }
+    registry::set_stdin(&[]);
+    keep_going
 }
 
 // ---------------------------------------------------------------- ADR-155 管道

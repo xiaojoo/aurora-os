@@ -1,0 +1,20 @@
+{
+ "tests": 17,
+ "baseline_failures": [],
+ "mutant_breaker_never_trips": [
+  "t_breaker_max_16_trips",
+  "t_breaker_strict",
+  "t_breaker_window_edges",
+  "t_breaker_zero",
+  "t_storm"
+ ],
+ "mutant_backoff_no_clamp": [
+  "t_backoff",
+  "t_breaker_max_16_trips",
+  "t_breaker_strict",
+  "t_breaker_window_edges"
+ ],
+ "mutant_parse_accept_dup": [
+  "t_parse_rejects"
+ ]
+}

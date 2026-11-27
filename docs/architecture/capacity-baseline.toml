@@ -471,3 +471,12 @@ linux_source = "Linux 的 softirq 无固定队列长度（ksoftirqd 用每 CPU �
 reason = "中断下半部队列深度。32 x ~24 B = 768 B，可忽略。**溢出时计数不静默丢弃**——那会让 TCP 重传悄悄消失。**这是接缝尺，不是硬件依据**。"
 is_tradeoff = true
 cost = "BottomItem x 32"
+
+[[const]]
+kernel_const = "MAX_FW_INSNS"
+value = 128
+section = "network"
+linux_source = "include/uapi/linux/bpf_common.h：BPF_MAXINSNS = 4096（经典 BPF 单程序指令上限；eBPF 特权程序另有 BPF_COMPLEXITY_LIMIT_INSNS 的已验证指令预算，量级 10^6）"
+reason = "防火墙单程序指令上限，也是每包执行步数上界（验证器保证 pc 严格递增 ⇒ 步数 ≤ len）。比 Linux 小 32 倍是有意的：①81 号把程序先拷进内核栈缓冲（128×8=1 KiB）；4096 条要 32 KiB，超过任务栈 16 KiB；②判决在 RANK_FW 锁内、IF=0 下执行，每包 ≤128 步、poll_once 每次 ≤8 帧 ⇒ 每次 syscall ≤1024 步。容量折算（防火墙包用 Python 移植 compile 实测装满得出）：典型规则 9 条指令 ⇒ ~14 条规则；最坏 IPv4 规则 19 条 ⇒ 6 条；最坏 IPv6 规则 31 条 ⇒ 4 条。这是接缝尺，不是硬件依据；规则更多时应先做多程序或查表指令，而不是改大这个数。"
+is_tradeoff = true
+cost = "Program = 128 × 8 B + 8 B ≈ 1 KiB（.bss，FwState 里一份）；81 号内核栈临时 1 KiB 拷贝缓冲 + 1 KiB 验证暂存 + 256 B 数据流表"

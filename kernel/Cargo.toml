@@ -11,6 +11,10 @@ path = "src/main.rs"
 [dependencies]
 aurora-capture = { path = "../capture", optional = true, default-features = false }
 host-initramfs = { path = "../crates/host-initramfs" }
+# ADR-266：TCP 纯函数层（isn/cc/sack/cookie）。no_std、无分配、无 unsafe；与宿主机 `cargo test -p host-tcp` 共用同一份源码。
+host-tcp = { path = "../crates/host-tcp", default-features = false }
+# ADR-267：最小防火墙纯函数层。optional：不开 `fw` 时连 host-fw 都不编译进内核。
+host-fw = { path = "../crates/host-fw", optional = true }
 
 # 手册 §1.3 第 7 条（R19）：[workspace.lints] 不会自动作用到成员 crate，
 # 必须在这里显式接入。**删掉这三行不会让构建失败，只会让 lint 门禁静默空转**，
@@ -41,6 +45,10 @@ kdump-busy-port = ["kdump", "aurora-capture/kdump-busy-port"]
 kdump-bad-entry = ["kdump"]
 kdump-early-panic = ["kdump"]
 default = []
+# ADR-270 负样本：proc_reap 不归还 fd 表（复现 ADR-180 漏改的旧缺陷），t_proc_reap_syscall 的页数格必须红。
+fault-reap-leak-fdtable = ["handles"]
+# ADR-267：最小防火墙第一期（UDP/NDP 入站无状态过滤 + 81/82 号）。依赖 handles（挂载点与凭据检查只在 handles 档存在）。
+fw = ["handles", "dep:host-fw"]
 # 负样本：让 ktest 里的一条断言故意不成立，用于证明判定契约的尺子能分辨
 # （手册 §12.3 R19）。正常运行时不得带这个 feature 合入。
 negative-probe = []

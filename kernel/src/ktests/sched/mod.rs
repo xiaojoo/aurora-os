@@ -8,3 +8,6 @@ mod sched;
 mod procinfo;
 #[cfg(feature = "handles")]
 mod prockill;
+// ADR-270：83 号 proc_reap 的九格判据。
+#[cfg(feature = "handles")]
+mod proc_reap;

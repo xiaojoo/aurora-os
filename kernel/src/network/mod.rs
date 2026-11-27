@@ -23,7 +23,10 @@ pub mod eth;
 pub mod icmp;
 pub mod ifaddr;
 pub mod ipv4;
+#[cfg(feature = "fw")]
+pub mod fw;
 pub mod ipv6;
+pub mod isn_source;
 pub mod ndp;
 pub mod proto;
 pub mod socket;

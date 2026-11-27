@@ -2,7 +2,7 @@
   "format": "aurora-sbom-v1",
   "generator": "tools/aurora.py release",
   "note": "workspace 与外部 crate 数均由 cargo metadata 实测；许可证策略见 docs/architecture/crates.toml",
-  "workspace_packages": 11,
+  "workspace_packages": 13,
   "external_packages": 16,
   "packages": [
     {
@@ -118,7 +118,21 @@
       "description": "A small cross-platform library for retrieving random data from system source"
     },
     {
+      "name": "host-fw",
+      "version": "0.1.0",
+      "license": "",
+      "source": "workspace",
+      "description": ""
+    },
+    {
       "name": "host-initramfs",
+      "version": "0.1.0",
+      "license": "",
+      "source": "workspace",
+      "description": ""
+    },
+    {
+      "name": "host-svc",
       "version": "0.1.0",
       "license": "",
       "source": "workspace",

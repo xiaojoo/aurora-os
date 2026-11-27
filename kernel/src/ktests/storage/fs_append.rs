@@ -216,6 +216,8 @@ fn fsw_worker() -> ! {
 
 fn t_fsw_lock() -> bool {
     sched::init_boot_task();
+    sched::init_idle();
+    crate::arch::x86_64::cpu::mark_sched(0);
     sched::start_workers();
     crate::arch::x86_64::apic::timer_start().ok();
     let c0 = fsw_lock::FSW_CONTENDED.load(Ordering::Relaxed);
@@ -296,6 +298,8 @@ fn ca_worker_b() -> ! { ca_worker(b'B', 64) }
 
 fn t_fs_append_concurrent() -> bool {
     sched::init_boot_task();
+    sched::init_idle();
+    crate::arch::x86_64::cpu::mark_sched(0);
     sched::start_workers();
     crate::arch::x86_64::apic::timer_start().ok();
     let Ok(pf) = mm::phys_alloc(0, mm::MOD_TEST) else { return false };

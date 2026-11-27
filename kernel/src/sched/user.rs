@@ -230,6 +230,26 @@ pub const SYS_FS_UNLINK: u64 = 71;
 /// `rdi`=路径指针、`rsi`=路径长、`rdx`=数据指针、`r10`=数据长 → 追加的字节数。
 /// 单次数据长度 ≤ `SECTOR_BYTES`(512)；不放宽 23 号的 EOF 语义。
 pub const SYS_FILE_APPEND: u64 = 80;
+/// 81（ADR-267）：`fw_load` —— 验证并装载一份防火墙字节码。
+/// `rdi`=字节码指针、`rsi`=字节数（1..=1024，8 的倍数）、`rdx`=标志（bit0=装载后启用，其余位必须 0）→ 新世代号（≥1）。
+///
+/// 顺序固定：形状检查 → **权限**（`CAP_ADMIN|CAP_WRITE`，无凭据 `E_BAD_HANDLE`、缺位 `E_DENIED`）
+/// → **先拷后验**（`copy_from_user` 进内核栈缓冲，验证的是内核副本，无 TOCTOU；拷贝时不持任何锁）
+/// → 验证（纯函数，锁外）→ 取 `RANK_FW` 换入。验证失败回 `E_INVALID` 且现有规则、开关、世代号都不动。
+pub const SYS_FW_LOAD: u64 = 81;
+/// 82（ADR-267）：`fw_ctl` —— `rdi`=子命令：0 清空 / 1 启用（无程序 `E_NOT_FOUND`）/ 2 停用 / 3 读统计（`rsi`=64 字节缓冲、`rdx` 必须 = 64）。
+/// 0/1/2 要 `CAP_ADMIN|CAP_WRITE`；3 只要有凭据。其它子命令 `E_INVALID`。
+pub const SYS_FW_CTL: u64 = 82;
+/// 83（ADR-270）：`proc_reap` —— 收走一个**已终止**的进程（僵尸），还它占的进程槽、Job 额度、子 AS 与 fd 表。
+/// `rdi` = Proc 句柄（要 `RIGHT_WRITE`）→ 成功返回**退出码**（`u32` 零扩展；与 17/19 号等到的退出码同一个值）。
+///
+/// 语义（对应 POSIX `waitpid` 的"收尸"半边；17/19 号仍只"等"不"收"）：
+/// * 进程**还在跑** ⇒ `E_DENIED`（-4），**什么都不动**（不是杀）。
+/// * 句柄不是 Proc / 缺 `WRITE` ⇒ `E_DENIED`；句柄已失效 / 进程世代不符（已被收过）⇒ `E_BAD_HANDLE`。
+/// * 杀自己的进程 ⇒ `E_DENIED`（与 18 号同口径；自己不可能是已终止态，这一条是纵深防御）。
+/// * 成功后**调用方持有的这个 Proc 句柄被关闭**（再用它 ⇒ `E_BAD_HANDLE`）；其它由 `dup` 派生的副本靠
+///   `(slot, gen)` 世代失效（`proc_reap` 保留 gen 防 ABA），**不会**指到后来复用该槽的新进程。
+pub const SYS_PROC_REAP: u64 = 83;
 // ---- ADR-186：fd 号段（72–75）
 /// 把一个句柄装进当前进程的 fd 表，返回 fd。
 pub const SYS_FD_INSTALL: u64 = 72;
@@ -2515,6 +2535,157 @@ fn sys_cred_allows(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
     u64::from(crate::cred::cred_allows(id, cap))
 }
 
+/// ADR-267：防火墙写操作的权限闸。**在任何拷贝与取锁之前调**。
+///
+/// `current_cred()` 内部取 RUNQ(8)，必须在 `RANK_FW(42)` 之外（42→8 是反向嵌套）。
+/// `cred_allows(id, A|B)` 是"两位都要"（cred.rs:191 `c.caps & cap == cap`）。
+/// root（`CAP_ALL`）通过；`a3-cred-guest` 的 guest（只有 `CAP_READ`）被拒；内核任务没有凭据 ⇒ `E_BAD_HANDLE`
+/// （内核自己装规则走 `network::fw::load`，不经 syscall）。
+#[cfg(feature = "fw")]
+fn fw_privileged() -> Result<(), u64> {
+    let Some(id) = crate::sched::current_cred() else { return Err(E_BAD_HANDLE) };
+    if crate::cred::cred_allows(id, crate::cred::CAP_ADMIN | crate::cred::CAP_WRITE) {
+        Ok(())
+    } else {
+        Err(E_DENIED)
+    }
+}
+
+/// 81（ADR-267）：验证并装载防火墙字节码。见常量 `SYS_FW_LOAD` 的注释。
+#[cfg(feature = "fw")]
+#[inline(never)]
+fn sys_fw_load(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    use crate::network::fw;
+    let len = frame.rsi as usize;
+    let flags = frame.rdx;
+    if len == 0 || flags & !fw::FW_LOAD_ENABLE != 0 {
+        return E_INVALID;
+    }
+    if len > fw::FW_PROG_BYTES_MAX {
+        return E_TOO_LONG;
+    }
+    if let Err(e) = fw_privileged() {
+        return e;
+    }
+    let mut buf = [0u8; fw::FW_PROG_BYTES_MAX];
+    match copy_from_user(frame.rdi, &mut buf[..len]) {
+        Ok(n) if n == len => {}
+        Ok(_) => return E_FAULT,
+        Err(e) => {
+            BAD_PTRS.fetch_add(1, Ordering::Relaxed);
+            return ptr_err_to_ret(e);
+        }
+    }
+    match fw::load(&buf[..len], flags & fw::FW_LOAD_ENABLE != 0) {
+        Ok(gen) => u64::from(gen),
+        Err(_) => E_INVALID,
+    }
+}
+
+/// 82（ADR-267）：防火墙控制。见常量 `SYS_FW_CTL` 的注释。
+#[cfg(feature = "fw")]
+#[inline(never)]
+fn sys_fw_ctl(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    use crate::network::fw;
+    match frame.rdi {
+        fw::FW_CTL_STATS => {
+            if crate::sched::current_cred().is_none() {
+                return E_BAD_HANDLE;
+            }
+            if frame.rdx as usize != fw::FW_STATS_LEN {
+                return E_INVALID;
+            }
+            // 快照在锁内取、锁外拷：copy_to_user 自己取 VMM(20)，不能在 RANK_FW 里。
+            let blk = fw::stats_record();
+            match copy_to_user(&blk, frame.rsi) {
+                Ok(w) if w == blk.len() => w as u64,
+                Ok(_) => E_FAULT,
+                Err(e) => {
+                    BAD_PTRS.fetch_add(1, Ordering::Relaxed);
+                    ptr_err_to_ret(e)
+                }
+            }
+        }
+        fw::FW_CTL_CLEAR | fw::FW_CTL_ENABLE | fw::FW_CTL_DISABLE => {
+            if let Err(e) = fw_privileged() {
+                return e;
+            }
+            match frame.rdi {
+                fw::FW_CTL_CLEAR => {
+                    fw::clear();
+                    0
+                }
+                fw::FW_CTL_ENABLE => {
+                    if fw::enable() { 0 } else { E_NOT_FOUND }
+                }
+                _ => {
+                    fw::disable();
+                    0
+                }
+            }
+        }
+        _ => E_INVALID,
+    }
+}
+
+/// 83（ADR-270）：收走已终止进程。见常量 `SYS_PROC_REAP` 的注释。
+///
+/// 顺序（每一步都有理由）：
+/// 1. `resolve(h, owner, RIGHT_WRITE)`：句柄层校验（权限/世代/所有权）。**不持 HANDLE 锁进后面**——`resolve` 内部取放。
+/// 2. 类型必须是 `Proc`；`proc_live(pid,pgen)` 核世代（已被收过 ⇒ `E_BAD_HANDLE`）。
+/// 3. 不许收自己。
+/// 4. `proc_info.terminated` 为假 ⇒ `E_DENIED`（还在跑，不动）。**先查后收**而不是依赖 `proc_reap` 自己回 `Denied`：
+///    错误码要能区分"还在跑"与"别的失败"，判据才能点名是哪一格拒的。
+/// 5. `proc_reap(pid)`（内部：VMM(20) 内清槽还额度 → 锁外 `aspace_destroy` 与 `release_fd_table`）。
+/// 6. **最后**才 `handle::close(h)`：先关句柄再 reap 的话，reap 失败时调用方已经丢了句柄、僵尸永远收不掉。
+///    关句柄失败（并发被撤销）不影响 reap 结果，退出码照回。
+/// 锁序：`resolve`(35 放掉) → `proc_info/proc_reap`(20) → 锁外 PMM(30) → `handle::close`(35)。无嵌套，不新增锁。
+#[cfg(feature = "handles")]
+#[inline(never)]
+fn sys_proc_reap(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
+    let Some(owner) = crate::sched::current_identity() else { return E_BAD_HANDLE };
+    let h = crate::handle::Handle(frame.rdi);
+    let (obj, _) = match crate::handle::resolve(h, owner, crate::handle::RIGHT_WRITE) {
+        Ok(v) => v,
+        Err(e) => return handle_err(e),
+    };
+    let (pid, pgen) = match obj {
+        crate::handle::ObjRef::Proc { slot, gen } => (slot, gen),
+        _ => return E_DENIED,
+    };
+    if !crate::proc::proc_live(pid, pgen) {
+        return E_BAD_HANDLE;
+    }
+    let me = crate::sched::current_id();
+    if crate::sched::proc_id_of(me) == pid {
+        return E_DENIED;
+    }
+    match crate::proc::proc_info(pid as usize) {
+        Some(info) if info.gen == pgen && info.terminated => {}
+        Some(info) if info.gen == pgen => return E_DENIED, // 还在跑
+        _ => return E_BAD_HANDLE,
+    }
+    let code = match crate::proc::proc_reap_gen(pid, pgen) {
+        Ok(c) => c,
+        // 并发下被别人先收了 / 状态在两次读之间变了：按"句柄已失效"报，不吞成成功。
+        Err(crate::proc::ProcError::NoSuchProc) => return E_BAD_HANDLE,
+        Err(_) => return E_DENIED,
+    };
+    PROC_REAP_CALLS.fetch_add(1, Ordering::Relaxed);
+    let _ = crate::handle::close(h, owner);
+    u64::from(code)
+}
+
+/// 83 号成功次数（判据读数：防空转证人）。
+#[cfg(feature = "handles")]
+static PROC_REAP_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// 读 83 号成功次数。
+#[cfg(feature = "handles")]
+pub fn proc_reap_calls() -> u64 {
+    PROC_REAP_CALLS.load(Ordering::Relaxed)
+}
+
 /// 41（ADR-150）：凭据判据读数（16 字节：lookups/hits/misses/denies）。
 #[cfg(feature = "handles")]
 #[inline(never)]
@@ -3263,9 +3434,16 @@ fn sys_sock_send(frame: &crate::arch::x86_64::trap::TrapFrame) -> u64 {
         // 没 connect 就 send：Linux 回 EDESTADDRREQ（-89）。
         return u64::MAX - 88;
     }
-    // 临时端口：从 49152 起按槽号错开（IANA 动态端口段）
+    // 临时端口（ADR-266，RFC 6056 算法 3）：PRF(目的地, per-boot secret) + 递增计数器，不再按槽号顺序。
+    // `in_use` 传恒假：socket 层没有"端口占用查询"，新增一个要碰 TABLE 锁序（AGENTS：改锁序须先裁决）。
+    // 因此**冲突仍由下面的 `bind` 判定**（同端口被占会回错，调用方可重试）；本处只负责"不可预测"。
+    // secret 未就绪时 `ephemeral` 自行降级为旧公式 `49152+slot` 并计 `ISN_WEAK`。
     if local.port() == 0 {
-        let p = 49152 + slot;
+        let (lip4, rip4, rport) = match (local, peer) {
+            (crate::network::socket::SockAddr::V4 { ip: l, .. }, crate::network::socket::SockAddr::V4 { ip: r, port: rp }) => (l, r, rp),
+            _ => ([0u8; 4], [0u8; 4], peer.port()), // V6：无 4 字节地址，仍用 peer 端口打散
+        };
+        let p = crate::network::isn_source::ephemeral(lip4, rip4, rport, slot, &|_| false);
         local = match local {
             crate::network::socket::SockAddr::V4 { ip, .. } => {
                 crate::network::socket::SockAddr::V4 { ip, port: p }
@@ -5075,6 +5253,20 @@ pub fn syscall_dispatch(frame: &mut crate::arch::x86_64::trap::TrapFrame) -> boo
         SYS_FILE_APPEND => sys_file_append(frame),
         #[cfg(not(all(feature = "handles", feature = "fs-open", feature = "fs-rw")))]
         SYS_FILE_APPEND => nosys(),
+        // ---- 81/82：最小防火墙（ADR-267）。未开 `fw` 档回 E_NOSYS（ADR-176：号在、功能不在）。
+        #[cfg(feature = "fw")]
+        SYS_FW_LOAD => sys_fw_load(frame),
+        #[cfg(not(feature = "fw"))]
+        SYS_FW_LOAD => nosys(),
+        #[cfg(feature = "fw")]
+        SYS_FW_CTL => sys_fw_ctl(frame),
+        #[cfg(not(feature = "fw"))]
+        SYS_FW_CTL => nosys(),
+        // ---- 83：proc_reap（ADR-270）。handles 档才有进程表；其它档回 E_NOSYS（ADR-176：号在、功能不在）。
+        #[cfg(feature = "handles")]
+        SYS_PROC_REAP => sys_proc_reap(frame),
+        #[cfg(not(feature = "handles"))]
+        SYS_PROC_REAP => nosys(),
         // ---- 67/68/69：信号族（ADR-177 决策 1）。
         // **注意 sigreturn 收 `&mut`**：它要整份覆盖当前 frame，`iretq` 才能回到被中断处。
         #[cfg(feature = "handles")]

@@ -1,0 +1,2553 @@
+{
+ "baseline": {
+  "T1": {
+   "cases": 21,
+   "fail": 0,
+   "detail": []
+  },
+  "T2": {
+   "programs": 30000,
+   "accepted": 9283,
+   "violations": 0,
+   "max_steps": 107,
+   "reject_reasons": {
+    "BackwardJump": 2066,
+    "Unreachable": 5132,
+    "Reserved": 1069,
+    "UninitRead": 4926,
+    "BadVerdict": 1051,
+    "BadOpcode": 1001,
+    "FallsOffEnd": 1047,
+    "TooLong": 1066,
+    "BadField": 1016,
+    "JumpOutOfRange": 1318,
+    "BadReg": 1025
+   },
+   "fail": 0,
+   "first": []
+  },
+  "T3": {
+   "programs": 111150,
+   "accepted": 346,
+   "violations": 0,
+   "max_steps": 4,
+   "rejected_but_safe_on_6pkts": 16836,
+   "fail": 0
+  },
+  "T4": {
+   "rulesets": 2343,
+   "evals": 93720,
+   "mismatch": 0,
+   "too_many_insns": 157,
+   "compiled_but_unverified": 0,
+   "max_steps": 75,
+   "fail": 0,
+   "first": []
+  },
+  "T5": {
+   "fail": 0,
+   "detail": []
+  },
+  "T6": {
+   "frames": 47016,
+   "crash": 0,
+   "kernel_port_oob": 0,
+   "kernel_v4_some": 5056,
+   "kernel_v6udp_some": 6091,
+   "kernel_nd_some": 6395,
+   "D1_v4": 0,
+   "D2_v6udp": 0,
+   "D3_nd_containment": 0,
+   "fail": 0,
+   "first": []
+  },
+  "T7": {
+   "fail": 0,
+   "detail": [],
+   "expected_drops": 13853,
+   "expected_udp_drops": 3544,
+   "ndp_branch_frames": 10309,
+   "fw_counters": {
+    "evaluated": 18047,
+    "dropped": 10444,
+    "malformed": 3409
+   }
+  },
+  "_secs": 13.6
+ },
+ "mutants": {
+  "no_backward_check": {
+   "summary": {
+    "T1": 2,
+    "T2": 22,
+    "T3": 4,
+    "T4": 0,
+    "T5": 0,
+    "T6": 0,
+    "T7": 0
+   },
+   "caught": true,
+   "full": {
+    "T1": {
+     "cases": 21,
+     "fail": 2,
+     "detail": [
+      "后向跳转: 坏程序被接受",
+      "自环: 期望 BackwardJump@1，实得 Unreachable@2"
+     ]
+    },
+    "T2": {
+     "programs": 8000,
+     "accepted": 2565,
+     "violations": 22,
+     "max_steps": 105,
+     "reject_reasons": {
+      "UninitRead": 1440,
+      "Unreachable": 1624,
+      "Reserved": 292,
+      "BadVerdict": 293,
+      "BadOpcode": 264,
+      "FallsOffEnd": 291,
+      "TooLong": 301,
+      "BadField": 282,
+      "JumpOutOfRange": 378,
+      "BadReg": 270
+     },
+     "fail": 22,
+     "first": [
+      [
+       [
+        "Fault:StepBudget",
+        "Fault:StepBudget"
+       ],
+       [
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,1,0,0)",
+        "Insn(0x2,2,0,0)",
+        "Insn(0x2,3,0,0)",
+        "Insn(0x10,3,1,58)",
+        "Insn(0x13,3,8,17)",
+        "Insn(0x13,3,6,162605835)",
+        "Insn(0x13,3,0,1)"
+       ]
+      ],
+      [
+       [
+        "Fault:StepBudget"
+       ],
+       [
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,1,0,0)",
+        "Insn(0x2,2,0,0)",
+        "Insn(0x2,3,0,0)",
+        "Insn(0x12,3,0,17)",
+        "Insn(0x1,2,0,4)",
+        "Insn(0x3,3,0,211241614)",
+        "Insn(0x1,0,0,13)"
+       ]
+      ],
+      [
+       [
+        "Fault:StepBudget",
+        "Fault:StepBudget"
+       ],
+       [
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,1,0,0)",
+        "Insn(0x2,2,0,0)",
+        "Insn(0x2,3,0,0)",
+        "Insn(0x12,0,1,0)",
+        "Insn(0x14,0,-1,0)",
+        "Insn(0x14,0,0,0)",
+        "Insn(0x20,0,0,0)"
+       ]
+      ]
+     ]
+    },
+    "T3": {
+     "programs": 6174,
+     "accepted": 56,
+     "violations": 4,
+     "max_steps": 3,
+     "rejected_but_safe_on_6pkts": 864,
+     "fail": 4
+    },
+    "T4": {
+     "rulesets": 758,
+     "evals": 30320,
+     "mismatch": 0,
+     "too_many_insns": 42,
+     "compiled_but_unverified": 0,
+     "max_steps": 72,
+     "fail": 0,
+     "first": []
+    },
+    "T5": {
+     "fail": 0,
+     "detail": []
+    },
+    "T6": {
+     "frames": 47016,
+     "crash": 0,
+     "kernel_port_oob": 0,
+     "kernel_v4_some": 5056,
+     "kernel_v6udp_some": 6091,
+     "kernel_nd_some": 6395,
+     "D1_v4": 0,
+     "D2_v6udp": 0,
+     "D3_nd_containment": 0,
+     "fail": 0,
+     "first": []
+    },
+    "T7": {
+     "fail": 0,
+     "detail": [],
+     "expected_drops": 13853,
+     "expected_udp_drops": 3544,
+     "ndp_branch_frames": 10309,
+     "fw_counters": {
+      "evaluated": 18047,
+      "dropped": 10444,
+      "malformed": 3409
+     }
+    },
+    "_secs": 3.2
+   }
+  },
+  "range_off_by_one": {
+   "summary": {
+    "T1": 3,
+    "T2": 9,
+    "T3": 6,
+    "T4": 0,
+    "T5": 0,
+    "T6": 0,
+    "T7": 0
+   },
+   "caught": true,
+   "full": {
+    "T1": {
+     "cases": 21,
+     "fail": 3,
+     "detail": [
+      "跳出末尾: 坏程序被接受",
+      "JA跳出末尾: 期望 JumpOutOfRange@0，实得 Unreachable@1",
+      "以条件跳转结尾: 期望 JumpOutOfRange@1，实得 FallsOffEnd@None"
+     ]
+    },
+    "T2": {
+     "programs": 8000,
+     "accepted": 2506,
+     "violations": 9,
+     "max_steps": 105,
+     "reject_reasons": {
+      "BackwardJump": 554,
+      "Unreachable": 1398,
+      "Reserved": 293,
+      "UninitRead": 1346,
+      "BadVerdict": 294,
+      "BadOpcode": 265,
+      "FallsOffEnd": 261,
+      "TooLong": 301,
+      "BadField": 282,
+      "JumpOutOfRange": 229,
+      "BadReg": 271
+     },
+     "fail": 9,
+     "first": [
+      [
+       [
+        "Fault:PcOutOfRange",
+        "Fault:PcOutOfRange"
+       ],
+       [
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,1,0,0)",
+        "Insn(0x2,2,0,0)",
+        "Insn(0x2,3,0,0)",
+        "Insn(0x11,3,0,58)",
+        "Insn(0x2,1,0,3988314398)",
+        "Insn(0x1,2,0,3)",
+        "Insn(0x10,3,1,878862293)"
+       ]
+      ],
+      [
+       [
+        "Fault:PcOutOfRange",
+        "Fault:PcOutOfRange"
+       ],
+       [
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,1,0,0)",
+        "Insn(0x2,2,0,0)",
+        "Insn(0x2,3,0,0)",
+        "Insn(0x1,0,0,0)",
+        "Insn(0x3,3,0,255)",
+        "Insn(0x11,0,21,0)",
+        "Insn(0x10,2,13,0)"
+       ]
+      ],
+      [
+       [
+        "Fault:PcOutOfRange",
+        "Fault:PcOutOfRange"
+       ],
+       [
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,1,0,0)",
+        "Insn(0x2,2,0,0)",
+        "Insn(0x2,3,0,0)",
+        "Insn(0x1,3,0,11)",
+        "Insn(0x10,0,3,0)",
+        "Insn(0x2,3,0,2510294371)",
+        "Insn(0x2,0,0,1)"
+       ]
+      ]
+     ]
+    },
+    "T3": {
+     "programs": 6174,
+     "accepted": 58,
+     "violations": 6,
+     "max_steps": 3,
+     "rejected_but_safe_on_6pkts": 864,
+     "fail": 6
+    },
+    "T4": {
+     "rulesets": 758,
+     "evals": 30320,
+     "mismatch": 0,
+     "too_many_insns": 42,
+     "compiled_but_unverified": 0,
+     "max_steps": 72,
+     "fail": 0,
+     "first": []
+    },
+    "T5": {
+     "fail": 0,
+     "detail": []
+    },
+    "T6": {
+     "frames": 47016,
+     "crash": 0,
+     "kernel_port_oob": 0,
+     "kernel_v4_some": 5056,
+     "kernel_v6udp_some": 6091,
+     "kernel_nd_some": 6395,
+     "D1_v4": 0,
+     "D2_v6udp": 0,
+     "D3_nd_containment": 0,
+     "fail": 0,
+     "first": []
+    },
+    "T7": {
+     "fail": 0,
+     "detail": [],
+     "expected_drops": 13853,
+     "expected_udp_drops": 3544,
+     "ndp_branch_frames": 10309,
+     "fw_counters": {
+      "evaluated": 18047,
+      "dropped": 10444,
+      "malformed": 3409
+     }
+    },
+    "_secs": 3.2
+   }
+  },
+  "no_fallsoff_check": {
+   "summary": {
+    "T1": 1,
+    "T2": 121,
+    "T3": 105,
+    "T4": 0,
+    "T5": 0,
+    "T6": 0,
+    "T7": 0
+   },
+   "caught": true,
+   "full": {
+    "T1": {
+     "cases": 21,
+     "fail": 1,
+     "detail": [
+      "无终止: 坏程序被接受"
+     ]
+    },
+    "T2": {
+     "programs": 8000,
+     "accepted": 2607,
+     "violations": 121,
+     "max_steps": 105,
+     "reject_reasons": {
+      "BackwardJump": 553,
+      "Unreachable": 1409,
+      "Reserved": 292,
+      "UninitRead": 1400,
+      "BadVerdict": 293,
+      "BadOpcode": 264,
+      "TooLong": 301,
+      "BadField": 282,
+      "JumpOutOfRange": 329,
+      "BadReg": 270
+     },
+     "fail": 121,
+     "first": [
+      [
+       [
+        "Fault:PcOutOfRange",
+        "Fault:PcOutOfRange"
+       ],
+       [
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,1,0,0)",
+        "Insn(0x2,2,0,0)",
+        "Insn(0x2,3,0,0)",
+        "Insn(0x13,0,1,1)",
+        "Insn(0x13,3,0,53)",
+        "Insn(0x13,0,4,53)",
+        "Insn(0x10,1,0,17)"
+       ]
+      ],
+      [
+       [
+        "Fault:PcOutOfRange",
+        "Fault:PcOutOfRange"
+       ],
+       [
+        "Insn(0x1,2,0,7)",
+        "Insn(0x2,2,0,1)",
+        "Insn(0x1,0,0,2)",
+        "Insn(0x2,0,0,53)",
+        "Insn(0x1,1,0,11)",
+        "Insn(0x1,0,0,8)",
+        "Insn(0x12,1,1,17)",
+        "Insn(0x13,0,1,58)"
+       ]
+      ],
+      [
+       [
+        "Fault:PcOutOfRange",
+        "Fault:PcOutOfRange"
+       ],
+       [
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,1,0,0)",
+        "Insn(0x2,2,0,0)",
+        "Insn(0x2,3,0,0)",
+        "Insn(0x2,1,0,3746096577)",
+        "Insn(0x2,1,0,1248906682)",
+        "Insn(0x12,0,0,53)",
+        "Insn(0x10,2,0,1121227695)"
+       ]
+      ]
+     ]
+    },
+    "T3": {
+     "programs": 6174,
+     "accepted": 157,
+     "violations": 105,
+     "max_steps": 3,
+     "rejected_but_safe_on_6pkts": 864,
+     "fail": 105
+    },
+    "T4": {
+     "rulesets": 758,
+     "evals": 30320,
+     "mismatch": 0,
+     "too_many_insns": 42,
+     "compiled_but_unverified": 0,
+     "max_steps": 72,
+     "fail": 0,
+     "first": []
+    },
+    "T5": {
+     "fail": 0,
+     "detail": []
+    },
+    "T6": {
+     "frames": 47016,
+     "crash": 0,
+     "kernel_port_oob": 0,
+     "kernel_v4_some": 5056,
+     "kernel_v6udp_some": 6091,
+     "kernel_nd_some": 6395,
+     "D1_v4": 0,
+     "D2_v6udp": 0,
+     "D3_nd_containment": 0,
+     "fail": 0,
+     "first": []
+    },
+    "T7": {
+     "fail": 0,
+     "detail": [],
+     "expected_drops": 13853,
+     "expected_udp_drops": 3544,
+     "ndp_branch_frames": 10309,
+     "fw_counters": {
+      "evaluated": 18047,
+      "dropped": 10444,
+      "malformed": 3409
+     }
+    },
+    "_secs": 3.2
+   }
+  },
+  "no_uninit_check": {
+   "summary": {
+    "T1": 3,
+    "T2": 798,
+    "T3": 98,
+    "T4": 0,
+    "T5": 0,
+    "T6": 0,
+    "T7": 0
+   },
+   "caught": true,
+   "full": {
+    "T1": {
+     "cases": 21,
+     "fail": 3,
+     "detail": [
+      "未初始化读(跳转): 坏程序被接受",
+      "未初始化读(AND): 坏程序被接受",
+      "单路径未初始化(需交集): 坏程序被接受"
+     ]
+    },
+    "T2": {
+     "programs": 8000,
+     "accepted": 3287,
+     "violations": 798,
+     "max_steps": 105,
+     "reject_reasons": {
+      "BackwardJump": 553,
+      "Unreachable": 1874,
+      "Reserved": 292,
+      "BadVerdict": 293,
+      "BadOpcode": 264,
+      "FallsOffEnd": 255,
+      "TooLong": 301,
+      "BadField": 282,
+      "JumpOutOfRange": 329,
+      "BadReg": 270
+     },
+     "fail": 798,
+     "first": [
+      [
+       [
+        "uninit_read",
+        "uninit_read"
+       ],
+       [
+        "Insn(0x11,1,1,1351907531)",
+        "Insn(0x1,0,0,5)",
+        "Insn(0x20,0,0,0)"
+       ]
+      ],
+      [
+       [
+        "uninit_read",
+        "uninit_read"
+       ],
+       [
+        "Insn(0x12,0,1,1)",
+        "Insn(0x11,0,0,1)",
+        "Insn(0x12,3,0,58)",
+        "Insn(0x1,0,0,13)",
+        "Insn(0x13,2,9,4034525293)",
+        "Insn(0x11,0,44,58)",
+        "Insn(0x12,3,0,53)",
+        "Insn(0x2,2,0,2531035180)"
+       ]
+      ],
+      [
+       [
+        "uninit_read",
+        "uninit_read"
+       ],
+       [
+        "Insn(0x12,2,1,17)",
+        "Insn(0x1,2,0,10)",
+        "Insn(0x2,1,0,0)",
+        "Insn(0x1,3,0,4)",
+        "Insn(0x3,2,0,2864412165)",
+        "Insn(0x10,0,0,0)",
+        "Insn(0x10,0,1,58)",
+        "Insn(0x11,0,1,17)"
+       ]
+      ]
+     ]
+    },
+    "T3": {
+     "programs": 6174,
+     "accepted": 150,
+     "violations": 98,
+     "max_steps": 3,
+     "rejected_but_safe_on_6pkts": 864,
+     "fail": 98
+    },
+    "T4": {
+     "rulesets": 758,
+     "evals": 30320,
+     "mismatch": 0,
+     "too_many_insns": 42,
+     "compiled_but_unverified": 0,
+     "max_steps": 72,
+     "fail": 0,
+     "first": []
+    },
+    "T5": {
+     "fail": 0,
+     "detail": []
+    },
+    "T6": {
+     "frames": 47016,
+     "crash": 0,
+     "kernel_port_oob": 0,
+     "kernel_v4_some": 5056,
+     "kernel_v6udp_some": 6091,
+     "kernel_nd_some": 6395,
+     "D1_v4": 0,
+     "D2_v6udp": 0,
+     "D3_nd_containment": 0,
+     "fail": 0,
+     "first": []
+    },
+    "T7": {
+     "fail": 0,
+     "detail": [],
+     "expected_drops": 13853,
+     "expected_udp_drops": 3544,
+     "ndp_branch_frames": 10309,
+     "fw_counters": {
+      "evaluated": 18047,
+      "dropped": 10444,
+      "malformed": 3409
+     }
+    },
+    "_secs": 3.2
+   }
+  },
+  "no_reg_check": {
+   "summary": {
+    "T1": 1,
+    "T2": 62,
+    "T3": 20,
+    "T4": 0,
+    "T5": 0,
+    "T6": 0,
+    "T7": 0
+   },
+   "caught": true,
+   "full": {
+    "T1": {
+     "cases": 21,
+     "fail": 1,
+     "detail": [
+      "寄存器越界: 坏程序被接受"
+     ]
+    },
+    "T2": {
+     "programs": 8000,
+     "accepted": 2551,
+     "violations": 62,
+     "max_steps": 105,
+     "reject_reasons": {
+      "BackwardJump": 553,
+      "Unreachable": 1399,
+      "Reserved": 292,
+      "UninitRead": 1457,
+      "BadVerdict": 293,
+      "BadOpcode": 264,
+      "FallsOffEnd": 279,
+      "TooLong": 301,
+      "BadField": 282,
+      "JumpOutOfRange": 329
+     },
+     "fail": 62,
+     "first": [
+      [
+       [
+        "Fault:BadReg",
+        "Fault:BadReg"
+       ],
+       [
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,1,0,0)",
+        "Insn(0x2,2,0,0)",
+        "Insn(0x2,3,0,0)",
+        "Insn(0x11,0,0,1)",
+        "Insn(0x1,78,0,10)",
+        "Insn(0x11,3,0,17)",
+        "Insn(0x1,0,0,4)"
+       ]
+      ],
+      [
+       [
+        "Fault:BadReg",
+        "Fault:BadReg"
+       ],
+       [
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,16,0,0)",
+        "Insn(0x2,2,0,0)",
+        "Insn(0x2,3,0,0)",
+        "Insn(0x2,2,0,3226048427)",
+        "Insn(0x20,0,0,1)"
+       ]
+      ],
+      [
+       [
+        "Fault:BadReg",
+        "Fault:BadReg"
+       ],
+       [
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,1,0,0)",
+        "Insn(0x2,2,0,0)",
+        "Insn(0x2,123,0,0)",
+        "Insn(0x1,2,0,6)",
+        "Insn(0x13,2,0,58)",
+        "Insn(0x20,0,0,0)"
+       ]
+      ]
+     ]
+    },
+    "T3": {
+     "programs": 6174,
+     "accepted": 72,
+     "violations": 20,
+     "max_steps": 3,
+     "rejected_but_safe_on_6pkts": 864,
+     "fail": 20
+    },
+    "T4": {
+     "rulesets": 758,
+     "evals": 30320,
+     "mismatch": 0,
+     "too_many_insns": 42,
+     "compiled_but_unverified": 0,
+     "max_steps": 72,
+     "fail": 0,
+     "first": []
+    },
+    "T5": {
+     "fail": 0,
+     "detail": []
+    },
+    "T6": {
+     "frames": 47016,
+     "crash": 0,
+     "kernel_port_oob": 0,
+     "kernel_v4_some": 5056,
+     "kernel_v6udp_some": 6091,
+     "kernel_nd_some": 6395,
+     "D1_v4": 0,
+     "D2_v6udp": 0,
+     "D3_nd_containment": 0,
+     "fail": 0,
+     "first": []
+    },
+    "T7": {
+     "fail": 0,
+     "detail": [],
+     "expected_drops": 13853,
+     "expected_udp_drops": 3544,
+     "ndp_branch_frames": 10309,
+     "fw_counters": {
+      "evaluated": 18047,
+      "dropped": 10444,
+      "malformed": 3409
+     }
+    },
+    "_secs": 3.2
+   }
+  },
+  "no_field_check": {
+   "summary": {
+    "T1": 1,
+    "T2": 89,
+    "T3": 24,
+    "T4": 0,
+    "T5": 0,
+    "T6": 0,
+    "T7": 0
+   },
+   "caught": true,
+   "full": {
+    "T1": {
+     "cases": 21,
+     "fail": 1,
+     "detail": [
+      "字段越界: 坏程序被接受"
+     ]
+    },
+    "T2": {
+     "programs": 8000,
+     "accepted": 2593,
+     "violations": 89,
+     "max_steps": 105,
+     "reject_reasons": {
+      "BackwardJump": 553,
+      "Unreachable": 1418,
+      "Reserved": 292,
+      "UninitRead": 1401,
+      "BadVerdict": 293,
+      "BadOpcode": 264,
+      "FallsOffEnd": 281,
+      "TooLong": 301,
+      "JumpOutOfRange": 334,
+      "BadReg": 270
+     },
+     "fail": 89,
+     "first": [
+      [
+       [
+        "Fault:BadField",
+        "Fault:BadField"
+       ],
+       [
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,1,0,0)",
+        "Insn(0x2,2,0,0)",
+        "Insn(0x2,3,0,0)",
+        "Insn(0x1,2,0,11)",
+        "Insn(0x1,1,0,11)",
+        "Insn(0x1,0,0,5)",
+        "Insn(0x2,1,0,3532312544)"
+       ]
+      ],
+      [
+       [
+        "Fault:BadField",
+        "Fault:BadField"
+       ],
+       [
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,1,0,0)",
+        "Insn(0x2,2,0,0)",
+        "Insn(0x2,3,0,0)",
+        "Insn(0x1,0,0,255)",
+        "Insn(0x1,1,0,10)",
+        "Insn(0x13,0,1,17)",
+        "Insn(0x13,0,0,0)"
+       ]
+      ],
+      [
+       [
+        "Fault:BadField",
+        "Fault:BadField"
+       ],
+       [
+        "Insn(0x1,0,0,255)",
+        "Insn(0x20,0,0,1)"
+       ]
+      ]
+     ]
+    },
+    "T3": {
+     "programs": 6174,
+     "accepted": 76,
+     "violations": 24,
+     "max_steps": 3,
+     "rejected_but_safe_on_6pkts": 864,
+     "fail": 24
+    },
+    "T4": {
+     "rulesets": 758,
+     "evals": 30320,
+     "mismatch": 0,
+     "too_many_insns": 42,
+     "compiled_but_unverified": 0,
+     "max_steps": 72,
+     "fail": 0,
+     "first": []
+    },
+    "T5": {
+     "fail": 0,
+     "detail": []
+    },
+    "T6": {
+     "frames": 47016,
+     "crash": 0,
+     "kernel_port_oob": 0,
+     "kernel_v4_some": 5056,
+     "kernel_v6udp_some": 6091,
+     "kernel_nd_some": 6395,
+     "D1_v4": 0,
+     "D2_v6udp": 0,
+     "D3_nd_containment": 0,
+     "fail": 0,
+     "first": []
+    },
+    "T7": {
+     "fail": 0,
+     "detail": [],
+     "expected_drops": 13853,
+     "expected_udp_drops": 3544,
+     "ndp_branch_frames": 10309,
+     "fw_counters": {
+      "evaluated": 18047,
+      "dropped": 10444,
+      "malformed": 3409
+     }
+    },
+    "_secs": 3.2
+   }
+  },
+  "no_opcode_check": {
+   "summary": {
+    "T1": 1,
+    "T2": 93,
+    "T3": 0,
+    "T4": 0,
+    "T5": 0,
+    "T6": 0,
+    "T7": 0
+   },
+   "caught": true,
+   "full": {
+    "T1": {
+     "cases": 21,
+     "fail": 1,
+     "detail": [
+      "非法操作码: 坏程序被接受"
+     ]
+    },
+    "T2": {
+     "programs": 8000,
+     "accepted": 2594,
+     "violations": 93,
+     "max_steps": 105,
+     "reject_reasons": {
+      "BackwardJump": 553,
+      "Unreachable": 1403,
+      "Reserved": 292,
+      "UninitRead": 1399,
+      "BadVerdict": 293,
+      "FallsOffEnd": 281,
+      "TooLong": 301,
+      "BadField": 282,
+      "JumpOutOfRange": 332,
+      "BadReg": 270
+     },
+     "fail": 93,
+     "first": [
+      [
+       [
+        "Fault:BadOpcode",
+        "Fault:BadOpcode"
+       ],
+       [
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,1,0,0)",
+        "Insn(0xff,0,0,0)",
+        "Insn(0x2,3,0,0)",
+        "Insn(0x2,2,0,0)",
+        "Insn(0x13,3,1,2637242304)",
+        "Insn(0x10,1,0,457766264)",
+        "Insn(0x20,0,0,1)"
+       ]
+      ],
+      [
+       [
+        "Fault:BadOpcode",
+        "Fault:BadOpcode"
+       ],
+       [
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,1,0,0)",
+        "Insn(0x2,2,0,0)",
+        "Insn(0x15,0,0,0)",
+        "Insn(0x14,0,0,0)",
+        "Insn(0x20,0,0,1)"
+       ]
+      ],
+      [
+       [
+        "Fault:BadOpcode",
+        "Fault:BadOpcode"
+       ],
+       [
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,1,0,0)",
+        "Insn(0x2,2,0,0)",
+        "Insn(0x2,3,0,0)",
+        "Insn(0x2,0,0,1)",
+        "Insn(0x1,0,0,13)",
+        "Insn(0x2,3,0,3306773506)",
+        "Insn(0x15,0,0,0)"
+       ]
+      ]
+     ]
+    },
+    "T3": {
+     "programs": 6174,
+     "accepted": 52,
+     "violations": 0,
+     "max_steps": 3,
+     "rejected_but_safe_on_6pkts": 864,
+     "fail": 0
+    },
+    "T4": {
+     "rulesets": 758,
+     "evals": 30320,
+     "mismatch": 0,
+     "too_many_insns": 42,
+     "compiled_but_unverified": 0,
+     "max_steps": 72,
+     "fail": 0,
+     "first": []
+    },
+    "T5": {
+     "fail": 0,
+     "detail": []
+    },
+    "T6": {
+     "frames": 47016,
+     "crash": 0,
+     "kernel_port_oob": 0,
+     "kernel_v4_some": 5056,
+     "kernel_v6udp_some": 6091,
+     "kernel_nd_some": 6395,
+     "D1_v4": 0,
+     "D2_v6udp": 0,
+     "D3_nd_containment": 0,
+     "fail": 0,
+     "first": []
+    },
+    "T7": {
+     "fail": 0,
+     "detail": [],
+     "expected_drops": 13853,
+     "expected_udp_drops": 3544,
+     "ndp_branch_frames": 10309,
+     "fw_counters": {
+      "evaluated": 18047,
+      "dropped": 10444,
+      "malformed": 3409
+     }
+    },
+    "_secs": 3.2
+   }
+  },
+  "no_verdict_check": {
+   "summary": {
+    "T1": 1,
+    "T2": 28,
+    "T3": 26,
+    "T4": 0,
+    "T5": 0,
+    "T6": 0,
+    "T7": 0
+   },
+   "caught": true,
+   "full": {
+    "T1": {
+     "cases": 21,
+     "fail": 1,
+     "detail": [
+      "非法判决: 坏程序被接受"
+     ]
+    },
+    "T2": {
+     "programs": 8000,
+     "accepted": 2523,
+     "violations": 28,
+     "max_steps": 105,
+     "reject_reasons": {
+      "BackwardJump": 553,
+      "Unreachable": 1544,
+      "Reserved": 292,
+      "UninitRead": 1383,
+      "BadOpcode": 264,
+      "FallsOffEnd": 255,
+      "TooLong": 301,
+      "BadField": 282,
+      "JumpOutOfRange": 333,
+      "BadReg": 270
+     },
+     "fail": 28,
+     "first": [
+      [
+       [
+        "Fault:BadVerdict",
+        "Fault:BadVerdict"
+       ],
+       [
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,1,0,0)",
+        "Insn(0x2,2,0,0)",
+        "Insn(0x2,3,0,0)",
+        "Insn(0x1,0,0,5)",
+        "Insn(0x11,0,0,53)",
+        "Insn(0x11,0,3,0)",
+        "Insn(0x3,2,0,255)"
+       ]
+      ],
+      [
+       [
+        "Fault:BadVerdict",
+        "Fault:BadVerdict"
+       ],
+       [
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,1,0,0)",
+        "Insn(0x2,2,0,0)",
+        "Insn(0x2,3,0,0)",
+        "Insn(0x13,3,1,58)",
+        "Insn(0x13,2,1,1)",
+        "Insn(0x3,3,0,255)",
+        "Insn(0x10,1,1,17)"
+       ]
+      ],
+      [
+       [
+        "Fault:BadVerdict",
+        "Fault:BadVerdict"
+       ],
+       [
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,1,0,0)",
+        "Insn(0x2,2,0,0)",
+        "Insn(0x2,3,0,0)",
+        "Insn(0x20,0,0,4294967295)"
+       ]
+      ]
+     ]
+    },
+    "T3": {
+     "programs": 6174,
+     "accepted": 78,
+     "violations": 26,
+     "max_steps": 3,
+     "rejected_but_safe_on_6pkts": 864,
+     "fail": 26
+    },
+    "T4": {
+     "rulesets": 758,
+     "evals": 30320,
+     "mismatch": 0,
+     "too_many_insns": 42,
+     "compiled_but_unverified": 0,
+     "max_steps": 72,
+     "fail": 0,
+     "first": []
+    },
+    "T5": {
+     "fail": 0,
+     "detail": []
+    },
+    "T6": {
+     "frames": 47016,
+     "crash": 0,
+     "kernel_port_oob": 0,
+     "kernel_v4_some": 5056,
+     "kernel_v6udp_some": 6091,
+     "kernel_nd_some": 6395,
+     "D1_v4": 0,
+     "D2_v6udp": 0,
+     "D3_nd_containment": 0,
+     "fail": 0,
+     "first": []
+    },
+    "T7": {
+     "fail": 0,
+     "detail": [],
+     "expected_drops": 13853,
+     "expected_udp_drops": 3544,
+     "ndp_branch_frames": 10309,
+     "fw_counters": {
+      "evaluated": 18047,
+      "dropped": 10444,
+      "malformed": 3409
+     }
+    },
+    "_secs": 3.2
+   }
+  },
+  "merge_union": {
+   "summary": {
+    "T1": 1,
+    "T2": 4,
+    "T3": 0,
+    "T4": 0,
+    "T5": 0,
+    "T6": 0,
+    "T7": 0
+   },
+   "caught": true,
+   "full": {
+    "T1": {
+     "cases": 21,
+     "fail": 1,
+     "detail": [
+      "单路径未初始化(需交集): 坏程序被接受"
+     ]
+    },
+    "T2": {
+     "programs": 8000,
+     "accepted": 2490,
+     "violations": 4,
+     "max_steps": 105,
+     "reject_reasons": {
+      "BackwardJump": 553,
+      "Unreachable": 1352,
+      "Reserved": 292,
+      "UninitRead": 1319,
+      "BadVerdict": 293,
+      "BadOpcode": 264,
+      "FallsOffEnd": 255,
+      "TooLong": 301,
+      "BadField": 282,
+      "JumpOutOfRange": 329,
+      "BadReg": 270
+     },
+     "fail": 4,
+     "first": [
+      [
+       [
+        "uninit_read",
+        "uninit_read"
+       ],
+       [
+        "Insn(0x1,2,0,3)",
+        "Insn(0x14,0,0,0)",
+        "Insn(0x2,3,0,1)",
+        "Insn(0x1,0,0,0)",
+        "Insn(0x1,0,0,11)",
+        "Insn(0x13,3,19,53)",
+        "Insn(0x11,0,0,17)",
+        "Insn(0x1,0,0,4)"
+       ]
+      ],
+      [
+       [
+        "uninit_read",
+        "uninit_read"
+       ],
+       [
+        "Insn(0x2,3,0,53)",
+        "Insn(0x12,3,1,1785946693)",
+        "Insn(0x1,0,0,11)",
+        "Insn(0x2,2,0,1)",
+        "Insn(0x12,3,0,17)",
+        "Insn(0x1,1,0,1)",
+        "Insn(0x11,0,0,53)",
+        "Insn(0x2,2,0,1265785364)"
+       ]
+      ],
+      [
+       [
+        "uninit_read",
+        "uninit_read"
+       ],
+       [
+        "Insn(0x1,2,0,5)",
+        "Insn(0x1,0,0,12)",
+        "Insn(0x11,0,2,58)",
+        "Insn(0x1,1,0,13)",
+        "Insn(0x14,0,0,0)",
+        "Insn(0x13,0,0,53)",
+        "Insn(0x3,0,0,255)",
+        "Insn(0x11,0,1,1)"
+       ]
+      ]
+     ]
+    },
+    "T3": {
+     "programs": 6174,
+     "accepted": 52,
+     "violations": 0,
+     "max_steps": 3,
+     "rejected_but_safe_on_6pkts": 864,
+     "fail": 0
+    },
+    "T4": {
+     "rulesets": 758,
+     "evals": 30320,
+     "mismatch": 0,
+     "too_many_insns": 42,
+     "compiled_but_unverified": 0,
+     "max_steps": 72,
+     "fail": 0,
+     "first": []
+    },
+    "T5": {
+     "fail": 0,
+     "detail": []
+    },
+    "T6": {
+     "frames": 47016,
+     "crash": 0,
+     "kernel_port_oob": 0,
+     "kernel_v4_some": 5056,
+     "kernel_v6udp_some": 6091,
+     "kernel_nd_some": 6395,
+     "D1_v4": 0,
+     "D2_v6udp": 0,
+     "D3_nd_containment": 0,
+     "fail": 0,
+     "first": []
+    },
+    "T7": {
+     "fail": 0,
+     "detail": [],
+     "expected_drops": 13853,
+     "expected_udp_drops": 3544,
+     "ndp_branch_frames": 10309,
+     "fw_counters": {
+      "evaluated": 18047,
+      "dropped": 10444,
+      "malformed": 3409
+     }
+    },
+    "_secs": 3.2
+   }
+  },
+  "no_toolong_check": {
+   "summary": {
+    "T1": 1,
+    "T2": 86,
+    "T3": 0,
+    "T4": 0,
+    "T5": 1,
+    "T6": 0,
+    "T7": 0
+   },
+   "caught": true,
+   "full": {
+    "T1": {
+     "cases": 21,
+     "fail": 1,
+     "detail": [
+      "超长129: 坏程序被接受"
+     ]
+    },
+    "T2": {
+     "programs": 8000,
+     "accepted": 2638,
+     "violations": 86,
+     "max_steps": 128,
+     "reject_reasons": {
+      "BackwardJump": 553,
+      "Unreachable": 1437,
+      "Reserved": 292,
+      "UninitRead": 1383,
+      "BadVerdict": 293,
+      "BadOpcode": 264,
+      "FallsOffEnd": 255,
+      "BadField": 282,
+      "JumpOutOfRange": 333,
+      "BadReg": 270
+     },
+     "fail": 86,
+     "first": [
+      [
+       [
+        "Fault:StepBudget",
+        "Fault:StepBudget"
+       ],
+       [
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,0,0,0)"
+       ]
+      ],
+      [
+       [
+        "Fault:StepBudget",
+        "Fault:StepBudget"
+       ],
+       [
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,0,0,0)"
+       ]
+      ],
+      [
+       [
+        "Fault:StepBudget",
+        "Fault:StepBudget"
+       ],
+       [
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,0,0,0)",
+        "Insn(0x2,0,0,0)"
+       ]
+      ]
+     ]
+    },
+    "T3": {
+     "programs": 6174,
+     "accepted": 52,
+     "violations": 0,
+     "max_steps": 3,
+     "rejected_but_safe_on_6pkts": 864,
+     "fail": 0
+    },
+    "T4": {
+     "rulesets": 758,
+     "evals": 30320,
+     "mismatch": 0,
+     "too_many_insns": 42,
+     "compiled_but_unverified": 0,
+     "max_steps": 72,
+     "fail": 0,
+     "first": []
+    },
+    "T5": {
+     "fail": 1,
+     "detail": [
+      "129 条程序被验证器接受"
+     ]
+    },
+    "T6": {
+     "frames": 47016,
+     "crash": 0,
+     "kernel_port_oob": 0,
+     "kernel_v4_some": 5056,
+     "kernel_v6udp_some": 6091,
+     "kernel_nd_some": 6395,
+     "D1_v4": 0,
+     "D2_v6udp": 0,
+     "D3_nd_containment": 0,
+     "fail": 0,
+     "first": []
+    },
+    "T7": {
+     "fail": 0,
+     "detail": [],
+     "expected_drops": 13853,
+     "expected_udp_drops": 3544,
+     "ndp_branch_frames": 10309,
+     "fw_counters": {
+      "evaluated": 18047,
+      "dropped": 10444,
+      "malformed": 3409
+     }
+    },
+    "_secs": 3.3
+   }
+  },
+  "no_unreachable_check": {
+   "summary": {
+    "T1": 2,
+    "T2": 0,
+    "T3": 0,
+    "T4": 0,
+    "T5": 0,
+    "T6": 0,
+    "T7": 0
+   },
+   "caught": true,
+   "full": {
+    "T1": {
+     "cases": 21,
+     "fail": 2,
+     "detail": [
+      "不可达尾: 坏程序被接受",
+      "不可达中段: 坏程序被接受"
+     ]
+    },
+    "T2": {
+     "programs": 8000,
+     "accepted": 2559,
+     "violations": 0,
+     "max_steps": 105,
+     "reject_reasons": {
+      "BackwardJump": 553,
+      "UninitRead": 2602,
+      "Reserved": 292,
+      "BadVerdict": 293,
+      "BadOpcode": 264,
+      "FallsOffEnd": 255,
+      "TooLong": 301,
+      "BadField": 282,
+      "JumpOutOfRange": 329,
+      "BadReg": 270
+     },
+     "fail": 0,
+     "first": []
+    },
+    "T3": {
+     "programs": 6174,
+     "accepted": 108,
+     "violations": 0,
+     "max_steps": 3,
+     "rejected_but_safe_on_6pkts": 808,
+     "fail": 0
+    },
+    "T4": {
+     "rulesets": 758,
+     "evals": 30320,
+     "mismatch": 0,
+     "too_many_insns": 42,
+     "compiled_but_unverified": 0,
+     "max_steps": 72,
+     "fail": 0,
+     "first": []
+    },
+    "T5": {
+     "fail": 0,
+     "detail": []
+    },
+    "T6": {
+     "frames": 47016,
+     "crash": 0,
+     "kernel_port_oob": 0,
+     "kernel_v4_some": 5056,
+     "kernel_v6udp_some": 6091,
+     "kernel_nd_some": 6395,
+     "D1_v4": 0,
+     "D2_v6udp": 0,
+     "D3_nd_containment": 0,
+     "fail": 0,
+     "first": []
+    },
+    "T7": {
+     "fail": 0,
+     "detail": [],
+     "expected_drops": 13853,
+     "expected_udp_drops": 3544,
+     "ndp_branch_frames": 10309,
+     "fw_counters": {
+      "evaluated": 18047,
+      "dropped": 10444,
+      "malformed": 3409
+     }
+    },
+    "_secs": 3.2
+   }
+  },
+  "no_reserved_check": {
+   "summary": {
+    "T1": 3,
+    "T2": 0,
+    "T3": 0,
+    "T4": 0,
+    "T5": 0,
+    "T6": 0,
+    "T7": 0
+   },
+   "caught": true,
+   "full": {
+    "T1": {
+     "cases": 21,
+     "fail": 3,
+     "detail": [
+      "保留位LDF.off: 坏程序被接受",
+      "保留位JA.a: 坏程序被接受",
+      "保留位RET.a: 坏程序被接受"
+     ]
+    },
+    "T2": {
+     "programs": 8000,
+     "accepted": 2554,
+     "violations": 0,
+     "max_steps": 105,
+     "reject_reasons": {
+      "BackwardJump": 553,
+      "Unreachable": 1486,
+      "UninitRead": 1401,
+      "BadVerdict": 293,
+      "BadOpcode": 264,
+      "FallsOffEnd": 266,
+      "TooLong": 301,
+      "BadField": 282,
+      "JumpOutOfRange": 330,
+      "BadReg": 270
+     },
+     "fail": 0,
+     "first": []
+    },
+    "T3": {
+     "programs": 6174,
+     "accepted": 52,
+     "violations": 0,
+     "max_steps": 3,
+     "rejected_but_safe_on_6pkts": 864,
+     "fail": 0
+    },
+    "T4": {
+     "rulesets": 758,
+     "evals": 30320,
+     "mismatch": 0,
+     "too_many_insns": 42,
+     "compiled_but_unverified": 0,
+     "max_steps": 72,
+     "fail": 0,
+     "first": []
+    },
+    "T5": {
+     "fail": 0,
+     "detail": []
+    },
+    "T6": {
+     "frames": 47016,
+     "crash": 0,
+     "kernel_port_oob": 0,
+     "kernel_v4_some": 5056,
+     "kernel_v6udp_some": 6091,
+     "kernel_nd_some": 6395,
+     "D1_v4": 0,
+     "D2_v6udp": 0,
+     "D3_nd_containment": 0,
+     "fail": 0,
+     "first": []
+    },
+    "T7": {
+     "fail": 0,
+     "detail": [],
+     "expected_drops": 13853,
+     "expected_udp_drops": 3544,
+     "ndp_branch_frames": 10309,
+     "fw_counters": {
+      "evaluated": 18047,
+      "dropped": 10444,
+      "malformed": 3409
+     }
+    },
+    "_secs": 3.2
+   }
+  },
+  "exec_swap_lt_gt": {
+   "summary": {
+    "T1": 0,
+    "T2": 0,
+    "T3": 0,
+    "T4": 1461,
+    "T5": 0,
+    "T6": 0,
+    "T7": 0
+   },
+   "caught": true,
+   "full": {
+    "T1": {
+     "cases": 21,
+     "fail": 0,
+     "detail": []
+    },
+    "T2": {
+     "programs": 8000,
+     "accepted": 2485,
+     "violations": 0,
+     "max_steps": 94,
+     "reject_reasons": {
+      "BackwardJump": 553,
+      "Unreachable": 1348,
+      "Reserved": 292,
+      "UninitRead": 1328,
+      "BadVerdict": 293,
+      "BadOpcode": 264,
+      "FallsOffEnd": 255,
+      "TooLong": 301,
+      "BadField": 282,
+      "JumpOutOfRange": 329,
+      "BadReg": 270
+     },
+     "fail": 0,
+     "first": []
+    },
+    "T3": {
+     "programs": 6174,
+     "accepted": 52,
+     "violations": 0,
+     "max_steps": 3,
+     "rejected_but_safe_on_6pkts": 868,
+     "fail": 0
+    },
+    "T4": {
+     "rulesets": 758,
+     "evals": 30320,
+     "mismatch": 1461,
+     "too_many_insns": 42,
+     "compiled_but_unverified": 0,
+     "max_steps": 73,
+     "fail": 1461,
+     "first": [
+      "want=Accept got=Drop pkt=Packet(6, 204, 0, b'\\x83\\x17\\x19v\\xe8\\x9e\\x1b\\x83b6c\\xb1\\xf2\\x05\\xdd\\xb9', b'\\xa3N\\xf7\\x87\\xe7\\x8dN\\xd8\\xc0\\x81;\\xc7\\xc0U.\\xf0', 50062, 65535, 190) rules=[Rule(dir=0,fam=6,proto=None,src=(b'=\\xa90\\x19\\x9b\\x87xM,\\x7f)A2j\\x81\\xd1', 64),dst=None,sp=None,dp=None,Accept), Rule(dir=1,fam=None,proto=58,src=None,dst=None,sp=None,dp=(30920, 65535),Accept), Rule(dir=0,fam=6,proto=None,src=None,dst=None,sp=(0, 1897),dp=(33609, 34664),Accept), Rule(dir=0,fam=4,proto=17,src=None,dst=None,sp=(0, 65535),dp=None,Drop), Rule(dir=0,fam=None,proto=None,src=None,dst=None,sp=(10342, 65534),dp=(65535, 65535),Accept), Rule(dir=0,fam=None,proto=None,src=None,dst=None,sp=(1024, 1024),dp=(0, 65535),Drop), Rule(dir=0,fam=None,proto=17,src=None,dst=None,sp=None,dp=(0, 65535),Accept), Rule(dir=1,fam=6,proto=58,src=None,dst=None,sp=None,dp=(0, 65535),Accept), Rule(dir=0,fam=None,proto=17,src=None,dst=None,sp=(1, 65535),dp=(1024, 65534),Drop), Rule(dir=0,fam=None,proto=None,src=None,dst=None,sp=(0, 0),dp=None,Accept), Rule(dir=0,fam=4,proto=58,src=(b'\\x13\\x8d\\xfei\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00', 9),dst=(b',au`\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00', 7),sp=(1, 65535),dp=(8978, 65534),Drop), Rule(dir=0,fam=4,proto=17,src=(b'+\\nC\\x05\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00', 24),dst=None,sp=(53, 53),dp=(50062, 50062),Drop)]",
+      "want=Drop got=Accept pkt=Packet(6, 58, 0, b\"\\x078\\x9b$}'\\xcdQJ;\\x7fOV!E\\xe1\", b'O\\xdd\\xda_\\xda\\xd5s2\\xd1h\\x06\\x03\\xac\\xe4\\x8e\\xae', 45068, 12381, 154) rules=[Rule(dir=0,fam=6,proto=17,src=None,dst=None,sp=None,dp=(15027, 65535),Drop), Rule(dir=0,fam=None,proto=58,src=None,dst=None,sp=(1, 65534),dp=(1024, 65534),Drop), Rule(dir=0,fam=4,proto=58,src=(b'\\xd6]nw\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00', 32),dst=None,sp=(45069, 45069),dp=(1, 1),Drop)]",
+      "want=Accept got=Drop pkt=Packet(6, 17, 0, b'\\x8a\\x9b\\x00\\x82\\x97\\x80\\x94\\xd5\\xf2n\\xe7\\x01\\xf2\\xfeC\\\\', b'\\x93\\xd3\\xd7x\\x90\\xb5MY\\xdc\\x02\\x1f\\x85\\xf1\\x1eaD', 0, 5353, 212) rules=[Rule(dir=0,fam=6,proto=17,src=None,dst=None,sp=None,dp=(15027, 65535),Drop), Rule(dir=0,fam=None,proto=58,src=None,dst=None,sp=(1, 65534),dp=(1024, 65534),Drop), Rule(dir=0,fam=4,proto=58,src=(b'\\xd6]nw\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00', 32),dst=None,sp=(45069, 45069),dp=(1, 1),Drop)]"
+     ]
+    },
+    "T5": {
+     "fail": 0,
+     "detail": []
+    },
+    "T6": {
+     "frames": 47016,
+     "crash": 0,
+     "kernel_port_oob": 0,
+     "kernel_v4_some": 5056,
+     "kernel_v6udp_some": 6091,
+     "kernel_nd_some": 6395,
+     "D1_v4": 0,
+     "D2_v6udp": 0,
+     "D3_nd_containment": 0,
+     "fail": 0,
+     "first": []
+    },
+    "T7": {
+     "fail": 0,
+     "detail": [],
+     "expected_drops": 13853,
+     "expected_udp_drops": 3544,
+     "ndp_branch_frames": 10309,
+     "fw_counters": {
+      "evaluated": 18047,
+      "dropped": 10444,
+      "malformed": 3409
+     }
+    },
+    "_secs": 3.3
+   }
+  },
+  "exec_target_off_by_one": {
+   "summary": {
+    "T1": 17,
+    "T2": 0,
+    "T3": 0,
+    "T4": 643,
+    "T5": 1,
+    "T6": 0,
+    "T7": 1
+   },
+   "caught": true,
+   "full": {
+    "T1": {
+     "cases": 21,
+     "fail": 17,
+     "detail": [
+      "不对齐: 最小对的好程序被拒 VErr(Unreachable,3,None)",
+      "保留位JA.a: 最小对的好程序被拒 VErr(BackwardJump,0,None)",
+      "后向跳转: 最小对的好程序被拒 VErr(BackwardJump,1,None)",
+      "自环: 最小对的好程序被拒 VErr(BackwardJump,1,None)",
+      "跳出末尾: 坏程序被接受",
+      "跳出末尾: 最小对的好程序被拒 VErr(BackwardJump,1,None)",
+      "JA跳出末尾: 坏程序被接受",
+      "JA跳出末尾: 最小对的好程序被拒 VErr(BackwardJump,0,None)",
+      "以条件跳转结尾: 期望 JumpOutOfRange@1，实得 BackwardJump@1",
+      "以条件跳转结尾: 最小对的好程序被拒 VErr(BackwardJump,1,None)"
+     ]
+    },
+    "T2": {
+     "programs": 8000,
+     "accepted": 727,
+     "violations": 0,
+     "max_steps": 31,
+     "reject_reasons": {
+      "BackwardJump": 6127,
+      "BadVerdict": 130,
+      "BadOpcode": 102,
+      "UninitRead": 104,
+      "Reserved": 126,
+      "TooLong": 301,
+      "JumpOutOfRange": 79,
+      "BadReg": 108,
+      "BadField": 117,
+      "FallsOffEnd": 46,
+      "Unreachable": 33
+     },
+     "fail": 0,
+     "first": []
+    },
+    "T3": {
+     "programs": 6174,
+     "accepted": 54,
+     "violations": 0,
+     "max_steps": 3,
+     "rejected_but_safe_on_6pkts": 828,
+     "fail": 0
+    },
+    "T4": {
+     "rulesets": 110,
+     "evals": 4400,
+     "mismatch": 0,
+     "too_many_insns": 47,
+     "compiled_but_unverified": 643,
+     "max_steps": 1,
+     "fail": 643,
+     "first": [
+      "编译产物未过验证 VErr(Unreachable,15,None) rules=[Rule(dir=0,fam=4,proto=17,src=(b'D pj\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00', 9),dst=(b'%\\n\\xdf\\x14\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00', 1),sp=None,dp=(1, 1),Drop), Rule(dir=0,fam=6,proto=17,src=None,dst=(b'B\\xa3\\xc6\\xff\\x98\\xf1(\\x8cM\\xcf1\\x83\\xe5\\xa7gm', 0),sp=(59107, 59347),dp=(1024, 65535),Accept)]",
+      "编译产物未过验证 VErr(Unreachable,12,None) rules=[Rule(dir=1,fam=6,proto=17,src=None,dst=(b'-+qIM\\x94\\xf0\\xf2\\xe65L\\xd1\\xd7\\xf1i\\x06', 9),sp=None,dp=(33284, 33284),Accept), Rule(dir=0,fam=4,proto=None,src=(b'\\x8c\\xbb>\\x1b\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00', 0),dst=(b'\\xac\\x84\"\\xe9\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00', 1),sp=None,dp=(0, 65535),Accept), Rule(dir=0,fam=6,proto=17,src=None,dst=None,sp=None,dp=(4993, 65535),Drop), Rule(dir=1,fam=6,proto=None,src=None,dst=None,sp=(53, 53),dp=(13995, 15176),Drop), Rule(dir=0,fam=None,proto=None,src=None,dst=None,sp=(53, 53),dp=(65535, 65535),Accept)]",
+      "编译产物未过验证 VErr(Unreachable,12,None) rules=[Rule(dir=0,fam=6,proto=17,src=(b'rRe\\xc5@\\xc8N\\xe6\\xd1x\\xf5\\x08\\xd1\\x07\\xa6.', 8),dst=None,sp=None,dp=(1, 65535),Drop), Rule(dir=0,fam=4,proto=None,src=(b'\\xe3z1^\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00', 7),dst=(b'\\xe8S\\xb0\\xbc\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00', 32),sp=(9591, 65535),dp=None,Drop), Rule(dir=0,fam=4,proto=58,src=(b'\\xe4\\xd4n\\xb6\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00', 31),dst=(b'\\x1b\\x9a\\xdf{\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00', 0),sp=(53, 53),dp=(1024, 65534),Accept), Rule(dir=0,fam=6,proto=58,src=None,dst=(b'<\\xe1\\x16@\\x04\\xc4.\\xd5X\\xfa\\xa0N\\xd8\\xccnq', 31),sp=None,dp=None,Drop), Rule(dir=0,fam=4,proto=58,src=(b'\\x9b\\xcf\\x88\\xfd\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00', 16),dst=(b'\\x15\\x11I?\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00', 1),sp=None,dp=(0, 0),Drop), Rule(dir=0,fam=4,proto=58,src=None,dst=None,sp=(1024, 1971),dp=None,Drop), Rule(dir=0,fam=4,proto=17,src=None,dst=None,sp=None,dp=(1024, 65535),Accept), Rule(dir=0,fam=4,proto=58,src=(b\"'GNx\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\", 8),dst=None,sp=(1, 1),dp=(0, 65535),Accept)]"
+     ]
+    },
+    "T5": {
+     "fail": 1,
+     "detail": [
+      "自环期望 StepBudget 实得 PcOutOfRange"
+     ]
+    },
+    "T6": {
+     "frames": 47016,
+     "crash": 0,
+     "kernel_port_oob": 0,
+     "kernel_v4_some": 5056,
+     "kernel_v6udp_some": 6091,
+     "kernel_nd_some": 6395,
+     "D1_v4": 0,
+     "D2_v6udp": 0,
+     "D3_nd_containment": 0,
+     "fail": 0,
+     "first": []
+    },
+    "T7": {
+     "fail": 1,
+     "detail": [
+      "7a 装载失败 VErr(Unreachable,5,None)"
+     ]
+    },
+    "_secs": 1.8
+   }
+  },
+  "compile_hi_exclusive": {
+   "summary": {
+    "T1": 0,
+    "T2": 0,
+    "T3": 0,
+    "T4": 49,
+    "T5": 0,
+    "T6": 0,
+    "T7": 0
+   },
+   "caught": true,
+   "full": {
+    "T1": {
+     "cases": 21,
+     "fail": 0,
+     "detail": []
+    },
+    "T2": {
+     "programs": 8000,
+     "accepted": 2485,
+     "violations": 0,
+     "max_steps": 105,
+     "reject_reasons": {
+      "BackwardJump": 553,
+      "Unreachable": 1348,
+      "Reserved": 292,
+      "UninitRead": 1328,
+      "BadVerdict": 293,
+      "BadOpcode": 264,
+      "FallsOffEnd": 255,
+      "TooLong": 301,
+      "BadField": 282,
+      "JumpOutOfRange": 329,
+      "BadReg": 270
+     },
+     "fail": 0,
+     "first": []
+    },
+    "T3": {
+     "programs": 6174,
+     "accepted": 52,
+     "violations": 0,
+     "max_steps": 3,
+     "rejected_but_safe_on_6pkts": 864,
+     "fail": 0
+    },
+    "T4": {
+     "rulesets": 758,
+     "evals": 30320,
+     "mismatch": 49,
+     "too_many_insns": 42,
+     "compiled_but_unverified": 0,
+     "max_steps": 72,
+     "fail": 49,
+     "first": [
+      "want=Drop got=Accept pkt=Packet(4, 17, 0, b'\\xb09<\\xf5\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00', b'\\xe3\\xbcH\\x12\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00', 68, 65534, 105) rules=[Rule(dir=0,fam=None,proto=None,src=None,dst=None,sp=(0, 65534),dp=(50820, 65534),Drop), Rule(dir=0,fam=6,proto=58,src=(b'\\xb09<\\xf5\\xcd\\xa5K4t^w\\xb3\\x1c\\xf0@1', 33),dst=None,sp=(32755, 33834),dp=None,Drop), Rule(dir=0,fam=4,proto=58,src=None,dst=(b'56\\xac\\xd5\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00', 8),sp=None,dp=(1, 65534),Drop)]",
+      "want=Drop got=Accept pkt=Packet(6, 58, 0, b'd\\x1c\\x011Or\\xf8\\x07\\x84\\xbe:B?-0\\x85', b'l\\xdf\\xae~\\xfc\\x0fC\\x12\\xac\\xd3\\xa3\\x7f\\xbc3\\x92i', 67, 65534, 253) rules=[Rule(dir=0,fam=None,proto=None,src=None,dst=None,sp=(0, 65534),dp=(50820, 65534),Drop), Rule(dir=0,fam=6,proto=58,src=(b'\\xb09<\\xf5\\xcd\\xa5K4t^w\\xb3\\x1c\\xf0@1', 33),dst=None,sp=(32755, 33834),dp=None,Drop), Rule(dir=0,fam=4,proto=58,src=None,dst=(b'56\\xac\\xd5\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00', 8),sp=None,dp=(1, 65534),Drop)]",
+      "want=Accept got=Drop pkt=Packet(6, 17, 0, b'o\\xd2G\\x8f~\\xbejT\\xd0$\\xbc\\x80\\xdd\\x19\\x1a\\t', b'IX\\xf1wQ-?\\x9e{\\x81_\\x13#\\x07\\xe5\\xf5', 44654, 65534, 131) rules=[Rule(dir=0,fam=6,proto=58,src=(b'IX\\xf1wQ-?\\x9e{\\x81_\\x13#G\\xe5\\xf5', 1),dst=(b'w\\x8d>\\xb0\\xbe\\x97}I\\xfc@;\\xd99\\x85\\xe2f', 96),sp=None,dp=None,Accept), Rule(dir=0,fam=6,proto=17,src=None,dst=(b'\\x95\\x18\\xc2^\\xd9Z\\xf3\\xf7\\x01\\x9b\\x054$\\xd4q[', 0),sp=None,dp=(1, 65534),Accept)]"
+     ]
+    },
+    "T5": {
+     "fail": 0,
+     "detail": []
+    },
+    "T6": {
+     "frames": 47016,
+     "crash": 0,
+     "kernel_port_oob": 0,
+     "kernel_v4_some": 5056,
+     "kernel_v6udp_some": 6091,
+     "kernel_nd_some": 6395,
+     "D1_v4": 0,
+     "D2_v6udp": 0,
+     "D3_nd_containment": 0,
+     "fail": 0,
+     "first": []
+    },
+    "T7": {
+     "fail": 0,
+     "detail": [],
+     "expected_drops": 13853,
+     "expected_udp_drops": 3544,
+     "ndp_branch_frames": 10309,
+     "fw_counters": {
+      "evaluated": 18047,
+      "dropped": 10444,
+      "malformed": 3409
+     }
+    },
+    "_secs": 3.2
+   }
+  },
+  "compile_mask_off_by_one": {
+   "summary": {
+    "T1": 0,
+    "T2": 0,
+    "T3": 0,
+    "T4": 38,
+    "T5": 0,
+    "T6": 0,
+    "T7": 0
+   },
+   "caught": true,
+   "full": {
+    "T1": {
+     "cases": 21,
+     "fail": 0,
+     "detail": []
+    },
+    "T2": {
+     "programs": 8000,
+     "accepted": 2485,
+     "violations": 0,
+     "max_steps": 105,
+     "reject_reasons": {
+      "BackwardJump": 553,
+      "Unreachable": 1348,
+      "Reserved": 292,
+      "UninitRead": 1328,
+      "BadVerdict": 293,
+      "BadOpcode": 264,
+      "FallsOffEnd": 255,
+      "TooLong": 301,
+      "BadField": 282,
+      "JumpOutOfRange": 329,
+      "BadReg": 270
+     },
+     "fail": 0,
+     "first": []
+    },
+    "T3": {
+     "programs": 6174,
+     "accepted": 52,
+     "violations": 0,
+     "max_steps": 3,
+     "rejected_but_safe_on_6pkts": 864,
+     "fail": 0
+    },
+    "T4": {
+     "rulesets": 757,
+     "evals": 30280,
+     "mismatch": 38,
+     "too_many_insns": 43,
+     "compiled_but_unverified": 0,
+     "max_steps": 72,
+     "fail": 38,
+     "first": [
+      "want=Drop got=Accept pkt=Packet(4, 58, 0, b'\\xa3\\x81\\x0fq\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00', b'5\\xb6\\xac\\xd5\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00', 0, 32767, 199) rules=[Rule(dir=0,fam=None,proto=None,src=None,dst=None,sp=(0, 65534),dp=(50820, 65534),Drop), Rule(dir=0,fam=6,proto=58,src=(b'\\xb09<\\xf5\\xcd\\xa5K4t^w\\xb3\\x1c\\xf0@1', 33),dst=None,sp=(32755, 33834),dp=None,Drop), Rule(dir=0,fam=4,proto=58,src=None,dst=(b'56\\xac\\xd5\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00', 8),sp=None,dp=(1, 65534),Drop)]",
+      "want=Accept got=Drop pkt=Packet(6, 17, 1, b'\\xfd\\r\\x0b\\xae\\xec[RvfP\\x90\\xfe\\x7f)<\\xd8', b'\\xa4i0\\xe0\\x90S\\xfdl\\x84\\xa0}_\\x1e\\xd1\\xfe\\xb0', 68, 5353, 93) rules=[Rule(dir=1,fam=6,proto=None,src=None,dst=(b'\\xa4i0\\xe0\\xd0S\\xfdl\\x84\\xa0}_\\x1e\\xd1\\xfe\\xb0', 33),sp=None,dp=None,Accept), Rule(dir=0,fam=4,proto=58,src=None,dst=None,sp=(1, 1478),dp=None,Drop), Rule(dir=0,fam=None,proto=58,src=None,dst=None,sp=None,dp=(0, 0),Accept)]",
+      "want=Drop got=Accept pkt=Packet(6, 17, 0, b'5;\\xb2tk\\x02\\x8d\\xe8\\xaf\\xeb\\x81\\xdd\\xf8\\xa0we', b'@\\xf1\\x82\\xbf.\\x83\\xd1\\x1a\\xb5\\x8ba^Fg>\\x11', 68, 67, 95) rules=[Rule(dir=0,fam=6,proto=17,src=(b'}\\xc8I\\x94\\x06L\\xda%\\x0b\\xf4\\xc1;\\x08\\x13&\\x9f', 1),dst=None,sp=None,dp=(1, 65534),Drop), Rule(dir=0,fam=4,proto=58,src=None,dst=(b'\\xba:\\x7f\\xaf\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00', 9),sp=(20132, 20132),dp=None,Drop), Rule(dir=0,fam=4,proto=17,src=None,dst=None,sp=(0, 1916),dp=(1024, 1311),Drop), Rule(dir=0,fam=None,proto=17,src=None,dst=None,sp=(65535, 65535),dp=None,Drop), Rule(dir=0,fam=4,proto=None,src=(b'\\xa0\\x98\\x17q\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00', 16),dst=None,sp=(1024, 65535),dp=None,Accept)]"
+     ]
+    },
+    "T5": {
+     "fail": 0,
+     "detail": []
+    },
+    "T6": {
+     "frames": 47016,
+     "crash": 0,
+     "kernel_port_oob": 0,
+     "kernel_v4_some": 5056,
+     "kernel_v6udp_some": 6091,
+     "kernel_nd_some": 6395,
+     "D1_v4": 0,
+     "D2_v6udp": 0,
+     "D3_nd_containment": 0,
+     "fail": 0,
+     "first": []
+    },
+    "T7": {
+     "fail": 0,
+     "detail": [],
+     "expected_drops": 13853,
+     "expected_udp_drops": 3544,
+     "ndp_branch_frames": 10309,
+     "fw_counters": {
+      "evaluated": 18047,
+      "dropped": 10444,
+      "malformed": 3409
+     }
+    },
+    "_secs": 3.2
+   }
+  },
+  "compile_no_family": {
+   "summary": {
+    "T1": 0,
+    "T2": 0,
+    "T3": 0,
+    "T4": 789,
+    "T5": 0,
+    "T6": 0,
+    "T7": 0
+   },
+   "caught": true,
+   "full": {
+    "T1": {
+     "cases": 21,
+     "fail": 0,
+     "detail": []
+    },
+    "T2": {
+     "programs": 8000,
+     "accepted": 2485,
+     "violations": 0,
+     "max_steps": 105,
+     "reject_reasons": {
+      "BackwardJump": 553,
+      "Unreachable": 1348,
+      "Reserved": 292,
+      "UninitRead": 1328,
+      "BadVerdict": 293,
+      "BadOpcode": 264,
+      "FallsOffEnd": 255,
+      "TooLong": 301,
+      "BadField": 282,
+      "JumpOutOfRange": 329,
+      "BadReg": 270
+     },
+     "fail": 0,
+     "first": []
+    },
+    "T3": {
+     "programs": 6174,
+     "accepted": 52,
+     "violations": 0,
+     "max_steps": 3,
+     "rejected_but_safe_on_6pkts": 864,
+     "fail": 0
+    },
+    "T4": {
+     "rulesets": 795,
+     "evals": 31800,
+     "mismatch": 789,
+     "too_many_insns": 5,
+     "compiled_but_unverified": 0,
+     "max_steps": 79,
+     "fail": 789,
+     "first": [
+      "want=Accept got=Drop pkt=Packet(4, 58, 1, b'%\\x1f\\xa6\\xf6\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00', b'@\\x92\\xc3r\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00', 30331, 53, 64) rules=[Rule(dir=1,fam=6,proto=58,src=None,dst=None,sp=None,dp=None,Drop), Rule(dir=0,fam=6,proto=58,src=None,dst=(b'\\xc4M\\xa8\\xd0\\x1c#\\x80HVK\\x0fU\\xe4\\xd2\\r\\xa8', 1),sp=None,dp=(45204, 45204),Accept), Rule(dir=0,fam=None,proto=None,src=None,dst=None,sp=None,dp=(1024, 1024),Accept), Rule(dir=1,fam=None,proto=58,src=None,dst=None,sp=(1, 65534),dp=(1024, 1024),Accept), Rule(dir=0,fam=4,proto=17,src=(b'U\\x10\\x0c+\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00', 7),dst=None,sp=(65535, 65535),dp=None,Accept), Rule(dir=0,fam=4,proto=17,src=None,dst=(b'u\\xd0\\x93\\r\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00', 16),sp=(0, 1077),dp=None,Accept), Rule(dir=0,fam=None,proto=17,src=None,dst=None,sp=(27057, 27057),dp=(30332, 30332),Accept), Rule(dir=1,fam=None,proto=58,src=None,dst=None,sp=None,dp=(1, 1),Accept)]",
+      "want=Accept got=Drop pkt=Packet(6, 17, 0, b'n\\x01\\xe2\\xe0\\xd6<\\x12\\xb0s\\xbb\\x16e\\x98>\\xd4\\xcf', b'\\xf0\\xa4L\\x98\\x8c\\x00Yf\\xa4\\r\\x97A\\x84\\x07\\x10\\xe1', 48227, 53, 108) rules=[Rule(dir=0,fam=6,proto=None,src=(b'=\\xa90\\x19\\x9b\\x87xM,\\x7f)A2j\\x81\\xd1', 64),dst=None,sp=None,dp=None,Accept), Rule(dir=1,fam=None,proto=58,src=None,dst=None,sp=None,dp=(30920, 65535),Accept), Rule(dir=0,fam=6,proto=None,src=None,dst=None,sp=(0, 1897),dp=(33609, 34664),Accept), Rule(dir=0,fam=4,proto=17,src=None,dst=None,sp=(0, 65535),dp=None,Drop), Rule(dir=0,fam=None,proto=None,src=None,dst=None,sp=(10342, 65534),dp=(65535, 65535),Accept), Rule(dir=0,fam=None,proto=None,src=None,dst=None,sp=(1024, 1024),dp=(0, 65535),Drop), Rule(dir=0,fam=None,proto=17,src=None,dst=None,sp=None,dp=(0, 65535),Accept), Rule(dir=1,fam=6,proto=58,src=None,dst=None,sp=None,dp=(0, 65535),Accept), Rule(dir=0,fam=None,proto=17,src=None,dst=None,sp=(1, 65535),dp=(1024, 65534),Drop), Rule(dir=0,fam=None,proto=None,src=None,dst=None,sp=(0, 0),dp=None,Accept), Rule(dir=0,fam=4,proto=58,src=(b'\\x13\\x8d\\xfei\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00', 9),dst=(b',au`\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00', 7),sp=(1, 65535),dp=(8978, 65534),Drop), Rule(dir=0,fam=4,proto=17,src=(b'+\\nC\\x05\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00', 24),dst=None,sp=(53, 53),dp=(50062, 50062),Drop)]",
+      "want=Accept got=Drop pkt=Packet(6, 17, 0, b'\\x89_\\x1b\\xed\\xe3\\x99\\x0ea\\xc3}\\xcc\\xd0\\xacz\\x03\\x80', b'\\x80|%.\\x9e\\xf7\\x11~\\xe2\\xa4\\x9c\\x00)\\xdb[\\xfb', 0, 0, 140) rules=[Rule(dir=0,fam=6,proto=None,src=(b'=\\xa90\\x19\\x9b\\x87xM,\\x7f)A2j\\x81\\xd1', 64),dst=None,sp=None,dp=None,Accept), Rule(dir=1,fam=None,proto=58,src=None,dst=None,sp=None,dp=(30920, 65535),Accept), Rule(dir=0,fam=6,proto=None,src=None,dst=None,sp=(0, 1897),dp=(33609, 34664),Accept), Rule(dir=0,fam=4,proto=17,src=None,dst=None,sp=(0, 65535),dp=None,Drop), Rule(dir=0,fam=None,proto=None,src=None,dst=None,sp=(10342, 65534),dp=(65535, 65535),Accept), Rule(dir=0,fam=None,proto=None,src=None,dst=None,sp=(1024, 1024),dp=(0, 65535),Drop), Rule(dir=0,fam=None,proto=17,src=None,dst=None,sp=None,dp=(0, 65535),Accept), Rule(dir=1,fam=6,proto=58,src=None,dst=None,sp=None,dp=(0, 65535),Accept), Rule(dir=0,fam=None,proto=17,src=None,dst=None,sp=(1, 65535),dp=(1024, 65534),Drop), Rule(dir=0,fam=None,proto=None,src=None,dst=None,sp=(0, 0),dp=None,Accept), Rule(dir=0,fam=4,proto=58,src=(b'\\x13\\x8d\\xfei\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00', 9),dst=(b',au`\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00', 7),sp=(1, 65535),dp=(8978, 65534),Drop), Rule(dir=0,fam=4,proto=17,src=(b'+\\nC\\x05\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00', 24),dst=None,sp=(53, 53),dp=(50062, 50062),Drop)]"
+     ]
+    },
+    "T5": {
+     "fail": 0,
+     "detail": []
+    },
+    "T6": {
+     "frames": 47016,
+     "crash": 0,
+     "kernel_port_oob": 0,
+     "kernel_v4_some": 5056,
+     "kernel_v6udp_some": 6091,
+     "kernel_nd_some": 6395,
+     "D1_v4": 0,
+     "D2_v6udp": 0,
+     "D3_nd_containment": 0,
+     "fail": 0,
+     "first": []
+    },
+    "T7": {
+     "fail": 0,
+     "detail": [],
+     "expected_drops": 13853,
+     "expected_udp_drops": 3544,
+     "ndp_branch_frames": 10309,
+     "fw_counters": {
+      "evaluated": 18047,
+      "dropped": 10444,
+      "malformed": 3409
+     }
+    },
+    "_secs": 3.2
+   }
+  },
+  "parse_v4_fixed_ihl": {
+   "summary": {
+    "T1": 0,
+    "T2": 0,
+    "T3": 0,
+    "T4": 0,
+    "T5": 0,
+    "T6": 2452,
+    "T7": 0
+   },
+   "caught": true,
+   "full": {
+    "T1": {
+     "cases": 21,
+     "fail": 0,
+     "detail": []
+    },
+    "T2": {
+     "programs": 8000,
+     "accepted": 2485,
+     "violations": 0,
+     "max_steps": 105,
+     "reject_reasons": {
+      "BackwardJump": 553,
+      "Unreachable": 1348,
+      "Reserved": 292,
+      "UninitRead": 1328,
+      "BadVerdict": 293,
+      "BadOpcode": 264,
+      "FallsOffEnd": 255,
+      "TooLong": 301,
+      "BadField": 282,
+      "JumpOutOfRange": 329,
+      "BadReg": 270
+     },
+     "fail": 0,
+     "first": []
+    },
+    "T3": {
+     "programs": 6174,
+     "accepted": 52,
+     "violations": 0,
+     "max_steps": 3,
+     "rejected_but_safe_on_6pkts": 864,
+     "fail": 0
+    },
+    "T4": {
+     "rulesets": 758,
+     "evals": 30320,
+     "mismatch": 0,
+     "too_many_insns": 42,
+     "compiled_but_unverified": 0,
+     "max_steps": 72,
+     "fail": 0,
+     "first": []
+    },
+    "T5": {
+     "fail": 0,
+     "detail": []
+    },
+    "T6": {
+     "frames": 47016,
+     "crash": 0,
+     "kernel_port_oob": 0,
+     "kernel_v4_some": 5056,
+     "kernel_v6udp_some": 6091,
+     "kernel_nd_some": 6395,
+     "D1_v4": 2452,
+     "D2_v6udp": 0,
+     "D3_nd_containment": 0,
+     "fail": 2452,
+     "first": [
+      "D1 内核v4有/fw无或不等 ('Malformed',)",
+      "D1 内核v4有/fw无或不等 ('Malformed',)",
+      "D1 内核v4有/fw无或不等 ('Malformed',)"
+     ]
+    },
+    "T7": {
+     "fail": 0,
+     "detail": [],
+     "expected_drops": 13853,
+     "expected_udp_drops": 3544,
+     "ndp_branch_frames": 10309,
+     "fw_counters": {
+      "evaluated": 18047,
+      "dropped": 10444,
+      "malformed": 3409
+     }
+    },
+    "_secs": 3.2
+   }
+  },
+  "parse_v6_no_ulen_check": {
+   "summary": {
+    "T1": 0,
+    "T2": 0,
+    "T3": 0,
+    "T4": 0,
+    "T5": 0,
+    "T6": 475,
+    "T7": 0
+   },
+   "caught": true,
+   "full": {
+    "T1": {
+     "cases": 21,
+     "fail": 0,
+     "detail": []
+    },
+    "T2": {
+     "programs": 8000,
+     "accepted": 2485,
+     "violations": 0,
+     "max_steps": 105,
+     "reject_reasons": {
+      "BackwardJump": 553,
+      "Unreachable": 1348,
+      "Reserved": 292,
+      "UninitRead": 1328,
+      "BadVerdict": 293,
+      "BadOpcode": 264,
+      "FallsOffEnd": 255,
+      "TooLong": 301,
+      "BadField": 282,
+      "JumpOutOfRange": 329,
+      "BadReg": 270
+     },
+     "fail": 0,
+     "first": []
+    },
+    "T3": {
+     "programs": 6174,
+     "accepted": 52,
+     "violations": 0,
+     "max_steps": 3,
+     "rejected_but_safe_on_6pkts": 864,
+     "fail": 0
+    },
+    "T4": {
+     "rulesets": 758,
+     "evals": 30320,
+     "mismatch": 0,
+     "too_many_insns": 42,
+     "compiled_but_unverified": 0,
+     "max_steps": 72,
+     "fail": 0,
+     "first": []
+    },
+    "T5": {
+     "fail": 0,
+     "detail": []
+    },
+    "T6": {
+     "frames": 47016,
+     "crash": 0,
+     "kernel_port_oob": 0,
+     "kernel_v4_some": 5056,
+     "kernel_v6udp_some": 6091,
+     "kernel_nd_some": 6395,
+     "D1_v4": 0,
+     "D2_v6udp": 475,
+     "D3_nd_containment": 0,
+     "fail": 475,
+     "first": [
+      "D2 fw v6udp 有、内核无",
+      "D2 fw v6udp 有、内核无",
+      "D2 fw v6udp 有、内核无"
+     ]
+    },
+    "T7": {
+     "fail": 0,
+     "detail": [],
+     "expected_drops": 13853,
+     "expected_udp_drops": 3544,
+     "ndp_branch_frames": 10309,
+     "fw_counters": {
+      "evaluated": 18047,
+      "dropped": 10444,
+      "malformed": 3409
+     }
+    },
+    "_secs": 3.2
+   }
+  },
+  "parse_icmp6_too_strict": {
+   "summary": {
+    "T1": 0,
+    "T2": 0,
+    "T3": 0,
+    "T4": 0,
+    "T5": 0,
+    "T6": 3194,
+    "T7": 0
+   },
+   "caught": true,
+   "full": {
+    "T1": {
+     "cases": 21,
+     "fail": 0,
+     "detail": []
+    },
+    "T2": {
+     "programs": 8000,
+     "accepted": 2485,
+     "violations": 0,
+     "max_steps": 105,
+     "reject_reasons": {
+      "BackwardJump": 553,
+      "Unreachable": 1348,
+      "Reserved": 292,
+      "UninitRead": 1328,
+      "BadVerdict": 293,
+      "BadOpcode": 264,
+      "FallsOffEnd": 255,
+      "TooLong": 301,
+      "BadField": 282,
+      "JumpOutOfRange": 329,
+      "BadReg": 270
+     },
+     "fail": 0,
+     "first": []
+    },
+    "T3": {
+     "programs": 6174,
+     "accepted": 52,
+     "violations": 0,
+     "max_steps": 3,
+     "rejected_but_safe_on_6pkts": 864,
+     "fail": 0
+    },
+    "T4": {
+     "rulesets": 758,
+     "evals": 30320,
+     "mismatch": 0,
+     "too_many_insns": 42,
+     "compiled_but_unverified": 0,
+     "max_steps": 72,
+     "fail": 0,
+     "first": []
+    },
+    "T5": {
+     "fail": 0,
+     "detail": []
+    },
+    "T6": {
+     "frames": 47016,
+     "crash": 0,
+     "kernel_port_oob": 0,
+     "kernel_v4_some": 5056,
+     "kernel_v6udp_some": 6091,
+     "kernel_nd_some": 6395,
+     "D1_v4": 0,
+     "D2_v6udp": 0,
+     "D3_nd_containment": 3194,
+     "fail": 3194,
+     "first": [
+      "D3 parse_nd 有/fw 不含 ('Malformed',)",
+      "D3 parse_nd 有/fw 不含 ('Malformed',)",
+      "D3 parse_nd 有/fw 不含 ('Malformed',)"
+     ]
+    },
+    "T7": {
+     "fail": 0,
+     "detail": [],
+     "expected_drops": 13853,
+     "expected_udp_drops": 3544,
+     "ndp_branch_frames": 10309,
+     "fw_counters": {
+      "evaluated": 14578,
+      "dropped": 6975,
+      "malformed": 6878
+     }
+    },
+    "_secs": 3.1
+   }
+  },
+  "hook_after_enqueue": {
+   "summary": {
+    "T1": 0,
+    "T2": 0,
+    "T3": 0,
+    "T4": 0,
+    "T5": 0,
+    "T6": 0,
+    "T7": 3544
+   },
+   "caught": true,
+   "full": {
+    "T1": {
+     "cases": 21,
+     "fail": 0,
+     "detail": []
+    },
+    "T2": {
+     "programs": 8000,
+     "accepted": 2485,
+     "violations": 0,
+     "max_steps": 105,
+     "reject_reasons": {
+      "BackwardJump": 553,
+      "Unreachable": 1348,
+      "Reserved": 292,
+      "UninitRead": 1328,
+      "BadVerdict": 293,
+      "BadOpcode": 264,
+      "FallsOffEnd": 255,
+      "TooLong": 301,
+      "BadField": 282,
+      "JumpOutOfRange": 329,
+      "BadReg": 270
+     },
+     "fail": 0,
+     "first": []
+    },
+    "T3": {
+     "programs": 6174,
+     "accepted": 52,
+     "violations": 0,
+     "max_steps": 3,
+     "rejected_but_safe_on_6pkts": 864,
+     "fail": 0
+    },
+    "T4": {
+     "rulesets": 758,
+     "evals": 30320,
+     "mismatch": 0,
+     "too_many_insns": 42,
+     "compiled_but_unverified": 0,
+     "max_steps": 72,
+     "fail": 0,
+     "first": []
+    },
+    "T5": {
+     "fail": 0,
+     "detail": []
+    },
+    "T6": {
+     "frames": 47016,
+     "crash": 0,
+     "kernel_port_oob": 0,
+     "kernel_v4_some": 5056,
+     "kernel_v6udp_some": 6091,
+     "kernel_nd_some": 6395,
+     "D1_v4": 0,
+     "D2_v6udp": 0,
+     "D3_nd_containment": 0,
+     "fail": 0,
+     "first": []
+    },
+    "T7": {
+     "fail": 3544,
+     "detail": [
+      "7b 判决与参考不一致 3544 帧"
+     ],
+     "expected_drops": 13853,
+     "expected_udp_drops": 3544,
+     "ndp_branch_frames": 10309,
+     "fw_counters": {
+      "evaluated": 18047,
+      "dropped": 10444,
+      "malformed": 3409
+     }
+    },
+    "_secs": 3.2
+   }
+  },
+  "hook_skip_ndp": {
+   "summary": {
+    "T1": 0,
+    "T2": 0,
+    "T3": 0,
+    "T4": 0,
+    "T5": 0,
+    "T6": 0,
+    "T7": 10309
+   },
+   "caught": true,
+   "full": {
+    "T1": {
+     "cases": 21,
+     "fail": 0,
+     "detail": []
+    },
+    "T2": {
+     "programs": 8000,
+     "accepted": 2485,
+     "violations": 0,
+     "max_steps": 105,
+     "reject_reasons": {
+      "BackwardJump": 553,
+      "Unreachable": 1348,
+      "Reserved": 292,
+      "UninitRead": 1328,
+      "BadVerdict": 293,
+      "BadOpcode": 264,
+      "FallsOffEnd": 255,
+      "TooLong": 301,
+      "BadField": 282,
+      "JumpOutOfRange": 329,
+      "BadReg": 270
+     },
+     "fail": 0,
+     "first": []
+    },
+    "T3": {
+     "programs": 6174,
+     "accepted": 52,
+     "violations": 0,
+     "max_steps": 3,
+     "rejected_but_safe_on_6pkts": 864,
+     "fail": 0
+    },
+    "T4": {
+     "rulesets": 758,
+     "evals": 30320,
+     "mismatch": 0,
+     "too_many_insns": 42,
+     "compiled_but_unverified": 0,
+     "max_steps": 72,
+     "fail": 0,
+     "first": []
+    },
+    "T5": {
+     "fail": 0,
+     "detail": []
+    },
+    "T6": {
+     "frames": 47016,
+     "crash": 0,
+     "kernel_port_oob": 0,
+     "kernel_v4_some": 5056,
+     "kernel_v6udp_some": 6091,
+     "kernel_nd_some": 6395,
+     "D1_v4": 0,
+     "D2_v6udp": 0,
+     "D3_nd_containment": 0,
+     "fail": 0,
+     "first": []
+    },
+    "T7": {
+     "fail": 10309,
+     "detail": [
+      "7b 判决与参考不一致 10309 帧"
+     ],
+     "expected_drops": 13853,
+     "expected_udp_drops": 3544,
+     "ndp_branch_frames": 10309,
+     "fw_counters": {
+      "evaluated": 11147,
+      "dropped": 3544,
+      "malformed": 0
+     }
+    },
+    "_secs": 3.1
+   }
+  }
+ }
+}

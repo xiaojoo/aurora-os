@@ -60,6 +60,8 @@ pub const SYS_PROCESS_START: u64 = 16;
 pub const SYS_PROCESS_WAIT: u64 = 17;
 /// 18 收掉一个进程的全部线程（user.rs:96；实现 user.rs:958）。
 pub const SYS_PROCESS_KILL: u64 = 18;
+/// 83（ADR-270）：收走已终止的进程（僵尸），还槽/额度/子 AS/fd 表；返回退出码。
+pub const SYS_PROC_REAP: u64 = 83;
 /// ADR-134 (29): rdi=pid -> threads killed. pid is only an address; the kernel
 /// still requires a RIGHT_WRITE Proc handle in the caller own name table.
 pub const SYS_PROC_KILL_BY_PID: u64 = 29;
@@ -999,6 +1001,26 @@ pub fn process_kill_pid(pid: u16) -> Result<u64, RTError> {
     }
 }
 
+/// 83 号：收走一个**已终止**的进程，成功返回它的**退出码**（ADR-270）。
+///
+/// * 进程还在跑 ⇒ `Err(DENIED)`，**什么都不动**（不是杀；要杀用 [`process_kill`]）。
+/// * 句柄缺 `RIGHT_WRITE`（11 号给的句柄带它，`dup` 收窄后的副本不带）或不是 Proc ⇒ `Err(DENIED)`。
+/// * 句柄已失效 / 进程已被收过 ⇒ `Err(BADHANDLE)`。
+/// * **成功后这个句柄已被内核关闭**：不要再对它调 [`handle_close`]（会得到 `BADHANDLE`，无害但说明用法有误）。
+///   由它 `dup` 出的副本靠世代失效，调用方应自己丢弃。
+///
+/// 与 [`process_wait`] 的分工：wait 只**等并读退出码**、不改状态；reap 才**释放资源**。
+/// 不 reap 的后果是僵尸永久占进程槽与 Job 额度（见 ADR-269 §0），所以长期运行的监督者必须在每次 wait 到结局之后 reap。
+pub fn proc_reap(proc_h: Handle) -> Result<u32, RTError> {
+    // SAFETY: 83 号 `rdi` = Proc 句柄（要 WRITE），其余参数位无语义（syscall_abi 统一置零）。
+    let ret = unsafe { syscall_abi(SYS_PROC_REAP, proc_h, 0, 0, 0) };
+    if ret < 0 {
+        Err(RTError(ret))
+    } else {
+        Ok(ret as u32)
+    }
+}
+
 /// 30 号：把**串口日志环**的最近整行读进 `buf`。返回 `(行数, 字节数)`。
 ///
 /// 内核侧保证：只给整行（开头/结尾的半行丢掉），所以拿回来的段一定以 `\n` 结尾
@@ -1513,17 +1535,21 @@ pub fn file_append(path: &[u8], data: &[u8]) -> Result<usize, RTError> {
     if ret < 0 { Err(RTError(ret)) } else { Ok(ret as usize) }
 }
 
-/// `>` 的落盘结果。
+/// `>` / `>>` 的落盘结果。
 pub struct Overwrite { pub written: usize, pub err: Option<RTError> }
 
-/// `>` = unlink + create + append（ADR-264 决策 4 方案 B）。
-/// 非原子：unlink 与 create 之间掉电会丢目标；被打开的非空文件会报 -4。
-pub fn overwrite_file(path: &[u8], data: &[u8]) -> Overwrite {
-    match fs_unlink(path) {
-        Ok(()) | Err(RTError::NOTFOUND) => {}
-        Err(e) => return Overwrite { written: 0, err: Some(e) },
+/// 目标是否已存在（只读 open 探测；用来消歧内核 70 号把 `AlreadyExists` 与 `BadName`
+/// 都回 `-1` 的歧义，**不改内核 ABI**）。
+fn path_exists(path: &[u8]) -> Result<bool, RTError> {
+    match file_open(path, 0) {
+        Ok(h) => { let _ = handle_close(h); Ok(true) }
+        Err(RTError::NOTFOUND) => Ok(false),
+        Err(e) => Err(e),
     }
-    if let Err(e) = fs_create(path) { return Overwrite { written: 0, err: Some(e) }; }
+}
+
+/// 把 `data` 分块追加到已存在的 `path`。
+fn append_chunks(path: &[u8], data: &[u8]) -> Overwrite {
     let mut done = 0usize;
     while done < data.len() {
         let end = core::cmp::min(done + APPEND_CHUNK, data.len());
@@ -1536,21 +1562,77 @@ pub fn overwrite_file(path: &[u8], data: &[u8]) -> Overwrite {
     Overwrite { written: done, err: None }
 }
 
-/// `>>`：目标不存在则先建，再追加。
-pub fn append_file(path: &[u8], data: &[u8]) -> Overwrite {
-    if let Err(e) = fs_create(path) {
-        if e != RTError::INVALID { return Overwrite { written: 0, err: Some(e) }; }
-    }
-    let mut done = 0usize;
-    while done < data.len() {
-        let end = core::cmp::min(done + APPEND_CHUNK, data.len());
-        match file_append(path, &data[done..end]) {
-            Ok(n) if n > 0 => done += n,
-            Ok(_) => return Overwrite { written: done, err: Some(RTError::IO) },
-            Err(e) => return Overwrite { written: done, err: Some(e) },
+/// `>`：覆盖写。
+///
+/// 内核没有 truncate/rename（新增 syscall 属 R9 待裁决），所以仍是 unlink + create + append，
+/// **但做三处收窄**（比旧版少丢数据的场景）：
+/// 1. 先 `path_exists` 探测：目标是目录/坏名字/权限问题在**动手前**就报错，不会先 unlink 掉再失败；
+/// 2. 空输入（`> f` 且无输出）只 unlink+create，不进 append；
+/// 3. create 失败时（unlink 已成功）**立刻重试一次**，把“旧文件已删而新文件未建”的窗口压到最小。
+///
+/// 仍然**非原子**：unlink 与 create 之间掉电会丢目标。该限制不得在文档里写成已解决（R9）。
+pub fn overwrite_file(path: &[u8], data: &[u8]) -> Overwrite {
+    let existed = match path_exists(path) {
+        Ok(v) => v,
+        Err(e) => return Overwrite { written: 0, err: Some(e) },
+    };
+    if existed {
+        match fs_unlink(path) {
+            Ok(()) | Err(RTError::NOTFOUND) => {}
+            Err(e) => return Overwrite { written: 0, err: Some(e) },
         }
     }
-    Overwrite { written: done, err: None }
+    if let Err(e1) = fs_create(path) {
+        if fs_create(path).is_err() {
+            return Overwrite { written: 0, err: Some(e1) };
+        }
+    }
+    append_chunks(path, data)
+}
+
+/// `>>`：目标不存在则先建，再追加。
+///
+/// 旧版把 `fs_create` 的 `INVALID` 一律当“已存在”放行，于是**非法文件名也被放行**，
+/// 错误被推迟并改头换面。现在用 `path_exists` 先判，只有确实不存在才 create，create 的任何错误都如实上报。
+pub fn append_file(path: &[u8], data: &[u8]) -> Overwrite {
+    match path_exists(path) {
+        Ok(true) => {}
+        Ok(false) => {
+            if let Err(e) = fs_create(path) { return Overwrite { written: 0, err: Some(e) }; }
+        }
+        Err(e) => return Overwrite { written: 0, err: Some(e) },
+    }
+    append_chunks(path, data)
+}
+
+/// 把整个文件读进 `out`（`<` 用）。返回读到的字节数；文件超过 `out` 容量 → `Err(TOOLONG)`，不静默截断。
+pub fn read_file_into(path: &[u8], out: &mut [u8]) -> Result<usize, RTError> {
+    let h = file_open(path, 0)?;
+    let mut total = 0usize;
+    loop {
+        let room = out.len().saturating_sub(total);
+        if room == 0 {
+            // 缓冲已满：再探一个字节，若还有数据就是溢出
+            let mut probe = [0u8; 1];
+            let r = file_read(h, &mut probe);
+            let _ = handle_close(h);
+            return match r {
+                Ok(0) => Ok(total),
+                Ok(_) => Err(RTError::TOOLONG),
+                Err(e) => Err(e),
+            };
+        }
+        let want = core::cmp::min(room, COPY_MAX);
+        let dst = match out.get_mut(total..total + want) {
+            Some(d) => d,
+            None => { let _ = handle_close(h); return Err(RTError::INVALID); }
+        };
+        match file_read(h, dst) {
+            Ok(0) => { let _ = handle_close(h); return Ok(total); }
+            Ok(n) => total += n,
+            Err(e) => { let _ = handle_close(h); return Err(e); }
+        }
+    }
 }
 
 pub fn net_build_arp(our_mac: &[u8; 6], our_ip: &[u8; 4], target_ip: &[u8; 4]) -> [u8; 42] {
@@ -1566,4 +1648,54 @@ pub fn net_build_arp(our_mac: &[u8; 6], our_ip: &[u8; 4], target_ip: &[u8; 4]) -
     f[28..32].copy_from_slice(our_ip);
     f[38..42].copy_from_slice(target_ip);
     f
+}
+
+// ---------------------------------------------------------------------------
+// 81/82：最小防火墙（ADR-267）。三个公开封装共用一个私有 unsafe 块（普查只 +1）。
+// ---------------------------------------------------------------------------
+
+/// 81（ADR-267）：验证并装载防火墙字节码。成功返回新世代号。
+pub const SYS_FW_LOAD: u64 = 81;
+/// 82（ADR-267）：防火墙控制（清空/启用/停用/读统计）。
+pub const SYS_FW_CTL: u64 = 82;
+/// 81 号单次字节码上限（128 条 × 8 字节）。与内核 `network::fw::FW_PROG_BYTES_MAX` 同数。
+pub const FW_PROG_BYTES_MAX: usize = 1024;
+/// 82 号统计记录长度。
+pub const FW_STATS_LEN: usize = 64;
+/// 82 号子命令：清空。
+pub const FW_CTL_CLEAR: u64 = 0;
+/// 82 号子命令：启用。
+pub const FW_CTL_ENABLE: u64 = 1;
+/// 82 号子命令：停用。
+pub const FW_CTL_DISABLE: u64 = 2;
+/// 82 号子命令：读统计。
+pub const FW_CTL_STATS: u64 = 3;
+
+/// 81/82 的唯一入口。**私有**：只被下面三个 safe 封装以已校验的参数调用。
+fn fw_call(nr: u64, a1: u64, a2: u64, a3: u64) -> i64 {
+    // SAFETY: nr ∈ {81, 82}；指针参数只来自下面三个封装——fw_load 传 `prog` 切片（长度已 ≤ 1024 且 8 的倍数），
+    // fw_stats 传本函数栈上 64 字节数组；其余参数是整数。内核侧对指针做 copy_from/to_user 校验。
+    unsafe { syscall_abi(nr, a1, a2, a3, 0) }
+}
+
+/// 装载并（可选）启用。`Err(DENIED)` = 凭据缺 ADMIN|WRITE；`Err(INVALID)` = 验证器拒绝（现有规则不变）。
+pub fn fw_load(prog: &[u8], enable: bool) -> Result<u32, RTError> {
+    if prog.is_empty() || prog.len() % 8 != 0 { return Err(RTError::INVALID); }
+    if prog.len() > FW_PROG_BYTES_MAX { return Err(RTError::TOOLONG); }
+    let ret = fw_call(SYS_FW_LOAD, prog.as_ptr() as u64, prog.len() as u64, u64::from(enable));
+    if ret < 0 { Err(RTError(ret)) } else { Ok(ret as u32) }
+}
+
+/// 清空/启用/停用。读统计请用 [`fw_stats`]。
+pub fn fw_ctl(cmd: u64) -> Result<(), RTError> {
+    if cmd > FW_CTL_DISABLE { return Err(RTError::INVALID); }
+    let ret = fw_call(SYS_FW_CTL, cmd, 0, 0);
+    if ret < 0 { Err(RTError(ret)) } else { Ok(()) }
+}
+
+/// 读 64 字节统计记录（布局见内核 `network::fw::stats_record`）。
+pub fn fw_stats() -> Result<[u8; FW_STATS_LEN], RTError> {
+    let mut blk = [0u8; FW_STATS_LEN];
+    let ret = fw_call(SYS_FW_CTL, FW_CTL_STATS, blk.as_mut_ptr() as u64, FW_STATS_LEN as u64);
+    if ret < 0 { Err(RTError(ret)) } else { Ok(blk) }
 }

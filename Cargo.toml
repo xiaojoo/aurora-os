@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["kernel", "capture", "crates/host-initramfs", "crates/host-tcp", "user/hello", "user/probe", "user/shell", "user/fileprobe", "user/runtime", "user/execprobe", "user/sdkdemo"]
+members = ["kernel", "capture", "crates/host-initramfs", "crates/host-tcp", "crates/host-fw", "crates/host-svc", "user/hello", "user/probe", "user/shell", "user/fileprobe", "user/runtime", "user/execprobe", "user/sdkdemo"]
 
 # 主内核之外保留一个真实调用者：aurora-capture 是 kdump 特性启用的独立第二内核。
 # §2.5 的 api/impl 拆分等第一个真实实现出现后再展开，避免“先造空壳再填肉”。

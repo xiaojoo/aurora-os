@@ -31,6 +31,9 @@ pub const NO_PROC: u16 = 0xFFFF;
 /// 但 `mm` 不依赖 `capability`；`release_fd_table` 在 `mm` 侧，所以字节数由**调用方**给。
 /// 必须与 `handle::FD_TABLE_INIT * size_of::<u64>()` 相等（64 * 8 = 512）。
 const FD_TABLE_BYTES: usize = 64 * 8;
+/// `proc_reap` 实际归还 fd 表的次数（判据证人；不参与控制流）。
+pub static PROC_REAP_FD_RELEASES: AtomicU64 = AtomicU64::new(0);
+pub fn proc_reap_fd_releases() -> u64 { PROC_REAP_FD_RELEASES.load(Ordering::Relaxed) }
 /// `ProcEntry::aspace` 的"这个进程还没有地址空间"哨兵（与 `sched::NO_ASPACE` 同值不同模块）。
 pub const NO_ASPACE: u16 = 0xFFFF;
 /// signal：bit31 = 0 表示还在跑。
@@ -339,11 +342,25 @@ pub fn proc_info(idx: usize) -> Option<ProcInfo> {
 /// 收走一个**已终止**的进程（僵尸）：还额度、清槽，返回退出码。
 /// 只在进程上下文里调（取 VMM），**不在故障路径上**。
 pub fn proc_reap(proc_id: u16) -> Result<u32, ProcError> {
-    let (code, aspace) = mm::with_vmm_lock(|| {
+    proc_reap_inner(proc_id, None)
+}
+
+/// 带世代校验的 `proc_reap`：句柄解析与清槽之间若槽位被复用，旧句柄不能收掉新进程。
+pub fn proc_reap_gen(proc_id: u16, expected_gen: u32) -> Result<u32, ProcError> {
+    proc_reap_inner(proc_id, Some(expected_gen))
+}
+
+fn proc_reap_inner(proc_id: u16, expected_gen: Option<u32>) -> Result<u32, ProcError> {
+    let reaped = mm::with_vmm_lock(|| {
         let s = st();
         let p = s.procs.get_mut(proc_id as usize).ok_or(ProcError::NoSuchProc)?;
         if !alive_flag(&p.used) {
             return Err(ProcError::NoSuchProc);
+        }
+        if let Some(want) = expected_gen {
+            if p.gen != want {
+                return Err(ProcError::NoSuchProc);
+            }
         }
         let sig = p.signal.load(Ordering::Acquire);
         if sig & SIG_TERMINATED == 0 {
@@ -355,16 +372,34 @@ pub fn proc_reap(proc_id: u16) -> Result<u32, ProcError> {
         // **gen 必须活过销毁**（P5c-3a 修的那条 ABA）：整项写回 EMPTY 会把 gen 复位成 0，
         // 下一次 create 又变 1 ⇒ 旧句柄的 `(slot, gen)` 重新匹配上。
         let gen = p.gen;
+        // ADR-270：fd 表要跟着进程一起还。**这是 ADR-180 引入 fd 表时漏改的既有缺陷**：
+        // `proc_discard` 归还了它，`proc_reap` 没有 ⇒ 每个用过 fd 表（fd_install/fd_lookup/fd_io，
+        // 即任何走 stdio 的程序）的进程 reap 一次就永久漏一页。
+        // 与 `proc_discard` 同一纪律：只在锁内把地址抄出来，**放锁之后**还（归还走 PMM(30)，
+        // 在 VMM(20) 内取会在 `frame_put` 失败回头记账时反向嵌套 ⇒ L4）。
+        // 变异 `fault-reap-leak-fdtable`：不抄地址 ⇒ 复现旧缺陷，`t_proc_reap_syscall` 的页数格必红。
+        let fd_base = if cfg!(feature = "fault-reap-leak-fdtable") { 0 } else { p.fd_table.load(Ordering::Acquire) };
+        let fd_bytes = if cfg!(feature = "fault-reap-leak-fdtable") {
+            0
+        } else {
+            p.fd_cap.load(Ordering::Acquire).saturating_mul(core::mem::size_of::<u64>())
+        };
         *p = PROC_EMPTY;
         p.gen = gen;
         if let Some(j) = s.jobs.get_mut(job as usize) {
             j.used_procs = j.used_procs.saturating_sub(1);
         }
-        Ok((code, aspace))
+        Ok((code, aspace, fd_base, fd_bytes))
     })?;
+    let (code, aspace, fd_base, fd_bytes) = reaped;
     // 锁外销毁：`aspace_destroy` 自己取 VMM，留在上面那个闭包里就是重入
     if aspace != NO_ASPACE {
         mm::aspace_destroy(aspace);
+    }
+    // fd 表：锁外归还。0 = 从没分配过，不必还。
+    if fd_base != 0 && fd_bytes != 0 {
+        mm::release_fd_table(fd_base, fd_bytes);
+        PROC_REAP_FD_RELEASES.fetch_add(1, Ordering::Relaxed);
     }
     Ok(code)
 }
@@ -393,20 +428,21 @@ pub fn proc_discard(proc_id: u16) -> Result<(), ProcError> {
         // **必须在锁外还**（与 `aspace_destroy` 同一纪律）：归还走 `frame_put`（PMM，rank 30），
         // 而这里持 VMM(20) ⇒ 反向嵌套 ⇒ L4。所以只把地址抄出来，放锁之后还。
         let fd_base = p.fd_table.load(Ordering::Acquire);
+        let fd_bytes = p.fd_cap.load(Ordering::Acquire).saturating_mul(core::mem::size_of::<u64>());
         *p = PROC_EMPTY;
         p.gen = gen;
         if let Some(j) = s.jobs.get_mut(job as usize) {
             j.used_procs = j.used_procs.saturating_sub(1);
         }
-        Ok((aspace, fd_base))
+        Ok((aspace, fd_base, fd_bytes))
     })?;
-    let (aspace, fd_base) = aspace;
+    let (aspace, fd_base, fd_bytes) = aspace;
     if aspace != NO_ASPACE {
         mm::aspace_destroy(aspace);
     }
     // fd 表：锁外归还（见上面那段注释）。0 = 从没分配过，不必还。
-    if fd_base != 0 {
-        mm::release_fd_table(fd_base, FD_TABLE_BYTES);
+    if fd_base != 0 && fd_bytes != 0 {
+        mm::release_fd_table(fd_base, fd_bytes);
     }
     Ok(())
 }

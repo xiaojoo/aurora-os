@@ -58,6 +58,7 @@ impl LockRank {
             39 => "NOTIFY",
             40 => "LEDGER",
             41 => "RAND",
+            42 => "FW",
             50 => "ACPI",
             60 => "TEST",
             _ => "?",
@@ -122,6 +123,12 @@ pub const RANK_DENTRY: LockRank = LockRank(38);
 pub const RANK_NOTIFY: LockRank = LockRank(39);
 pub const RANK_LEDGER: LockRank = LockRank(40);
 pub const RANK_RAND: LockRank = LockRank(41);
+/// 等级 42：防火墙规则表（`network/fw.rs` 的 `FW`，ADR-267）。
+///
+/// **叶子**：临界区只执行已验证字节码（≤128 步纯计算）与读写定长状态，不取任何锁、不分配、不 yield。
+/// 防火墙包原选 41，与已合入的 `RANK_RAND` 冲突，合入时顺延为 42（R29 已由使用者批准，见 ADR-267）。
+/// **不在中断上下文取** ⇒ `IrqSpinLock::new`（lock-order.md 末列"否"）。
+pub const RANK_FW: LockRank = LockRank(42);
 pub const RANK_ACPI: LockRank = LockRank(50);
 /// 跨核竞争用例专用（`smp::CONTENTION_LOCK`）。排在最内层是因为它**不嵌套任何东西**：
 /// 临界区里只有一次原子读改写，不调分配器、不碰页表、不打日志。

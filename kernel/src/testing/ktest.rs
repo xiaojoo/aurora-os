@@ -27,6 +27,19 @@ macro_rules! ktest {
     };
 }
 
+/// 依赖全局时钟/APIC 等晚初始化基础设施的用例；排在普通 `.ktests` 之后。
+#[macro_export]
+macro_rules! ktest_late {
+    ($static_name:ident, $fn_name:ident) => {
+        #[used]
+        #[link_section = ".ktests_late"]
+        static $static_name: $crate::ktest::KTest = $crate::ktest::KTest {
+            name: stringify!($fn_name),
+            run: $fn_name,
+        };
+    };
+}
+
 extern "C" {
     static __ktests_start: u8;
     static __ktests_end: u8;

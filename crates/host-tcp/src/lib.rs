@@ -15,6 +15,10 @@ pub mod rto;
 pub mod retx;
 pub mod window;
 pub mod reasm;
+pub mod cc;      // S4-1 NewReno（纯函数，未接线）
+pub mod sack;    // S4-2 SACK（纯函数，未接线）
+pub mod cookie;  // S4-3 SYN cookie（纯函数，未接线）
+pub mod isn;     // S4-4 ISN/临时端口（已接线 kernel/network/isn_source.rs）
 
 /// a < b（模 2^32）。
 #[inline] pub fn seq_lt(a: u32, b: u32) -> bool { (a.wrapping_sub(b) as i32) < 0 }

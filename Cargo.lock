@@ -11,7 +11,9 @@ name = "aurora-kernel"
 version = "0.0.0"
 dependencies = [
  "aurora-capture",
+ "host-fw",
  "host-initramfs",
+ "host-tcp",
 ]
 
 [[package]]
@@ -108,11 +110,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "host-fw"
+version = "0.1.0"
+
+[[package]]
 name = "host-initramfs"
 version = "0.1.0"
 dependencies = [
  "proptest",
 ]
+
+[[package]]
+name = "host-svc"
+version = "0.1.0"
 
 [[package]]
 name = "host-tcp"

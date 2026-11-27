@@ -1,0 +1,11 @@
+{
+ "len_v4": 48,
+ "len_na": 86,
+ "a_trunc_all_zero": true,
+ "a_eval_delta": 0,
+ "b_nd_trunc_all_zero": true,
+ "b_malformed_delta": 65,
+ "c_eval_delta": 2513,
+ "c_malformed_delta": 443,
+ "c_faults": 0
+}

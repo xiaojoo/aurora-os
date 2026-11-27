@@ -591,6 +591,10 @@ fn stage_rand() {
     if sources < crate::security::rand::MIN_SOURCES {
         crate::log_warn!("rand: 熵源不足({}<{})，随机数 API 返回 NotSeeded", sources, crate::security::rand::MIN_SOURCES);
     }
+    // ADR-266：取 ISN/端口的 per-boot secret。熵不足不阻断启动；`isn_source::ISN_WEAK` 会计数每一次降级。
+    if !crate::network::isn_source::init_secret() {
+        crate::log_warn!("isn: secret 未取得（rand 未播种）——TCP ISN/临时端口降级为旧可预测公式，ISN_WEAK 计数");
+    }
 }
 
 /// Stage2c：SMEP/SMAP 必需项与 BSP 的 #DF guard 栈。

@@ -263,9 +263,10 @@ pub fn create(domain: u16, ty: u16) -> Result<(u16, u32), u64> {
     // stream socket 出生在 `Listen` 态（`bind`+`listen` 之后才真的收 SYN）；
     // dgram 的 `tcp` 保持 `None`。
     if ty == SOCK_STREAM {
-        // ISS 用组合数：槽号 + 世代，够避免同一槽复用时序号撞车
-        let iss = 0x1000_0000u32.wrapping_add((slot as u32) << 8).wrapping_add(s.gen.load(Ordering::Acquire));
-        let st = crate::network::tcp_conn::ConnState::listen(iss);
+        // ISS 仅为占位（ADR-266）：此刻本地端口/对端都未知。真正的 ISN 在 LISTEN 收 SYN（被动）
+        // 与 `tcp_start_connect`（主动）时按四元组重算（RFC 6528）。
+        let st = crate::network::tcp_conn::ConnState::listen(
+            crate::network::isn_source::legacy_isn(slot as u16, s.gen.load(Ordering::Acquire)));
         s.tcp.with(|o| *o = Some(st));
     }
     s.used.store(1, Ordering::Release);
@@ -497,6 +498,11 @@ pub fn deliver_frame(f: &[u8]) -> u8 {
         // **先看是不是 NDP**（ICMPv6 58），是就处理并返回——NDP 不是 UDP，
         // 不能走下面的 UDP 解析。
         if f.len() > 14 + 6 && f[14 + 6] == crate::network::ndp::NEXT_HEADER_ICMPV6 {
+            // ADR-267 挂载点①：判属/handle_frame/回 NA 之前过滤。
+            #[cfg(feature = "fw")]
+            if !crate::network::fw::filter_icmp6_frame(f) {
+                return 0;
+            }
             let our_mac = crate::virtio::net_info().map(|i| i.mac).unwrap_or([0u8; 6]);
             // 判属在**拿锁之前**做（`handle_frame` 内部不能查地址表，会同等级重入）
             let is_ours = crate::network::ndp::peek_ns_target(f)
@@ -522,6 +528,11 @@ pub fn deliver_frame(f: &[u8]) -> u8 {
             return 6;
         }
         if let Some((src, _dst, sp, dp, payload)) = crate::network::ipv6::parse_udp6_frame(f) {
+            // ADR-267 挂载点②：用内核解析器的结果（过滤的就是将要投递的），enqueue 之前判。
+            #[cfg(feature = "fw")]
+            if !crate::network::fw::filter(&host_fw::Packet::udp6(src, _dst, sp, dp, host_fw::Dir::In)) {
+                return 0;
+            }
             let ep = SockAddr::V6 { ip: src, port: sp };
             if enqueue(dp, ep, payload) {
                 return 6;
@@ -531,6 +542,11 @@ pub fn deliver_frame(f: &[u8]) -> u8 {
     }
     if crate::network::ipv6::is_ipv4_frame(f) {
         if let Some((src, _dst, payload)) = crate::network::udp::parse_frame(f) {
+            // ADR-267 挂载点③：同②。
+            #[cfg(feature = "fw")]
+            if !crate::network::fw::filter(&host_fw::Packet::udp4(src.ip, _dst.ip, src.port, _dst.port, host_fw::Dir::In)) {
+                return 0;
+            }
             let ep = SockAddr::from_v4(src);
             if enqueue(_dst.port, ep, payload) {
                 return 4;
@@ -689,13 +705,19 @@ pub fn tcp_start_connect(slot: u16, gen: u32) -> Result<crate::network::tcp_conn
     if s.ty != SOCK_STREAM {
         return Err(E_OPNOTSUPP);
     }
+    // ADR-266：此刻 local/peer 已设，先拷成局部变量（SockAddr: Copy），再进 `with` 闭包，避免闭包内二次借用 `s`。
+    let (loc, peer) = (s.local, s.peer);
     s.tcp.with(|o| match o {
         Some(st) => {
             if st.state != crate::network::tcp_conn::State::Listen {
                 return Err(E_INVAL);
             }
             // Listen ⇒ SynSent
-            let iss = st.iss;
+            let iss = match (loc, peer) {
+                (SockAddr::V4 { ip: lip, port: lp }, SockAddr::V4 { ip: rip, port: rp }) =>
+                    crate::network::isn_source::isn_for(lip, lp, rip, rp, slot, gen),
+                _ => st.iss, // IPv6 TCP 今天没有路径（tcp_conn 只有 IPv4 段），保持占位
+            };
             *st = crate::network::tcp_conn::ConnState::connect(iss);
             let r = st.syn_segment();
             // SYN 占一格
@@ -738,9 +760,18 @@ pub fn tcp_on_segment(
     let mut payload = [0u8; crate::network::tcp::TCP_PAYLOAD_MAX];
     payload[..payload_len].copy_from_slice(&seg.payload[..payload_len]);
 
+    // ADR-266：被动端 ISN。LISTEN 收到 SYN 的这一刻四元组才知道。持 TABLE 锁；`isn_for` 不取任何锁。
+    let isn_for_syn = match (s.local, src) {
+        (SockAddr::V4 { ip: lip, port: lp }, SockAddr::V4 { ip: rip, port: rp }) if seg.is_syn() && !seg.is_ack() =>
+            Some(crate::network::isn_source::isn_for(lip, lp, rip, rp, slot, gen)),
+        _ => None,
+    };
     let (reaction, accepted, acked) = s.tcp.with(|o| match o {
         Some(st) => {
             let before = st.rcv_nxt;
+            if st.state == crate::network::tcp_conn::State::Listen {
+                if let Some(iss) = isn_for_syn { st.iss = iss; st.snd_nxt = iss; } // on_segment 的 LISTEN 分支读 st.iss
+            }
             let r = tcp_conn::on_segment(st, seg);
             let acc = st.rcv_nxt != before && payload_len > 0;
             // **收到 ACK ⇒ 取消重传**（ADR-203）。
@@ -914,10 +945,9 @@ pub fn tcp_accept(listen_slot: u16, listen_gen: u32) -> Result<(u16, u32), u64> 
     // ④ 原槽退回 `Listen`（用同一个 ISS 重新开）
     {
         let s = &mut t.slots[listen_slot as usize];
-        let iss = s.tcp.get().map(|st| st.iss).unwrap_or(0x1000_0000);
-        // 换一个 ISS：同一条连接不该复用同一个初始序号
-        let new_iss = iss.wrapping_add(0x1000);
-        let fresh = crate::network::tcp_conn::ConnState::listen(new_iss);
+        // ISN 在下一个 SYN 到达时按四元组重算（ADR-266）；这里的占位值不会上线。
+        let fresh = crate::network::tcp_conn::ConnState::listen(
+            crate::network::isn_source::legacy_isn(listen_slot as u16, s.gen.load(Ordering::Acquire)));
         s.tcp.with(|o| *o = Some(fresh));
         s.peer = SockAddr::V4 { ip: [0; 4], port: 0 };
     }
