@@ -154,13 +154,16 @@ U2 = 10
 # 2026-11-26 ADR-259 第5片：user/runtime +U1 1/+U5 1（find_role），
 # +user/shell/notify U1 2/U5 9（SI 与共享环访问、RIP 相对 panic 探针）。
 # 对账：728+13=741、U1 105+3=108、U5 128+10=138。
-total = 741
+# 2026-11-27 ADR-259 第9条：删除旧函数指针回调池 -filesystem/block_io U4 16、
+# -ktests/storage/vfs_ro U6 1（旧回调测试的 static mut 夹具）；等价断言迁入真异步核心。
+# 对账：741-17=724、U4 253-16=237、U6 44-1=43。
+total = 724
 U1 = 108
 U2 = 185
 U3 = 13
-U4 = 253
+U4 = 237
 U5 = 138
-U6 = 44
+U6 = 43
 
 [modules."arch/hooks"]
 U4 = 3
@@ -217,7 +220,7 @@ U4 = 17
 U4 = 8
 
 [modules."filesystem/block_io"]
-U4 = 30
+U4 = 14
 
 [modules."filesystem/block_notify"]
 # ADR-259 第5片：通知账本 UnsafeCell 的 Sync 与锁内可变视图；NOTIFY_LOCK(39) 是唯一访问门。
@@ -231,7 +234,7 @@ U2 = 2
 U4 = 30
 
 [modules."ktests/storage/vfs_ro"]
-U6 = 6
+U6 = 5
 
 [modules."irq/mod"]
 U4 = 9

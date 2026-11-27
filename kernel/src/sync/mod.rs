@@ -36,8 +36,7 @@ impl LockRank {
     ///
     /// 锁序违规的日志原来只说 `外层 rank=37 本次 rank=6` ——
     /// **37 是哪把锁、6 是哪把锁，得靠人肉去数**。
-    /// 实测为此浪费了一整轮（先是怀疑 `QUEUE_LOCK`、再怀疑 `CB_LOCK`、
-    /// 最后才发现是 AHCI 的 `XFER`）。
+    /// 实测为此浪费了一整轮（先是怀疑 `QUEUE_LOCK`，最后才发现是 AHCI 的 `XFER`）。
     ///
     /// 这个函数只读常量、不进临界区、不分配，可以安全地在崩溃路径调用。
     pub const fn name(self) -> &'static str {

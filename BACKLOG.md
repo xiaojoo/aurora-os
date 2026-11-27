@@ -26283,3 +26283,9 @@ PASS，按环境形状记“不归因”，判据不动。
   三驱动 PASS，同步 `run-18462` PASS。负样本 `run-18464/18402/18403` 丢所有权、`run-18461` drain 丢回执、
   `run-18463` 关闭同步隔离、`run-18404` 清零错误完成扇区数，均红各自目标格。`check` **21/21**；
   最终独立进程整链 **91/91 符合**（`build/submit-owner-matrix2.out.log`）。真机未验证；AOCI MCP 不可用，索引未更新。
+- 旧回调删除（ADR-259⑨）：`OnComplete`/`OnCompleteCtx`、CB/CTX 队列与锁、四个 submit/drain
+  回调入口及两个旧测试已删除；按目标批量池保留。逐 token/恰好一次/失败/满池/多目标由
+  `t_block_async_core` 覆盖，旧锁外链式提交迁移为持有 LeaseClaim 仍可提交（`链式=true`）。
+  `run-18562` handles **135/135**、`run-18563` fs-ro **107/107**；`check` **21/21**，unsafe
+  741→724（block_io U4 -16、旧测试 U6 -1）；最终独立进程整链 **91/91 符合**
+  （`build/callback-remove-matrix.out.log`）。真机未验证；AOCI MCP 不可用，索引未更新。

@@ -1618,6 +1618,14 @@ fn t_block_async_core() -> bool {
         block_io::async_copy_out(&other, c, &mut bytes) == Err(BlockError::Refused)
     });
     let read_bytes_ok = bytes == disk.data.borrow()[SECTOR..2 * SECTOR];
+    // 旧回调的“锁外链式提交”迁移为：消费者持有 LeaseClaim 时仍可提交下一条请求。
+    let chained_id = block_io::async_submit(&disk, target, 3, 1, false, 47, None).ok();
+    let chained_poll = chained_id.is_some() && block_io::async_poll(&disk) == 1;
+    let mut chained = block_io::async_take_completion(target);
+    let chained_ok = chained_poll && chained.as_ref().is_some_and(|c| {
+        Some(c.request) == chained_id && c.token == 47 && c.error.is_none()
+    });
+    if let Some(c) = chained.as_mut() { let _ = block_io::async_release(&disk, c); }
     if let Some(mut c) = completion {
         let _ = block_io::async_release(&disk, &mut c);
     }
@@ -1763,13 +1771,13 @@ fn t_block_async_core() -> bool {
     if let Some(c) = late_claim.as_mut() { let _ = block_io::async_release(&disk, c); }
 
     let stats = block_io::async_stats();
-    let ok = no_early && polled && once && read_ok && bounded && wrong_copy && read_bytes_ok
+    let ok = no_early && polled && once && read_ok && bounded && wrong_copy && read_bytes_ok && chained_ok
         && write_id && write_ok && write_read && written_ok && written[..4] == pattern[..4] && bad_len
         && cancelled && full && failed_id && failure_ok && duplicate_poll == 1 && duplicate_ok
         && routed && clear_kept && wrong_adapter && cross_a_ok && cross_b_ok && timeout_ok && late_ok
         && stats.3 == 1 && stats.4 == 0 && stats.5 == 0 && stats.6 == 1 && stats.7 == 1 && disk.double_release.get() == 0;
-    crate::log_info!("block-async: 提交不执行={} 轮询={} 完成一次={} 租约可读={} 租约边界={} 字节同={} 写回={} 写字节同={} 写长度={} 取消={} 池满={} 失败={} 重复={} 多目标={} 清队列留途={} 适配器={} 跨盘={} 超时={} 迟到={} 双释放={} 台账={:?} ⇒ {}",
-        no_early, polled, once, read_ok, bounded, read_bytes_ok, written_ok,
+    crate::log_info!("block-async: 提交不执行={} 轮询={} 完成一次={} 租约可读={} 租约边界={} 字节同={} 链式={} 写回={} 写字节同={} 写长度={} 取消={} 池满={} 失败={} 重复={} 多目标={} 清队列留途={} 适配器={} 跨盘={} 超时={} 迟到={} 双释放={} 台账={:?} ⇒ {}",
+        no_early, polled, once, read_ok, bounded, read_bytes_ok, chained_ok, written_ok,
         written[..4] == pattern[..4], bad_len, cancelled, full, failure_ok, duplicate_ok, routed, clear_kept,
         wrong_adapter, cross_a_ok && cross_b_ok, timeout_ok, late_ok, disk.double_release.get(), stats, ok);
     ok
@@ -2388,155 +2396,6 @@ fn t_block_queue() -> bool {
 #[cfg(feature = "handles")]
 ktest!(KT_BLOCK_QUEUE, t_block_queue);
 
-/// ADR-215：**完成回调**的证人。
-///
-/// ## 要证什么
-///
-/// ADR-214 的 `drain` 只返回汇总（`DrainReport`）。这一层补**逐条回调**：
-/// 每条请求完成时调自己的回调，带回 token 与结果。
-///
-/// ## 判据七格
-///
-/// 1. `submit_with_cb` 入队，`cb_pending()` 增长；
-/// 2. **每条都回调一次**（不多不少）；
-/// 3. **token 原样带回**（回调能认出是谁的请求）；
-/// 4. **回调顺序按 LBA**（排序生效）；
-/// 5. **失败的那条回 `Err`**，其余回 `Ok`；
-/// 6. **回调在锁外调**（回调里能再 `submit_with_cb` —— 这格证不自死锁）；
-/// 7. `cb_stats()` 的 `(投递, 失败)` 与实际一致。
-///
-/// **负样本**：把回调移到锁内 ⇒ 第 6 格死锁（整机 HANG）。
-#[cfg(feature = "handles")]
-fn t_block_callback() -> bool {
-    use crate::filesystem::block_io::{self, Budget};
-    use core::sync::atomic::{AtomicU32, Ordering};
-    let mut ok = true;
-
-    static mut IMG: [u8; 128 * 512] = [0u8; 128 * 512];
-    // SAFETY: 单核判据路径。
-    let img: &mut [u8] = unsafe { &mut *core::ptr::addr_of_mut!(IMG) };
-    for (i, b) in img.iter_mut().enumerate() {
-        *b = (i % 251) as u8;
-    }
-    let disk = crate::filesystem::vfs::MemDisk { img };
-
-    // 回调记录：token 顺序 + Ok/Err
-    static ORDER: AtomicU32 = AtomicU32::new(0);
-    static TOK0: AtomicU32 = AtomicU32::new(0);
-    static TOK1: AtomicU32 = AtomicU32::new(0);
-    static OK_COUNT: AtomicU32 = AtomicU32::new(0);
-    static ERR_COUNT: AtomicU32 = AtomicU32::new(0);
-    static CHAIN_TRIED: AtomicU32 = AtomicU32::new(0);
-    fn cb(token: u64, r: Result<u32, crate::filesystem::vfs::BlockError>) {
-        let n = ORDER.fetch_add(1, Ordering::Relaxed);
-        if n == 0 {
-            TOK0.store(token as u32, Ordering::Relaxed);
-        } else if n == 1 {
-            TOK1.store(token as u32, Ordering::Relaxed);
-        }
-        match r {
-            Ok(_) => {
-                OK_COUNT.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(_) => {
-                ERR_COUNT.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        // ⑥ **在回调里再提交一条** —— 若回调在锁内，这里会自死锁。
-        if token == 42 {
-            CHAIN_TRIED.store(1, Ordering::Relaxed);
-            let _ = block_io::submit_with_cb(100, 1, 999, cb);
-        }
-    }
-
-    block_io::cb_clear();
-    ORDER.store(0, Ordering::Relaxed);
-    OK_COUNT.store(0, Ordering::Relaxed);
-    ERR_COUNT.store(0, Ordering::Relaxed);
-    CHAIN_TRIED.store(0, Ordering::Relaxed);
-
-    // ① 入队（乱序：先 20 再 10）
-    let a = block_io::submit_with_cb(20, 1, 42, cb);
-    let b = block_io::submit_with_cb(10, 1, 7, cb);
-    let pend_ok = a && b && block_io::cb_pending() == 2;
-    if !pend_ok {
-        crate::log_fatal!("cb: 入队不对 pending={}", block_io::cb_pending());
-        ok = false;
-    }
-
-    // 执行
-    let rep = block_io::drain_with_cb(&disk, &Budget::UNBOUNDED);
-    let n = ORDER.load(Ordering::Relaxed);
-
-    // ② **本轮只回调已入队的 2 条**
-    //
-    // 链式那条（在回调里 submit 的）进的是**下一轮**队列 —— 这是正确语义：
-    // `drain_with_cb` 在开跑时就把队列拷出来并清空，所以它看不到自己执行期间新增的项。
-    //
-    // 第一版判据写 `n == 3`，实测 2 ⇒ **判据的错，不是代码的错**。
-    let count_ok = n == 2;
-    if !count_ok {
-        crate::log_fatal!("cb: 回调次数不对 {}", n);
-        ok = false;
-    }
-
-    // ④ 顺序按 LBA：10 先、20 后
-    let order_ok = TOK0.load(Ordering::Relaxed) == 7 && TOK1.load(Ordering::Relaxed) == 42;
-    if !order_ok {
-        crate::log_fatal!("cb: 顺序不对 tok0={} tok1={}",
-            TOK0.load(Ordering::Relaxed), TOK1.load(Ordering::Relaxed));
-        ok = false;
-    }
-
-    // ③ token 原样带回（由上格间接证明）
-    let token_ok = order_ok;
-
-    // ⑤⑥ 全成功 + 回调里能再提交
-    let all_ok = OK_COUNT.load(Ordering::Relaxed) == 2 && ERR_COUNT.load(Ordering::Relaxed) == 0;
-    let chain_ok = CHAIN_TRIED.load(Ordering::Relaxed) == 1;
-    if !all_ok || !chain_ok {
-        crate::log_fatal!("cb: 成功数={} 失败数={} 链式={}",
-            OK_COUNT.load(Ordering::Relaxed), ERR_COUNT.load(Ordering::Relaxed), chain_ok);
-        ok = false;
-    }
-
-    // ⑦ 统计一致
-    let (delivered, failed) = block_io::cb_stats();
-    let stats_ok = delivered == 2 && failed == 0;
-    if !stats_ok {
-        crate::log_fatal!("cb: 统计不对 delivered={} failed={}", delivered, failed);
-        ok = false;
-    }
-
-    // 补一格：失败路径
-    block_io::cb_clear();
-    ORDER.store(0, Ordering::Relaxed);
-    OK_COUNT.store(0, Ordering::Relaxed);
-    ERR_COUNT.store(0, Ordering::Relaxed);
-    let _ = block_io::submit_with_cb(127, 4, 55, cb); // 越界
-    let rep2 = block_io::drain_with_cb(&disk, &Budget::UNBOUNDED);
-    let (_, failed2) = block_io::cb_stats();
-    let err_ok = rep2.failed_at == Some(55)
-        && ERR_COUNT.load(Ordering::Relaxed) == 1
-        && failed2 == 1;
-    if !err_ok {
-        crate::log_fatal!("cb: 失败路径不对 failed_at={:?} err_count={}",
-            rep2.failed_at, ERR_COUNT.load(Ordering::Relaxed));
-        ok = false;
-    }
-
-    block_io::cb_clear();
-    crate::log_info!(
-        "cb: 入队={} 次数={} 顺序={} token={} 全成功={} 链式={} 统计={} 失败路径={} ｜ issued={} ⇒ {}",
-        pend_ok, count_ok, order_ok, token_ok, all_ok, chain_ok, stats_ok, err_ok, rep.issued, ok
-    );
-    ok
-}
-
-#[cfg(feature = "handles")]
-ktest!(KT_BLOCK_CALLBACK, t_block_callback);
-
-
 /// ADR-251：批量请求按目标提取，A 目标执行不能碰 B 目标。
 #[cfg(feature = "handles")]
 fn t_block_per_disk_queue() -> bool {
@@ -2662,189 +2521,6 @@ fn t_block_per_disk_queue() -> bool {
 }
 #[cfg(feature = "handles")]
 ktest!(KT_BLOCK_PER_DISK_QUEUE, t_block_per_disk_queue);
-
-/// ADR-251：带上下文回调按目标完成，统计先于回调提交，链式请求留到下一轮。
-#[cfg(feature = "handles")]
-fn t_block_context_callback() -> bool {
-    use crate::filesystem::block_io::{self, Budget, Outcome, TargetId};
-    use crate::filesystem::vfs::{Block, BlockError, DiskKey};
-    use core::sync::atomic::{AtomicU32, Ordering};
-
-    struct KeyDisk<'a> {
-        key: DiskKey,
-        calls: &'a AtomicU32,
-        fail_at: Option<u64>,
-    }
-    impl Block for KeyDisk<'_> {
-        fn read_sectors(&self, lba: u64, dst: &mut [u8]) -> Result<(), BlockError> {
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            if lba >= 64 || self.fail_at == Some(lba) {
-                return Err(BlockError::Refused);
-            }
-            dst.fill(if self.key == DiskKey::Ahci(10) { 0x11 } else { 0x22 });
-            Ok(())
-        }
-        fn disk_key(&self) -> DiskKey {
-            self.key
-        }
-    }
-
-    let ta = TargetId(0xA);
-    let tb = TargetId(0xB);
-    const CTX: u64 = 0x51a7_2026_1125;
-    const CTX2: u64 = CTX + 1;
-    const CTX3: u64 = CTX + 2;
-    static CALLS_A: AtomicU32 = AtomicU32::new(0);
-    static CALLS_B: AtomicU32 = AtomicU32::new(0);
-    static ORDER: AtomicU32 = AtomicU32::new(0);
-    static TOK0: AtomicU32 = AtomicU32::new(0);
-    static TOK1: AtomicU32 = AtomicU32::new(0);
-    static TOK2: AtomicU32 = AtomicU32::new(0);
-    static TOK3: AtomicU32 = AtomicU32::new(0);
-    static BAD_CTX: AtomicU32 = AtomicU32::new(0);
-    static BAD_RESULT: AtomicU32 = AtomicU32::new(0);
-    static OK_COUNT: AtomicU32 = AtomicU32::new(0);
-    static ERR_COUNT: AtomicU32 = AtomicU32::new(0);
-    static ERR_REFUSED: AtomicU32 = AtomicU32::new(0);
-    static CHAIN: AtomicU32 = AtomicU32::new(0);
-    static SAW0: AtomicU32 = AtomicU32::new(0);
-    static SAW1: AtomicU32 = AtomicU32::new(0);
-
-    fn cb(ctx: u64, token: u64, result: Result<u32, BlockError>) {
-        let want_ctx = match token {
-            7 => CTX,
-            42 | 999 => CTX2,
-            99 => CTX3,
-            55 | 56 => CTX,
-            _ => 0,
-        };
-        if ctx != want_ctx {
-            BAD_CTX.fetch_add(1, Ordering::Relaxed);
-        }
-        let n = ORDER.fetch_add(1, Ordering::Relaxed);
-        let slot = match n {
-            0 => &TOK0,
-            1 => &TOK1,
-            2 => &TOK2,
-            _ => &TOK3,
-        };
-        slot.store(token as u32, Ordering::Relaxed);
-        match result {
-            Ok(sectors) => {
-                OK_COUNT.fetch_add(1, Ordering::Relaxed);
-                let want = if token == 7 || token == 42 { 2 } else { 1 };
-                if sectors != want {
-                    BAD_RESULT.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            Err(e) => {
-                ERR_COUNT.fetch_add(1, Ordering::Relaxed);
-                if token == 55 && e == BlockError::Refused {
-                    ERR_REFUSED.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
-        let (delivered, _, _) = block_io::ctx_cb_stats();
-        if n == 0 {
-            SAW0.store(delivered, Ordering::Relaxed);
-        } else if n == 1 {
-            SAW1.store(delivered, Ordering::Relaxed);
-        }
-        if token == 42 {
-            CHAIN.store(1, Ordering::Relaxed);
-            let _ = block_io::submit_with_cb_ctx(TargetId(0xA), 30, 1, 999, CTX2, cb);
-        }
-    }
-
-    let mut disk_a = KeyDisk { key: DiskKey::Ahci(10), calls: &CALLS_A, fail_at: None };
-    let disk_b = KeyDisk { key: DiskKey::Ahci(10), calls: &CALLS_B, fail_at: None };
-    block_io::ctx_cb_clear();
-    CALLS_A.store(0, Ordering::Relaxed);
-    CALLS_B.store(0, Ordering::Relaxed);
-    ORDER.store(0, Ordering::Relaxed);
-    TOK0.store(0, Ordering::Relaxed);
-    TOK1.store(0, Ordering::Relaxed);
-    TOK2.store(0, Ordering::Relaxed);
-    TOK3.store(0, Ordering::Relaxed);
-    BAD_CTX.store(0, Ordering::Relaxed);
-    BAD_RESULT.store(0, Ordering::Relaxed);
-    OK_COUNT.store(0, Ordering::Relaxed);
-    ERR_COUNT.store(0, Ordering::Relaxed);
-    ERR_REFUSED.store(0, Ordering::Relaxed);
-    CHAIN.store(0, Ordering::Relaxed);
-    SAW0.store(0, Ordering::Relaxed);
-    SAW1.store(0, Ordering::Relaxed);
-
-    let submitted = block_io::submit_with_cb_ctx(tb, 5, 1, 99, CTX3, cb)
-        && block_io::submit_with_cb_ctx(ta, 12, 2, 42, CTX2, cb)
-        && block_io::submit_with_cb_ctx(ta, 10, 2, 7, CTX, cb);
-    let split = submitted && block_io::cb_pending_for(ta) == 2 && block_io::cb_pending_for(tb) == 1;
-    let ra = block_io::drain_with_cb_ctx(ta, &disk_a, &Budget::UNBOUNDED);
-    let a_only = ra.issued == 2 && ra.failed_at.is_none()
-        && ORDER.load(Ordering::Relaxed) == 2
-        && TOK0.load(Ordering::Relaxed) == 7
-        && TOK1.load(Ordering::Relaxed) == 42
-        && CALLS_A.load(Ordering::Relaxed) == 4
-        && CALLS_B.load(Ordering::Relaxed) == 0
-        && block_io::cb_pending_for(tb) == 1;
-    let stats_precommit = SAW0.load(Ordering::Relaxed) == 1 && SAW1.load(Ordering::Relaxed) == 2;
-    let chain_ok = CHAIN.load(Ordering::Relaxed) == 1 && block_io::cb_pending_for(ta) == 1;
-    let cleared_b = {
-        block_io::cb_clear_for(tb);
-        block_io::cb_pending_for(tb) == 0
-    };
-    let resubmitted_b = block_io::submit_with_cb_ctx(tb, 5, 1, 99, CTX3, cb);
-    let rb = block_io::drain_with_cb_ctx(tb, &disk_b, &Budget::UNBOUNDED);
-    let b_done = cleared_b && resubmitted_b && rb.issued == 1
-        && TOK2.load(Ordering::Relaxed) == 99
-        && CALLS_B.load(Ordering::Relaxed) == 1;
-    let rc = block_io::drain_with_cb_ctx(ta, &disk_a, &Budget::UNBOUNDED);
-    let chain_done = rc.issued == 1 && TOK3.load(Ordering::Relaxed) == 999;
-    let ctx_ok = BAD_CTX.load(Ordering::Relaxed) == 0
-        && BAD_RESULT.load(Ordering::Relaxed) == 0
-        && OK_COUNT.load(Ordering::Relaxed) == 4;
-
-    block_io::ctx_cb_clear();
-    CALLS_A.store(0, Ordering::Relaxed);
-    let _ = block_io::submit_with_cb_ctx(ta, u64::MAX, 1, 55, CTX, cb);
-    let rf = block_io::drain_with_cb_ctx(ta, &disk_a, &Budget::UNBOUNDED);
-    let (delivered, failed, _) = block_io::ctx_cb_stats();
-    let failure_ok = rf.failed_at == Some(55) && delivered == 0 && failed == 1
-        && ERR_COUNT.load(Ordering::Relaxed) == 1
-        && ERR_REFUSED.load(Ordering::Relaxed) == 1
-        && CALLS_A.load(Ordering::Relaxed) == 0;
-
-    block_io::ctx_cb_clear();
-    disk_a.fail_at = Some(1);
-    let _ = block_io::submit_with_cb_ctx(ta, 0, 2, 56, CTX, cb);
-    let rp = block_io::drain_with_cb_ctx(ta, &disk_a, &Budget::UNBOUNDED);
-    disk_a.fail_at = None;
-    let partial_ok = rp.failed_at == Some(56) && rp.sectors_ok == 1;
-
-    block_io::ctx_cb_clear();
-    let mut filled = 0usize;
-    for i in 0..block_io::QUEUE_MAX {
-        let target = if i % 2 == 0 { ta } else { tb };
-        if block_io::submit_with_cb_ctx(target, i as u64, 1, i as u64, CTX, cb) {
-            filled += 1;
-        }
-    }
-    let overflow_full = block_io::submit_with_cb_ctx(ta, 999, 1, 999, CTX, cb);
-    let (_, _, refused) = block_io::ctx_cb_stats();
-    let full_ok = filled == block_io::QUEUE_MAX && !overflow_full && refused >= 1;
-    block_io::ctx_cb_clear();
-
-    let ok = split && a_only && stats_precommit && chain_ok && b_done && chain_done
-        && ctx_ok && failure_ok && partial_ok && full_ok;
-    crate::log_info!(
-        "block-ctx: 按目标={} ctx={} token={} 统计先提交={} 链式={} 目标清={} B完成={} LBA溢出失败={} 部分成功={}(失败={:?} 扇区={}) 满池拒={} ⇒ {}",
-        split, ctx_ok, a_only, stats_precommit, chain_ok && chain_done, cleared_b, b_done,
-        failure_ok, partial_ok, rp.failed_at, rp.sectors_ok, full_ok, ok
-    );
-    ok
-}
-#[cfg(feature = "handles")]
-ktest!(KT_BLOCK_CONTEXT_CALLBACK, t_block_context_callback);
 
 /// ADR-216：**inode 层**的证人。
 ///
