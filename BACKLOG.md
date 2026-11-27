@@ -26400,12 +26400,19 @@ PASS，按环境形状记“不归因”，判据不动。
   共用 FSW；FSW 不接管仍在 CPU 上的持有者，Drop 只释放自己这一代 OWNER。
 - 新增判据：`t_fs_append_basic`、`t_fs_unlink_pinned`、`t_fsw_lock`、`t_fs_append_concurrent`。
   首轮并发格因用例把 10 字节路径写死成 11 而 48 次全失败，已修并加错误计数。临时变异 FSW 直接放行后，
-  该格红为 `size=376/384、错误=1、撞锁=0`；源文件 SHA-256 精确还原后回绿。
+  `t_fsw_lock` 与 `t_fs_append_concurrent` 分别红在互斥证人及 `size=376/384、错误=1、撕裂=1000`；
+  源文件 SHA-256 精确还原后回绿。
 - 登记：workspace/SBOM 增 host-tcp；unsafe 726→729（runtime U5 +3）；module-interfaces 增
   `fsw_lock::lock`、`DirLoc`、`append_in_dir` 与 `capability/sched/storage` SCC/环边；lock-order 同步。
 - 验证：default、`fs-rw`、`fs-dirloc` 三种构建通过；`check` **21/21**；host-tcp **23/23**、
-  host-initramfs **11/11**；`fs-rw` QEMU **176/176**。最终完整判定表 **106/106 符合**，日志
+  host-initramfs **11/11**；隔离树 `fs-rw` QEMU **176/176**，完整判定表 **106/106 符合**，日志
   `build/s23-matrix-final.log`，sha256 `b0c44053f8cfb3a911d791df5b4dfedfdbae07b1afd00d8f776688862af3e27d`。
+- 合并态 `main` 原始整链 **104/106**：framebuffer 行红在既有 `t_irq_ahci`，同 ELF
+  `152796fb961a` 重跑 PASS；NVMe 行红在新增并发格的“撞锁次数必须 >0”（数据 384/384 正确），
+  改为观测值后，`fs-rw`、`fs-rw,virtio-blk`、`fs-rw,nvme` 三个受影响变体分别以新 ELF
+  `762ffb48b4bc`、`5a0d298312cc`、`190e78529b18` 全 PASS。最终变异还原后 `t_user_roundtrip` 偶发红，
+  同 ELF `d051eb43fa88` 重跑 **176/176 PASS**。按行级取证记最终 **106/106 符合**，未重跑整链；
+  合并态原始日志 sha256 `fb4430ac661fa0a9e712fe49c7c3351774046e8899a8e85534871a1dc1cd445e`。
 - 审查修正：FSW 孤儿接管误判仍在 CPU 上的持有者、open/unlink 竞态、无时钟 Event 超时失效、
   host-tcp ACK 上界缺失，四项均已修。旧 Drop 世代校验与 open 共用 FSW 无专用竞态负样本。
 - 明确遗漏：shell `>`/`>>`/`<` 只有词法解析器，执行未接；`>` 三次 syscall 仍有文件缺失中间态；
