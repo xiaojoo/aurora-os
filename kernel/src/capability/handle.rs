@@ -47,6 +47,7 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 pub const MAX_HANDLES: usize = 16384;
 #[cfg(not(feature = "fs-open"))]
 pub const MAX_HANDLES: usize = 131072;
+pub const MAX_HANDLES_PER_PROC: usize = 1024;
 /// 查「这个任务属于哪个进程」的函数指针（ADR-191）。
 ///
 /// ## 为什么是函数指针而不是直接调 `sched`
@@ -1032,28 +1033,70 @@ fn check(t: &mut Table, h: Handle, owner: (usize, u32), need: u32) -> Result<usi
     Ok(slot as usize)
 }
 
-/// 占一格并提交（**锁内**）。调用方已经在锁外给对象加好了它该有的那份引用。
-fn insert(t: &mut Table, owner: (usize, u32), rights: u32, obj: ObjRef) -> Result<Handle, HErr> {
-    let Some(slot) = t.slots.iter().position(|e| !e.used) else {
+fn owned_by_proc(t: &Table, proc: u16) -> usize {
+    t.slots.iter().filter(|e| e.used
+        && (cfg!(feature = "fault-handle-proc-count") || e.owner_proc == proc)).count()
+}
+
+fn reserve_slot(t: &mut Table, owner: (usize, u32)) -> Result<(usize, u16, usize), HErr> {
+    let proc = proc_of(owner.0);
+    let mut free_slot = None;
+    let mut owned = 0usize;
+    let mut live_count = 0usize;
+    for (slot, entry) in t.slots.iter().enumerate() {
+        if entry.used {
+            live_count += 1;
+            if proc != u16::MAX && entry.owner_proc == proc {
+                owned += 1;
+            }
+        } else if free_slot.is_none() {
+            free_slot = Some(slot);
+        }
+    }
+    if proc != u16::MAX && owned >= MAX_HANDLES_PER_PROC
+        && !cfg!(feature = "fault-handle-quota")
+    {
+        t.c.exhausted += 1;
+        return Err(HErr::Exhausted);
+    }
+    let Some(slot) = free_slot else {
         t.c.exhausted += 1;
         return Err(HErr::Exhausted);
     };
+    Ok((slot, proc, live_count))
+}
+
+fn commit_slot(
+    t: &mut Table,
+    slot: usize,
+    owner: (usize, u32),
+    proc: u16,
+    rights: u32,
+    obj: ObjRef,
+    live_count: usize,
+) -> Handle {
     let next = next_gen(t.slots[slot].gen);
     t.slots[slot] = Entry {
         gen: next,
         used: true,
         owner_gidx: owner.0 as u16,
         owner_id: owner.1,
-        owner_proc: proc_of(owner.0),
+        owner_proc: proc,
         rights,
         obj: Some(obj),
     };
     t.c.grants += 1;
-    let live = t.live();
+    let live = (live_count + 1) as u32;
     if live > t.c.live_peak {
         t.c.live_peak = live;
     }
-    Ok(Handle::pack(slot as u16, next))
+    Handle::pack(slot as u16, next)
+}
+
+/// 占一格并提交（**锁内**）。调用方已经在锁外给对象加好了它该有的那份引用。
+fn insert(t: &mut Table, owner: (usize, u32), rights: u32, obj: ObjRef) -> Result<Handle, HErr> {
+    let (slot, proc, live_count) = reserve_slot(t, owner)?;
+    Ok(commit_slot(t, slot, owner, proc, rights, obj, live_count))
 }
 
 pub fn grant_console(owner: (usize, u32), rights: u32, sid: u8) -> Result<Handle, HErr> {
@@ -1629,6 +1672,14 @@ pub fn transfer(h: Handle, from: (usize, u32), to: (usize, u32)) -> Result<Handl
     let mut g = TABLE.lock();
     let t = g.get();
     let slot = check(t, h, from, RIGHT_TRANSFER)?;
+    let target_proc = proc_of(to.0);
+    if target_proc != u16::MAX && t.slots[slot].owner_proc != target_proc
+        && owned_by_proc(t, target_proc) >= MAX_HANDLES_PER_PROC
+        && !cfg!(feature = "fault-handle-transfer-quota")
+    {
+        t.c.exhausted += 1;
+        return Err(HErr::Exhausted);
+    }
     let e = &mut t.slots[slot];
     let next = next_gen(e.gen);
     e.gen = next;
@@ -1704,7 +1755,9 @@ pub fn close(h: Handle, owner: (usize, u32)) -> Result<(), HErr> {
         });
         #[cfg(not(feature = "fs-open"))]
         let node: Option<()> = None;
-        t.slots[slot].used = false;
+        if !cfg!(feature = "fault-handle-close-used") {
+            t.slots[slot].used = false;
+        }
         t.slots[slot].rights = 0;
         t.c.closes += 1;
         (obj, node)
@@ -1734,12 +1787,17 @@ pub fn dup(h: Handle, owner: (usize, u32), new_rights: u32) -> Result<Handle, HE
     {
         let mut g = TABLE.lock();
         let t = g.get();
-        let slot = check(t, h, owner, RIGHT_DUP)?;
-        let old = t.slots[slot];
+        let source_slot = check(t, h, owner, RIGHT_DUP)?;
+        let old = t.slots[source_slot];
         if new_rights & !old.rights != 0 {
             t.c.denied += 1;
             return Err(HErr::Denied);
         }
+        let reserved = if cfg!(feature = "fault-handle-dup-quota") {
+            None
+        } else {
+            Some(reserve_slot(t, owner)?)
+        };
         let shared = match old.obj {
             Some(ObjRef::File(f)) => {
                 let i = match f.share {
@@ -1760,10 +1818,6 @@ pub fn dup(h: Handle, owner: (usize, u32), new_rights: u32) -> Result<Handle, HE
             }
             #[cfg(feature = "fs-open")]
             Some(ObjRef::VfsFile { port, part, cursor, stat, share, vol, node }) => {
-                if !t.slots.iter().any(|e| !e.used) {
-                    t.c.exhausted += 1;
-                    return Err(HErr::Exhausted);
-                }
                 let i = match share {
                     Some(i) => {
                         cell_retain(t, i);
@@ -1782,10 +1836,6 @@ pub fn dup(h: Handle, owner: (usize, u32), new_rights: u32) -> Result<Handle, HE
             #[cfg(feature = "fs-open")]
             Some(ObjRef::VfsDir { port, part, stat, state, share, node }) => {
                 if let Some(node) = node {
-                    if !t.slots.iter().any(|e| !e.used) {
-                        t.c.exhausted += 1;
-                        return Err(HErr::Exhausted);
-                    }
                     let i = match share {
                         Some(i) => { cell_retain(t, i); i }
                         None => {
@@ -1808,8 +1858,12 @@ pub fn dup(h: Handle, owner: (usize, u32), new_rights: u32) -> Result<Handle, HE
         };
         if let Some(obj) = shared {
             // 原句柄也改指向共享格子（第一次 dup 时它是 None；之后的 dup 是同一个 i）。
-            t.slots[slot].obj = Some(obj);
-            return insert(t, owner, new_rights, obj);
+            t.slots[source_slot].obj = Some(obj);
+            let (slot, proc, live_count) = match reserved {
+                Some(value) => value,
+                None => reserve_slot(t, owner)?,
+            };
+            return Ok(commit_slot(t, slot, owner, proc, new_rights, obj, live_count));
         }
     }
     let obj = {
@@ -2170,7 +2224,8 @@ pub fn revoke_task(gidx: usize, id: u32) -> usize {
         let t = g.get();
         let mut n = 0u32;
         for i in 0..MAX_HANDLES {
-            if t.slots[i].used && t.slots[i].owner_gidx as usize == gidx && t.slots[i].owner_id == id {
+            if t.slots[i].used && t.slots[i].owner_gidx as usize == gidx
+                && (cfg!(feature = "fault-handle-revoke-owner") || t.slots[i].owner_id == id) {
                 let obj = t.slots[i].obj.take();
                 if let Some(ObjRef::Vmo { slot }) = obj {
                     if nv < vmos.len() { vmos[nv] = slot; nv += 1; }
@@ -2194,6 +2249,18 @@ pub fn revoke_task(gidx: usize, id: u32) -> usize {
         crate::vmo::vmo_unref(crate::vmo::VmoId::from_slot(*slot));
     }
     n as usize
+}
+
+pub fn is_live(h: Handle) -> bool {
+    let Some((slot, gen)) = h.unpack() else { return false };
+    let mut g = TABLE.lock();
+    let entry = &g.get().slots[slot as usize];
+    entry.used && (cfg!(feature = "fault-handle-is-live-gen") || entry.gen == gen)
+}
+
+pub fn count_for_proc(proc: u16) -> usize {
+    let mut g = TABLE.lock();
+    owned_by_proc(g.get(), proc)
 }
 
 pub fn live() -> usize {
@@ -2479,6 +2546,163 @@ mod tests {
     }
 
     crate::ktest!(KT_HANDLE_TABLE, t_handle_table);
+
+    fn fill_console_slots(h: Handle, count: usize) -> bool {
+        if h.slot() as usize >= count || count > MAX_HANDLES {
+            return false;
+        }
+        let mut g = TABLE.lock();
+        let t = g.get();
+        let template = t.slots[h.slot() as usize];
+        for slot in 0..count {
+            if slot != h.slot() as usize {
+                t.slots[slot] = template;
+            }
+        }
+        true
+    }
+
+    pub fn t_handle_is_live() -> bool {
+        reset_for_test();
+        reset_counters_for_test();
+        let owner = (3usize, 10u32);
+        let Some(h) = grant_console(owner, RIGHT_READ, 0).ok() else {
+            reset_for_test();
+            return false;
+        };
+        let live_before = is_live(h);
+        let close_ok = close(h, owner).is_ok();
+        let live_after = is_live(h);
+        let Some(h2) = grant_console(owner, RIGHT_READ, 0).ok() else {
+            reset_for_test();
+            return false;
+        };
+        let reuse_slot = h2.slot() == h.slot();
+        let stale_still_dead = !is_live(h);
+        let new_alive = is_live(h2);
+        let shape = !is_live(Handle(0)) && !is_live(Handle::pack(0, 0));
+        crate::log_info!(
+            "handle-live: before={} close={} after={} reuse={} stale_dead={} new={} shape={}",
+            live_before, close_ok, live_after, reuse_slot, stale_still_dead, new_alive, shape
+        );
+        reset_for_test();
+        live_before && close_ok && !live_after && stale_still_dead && new_alive && shape
+    }
+    crate::ktest!(KT_HANDLE_LIVE, t_handle_is_live);
+
+    pub fn t_handle_quota() -> bool {
+        reset_for_test();
+        reset_counters_for_test();
+        let old_proc_of = PROC_OF.load(core::sync::atomic::Ordering::Acquire);
+        install_proc_of(|gidx| if gidx < 100 { 1 } else { 2 });
+        let a = (50usize, 1u32);
+        let b = (150usize, 2u32);
+        let result = (|| {
+            let Some(first) = grant_console(a, RIGHT_READ, 0).ok() else { return false };
+            if !fill_console_slots(first, MAX_HANDLES_PER_PROC) {
+                return false;
+            }
+            let fill_ok = count_for_proc(1) == MAX_HANDLES_PER_PROC;
+            let over = matches!(grant_console(a, RIGHT_READ, 0), Err(HErr::Exhausted));
+            let other_ok = grant_console(b, RIGHT_READ, 0).is_ok();
+            let close_ok = close(first, a).is_ok();
+            let again_ok = grant_console(a, RIGHT_READ, 0).is_ok();
+            let count_ok = count_for_proc(1) == MAX_HANDLES_PER_PROC;
+            crate::log_info!(
+                "handle-quota: fill={} over={} other={} close={} again={} count={}",
+                fill_ok, over, other_ok, close_ok, again_ok, count_ok
+            );
+            fill_ok && over && other_ok && close_ok && again_ok && count_ok
+        })();
+        PROC_OF.store(old_proc_of, core::sync::atomic::Ordering::Release);
+        reset_for_test();
+        result
+    }
+    crate::ktest!(KT_HANDLE_QUOTA, t_handle_quota);
+
+    pub fn t_handle_revoke_only_owner() -> bool {
+        reset_for_test();
+        reset_counters_for_test();
+        let a = (60usize, 1u32);
+        let b = (60usize, 2u32);
+        let Some(ha) = grant_console(a, RIGHT_READ, 0).ok() else {
+            reset_for_test();
+            return false;
+        };
+        let Some(hb) = grant_console(b, RIGHT_READ, 0).ok() else {
+            reset_for_test();
+            return false;
+        };
+        let n = revoke_task(a.0, a.1);
+        let ok = n == 1 && !is_live(ha) && is_live(hb);
+        crate::log_info!("handle-revoke-owner: revoked={} a_live={} b_live={}", n, is_live(ha), is_live(hb));
+        reset_for_test();
+        ok
+    }
+    crate::ktest!(KT_HANDLE_REVOKE_ONLY_OWNER, t_handle_revoke_only_owner);
+
+    pub fn t_handle_transfer_quota() -> bool {
+        reset_for_test();
+        reset_counters_for_test();
+        let old_proc_of = PROC_OF.load(core::sync::atomic::Ordering::Acquire);
+        install_proc_of(|gidx| if gidx < 100 { 1 } else { 2 });
+        let a = (70usize, 1u32);
+        let b = (150usize, 2u32);
+        let result = (|| {
+            let Some(hb) = grant_console(b, RIGHT_READ | RIGHT_TRANSFER, 0).ok() else { return false };
+            let filled = fill_console_slots(hb, MAX_HANDLES_PER_PROC);
+            let ha = grant_console(a, RIGHT_READ | RIGHT_TRANSFER, 0).ok();
+            let rejected = ha.is_some_and(|h| matches!(transfer(h, a, b), Err(HErr::Exhausted)));
+            let source_live = ha.is_some_and(is_live);
+            let target_count = count_for_proc(2) == MAX_HANDLES_PER_PROC;
+            crate::log_info!(
+                "handle-transfer-quota: fill={} rejected={} source_live={} target_count={}",
+                filled, rejected, source_live, target_count
+            );
+            filled && rejected && source_live && target_count
+        })();
+        PROC_OF.store(old_proc_of, core::sync::atomic::Ordering::Release);
+        reset_for_test();
+        result
+    }
+    crate::ktest!(KT_HANDLE_TRANSFER_QUOTA, t_handle_transfer_quota);
+
+    pub fn t_handle_dup_quota() -> bool {
+        reset_for_test();
+        reset_counters_for_test();
+        let old_proc_of = PROC_OF.load(core::sync::atomic::Ordering::Acquire);
+        install_proc_of(|gidx| if gidx < 100 { 1 } else { 2 });
+        let owner = (50usize, 1u32);
+        let result = (|| {
+            let cells_before = {
+                let mut g = TABLE.lock();
+                g.get().cells.iter().filter(|c| c.used).count()
+            };
+            let Some(cursor) = fixture() else { return false };
+            let Some(console) = grant_console(owner, RIGHT_READ | RIGHT_DUP, 0).ok() else { return false };
+            if !fill_console_slots(console, MAX_HANDLES_PER_PROC - 1) {
+                return false;
+            }
+            let Some(file) = grant_file(owner, 3, cursor, RIGHT_READ | RIGHT_DUP).ok() else { return false };
+            let rejected = matches!(dup(file, owner, RIGHT_READ), Err(HErr::Exhausted));
+            let (unchanged, cells_used) = {
+                let mut g = TABLE.lock();
+                let t = g.get();
+                let unchanged = matches!(t.slots[file.slot() as usize].obj,
+                    Some(ObjRef::File(f)) if f.share.is_none());
+                (unchanged, t.cells.iter().filter(|c| c.used).count())
+            };
+            crate::log_info!(
+                "handle-dup-quota: rejected={} unchanged={} cells_before={} cells_after={}",
+                rejected, unchanged, cells_before, cells_used
+            );
+            rejected && unchanged && cells_used == cells_before
+        })();
+        PROC_OF.store(old_proc_of, core::sync::atomic::Ordering::Release);
+        reset_for_test();
+        result
+    }
+    crate::ktest!(KT_HANDLE_DUP_QUOTA, t_handle_dup_quota);
 
     #[cfg(feature = "fat32-exec")]
     pub fn t_handle_syscalls() -> bool {

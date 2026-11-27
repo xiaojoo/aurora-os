@@ -1,9 +1,9 @@
 {
   "format": "aurora-sbom-v1",
   "generator": "tools/aurora.py release",
-  "note": "外部 crate 数为 0 是实测而不是省略；依赖出现的第一天 check-sbom 就要管到它",
-  "workspace_packages": 9,
-  "external_packages": 0,
+  "note": "workspace 与外部 crate 数均由 cargo metadata 实测；许可证策略见 docs/architecture/crates.toml",
+  "workspace_packages": 10,
+  "external_packages": 16,
   "packages": [
     {
       "name": "aurora-capture",
@@ -67,16 +67,125 @@
       "license": "",
       "source": "workspace",
       "description": ""
+    },
+    {
+      "name": "autocfg",
+      "version": "1.5.1",
+      "license": "Apache-2.0 OR MIT",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "description": "Automatic cfg for Rust compiler features"
+    },
+    {
+      "name": "bitflags",
+      "version": "2.13.2",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "description": "A macro to generate structures which behave like bitflags."
+    },
+    {
+      "name": "cfg-if",
+      "version": "1.0.5",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "description": "A macro to ergonomically define an item depending on a large number of #[cfg]\nparameters. Structured like an if-else chain, the first matching branch is the\nitem that gets emitted."
+    },
+    {
+      "name": "chacha20",
+      "version": "0.10.2",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "description": "The ChaCha20 stream cipher (RFC 8439) implemented in pure Rust using traits\nfrom the RustCrypto `cipher` crate, with optional architecture-specific\nhardware acceleration (AVX2, SSE2). Additionally provides the ChaCha8, ChaCha12,\nXChaCha20, XChaCha12 and XChaCha8 stream ciphers, and also optional\nrand_core-compatible RNGs based on those ciphers."
+    },
+    {
+      "name": "core_detect",
+      "version": "1.0.0",
+      "license": "MIT/Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "description": "A `no_std` version of the `std::is_x86_feature_detected!` macro."
+    },
+    {
+      "name": "cpufeatures",
+      "version": "0.3.1",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "description": "Lightweight runtime CPU feature detection for aarch64, loongarch64, and x86/x86_64 targets,\nwith no_std support and support for mobile targets including Android and iOS"
+    },
+    {
+      "name": "getrandom",
+      "version": "0.4.3",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "description": "A small cross-platform library for retrieving random data from system source"
+    },
+    {
+      "name": "host-initramfs",
+      "version": "0.1.0",
+      "license": "",
+      "source": "workspace",
+      "description": ""
+    },
+    {
+      "name": "libc",
+      "version": "0.2.191",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "description": "Raw FFI bindings to platform libraries like libc."
+    },
+    {
+      "name": "num-traits",
+      "version": "0.2.19",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "description": "Numeric traits for generic mathematics"
+    },
+    {
+      "name": "proptest",
+      "version": "1.12.0",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "description": "Hypothesis-like property-based testing and shrinking."
+    },
+    {
+      "name": "r-efi",
+      "version": "6.0.0",
+      "license": "MIT OR Apache-2.0 OR LGPL-2.1-or-later",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "description": "UEFI Reference Specification Protocol Constants and Definitions"
+    },
+    {
+      "name": "rand",
+      "version": "0.10.4",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "description": "Random number generators and other randomness functionality."
+    },
+    {
+      "name": "rand_core",
+      "version": "0.10.1",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "description": "Core random number generation traits and tools for implementation."
+    },
+    {
+      "name": "rand_xorshift",
+      "version": "0.5.0",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "description": "Xorshift random number generator"
+    },
+    {
+      "name": "regex-syntax",
+      "version": "0.8.12",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "description": "A regular expression parser."
+    },
+    {
+      "name": "unarray",
+      "version": "0.1.4",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "description": "Utilities for working with uninitialized arrays"
     }
-  ],
-  "kernel_elf_sha256": "a712020f3a8c8056deac77cfa2decb8936982688964a1e2ef78f8c791cc1c28a",
-  "image_sha256": "0cdab22fedb2254fea31a406d459e2f2854c7e1a44944850e8f1d3b9e259dc7a",
-  "image_file_digests": {
-    "/EFI/": "e3b0c44298fc1c14",
-    "/EFI/BOOT/": "e3b0c44298fc1c14",
-    "/EFI/BOOT/BOOTX64.EFI": "333f7a69379b1f47",
-    "/boot/": "e3b0c44298fc1c14",
-    "/boot/aurora.bin": "a712020f3a8c8056",
-    "/limine.conf": "ceb9d14a0d1eea51"
-  }
+  ]
 }

@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 aurora-capture = { path = "../capture", optional = true, default-features = false }
+host-initramfs = { path = "../crates/host-initramfs" }
 
 # 手册 §1.3 第 7 条（R19）：[workspace.lints] 不会自动作用到成员 crate，
 # 必须在这里显式接入。**删掉这三行不会让构建失败，只会让 lint 门禁静默空转**，
@@ -20,7 +21,7 @@ workspace = true
 [features]
 nvme = []
 initramfs-probe = []
-fault-initramfs-no-align = []
+fault-initramfs-no-align = ["host-initramfs/fault-initramfs-no-align"]
 xhci = []
 
 # ADR-213：命令环闭环（Enable Slot）。**默认关** —— 见 ADR-213 未决 1：
@@ -172,6 +173,8 @@ fault-alloc-in-irq = []
 # 负样本（§7.1 R16）：同一上下文重复获取堆锁。held_by 必须认出并升 L4，
 # 否则"重入即死锁"这件事今天没人能证明它被抓得住。
 fault-lock-reentrant = []
+fault-rand-reentrant = []
+fault-rand-no-entropy = []
 
 # 负样本（ADR-081 决策 4）：同一上下文重复获取 GROW(4)，必须被 held_by 认出并升 L4。
 fault-grow-reentrant = []
@@ -345,6 +348,13 @@ handles = []
 # 负样本（P7 §9 F）：把装载器授予的 owner 改错一格（Task::id ^ 1）。
 # 容器读自己的句柄必须 NotOwner ⇒ 判定链这一行期望 FAIL；证明"授予给谁"不是修辞。
 fault-handle-owner = []
+fault-handle-is-live-gen = []
+fault-handle-close-used = []
+fault-handle-quota = []
+fault-handle-proc-count = []
+fault-handle-revoke-owner = []
+fault-handle-transfer-quota = []
+fault-handle-dup-quota = []
 # §194 负样本：把 wait_for_task 里"查条件之后、block_current 之前"那个窗口故意撑大。
 # 推导见 BACKLOG §194：目标若在窗口里收工，drain 会对着还没 Blocked 的等待者调 wake_task，
 # 失败被 `let _ =` 吞掉 ⇒ 槽已 WOKEN 而 ARMED/PENDING 归零，之后 block_current 永久停住。

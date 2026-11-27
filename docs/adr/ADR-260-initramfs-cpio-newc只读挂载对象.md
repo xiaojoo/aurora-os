@@ -31,3 +31,9 @@ initramfs 一直未交付，但当前 `ReadOnlyFs/ReadCursor` 与 FAT 的 `Bpb/V
 - 宿主解析器对真实日志零偏差；把 `init_sha` 离线改为全零必须红。
 - `check` **21/21**；相关 cfg 构建通过；矩阵新增 initramfs 行后总行数 94，最终独立进程整链
   **94/94 符合**（`build/initramfs-matrix.out.log`）。真机未验证；AOCI MCP 不可用，索引未更新。
+
+## S1 补记（2026-11-27）
+
+实现原样搬入 `crates/host-initramfs`，内核侧保留五个显式类型别名；搬移前后 231 行有效实现
+逐字一致。宿主单测 **11/11**，专用四字节对齐变异证红；内核 `fault-initramfs-no-align` 目标用例
+证红。最终 S1 合并态 `check` **21/21**、矩阵 **106/106 符合**。Miri 与真机未验证。

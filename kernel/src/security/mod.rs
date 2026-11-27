@@ -4,4 +4,5 @@
 //! 句柄（`capability` 逻辑模块）**不在这一层**：它有自己的锁等级与负样本，单独一个域。
 
 pub(crate) mod cred;
+pub(crate) mod rand;
 pub(crate) mod sign;

@@ -93,16 +93,19 @@ fn t_kbd_inject() -> bool {
     // 这里只当「前后读数」用，不解读单个字段——字段顺序的权威在 `kbd.rs` 的注释里，
     // 而这条判据不需要知道它：收到字符本身就证明通路通了。
     let before = kbd::stats();
-    let mut got = None;
-    // 约 2 亿轮：宿主机的注入要在 `run` 起来之后才发，给足窗口。
-    // 判据靠的是「收到了什么」，不是「等了多久」——超时只影响红的方式。
-    for _ in 0..200_000_000u64 {
-        if let Some(c) = kbd::read_char() {
-            got = Some(c);
-            break;
+    let got = crate::apic::with_interrupts(|| {
+        let mut got = None;
+        // 约 2 亿轮：宿主机的注入要在 `run` 起来之后才发，给足窗口。
+        // 判据靠的是「收到了什么」，不是「等了多久」——超时只影响红的方式。
+        for _ in 0..200_000_000u64 {
+            if let Some(c) = kbd::read_char() {
+                got = Some(c);
+                break;
+            }
+            core::hint::spin_loop();
         }
-        core::hint::spin_loop();
-    }
+        got
+    });
     let after = kbd::stats();
     let ch = match got {
         Some(c) => c,

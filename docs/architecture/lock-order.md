@@ -26,6 +26,7 @@
 | `RANK_DENTRY` | 38 | dentry 缓存（`filesystem/vfs_ro.rs` 的 `DENTRY_LOCK`，ADR-195）| （叶子：只读写缓存表）| **ADR-195（2026-11-22）**：路径解析的 `(卷指纹, 父簇, 名字)` → `Entry` 缓存。**叶子锁**：临界区里只读写那 64 条 `DentrySlot`，不取任何别的锁。比 `RANK_BLOCK(37)` 深：缓存命中时**不碰盘**。**每次 `ReadOnlyFs::mount` 都清缓存** —— 夹具造坏卷的方式是改同一块 img 的目录项，引导扇区指纹不变 ⇒ 不清就会把好卷的结果返回给坏卷（实测两个用例红）。| 否 |
 | `RANK_NOTIFY` | 39 | 用户完成通知账本（`filesystem/block_notify.rs` 的 `NOTIFY_LOCK`）| （叶子：只读写定长 Copy 记录）| **ADR-259 第5片（2026-11-26）**：只存 token/result/seq 与端点身份，不碰 VMO、Proc、DMA 或回调；页面镜像在锁外完成。满队列拒绝而不覆盖未确认记录。 | 否 |
 | `RANK_LEDGER` | 40 | `resource::Ledger` 的每模块计数 | （叶子） | 不再获取别的锁 | 否 |
+| `RANK_RAND` | 41 | `security::rand` 的熵池与 ChaCha20 状态 | （叶子） | 持有期间不取任何锁、不分配、不打日志 | 否 |
 | `RANK_ACPI` | 50 | ACPI 解析结果静态量 | （叶子，目前只在启动期单独使用） | 解析路径不分配物理帧 | 否 |
 | `RANK_TEST` | 60 | 无（跨核竞争用例的自旋占位） | （叶子，**故意**是叶子） | `smp::contention_round`；临界区里只有一次 volatile 读改写 + 一段 `tsc::spin`；`KT_AHCI_LOCK_RANK_GUARD` 也借它制造外层 rank=60，验证 AHCI 在 XFER 前拒绝 | 否 |
 

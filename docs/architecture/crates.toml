@@ -9,6 +9,9 @@ crate.aurora-kernel = "aurora-kernel"
 # ADR-247：独立 capture 内核。固定链接基址，不依赖主内核分配器/锁/页表。
 crate.aurora-capture = "aurora-capture"
 
+# S1：内核与宿主机测试共用的 cpio newc 只读解析库。
+crate.host-initramfs = "host-initramfs"
+
 # M4-2：第一个用户程序的**产物**包。它不是库、没有 api/impl 之分，
 # 登记它是为了让 §2.5 R10 的双向比对覆盖到"仓库里存在的包都必须有说明"这条。
 crate.aurora-user-hello = "aurora-user-hello"
@@ -62,6 +65,7 @@ license.allow[] = "MPL-2.0"
 
 license.pending.aurora-kernel = "ADR-009b 未定（发布许可证由安全委员会在 M9 前确定，手册 §11.2/§15.4）"
 license.pending.aurora-capture = "同上：kdump 第二内核，许可证随内核一起定"
+license.pending.host-initramfs = "ADR-009b 未定；随内核一起确定发布许可证"
 license.pending.aurora-user-hello = "同上：它是内核的产物夹具，许可证随内核一起定"
 license.pending.aurora-user-probe = "同上：第二个用户产物夹具（W3 P5a），许可证随内核一起定"
 license.pending.aurora-user-shell = "同上：第三个用户产物（S5c 串口 shell），许可证随内核一起定"

@@ -1,0 +1,21 @@
+[package]
+name = "host-initramfs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# 宿主机可测：no_std 库；内核通过 path 依赖复用同一份源码（S1-3）。
+# 注意：新增 crate 必须同时登记 docs/architecture/crates.toml 与根 Cargo.toml members（§2.5 R10，check-crates 双向对账）。
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# 与内核同名的变异开关：打开后跳过 4 字节对齐，用来证明测试会红。
+fault-initramfs-no-align = []
+
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }

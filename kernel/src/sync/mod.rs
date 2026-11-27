@@ -57,6 +57,7 @@ impl LockRank {
             38 => "DENTRY",
             39 => "NOTIFY",
             40 => "LEDGER",
+            41 => "RAND",
             50 => "ACPI",
             60 => "TEST",
             _ => "?",
@@ -120,6 +121,7 @@ pub const RANK_DENTRY: LockRank = LockRank(38);
 /// 用户完成通知账本（`filesystem/block_notify.rs`，ADR-259）。叶子锁，只读写 Copy 记录。
 pub const RANK_NOTIFY: LockRank = LockRank(39);
 pub const RANK_LEDGER: LockRank = LockRank(40);
+pub const RANK_RAND: LockRank = LockRank(41);
 pub const RANK_ACPI: LockRank = LockRank(50);
 /// 跨核竞争用例专用（`smp::CONTENTION_LOCK`）。排在最内层是因为它**不嵌套任何东西**：
 /// 临界区里只有一次原子读改写，不调分配器、不碰页表、不打日志。

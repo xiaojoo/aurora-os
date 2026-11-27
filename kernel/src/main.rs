@@ -322,6 +322,7 @@ extern "C" fn after_switch(_: usize) -> ! {
     crate::network::socket::install_mac_of(crate::sched::user::mac_for_retx);
     // Task C（V1.0 §14）：启动编排按阶段函数组织；顺序与日志契约不变。
     stage_memory();
+    stage_rand();
     stage_cpu_protections();
     stage_probe_addr();
     stage_acpi_and_pci();
@@ -583,6 +584,13 @@ fn stage_memory() {
         }
     }
     tsc::stage("heap");
+}
+
+fn stage_rand() {
+    let sources = crate::security::rand::init();
+    if sources < crate::security::rand::MIN_SOURCES {
+        crate::log_warn!("rand: 熵源不足({}<{})，随机数 API 返回 NotSeeded", sources, crate::security::rand::MIN_SOURCES);
+    }
 }
 
 /// Stage2c：SMEP/SMAP 必需项与 BSP 的 #DF guard 栈。

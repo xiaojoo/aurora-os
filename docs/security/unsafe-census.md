@@ -5,11 +5,11 @@
 >
 > **2026-11-20（ADR-175 跨 AS 读走物理地址）**：`sched/user` U2 9 → 10（`copy_from_user_in` 里 HHDM 别名的单字节读）。**总数 +1**（530 → 531）。
 
-总计 724 处。U1 108 · U2 185 · U3 13 · U4 237 · U5 138 · U6 43
+总计 726 处。U1 110 · U2 185 · U3 13 · U4 237 · U5 138 · U6 43
 
 | 类别 | 含义 | 处数 |
 |---|---|---|
-| U1 | 架构入口与特殊寄存器 | 108 |
+| U1 | 架构入口与特殊寄存器 | 110 |
 | U2 | 页表、物理内存与 MMIO | 185 |
 | U3 | DMA 与设备共享内存 | 13 |
 | U4 | 并发共享状态与 UnsafeCell | 237 |
@@ -671,6 +671,13 @@ ADR-199：`Socket` 存 `ConnState` 需要一个可变入口，而 `Socket` 本�
 | U4 | 207 | `let t = unsafe { &*TABLE.0.get() }; t.n as u32 }` |
 | U4 | 220 | `let t = unsafe { &*TABLE.0.get() }; const REC: usize = 28; let mut n = 0usize;` |
 | U4 | 250 | `let t = unsafe { &*TABLE.0.get() }; t.stats }` |
+
+### security/rand
+
+| 类别 | 行 | 形状 |
+|---|---|---|
+| U1 | 159 | `unsafe { core::arch::x86_64::_rdrand64_step(&mut value) }`；CPUID.1:ECX[30] 已确认，只写栈上 u64，四轮共 32 字节 |
+| U1 | 175 | `unsafe { core::arch::x86_64::_rdseed64_step(&mut value) }`；CPUID.7.0:EBX[18] 已确认，只写栈上 u64，四轮共 32 字节 |
 
 ### sync/mod
 

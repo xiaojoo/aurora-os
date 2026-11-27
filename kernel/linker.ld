@@ -42,7 +42,9 @@ SECTIONS {
     /* 内核测试表（§12.2 的段注册方案）：运行器遍历两个符号之间的条目 */
     . = ALIGN(8);
     PROVIDE(__ktests_start = .);
-    KEEP(*(.ktests .ktests.*))
+    KEEP(*(.ktests))
+    KEEP(*(.ktests_late))
+    KEEP(*(.ktests.*))
     PROVIDE(__ktests_end = .);
     PROVIDE(__rodata_end = .);
   } :rodata

@@ -157,8 +157,10 @@ U2 = 10
 # 2026-11-27 ADR-259 第9条：删除旧函数指针回调池 -filesystem/block_io U4 16、
 # -ktests/storage/vfs_ro U6 1（旧回调测试的 static mut 夹具）；等价断言迁入真异步核心。
 # 对账：741-17=724、U4 253-16=237、U6 44-1=43。
-total = 724
-U1 = 108
+# 2026-11-27 S1/ADR-261：security/rand 的 RDRAND/RDSEED 指令 +U1 2。
+# 对账：724+2=726、U1 108+2=110。
+total = 726
+U1 = 110
 U2 = 185
 U3 = 13
 U4 = 237
@@ -349,6 +351,13 @@ U5 = 6
 
 [modules."security/cred"]
 U4 = 7
+
+[modules."security/rand"]
+# ADR-261：RDRAND/RDSEED 只写调用方栈上的 u64，不对指针解引用。
+# 地址范围为当次调用栈帧，对齐由 u64 类型保证，生命周期仅当次调用；
+# 调用前分别核 CPUID.1:ECX[30] 与 CPUID.7.0:EBX[18]；
+# 启动期单线程 init_from_hw 调用，熵池状态由 RANK_RAND(41) 串行化。
+U1 = 2
 
 [modules."sync/mod"]
 U1 = 4

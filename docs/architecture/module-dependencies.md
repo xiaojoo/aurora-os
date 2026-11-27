@@ -47,7 +47,7 @@ Boot / Platform     (boot)
 | irq | arch, memory |
 | storage | arch, boot, driver, irq, memory, pci, time |
 | diagnostics | arch, irq, memory, pci, storage, time |
-| security | （无产品路径出边；签名目前只在用例里调用） |
+| security | arch, sync, time |
 | time | arch, diagnostics |
 | capability | memory, storage, sync |
 | resource | memory, sync |

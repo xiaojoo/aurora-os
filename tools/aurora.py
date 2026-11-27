@@ -3751,6 +3751,59 @@ def check_initramfs(log: str) -> list[str]:
     return bad
 
 
+def check_csprng(log: str) -> list[str]:
+    """宿主独立实现 RFC 8439 块函数，核对固定 key/counter 的 16 个字。"""
+    bad: list[str] = []
+    m = re.search(r"csprng: block ctr=1 ((?:[0-9a-f]{8} ?){16})", log)
+    if not m:
+        return ["串口没有 csprng 固定块向量"]
+    got = [int(word, 16) for word in m.group(1).split()]
+    mask = 0xFFFFFFFF
+
+    def rotl(value: int, bits: int) -> int:
+        return ((value << bits) | (value >> (32 - bits))) & mask
+
+    def quarter(s: list[int], a: int, b: int, c: int, d: int) -> None:
+        s[a] = (s[a] + s[b]) & mask
+        s[d] = rotl(s[d] ^ s[a], 16)
+        s[c] = (s[c] + s[d]) & mask
+        s[b] = rotl(s[b] ^ s[c], 12)
+        s[a] = (s[a] + s[b]) & mask
+        s[d] = rotl(s[d] ^ s[a], 8)
+        s[c] = (s[c] + s[d]) & mask
+        s[b] = rotl(s[b] ^ s[c], 7)
+
+    initial = list(struct.unpack("<4I", b"expand 32-byte k"))
+    initial += list(struct.unpack("<8I", bytes(range(32))))
+    initial += [1, 0, 0, 0]
+    state = initial[:]
+    for _ in range(10):
+        quarter(state, 0, 4, 8, 12)
+        quarter(state, 1, 5, 9, 13)
+        quarter(state, 2, 6, 10, 14)
+        quarter(state, 3, 7, 11, 15)
+        quarter(state, 0, 5, 10, 15)
+        quarter(state, 1, 6, 11, 12)
+        quarter(state, 2, 7, 8, 13)
+        quarter(state, 3, 4, 9, 14)
+    want = [(a + b) & mask for a, b in zip(state, initial)]
+    if got != want:
+        bad.append("csprng 块向量与宿主 RFC 8439 实现不同")
+    verdict = re.search(
+        r"csprng: 判据 sources=(\d+) seeded=(true|false) block=(true|false) fill=(true|false)", log
+    )
+    if not verdict:
+        bad.append("串口没有 csprng 熵源/fill 判据")
+    else:
+        sources = int(verdict.group(1))
+        seeded = verdict.group(2) == "true"
+        if seeded != (sources >= 2):
+            bad.append("csprng seeded 与熵源计数不一致")
+        if verdict.group(3) != "true" or verdict.group(4) != "true":
+            bad.append("csprng 核内 block/fill 判据为 false")
+    return bad
+
+
 def check_fb_pattern(log: str, ppm: tuple[int, int, bytes] | str) -> list[str]:
     """显示域的宿主机侧对账：从 `screendump` 的 PPM 里取样，与内核图案对账。
 
@@ -5704,7 +5757,7 @@ UNSITE = re.compile(r"\bunsafe\s*(\{|impl|fn|extern)")
 # 顶层 fn（列 0）。只认列 0 是有意的：extern "C" {} 里那些缩进的 fn 是**声明**不是定义，
 # 认了它会把后面整个文件的"所属函数"都记成 context_load。
 UNFN = re.compile(r'^(?:pub )?(?:unsafe )?(?:extern "C" )?fn\s+(\w+)')
-UNSAFE_ARCH_TABLE = ("tss.", "gdt", "idt", "gdtr", "write_unaligned")
+UNSAFE_ARCH_TABLE = ("tss.", "gdt", "idt", "gdtr", "write_unaligned", "rdrand64_step", "rdseed64_step")
 
 
 def _unsafe_roots() -> list[Path]:
@@ -7505,7 +7558,8 @@ def sbom_current() -> dict:
     if r.returncode != 0:
         raise RuntimeError("cargo metadata 失败，SBOM 无从生成")
     d = json.loads(r.stdout)
-    members = {p["name"] for p in d["packages"] if str(ROOT) in str(p["manifest_path"])}
+    member_ids = set(d["workspace_members"])
+    members = {p["name"] for p in d["packages"] if p["id"] in member_ids}
     comps = []
     for pkg in sorted(d["packages"], key=lambda x: (x["name"], x["version"])):
         comps.append({
@@ -7518,7 +7572,7 @@ def sbom_current() -> dict:
     return {
         "format": "aurora-sbom-v1",
         "generator": "tools/aurora.py release",
-        "note": "外部 crate 数为 0 是实测而不是省略；依赖出现的第一天 check-sbom 就要管到它",
+        "note": "workspace 与外部 crate 数均由 cargo metadata 实测；许可证策略见 docs/architecture/crates.toml",
         "workspace_packages": len(members),
         "external_packages": len(comps) - len(members),
         "packages": comps,
@@ -10208,6 +10262,77 @@ def do_test(timeout: int) -> int:
     for x in i_bad:
         print("    initramfs 对账:", x)
 
+    print("=== S1 句柄：活性、每进程配额、撤销 OWNER 与转移配额 ===")
+    IMAGE.unlink(missing_ok=True)
+    hsv, hsrc, hslog = do_run(["fat32-probe", "handles"], timeout)
+    hs_bad = []
+    for _name in ("t_handle_is_live", "t_handle_quota", "t_handle_revoke_only_owner", "t_handle_transfer_quota", "t_handle_dup_quota"):
+        hs_bad += ktest_row(hslog, _name)
+    hs_verdict = hsv if hsv != "PASS" else ("PASS" if not hs_bad else "CONTENT-MISMATCH")
+    for x in hs_bad:
+        print("    S1 句柄对账:", x)
+
+    print("=== S1 句柄负样本：is_live 忽略世代 ===")
+    IMAGE.unlink(missing_ok=True)
+    higenv, higenrc, higenlog = do_run(["fat32-probe", "handles", "fault-handle-is-live-gen"], timeout)
+    higen_verdict = "FAIL" if higenv == "FAIL" and ktest_named(higenlog, "t_handle_is_live") == "failed" else "CONTENT-MISMATCH"
+
+    print("=== S1 句柄负样本：close 不清 used ===")
+    IMAGE.unlink(missing_ok=True)
+    hclosev, hcloserc, hcloselog = do_run(["fat32-probe", "handles", "fault-handle-close-used"], timeout)
+    hclose_verdict = "FAIL" if hclosev == "FAIL" and ktest_named(hcloselog, "t_handle_is_live") == "failed" else "CONTENT-MISMATCH"
+
+    print("=== S1 句柄负样本：insert 绕过配额 ===")
+    IMAGE.unlink(missing_ok=True)
+    hquotav, hquotarc, hquotalog = do_run(["fat32-probe", "handles", "fault-handle-quota"], timeout)
+    hquota_verdict = "FAIL" if hquotav == "FAIL" and ktest_named(hquotalog, "t_handle_quota") == "failed" else "CONTENT-MISMATCH"
+
+    print("=== S1 句柄负样本：进程计数不筛 owner_proc ===")
+    IMAGE.unlink(missing_ok=True)
+    hprocv, hprocrc, hproclog = do_run(["fat32-probe", "handles", "fault-handle-proc-count"], timeout)
+    hproc_verdict = "FAIL" if hprocv == "FAIL" and ktest_named(hproclog, "t_handle_quota") == "failed" else "CONTENT-MISMATCH"
+
+    print("=== S1 句柄负样本：revoke 不筛 owner_id ===")
+    IMAGE.unlink(missing_ok=True)
+    hrevokev, hrevokerc, hrevokelog = do_run(["fat32-probe", "handles", "fault-handle-revoke-owner"], timeout)
+    hrevoke_verdict = "FAIL" if hrevokev == "FAIL" and ktest_named(hrevokelog, "t_handle_revoke_only_owner") == "failed" else "CONTENT-MISMATCH"
+
+    print("=== S1 句柄负样本：transfer 绕过目标配额 ===")
+    IMAGE.unlink(missing_ok=True)
+    htransferv, htransferrc, htransferlog = do_run(["fat32-probe", "handles", "fault-handle-transfer-quota"], timeout)
+    htransfer_verdict = "FAIL" if htransferv == "FAIL" and ktest_named(htransferlog, "t_handle_transfer_quota") == "failed" else "CONTENT-MISMATCH"
+
+    print("=== S1 句柄负样本：dup 在配额检查前保留共享 cell ===")
+    IMAGE.unlink(missing_ok=True)
+    hdupv, hduprc, hduplog = do_run(["fat32-probe", "handles", "fault-handle-dup-quota"], timeout)
+    hdup_verdict = "FAIL" if hdupv == "FAIL" and ktest_named(hduplog, "t_handle_dup_quota") == "failed" else "CONTENT-MISMATCH"
+
+    print("=== S1 CSPRNG：固定块向量由宿主独立复算 ===")
+    IMAGE.unlink(missing_ok=True)
+    crv, crrc, crlog = do_run([], timeout)
+    cr_bad = ktest_row(crlog, "t_csprng_contract") + check_csprng(crlog)
+    cr_verdict = crv if crv != "PASS" else ("PASS" if not cr_bad else "CONTENT-MISMATCH")
+    for x in cr_bad:
+        print("    CSPRNG 对账:", x)
+
+    print("=== S1 CSPRNG：零熵必须返回 NotSeeded ===")
+    IMAGE.unlink(missing_ok=True)
+    cnv, cnrc, cnlog = do_run(["fault-rand-no-entropy"], timeout)
+    cn_bad = ktest_row(cnlog, "t_csprng_contract") + check_csprng(cnlog)
+    cn_verdict = cnv if cnv != "PASS" else ("PASS" if not cn_bad else "CONTENT-MISMATCH")
+    for x in cn_bad:
+        print("    CSPRNG 零熵对账:", x)
+
+    print("=== S1 CSPRNG 负样本：重入 RANK_RAND 必须升 L4 ===")
+    IMAGE.unlink(missing_ok=True)
+    crrv, crrrc, crrlog = do_run(["fault-rand-reentrant"], timeout)
+    crr_verdict = "EXCEPTION" if crrv == "EXCEPTION" and "重入获取 rank=41 token=" in crrlog else "CONTENT-MISMATCH"
+
+    print("=== initramfs 负样本：跳过名字后四字节对齐 ===")
+    IMAGE.unlink(missing_ok=True)
+    imv, imrc, imlog = do_run(["initramfs-probe", "fault-initramfs-no-align"], timeout)
+    im_verdict = "FAIL" if imv == "FAIL" and ktest_named(imlog, "t_initramfs_core") == "failed" else "CONTENT-MISMATCH"
+
     # =====================================================================
     # ADR-259 第5片：独立 ring3 broker、共享页确认、死亡/替换重投与 panic 隔离。
     print("=== 用户完成通知 broker：ring3 0/3/0、替换重投与资源收尾 ===")
@@ -11181,6 +11306,18 @@ def do_test(timeout: int) -> int:
         ("virtio-blk 原子RMW与宿主对账", rmwv_verdict, rmwvc, "PASS", 33),
         ("NVMe 原子RMW与宿主对账", rmwn_verdict, rmwnc, "PASS", 33),
         ("initramfs newc只读与宿主解析对账", i_verdict, irc, "PASS", 33),
+        ("S1句柄活性配额与转移", hs_verdict, hsrc, "PASS", 33),
+        ("S1句柄世代不校验必须红", higen_verdict, higenrc, "FAIL", 35),
+        ("S1句柄close不清used必须红", hclose_verdict, hcloserc, "FAIL", 35),
+        ("S1句柄insert绕过配额必须红", hquota_verdict, hquotarc, "FAIL", 35),
+        ("S1句柄进程计数不筛选必须红", hproc_verdict, hprocrc, "FAIL", 35),
+        ("S1句柄撤销不筛owner必须红", hrevoke_verdict, hrevokerc, "FAIL", 35),
+        ("S1句柄转移绕过配额必须红", htransfer_verdict, htransferrc, "FAIL", 35),
+        ("S1句柄dup配额拒绝不得泄漏", hdup_verdict, hduprc, "FAIL", 35),
+        ("S1 CSPRNG块向量与宿主对账", cr_verdict, crrc, "PASS", 33),
+        ("S1 CSPRNG零熵必须拒产", cn_verdict, cnrc, "PASS", 33),
+        ("S1 CSPRNG重入必须升L4", crr_verdict, crrrc, "EXCEPTION", 39),
+        ("initramfs跳过对齐必须红", im_verdict, imrc, "FAIL", 35),
         # ADR-259 第5片：四格核内接线 + 独立 ring3 生命周期；负样本各自只咬目标格。
         ("用户通知broker与ring3重投", bn_verdict, bnrc, "PASS", 33),
         ("通知端点世代不校验必须红", bng_verdict, bngrc, "FAIL", 35),
@@ -11331,6 +11468,18 @@ def do_test(timeout: int) -> int:
         "virtio-blk 原子RMW与宿主对账": rmwvlog,
         "NVMe 原子RMW与宿主对账": rmwnlog,
         "initramfs newc只读与宿主解析对账": ilog,
+        "S1句柄活性配额与转移": hslog,
+        "S1句柄世代不校验必须红": higenlog,
+        "S1句柄close不清used必须红": hcloselog,
+        "S1句柄insert绕过配额必须红": hquotalog,
+        "S1句柄进程计数不筛选必须红": hproclog,
+        "S1句柄撤销不筛owner必须红": hrevokelog,
+        "S1句柄转移绕过配额必须红": htransferlog,
+        "S1句柄dup配额拒绝不得泄漏": hduplog,
+        "S1 CSPRNG块向量与宿主对账": crlog,
+        "S1 CSPRNG零熵必须拒产": cnlog,
+        "S1 CSPRNG重入必须升L4": crrlog,
+        "initramfs跳过对齐必须红": imlog,
         "用户通知broker与ring3重投": bnlog,
         "通知端点世代不校验必须红": bnglog,
         "覆盖未确认通知必须红": bnolog,

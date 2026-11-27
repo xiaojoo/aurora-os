@@ -150,6 +150,15 @@ is_tradeoff = true
 cost = "Entry 结构见 handle.rs；131072 格全局表"
 
 [[const]]
+kernel_const = "MAX_HANDLES_PER_PROC"
+value = 1024
+section = "capability"
+linux_source = "include/uapi/linux/limits.h: NR_OPEN = 1024；fs/file.c: sysctl_nr_open = 1048576"
+reason = "每进程句柄软限对齐 Linux 默认 RLIMIT_NOFILE=1024；fs-open 档全局仅 16384 槽，1024 即最多 16 个进程占满，属于有意取舍。"
+is_tradeoff = true
+cost = "无新增存储；在 HANDLE 锁内扫描 slots 统计同一 owner_proc 的已用项"
+
+[[const]]
 kernel_const = "MAX_JOBS"
 value = 1024
 section = "sched"

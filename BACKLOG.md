@@ -26350,3 +26350,37 @@ PASS，按环境形状记“不归因”，判据不动。
 - 定向回归：default `run-18893` PASS、AHCI `run-18894` PASS、NVMe `run-18895` PASS、
   `fs-rw,virtio-blk` `run-18897` PASS；最终码态另有 virtio 同 ELF 4/4 与 fs-rw 同 ELF 3/3。
   真机未验证；未提交 Git。AOCI 收尾维护结果见本轮汇报。
+## 592. S1 合并试验：宿主 initramfs、capability 配额与内核 CSPRNG（2026-11-27）
+
+- 输入：`aurora-S1-代码.zip`，sha256 `eb234a96d3bac01eb98c5d4ae9a6e510c2791471174c459eaf381c85fc109837`。
+  基线 `fd5652b`，默认内核 ELF 19,013,472 B / sha256 `63a072f44c25bbc3346721e01454954825b2042de2d7a29d260fd07c796fc6bb`。
+  使用者在隔离工作树 `H:/aurora-os-s1-test` 批准新增 `RANK_RAND=41`、`host-initramfs` crate 与 ADR-261。
+- host-initramfs：231 行有效实现搬移前后逐字一致；内核保留五个显式类型别名。宿主单测 **11/11**，
+  `fault-initramfs-no-align` 下专用对齐用例按预期失败；新增 crate 接入 workspace lints、成员清单、
+  license.pending 与 SBOM。Cargo metadata 现有 10 workspace / 16 external；修正 SBOM 用
+  `workspace_members` 而非路径子串判定成员，避免便携工具链路径把外部 crate 误算成 workspace。
+- capability：新增 `is_live`、每进程 1024 配额与 `count_for_proc`；insert、transfer、dup 都受配额约束。
+  `reserve_slot` 一次遍历同时找空槽、计 owned/live，`commit_slot` 无失败提交；shared dup 先预留再 retain，
+  杜绝配额拒绝后的 cell/VFS inode 泄漏。基线原本也在 insert 末尾全表 `live()`，本次把两次遍历合并为一次，
+  不增加渐近复杂度；仍保留 O(MAX_HANDLES) 扫描，旁表计数/位图优化未做。
+- CSPRNG（ADR-261）：ChaCha20 + 既有 SHA-256，启动在堆初始化后播种；RDRAND/RDSEED 各取 4×u64，
+  TSC 抖动为第三路，至少两路才 seeded。零熵 `fill()` 回 `NotSeeded`；本片不接入 TCP ISS。
+  新增 U1 两处并修正 unsafe 分类表， census 724→726 / U1 108→110。
+- 新增判据与变异：句柄 is_live/close/insert 配额/进程筛选/revoke OWNER/transfer 配额/dup 泄漏七组，
+  CSPRNG 固定块向量、零熵拒产、RANK_RAND 重入，initramfs 跳对齐；矩阵新增 12 行。ChaCha20 固定
+  key/counter 的 16 个字由宿主独立 RFC 8439 实现对账，QEMU 正常档 `sources=3 seeded=true`。
+- 首轮矩阵 100/106，红点全部定位并修复：新增 ktest 改变链接顺序，使 `t_sdkdemo` 提前运行、`t_fd_number`
+  取不到 boot 身份、`t_kbd_inject` 在 IF=0 自旋。sdkdemo 改用链接脚本显式 `.ktests_late` 末段；
+  fd 用例自调 `init_boot_task`；PS2 等待窗口用 `apic::with_interrupts`。修复后 fat32-exec 150/150、
+  esp-probe PASS、fs-rw PASS、ps2-kbd PASS。IRQ 风暴在有效 QMP 对照下 S1 raise=105,761、基线 raise=70,328；
+  无 QMP 的 6 秒窗口对量具时序敏感，最终整链仍按原判据通过。
+- 合并态复核：默认 ELF 19,031,272 B / sha256 `799e54a53973c9e35e064d266ede28eb347a9cb1044cf65e12fc340a418b687e`；
+  `check` **21/21**，host-initramfs **11/11**。完整判定矩阵原始 **105/106 符合**，唯一
+  `irq-sticky-pxis` 风暴行因 6 秒窗口内 raise=0 记 CONTENT-MISMATCH；同 ELF
+  `0e877dd0216d` 的 `run-145` 用相同 `-d int`/trace 仪器重跑，raise=11020、边沿=11020、
+  投递=11020，风暴对账通过，按环境形状记“不归因”，判据不动、不重跑整链，最终 **106/106 符合**。
+  合并态日志 `build/s1-merge-matrix.out.log`，SHA-256
+  `2e6d6f84a8e627b70c074fb6d42274b8396a644e19ce5f3f60ecdd5a67f362a1`。
+- 未做/未验证：TCP ISS 随机化、Miri、真机、密码学外部审计；TSC 抖动不宣称达到硬件熵源强度。
+  本次将 S1 diff 合入当前 `main`（包含已交付的 virtio-blk 八扇区长请求），未覆盖
+  `H:/aurora-os-wb` 的并行改动；AOCI 收尾维护结果见本轮汇报。

@@ -20,8 +20,7 @@
 //! `a3-cred-guest` 档 + ADR-151 那条判定行覆盖——本用例证的是"SDK 样板能跑通
 //! 调号 + 回传结果"这条链。
 
-use crate::ktests::common::{SDKDEMO_ELF, drain_reap};
-use crate::{ktest, user};
+use crate::{ktests::common::{SDKDEMO_ELF, drain_reap}, user};
 
 /// 在 ring3 跑 `sdkdemo` 并把它的串口输出抓出来。
 ///
@@ -154,5 +153,10 @@ fn t_sdkdemo() -> bool {
     }
     ok
 }
-#[cfg(feature = "handles")]
-ktest!(KT_SDKDEMO, t_sdkdemo);
+// 依赖全局 APIC/调度基础设施；放在普通 .ktests 之后，避免链接顺序把它提前。
+#[used]
+#[link_section = ".ktests_late"]
+static KT_SDKDEMO: crate::ktest::KTest = crate::ktest::KTest {
+    name: stringify!(t_sdkdemo),
+    run: t_sdkdemo,
+};

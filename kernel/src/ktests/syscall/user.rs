@@ -1324,6 +1324,7 @@ ktest!(KT_IFADDR, t_ifaddr);
 /// **负样本**：把 `socket_arg` 的 fd 分支去掉（只认句柄），第 1、5 格同时红。
 #[cfg(feature = "handles")]
 fn t_fd_number() -> bool {
+    crate::sched::init_boot_task();
     use crate::user::{SYS_FD_CLOSE, SYS_FD_LIST, SYS_FD_LOOKUP, SYS_SOCK_BIND, SYS_SOCK_CREATE};
     let mut ok = true;
     let mut f = crate::arch::x86_64::trap::TrapFrame {
